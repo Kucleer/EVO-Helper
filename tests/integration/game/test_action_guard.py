@@ -49,6 +49,19 @@ def test_action_guard_refuses_unstable_reobservation() -> None:
     assert not final.allowed
 
 
+def test_action_guard_refuses_final_check_on_wrong_known_screen() -> None:
+    guard = ActionGuard(Settings(dry_run=False))
+    decision = guard.evaluate(_command(), ScreenObservation("attack", "attack-v2", 1.0))
+    assert decision.token is not None
+
+    final = guard.verify_and_consume(
+        decision.token, ScreenObservation("mail_list", "mail-list-v2", 1.0)
+    )
+
+    assert not final.allowed
+    assert "immediately before dispatch" in final.reason
+
+
 def test_safe_adapter_records_intent_without_click_in_dry_run() -> None:
     inner = SimulatedGameAdapter(dry_run=True)
     guard = ActionGuard(Settings(dry_run=True))

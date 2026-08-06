@@ -90,5 +90,11 @@ class ActionGuard:
             return ActionGuardDecision(False, "token expired")
         if observation.ui_version is None or observation.confidence < self._min_page_confidence:
             return ActionGuardDecision(False, "re-observation did not confirm a consistent screen")
+        if observation.screen != self._required_page:
+            return ActionGuardDecision(
+                False,
+                f"expected {self._required_page!r} immediately before dispatch, "
+                f"observed {observation.screen!r}",
+            )
         self._consumed.add(token.value)
         return ActionGuardDecision(True, "token consumed; dispatch authorized")
