@@ -106,7 +106,7 @@ def parse_iso_utc(text: str) -> datetime | None:
 def parse_mail_list(page: PageObservation, ocr_text: str, source: str) -> MailListObservation:
     if page.ui_version is None:
         raise UnknownUiVersionError("mail list UI version unknown; refusing to navigate")
-    if page.ui_version not in {"mail-list-v2", "mail-list-v1"}:
+    if page.ui_version != "mail-list-v2":
         raise UnknownUiVersionError(f"unsupported mail list UI version: {page.ui_version}")
     items: list[MailItem] = []
     for block in _split_blocks(ocr_text):
