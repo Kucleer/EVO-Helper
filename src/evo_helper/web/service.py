@@ -43,6 +43,7 @@ class ScanRangeView:
     end: Coordinate
     origin: Coordinate
     fleet_preset: str
+    fleet_preset_signature: str
     priority: int
 
 

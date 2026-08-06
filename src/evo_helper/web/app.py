@@ -76,6 +76,7 @@ def _range_out(scan_range: ScanRangeView) -> ScanRangeOut:
         end=_coordinate_out(scan_range.end),
         origin=_coordinate_out(scan_range.origin),
         fleet_preset=scan_range.fleet_preset,
+        fleet_preset_signature=scan_range.fleet_preset_signature,
         priority=scan_range.priority,
     )
 
@@ -100,6 +101,7 @@ def _range_view(item: ScanRangeIn) -> ScanRangeView:
         end=Coordinate(item.end.galaxy, item.end.system, item.end.position),
         origin=Coordinate(item.origin.galaxy, item.origin.system, item.origin.position),
         fleet_preset=item.fleet_preset,
+        fleet_preset_signature=item.fleet_preset_signature,
         priority=item.priority,
     )
 

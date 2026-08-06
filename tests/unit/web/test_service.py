@@ -26,6 +26,7 @@ def _plan_payload(clock: FakeApplicationService) -> ScanPlanView:
         end=Coordinate(1, 1, 20),
         origin=Coordinate(1, 1, 1),
         fleet_preset="main-fleet",
+        fleet_preset_signature="main-fleet-v1",
         priority=0,
     )
     return clock.create_plan(

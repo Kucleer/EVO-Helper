@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, String, UniqueConstraint, Uuid
@@ -15,6 +15,7 @@ class ScanPlan(Base):
     __tablename__ = "scan_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    public_id: Mapped[UUID] = mapped_column(Uuid, unique=True, default=uuid4, index=True)
     name: Mapped[str] = mapped_column(String(120), unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     time_window_start: Mapped[str] = mapped_column(String(5), default="08:00")
@@ -22,6 +23,9 @@ class ScanPlan(Base):
     timezone_name: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        UTCDateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
 
 
 class ScanRangeRow(Base):
