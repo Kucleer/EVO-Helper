@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics{% endblock %}
+{% block content %}
+<h1>Diagnostics</h1>
+<h2>Request a revisit</h2>
+<form data-api="/api/revisits">
+  <p>
+    <label>Scope
+      <select name="scope"><option value="target">target</option><option value="plan">plan</option><option value="range">range</option></select>
+    </label>
+    <label>Reason <input name="reason" required></label>
+  </p>
+  <p>
+    <label>Target coordinate (galaxy:system:position, for target scope)
+      <input name="target_coordinate.galaxy" type="number" min="1" placeholder="1">
+      :<input name="target_coordinate.system" type="number" min="1" placeholder="1">
+      :<input name="target_coordinate.position" type="number" min="1" placeholder="1">
+    </label>
+  </p>
+  <button type="submit">Request revisit</button>
+</form>
+<h2>Revisits</h2>
+<table>
+  <thead><tr><th>Scope</th><th>Reason</th><th>Status</th><th>Coordinate</th><th>Requested (UTC)</th></tr></thead>
+  <tbody>
+  {% for revisit in revisits %}
+    <tr>
+      <td>{{ revisit.scope }}</td>
+      <td>{{ revisit.reason }}</td>
+      <td>{{ revisit.status }}</td>
+      <td>{{ revisit.target_coordinate.galaxy if revisit.target_coordinate else "-" }}:{{ revisit.target_coordinate.system if revisit.target_coordinate else "" }}:{{ revisit.target_coordinate.position if revisit.target_coordinate else "" }}</td>
+      <td>{{ revisit.requested_at_utc }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No revisits yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<h2>State events</h2>
+<table>
+  <thead><tr><th>Time (UTC)</th><th>Aggregate</th><th>Event</th><th>From</th><th>To</th></tr></thead>
+  <tbody>
+  {% for event in events %}
+    <tr>
+      <td>{{ event.occurred_at_utc }}</td>
+      <td>{{ event.aggregate }}:{{ event.aggregate_id }}</td>
+      <td>{{ event.event }}</td>
+      <td>{{ event.from_state or "-" }}</td>
+      <td>{{ event.to_state or "-" }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No events yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
