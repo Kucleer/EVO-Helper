@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from evo_helper.domain.models import DispatchCommand
 from evo_helper.domain.ports import InflightFleet, PresetObservation, ScreenObservation
 
-from .action_guard import ActionGuard, ActionGuardDecision
+from .action_guard import ActionGuard, ActionGuardDecision, ActionGuardToken
 from .capacity import CapacityCheck, LineCapacityGate
 
 
@@ -50,3 +50,11 @@ class DispatchCoordinator:
             capacity=capacity,
             guard=guard,
         )
+
+    def authorize_final_dispatch(
+        self,
+        token: ActionGuardToken,
+        screen_observation: ScreenObservation,
+    ) -> ActionGuardDecision:
+        """Consume a previously issued token after the final screen re-check."""
+        return self._guard.verify_and_consume(token, screen_observation)
