@@ -23,6 +23,16 @@ dev = [
   "pytest>=8.3,<9",
   "ruff>=0.6,<1",
 ]
+vision = [
+  "mss>=9,<11",
+  "opencv-python>=4.9,<5",
+  "pytesseract>=0.3.10,<1",
+  "ultralytics>=8.2,<9",
+]
+
+[project.scripts]
+evo-capture = "evo_helper.tools.capture:main"
+evo-dataset = "evo_helper.tools.dataset:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evo_helper"]

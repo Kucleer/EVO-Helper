@@ -1,0 +1,1 @@
+"""Shared vision fixture helpers."""
