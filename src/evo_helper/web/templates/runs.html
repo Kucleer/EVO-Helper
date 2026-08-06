@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<h2>Start a run</h2>
+<form data-api="/api/runs/start">
+  <p>
+    <label>Plan
+      <select name="plan_id" required>
+        {% for plan in plans %}<option value="{{ plan.id }}">{{ plan.name }}</option>{% endfor %}
+      </select>
+    </label>
+  </p>
+  <p>
+    <label>Idempotency key <input name="idempotency_key" id="idem-key" minlength="8" required></label>
+    <button type="button" onclick="document.getElementById('idem-key').value = crypto.randomUUID()">Generate</button>
+  </p>
+  <button type="submit">Start run</button>
+</form>
+<h2>Recent runs</h2>
+<table>
+  <thead><tr><th>Run</th><th>Plan</th><th>State</th><th>Target date</th><th>Created (UTC)</th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{ run.run_id }}">{{ run.run_id }}</a></td>
+      <td>{{ run.plan_id }}</td>
+      <td>{{ run.state }}</td>
+      <td>{{ run.target_date }}</td>
+      <td>{{ run.created_at }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No runs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

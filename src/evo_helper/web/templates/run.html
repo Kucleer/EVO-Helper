@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.run_id }}{% endblock %}
+{% block content %}
+<h1>Run status</h1>
+<p><a href="/runs">Back to runs</a></p>
+<table>
+  <tr><th>Run ID</th><td>{{ run.run_id }}</td></tr>
+  <tr><th>Plan ID</th><td>{{ run.plan_id }}</td></tr>
+  <tr><th>State</th><td>{{ run.state }}</td></tr>
+  <tr><th>Idempotency key</th><td>{{ run.idempotency_key }}</td></tr>
+  <tr><th>Target date</th><td>{{ run.target_date }}</td></tr>
+  <tr><th>Created (UTC)</th><td>{{ run.created_at }}</td></tr>
+  <tr><th>Started (UTC)</th><td>{{ run.started_at or "pending" }}</td></tr>
+  <tr><th>Finished (UTC)</th><td>{{ run.finished_at or "pending" }}</td></tr>
+</table>
+<form class="inline" data-api="/api/runs/{{ run.run_id }}/pause">
+  <button type="submit">Pause</button>
+</form>
+<form class="inline" data-api="/api/runs/{{ run.run_id }}/resume">
+  <button type="submit">Resume</button>
+</form>
+<form class="inline" data-api="/api/runs/{{ run.run_id }}/emergency-stop">
+  <button type="submit" class="danger">Emergency stop</button>
+</form>
+{% endblock %}
