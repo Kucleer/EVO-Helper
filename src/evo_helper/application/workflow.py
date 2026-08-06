@@ -77,6 +77,15 @@ class ScanOutcome:
     intent_id: UUID | None = None
 
 
+@dataclass(frozen=True)
+class ReportDrainOutcome:
+    """The result of a report-only draining pass."""
+
+    status: str
+    report_count: int = 0
+    detail: str | None = None
+
+
 class IntegrationWorkflow:
     """Run one safe scan step or drain parsed reports.
 
@@ -230,15 +239,21 @@ class IntegrationWorkflow:
 
     def drain_reports(self, run_id: UUID, reports: Iterable[BattleReport]) -> int:
         """Append reports only; draining cannot scan or initiate new dispatches."""
+        return self.drain_reports_outcome(run_id, reports).report_count
+
+    def drain_reports_outcome(
+        self, run_id: UUID, reports: Iterable[BattleReport]
+    ) -> ReportDrainOutcome:
+        """Drain reports with an explicit, fail-closed outcome for the runner."""
         if not self._game.open_battle_reports().success:
-            self._safety_pause(run_id, None, "could not open battle reports")
-            return 0
+            self._append_event(run_id, "safety_paused", "DRAINING", "PAUSED")
+            return ReportDrainOutcome("SAFETY_PAUSED", detail="could not open battle reports")
         count = 0
         for report in reports:
             self._repository.append_report(report)
             count += 1
         self._append_event(run_id, "reports_drained", "DRAINING", "COMPLETED")
-        return count
+        return ReportDrainOutcome("COMPLETED", report_count=count)
 
     def _safety_pause(
         self,
