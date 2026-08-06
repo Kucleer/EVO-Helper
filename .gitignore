@@ -1,0 +1,55 @@
+# Runtime and generated data
+/var/
+*.db
+*.sqlite3
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Credentials and browser state
+.env
+.env.*
+!.env.example
+cookies.json
+tokens.json
+
+# Raw evidence, model weights, and locally sourced legacy fixtures
+/datasets/raw/
+/datasets/processed/
+/datasets/fixtures/legacy-source/
+/models/*.pt
+/models/*.onnx
+/models/*.pth
+
+# IDE / platform
+.idea/
+.vscode/
+Thumbs.db
+
+# Legacy workspace content retained only until environment-authorized removal.
+/.claude/
+/.codex-remote-attachments/
+/data/
+/debug/
+/image/
+/templates/
+/__pycache__/
+/CLAUDE.md
+/config.py
+/config_gui.py
+/evo-daily-log.html
+/evo-monitor.user.js
+/EVO-每日探索记录.html
+/EVO-账号记录.md
+/evo_bot.py
+/expedition-reports.html
+/expedition_reports.py
+/grab_template.py
+/planet_snapshot.py
+/planet_snapshot_html.py
+/requirements.txt
+/click research.png

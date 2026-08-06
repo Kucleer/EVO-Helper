@@ -1,0 +1,50 @@
+﻿{
+    "batch":  "legacy-source-20260806",
+    "captured_at_utc":  "unknown-legacy-source",
+    "sample_count":  6,
+    "notes":  "Externally archived legacy references. They are ignored by Git and must not become current mail-list training or regression fixtures without review.",
+    "samples":  [
+                    {
+                        "file":  "click-research.png",
+                        "bytes":  1188115,
+                        "sha256":  "a49ac6b4fb25f651bf669aa97d9c8e93813da4c3e9e491e53e628efa7e034252",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    },
+                    {
+                        "file":  "photo-1.jpg",
+                        "bytes":  79901,
+                        "sha256":  "2414803c6056424c30afad90453852ff3b95b50d5fa71dc3a259ff64de0397db",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    },
+                    {
+                        "file":  "photo-2.jpg",
+                        "bytes":  88460,
+                        "sha256":  "63aa1661582b8aa87f87fb90755a5d8b8c5ea5bbf5b9d24d1a54184a1db59db8",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    },
+                    {
+                        "file":  "photo-3.jpg",
+                        "bytes":  86058,
+                        "sha256":  "42f012f7adf4f2ed8fc8bf25c4e2d59a6549661e6a4202dcf97169557db00f63",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    },
+                    {
+                        "file":  "photo-4.jpg",
+                        "bytes":  78503,
+                        "sha256":  "dca631c769d044a506881a9f865fdd5805c7177158b6a44d6c6bc51cf19bc4d1",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    },
+                    {
+                        "file":  "photo-5.jpg",
+                        "bytes":  81023,
+                        "sha256":  "f523c06ed71d8719d2743375f2792959e41a8c9ee41159e45f6fa5133788b491",
+                        "is_legacy":  true,
+                        "eligible_for_current_mail_baseline":  false
+                    }
+                ]
+}
