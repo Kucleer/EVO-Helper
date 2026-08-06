@@ -21,6 +21,7 @@ class ScanRangeIn(BaseModel):
     end: CoordinateModel
     origin: CoordinateModel
     fleet_preset: str = Field(min_length=1, max_length=64)
+    fleet_preset_signature: str = Field(min_length=1, max_length=255)
     priority: int = Field(default=0, ge=0, le=100)
 
 

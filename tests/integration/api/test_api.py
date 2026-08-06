@@ -30,6 +30,7 @@ def _create_plan(client: TestClient) -> str:
                 "end": {"galaxy": 1, "system": 1, "position": 20},
                 "origin": {"galaxy": 1, "system": 1, "position": 1},
                 "fleet_preset": "main-fleet",
+                "fleet_preset_signature": "main-fleet-v1",
                 "priority": 0,
             }
         ],
@@ -184,6 +185,29 @@ def test_validation_errors_are_422() -> None:
         "/api/plans",
         headers=_headers(),
         json={"name": "x", "window_start": "25:00", "window_end": "20:00", "ranges": []},
+    )
+
+    assert response.status_code == 422
+
+
+def test_plan_requires_a_preset_signature() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "missing-signature",
+            "window_start": "08:00",
+            "window_end": "20:00",
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 1, "position": 1},
+                    "end": {"galaxy": 1, "system": 1, "position": 2},
+                    "origin": {"galaxy": 1, "system": 1, "position": 1},
+                    "fleet_preset": "main-fleet",
+                }
+            ],
+        },
     )
 
     assert response.status_code == 422
