@@ -56,6 +56,7 @@ class ArtifactPayload:
 
 @dataclass(frozen=True)
 class ArtifactRef:
+    artifact_id: UUID
     path: str
     sha256: str
 
