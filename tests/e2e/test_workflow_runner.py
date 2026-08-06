@@ -11,6 +11,7 @@ from evo_helper.application.runner import WorkflowRunner
 from evo_helper.application.workflow import IntegrationWorkflow, TargetRecognition
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef, RunState
+from evo_helper.domain.ports import ReportNavigationResult
 from evo_helper.game.action_guard import ActionGuard
 from evo_helper.game.capacity import LineCapacityGate
 from evo_helper.game.coordinator import DispatchCoordinator
@@ -56,6 +57,44 @@ def test_runner_persists_waiting_and_draining_states(tmp_path: Path) -> None:
     assert repository.run_state(run_id) is RunState.SCANNING
     assert runner.scan_once(run_id).status == "DRAINING"
     assert repository.run_state(run_id) is RunState.DRAINING
+    assert runner.drain_reports(run_id, []).status == "COMPLETED"
+    assert repository.run_state(run_id) is RunState.COMPLETED
+    assert "capacity_recheck_started" in {
+        event.event for event in repository.state_events_for("run", run_id)
+    }
+
+
+def test_runner_pauses_when_battle_reports_cannot_be_opened(tmp_path: Path) -> None:
+    database_path = tmp_path / "runner-reports.db"
+    run_id, repository, sessions = _seed(database_path)
+    game = BrokenReportsGame()
+    game.register_preset(PRESET)
+    workflow = IntegrationWorkflow(
+        repository,
+        game,
+        Reader(),
+        DatabaseBindingResolver(sessions, run_id),
+        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(1)),
+        dry_run=True,
+        now_utc=lambda: NOW,
+    )
+    runner = WorkflowRunner(workflow, repository)
+
+    assert runner.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert runner.scan_once(run_id).status == "DRAINING"
+    assert runner.drain_reports(run_id, []).status == "SAFETY_PAUSED"
+    assert repository.run_state(run_id) is RunState.PAUSED
+    safety_events = [
+        event
+        for event in repository.state_events_for("run", run_id)
+        if event.event == "safety_paused"
+    ]
+    assert safety_events[-1].before_state == "DRAINING"
+
+
+class BrokenReportsGame(SimulatedGameAdapter):
+    def open_battle_reports(self) -> ReportNavigationResult:
+        return ReportNavigationResult(success=False)
 
 
 def _seed(
