@@ -1,0 +1,189 @@
+from datetime import UTC, datetime
+
+from fastapi.testclient import TestClient
+
+from evo_helper.domain.models import Coordinate
+from evo_helper.web.app import create_app
+from evo_helper.web.service import FakeApplicationService, FleetEntryView
+
+
+def _make_client() -> tuple[TestClient, FakeApplicationService]:
+    clock = FakeApplicationService(now_utc=lambda: datetime(2026, 8, 6, 1, 0, tzinfo=UTC))
+    app = create_app(service=clock, local_token="test-token")
+    return TestClient(app), clock
+
+
+def _headers() -> dict[str, str]:
+    return {"X-Evo-Helper-Token": "test-token"}
+
+
+def _create_plan(client: TestClient) -> str:
+    payload = {
+        "name": "daily-scan",
+        "enabled": True,
+        "window_start": "08:00",
+        "window_end": "20:00",
+        "dry_run": True,
+        "ranges": [
+            {
+                "start": {"galaxy": 1, "system": 1, "position": 1},
+                "end": {"galaxy": 1, "system": 1, "position": 20},
+                "origin": {"galaxy": 1, "system": 1, "position": 1},
+                "fleet_preset": "main-fleet",
+                "priority": 0,
+            }
+        ],
+    }
+    response = client.post("/api/plans", headers=_headers(), json=payload)
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def test_plan_crud_flow() -> None:
+    client, _ = _make_client()
+
+    plan_id = _create_plan(client)
+    assert client.get("/api/plans").json()[0]["name"] == "daily-scan"
+    assert client.get(f"/api/plans/{plan_id}").json()["dry_run"] is True
+
+    updated = client.put(
+        f"/api/plans/{plan_id}",
+        headers=_headers(),
+        json={"name": "renamed-scan", "enabled": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "renamed-scan"
+
+    deleted = client.delete(f"/api/plans/{plan_id}", headers=_headers())
+    assert deleted.status_code == 204
+    assert client.get(f"/api/plans/{plan_id}").status_code == 404
+
+
+def test_run_lifecycle_and_idempotency() -> None:
+    client, _ = _make_client()
+    plan_id = _create_plan(client)
+
+    started = client.post(
+        "/api/runs/start",
+        headers=_headers(),
+        json={"plan_id": plan_id, "idempotency_key": "run-key-0001"},
+    )
+    assert started.status_code == 201
+    assert started.json()["state"] == "SCANNING"
+    run_id = started.json()["run_id"]
+
+    duplicate = client.post(
+        "/api/runs/start",
+        headers=_headers(),
+        json={"plan_id": plan_id, "idempotency_key": "run-key-0001"},
+    )
+    assert duplicate.status_code == 409
+
+    paused = client.post(f"/api/runs/{run_id}/pause", headers=_headers())
+    assert paused.json()["state"] == "PAUSED"
+
+    resumed = client.post(f"/api/runs/{run_id}/resume", headers=_headers())
+    assert resumed.json()["state"] == "ARMED"
+
+    stopped = client.post(f"/api/runs/{run_id}/emergency-stop", headers=_headers())
+    assert stopped.json()["state"] == "EMERGENCY_STOPPED"
+
+    invalid = client.post(f"/api/runs/{run_id}/pause", headers=_headers())
+    assert invalid.status_code == 409
+
+
+def test_targets_history_and_diff() -> None:
+    client, clock = _make_client()
+    coordinate = Coordinate(4, 5, 6)
+    clock.add_snapshot(
+        coordinate,
+        "attacker",
+        (FleetEntryView("destroyer", 10),),
+        captured_at_utc=datetime(2026, 8, 6, 1, 0, tzinfo=UTC),
+    )
+    clock.add_snapshot(
+        coordinate,
+        "attacker",
+        (FleetEntryView("destroyer", 8), FleetEntryView("cruiser", 3)),
+        captured_at_utc=datetime(2026, 8, 6, 2, 0, tzinfo=UTC),
+    )
+
+    targets = client.get("/api/targets").json()
+    assert len(targets) == 1
+    assert targets[0]["coordinate"]["galaxy"] == 4
+
+    history = client.get("/api/targets/4:5:6/history")
+    assert history.status_code == 200
+    assert len(history.json()) == 2
+
+    diff = client.get("/api/targets/4:5:6/diff")
+    assert diff.status_code == 200
+    body = diff.json()
+    assert body["total_before"] == 10
+    assert body["total_after"] == 11
+    assert "cruiser" in body["first_seen"]
+
+
+def test_revisit_and_events() -> None:
+    client, _ = _make_client()
+
+    created = client.post(
+        "/api/revisits",
+        headers=_headers(),
+        json={
+            "scope": "target",
+            "reason": "confirm ownership",
+            "target_coordinate": {"galaxy": 1, "system": 2, "position": 3},
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["target_coordinate"]["position"] == 3
+
+    revisits = client.get("/api/revisits").json()
+    assert len(revisits) == 1
+    events = client.get("/api/diagnostics/events").json()
+    assert isinstance(events, list)
+
+
+def test_pages_render() -> None:
+    client, _ = _make_client()
+    _create_plan(client)
+
+    for path in ("/", "/plans", "/runs", "/diagnostics"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+
+
+def test_target_history_page_renders() -> None:
+    client, clock = _make_client()
+    coordinate = Coordinate(7, 8, 9)
+    clock.add_snapshot(
+        coordinate,
+        "attacker",
+        (FleetEntryView("destroyer", 5),),
+        captured_at_utc=datetime(2026, 8, 6, 1, 0, tzinfo=UTC),
+    )
+    clock.add_snapshot(
+        coordinate,
+        "attacker",
+        (FleetEntryView("destroyer", 6),),
+        captured_at_utc=datetime(2026, 8, 6, 2, 0, tzinfo=UTC),
+    )
+
+    for path in ("/targets", "/targets/7:8:9"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+
+
+def test_validation_errors_are_422() -> None:
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={"name": "x", "window_start": "25:00", "window_end": "20:00", "ranges": []},
+    )
+
+    assert response.status_code == 422

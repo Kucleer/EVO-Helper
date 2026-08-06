@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Scan Plans{% endblock %}
+{% block content %}
+<h1>Scan Plans</h1>
+<h2>Create plan</h2>
+<form data-api="/api/plans">
+  <p><label>Name <input name="name" required></label></p>
+  <p>
+    <label>Window start <input name="window_start" value="08:00" required></label>
+    <label>Window end <input name="window_end" value="20:00" required></label>
+    <label><input type="checkbox" name="enabled" checked> Enabled</label>
+    <label><input type="checkbox" name="dry_run" checked> Dry run</label>
+  </p>
+  <fieldset>
+    <legend>Range</legend>
+    <p>
+      <label>Start <input name="ranges.0.start.galaxy" type="number" min="1" value="1" required>:
+      <input name="ranges.0.start.system" type="number" min="1" value="1" required>:
+      <input name="ranges.0.start.position" type="number" min="1" value="1" required></label>
+    </p>
+    <p>
+      <label>End <input name="ranges.0.end.galaxy" type="number" min="1" value="1" required>:
+      <input name="ranges.0.end.system" type="number" min="1" value="2" required>:
+      <input name="ranges.0.end.position" type="number" min="1" value="20" required></label>
+    </p>
+    <p>
+      <label>Origin <input name="ranges.0.origin.galaxy" type="number" min="1" value="1" required>:
+      <input name="ranges.0.origin.system" type="number" min="1" value="1" required>:
+      <input name="ranges.0.origin.position" type="number" min="1" value="1" required></label>
+    </p>
+    <p>
+      <label>Fleet preset <input name="ranges.0.fleet_preset" value="main-fleet" required></label>
+      <label>Priority <input name="ranges.0.priority" type="number" min="0" max="100" value="0"></label>
+    </p>
+  </fieldset>
+  <button type="submit">Create plan</button>
+</form>
+<h2>Existing plans</h2>
+<table>
+  <thead><tr><th>Name</th><th>Window</th><th>Enabled</th><th>Dry run</th><th>Ranges</th></tr></thead>
+  <tbody>
+  {% for plan in plans %}
+    <tr>
+      <td>{{ plan.name }}</td>
+      <td>{{ plan.window_start }} - {{ plan.window_end }} (UTC+8)</td>
+      <td>{{ plan.enabled }}</td>
+      <td>{{ plan.dry_run }}</td>
+      <td>{{ plan.ranges|length }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No plans yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
