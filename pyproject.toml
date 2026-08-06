@@ -13,12 +13,12 @@ dependencies = [
   "uvicorn>=0.30,<1",
   "pydantic-settings>=2.4,<3",
   "sqlalchemy>=2.0,<3",
+  "alembic>=1.13,<2",
   "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "alembic>=1.13,<2",
   "httpx>=0.27,<1",
   "mypy>=1.11,<2",
   "pytest>=8.3,<9",
@@ -34,6 +34,7 @@ vision = [
 [project.scripts]
 evo-capture = "evo_helper.tools.capture:main"
 evo-dataset = "evo_helper.tools.dataset:main"
+evo-web = "evo_helper.web.runtime:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evo_helper"]
