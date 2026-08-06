@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, inspect, text
+
+from evo_helper.config import Settings
+from evo_helper.web.runtime import create_runtime_app
+
+
+def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'runtime.db'}"
+    app = create_runtime_app(Settings(database_url=database_url), local_token="runtime-token")
+    client = TestClient(app)
+    response = client.post(
+        "/api/plans",
+        headers={"X-Evo-Helper-Token": "runtime-token"},
+        json={
+            "name": "runtime-plan",
+            "window_start": "08:00",
+            "window_end": "20:00",
+            "dry_run": True,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 1, "position": 1},
+                    "end": {"galaxy": 1, "system": 1, "position": 2},
+                    "origin": {"galaxy": 1, "system": 1, "position": 1},
+                    "fleet_preset": "fleet-a",
+                    "fleet_preset_signature": "fleet-a-signature",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201
+
+    engine = create_engine(database_url)
+    assert {"public_id", "updated_at_utc"} <= {
+        column["name"] for column in inspect(engine).get_columns("scan_plans")
+    }
+    assert engine.connect().execute(text("SELECT version_num FROM alembic_version")).scalar_one()

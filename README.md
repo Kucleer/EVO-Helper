@@ -20,5 +20,13 @@ ruff format --check src tests
 mypy src
 ```
 
+Run the persistent local management service after installing dependencies:
+
+```powershell
+evo-web
+```
+
+Startup applies the bundled SQLite migrations and binds only to `127.0.0.1`.
+
 The future web service must bind only to `127.0.0.1`. Opening the UI never starts a run; each run
 requires an explicit, idempotent user action.
