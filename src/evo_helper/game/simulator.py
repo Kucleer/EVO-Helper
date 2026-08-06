@@ -48,7 +48,7 @@ class SimulatedGameAdapter:
             return PresetObservation(name=preset.name, signature="", confidence=0.0)
         return PresetObservation(name=preset.name, signature=signature, confidence=1.0)
 
-    def dispatch_attack(self, command: DispatchCommand) -> object:
+    def dispatch_attack(self, command: DispatchCommand) -> DispatchResult:
         self._dispatches.append(command)
         if self.dry_run:
             return DispatchResult(accepted=True, dry_run=True)

@@ -417,6 +417,8 @@ def _unmatched_dispatch_candidates(
             orm.AttackIntentRow.target_galaxy == report.defender_target.galaxy,
             orm.AttackIntentRow.target_system == report.defender_target.system,
             orm.AttackIntentRow.target_position == report.defender_target.position,
+            orm.AttackDispatchRow.accepted.is_(True),
+            orm.AttackDispatchRow.dry_run.is_(False),
             orm.AttackDispatchRow.id.not_in(linked),
         )
         .order_by(orm.AttackDispatchRow.dispatched_at_utc)

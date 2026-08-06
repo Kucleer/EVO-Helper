@@ -256,7 +256,7 @@ def test_report_strict_matching_closes_dispatch_once(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=True,
+            dry_run=False,
             accepted=True,
         )
     )
@@ -303,12 +303,39 @@ def test_report_outside_time_tolerance_is_unmatched(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=True,
+            dry_run=False,
             accepted=True,
         )
     )
 
     repository.append_report(_report(reported_at=dispatched_at + timedelta(hours=13)))
+
+    with session_factory() as session:
+        report = session.scalar(select(BattleReportRow))
+    assert report is not None
+    assert report.match_status == "UNMATCHED"
+    assert report.dispatch_id is None
+
+
+def test_report_never_matches_a_dry_run_dispatch(
+    session_factory,
+    repository,
+) -> None:
+    _plan_id, run_id = _seed_run(session_factory)
+    intent = _intent(run_id)
+    repository.save_attack_intent(intent)
+    dispatched_at = datetime(2026, 8, 6, 1, 0, tzinfo=UTC)
+    repository.save_dispatch(
+        AttackDispatch(
+            dispatch_id=uuid4(),
+            intent_id=intent.intent_id,
+            dispatched_at_utc=dispatched_at,
+            dry_run=True,
+            accepted=False,
+        )
+    )
+
+    repository.append_report(_report(reported_at=dispatched_at + timedelta(minutes=5)))
 
     with session_factory() as session:
         report = session.scalar(select(BattleReportRow))
@@ -330,7 +357,7 @@ def test_fleet_diff_computes_statuses_and_first_seen(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=True,
+            dry_run=False,
             accepted=True,
         )
     )
