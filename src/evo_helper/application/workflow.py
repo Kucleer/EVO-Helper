@@ -61,6 +61,7 @@ class BindingResolver(Protocol):
 
 class WorkflowRepository(Protocol):
     def claim_next_coordinate(self, run_id: UUID) -> CoordinateClaim | None: ...
+    def complete_coordinate(self, run_id: UUID, coordinate: Coordinate) -> None: ...
     def save_scan(self, scan: object) -> None: ...
     def save_attack_intent(self, intent: object) -> None: ...
     def save_dispatch(self, dispatch: object) -> None: ...
@@ -143,6 +144,7 @@ class IntegrationWorkflow:
             )
         )
         if not recognition.is_bot:
+            self._repository.complete_coordinate(run_id, coordinate)
             return ScanOutcome("SCANNED_NON_BOT", coordinate)
 
         binding = self._bindings.for_target(coordinate)
@@ -203,6 +205,7 @@ class IntegrationWorkflow:
                 )
             )
             self._append_event(run_id, "dry_run_dispatch_recorded", "SCANNING", "SCANNING")
+            self._repository.complete_coordinate(run_id, coordinate)
             return ScanOutcome("DRY_RUN_RECORDED", coordinate, intent_id=intent.intent_id)
         if not plan.dispatchable or plan.guard.token is None:
             return self._safety_pause(run_id, coordinate, plan.guard.reason, intent.intent_id)
@@ -221,6 +224,8 @@ class IntegrationWorkflow:
                 accepted=result.accepted,
             )
         )
+        if result.accepted:
+            self._repository.complete_coordinate(run_id, coordinate)
         return ScanOutcome("DISPATCHED" if result.accepted else "DISPATCH_REJECTED", coordinate)
 
     def drain_reports(self, run_id: UUID, reports: Iterable[BattleReport]) -> int:

@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.coordinates import POSITION_LIMIT, next_coordinate_after
-from evo_helper.domain.models import Coordinate
+from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
     AttackDispatch,
@@ -22,6 +22,7 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
+from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
 
@@ -47,6 +48,9 @@ class SqlAlchemyRepository:
             run = session.get(orm.RunInstance, run_id)
             if run is None:
                 raise ValueError(f"unknown run instance: {run_id}")
+            pending = _pending_from_run(run)
+            if pending is not None:
+                return CoordinateClaim(coordinate=pending)
             cursor = _cursor_from_run(run)
             ranges = session.scalars(
                 select(orm.ScanRangeRow)
@@ -69,10 +73,44 @@ class SqlAlchemyRepository:
                     next_coordinate = next_coordinate_after(cursor, end, POSITION_LIMIT)
                 if next_coordinate is None:
                     continue
-                _set_run_cursor(run, next_coordinate)
+                _set_run_pending(run, next_coordinate)
                 session.commit()
                 return CoordinateClaim(coordinate=next_coordinate)
             return None
+
+    def complete_coordinate(self, run_id: UUID, coordinate: Coordinate) -> None:
+        """Commit a claimed coordinate only after its workflow step completed."""
+        with self._session_factory() as session:
+            run = session.get(orm.RunInstance, run_id)
+            if run is None:
+                raise ValueError(f"unknown run instance: {run_id}")
+            if _pending_from_run(run) != coordinate:
+                raise StorageConflictError(
+                    "cannot complete a coordinate that is not currently pending"
+                )
+            _set_run_cursor(run, coordinate)
+            _clear_run_pending(run)
+            session.commit()
+
+    def run_state(self, run_id: UUID) -> RunState:
+        with self._session_factory() as session:
+            run = session.get(orm.RunInstance, run_id)
+            if run is None:
+                raise ValueError(f"unknown run instance: {run_id}")
+            return RunState(run.state)
+
+    def set_run_state(self, run_id: UUID, target: RunState) -> None:
+        """Persist a transition whose audit event was just appended by the workflow."""
+        with self._session_factory() as session:
+            run = session.get(orm.RunInstance, run_id)
+            if run is None:
+                raise ValueError(f"unknown run instance: {run_id}")
+            current = RunState(run.state)
+            require_transition(current, target)
+            run.state = target.value
+            if target in {RunState.COMPLETED, RunState.EMERGENCY_STOPPED}:
+                run.finished_at_utc = datetime.now(run.created_at_utc.tzinfo)
+            session.commit()
 
     def save_scan(self, scan: object) -> None:
         record = _require_type(scan, CoordinateScan, "scan")
@@ -380,6 +418,24 @@ def _set_run_cursor(run: orm.RunInstance, coordinate: Coordinate) -> None:
     run.cursor_galaxy = coordinate.galaxy
     run.cursor_system = coordinate.system
     run.cursor_position = coordinate.position
+
+
+def _pending_from_run(run: orm.RunInstance) -> Coordinate | None:
+    if run.pending_galaxy is None or run.pending_system is None or run.pending_position is None:
+        return None
+    return Coordinate(run.pending_galaxy, run.pending_system, run.pending_position)
+
+
+def _set_run_pending(run: orm.RunInstance, coordinate: Coordinate) -> None:
+    run.pending_galaxy = coordinate.galaxy
+    run.pending_system = coordinate.system
+    run.pending_position = coordinate.position
+
+
+def _clear_run_pending(run: orm.RunInstance) -> None:
+    run.pending_galaxy = None
+    run.pending_system = None
+    run.pending_position = None
 
 
 def _range_start(row: orm.ScanRangeRow) -> Coordinate:
