@@ -43,6 +43,12 @@ def test_parse_mail_list_refuses_unknown_version() -> None:
         parse_mail_list(page, MAIL_OCR, "ocr")
 
 
+def test_parse_mail_list_refuses_legacy_version() -> None:
+    page = PageObservation(screen="mail_list", ui_version="mail-list-v1", confidence=0.99)
+    with pytest.raises(UnknownUiVersionError, match="mail-list-v1"):
+        parse_mail_list(page, MAIL_OCR, "ocr")
+
+
 def test_parse_battle_detail_matches_both_sides() -> None:
     page = PageObservation(
         screen="battle_detail",

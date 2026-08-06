@@ -15,6 +15,12 @@ from evo_helper.datasets.manifest import compute_sha256
 
 @dataclass(frozen=True)
 class CapturedImage:
+    """A capture record that is directly consumable by ``DatasetManifest``."""
+
+    file: str
+    bytes: int
+    is_legacy: bool
+    eligible_for_current_mail_baseline: bool
     artifact_id: str
     captured_at_utc: str
     session_id: str
@@ -23,7 +29,6 @@ class CapturedImage:
     ui_version: str
     viewport: dict[str, object]
     sha256: str
-    path: str
 
 
 class CapturePlatform(Protocol):
@@ -63,6 +68,7 @@ def build_manifest(entries: list[CapturedImage]) -> dict[str, object]:
         "batch": entries[0].batch if entries else "empty",
         "captured_at_utc": datetime.now(UTC).isoformat(),
         "sample_count": len(entries),
+        "notes": "Captured by evo_helper.tools.capture; baseline eligibility is explicit.",
         "samples": [asdict(entry) for entry in entries],
     }
 
@@ -76,7 +82,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--screen", default="mail_list")
     parser.add_argument("--ui-version", default="mail-list-v2")
     parser.add_argument("--session-id", default=None)
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="mark captures as archival-only and ineligible for the current mail baseline",
+    )
+    parser.add_argument(
+        "--eligible-for-current-mail-baseline",
+        action="store_true",
+        help="explicitly allow non-legacy mail-list captures into the current baseline",
+    )
     args = parser.parse_args(argv)
+    if args.legacy and args.eligible_for_current_mail_baseline:
+        parser.error("legacy captures cannot be eligible for the current mail baseline")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -90,6 +108,10 @@ def main(argv: list[str] | None = None) -> int:
         platform.grab(path)
         entries.append(
             CapturedImage(
+                file=filename,
+                bytes=path.stat().st_size,
+                is_legacy=args.legacy,
+                eligible_for_current_mail_baseline=args.eligible_for_current_mail_baseline,
                 artifact_id=str(uuid4()),
                 captured_at_utc=datetime.now(UTC).isoformat(),
                 session_id=session_id,
@@ -98,7 +120,6 @@ def main(argv: list[str] | None = None) -> int:
                 ui_version=args.ui_version,
                 viewport={"width": 1920, "height": 1080, "scale": 1.0},
                 sha256=compute_sha256(path),
-                path=str(path),
             )
         )
     manifest_path = out / f"{args.batch}-manifest.json"
