@@ -49,6 +49,11 @@ before final dispatch; `ActionGuard` remains the sole final-action gate.
    Validate live batches with `validate_capture_manifest`, which also requires
    artifact id, capture time, screen, UI version, viewport, source, and a
    matching batch value for every sample.
+   The equivalent command-line check is:
+
+   ```powershell
+   evo-dataset validate <manifest> --base-dir <capture-directory> --capture-evidence
+   ```
 5. Mark the old 7/21 mail list as `is_legacy=true`; it is archival only and
    cannot be eligible for the current-mail baseline.
 6. Use the newly captured mail-list session, not legacy mail images, for parser
