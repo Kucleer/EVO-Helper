@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -12,6 +12,7 @@ from evo_helper.application.workflow import IntegrationWorkflow, TargetRecogniti
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef, RunState
 from evo_helper.domain.ports import ReportNavigationResult
+from evo_helper.domain.records import BattleReport, FleetSnapshotEntry
 from evo_helper.game.action_guard import ActionGuard
 from evo_helper.game.capacity import LineCapacityGate
 from evo_helper.game.coordinator import DispatchCoordinator
@@ -90,6 +91,42 @@ def test_runner_pauses_when_battle_reports_cannot_be_opened(tmp_path: Path) -> N
         if event.event == "safety_paused"
     ]
     assert safety_events[-1].before_state == "DRAINING"
+
+
+def test_runner_persists_drained_report_before_completing(tmp_path: Path) -> None:
+    database_path = tmp_path / "runner-report-history.db"
+    run_id, repository, sessions = _seed(database_path)
+    game = SimulatedGameAdapter()
+    game.register_preset(PRESET)
+    workflow = IntegrationWorkflow(
+        repository,
+        game,
+        Reader(),
+        DatabaseBindingResolver(sessions, run_id),
+        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(1)),
+        dry_run=True,
+        now_utc=lambda: NOW,
+    )
+    runner = WorkflowRunner(workflow, repository)
+    report = BattleReport(
+        report_id=uuid4(),
+        reported_at_utc=NOW,
+        attacker_origin=ORIGIN,
+        defender_target=TARGET,
+        fleet=(FleetSnapshotEntry("defender", "fighter", 9),),
+    )
+
+    assert runner.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert runner.scan_once(run_id).status == "DRAINING"
+    outcome = runner.drain_reports(run_id, [report])
+
+    assert outcome.status == "COMPLETED"
+    assert outcome.report_count == 1
+    assert repository.run_state(run_id) is RunState.COMPLETED
+    history = repository.history_for_coordinate(TARGET)
+    assert [(entry.report_id, entry.ship_type, entry.count) for entry in history] == [
+        (report.report_id, "fighter", 9)
+    ]
 
 
 class BrokenReportsGame(SimulatedGameAdapter):
