@@ -38,6 +38,9 @@ class MemoryRepository:
     def claim_next_coordinate(self, _run_id: UUID) -> CoordinateClaim | None:
         return CoordinateClaim(self.remaining.popleft()) if self.remaining else None
 
+    def complete_coordinate(self, _run_id: UUID, _coordinate: Coordinate) -> None:
+        return None
+
     def save_scan(self, scan: object) -> None:
         self.scans.append(scan)
 

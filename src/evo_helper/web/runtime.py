@@ -41,4 +41,5 @@ def _upgrade_database(database_url: str) -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     config.set_main_option("sqlalchemy.url", database_url)
+    config.attributes["database_url"] = database_url
     command.upgrade(config, "head")

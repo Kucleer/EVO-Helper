@@ -147,7 +147,12 @@ def test_claim_next_coordinate_walks_ranges_in_priority_order(
         ),
     )
 
-    claims = [repository.claim_next_coordinate(run_id) for _ in range(5)]
+    claims = []
+    for _ in range(3):
+        claim = repository.claim_next_coordinate(run_id)
+        assert claim is not None
+        claims.append(claim)
+        repository.complete_coordinate(run_id, claim.coordinate)
 
     assert [claim.coordinate for claim in claims if claim is not None] == [
         Coordinate(1, 1, 1),
@@ -155,6 +160,20 @@ def test_claim_next_coordinate_walks_ranges_in_priority_order(
         Coordinate(1, 1, 5),
     ]
     assert repository.claim_next_coordinate(run_id) is None
+
+
+def test_pending_coordinate_is_retried_until_completed(session_factory, repository) -> None:
+    _plan_id, run_id = _seed_run(session_factory)
+
+    first = repository.claim_next_coordinate(run_id)
+    second = repository.claim_next_coordinate(run_id)
+
+    assert first is not None and second is not None
+    assert second.coordinate == first.coordinate
+    repository.complete_coordinate(run_id, first.coordinate)
+    advanced = repository.claim_next_coordinate(run_id)
+    assert advanced is not None
+    assert advanced.coordinate > first.coordinate
 
 
 def test_claim_unknown_run_raises(repository) -> None:
