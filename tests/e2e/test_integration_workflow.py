@@ -12,7 +12,7 @@ from evo_helper.application.workflow import (
 )
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef
-from evo_helper.domain.ports import CoordinateClaim
+from evo_helper.domain.ports import CoordinateClaim, ScreenObservation
 from evo_helper.domain.records import BattleReport, FleetSnapshotEntry
 from evo_helper.game.action_guard import ActionGuard
 from evo_helper.game.capacity import LineCapacityGate
@@ -65,7 +65,12 @@ class Bindings:
         return AttackBinding(ORIGIN, PRESET) if coordinate == BOT else None
 
 
-def _workflow(repository: MemoryRepository, game: SimulatedGameAdapter) -> IntegrationWorkflow:
+def _workflow(
+    repository: MemoryRepository,
+    game: SimulatedGameAdapter,
+    *,
+    game_feedback_slots: int | None = None,
+) -> IntegrationWorkflow:
     coordinator = DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(user_limit=3))
     return IntegrationWorkflow(
         repository,
@@ -75,6 +80,7 @@ def _workflow(repository: MemoryRepository, game: SimulatedGameAdapter) -> Integ
         coordinator,
         dry_run=True,
         now_utc=lambda: NOW,
+        game_feedback_slots=lambda: game_feedback_slots,
     )
 
 
@@ -114,3 +120,34 @@ def test_new_workflow_instance_resumes_from_repository_cursor() -> None:
     assert _workflow(repository, game).scan_once(run_id).coordinate == BOT
     assert _workflow(repository, game).scan_once(run_id).coordinate == NON_BOT
     assert len(repository.scans) == 2
+
+
+def test_unknown_attack_ui_pauses_before_recording_an_intent() -> None:
+    class UnknownUiGame(SimulatedGameAdapter):
+        def observe(self) -> ScreenObservation:
+            return ScreenObservation("attack", None, 1.0)
+
+    repository = MemoryRepository(deque([BOT]))
+    game = UnknownUiGame()
+    game.register_preset(PRESET)
+
+    outcome = _workflow(repository, game).scan_once(uuid4())
+
+    assert outcome.status == "SAFETY_PAUSED"
+    assert repository.intents == []
+    assert repository.dispatches == []
+    assert game.dispatched == ()
+
+
+def test_full_capacity_waits_before_recording_a_dry_run_dispatch() -> None:
+    repository = MemoryRepository(deque([BOT]))
+    game = SimulatedGameAdapter()
+    game.register_preset(PRESET)
+
+    outcome = _workflow(repository, game, game_feedback_slots=0).scan_once(uuid4())
+
+    assert outcome.status == "WAITING_CAPACITY"
+    assert "full" in (outcome.detail or "")
+    assert repository.intents == []
+    assert repository.dispatches == []
+    assert game.dispatched == ()

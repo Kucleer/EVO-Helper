@@ -150,7 +150,11 @@ class IntegrationWorkflow:
             return self._safety_pause(run_id, coordinate, "no approved range binding for target")
 
         preset = self._game.load_fleet_preset(binding.preset)
-        if preset.name != binding.preset.name or preset.signature != binding.preset.signature:
+        if (
+            preset.name != binding.preset.name
+            or preset.signature != binding.preset.signature
+            or preset.confidence < 0.99
+        ):
             return self._safety_pause(run_id, coordinate, "fleet preset signature mismatch")
         command = DispatchCommand(
             run_id=run_id,
@@ -158,13 +162,23 @@ class IntegrationWorkflow:
             target=coordinate,
             preset=binding.preset,
         )
+        screen_observation = self._game.observe()
+        if (
+            screen_observation.screen != "attack"
+            or screen_observation.ui_version is None
+            or screen_observation.confidence < 0.99
+        ):
+            return self._safety_pause(run_id, coordinate, "attack UI is not stable and recognized")
         plan = self._coordinator.plan(
             command,
             preset,
             self._game.list_inflight(),
             self._game_feedback_slots(),
-            self._game.observe(),
+            screen_observation,
         )
+        if not plan.capacity.available:
+            self._append_event(run_id, "waiting_capacity", "SCANNING", "WAITING_CAPACITY")
+            return ScanOutcome("WAITING_CAPACITY", coordinate, plan.capacity.reason)
         now = self._now_utc()
         intent = AttackIntent(
             intent_id=uuid4(),
