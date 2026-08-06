@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
@@ -483,4 +484,20 @@ def create_app(
     return app
 
 
-__all__ = ["create_app"]
+def create_persistent_app(
+    session_factory: sessionmaker[Session],
+    *,
+    settings: Settings | None = None,
+    local_token: str | None = None,
+) -> FastAPI:
+    """Build the local Web UI against the SQLite-backed management service."""
+    from .persistent_service import PersistentApplicationService
+
+    return create_app(
+        service=PersistentApplicationService(session_factory),
+        settings=settings,
+        local_token=local_token,
+    )
+
+
+__all__ = ["create_app", "create_persistent_app"]
