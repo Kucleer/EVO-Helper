@@ -6,7 +6,13 @@ from pathlib import Path
 from evo_helper.datasets.manifest import DatasetManifest, compute_sha256, validate_manifest
 
 
-def _write_manifest(tmp_path: Path, *, legacy_eligible: bool) -> Path:
+def _write_manifest(
+    tmp_path: Path,
+    *,
+    is_legacy: bool = True,
+    legacy_eligible: bool,
+    screen: str | None = None,
+) -> Path:
     sample = tmp_path / "sample.png"
     sample.write_bytes(b"fake-png-content")
     manifest = {
@@ -19,8 +25,9 @@ def _write_manifest(tmp_path: Path, *, legacy_eligible: bool) -> Path:
                 "file": "sample.png",
                 "bytes": sample.stat().st_size,
                 "sha256": compute_sha256(sample),
-                "is_legacy": True,
+                "is_legacy": is_legacy,
                 "eligible_for_current_mail_baseline": legacy_eligible,
+                **({"screen": screen} if screen is not None else {}),
             }
         ],
     }
@@ -41,3 +48,14 @@ def test_manifest_rejects_legacy_mail_baseline_pollution(tmp_path: Path) -> None
     manifest = DatasetManifest.load(manifest_path)
     errors = validate_manifest(manifest, tmp_path)
     assert any("must not enter current mail baseline" in error for error in errors)
+
+
+def test_manifest_rejects_non_mail_baseline_pollution(tmp_path: Path) -> None:
+    manifest_path = _write_manifest(
+        tmp_path,
+        is_legacy=False,
+        legacy_eligible=True,
+        screen="galaxy",
+    )
+    errors = validate_manifest(DatasetManifest.load(manifest_path), tmp_path)
+    assert any("non-mail sample" in error for error in errors)

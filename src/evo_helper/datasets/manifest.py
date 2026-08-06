@@ -15,6 +15,7 @@ class SampleEntry:
     sha256: str
     is_legacy: bool
     eligible_for_current_mail_baseline: bool
+    screen: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class DatasetManifest:
                 eligible_for_current_mail_baseline=bool(
                     entry.get("eligible_for_current_mail_baseline", False)
                 ),
+                screen=str(entry["screen"]) if entry.get("screen") is not None else None,
             )
             for entry in raw.get("samples", [])
         )
@@ -69,6 +71,8 @@ def validate_manifest(manifest: DatasetManifest, base_dir: Path | str) -> list[s
             errors.append(f"sha256 mismatch for {entry.file}: {digest}")
         if entry.is_legacy and entry.eligible_for_current_mail_baseline:
             errors.append(f"legacy sample must not enter current mail baseline: {entry.file}")
+        if entry.eligible_for_current_mail_baseline and entry.screen != "mail_list":
+            errors.append(f"non-mail sample must not enter current mail baseline: {entry.file}")
     return errors
 
 

@@ -95,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.legacy and args.eligible_for_current_mail_baseline:
         parser.error("legacy captures cannot be eligible for the current mail baseline")
+    if args.eligible_for_current_mail_baseline and args.screen != "mail_list":
+        parser.error("only mail_list captures can enter the current mail baseline")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
