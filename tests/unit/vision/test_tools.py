@@ -59,3 +59,22 @@ def test_capture_cli_rejects_legacy_baseline_eligibility(tmp_path) -> None:
         assert exc.code == 2
     else:  # pragma: no cover - explicit safety assertion
         raise AssertionError("conflicting capture classifications must be rejected")
+
+
+def test_capture_cli_rejects_non_mail_baseline_eligibility(tmp_path) -> None:
+    try:
+        capture_main(
+            [
+                "--batch",
+                "galaxy",
+                "--out",
+                str(tmp_path),
+                "--screen",
+                "galaxy",
+                "--eligible-for-current-mail-baseline",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:  # pragma: no cover - explicit safety assertion
+        raise AssertionError("only current mail-list captures may enter that baseline")
