@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}History {{ coordinate }}{% endblock %}
+{% block content %}
+<h1>Coordinate history: {{ coordinate }}</h1>
+<p><a href="/targets">Back to targets</a></p>
+{% if diff %}
+<h2>Latest fleet diff</h2>
+<table>
+  <tr><th>Total before</th><td>{{ diff.total_before }}</td></tr>
+  <tr><th>Total after</th><td>{{ diff.total_after }}</td></tr>
+  <tr><th>Delta</th><td>{{ diff.total_after - diff.total_before }}</td></tr>
+  <tr><th>First seen</th><td>{{ diff.first_seen|join(", ") or "-" }}</td></tr>
+  <tr><th>Disappeared</th><td>{{ diff.disappeared|join(", ") or "-" }}</td></tr>
+  <tr><th>Added</th><td>{{ diff.added|map(attribute="ship_type")|join(", ") or "-" }}</td></tr>
+  <tr><th>Removed</th><td>{{ diff.removed|map(attribute="ship_type")|join(", ") or "-" }}</td></tr>
+</table>
+{% if diff.changes %}
+<table>
+  <thead><tr><th>Ship</th><th>Before</th><th>After</th><th>Delta</th><th>%</th></tr></thead>
+  <tbody>
+  {% for change in diff.changes %}
+    <tr><td>{{ change.ship_type }}</td><td>{{ change.before }}</td><td>{{ change.after }}</td><td>{{ change.delta }}</td><td>{{ "%+.1f"|format(change.percent) }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% else %}
+<p class="muted">No snapshots for this coordinate.</p>
+{% endif %}
+<h2>Snapshot timeline</h2>
+<table>
+  <thead><tr><th>Captured (UTC)</th><th>Side</th><th>Total</th><th>Revisit</th><th>Confidence</th><th>Review</th></tr></thead>
+  <tbody>
+  {% for snapshot in history %}
+    <tr>
+      <td>{{ snapshot.captured_at_utc }}</td>
+      <td>{{ snapshot.side }}</td>
+      <td>{{ snapshot.total }}</td>
+      <td>{{ snapshot.is_revisit }}</td>
+      <td>{{ snapshot.match_confidence }}</td>
+      <td>{{ snapshot.review_status }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No snapshots yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
