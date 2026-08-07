@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from evo_helper.vision.report_layout import (
-    BINARIZE_THRESHOLD,
     LIVE_LAYOUT,
+    OCR_PSM_COLUMN,
+    OCR_PSM_LINE,
+    OCR_UPSCALE,
     ColumnBand,
     Region,
     layout_for_viewport,
@@ -61,10 +63,33 @@ class TestColumns:
             ColumnBand(720, 960).rows(900, 900)
 
 
-def test_threshold_clears_background_without_eroding_glyphs() -> None:
-    """140 was measured: filler gone, strokes intact. 170 erodes Chinese glyphs."""
-    assert BINARIZE_THRESHOLD == 140
-    assert LIVE_LAYOUT.binarize_threshold == BINARIZE_THRESHOLD
+def test_ocr_recipe_upscales_and_does_not_binarize() -> None:
+    """Binarizing defeats Tesseract's adaptive threshold and corrupts counts."""
+    assert LIVE_LAYOUT.ocr_upscale == OCR_UPSCALE >= 2
+    assert not hasattr(LIVE_LAYOUT, "binarize_threshold")
+
+
+def test_coordinate_rois_are_single_line_bands() -> None:
+    """Coordinates are read alone at psm 7; in the wide VS crop `2` reads as `e`."""
+    assert OCR_PSM_LINE != OCR_PSM_COLUMN
+    for region in (
+        LIVE_LAYOUT.detail_attacker_coordinate,
+        LIVE_LAYOUT.detail_defender_coordinate,
+        LIVE_LAYOUT.replay_attacker_coordinate,
+        LIVE_LAYOUT.replay_defender_coordinate,
+    ):
+        assert region.bottom - region.top < 40
+        assert region.right > region.left
+
+
+def test_coordinate_rois_sit_inside_their_versus_block() -> None:
+    detail = LIVE_LAYOUT.detail_versus
+    for region in (
+        LIVE_LAYOUT.detail_attacker_coordinate,
+        LIVE_LAYOUT.detail_defender_coordinate,
+    ):
+        assert detail.top <= region.top and region.bottom <= detail.bottom
+        assert detail.left <= region.left and region.right <= detail.right
 
 
 def test_region_shift_keeps_width() -> None:

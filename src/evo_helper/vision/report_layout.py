@@ -11,14 +11,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-#: Luminance cut that removes the decorative background text.
+#: OCR recipe measured against Tesseract on the batch images.
 #:
-#: The report panels render dim ``COMMAND OFFICERS`` / ``TOTAL CREWS`` /
-#: ``-17003`` / ``personnel`` filler behind the real rows, inside the same
-#: columns. Measured on the batch: at 140 the filler disappears completely and
-#: the foreground glyphs keep their full stroke weight. Raising it to 170 starts
-#: eroding Chinese glyphs, so 140 is the value with margin on both sides.
-BINARIZE_THRESHOLD = 140
+#: Do not binarize. The panels render dim ``COMMAND OFFICERS`` / ``TOTAL CREWS``
+#: / ``-17003`` / ``personnel`` filler behind the real rows, and a luminance cut
+#: at 140 does remove it to the eye — but measured against Tesseract it makes
+#: results *worse*, because it defeats Tesseract's own adaptive thresholding:
+#: counts degrade (``95`` -> ``a5``, ``166`` -> ``165``, ``16`` -> ``15``).
+#: Plain grayscale plus a LANCZOS upscale reads every count on the batch
+#: correctly, and the filler is dim enough that Tesseract drops it anyway — the
+#: filler-heavy attacker column yields no spurious rows.
+OCR_UPSCALE = 4
+
+#: Multi-row column of text (fleet columns, mail rows).
+OCR_PSM_COLUMN = 6
+
+#: A single line read on its own (coordinates).
+OCR_PSM_LINE = 7
+
+#: Coordinates are read from their own tight ROI, never lifted out of the wide
+#: VS crop: in the wide crop Tesseract reads ``[2:137:18]`` as ``[e:137:18]``,
+#: which then fails the coordinate regex. Read alone at ``--psm 7`` both sides
+#: come back exact.
+OCR_COORDINATE_WHITELIST = "0123456789:[]"
 
 LAYOUT_VIEWPORT = (1920, 879)
 
@@ -57,13 +72,18 @@ class ColumnBand:
 @dataclass(frozen=True)
 class ReportLayout:
     viewport: tuple[int, int]
-    binarize_threshold: int
+    ocr_upscale: int
     mail_first_row: Region
     mail_row_pitch: int
     mail_visible_rows: int
     report_header: Region
     detail_versus: Region
     replay_versus: Region
+    #: Tight single-line ROIs for the coordinates, read separately at psm 7.
+    detail_attacker_coordinate: Region
+    detail_defender_coordinate: Region
+    replay_attacker_coordinate: Region
+    replay_defender_coordinate: Region
     attacker_column: ColumnBand
     defender_column: ColumnBand
     #: ``(top, bottom)`` of the 参战战舰 rows, before any scrolling.
@@ -85,7 +105,7 @@ class ReportLayout:
 #: Measured on evo-20260807-live (1920x879).
 LIVE_LAYOUT = ReportLayout(
     viewport=LAYOUT_VIEWPORT,
-    binarize_threshold=BINARIZE_THRESHOLD,
+    ocr_upscale=OCR_UPSCALE,
     # Row pitch is ~85.6px; 6 rows are fully visible and the 7th is clipped, so
     # only the 6 complete rows are addressable.
     mail_first_row=Region(700, 205, 1220, 290),
@@ -94,6 +114,10 @@ LIVE_LAYOUT = ReportLayout(
     report_header=Region(720, 125, 1200, 195),
     detail_versus=Region(720, 370, 1200, 460),
     replay_versus=Region(720, 150, 1200, 240),
+    detail_attacker_coordinate=Region(760, 428, 900, 452),
+    detail_defender_coordinate=Region(1020, 428, 1160, 452),
+    replay_attacker_coordinate=Region(760, 210, 900, 234),
+    replay_defender_coordinate=Region(1020, 210, 1160, 234),
     attacker_column=ColumnBand(720, 960),
     defender_column=ColumnBand(960, 1210),
     participating_rows=(405, 750),
