@@ -41,6 +41,14 @@ ISO_TIME_RE = re.compile(
 #: ``DD/MM/YYYY HH:MM:SS`` as rendered by the live mail list and report header.
 REPORT_TIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})")
 
+#: The game renders every in-game time in UTC+0 (confirmed 2026-08-07).
+#:
+#: This is not the schedule timezone. The user's run window (for example
+#: 08:00-10:00) is expressed in UTC+8 and lives in ``domain.scheduling``.
+#: Conflating the two would shift every report by eight hours and break the
+#: strict origin + target + time match against a dispatch.
+GAME_DISPLAY_ZONE = UTC
+
 #: Ground defences observed in the 参战战舰 list. They share the layout of ship
 #: rows but are structures, so a snapshot must keep them apart from a fleet.
 DEFENCE_NAMES = frozenset(
@@ -157,9 +165,9 @@ def parse_fleet_line(text: str, source: str, confidence: float = 1.0) -> FleetLi
 def parse_iso_utc(text: str) -> datetime | None:
     """Parse an ISO-ish timestamp and normalize it to UTC.
 
-    A bare local time is interpreted as game local time (UTC+8, the configured
-    business timezone) and converted to UTC. Text with an explicit zone keeps
-    that offset. Returns None when no timestamp can be parsed.
+    A bare time is read in :data:`GAME_DISPLAY_ZONE` (UTC+0, the zone the game
+    renders in). Text with an explicit zone keeps that offset. Returns None
+    when no timestamp can be parsed.
     """
     match = ISO_TIME_RE.search(text)
     if match is None:
@@ -179,7 +187,7 @@ def parse_iso_utc(text: str) -> datetime | None:
                 offset_minutes = -offset_minutes
             zone = timezone(timedelta(hours=offset_hours, minutes=offset_minutes), name="offset")
         else:
-            zone = timezone(timedelta(hours=8), name="game-local")
+            zone = GAME_DISPLAY_ZONE
     try:
         return datetime(year, month, day, hour, minute, second, tzinfo=zone).astimezone(UTC)
     except ValueError:
