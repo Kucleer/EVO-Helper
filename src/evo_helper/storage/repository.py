@@ -22,6 +22,7 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
+from evo_helper.domain.report_wait import PendingReport
 from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
@@ -394,6 +395,82 @@ class SqlAlchemyRepository:
                 )
             )
             session.commit()
+
+    # -- 派出后的松手等待 ------------------------------------------------------
+
+    def record_flight_time(
+        self, dispatch_id: UUID, flight: timedelta | None, dispatched_at_utc: datetime
+    ) -> None:
+        """存下飞行时长与预计战报时间。
+
+        读不到飞行时间时两列都留空。等待调度器会把「未知」当成「立即尝试收取」，
+        而不是无限等一个不知道何时抵达的战报。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.AttackDispatchRow, dispatch_id)
+            if row is None:
+                raise ValueError(f"dispatch {dispatch_id} not found")
+            if flight is None:
+                row.flight_seconds = None
+                row.expected_report_at_utc = None
+            else:
+                row.flight_seconds = int(flight.total_seconds())
+                row.expected_report_at_utc = (
+                    _require_utc(dispatched_at_utc, "dispatched_at_utc") + flight
+                )
+            session.commit()
+
+    def pending_reports(self, run_id: UUID) -> list[PendingReport]:
+        """本次运行已派出的攻击，以及各自是否已闭合。
+
+        只看**真实**派遣：演习模式的记录不会产生战报，把它们算进来会让运行永远等不完。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.AttackDispatchRow, orm.BattleReportRow.id)
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.run_id == run_id,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dry_run.is_(False),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            ).all()
+            return [
+                PendingReport(
+                    dispatch_id=str(dispatch.id),
+                    expected_report_at_utc=dispatch.expected_report_at_utc,
+                    closed=report_id is not None,
+                )
+                for dispatch, report_id in rows
+            ]
+
+    def set_resume_at(self, run_id: UUID, resume_at_utc: datetime | None) -> None:
+        with self._session_factory() as session:
+            row = session.get(orm.RunInstance, run_id)
+            if row is None:
+                raise ValueError(f"run {run_id} not found")
+            row.resume_at_utc = (
+                _require_utc(resume_at_utc, "resume_at_utc") if resume_at_utc else None
+            )
+            session.commit()
+
+    def note_session_attempt(self, run_id: UUID, *, succeeded: bool) -> int:
+        """记一次登录尝试，返回当前连续失败次数。成功则归零。"""
+        with self._session_factory() as session:
+            row = session.get(orm.RunInstance, run_id)
+            if row is None:
+                raise ValueError(f"run {run_id} not found")
+            row.session_attempts = 0 if succeeded else row.session_attempts + 1
+            attempts = row.session_attempts
+            session.commit()
+            return attempts
 
 
 def _require_type[T](value: object, expected: type[T], label: str) -> T:

@@ -446,3 +446,14 @@ def test_console_shows_no_english_dry_run_wording() -> None:
         body = client.get(path).text
         assert "dry run" not in body, path
         assert "演习模式" in body, path
+
+
+def test_the_new_waiting_states_have_chinese_labels() -> None:
+    """派出后松手等待的两个状态也要能在界面上读懂。"""
+    from evo_helper.web.app import run_state_glyph, run_state_label, run_state_tone
+
+    assert run_state_label("AWAITING_REPORT") == "等待战报"
+    assert run_state_label("WAITING_SESSION") == "等待登录"
+    for state in ("AWAITING_REPORT", "WAITING_SESSION"):
+        assert run_state_tone(state) != ""
+        assert run_state_glyph(state) != "•"

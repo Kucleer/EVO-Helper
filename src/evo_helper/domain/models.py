@@ -38,6 +38,10 @@ class RunState(StrEnum):
     SCANNING = "SCANNING"
     WAITING_CAPACITY = "WAITING_CAPACITY"
     DRAINING = "DRAINING"
+    #: 舰队在飞，助手已松手不持有会话，到 resume_at_utc 再回来。
+    AWAITING_REPORT = "AWAITING_REPORT"
+    #: 战报到点了但拿不到登录（用户在玩），退避重试中。
+    WAITING_SESSION = "WAITING_SESSION"
     COMPLETED = "COMPLETED"
     PAUSED = "PAUSED"
     FAILED = "FAILED"
