@@ -10,9 +10,12 @@
     "note": "Chrome window 1920x1080; screenshots returned downscaled to 1568x661."
   },
   "image_artifacts": {
-    "state": "missing",
-    "reason": "The browser control channel did not persist full-resolution screenshots. Only one 754x355 thumbnail was written, which is below OCR fixture quality. No image entered datasets/ or var/captures/ for this batch.",
-    "consequence": "This batch is a field-schema observation record only. It must not be used as a vision training, validation, or regression baseline, and it does not change docs/ui-version-matrix.md."
+    "state": "supplied_by_user",
+    "batch": "evo-20260807-live",
+    "manifest": "var/captures/evo-20260807-live/evo-20260807-live-manifest.json",
+    "resolution": "1920x879",
+    "reason": "The browser control channel did not persist full-resolution screenshots (one 754x355 thumbnail only). The user captured the four screens manually instead.",
+    "consequence": "Images are runtime-only under var/ (gitignored) and pass strict capture-evidence validation, but they are a single manual session with four samples. That is not enough for the section 7.4 acceptance metrics, so docs/ui-version-matrix.md stays at 'Needs current samples'."
   },
   "notes": "Read-only navigation: home -> mail -> 报告 -> report detail -> 战斗详情 -> 战斗回放. No mail deleted, no reward claimed, no fleet dispatched. Opening reports marked them read, which the user authorised.",
   "screens": [
