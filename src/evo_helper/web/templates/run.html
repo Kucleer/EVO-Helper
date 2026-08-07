@@ -3,7 +3,7 @@
 {% block heading %}运行实例{% endblock %}
 {% block topbar_extra %}
 <span class="chip {{ run_state_tone(run.state) }}">
-  <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run.state }}
+  <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run_state_label(run.state) }}
 </span>
 {% endblock %}
 {% block content %}
@@ -15,7 +15,7 @@
       <tbody>
         <tr><td class="muted">运行 ID</td><td class="coord">{{ run.run_id }}</td></tr>
         <tr><td class="muted">计划</td><td>{{ run.plan_id }}</td></tr>
-        <tr><td class="muted">状态</td><td>{{ run.state }}</td></tr>
+        <tr><td class="muted">状态</td><td>{{ run_state_label(run.state) }}</td></tr>
         <tr><td class="muted">目标日期</td><td>{{ run.target_date }}</td></tr>
         <tr><td class="muted">幂等键</td><td>{{ run.idempotency_key }}</td></tr>
         <tr><td class="muted">创建 (UTC)</td><td>{{ run.created_at }}</td></tr>

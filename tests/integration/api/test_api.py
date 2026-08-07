@@ -224,11 +224,11 @@ def test_console_pages_render() -> None:
 
 
 def test_console_pages_show_the_dry_run_lock() -> None:
-    """The lock is informational and must never render as a toggle."""
+    """锁只是提示，绝不能渲染成开关。"""
     client, _ = _make_client()
 
     body = client.get("/missions").text
-    assert "dry run 已锁定" in body
+    assert "演习模式 已锁定" in body
     assert 'type="checkbox"' not in body
 
 
@@ -426,3 +426,23 @@ def test_reserving_every_line_is_rejected() -> None:
 
     assert response.status_code == 400
     assert "never dispatch" in response.json()["detail"]
+
+
+def test_run_states_render_in_chinese() -> None:
+    """英文状态常量对用户有歧义；界面只显示中文。"""
+    from evo_helper.web.app import run_state_label
+
+    assert run_state_label("ARMED") == "待命"
+    assert run_state_label("DRAINING") == "收取战报"
+    assert run_state_label("EMERGENCY_STOPPED") == "已紧急停止"
+    # 未知状态回落到原值，宁可显示英文也不要显示空白。
+    assert run_state_label("SOMETHING_NEW") == "SOMETHING_NEW"
+
+
+def test_console_shows_no_english_dry_run_wording() -> None:
+    client, _ = _make_client()
+
+    for path in ("/missions", "/runs", "/diagnostics"):
+        body = client.get(path).text
+        assert "dry run" not in body, path
+        assert "演习模式" in body, path

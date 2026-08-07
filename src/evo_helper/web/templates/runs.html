@@ -17,7 +17,7 @@
     <button class="btn small" type="button"
             onclick="document.getElementById('idem-key').value = crypto.randomUUID()">生成</button>
     <button class="btn primary small" type="submit">启动</button>
-    <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>dry run</span>
+    <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>演习模式</span>
   </form>
   <p class="muted" style="margin:8px 0 0;font-size:12px">
     幂等键让重复点击只创建一个运行实例。打开本页本身不会启动任何任务。
@@ -41,7 +41,7 @@
           <td class="muted">{{ run.plan_id }}</td>
           <td>
             <span class="chip {{ run_state_tone(run.state) }}">
-              <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run.state }}
+              <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run_state_label(run.state) }}
             </span>
           </td>
           <td>{{ run.target_date }}</td>
