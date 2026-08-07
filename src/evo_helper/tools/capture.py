@@ -44,12 +44,12 @@ class MssCapturePlatform:
 
     def grab(self, path: Path) -> None:
         try:
-            import mss  # type: ignore[import-not-found]
+            import mss
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise RuntimeError("mss is not installed; use --platform fake for tests") from exc
         with mss.mss() as sct:
             shot = sct.grab(sct.monitors[self._monitor])
-            from mss.tools import to_png  # type: ignore[import-not-found]
+            from mss.tools import to_png
 
             to_png(shot.rgb, shot.size, output=str(path))
 

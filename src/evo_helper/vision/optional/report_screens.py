@@ -31,11 +31,11 @@ class _Ocr(Protocol):
 
 def _load_backends() -> tuple[Any, _Ocr]:
     try:
-        from PIL import Image  # type: ignore[import-not-found]
+        from PIL import Image
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("Pillow is required; install the 'vision' extra") from exc
     try:
-        import pytesseract  # type: ignore[import-not-found]
+        import pytesseract
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("pytesseract is required; install the 'vision' extra") from exc
     return Image, pytesseract

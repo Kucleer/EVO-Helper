@@ -28,7 +28,7 @@ class _CapturedScreens:
     """A ``ReportScreens`` stitched from one detail and one replay screenshot."""
 
     def __init__(self, detail: Path, replay: Path, tesseract_cmd: str) -> None:
-        from PIL import Image  # type: ignore[import-not-found]
+        from PIL import Image
 
         from evo_helper.vision.optional.report_screens import ImageReportScreens
 

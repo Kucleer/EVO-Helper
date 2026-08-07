@@ -1087,8 +1087,55 @@ CI 还需通过静态规则确认：
 离线回归 `tests/integration/vision/test_live_batch_ocr.py` 直接跑批次原图：双方坐标、报告时间、
 17 个舰队计数全部精确。缺 vision extra 时自动 skip。
 
-### 25.9 下一步（按顺序）
+### 25.9 报告已可在本地 Web 页面查看（已完成）
 
-1. 把 `ImageReportScreens` 接到实际浏览器采集：截屏来源、滚动定位 `第N回合` 横幅、翻页读满邮件列表。
-2. 补采多会话样本（含异常态：字段缺失、回放过期、未知弹窗），跑出第 7.4 节指标后再更新 UI 版本矩阵。
-3. 再进入 CP6 dry-run 与 CP7 影子运行。
+链路：截图 → OCR → `LiveBattleReport` → `to_battle_report` → SQLite → `/targets/{coordinate}`。
+
+```powershell
+.venv\Scripts\python.exe -m evo_helper.tools.ingest_report `
+  --detail var\captures\evo-20260807-live\evo-20260807-live-001-mail_detail.png `
+  --replay var\captures\evo-20260807-live\evo-20260807-live-003-battle_replay.png
+```
+
+实测结果与截图逐项一致：`[2:137:18]` vs `bot_2_149_17 [2:149:17]`、
+`06/08/2026 11:45:03` → `2026-08-06T11:45:03Z`、17 行舰队名称与数量全对、合计 2174。
+页面 `http://127.0.0.1:8000/targets/2:149:17` 与 `GET /api/targets/{coordinate}/history` 均正确渲染。
+
+踩到并修掉的两点：
+
+- 快照侧别常量必须小写 `attacker` / `defender`。仓储与 Web 服务按 `side == "defender"` 精确过滤，
+  写成大写页面查不到任何数据。
+- 上一轮离线回归只断言数量不断言名称，放过了 `无畏舰`→`AKER` 等 4 处名称错乱。
+  名称是舰队时间线做差异的键，错乱会让每份报告都显示成「首次出现」。
+  修法见 25.10；回归已补名称与分类断言。
+
+### 25.10 OCR 配方补充：每列读两遍
+
+| 语言 | 数量 | 名称 |
+|---|---|---|
+| `chi_sim+eng` | 全对 | 部分掉进拉丁噪声（`无畏舰`→`AKER`） |
+| `chi_sim` | 会坏（`5`→`日`） | 只差一个字（`无引舰`） |
+
+因此每列读两遍：名称取中文遍、数量取混合遍，按行合并。名称遍不要求行尾有数字，
+否则数量被读坏的行会被丢掉，导致后面所有名称错位一行。
+
+再用 `snap_unit_name` 把名称吸附到已知舰种闭集（编辑距离 ≤ 1）。匹配不唯一、名称短于 3 字
+或距离过远时保留原文并标 `unknown`，绝不把新舰种改写成已有的。
+
+### 25.11 代码驱动的截图（部分验证）
+
+`vision/optional/window_capture.py`：按标题定位**唯一**窗口，`PrintWindow(PW_RENDERFULLCONTENT)` 优先、
+`mss` 按窗口矩形兜底，只截指定窗口不整屏抓取，并对纯色位图做空白校验。
+
+- 已验证：Chrome 窗口位于副屏且非前台时，`PrintWindow` 仍返回 1936×1056、2095 种颜色的真实内容。
+- **未验证**：当时该窗口的活动标签页不是游戏，尚未证明能取到 WebGL canvas。
+  这是这条路径最可能失败的地方，需把游戏标签页切为活动状态后复测。
+- 整屏 `mss` 方案已排除：会拍到用户私人窗口。
+
+### 25.12 下一步（按顺序）
+
+1. 把游戏标签页切为活动状态，复测 `PrintWindow` 能否取到 WebGL canvas；若不行，改用
+   Chrome DevTools Protocol 的 `Page.captureScreenshot`（由代码通过 `--remote-debugging-port` 调用）。
+2. 接通完整采集：定位 `第N回合` 横幅做滚动分段、翻页读满邮件列表。
+3. 补采多会话样本（含异常态），跑出第 7.4 节指标后再更新 UI 版本矩阵。
+4. 再进入 CP6 dry-run 与 CP7 影子运行。
