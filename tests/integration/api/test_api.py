@@ -305,3 +305,48 @@ def test_a_reversed_scan_range_is_still_rejected() -> None:
 
     assert response.status_code == 400
     assert "precede" in response.json()["detail"]
+
+
+def test_legacy_pages_redirect_into_the_console() -> None:
+    """Nav collapsed to two entries; the old paths must not become dead ends."""
+    client, _ = _make_client()
+
+    for path, destination in (("/", "/missions"), ("/plans", "/missions"), ("/targets", "/intel")):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 307, (path, response.status_code)
+        assert response.headers["location"] == destination
+
+
+def test_legacy_paths_land_on_a_rendered_page() -> None:
+    client, _ = _make_client()
+
+    assert "任务中心" in client.get("/").text
+    assert "情报中心" in client.get("/targets").text
+
+
+def test_auxiliary_pages_render_in_the_console_shell() -> None:
+    client, _ = _make_client()
+
+    for path, marker in (("/runs", "运行详情"), ("/diagnostics", "诊断")):
+        body = client.get(path).text
+        assert response_ok(client, path), path
+        assert marker in body
+        # The console shell, not the old bare markup.
+        assert "/static/console.css" in body
+
+
+def response_ok(client: TestClient, path: str) -> bool:
+    return client.get(path).status_code == 200
+
+
+def test_run_state_chips_pair_colour_with_a_glyph() -> None:
+    """Colour must never be the only signal for a state."""
+    from evo_helper.web.app import run_state_glyph, run_state_tone
+
+    for state in ("SCANNING", "PAUSED", "FAILED", "EMERGENCY_STOPPED", "COMPLETED"):
+        assert run_state_tone(state) != "", state
+        assert run_state_glyph(state) != "•", state
+
+    # An unknown state still renders something rather than blowing up.
+    assert run_state_tone("SOMETHING_NEW") == ""
+    assert run_state_glyph("SOMETHING_NEW") == "•"

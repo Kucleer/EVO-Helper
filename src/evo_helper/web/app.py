@@ -6,7 +6,7 @@ from typing import cast
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
@@ -202,6 +202,39 @@ def _revisit_out(revisit: RevisitView) -> RevisitOut:
     )
 
 
+#: Run states grouped by tone for the status chips. Every chip also renders a
+#: glyph and the state name, so colour is never the only signal.
+_RUN_STATE_TONE = {
+    "SCANNING": "ok",
+    "DRAINING": "ok",
+    "COMPLETED": "ok",
+    "ARMED": "warn",
+    "WAITING_CAPACITY": "warn",
+    "PAUSED": "warn",
+    "FAILED": "danger",
+    "EMERGENCY_STOPPED": "danger",
+}
+
+_RUN_STATE_GLYPH = {
+    "SCANNING": "▶",
+    "DRAINING": "▼",
+    "COMPLETED": "✓",
+    "ARMED": "◷",
+    "WAITING_CAPACITY": "⏸",
+    "PAUSED": "⏸",
+    "FAILED": "✕",
+    "EMERGENCY_STOPPED": "■",
+}
+
+
+def run_state_tone(state: str) -> str:
+    return _RUN_STATE_TONE.get(state, "")
+
+
+def run_state_glyph(state: str) -> str:
+    return _RUN_STATE_GLYPH.get(state, "•")
+
+
 # ---- application factory --------------------------------------------------
 
 
@@ -223,6 +256,8 @@ def create_app(
     app.add_middleware(LocalSecurityMiddleware, local_token=token)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    templates.env.globals["run_state_tone"] = run_state_tone
+    templates.env.globals["run_state_glyph"] = run_state_glyph
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
@@ -240,14 +275,15 @@ def create_app(
 
     # ---- dashboard -------------------------------------------------------
 
-    @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        return templates.TemplateResponse(
-            request=request,
-            name="index.html",
-            context={"dashboard": service.dashboard()},
-        )
+    @app.get("/", include_in_schema=False)
+    async def index() -> RedirectResponse:
+        """The dashboard folded into 任务中心; keep the root a working entry."""
+        return RedirectResponse("/missions", status_code=307)
+
+    @app.get("/plans", include_in_schema=False)
+    async def plans_page() -> RedirectResponse:
+        """Plan configuration lives in 任务中心 now."""
+        return RedirectResponse("/missions", status_code=307)
 
     @app.get("/api/dashboard", response_model=DashboardOut)
     async def api_dashboard(
@@ -262,15 +298,6 @@ def create_app(
         )
 
     # ---- plans -----------------------------------------------------------
-
-    @app.get("/plans", response_class=HTMLResponse)
-    async def plans_page(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        return templates.TemplateResponse(
-            request=request,
-            name="plans.html",
-            context={"plans": [_plan_out(plan) for plan in service.list_plans()]},
-        )
 
     @app.get("/api/plans", response_model=list[ScanPlanOut])
     async def list_plans(
@@ -424,14 +451,10 @@ def create_app(
             context={"active": "intel", "list_ship_columns": list(LIST_SHIP_COLUMNS)},
         )
 
-    @app.get("/targets", response_class=HTMLResponse)
-    async def targets_page(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        return templates.TemplateResponse(
-            request=request,
-            name="targets.html",
-            context={"targets": [_target_out(t) for t in service.list_targets()]},
-        )
+    @app.get("/targets", include_in_schema=False)
+    async def targets_page() -> RedirectResponse:
+        """The bot list became 情报中心, which can also filter by fleet."""
+        return RedirectResponse("/intel", status_code=307)
 
     @app.get("/api/targets", response_model=list[BotTargetOut])
     async def list_targets(
