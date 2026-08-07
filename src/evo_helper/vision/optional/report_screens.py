@@ -31,11 +31,11 @@ class _Ocr(Protocol):
 
 def _load_backends() -> tuple[Any, _Ocr]:
     try:
-        from PIL import Image  # type: ignore[import-not-found]
+        from PIL import Image
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("Pillow is required; install the 'vision' extra") from exc
     try:
-        import pytesseract  # type: ignore[import-not-found]
+        import pytesseract
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("pytesseract is required; install the 'vision' extra") from exc
     return Image, pytesseract
@@ -102,8 +102,8 @@ class ImageReportScreens:
 
     def participating_columns(self) -> tuple[str, str]:
         return (
-            self._read(self._layout.participating(self._layout.attacker_column), OCR_PSM_COLUMN),
-            self._read(self._layout.participating(self._layout.defender_column), OCR_PSM_COLUMN),
+            self._read_fleet(self._layout.participating(self._layout.attacker_column)),
+            self._read_fleet(self._layout.participating(self._layout.defender_column)),
         )
 
     def round_columns(self) -> list[tuple[int, str, str]]:
@@ -119,7 +119,25 @@ class ImageReportScreens:
     # -- internals -------------------------------------------------------
 
     def _read_band(self, band: ColumnBand, top: int, bottom: int) -> str:
-        return self._read(band.rows(top, bottom), OCR_PSM_COLUMN)
+        return self._read_fleet(band.rows(top, bottom))
+
+    def _read_fleet(self, region: Region) -> str:
+        """Read a fleet column twice and take the best half of each pass.
+
+        Measured on the batch: ``chi_sim+eng`` gets every count right but drops
+        some names into Latin noise (``无畏舰`` -> ``AKER``), while ``chi_sim``
+        alone keeps the names within one character but corrupts counts
+        (``5`` -> ``日``). Neither pass is good enough alone, so names come from
+        the Chinese pass and counts from the mixed one, joined row by row.
+        """
+        counts = _rows(self._read(region, OCR_PSM_COLUMN))
+        names = _names(self._read(region, OCR_PSM_COLUMN, language="chi_sim"))
+        if len(names) != len(counts):
+            # Row counts disagree, so the two passes cannot be aligned. Fall
+            # back to the pass whose counts are trustworthy rather than pairing
+            # a name with another row's number.
+            return "\n".join(f"{name}  {count}" for name, count in counts)
+        return "\n".join(f"{name}  {count}" for name, (_, count) in zip(names, counts, strict=True))
 
     def _read_coordinate(self, region: Region) -> str:
         return self._read(
@@ -172,3 +190,36 @@ def _compose_versus(left: list[str], right: list[str], attacker: str, defender: 
     rows = [f"{a}    {b}" for a, b in zip(left[:2], right[:2], strict=False)]
     rows.append(f"{attacker}    {defender}")
     return "\n".join(rows)
+
+
+def _rows(text: str) -> list[tuple[str, str]]:
+    """Split OCR text into ``(name, count)`` pairs, dropping rows without a count."""
+    import re
+
+    pairs: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        match = re.match(r"^(.+?)\s{1,}(\d{1,7})$", raw.strip())
+        if match is None:
+            continue
+        pairs.append((match.group(1).strip(), match.group(2)))
+    return pairs
+
+
+def _names(text: str) -> list[str]:
+    """Take the leading name from each non-empty line of the name-only pass.
+
+    The Chinese pass corrupts counts (``5`` -> ``日``), so a row must not be
+    dropped for lacking a numeric tail — dropping it would shift every later
+    name onto the wrong count.
+    """
+    import re
+
+    names: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        name = re.split(r"\s{2,}", stripped)[0].strip()
+        if name:
+            names.append(name)
+    return names

@@ -55,3 +55,20 @@ select = ["E", "F", "I", "UP"]
 python_version = "3.12"
 strict = true
 packages = ["evo_helper"]
+
+[[tool.mypy.overrides]]
+# Optional vision/OS backends. CI installs only ".[dev]", so these are absent
+# there and untyped when the "vision" extra is installed locally. One override
+# covers both, which inline ignores cannot do without flipping error codes.
+module = [
+  "PIL.*",
+  "cv2.*",
+  "mss.*",
+  "mss.tools.*",
+  "pytesseract.*",
+  "ultralytics.*",
+  "win32con.*",
+  "win32gui.*",
+  "win32ui.*",
+]
+ignore_missing_imports = true

@@ -87,6 +87,49 @@ def test_report_reads_both_coordinates_and_the_bot_name() -> None:
     assert report.raw_time_text == "06/08/2026 11:45:03"
 
 
+def test_fleet_names_match_the_screenshot() -> None:
+    """The name is the key a fleet timeline diffs on; a garbled name breaks it."""
+    reader = LiveReportReader(_Chain())
+    report = reader.read_report(
+        PageObservation(screen="mail_detail", ui_version="battle-detail-v2", confidence=0.99),
+        PageObservation(screen="battle_replay", ui_version="battle-replay-v2", confidence=0.99),
+    )
+
+    assert [line.ship_type for line in report.participating_attacker] == [
+        "深空吞噬者",
+        "钛能守卫者",
+    ]
+    assert [line.ship_type for line in report.participating_defender] == [
+        "轻型战斗机",
+        "重型战斗机",
+        "巡洋舰",
+        "战列舰",
+        "无畏舰",
+        "轰炸机",
+        "毁灭者",
+        "裂变者",
+        "深空吞噬者",
+        "钛能守卫者",
+        "离子炮",
+        "火箭发射器",
+        "轻型激光炮",
+        "MK2 加农炮",
+        "等离子炮",
+    ]
+
+
+def test_every_unit_is_classified() -> None:
+    """An unknown category means the name did not resolve to a known unit."""
+    reader = LiveReportReader(_Chain())
+    report = reader.read_report(
+        PageObservation(screen="mail_detail", ui_version="battle-detail-v2", confidence=0.99),
+        PageObservation(screen="battle_replay", ui_version="battle-replay-v2", confidence=0.99),
+    )
+
+    lines = [*report.participating_attacker, *report.participating_defender]
+    assert [line.ship_type for line in lines if line.category == "unknown"] == []
+
+
 def test_fleet_counts_match_the_screenshot() -> None:
     reader = LiveReportReader(_Chain())
     report = reader.read_report(

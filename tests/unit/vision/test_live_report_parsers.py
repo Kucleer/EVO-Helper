@@ -255,3 +255,56 @@ class TestGameDisplayZone:
         parsed = parse_iso_utc("2026-08-06T14:30:00+08:00")
         assert parsed is not None
         assert parsed.hour == 6
+
+
+class TestUnitNameSnapping:
+    """chi_sim reads names within one character; counts come from a second pass."""
+
+    def test_snaps_a_one_character_misread(self) -> None:
+        from evo_helper.vision.parsers import snap_unit_name
+
+        assert snap_unit_name("无引舰") == ("无畏舰", "ship")
+        assert snap_unit_name("友炸机") == ("轰炸机", "ship")
+        assert snap_unit_name("深空吞噶者") == ("深空吞噬者", "ship")
+
+    def test_snaps_a_missing_character(self) -> None:
+        from evo_helper.vision.parsers import snap_unit_name
+
+        assert snap_unit_name("MK 加农炮") == ("MK2 加农炮", "defence")
+
+    def test_exact_name_is_unchanged(self) -> None:
+        from evo_helper.vision.parsers import snap_unit_name
+
+        assert snap_unit_name("巡洋舰") == ("巡洋舰", "ship")
+
+    def test_far_name_is_kept_raw_and_unknown(self) -> None:
+        """A genuinely new unit must not be snapped onto an existing one."""
+        from evo_helper.vision.parsers import snap_unit_name
+
+        assert snap_unit_name("星门要塞") == ("星门要塞", "unknown")
+
+    def test_ambiguous_match_is_refused(self) -> None:
+        """轻型战斗机 and 重型战斗机 differ by one char; a tie must not be resolved."""
+        from evo_helper.vision.parsers import snap_unit_name
+
+        name, category = snap_unit_name("X型战斗机")
+        assert name == "X型战斗机"
+        assert category == "unknown"
+
+    def test_short_names_are_not_snapped(self) -> None:
+        """One edit on a two-character name is too much of the string to guess."""
+        from evo_helper.vision.parsers import snap_unit_name
+
+        assert snap_unit_name("炮") == ("炮", "unknown")
+
+    def test_parse_fleet_column_snaps_by_default(self) -> None:
+        lines = parse_fleet_column("无引舰  95\n友炸机  166", "ocr")
+        assert [(line.ship_type, line.category) for line in lines] == [
+            ("无畏舰", "ship"),
+            ("轰炸机", "ship"),
+        ]
+
+    def test_snapping_can_be_disabled(self) -> None:
+        lines = parse_fleet_column("无引舰  95", "ocr", snap=False)
+        assert lines[0].ship_type == "无引舰"
+        assert lines[0].category == "unknown"

@@ -15,7 +15,7 @@ class YoloDetectorEngine:
     def detect(self, image: object) -> list[Detection]:
         if self._model is None:
             try:
-                from ultralytics import YOLO  # type: ignore[import-not-found]
+                from ultralytics import YOLO
             except ImportError as exc:  # pragma: no cover - environment dependent
                 raise RuntimeError("ultralytics is not installed") from exc
             self._model = YOLO(self._weights)
