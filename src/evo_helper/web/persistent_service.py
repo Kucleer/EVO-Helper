@@ -65,8 +65,11 @@ class PersistentApplicationService:
         window_end: time,
         dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
+        fleet_line_limit: int = 1,
+        reserved_lines: int = 0,
     ) -> ScanPlanView:
         self._validate_plan(window_start, window_end, ranges)
+        _validate_lines(fleet_line_limit, reserved_lines)
         now = self._now()
         with self._session_factory() as session:
             row = orm.ScanPlan(
@@ -76,6 +79,8 @@ class PersistentApplicationService:
                 time_window_end=window_end.strftime("%H:%M"),
                 timezone_name="Asia/Shanghai",
                 dry_run=dry_run,
+                fleet_line_limit=fleet_line_limit,
+                reserved_lines=reserved_lines,
                 created_at_utc=now,
                 updated_at_utc=now,
             )
@@ -354,6 +359,8 @@ class PersistentApplicationService:
             ),
             row.created_at_utc,
             row.updated_at_utc,
+            row.fleet_line_limit,
+            row.reserved_lines,
         )
 
     def _run_view(
@@ -473,4 +480,13 @@ class PersistentApplicationService:
             report.match_confidence,
             report.manual_review_status,
             ships,
+        )
+
+
+def _validate_lines(fleet_line_limit: int, reserved_lines: int) -> None:
+    """Reserving every line would make the plan unable to dispatch anything."""
+    if reserved_lines >= fleet_line_limit:
+        raise ServiceError(
+            f"reserved_lines ({reserved_lines}) must be fewer than "
+            f"fleet_line_limit ({fleet_line_limit}); the plan would never dispatch"
         )

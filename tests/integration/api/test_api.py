@@ -350,3 +350,79 @@ def test_run_state_chips_pair_colour_with_a_glyph() -> None:
     # An unknown state still renders something rather than blowing up.
     assert run_state_tone("SOMETHING_NEW") == ""
     assert run_state_glyph("SOMETHING_NEW") == "•"
+
+
+def test_plan_carries_fleet_line_configuration() -> None:
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "lines",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "fleet_line_limit": 6,
+            "reserved_lines": 2,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 100, "position": 1},
+                    "end": {"galaxy": 1, "system": 200, "position": 15},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "探路",
+                    "fleet_preset_signature": "轻型战斗机:1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["fleet_line_limit"] == 6
+    assert body["reserved_lines"] == 2
+
+
+def test_plan_line_configuration_defaults_are_conservative() -> None:
+    """Omitting the fields keeps the previous behaviour: one line, none reserved."""
+    client, _ = _make_client()
+    plan_id = _create_plan(client)
+
+    body = client.get(f"/api/plans/{plan_id}").json()
+
+    assert body["fleet_line_limit"] == 1
+    assert body["reserved_lines"] == 0
+
+
+def test_reserving_every_line_is_rejected() -> None:
+    """A plan that reserves its whole limit could never dispatch."""
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "all-reserved",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "fleet_line_limit": 3,
+            "reserved_lines": 3,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 100, "position": 1},
+                    "end": {"galaxy": 1, "system": 200, "position": 15},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "探路",
+                    "fleet_preset_signature": "轻型战斗机:1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "never dispatch" in response.json()["detail"]

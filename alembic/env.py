@@ -14,7 +14,11 @@ from evo_helper.storage.database import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers defaults to True, which would silence every
+    # logger already configured by the application. The web runtime applies
+    # migrations at startup, so that would kill the report-timing log for the
+    # rest of the process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 database_url = config.attributes.get("database_url") or os.environ.get("EVO_HELPER_DATABASE_URL")
 if database_url:

@@ -12,7 +12,10 @@ a report that is silently wrong closes the wrong dispatch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
@@ -29,6 +32,8 @@ from evo_helper.vision.parsers import (
     parse_versus_block,
 )
 
+logger = logging.getLogger(__name__)
+
 SUPPORTED_DETAIL_VERSIONS = frozenset({"battle-detail-v2"})
 SUPPORTED_REPLAY_VERSIONS = frozenset({"battle-replay-v2"})
 
@@ -41,6 +46,45 @@ class AttackReportRow:
     sender: str | None
     raw_time_text: str
     reported_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class ReadTiming:
+    """How long one report took to read, split by stage.
+
+    A single total says a read was slow; the per-stage split says which OCR
+    call to attack. Recorded for failed reads too — a read that dies after
+    thirty seconds is exactly what this is meant to surface.
+    """
+
+    stages: tuple[tuple[str, float], ...] = ()
+    total_seconds: float = 0.0
+
+    @property
+    def slowest(self) -> tuple[str, float]:
+        return max(self.stages, key=lambda item: item[1], default=("none", 0.0))
+
+    def summary(self) -> str:
+        parts = ", ".join(f"{name} {seconds:.2f}s" for name, seconds in self.stages)
+        return f"{self.total_seconds:.2f}s ({parts})" if parts else f"{self.total_seconds:.2f}s"
+
+
+class _StageTimer:
+    """Accumulates per-stage elapsed time from an injected clock."""
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._started = clock()
+        self._mark = self._started
+        self._stages: list[tuple[str, float]] = []
+
+    def stage(self, name: str) -> None:
+        now = self._clock()
+        self._stages.append((name, now - self._mark))
+        self._mark = now
+
+    def finish(self) -> ReadTiming:
+        return ReadTiming(stages=tuple(self._stages), total_seconds=self._clock() - self._started)
 
 
 @dataclass(frozen=True)
@@ -57,6 +101,8 @@ class LiveBattleReport:
     rounds: tuple[ReplayRound, ...]
     #: Per-screen UI versions. Section 3 forbids one label for the whole chain.
     ui_versions: dict[str, str]
+    #: How long this report took to read, split by stage.
+    timing: ReadTiming = field(default_factory=ReadTiming)
 
 
 class ReportScreens(Protocol):
@@ -84,9 +130,16 @@ class ReportScreens(Protocol):
 
 
 class LiveReportReader:
-    def __init__(self, screens: ReportScreens, source: str = "ocr") -> None:
+    def __init__(
+        self,
+        screens: ReportScreens,
+        source: str = "ocr",
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._screens = screens
         self._source = source
+        self._clock = clock
 
     def list_attack_reports(self, page: PageObservation) -> tuple[AttackReportRow, ...]:
         """Return only the rows that may be matched against a dispatch.
@@ -120,10 +173,31 @@ class LiveReportReader:
     def read_report(
         self, detail_page: PageObservation, replay_page: PageObservation
     ) -> LiveBattleReport:
+        timer = _StageTimer(self._clock)
+        try:
+            report = self._read_report(detail_page, replay_page, timer)
+        except Exception as error:
+            timing = timer.finish()
+            logger.warning("read attack report failed after %s: %s", timing.summary(), error)
+            raise
+        logger.info(
+            "read attack report in %s; slowest stage %s",
+            report.timing.summary(),
+            report.timing.slowest[0],
+        )
+        return report
+
+    def _read_report(
+        self,
+        detail_page: PageObservation,
+        replay_page: PageObservation,
+        timer: _StageTimer,
+    ) -> LiveBattleReport:
         self._require_version(detail_page, SUPPORTED_DETAIL_VERSIONS, "battle detail")
         self._require_version(replay_page, SUPPORTED_REPLAY_VERSIONS, "battle replay")
 
         header = self._screens.report_header()
+        timer.stage("header")
         subject = _subject_from_header(header)
         if subject is None:
             raise UnknownUiVersionError(
@@ -141,10 +215,12 @@ class LiveReportReader:
             raise UnknownUiVersionError("report header has no readable time")
 
         versus = parse_versus_block(self._screens.versus_block(), self._source)
+        timer.stage("versus")
         if versus is None:
             raise UnknownUiVersionError("versus block is incomplete; refusing a one-sided report")
 
         attacker_text, defender_text = self._screens.participating_columns()
+        timer.stage("fleet")
         participating_attacker = parse_fleet_column(attacker_text, self._source)
         participating_defender = parse_fleet_column(defender_text, self._source)
         if not participating_attacker and not participating_defender:
@@ -153,6 +229,7 @@ class LiveReportReader:
             )
 
         rounds = parse_replay_rounds(self._screens.round_columns(), self._source)
+        timer.stage("rounds")
 
         return LiveBattleReport(
             kind=kind,
@@ -167,6 +244,7 @@ class LiveReportReader:
                 "battle_detail_ui_version": str(detail_page.ui_version),
                 "battle_replay_ui_version": str(replay_page.ui_version),
             },
+            timing=timer.finish(),
         )
 
     @staticmethod

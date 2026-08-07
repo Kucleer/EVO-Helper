@@ -58,6 +58,10 @@ class ScanPlanView:
     ranges: tuple[ScanRangeView, ...]
     created_at: datetime
     updated_at: datetime
+    #: Fleet lines this plan may occupy at once.
+    fleet_line_limit: int = 1
+    #: Lines always kept free for the user's own dispatches.
+    reserved_lines: int = 0
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,8 @@ class ApplicationService(Protocol):
         window_end: time,
         dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
+        fleet_line_limit: int = 1,
+        reserved_lines: int = 0,
     ) -> ScanPlanView: ...
     def update_plan(self, plan_id: UUID, patch: PlanPatchView) -> ScanPlanView: ...
     def delete_plan(self, plan_id: UUID) -> None: ...
@@ -250,10 +256,13 @@ class FakeApplicationService:
         window_end: time,
         dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
+        fleet_line_limit: int = 1,
+        reserved_lines: int = 0,
     ) -> ScanPlanView:
         self._validate_window(window_start, window_end)
         for scan_range in ranges:
             self._validate_range(scan_range)
+        self._validate_lines(fleet_line_limit, reserved_lines)
         now = self._now()
         plan = ScanPlanView(
             id=uuid4(),
@@ -265,6 +274,8 @@ class FakeApplicationService:
             ranges=ranges,
             created_at=now,
             updated_at=now,
+            fleet_line_limit=fleet_line_limit,
+            reserved_lines=reserved_lines,
         )
         with self._lock:
             self._plans[plan.id] = plan
@@ -305,6 +316,15 @@ class FakeApplicationService:
     def _validate_window(window_start: time, window_end: time) -> None:
         if window_start > window_end:
             raise ServiceError("window_start must not be after window_end")
+
+    @staticmethod
+    def _validate_lines(fleet_line_limit: int, reserved_lines: int) -> None:
+        """Reserving every line would make the plan unable to dispatch anything."""
+        if reserved_lines >= fleet_line_limit:
+            raise ServiceError(
+                f"reserved_lines ({reserved_lines}) must be fewer than "
+                f"fleet_line_limit ({fleet_line_limit}); the plan would never dispatch"
+            )
 
     @staticmethod
     def _validate_range(scan_range: ScanRangeView) -> None:

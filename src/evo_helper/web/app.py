@@ -93,6 +93,8 @@ def _plan_out(plan: ScanPlanView) -> ScanPlanOut:
         window_start=plan.window_start.strftime("%H:%M"),
         window_end=plan.window_end.strftime("%H:%M"),
         dry_run=plan.dry_run,
+        fleet_line_limit=plan.fleet_line_limit,
+        reserved_lines=plan.reserved_lines,
         ranges=[_range_out(item) for item in plan.ranges],
         created_at=plan.created_at,
         updated_at=plan.updated_at,
@@ -316,6 +318,8 @@ def create_app(
             window_start=_parse_window(payload.window_start),
             window_end=_parse_window(payload.window_end),
             dry_run=payload.dry_run,
+            fleet_line_limit=payload.fleet_line_limit,
+            reserved_lines=payload.reserved_lines,
             ranges=tuple(_range_view(item) for item in payload.ranges),
         )
         return _plan_out(plan)
