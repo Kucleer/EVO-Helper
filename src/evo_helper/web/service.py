@@ -48,6 +48,17 @@ class ScanRangeView:
 
 
 @dataclass(frozen=True)
+class CoordinateScanView:
+    """一次坐标扫描的事实。空位与海盗同样记录，不只记 bot。"""
+
+    coordinate: Coordinate
+    scanned_at_utc: datetime
+    owner_name: str | None
+    is_bot: bool
+    confidence: float
+
+
+@dataclass(frozen=True)
 class ScanPlanView:
     id: UUID
     name: str
@@ -191,6 +202,7 @@ class ApplicationService(Protocol):
     def resume_run(self, run_id: UUID) -> RunStatusView: ...
     def emergency_stop_run(self, run_id: UUID) -> RunStatusView: ...
     def list_targets(self) -> list[BotTargetView]: ...
+    def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]: ...
     def get_fleet_diff(self, coordinate: Coordinate) -> FleetDiffView | None: ...
     def list_events(self, limit: int) -> list[StateEventView]: ...
@@ -236,6 +248,7 @@ class FakeApplicationService:
         self._snapshots: dict[Coordinate, list[FleetSnapshotView]] = {}
         self._events: list[StateEventView] = []
         self._revisits: list[RevisitView] = []
+        self._scans: list[CoordinateScanView] = []
 
     # ---- plans -----------------------------------------------------------
 
@@ -437,6 +450,13 @@ class FakeApplicationService:
     def list_targets(self) -> list[BotTargetView]:
         with self._lock:
             return sorted(self._targets.values(), key=lambda target: str(target.coordinate))
+
+    def list_scans(self, limit: int = 500) -> list[CoordinateScanView]:
+        with self._lock:
+            return sorted(
+                self._scans[:limit],
+                key=lambda s: (s.coordinate.galaxy, s.coordinate.system, s.coordinate.position),
+            )
 
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]:
         with self._lock:

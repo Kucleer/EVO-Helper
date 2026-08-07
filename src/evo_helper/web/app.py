@@ -18,6 +18,7 @@ from .display import LIST_SHIP_COLUMNS
 from .schemas import (
     BotTargetOut,
     CoordinateModel,
+    CoordinateScanOut,
     DashboardOut,
     FleetChangeOut,
     FleetDiffOut,
@@ -474,17 +475,52 @@ def create_app(
 
     @app.get("/intel", response_class=HTMLResponse)
     async def intel_page(request: Request) -> HTMLResponse:
-        """The intel centre loads its own data from /api/intel/*."""
+        """情报中心的筛选数据走 /api/intel/*，扫描结果随页面一起渲染。"""
+        # 必须用 get_service(request)：外层的 service 是工厂的可选参数，
+        # 直接引用会在未传入时是 None，而且类型上也不成立。
+        service = get_service(request)
         return templates.TemplateResponse(
             request=request,
             name="intel.html",
-            context={"active": "intel", "list_ship_columns": list(LIST_SHIP_COLUMNS)},
+            context={
+                "scans": [
+                    {
+                        "coordinate": str(s.coordinate),
+                        "owner_name": s.owner_name,
+                        "is_bot": s.is_bot,
+                        "scanned_at": s.scanned_at_utc,
+                    }
+                    for s in service.list_scans()
+                ],
+                "active": "intel",
+                "list_ship_columns": list(LIST_SHIP_COLUMNS),
+            },
         )
 
     @app.get("/targets", include_in_schema=False)
     async def targets_page() -> RedirectResponse:
         """The bot list became 情报中心, which can also filter by fleet."""
         return RedirectResponse("/intel", status_code=307)
+
+    @app.get("/api/scans", response_model=list[CoordinateScanOut])
+    async def list_scans(
+        service: ApplicationService = Depends(get_service),
+    ) -> list[CoordinateScanOut]:
+        """列出坐标扫描事实，含空位与非 bot 归属。
+
+        一次扫描的价值一半在于「这些坐标里没有 bot」，只返回 bot 会让
+        空扫描看起来像什么都没发生。
+        """
+        return [
+            CoordinateScanOut(
+                coordinate=_coordinate_out(scan.coordinate),
+                scanned_at_utc=scan.scanned_at_utc,
+                owner_name=scan.owner_name,
+                is_bot=scan.is_bot,
+                confidence=scan.confidence,
+            )
+            for scan in service.list_scans()
+        ]
 
     @app.get("/api/targets", response_model=list[BotTargetOut])
     async def list_targets(
