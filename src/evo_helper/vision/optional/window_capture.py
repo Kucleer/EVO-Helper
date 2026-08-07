@@ -113,9 +113,11 @@ def _print_window(window: WindowInfo) -> Any | None:
     try:
         bitmap.CreateCompatibleBitmap(source, width, height)
         target.SelectObject(bitmap)
-        result = ctypes.windll.user32.PrintWindow(
-            window.handle, target.GetSafeHdc(), PW_RENDERFULLCONTENT
-        )
+        # ctypes.windll exists only on Windows. Reached dynamically so the
+        # module still type-checks on the Linux CI runner, where mypy sees a
+        # ctypes without that attribute.
+        user32 = getattr(ctypes, "windll").user32
+        result = user32.PrintWindow(window.handle, target.GetSafeHdc(), PW_RENDERFULLCONTENT)
         if result != 1:
             return None
         info = bitmap.GetInfo()
