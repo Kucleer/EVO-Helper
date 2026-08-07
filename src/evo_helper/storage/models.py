@@ -32,6 +32,9 @@ class ScanPlan(Base):
     time_window_end: Mapped[str] = mapped_column(String(5), default="20:00")
     timezone_name: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Fleet lines this plan may occupy, and how many stay free for the user.
+    fleet_line_limit: Mapped[int] = mapped_column(Integer, default=1)
+    reserved_lines: Mapped[int] = mapped_column(Integer, default=0)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at_utc: Mapped[datetime] = mapped_column(
         UTCDateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)

@@ -41,6 +41,21 @@
         <label for="priority">优先级</label>
         <input id="priority" name="priority" type="number" value="0" style="width:100%">
       </div>
+      <div class="col-3">
+        <label for="fleet_line_limit">航线数量上限</label>
+        <input id="fleet_line_limit" type="number" min="1" max="99" value="1" style="width:100%"
+               title="本任务最多同时占用多少条舰队航线">
+      </div>
+      <div class="col-3">
+        <label for="reserved_lines">保留自由航线</label>
+        <input id="reserved_lines" type="number" min="0" max="99" value="0" style="width:100%"
+               title="始终留给你自己派遣的航线数，助手永不占用">
+      </div>
+      <div class="col-6" style="display:flex;align-items:flex-end">
+        <p class="muted" style="margin:0;font-size:12px">
+          助手最多同时占用「上限 − 保留」条航线。保留数必须小于上限，否则任务永远无法派遣。
+        </p>
+      </div>
     </div>
 
     <h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin:18px 0 8px">
@@ -63,6 +78,7 @@
       <thead>
         <tr>
           <th scope="col">名称</th><th scope="col">时间窗口</th><th scope="col">区段数</th>
+          <th scope="col" class="num">航线</th><th scope="col" class="num">保留</th>
           <th scope="col">状态</th><th scope="col">dry run</th>
         </tr>
       </thead>
@@ -72,6 +88,8 @@
           <td>{{ plan.name }}</td>
           <td>{{ plan.window_start }} – {{ plan.window_end }} <span class="muted">UTC+8</span></td>
           <td class="num">{{ plan.ranges | length }}</td>
+          <td class="num">{{ plan.fleet_line_limit }}</td>
+          <td class="num">{{ plan.reserved_lines }}</td>
           <td>
             <span class="chip {{ 'ok' if plan.enabled else '' }}">
               <span class="glyph" aria-hidden="true">{{ '●' if plan.enabled else '○' }}</span>
@@ -83,7 +101,7 @@
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="5" class="muted">还没有扫描计划。</td></tr>
+        <tr><td colspan="7" class="muted">还没有扫描计划。</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -139,12 +157,19 @@
         priority: 0,
       }));
       if (!ranges.length) throw new Error('至少需要一个扫描区段');
+      const lineLimit = Number(document.getElementById('fleet_line_limit').value);
+      const reserved = Number(document.getElementById('reserved_lines').value);
+      if (reserved >= lineLimit) {
+        throw new Error('保留自由航线必须小于航线数量上限，否则任务永远无法派遣');
+      }
       EVOHelper.post('/api/plans', {
         name: document.getElementById('name').value.trim(),
         enabled: true,
         window_start: document.getElementById('window_start').value.trim(),
         window_end: document.getElementById('window_end').value.trim(),
         dry_run: true,
+        fleet_line_limit: lineLimit,
+        reserved_lines: reserved,
         ranges,
       }).then(() => window.location.reload())
         .catch((error) => alert(error.detail || error.message));

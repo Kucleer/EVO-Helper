@@ -33,6 +33,9 @@ class ScanPlanIn(BaseModel):
     window_start: str = Field(pattern=r"^\d{2}:\d{2}$")
     window_end: str = Field(pattern=r"^\d{2}:\d{2}$")
     dry_run: bool = True
+    #: Fleet lines this plan may occupy, and how many stay free for the user.
+    fleet_line_limit: int = Field(default=1, ge=1, le=99)
+    reserved_lines: int = Field(default=0, ge=0, le=99)
     ranges: list[ScanRangeIn] = Field(min_length=1)
 
 
@@ -44,6 +47,8 @@ class ScanPlanPatch(BaseModel):
     window_start: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     window_end: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     dry_run: bool | None = None
+    fleet_line_limit: int | None = Field(default=None, ge=1, le=99)
+    reserved_lines: int | None = Field(default=None, ge=0, le=99)
     ranges: list[ScanRangeIn] | None = None
 
 
@@ -58,6 +63,8 @@ class ScanPlanOut(BaseModel):
     window_start: str
     window_end: str
     dry_run: bool
+    fleet_line_limit: int
+    reserved_lines: int
     ranges: list[ScanRangeOut]
     created_at: datetime
     updated_at: datetime

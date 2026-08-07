@@ -15,6 +15,7 @@ from uuid import uuid4
 from evo_helper.application.report_ingest import to_battle_report, ui_observations_for
 from evo_helper.config import Settings
 from evo_helper.infrastructure.artifacts import SqlAlchemyUiObservationStore
+from evo_helper.infrastructure.logging import configure_logging
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.live_reports import LiveBattleReport, LiveReportReader
@@ -82,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         help="print the parsed report without writing to the database",
     )
     args = parser.parse_args(argv)
+    log_path = configure_logging()
 
     for path in (args.detail, args.replay):
         if not path.is_file():
@@ -96,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"attacker      : {live.attacker.player} {live.attacker.coordinate.value}")
     print(f"defender      : {live.defender.player} {live.defender.coordinate.value}")
     print(f"fleet rows    : {len(report.fleet)}")
+    print(f"read time     : {live.timing.summary()}")
+    print(f"slowest stage : {live.timing.slowest[0]}")
+    print(f"log           : {log_path}")
     if args.dry_run:
         print("dry run: nothing written")
         return 0

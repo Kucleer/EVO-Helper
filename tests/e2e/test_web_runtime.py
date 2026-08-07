@@ -39,3 +39,22 @@ def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> 
         column["name"] for column in inspect(engine).get_columns("scan_plans")
     }
     assert engine.connect().execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+
+
+def test_applying_migrations_does_not_silence_application_logging(tmp_path: Path) -> None:
+    """Alembic's fileConfig defaults to disabling every existing logger.
+
+    The runtime migrates at startup, so that default would kill the
+    report-timing log for the rest of the process.
+    """
+    import logging
+
+    from evo_helper.web.runtime import _upgrade_database
+
+    logger = logging.getLogger("evo_helper.vision.live_reports")
+    logger.setLevel(logging.INFO)
+
+    _upgrade_database(f"sqlite:///{tmp_path / 'migrated.db'}")
+
+    assert logger.isEnabledFor(logging.INFO)
+    assert not logger.disabled
