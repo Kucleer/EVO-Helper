@@ -475,7 +475,10 @@ def create_app(
 
     @app.get("/intel", response_class=HTMLResponse)
     async def intel_page(request: Request) -> HTMLResponse:
-        """The intel centre loads its own data from /api/intel/*."""
+        """情报中心的筛选数据走 /api/intel/*，扫描结果随页面一起渲染。"""
+        # 必须用 get_service(request)：外层的 service 是工厂的可选参数，
+        # 直接引用会在未传入时是 None，而且类型上也不成立。
+        service = get_service(request)
         return templates.TemplateResponse(
             request=request,
             name="intel.html",
