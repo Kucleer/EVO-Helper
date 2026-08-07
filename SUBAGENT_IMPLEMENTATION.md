@@ -1037,9 +1037,27 @@ CI 还需通过静态规则确认：
 **该批次不足以作为验收基线**：单一会话、4 份样本，不满足第 7.4 节「按独立会话测试集计算」的要求，
 因此 `docs/ui-version-matrix.md` 维持「Needs current samples」。要转正仍需多会话样本与实测指标。
 
-### 25.5 下一步（按顺序）
+### 25.5 报告解析原语（已完成）
 
-1. 合并 PR #36，切回并更新 `main`。
-2. 以 25.2 的字段结构与本批次样本实现并验证 GamePort 的新邮件导航、攻击报告详情与回放解析；未知 UI 一律 fail-closed。
+按实测布局补齐 `src/evo_helper/vision/parsers.py`，见 `.changes/10-live-report-parsers.md`：
+`parse_report_timestamp`、`classify_report_subject` / `ReportKind`、`parse_fleet_column`、
+`parse_versus_block`、`parse_mail_rows_v2`、`parse_replay_rounds`。
+
+同时修掉两处会静默产出错误坐标的缺陷：
+
+- 读不到两个坐标时退回占位坐标 `1:1:1`（一个真实坐标），或把一侧坐标当作双方 → 改为 fail-closed。
+- 同一行上的两个坐标只取第一个，防守方坐标被丢弃 → 新增 `parse_all_coordinates`。
+
+### 25.6 待用户确认的开放问题
+
+**游戏报告时间的显示时区未核实。** 报告头显示 `06/08/2026 11:45:03`，但无法从画面判断这是 UTC、
+UTC+8 还是服务器时区。`parse_report_timestamp` 因此把 `display_zone` 设为必传参数、不给默认值。
+在用户确认之前，报告时间不能参与「攻击方出发坐标 + 目标坐标 + 报告时间」的严格匹配，否则整点偏移
+会让全部报告匹配失败或错配。
+
+### 25.7 下一步（按顺序）
+
+1. 确认报告时间的显示时区，并据此固化 `display_zone` 配置项。
+2. 把上述原语接到 GamePort 的邮件导航 → 攻击报告详情 → 回放链路，并按 ROI 分列送入 OCR；未知 UI 一律 fail-closed。
 3. 补采多会话样本（含异常态：字段缺失、回放过期、未知弹窗），跑出第 7.4 节指标后再更新 UI 版本矩阵。
 4. 再进入 CP6 dry-run 与 CP7 影子运行。
