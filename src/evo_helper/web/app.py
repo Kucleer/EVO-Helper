@@ -229,6 +229,25 @@ _RUN_STATE_GLYPH = {
 }
 
 
+#: 运行状态的中文标签。界面只显示中文；英文常量仍是接口与数据库里的值。
+_RUN_STATE_LABEL = {
+    "DRAFT": "草稿",
+    "ARMED": "待命",
+    "SCANNING": "扫描中",
+    "WAITING_CAPACITY": "等待航线",
+    "DRAINING": "收取战报",
+    "COMPLETED": "已完成",
+    "PAUSED": "已暂停",
+    "FAILED": "已失败",
+    "EMERGENCY_STOPPED": "已紧急停止",
+}
+
+
+def run_state_label(state: str) -> str:
+    """未知状态回落到原值，宁可显示英文也不要显示空白。"""
+    return _RUN_STATE_LABEL.get(state, state)
+
+
 def run_state_tone(state: str) -> str:
     return _RUN_STATE_TONE.get(state, "")
 
@@ -260,6 +279,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["run_state_tone"] = run_state_tone
     templates.env.globals["run_state_glyph"] = run_state_glyph
+    templates.env.globals["run_state_label"] = run_state_label
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
