@@ -1071,11 +1071,24 @@ CI 还需通过静态规则确认：
   非 1920×879 视口直接报错，不缩放；回合区块随滚动移动，只固定列的 x 边界。
   `BINARIZE_THRESHOLD = 140` 用于去掉面板里与正文同列的暗色装饰文字。
 
-尚未接线的部分：`ReportScreens` 的**具体实现**（截屏 → 裁 ROI → 二值化 → OCR → 滚动定位回合横幅）
-还没写，它属于持有浏览器窗口的适配器。上面两层已可脱离浏览器完整测试。
+- `vision/optional/report_screens.py`：`ImageReportScreens` 按 `LIVE_LAYOUT` 裁 ROI、放大后送
+  Tesseract（`chi_sim+eng`）。Pillow / pytesseract 属 `vision` extra。
 
-### 25.8 下一步（按顺序）
+### 25.8 OCR 配方（实测，不要凭肉眼判断）
 
-1. 实现 `ReportScreens` 适配器，用 `LIVE_LAYOUT` 裁图并接 Tesseract；用批次原图做离线回归。
+| 项 | 值 | 依据 |
+|---|---|---|
+| 二值化 | **不做** | 140 阈值肉眼看去干净，但送 Tesseract 反而更差：`95`→`a5`、`166`→`165`、`16`→`15` |
+| 预处理 | 灰度 + LANCZOS 放大 ×4 | 不放大会丢位（`178`→`78`） |
+| 舰队列 / 邮件行 | `--psm 6` | 多行列布局 |
+| 坐标 | 各自窄 ROI + `--psm 7` + 数字白名单 | 宽裁图里 `[2:137:18]` 被读成 `[e:137:18]` |
+| 装饰文字 | 无需处理 | 足够暗，Tesseract 自行丢弃；装饰最密的攻方列不产生伪造行 |
+
+离线回归 `tests/integration/vision/test_live_batch_ocr.py` 直接跑批次原图：双方坐标、报告时间、
+17 个舰队计数全部精确。缺 vision extra 时自动 skip。
+
+### 25.9 下一步（按顺序）
+
+1. 把 `ImageReportScreens` 接到实际浏览器采集：截屏来源、滚动定位 `第N回合` 横幅、翻页读满邮件列表。
 2. 补采多会话样本（含异常态：字段缺失、回放过期、未知弹窗），跑出第 7.4 节指标后再更新 UI 版本矩阵。
 3. 再进入 CP6 dry-run 与 CP7 影子运行。
