@@ -82,6 +82,17 @@ class StateEvent:
 
 
 @dataclass(frozen=True)
+class UiObservation:
+    observation_id: UUID
+    screen: str
+    ui_version: str | None
+    detection_result: str | None
+    confidence: float
+    observed_at_utc: datetime
+    evidence_artifact_id: UUID | None = None
+
+
+@dataclass(frozen=True)
 class TargetRevisit:
     revisit_id: UUID
     scope: str

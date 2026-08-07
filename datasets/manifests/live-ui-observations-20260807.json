@@ -1,0 +1,183 @@
+{
+  "batch": "evo-20260807-live-observations",
+  "captured_at_utc": "2026-08-07T02:10:00Z",
+  "source": "root-agent-browser",
+  "session_id": "chrome-mcp-1661587705",
+  "viewport": {
+    "width": 1920,
+    "height": 810,
+    "scale": 1.0,
+    "note": "Chrome window 1920x1080; screenshots returned downscaled to 1568x661."
+  },
+  "image_artifacts": {
+    "state": "supplied_by_user",
+    "batch": "evo-20260807-live",
+    "manifest": "var/captures/evo-20260807-live/evo-20260807-live-manifest.json",
+    "resolution": "1920x879",
+    "reason": "The browser control channel did not persist full-resolution screenshots (one 754x355 thumbnail only). The user captured the four screens manually instead.",
+    "consequence": "Images are runtime-only under var/ (gitignored) and pass strict capture-evidence validation, but they are a single manual session with four samples. That is not enough for the section 7.4 acceptance metrics, so docs/ui-version-matrix.md stays at 'Needs current samples'."
+  },
+  "notes": "Read-only navigation: home -> mail -> 报告 -> report detail -> 战斗详情 -> 战斗回放. No mail deleted, no reward claimed, no fleet dispatched. Opening reports marked them read, which the user authorised.",
+  "screens": [
+    {
+      "screen": "mail_list",
+      "ui_version_field": "mail_list_ui_version",
+      "observed": true,
+      "layout": {
+        "title": "邮箱",
+        "primary_tabs": ["个人", "报告", "探索", "收藏"],
+        "secondary_tabs": ["战斗", "侦察", "舰队", "系统"],
+        "secondary_tab_behaviour": "Unread-count badges that scroll the list to top; they do NOT filter the list. A parser must not assume the secondary tab selects a report subtype.",
+        "row_fields": ["subject", "sender", "timestamp"],
+        "row_states": ["unread (coloured subject)", "read (white subject)"],
+        "footer_actions": ["compose", "select-all", "delete"],
+        "timestamp_format": "DD/MM/YYYY HH:MM:SS"
+      },
+      "observed_subjects": [
+        "矮星系统战报",
+        "海盗攻击报告",
+        "侦察报告",
+        "攻击报告"
+      ],
+      "safety_note": "攻击报告 (player/bot attack report) is the only subject that carries a bot target. 海盗攻击报告 is a pirate battle and must not be matched to a bot dispatch."
+    },
+    {
+      "screen": "mail_detail_attack_report",
+      "ui_version_field": "battle_detail_ui_version",
+      "observed": true,
+      "sample": {
+        "sender": "System",
+        "timestamp_raw": "06/08/2026 11:45:03",
+        "subject": "攻击报告",
+        "outcome": "VICTORY",
+        "attacker": {
+          "player": "Kucleer",
+          "planet": "奥格瑞玛",
+          "coordinate": "[2:137:18]"
+        },
+        "defender": {
+          "player": "bot_2_149_17",
+          "planet": "bot_2_149_17's Planet",
+          "coordinate": "[2:149:17]"
+        },
+        "resources_gained": {
+          "metal": "928K",
+          "crystal": "501.1K",
+          "gas": "342.9K",
+          "unit_4": "7.7K"
+        },
+        "debris": {"metal": "3.7M", "crystal": "2.2M", "gas": "323K"},
+        "fleet_recovery": "20%",
+        "moon_chance": "15%",
+        "battle_detail": {
+          "attacker_units": 443,
+          "attacker_units_lost": 0,
+          "defender_units": "2.17K",
+          "defender_units_lost": "2.17K",
+          "tech_bonus": {
+            "attacker": {"weapon": "+55%", "shield": "+50%", "armour": "+55%"},
+            "defender": {"weapon": "+105%", "shield": "+105%", "armour": "+105%"}
+          },
+          "galaxy_stone_bonus": {
+            "attacker": {"weapon": "+99%", "shield": "+28%", "armour": "+156%"},
+            "defender": {"weapon": "+0%", "shield": "+0%", "armour": "+0%"}
+          }
+        }
+      },
+      "parser_landmarks": [
+        "发件人: / 主题: header pair with a right-aligned timestamp",
+        "战报 section banner above the VS block",
+        "VS block: player name, planet name, [galaxy:star:planet] per side",
+        "战斗详情 section banner; 查看战斗回放 button is the replay entry point",
+        "生成卫星概率 is present on attack reports and absent on pirate reports"
+      ],
+      "differences_from_pirate_report": [
+        "subject 攻击报告 vs 海盗攻击报告",
+        "defender player name is the bot account name, not the literal 'Pirates'",
+        "生成卫星概率 row is present"
+      ]
+    },
+    {
+      "screen": "battle_replay",
+      "ui_version_field": "battle_replay_ui_version",
+      "observed": true,
+      "sample": {
+        "title": "战斗回放",
+        "attacker": {"player": "Kucleer", "planet": "奥格瑞玛", "coordinate": "[2:137:18]"},
+        "defender": {"player": "bot_2_149_17", "planet": "bot_2_149_17's Planet", "coordinate": "[2:149:17]"},
+        "combined_bonus": {
+          "attacker": {"weapon": "+154%", "shield": "+78%", "armour": "+211%"},
+          "defender": {"weapon": "+105%", "shield": "+105%", "armour": "+105%"}
+        },
+        "participating_fleet": {
+          "attacker": {"深空吞噬者": 265, "钛能守卫者": 178},
+          "defender": {
+            "轻型战斗机": 461,
+            "重型战斗机": 736,
+            "巡洋舰": 257,
+            "战列舰": 148,
+            "无畏舰": 95,
+            "轰炸机": 166,
+            "毁灭者": 97,
+            "裂变者": 5,
+            "深空吞噬者": 2,
+            "钛能守卫者": 2,
+            "离子炮": 35,
+            "火箭发射器": 51,
+            "轻型激光炮": 55,
+            "MK2 加农炮": 48,
+            "等离子炮": 16
+          }
+        },
+        "round_1_remaining": {
+          "attacker": {"深空吞噬者": 265, "钛能守卫者": 178},
+          "defender": {
+            "轻型战斗机": 0,
+            "重型战斗机": 0,
+            "巡洋舰": 0,
+            "战列舰": 0,
+            "无畏舰": 0,
+            "轰炸机": 141,
+            "毁灭者": 97,
+            "裂变者": 5,
+            "深空吞噬者": 2,
+            "钛能守卫者": 2,
+            "离子炮": 35,
+            "火箭发射器": 51,
+            "轻型激光炮": 55
+          }
+        }
+      },
+      "parser_landmarks": [
+        "参战战舰 banner introduces the full pre-battle composition; this is the fleet snapshot to persist",
+        "第N回合【剩余战舰】 banners repeat per round with per-side remaining counts",
+        "Per-round stat cards: 射击次数 / 护盾吸收 / 装甲损伤 / 击杀数 / 引爆数",
+        "The defender list mixes ships and ground defences (离子炮, 火箭发射器, 轻型激光炮, MK2 加农炮, 等离子炮); the snapshot schema must keep them distinguishable",
+        "A zero count is rendered explicitly as 0 and must not be treated as a missing row"
+      ]
+    },
+    {
+      "screen": "battle_report_loading",
+      "ui_version_field": "battle_detail_ui_version",
+      "observed": true,
+      "layout": {
+        "description": "Between opening a report and content render, the panel shows only the decorative background text (COMMAND OFFICERS / TOTAL CREWS / -17003 / personnel) with no report fields.",
+        "safety_rule": "This state is indistinguishable from an empty report by field presence alone. The parser must fail closed and re-observe rather than record an empty report."
+      }
+    },
+    {
+      "screen": "mail_list_loading",
+      "ui_version_field": "mail_list_ui_version",
+      "observed": true,
+      "layout": {
+        "description": "The 邮箱 frame renders before the tab strip and rows. Tabs and rows appear ~4s later.",
+        "safety_rule": "Absence of rows is not an empty mailbox until the tab strip is present."
+      }
+    }
+  ],
+  "interaction_notes": [
+    "Panels do not respond to mouse-wheel scroll; the wheel moves the page/parallax instead. Panel content scrolls only via click-drag inside the panel.",
+    "Resizing the browser window does not re-layout the game canvas; a reload is required, which drops the open panel and returns to the entry screen.",
+    "After scrolling a panel the page itself can shift so the panel header (back button) leaves the viewport; scroll the page up before clicking back."
+  ]
+}
