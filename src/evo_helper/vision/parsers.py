@@ -8,6 +8,7 @@ instead of guessing.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
@@ -584,3 +585,103 @@ def _require_both_coordinates(
             f"{screen} needs an attacker and a defender coordinate; read {len(coordinates)}"
         )
     return coordinates[0], coordinates[1]
+
+
+class MissionType(Enum):
+    """派遣简报上的任务类型。
+
+    派攻击之前必须确认这里写的是「攻击」。类型选错会把舰队派成探索或运输，
+    既拿不到战报，也白烧一趟燃料。
+    """
+
+    ATTACK = "attack"
+    EXPLORE = "explore"
+    TRANSPORT = "transport"
+    RECYCLE = "recycle"
+    SCOUT = "scout"
+    UNKNOWN = "unknown"
+
+
+_MISSION_LABELS = {
+    "攻击": MissionType.ATTACK,
+    "探索": MissionType.EXPLORE,
+    "运输": MissionType.TRANSPORT,
+    "回收": MissionType.RECYCLE,
+    "侦察": MissionType.SCOUT,
+}
+
+#: 到达时间与「当前时间 + 飞行时长」允许的偏差。OCR 读的是秒级文本，
+#: 而读取本身要花时间，所以留一分钟；超过就说明至少有一处读错了。
+BRIEFING_SKEW_TOLERANCE = timedelta(minutes=1)
+
+
+@dataclass(frozen=True)
+class DispatchBriefing:
+    """派遣简报页（点「出发！」之前的那一屏）。"""
+
+    mission_type: MissionType
+    flight: timedelta
+    arrival_at_utc: datetime
+
+    @property
+    def is_attack(self) -> bool:
+        return self.mission_type is MissionType.ATTACK
+
+    @property
+    def expected_report_at_utc(self) -> datetime:
+        """战报在抵达时产生，所以就是到达时间。"""
+        return self.arrival_at_utc
+
+    def duration_agrees(self, *, now_utc: datetime) -> bool:
+        """交叉校验：绝对到达时间应当约等于当前时间加飞行时长。
+
+        两处都来自同一屏 OCR，对不上说明至少有一处读错了。用绝对时间作为
+        主来源、时长作为校验，比只用其中一个更难悄悄出错。
+        """
+        implied = now_utc + self.flight
+        return abs(implied - self.arrival_at_utc) <= BRIEFING_SKEW_TOLERANCE
+
+
+def parse_dispatch_briefing(ocr_text: str) -> DispatchBriefing:
+    """解析派遣简报页，缺关键字段就 fail closed。
+
+    到达时间是主来源：它不依赖本机时钟与游戏时钟同步，也不会因为「读完到点击
+    出发」之间的耗时而漂移。
+    """
+    flight = _labelled_duration(ocr_text, "飞行时间")
+    if flight is None:
+        raise UnknownUiVersionError("派遣简报缺少可读的飞行时间；面板可能仍在渲染")
+
+    arrival_line = _line_containing(ocr_text, "到达时间")
+    arrival = parse_report_timestamp(arrival_line, GAME_DISPLAY_ZONE) if arrival_line else None
+    if arrival is None:
+        raise UnknownUiVersionError("派遣简报缺少可读的预计到达时间；面板可能仍在渲染")
+
+    return DispatchBriefing(
+        mission_type=_mission_type(ocr_text), flight=flight, arrival_at_utc=arrival
+    )
+
+
+def _mission_type(ocr_text: str) -> MissionType:
+    line = _line_containing(ocr_text, "任务类型") or ""
+    for label, mission in _MISSION_LABELS.items():
+        if label in line:
+            return mission
+    return MissionType.UNKNOWN
+
+
+def _line_containing(ocr_text: str, label: str) -> str | None:
+    for line in ocr_text.splitlines():
+        if label in line:
+            return line
+    return None
+
+
+def _labelled_duration(ocr_text: str, label: str) -> timedelta | None:
+    from evo_helper.domain.report_wait import parse_game_duration
+
+    line = _line_containing(ocr_text, label)
+    if line is None:
+        return None
+    # 去掉标签本身，否则「飞行时间」里的数字都没有，但其它行的可能被带进来。
+    return parse_game_duration(line.split(label, 1)[-1])
