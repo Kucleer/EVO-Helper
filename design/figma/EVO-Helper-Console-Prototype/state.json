@@ -1,0 +1,21 @@
+{
+  "runId": "evo-console-20260807",
+  "fileKey": "dAXaK9feQZOhR68vSQXYJN",
+  "phase": "P3",
+  "step": "P3.a",
+  "entities": {
+    "collections": {
+      "primitives": "VariableCollectionId:2:2",
+      "color": "VariableCollectionId:2:3",
+      "layout": "VariableCollectionId:2:4"
+    },
+    "pages": {
+      "01_任务中心": "0:1",
+      "02_情报中心_默认态": "4:20",
+      "03_情报中心_命中详情": "4:21"
+    },
+    "components": {}
+  },
+  "completedSteps": ["P0.a", "P0.b", "P0.c", "P0.d", "P0.e", "P1.a", "P1.b", "P1.c", "P1.d", "P2.a", "P2.b", "P2.c"],
+  "pendingValidations": ["02_情报中心_默认态:screenshot", "03_情报中心_命中详情:screenshot", "04_组件库:create"]
+}
