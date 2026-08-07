@@ -21,7 +21,9 @@
 
 <section class="panel" aria-labelledby="new-task">
   <h2 id="new-task">新建扫描任务</h2>
-  <form data-api="/api/plans" id="plan-form">
+  {# No data-api: base.html's generic handler would post flat FormData and
+     double-submit. This form builds its own structured payload below. #}
+  <form id="plan-form">
     <div class="grid-12">
       <div class="col-4">
         <label for="name">任务名称</label>
@@ -91,6 +93,8 @@
 <script>
 (() => {
   const container = document.getElementById('ranges');
+  const DEFAULT_PRESET = {{ default_preset | tojson }};
+  const DEFAULT_PRESET_SIGNATURE = {{ default_preset_signature | tojson }};
 
   function addRange() {
     const row = document.createElement('div');
@@ -101,7 +105,7 @@
       <div class="col-3"><label>起点坐标</label><input class="r-start" placeholder="1:100:1" style="width:100%"></div>
       <div class="col-3"><label>终点坐标</label><input class="r-end" placeholder="1:200:15" style="width:100%"></div>
       <div class="col-3"><label>出发星球</label><input class="r-origin" placeholder="2:137:18" style="width:100%"></div>
-      <div class="col-2"><label>舰队预设</label><input class="r-preset" placeholder="main-fleet" style="width:100%"></div>
+      <div class="col-2"><label>舰队预设</label><input class="r-preset" value="${DEFAULT_PRESET}" style="width:100%"></div>
       <div class="col-1" style="display:flex;align-items:flex-end">
         <button class="btn small ghost" type="button" aria-label="移除区段">✕</button>
       </div>`;
@@ -129,7 +133,9 @@
         end: parse(row.querySelector('.r-end').value, '终点坐标'),
         origin: parse(row.querySelector('.r-origin').value, '出发星球'),
         fleet_preset: row.querySelector('.r-preset').value.trim(),
-        fleet_preset_signature: row.querySelector('.r-preset').value.trim(),
+        // The signature is the composition, not the name: a two-character
+        // preset name cannot be OCR-repaired, so the ship counts carry the check.
+        fleet_preset_signature: DEFAULT_PRESET_SIGNATURE,
         priority: 0,
       }));
       if (!ranges.length) throw new Error('至少需要一个扫描区段');
@@ -145,7 +151,7 @@
     } catch (error) {
       alert(error.message);
     }
-  }, true);
+  });
 })();
 </script>
 {% endblock %}

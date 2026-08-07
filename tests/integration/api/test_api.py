@@ -237,3 +237,71 @@ def test_static_console_stylesheet_is_served() -> None:
     response = client.get("/static/console.css")
     assert response.status_code == 200
     assert "--accent" in response.text
+
+
+def test_origin_outside_the_scan_range_is_accepted() -> None:
+    """The departure planet is the player's own and is normally outside the range.
+
+    Requiring it inside made the plan form unusable for real data: attacking
+    bots in 1:100-1:200 from your own planet at 2:137:18 was rejected.
+    """
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "morning-scan",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 100, "position": 1},
+                    "end": {"galaxy": 1, "system": 200, "position": 15},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "main-fleet",
+                    "fleet_preset_signature": "main-fleet-v1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["ranges"][0]["origin"] == {
+        "galaxy": 2,
+        "system": 137,
+        "position": 18,
+    }
+
+
+def test_a_reversed_scan_range_is_still_rejected() -> None:
+    """Dropping the origin rule must not loosen the range rule."""
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "bad-range",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 200, "position": 1},
+                    "end": {"galaxy": 1, "system": 100, "position": 1},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "main-fleet",
+                    "fleet_preset_signature": "main-fleet-v1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "precede" in response.json()["detail"]

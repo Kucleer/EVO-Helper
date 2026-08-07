@@ -227,6 +227,9 @@ def create_app(
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
 
+    def settings_for(request: Request) -> Settings:
+        return cast(Settings, request.app.state.settings)
+
     @app.exception_handler(ServiceError)
     async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
         return JSONResponse({"detail": exc.message}, status_code=exc.status_code)
@@ -407,6 +410,8 @@ def create_app(
                 "active_runs": dashboard.active_run_count,
                 "target_count": dashboard.target_count,
                 "pending_revisits": dashboard.pending_revisit_count,
+                "default_preset": settings_for(request).default_fleet_preset,
+                "default_preset_signature": settings_for(request).default_fleet_preset_signature,
             },
         )
 

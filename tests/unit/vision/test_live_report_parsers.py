@@ -358,3 +358,37 @@ class TestListColumnsAreRealUnits:
         from evo_helper.web.display import LIST_SHIP_COLUMNS
 
         assert set(LIST_SHIP_COLUMNS) <= set(UNIT_ORDER)
+
+
+class TestPresetSignature:
+    """Safety invariant 9: the preset name AND its composition must match."""
+
+    def test_composition_signature_round_trips(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        assert composition_signature({"轻型战斗机": 1}) == "轻型战斗机:1"
+
+    def test_signature_is_order_independent(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        first = composition_signature({"轻型战斗机": 1, "巡洋舰": 2})
+        second = composition_signature({"巡洋舰": 2, "轻型战斗机": 1})
+        assert first == second
+
+    def test_different_counts_give_different_signatures(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        assert composition_signature({"轻型战斗机": 1}) != composition_signature({"轻型战斗机": 2})
+
+    def test_default_preset_is_the_scouting_preset(self) -> None:
+        from evo_helper.domain.fleet_preset import DEFAULT_PRESET
+
+        assert DEFAULT_PRESET.name == "探路"
+        assert DEFAULT_PRESET.signature == "轻型战斗机:1"
+
+    def test_a_two_character_name_is_below_the_snap_threshold(self) -> None:
+        """探路 cannot be OCR-repaired, which is why composition must also match."""
+        from evo_helper.vision.parsers import snap_unit_name
+
+        name, category = snap_unit_name("探路")
+        assert (name, category) == ("探路", "unknown")

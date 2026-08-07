@@ -381,8 +381,9 @@ class PersistentApplicationService:
         for item in ranges:
             if item.end < item.start:
                 raise ServiceError("range end must not precede its start")
-            if not item.start <= item.origin <= item.end:
-                raise ServiceError("range origin must lie inside the range")
+            # The origin is deliberately not required to fall inside the range.
+            # It is the player's own planet, which normally sits well outside
+            # the coordinates being scanned.
 
     @staticmethod
     def _replace_ranges(session: Session, plan_id: int, ranges: tuple[ScanRangeView, ...]) -> None:
