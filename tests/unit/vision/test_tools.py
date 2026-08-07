@@ -4,6 +4,7 @@ import json
 
 from evo_helper.datasets.manifest import DatasetManifest, validate_manifest
 from evo_helper.tools.capture import main as capture_main
+from evo_helper.tools.dataset import main as dataset_main
 
 
 def test_capture_cli_writes_manifest(tmp_path) -> None:
@@ -39,6 +40,7 @@ def test_capture_cli_writes_manifest(tmp_path) -> None:
         assert sample["eligible_for_current_mail_baseline"]
         assert sample["screen"] == "mail_list"
         assert sample["ui_version"] == "mail-list-v2"
+        assert sample["source"] == "evo-capture"
         assert len(sample["sha256"]) == 64
     assert validate_manifest(DatasetManifest.load(manifest_path), out) == []
 
@@ -78,3 +80,37 @@ def test_capture_cli_rejects_non_mail_baseline_eligibility(tmp_path) -> None:
         assert exc.code == 2
     else:  # pragma: no cover - explicit safety assertion
         raise AssertionError("only current mail-list captures may enter that baseline")
+
+
+def test_dataset_cli_validates_complete_capture_evidence(tmp_path, capsys) -> None:
+    out = tmp_path / "out"
+    assert (
+        capture_main(
+            [
+                "--batch",
+                "capture-evidence",
+                "--out",
+                str(out),
+                "--platform",
+                "fake",
+                "--screen",
+                "home",
+                "--ui-version",
+                "unknown",
+            ]
+        )
+        == 0
+    )
+    assert (
+        dataset_main(
+            [
+                "validate",
+                str(out / "capture-evidence-manifest.json"),
+                "--base-dir",
+                str(out),
+                "--capture-evidence",
+            ]
+        )
+        == 0
+    )
+    assert "OK (1 samples)" in capsys.readouterr().out

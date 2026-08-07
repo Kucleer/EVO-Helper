@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from evo_helper.datasets.manifest import DatasetManifest, validate_manifest
+from evo_helper.datasets.manifest import (
+    DatasetManifest,
+    validate_capture_manifest,
+    validate_manifest,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -15,6 +19,11 @@ def main(argv: list[str] | None = None) -> int:
     validate = sub.add_parser("validate", help="validate a manifest against its files")
     validate.add_argument("manifest", type=Path)
     validate.add_argument("--base-dir", type=Path, default=Path("."))
+    validate.add_argument(
+        "--capture-evidence",
+        action="store_true",
+        help="require complete browser-capture evidence metadata",
+    )
 
     annotate = sub.add_parser("annotate", help="mark 7/21 regression eligibility")
     annotate.add_argument("manifest", type=Path)
@@ -25,7 +34,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "validate":
         manifest = DatasetManifest.load(args.manifest)
-        errors = validate_manifest(manifest, args.base_dir)
+        validator = validate_capture_manifest if args.capture_evidence else validate_manifest
+        errors = validator(manifest, args.base_dir)
         for error in errors:
             print(f"ERROR: {error}")
         print(f"{'FAIL' if errors else 'OK'} ({len(manifest.samples)} samples)")

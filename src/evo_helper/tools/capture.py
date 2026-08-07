@@ -29,6 +29,7 @@ class CapturedImage:
     ui_version: str
     viewport: dict[str, object]
     sha256: str
+    source: str
 
 
 class CapturePlatform(Protocol):
@@ -82,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--screen", default="mail_list")
     parser.add_argument("--ui-version", default="mail-list-v2")
     parser.add_argument("--session-id", default=None)
+    parser.add_argument("--source", default="evo-capture")
     parser.add_argument(
         "--legacy",
         action="store_true",
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                 ui_version=args.ui_version,
                 viewport={"width": 1920, "height": 1080, "scale": 1.0},
                 sha256=compute_sha256(path),
+                source=args.source,
             )
         )
     manifest_path = out / f"{args.batch}-manifest.json"
