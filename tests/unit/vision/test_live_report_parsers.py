@@ -224,3 +224,34 @@ class TestPlaceholderCoordinateIsRefused:
             parse_battle_detail(
                 page, "attack from 1:2:3\nattacker fleet:\nlight fighter x10", "ocr"
             )
+
+
+class TestGameDisplayZone:
+    """Game times render in UTC+0 (confirmed by the user on 2026-08-07)."""
+
+    def test_game_display_zone_is_utc(self) -> None:
+        from evo_helper.vision.parsers import GAME_DISPLAY_ZONE
+
+        assert GAME_DISPLAY_ZONE.utcoffset(None) == timedelta(0)
+
+    def test_report_timestamp_in_game_zone_is_not_shifted(self) -> None:
+        from evo_helper.vision.parsers import GAME_DISPLAY_ZONE
+
+        parsed = parse_report_timestamp("06/08/2026 11:45:03", GAME_DISPLAY_ZONE)
+        assert parsed is not None
+        assert (parsed.hour, parsed.minute, parsed.second) == (11, 45, 3)
+
+    def test_bare_iso_game_time_is_read_as_utc(self) -> None:
+        """A bare report time must not be shifted by the UTC+8 schedule zone."""
+        from evo_helper.vision.parsers import parse_iso_utc
+
+        parsed = parse_iso_utc("2026-08-06 14:30:00")
+        assert parsed is not None
+        assert parsed.hour == 14
+
+    def test_explicit_zone_still_wins(self) -> None:
+        from evo_helper.vision.parsers import parse_iso_utc
+
+        parsed = parse_iso_utc("2026-08-06T14:30:00+08:00")
+        assert parsed is not None
+        assert parsed.hour == 6

@@ -71,7 +71,7 @@ destroyer x2
     assert result.defender_target.value == Coordinate(9, 8, 7)
     assert result.reported_at_utc is not None
     assert result.reported_at_utc.tzinfo == UTC
-    assert result.reported_at_utc.hour == 6  # 14:30 UTC+8 -> 06:30 UTC
+    assert result.reported_at_utc.hour == 14  # game times render in UTC+0
     assert len(result.attacker_fleet) == 2
     assert result.attacker_fleet[0].ship_type == "light fighter"
     assert result.attacker_fleet[0].count == 10
@@ -111,7 +111,10 @@ def test_parse_galaxy_tracks_bot_owners() -> None:
 
 def test_parse_iso_utc_handles_explicit_and_implicit_zones() -> None:
     explicit = parse_iso_utc("2026-08-06T06:30:00Z")
-    implicit = parse_iso_utc("2026-08-06 14:30:00")
+    offset = parse_iso_utc("2026-08-06T14:30:00+08:00")
+    bare = parse_iso_utc("2026-08-06 14:30:00")
     assert explicit is not None and explicit.hour == 6
-    assert implicit is not None and implicit.hour == 6
+    assert offset is not None and offset.hour == 6
+    # A bare game time is UTC+0, not the UTC+8 schedule zone.
+    assert bare is not None and bare.hour == 14
     assert parse_iso_utc("no timestamp here") is None
