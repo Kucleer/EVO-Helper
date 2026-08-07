@@ -18,6 +18,7 @@ from .service import (
     SHANGHAI,
     BotTargetView,
     ConflictError,
+    CoordinateScanView,
     DashboardView,
     FakeApplicationService,
     FleetDiffView,
@@ -215,6 +216,33 @@ class PersistentApplicationService:
                 view
                 for report in reports
                 if (view := self._report_view(session, coordinate, report))
+            ]
+
+    def list_scans(self, limit: int = 500) -> list[CoordinateScanView]:
+        """按坐标顺序列出扫描事实。
+
+        这里**不**过滤 bot：一次扫描的价值一半在于「这些坐标里没有 bot」，
+        只显示 bot 会让空扫描看起来像什么都没发生。
+        """
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.CoordinateScanRow)
+                .order_by(
+                    orm.CoordinateScanRow.galaxy,
+                    orm.CoordinateScanRow.system,
+                    orm.CoordinateScanRow.position,
+                )
+                .limit(limit)
+            ).all()
+            return [
+                CoordinateScanView(
+                    coordinate=Coordinate(row.galaxy, row.system, row.position),
+                    scanned_at_utc=row.scanned_at_utc,
+                    owner_name=row.owner_name,
+                    is_bot=row.is_bot,
+                    confidence=row.confidence,
+                )
+                for row in rows
             ]
 
     def get_fleet_diff(self, coordinate: Coordinate) -> FleetDiffView | None:

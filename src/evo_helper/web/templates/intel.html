@@ -476,4 +476,43 @@
   })();
 })();
 </script>
+
+<section class="panel" aria-labelledby="scan-facts">
+  <h2 id="scan-facts">坐标扫描结果</h2>
+  <p class="muted" style="margin:0 0 10px;font-size:12px">
+    含空位与非 bot 归属。一次扫描的价值一半在于「这些坐标里没有 bot」，
+    只列 bot 会让空扫描看起来像什么都没发生。
+  </p>
+  <div class="table-wrap" style="max-height:460px;overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">坐标</th><th scope="col">归属</th>
+          <th scope="col">类型</th><th scope="col">扫描时间 (UTC)</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for scan in scans %}
+        <tr>
+          <td class="coord">{{ scan.coordinate }}</td>
+          <td>{{ scan.owner_name or '—' }}</td>
+          <td>
+            {% if scan.is_bot %}
+              <span class="chip ok"><span class="glyph" aria-hidden="true">●</span>bot</span>
+            {% elif scan.owner_name %}
+              <span class="chip warn"><span class="glyph" aria-hidden="true">◆</span>有主</span>
+            {% else %}
+              <span class="chip"><span class="glyph" aria-hidden="true">○</span>空位</span>
+            {% endif %}
+          </td>
+          <td class="muted">{{ scan.scanned_at }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">还没有坐标扫描记录。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
 {% endblock %}

@@ -56,6 +56,14 @@ class ScanRangeOut(ScanRangeIn):
     pass
 
 
+class CoordinateScanOut(BaseModel):
+    coordinate: CoordinateModel
+    scanned_at_utc: datetime
+    owner_name: str | None
+    is_bot: bool
+    confidence: float
+
+
 class ScanPlanOut(BaseModel):
     id: UUID
     name: str
