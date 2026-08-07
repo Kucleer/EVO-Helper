@@ -1,40 +1,33 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}EVO-Helper{% endblock %}</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 1rem; }
-    nav { display: flex; gap: 1rem; margin-bottom: 1rem; }
-    nav a { text-decoration: none; }
-    table { border-collapse: collapse; width: 100%; margin: 0.75rem 0; }
-    th, td { border: 1px solid #888; padding: 0.35rem 0.5rem; text-align: left; }
-    .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
-    .card { border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; min-width: 8rem; }
-    .card b { font-size: 1.6rem; display: block; }
-    form.inline { display: inline; }
-    .muted { color: #777; }
-    .danger { color: #b00020; }
-  </style>
+  <link rel="stylesheet" href="/static/console.css">
   <script>
     window.EVOHelper = {
-      async post(url, data) {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data),
-        });
+      async request(method, url, data) {
+        const options = { method, headers: {} };
+        if (data !== undefined) {
+          options.headers['Content-Type'] = 'application/json';
+          options.body = JSON.stringify(data);
+        }
+        const response = await fetch(url, options);
         if (!response.ok) {
           let detail = response.statusText;
           try { detail = (await response.json()).detail || detail; } catch (_) {}
-          alert(detail);
-          throw new Error(detail);
+          const error = new Error(detail);
+          error.detail = detail;
+          throw error;
         }
-        return response;
+        return response.status === 204 ? null : response.json();
       },
+      post(url, data) { return this.request('POST', url, data); },
+      get(url) { return this.request('GET', url); },
+      del(url) { return this.request('DELETE', url); },
     };
+
     document.addEventListener('submit', (event) => {
       const form = event.target;
       if (!form.matches('form[data-api]')) return;
@@ -42,19 +35,38 @@
       const data = {};
       for (const [key, value] of new FormData(form).entries()) data[key] = value;
       EVOHelper.post(form.dataset.api, data)
-        .then(() => { window.location.reload(); })
-        .catch(() => {});
+        .then(() => window.location.reload())
+        .catch((error) => alert(error.detail || error.message));
     });
   </script>
 </head>
 <body>
-  <nav>
-    <a href="/">Home</a>
-    <a href="/plans">Plans</a>
-    <a href="/runs">Runs</a>
-    <a href="/targets">Targets</a>
-    <a href="/diagnostics">Diagnostics</a>
+<div class="shell">
+  <nav class="sidenav" aria-label="主导航">
+    <div class="brand">EVO&nbsp;HELPER</div>
+    <a href="/missions" {% if active == 'missions' %}aria-current="page"{% endif %}>任务中心</a>
+    <a href="/intel" {% if active == 'intel' %}aria-current="page"{% endif %}>情报中心</a>
+    <div class="group-label">辅助</div>
+    <a href="/runs" {% if active == 'runs' %}aria-current="page"{% endif %}>运行详情</a>
+    <a href="/diagnostics" {% if active == 'diagnostics' %}aria-current="page"{% endif %}>诊断</a>
   </nav>
-  {% block content %}{% endblock %}
+  <div class="main">
+    <header class="topbar">
+      <h1>{% block heading %}EVO-Helper{% endblock %}</h1>
+      <div class="spacer"></div>
+      {% block topbar_extra %}{% endblock %}
+      {#
+        The dry-run lock is shown, never toggled. Turning it off is a
+        deliberate Canary step outside this UI (see docs/safety.md).
+      #}
+      <span class="chip locked" title="真实派遣只能通过 Canary 安全流程解锁，本界面不提供开关">
+        <span class="glyph" aria-hidden="true">🔒</span>dry run 已锁定
+      </span>
+    </header>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </div>
+</div>
 </body>
 </html>

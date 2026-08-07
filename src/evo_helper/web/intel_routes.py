@@ -27,6 +27,7 @@ from evo_helper.storage.intel import (
     decode_group,
     encode_group,
 )
+from evo_helper.vision.parsers import UNIT_ORDER
 
 
 class SpanIn(BaseModel):
@@ -93,8 +94,16 @@ def register_intel_routes(app: FastAPI, session_factory: sessionmaker[Session]) 
 
     @router.get("/ships", response_model=list[str])
     async def list_ships() -> list[str]:
-        """Ship types actually recorded on a defender, for the field picker."""
-        return sorted(repository.known_ship_names())
+        """Recorded defender unit types, in the order the game lists them.
+
+        Alphabetical order would scatter the catalogue; the picker reads more
+        like the in-game list this way. Anything recorded but not in the
+        catalogue is appended so it stays visible rather than disappearing.
+        """
+        recorded = repository.known_ship_names()
+        known = [name for name in UNIT_ORDER if name in recorded]
+        extra = sorted(recorded - set(UNIT_ORDER))
+        return known + extra
 
     @router.post("/search", response_model=SearchOut)
     async def search(payload: SearchIn) -> SearchOut:

@@ -19,8 +19,8 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
-from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.intel_query import (
     ConditionGroup,

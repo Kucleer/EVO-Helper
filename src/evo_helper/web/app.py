@@ -7,12 +7,14 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 
+from .display import LIST_SHIP_COLUMNS
 from .schemas import (
     BotTargetOut,
     CoordinateModel,
@@ -54,6 +56,7 @@ from .service import (
 )
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 def _default_token() -> str:
@@ -219,6 +222,7 @@ def create_app(
     token = local_token or _default_token()
     app.add_middleware(LocalSecurityMiddleware, local_token=token)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
@@ -388,6 +392,32 @@ def create_app(
         return _run_out(service.emergency_stop_run(run_id))
 
     # ---- targets / history ----------------------------------------------
+
+    @app.get("/missions", response_class=HTMLResponse)
+    async def missions_page(request: Request) -> HTMLResponse:
+        service = get_service(request)
+        dashboard = service.dashboard()
+        return templates.TemplateResponse(
+            request=request,
+            name="missions.html",
+            context={
+                "active": "missions",
+                "plans": [_plan_out(plan) for plan in service.list_plans()],
+                "plan_count": dashboard.plan_count,
+                "active_runs": dashboard.active_run_count,
+                "target_count": dashboard.target_count,
+                "pending_revisits": dashboard.pending_revisit_count,
+            },
+        )
+
+    @app.get("/intel", response_class=HTMLResponse)
+    async def intel_page(request: Request) -> HTMLResponse:
+        """The intel centre loads its own data from /api/intel/*."""
+        return templates.TemplateResponse(
+            request=request,
+            name="intel.html",
+            context={"active": "intel", "list_ship_columns": list(LIST_SHIP_COLUMNS)},
+        )
 
     @app.get("/targets", response_class=HTMLResponse)
     async def targets_page(request: Request) -> HTMLResponse:

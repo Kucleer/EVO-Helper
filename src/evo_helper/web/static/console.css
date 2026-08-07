@@ -1,0 +1,322 @@
+/* EVO-Helper dark operations console.
+ *
+ * Status is never carried by colour alone: every state chip pairs its colour
+ * with a glyph and a word, so the console stays readable for colour-blind
+ * users and in greyscale.
+ */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0d1117;
+  --bg-panel: #151b24;
+  --bg-panel-raised: #1b232e;
+  --bg-input: #0f151d;
+  --border: #263140;
+  --border-strong: #35435a;
+
+  --text: #e4eaf2;
+  --text-muted: #8b97a8;
+  --text-faint: #5f6b7c;
+
+  --accent: #35c8e0;
+  --accent-strong: #4fdcf2;
+  --accent-dim: #16323b;
+
+  --ok: #4ec98a;
+  --warn: #e0b341;
+  --danger: #e5675f;
+
+  --radius: 6px;
+  --gap: 16px;
+  --nav-w: 208px;
+  --topbar-h: 52px;
+
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ---- shell ---------------------------------------------------------- */
+
+.shell { display: grid; grid-template-columns: var(--nav-w) 1fr; min-height: 100vh; }
+
+.sidenav {
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  padding: 18px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  font-size: 13px;
+  color: var(--accent);
+  padding: 0 20px 18px;
+}
+
+.sidenav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 9px 20px;
+  border-left: 2px solid transparent;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.sidenav a:hover { color: var(--text); background: var(--bg-panel-raised); }
+
+.sidenav a[aria-current="page"] {
+  color: var(--accent-strong);
+  border-left-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.sidenav .group-label {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 16px 20px 6px;
+}
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+
+.topbar {
+  height: var(--topbar-h);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  padding: 0 20px;
+  flex-wrap: wrap;
+}
+
+.topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+.topbar .spacer { flex: 1; }
+
+.content { padding: 14px; display: grid; gap: 12px; align-content: start; }
+
+/* ---- panels --------------------------------------------------------- */
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.panel > h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.grid-12 { display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--gap); }
+.col-3 { grid-column: span 3; }
+.col-4 { grid-column: span 4; }
+.col-6 { grid-column: span 6; }
+.col-12 { grid-column: span 12; }
+
+/* ---- chips ---------------------------------------------------------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel-raised);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.chip .glyph { font-weight: 700; }
+.chip.ok { color: var(--ok); border-color: #24503c; }
+.chip.warn { color: var(--warn); border-color: #524220; }
+.chip.danger { color: var(--danger); border-color: #562b2a; }
+.chip.locked { color: var(--accent); border-color: #234a55; }
+
+/* ---- stat tiles ----------------------------------------------------- */
+
+.tile { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+.tile .label { color: var(--text-muted); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+
+/* ---- forms ---------------------------------------------------------- */
+
+label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+
+input, select, button, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 6px 9px;
+}
+
+input:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[type="number"] { font-variant-numeric: tabular-nums; }
+
+.btn { cursor: pointer; background: var(--bg-panel-raised); }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: #04222a; border-color: var(--accent); font-weight: 600; }
+.btn.primary:hover { background: var(--accent-strong); }
+.btn.ghost { background: transparent; color: var(--text-muted); }
+.btn.small { padding: 3px 8px; font-size: 12px; }
+
+.field-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+
+/* ---- compact filter bar ---------------------------------------------
+ * Laptop screens are the target, so the filter must not eat the fold. Labels
+ * sit inline instead of stacked, which halves the bar's height.
+ */
+
+.panel.compact { padding: 10px 12px; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.filter-bar input, .filter-bar select { padding: 3px 7px; font-size: 13px; }
+.filter-bar .inline-label { color: var(--text-muted); font-size: 12px; }
+.filter-bar .dash { color: var(--text-faint); }
+.filter-bar .spacer { flex: 1 1 16px; }
+.filter-bar .sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 4px;
+}
+
+details#cond-details { margin-top: 8px; }
+
+details#cond-details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 2px 0;
+  user-select: none;
+}
+
+details#cond-details > summary:focus-visible { outline: 2px solid var(--accent); }
+details#cond-details[open] > summary { margin-bottom: 6px; }
+
+/* ---- condition builder ---------------------------------------------- */
+
+.cond-group {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.cond-group.root { border: none; padding: 0; background: none; }
+.cond-group-head { display: flex; gap: 8px; align-items: center; }
+.cond-group-head select { padding: 3px 7px; font-size: 12px; }
+.cond-row { display: flex; gap: 6px; align-items: center; }
+.cond-row select, .cond-row input { min-width: 0; padding: 3px 7px; font-size: 13px; }
+.cond-row .field { flex: 0 1 150px; }
+.cond-row .op { flex: 0 0 68px; }
+.cond-row .val { flex: 0 1 92px; }
+
+/* ---- tables --------------------------------------------------------- */
+
+/* The wrapper scrolls in both directions so the sticky header locks to the
+   table rather than to the page, which keeps it visible on a short screen. */
+.table-wrap { overflow: auto; max-height: calc(100vh - 260px); min-height: 160px; }
+
+table { border-collapse: collapse; width: 100%; }
+
+th, td {
+  text-align: left;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-panel);
+  box-shadow: inset 0 -1px 0 var(--border-strong);
+}
+
+tbody tr:hover { background: var(--bg-panel-raised); cursor: pointer; }
+tbody tr[aria-selected="true"] { background: var(--accent-dim); }
+
+td.num, th.num { text-align: center; }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
+td.coord { font-family: var(--mono); color: var(--accent-strong); }
+
+/* ---- history dialog -------------------------------------------------- */
+
+dialog {
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  max-height: 82vh;
+  overflow: auto;
+}
+
+dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
+
+.detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.detail-head h2 { margin: 0; font-size: 15px; font-family: var(--mono); color: var(--accent-strong); }
+
+.timeline { display: grid; gap: 12px; }
+.timeline-entry { border-left: 2px solid var(--border-strong); padding-left: 12px; }
+.timeline-entry .when { color: var(--text-muted); font-size: 12px; }
+
+.delta-up { color: var(--ok); }
+.delta-down { color: var(--danger); }
+
+.muted { color: var(--text-muted); }
+.empty { color: var(--text-muted); padding: 28px; text-align: center; border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+.error { color: var(--danger); border: 1px solid #562b2a; background: #2a1817; border-radius: 4px; padding: 9px 12px; }
+
+/* Narrow screens: the nav collapses to a horizontal strip. The results
+   table keeps its per-ship columns and scrolls inside .table-wrap. */
+@media (max-width: 1100px) {
+  .shell { grid-template-columns: 1fr; }
+  .sidenav { flex-direction: row; overflow-x: auto; padding: 8px; }
+  .sidenav .brand, .sidenav .group-label { display: none; }
+  .sidenav a { border-left: none; border-bottom: 2px solid transparent; }
+  .sidenav a[aria-current="page"] { border-bottom-color: var(--accent); }
+}

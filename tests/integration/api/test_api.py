@@ -211,3 +211,29 @@ def test_plan_requires_a_preset_signature() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_console_pages_render() -> None:
+    """The two console pages must render; a template or service typo is a 500."""
+    client, _ = _make_client()
+
+    for path, marker in (("/missions", "任务中心"), ("/intel", "情报中心")):
+        response = client.get(path)
+        assert response.status_code == 200, (path, response.status_code)
+        assert marker in response.text
+
+
+def test_console_pages_show_the_dry_run_lock() -> None:
+    """The lock is informational and must never render as a toggle."""
+    client, _ = _make_client()
+
+    body = client.get("/missions").text
+    assert "dry run 已锁定" in body
+    assert 'type="checkbox"' not in body
+
+
+def test_static_console_stylesheet_is_served() -> None:
+    client, _ = _make_client()
+    response = client.get("/static/console.css")
+    assert response.status_code == 200
+    assert "--accent" in response.text

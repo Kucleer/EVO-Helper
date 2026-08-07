@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block title %}任务中心 · EVO-Helper{% endblock %}
+{% block heading %}任务中心{% endblock %}
+{% block topbar_extra %}
+<span class="chip {{ 'ok' if active_runs else '' }}">
+  <span class="glyph" aria-hidden="true">{{ '▶' if active_runs else '■' }}</span>
+  {{ '运行中 ' ~ active_runs if active_runs else '空闲' }}
+</span>
+<span class="chip">
+  <span class="glyph" aria-hidden="true">🕗</span>时间窗口 UTC+8
+</span>
+{% endblock %}
+{% block content %}
+
+<div class="grid-12">
+  <div class="col-3 tile"><div class="label">扫描计划</div><div class="value">{{ plan_count }}</div></div>
+  <div class="col-3 tile"><div class="label">运行中实例</div><div class="value">{{ active_runs }}</div></div>
+  <div class="col-3 tile"><div class="label">已记录 bot</div><div class="value">{{ target_count }}</div></div>
+  <div class="col-3 tile"><div class="label">待复查</div><div class="value">{{ pending_revisits }}</div></div>
+</div>
+
+<section class="panel" aria-labelledby="new-task">
+  <h2 id="new-task">新建扫描任务</h2>
+  <form data-api="/api/plans" id="plan-form">
+    <div class="grid-12">
+      <div class="col-4">
+        <label for="name">任务名称</label>
+        <input id="name" name="name" required style="width:100%">
+      </div>
+      <div class="col-3">
+        <label for="window_start">开始时间 (UTC+8)</label>
+        <input id="window_start" name="window_start" value="08:00" required style="width:100%">
+      </div>
+      <div class="col-3">
+        <label for="window_end">结束时间 (UTC+8)</label>
+        <input id="window_end" name="window_end" value="10:00" required style="width:100%">
+      </div>
+      <div class="col-2">
+        <label for="priority">优先级</label>
+        <input id="priority" name="priority" type="number" value="0" style="width:100%">
+      </div>
+    </div>
+
+    <h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin:18px 0 8px">
+      扫描区段 <span class="muted" style="text-transform:none;letter-spacing:0">（起止坐标均包含）</span>
+    </h3>
+    <div id="ranges"></div>
+    <button class="btn small" type="button" id="add-range">+ 增加区段</button>
+
+    <div class="field-row" style="margin-top:18px">
+      <button class="btn primary" type="submit">创建任务</button>
+      <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>创建后仍为 dry run</span>
+    </div>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="history">
+  <h2 id="history">历史任务</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">名称</th><th scope="col">时间窗口</th><th scope="col">区段数</th>
+          <th scope="col">状态</th><th scope="col">dry run</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for plan in plans %}
+        <tr onclick="location.href='/runs'">
+          <td>{{ plan.name }}</td>
+          <td>{{ plan.window_start }} – {{ plan.window_end }} <span class="muted">UTC+8</span></td>
+          <td class="num">{{ plan.ranges | length }}</td>
+          <td>
+            <span class="chip {{ 'ok' if plan.enabled else '' }}">
+              <span class="glyph" aria-hidden="true">{{ '●' if plan.enabled else '○' }}</span>
+              {{ '已启用' if plan.enabled else '已停用' }}
+            </span>
+          </td>
+          <td>
+            <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>{{ '是' if plan.dry_run else '否' }}</span>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">还没有扫描计划。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+(() => {
+  const container = document.getElementById('ranges');
+
+  function addRange() {
+    const row = document.createElement('div');
+    row.className = 'grid-12';
+    row.style.marginBottom = '8px';
+    row.dataset.range = '';
+    row.innerHTML = `
+      <div class="col-3"><label>起点坐标</label><input class="r-start" placeholder="1:100:1" style="width:100%"></div>
+      <div class="col-3"><label>终点坐标</label><input class="r-end" placeholder="1:200:15" style="width:100%"></div>
+      <div class="col-3"><label>出发星球</label><input class="r-origin" placeholder="2:137:18" style="width:100%"></div>
+      <div class="col-2"><label>舰队预设</label><input class="r-preset" placeholder="main-fleet" style="width:100%"></div>
+      <div class="col-1" style="display:flex;align-items:flex-end">
+        <button class="btn small ghost" type="button" aria-label="移除区段">✕</button>
+      </div>`;
+    row.querySelector('button').onclick = () => row.remove();
+    container.append(row);
+  }
+
+  document.getElementById('add-range').onclick = addRange;
+  addRange();
+
+  // The plan API takes structured coordinates, so the form's text inputs are
+  // parsed here rather than posted raw.
+  document.getElementById('plan-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const parse = (text, label) => {
+      const parts = String(text).trim().split(':').map(Number);
+      if (parts.length !== 3 || parts.some((n) => !Number.isInteger(n) || n < 1)) {
+        throw new Error(`${label} 需要形如 1:100:1 的完整坐标`);
+      }
+      return { galaxy: parts[0], system: parts[1], position: parts[2] };
+    };
+    try {
+      const ranges = [...container.querySelectorAll('[data-range]')].map((row) => ({
+        start: parse(row.querySelector('.r-start').value, '起点坐标'),
+        end: parse(row.querySelector('.r-end').value, '终点坐标'),
+        origin: parse(row.querySelector('.r-origin').value, '出发星球'),
+        fleet_preset: row.querySelector('.r-preset').value.trim(),
+        fleet_preset_signature: row.querySelector('.r-preset').value.trim(),
+        priority: 0,
+      }));
+      if (!ranges.length) throw new Error('至少需要一个扫描区段');
+      EVOHelper.post('/api/plans', {
+        name: document.getElementById('name').value.trim(),
+        enabled: true,
+        window_start: document.getElementById('window_start').value.trim(),
+        window_end: document.getElementById('window_end').value.trim(),
+        dry_run: true,
+        ranges,
+      }).then(() => window.location.reload())
+        .catch((error) => alert(error.detail || error.message));
+    } catch (error) {
+      alert(error.message);
+    }
+  }, true);
+})();
+</script>
+{% endblock %}

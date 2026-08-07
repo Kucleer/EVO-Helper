@@ -1,0 +1,479 @@
+{% extends "base.html" %}
+{% block title %}情报中心 · EVO-Helper{% endblock %}
+{% block heading %}情报中心{% endblock %}
+{% block content %}
+
+<section class="panel compact" aria-labelledby="filter-heading">
+  <h2 id="filter-heading" class="visually-hidden">检索条件</h2>
+
+  <div class="filter-bar">
+    <span class="inline-label">坐标</span>
+    <input id="span-start" placeholder="1:100" size="9" aria-label="坐标范围起点">
+    <span class="dash">–</span>
+    <input id="span-end" placeholder="1:200" size="9" aria-label="坐标范围终点">
+
+    <span class="sep" role="separator"></span>
+
+    <select id="saved-filter" aria-label="已保存筛选器"><option value="">临时筛选</option></select>
+    <button class="btn small" id="apply-saved" type="button">应用</button>
+    <button class="btn small ghost" id="delete-saved" type="button" aria-label="删除筛选器">✕</button>
+
+    <span class="sep" role="separator"></span>
+
+    <select id="sort" aria-label="排序">
+      <option value="coordinate">坐标</option>
+      <option value="total_desc">总数 ↓</option>
+      <option value="total_asc">总数 ↑</option>
+      <option value="snapshot_desc">时间 ↓</option>
+    </select>
+
+    <button class="btn primary small" id="run-search" type="button">检索</button>
+    <span class="spacer"></span>
+    <input id="save-name" placeholder="另存为…" size="10" aria-label="筛选器名称">
+    <button class="btn small" id="save-filter" type="button">保存</button>
+  </div>
+
+  <details id="cond-details" open>
+    <summary>舰队条件 <span class="muted" id="cond-count"></span></summary>
+    <div class="filter-bar" style="margin-bottom:6px">
+      <select id="root-operator" aria-label="条件组关系">
+        <option value="AND">全部满足</option>
+        <option value="OR">任一满足</option>
+      </select>
+      <button class="btn small" id="add-condition" type="button">+ 条件</button>
+      <button class="btn small" id="add-group" type="button">+ 条件组</button>
+    </div>
+    <div id="condition-root"></div>
+  </details>
+
+  <p id="query-error" class="error" hidden role="alert"></p>
+</section>
+
+<section class="panel" aria-labelledby="results-heading">
+  <h2 id="results-heading">命中结果 <span class="muted" id="result-count"></span></h2>
+  <div class="table-wrap">
+    <table id="result-table">
+      <thead><tr id="result-head"></tr></thead>
+      <tbody id="result-rows"></tbody>
+    </table>
+  </div>
+  <div id="result-empty" class="empty" hidden>还没有检索结果。设置条件后点击「检索」。</div>
+  <div class="field-row" style="margin-top:10px">
+    <button class="btn small" id="load-more" type="button" hidden>加载更多</button>
+  </div>
+</section>
+
+<dialog id="history-dialog" class="panel" style="max-width:720px;width:90vw">
+  <div class="detail-head">
+    <h2 id="history-title">—</h2>
+    <div style="flex:1"></div>
+    <button class="btn small ghost" id="close-history" type="button" aria-label="关闭">✕</button>
+  </div>
+  <div id="history-body"></div>
+</dialog>
+
+<script>
+(() => {
+  const TOTAL_FIELD = '__total__';
+  const OPERATORS = ['>', '>=', '<', '<=', '=', '!='];
+  const FIXED_COLUMNS = ['坐标', 'bot 名称', '最新战报时间', '舰队总数'];
+  // Only these ship types get their own list column; the rest live in the
+  // detail dialog. A column per recorded type overflowed a laptop screen.
+  const LIST_SHIPS = {{ list_ship_columns | tojson }};
+  let shipNames = [];
+  let cursor = null;
+  let lastQuery = null;
+
+  const el = (id) => document.getElementById(id);
+  const root = el('condition-root');
+  const fmtTime = (value) => (value ? value.replace('T', ' ').slice(0, 19) : '—');
+
+  // ---- condition builder ------------------------------------------------
+
+  function makeGroup(operator = 'AND', depth = 0) {
+    const group = document.createElement('div');
+    // The root group's operator lives in the toolbar, so it needs neither a
+    // header row nor a border — both were pure vertical cost on a laptop.
+    group.className = depth === 0 ? 'cond-group root' : 'cond-group';
+    group.dataset.node = 'group';
+    group.dataset.depth = String(depth);
+    if (depth > 0) {
+      const head = document.createElement('div');
+      head.className = 'cond-group-head';
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', '条件组关系');
+      select.add(new Option('全部满足', 'AND'));
+      select.add(new Option('任一满足', 'OR'));
+      select.value = operator;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn small ghost';
+      remove.textContent = '移除组';
+      remove.onclick = () => { group.remove(); refreshCondCount(); };
+      head.append(select, remove);
+      group.append(head);
+    }
+    const children = document.createElement('div');
+    children.dataset.children = '';
+    children.style.cssText = 'display:grid;gap:6px';
+    group.append(children);
+    return group;
+  }
+
+  function makeCondition() {
+    const row = document.createElement('div');
+    row.className = 'cond-row';
+    row.dataset.node = 'condition';
+
+    const field = document.createElement('select');
+    field.className = 'field';
+    field.setAttribute('aria-label', '字段');
+    field.add(new Option('舰队总数', TOTAL_FIELD));
+    for (const name of shipNames) field.add(new Option(name, name));
+
+    const operator = document.createElement('select');
+    operator.className = 'op';
+    operator.setAttribute('aria-label', '运算符');
+    for (const value of OPERATORS) operator.add(new Option(value, value));
+
+    const value = document.createElement('input');
+    value.className = 'val';
+    value.type = 'number';
+    value.min = '0';
+    value.value = '0';
+    value.setAttribute('aria-label', '数值');
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn small ghost';
+    remove.textContent = '✕';
+    remove.setAttribute('aria-label', '移除条件');
+    remove.onclick = () => { row.remove(); refreshCondCount(); };
+
+    row.append(field, operator, value, remove);
+    return row;
+  }
+
+  const activeGroup = () => root.querySelector('[data-node="group"]');
+
+  function refreshCondCount() {
+    const count = root.querySelectorAll('[data-node="condition"]').length;
+    el('cond-count').textContent = count ? `(${count})` : '(无)';
+  }
+
+  function serialise(group) {
+    const operator = group.dataset.depth === '0'
+      ? el('root-operator').value
+      : group.querySelector(':scope > .cond-group-head select').value;
+    const children = [];
+    for (const node of group.querySelector(':scope > [data-children]').children) {
+      if (node.dataset.node === 'group') {
+        children.push(serialise(node));
+      } else {
+        const [field, op, value] = node.querySelectorAll('select, input');
+        children.push({ type: 'condition', field: field.value, operator: op.value, value: Number(value.value) });
+      }
+    }
+    return { type: 'group', operator, children };
+  }
+
+  function hydrate(group, node) {
+    if (group.dataset.depth === '0') {
+      el('root-operator').value = node.operator;
+    } else {
+      group.querySelector(':scope > .cond-group-head select').value = node.operator;
+    }
+    const children = group.querySelector(':scope > [data-children]');
+    children.replaceChildren();
+    for (const child of node.children) {
+      if (child.type === 'group') {
+        const sub = makeGroup(child.operator, 1);
+        children.append(sub);
+        hydrate(sub, child);
+      } else {
+        const row = makeCondition();
+        const [field, operator, value] = row.querySelectorAll('select, input');
+        if (child.field !== TOTAL_FIELD && !shipNames.includes(child.field)) {
+          field.add(new Option(child.field, child.field));
+        }
+        field.value = child.field;
+        operator.value = child.operator;
+        value.value = child.value;
+        children.append(row);
+      }
+    }
+  }
+
+  // ---- table ------------------------------------------------------------
+
+  function renderHead() {
+    const head = el('result-head');
+    head.replaceChildren();
+    const numeric = new Set(['舰队总数', ...LIST_SHIPS, '其他舰种']);
+    for (const label of [...FIXED_COLUMNS, ...LIST_SHIPS, '其他舰种', '操作']) {
+      const th = document.createElement('th');
+      th.scope = 'col';
+      th.textContent = label;
+      // Numeric headers carry the same alignment class as their cells so the
+      // column name sits over its own numbers.
+      if (numeric.has(label)) th.className = 'num';
+      head.append(th);
+    }
+  }
+
+  function renderRows(rows, append) {
+    const body = el('result-rows');
+    if (!append) body.replaceChildren();
+    for (const row of rows) {
+      const counts = Object.fromEntries(row.ships.map((s) => [s.ship_type, s.count]));
+      const tr = document.createElement('tr');
+
+      tr.append(cell(row.coordinate, 'coord'));
+      tr.append(cell(row.player || '—'));
+      tr.append(cell(row.has_fleet_data ? fmtTime(row.snapshot_at) : '暂无舰队数据'));
+      tr.append(cell(row.total === null ? '0' : row.total.toLocaleString(), 'num'));
+
+      // A type the snapshot did not list means the bot holds none of it, so
+      // it reads as 0 rather than a blank the eye has to interpret.
+      for (const name of LIST_SHIPS) {
+        tr.append(cell((counts[name] ?? 0).toLocaleString(), 'num'));
+      }
+      const others = row.ships.filter((s) => !LIST_SHIPS.includes(s.ship_type));
+      const othersTotal = others.reduce((sum, s) => sum + s.count, 0);
+      tr.append(cell(`${others.length} 种 / ${othersTotal.toLocaleString()}`, 'num'));
+
+      const action = document.createElement('td');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn small';
+      button.textContent = '查看历史战报';
+      button.disabled = !row.has_fleet_data;
+      button.onclick = () => openHistory(row.coordinate);
+      action.append(button);
+      tr.append(action);
+
+      body.append(tr);
+    }
+    const total = body.children.length;
+    el('result-count').textContent = total ? `(${total})` : '';
+    el('result-empty').hidden = total > 0;
+    if (!total) el('result-empty').textContent = '没有目标满足当前条件。';
+  }
+
+  function cell(text, className) {
+    const td = document.createElement('td');
+    if (className) td.className = className;
+    td.textContent = text;
+    return td;
+  }
+
+  // ---- history dialog ---------------------------------------------------
+
+  async function openHistory(coordinate) {
+    const dialog = el('history-dialog');
+    el('history-title').textContent = `${coordinate} · 舰队详情`;
+    const body = el('history-body');
+    body.textContent = '加载中…';
+    dialog.showModal();
+    try {
+      const history = await EVOHelper.get(`/api/targets/${coordinate}/history`);
+      renderDetail(body, history);
+    } catch (error) {
+      body.textContent = error.detail || error.message;
+    }
+  }
+
+  function renderDetail(container, history) {
+    container.replaceChildren();
+    if (!history.length) {
+      container.textContent = '没有战报快照。';
+      return;
+    }
+    // Newest first so the default selection is the current holding.
+    const ordered = [...history].reverse();
+
+    const bar = document.createElement('div');
+    bar.className = 'filter-bar';
+    bar.style.marginBottom = '10px';
+    const label = document.createElement('span');
+    label.className = 'inline-label';
+    label.textContent = '快照';
+    const picker = document.createElement('select');
+    picker.setAttribute('aria-label', '选择快照');
+    ordered.forEach((entry, index) => {
+      const suffix = index === 0 ? ' · 最新' : '';
+      picker.add(new Option(`${fmtTime(entry.captured_at_utc)}${suffix}`, String(index)));
+    });
+    picker.disabled = ordered.length === 1;
+    bar.append(label, picker);
+    if (ordered.length === 1) {
+      const only = document.createElement('span');
+      only.className = 'muted';
+      only.textContent = '（暂无历史快照）';
+      bar.append(only);
+    }
+    container.append(bar);
+
+    const pane = document.createElement('div');
+    container.append(pane);
+
+    const show = (index) => {
+      const entry = ordered[index];
+      const previous = ordered[index + 1] || null;
+      pane.replaceChildren(snapshotView(entry, previous));
+    };
+    picker.onchange = () => show(Number(picker.value));
+    show(0);
+  }
+
+  function snapshotView(entry, previous) {
+    const wrap = document.createElement('div');
+
+    const meta = document.createElement('div');
+    meta.className = 'muted';
+    meta.style.marginBottom = '8px';
+    meta.textContent = `${fmtTime(entry.captured_at_utc)} · ${entry.side} · 合计 ${entry.total.toLocaleString()}`;
+    wrap.append(meta);
+
+    if (previous) {
+      const delta = entry.total - previous.total;
+      const change = document.createElement('div');
+      change.className = delta >= 0 ? 'delta-up' : 'delta-down';
+      change.style.marginBottom = '8px';
+      change.textContent = `${delta >= 0 ? '+' : ''}${delta.toLocaleString()} 相对 ${fmtTime(previous.captured_at_utc)}`;
+      wrap.append(change);
+    }
+
+    const before = previous
+      ? Object.fromEntries(previous.ships.map((s) => [s.ship_type, s.quantity]))
+      : null;
+
+    const table = document.createElement('table');
+    table.innerHTML =
+      '<thead><tr><th>舰种</th><th style="text-align:right">数量</th>'
+      + (previous ? '<th style="text-align:right">变化</th>' : '')
+      + '</tr></thead>';
+    const tbody = document.createElement('tbody');
+    for (const ship of entry.ships) {
+      const tr = document.createElement('tr');
+      tr.append(cell(ship.ship_type), cell(ship.quantity.toLocaleString(), 'num'));
+      if (previous) {
+        const delta = ship.quantity - (before[ship.ship_type] ?? 0);
+        const td = cell(delta === 0 ? '—' : `${delta > 0 ? '+' : ''}${delta.toLocaleString()}`, 'num');
+        if (delta > 0) td.classList.add('delta-up');
+        if (delta < 0) td.classList.add('delta-down');
+        tr.append(td);
+      }
+      tbody.append(tr);
+    }
+    const totalRow = document.createElement('tr');
+    totalRow.append(cell('合计'), cell(entry.total.toLocaleString(), 'num'));
+    if (previous) totalRow.append(cell(''));
+    totalRow.style.fontWeight = '700';
+    tbody.append(totalRow);
+    table.append(tbody);
+    wrap.append(table);
+    return wrap;
+  }
+
+  // ---- search -----------------------------------------------------------
+
+  function readSpan() {
+    const start = el('span-start').value.trim();
+    const end = el('span-end').value.trim();
+    return (!start && !end) ? null : { start, end };
+  }
+
+  function buildQuery() {
+    const group = serialise(activeGroup());
+    return { span: readSpan(), conditions: group.children.length ? group : null, sort: el('sort').value };
+  }
+
+  function showError(message) {
+    const box = el('query-error');
+    box.textContent = message;
+    box.hidden = !message;
+  }
+
+  async function runSearch(append = false) {
+    const query = append && lastQuery ? { ...lastQuery, cursor } : buildQuery();
+    lastQuery = { ...query };
+    delete lastQuery.cursor;
+    showError('');
+    try {
+      const page = await EVOHelper.post('/api/intel/search', query);
+      renderRows(page.rows, append);
+      cursor = page.next_cursor;
+      el('load-more').hidden = !cursor;
+    } catch (error) {
+      showError(error.detail || error.message);
+    }
+  }
+
+  // ---- saved filters ----------------------------------------------------
+
+  async function loadFilters() {
+    const filters = await EVOHelper.get('/api/intel/filters');
+    const select = el('saved-filter');
+    select.replaceChildren(new Option('临时筛选', ''));
+    for (const filter of filters) {
+      const option = new Option(filter.name, filter.filter_id);
+      option.dataset.payload = JSON.stringify(filter);
+      select.add(option);
+    }
+  }
+
+  el('apply-saved').onclick = () => {
+    const option = el('saved-filter').selectedOptions[0];
+    if (!option || !option.value) return;
+    const filter = JSON.parse(option.dataset.payload);
+    el('span-start').value = filter.span ? filter.span.start : '';
+    el('span-end').value = filter.span ? filter.span.end : '';
+    hydrate(activeGroup(), filter.conditions);
+    refreshCondCount();
+    runSearch();
+  };
+
+  el('delete-saved').onclick = async () => {
+    const option = el('saved-filter').selectedOptions[0];
+    if (!option || !option.value) return;
+    await EVOHelper.del(`/api/intel/filters/${option.value}`);
+    await loadFilters();
+  };
+
+  el('save-filter').onclick = async () => {
+    const name = el('save-name').value.trim();
+    if (!name) { showError('保存筛选器需要一个名称。'); return; }
+    showError('');
+    try {
+      await EVOHelper.post('/api/intel/filters', {
+        name, span: readSpan(), conditions: serialise(activeGroup()),
+      });
+      el('save-name').value = '';
+      await loadFilters();
+    } catch (error) {
+      showError(error.detail || error.message);
+    }
+  };
+
+  // ---- wiring -----------------------------------------------------------
+
+  el('add-condition').onclick = () => { activeGroup().querySelector('[data-children]').append(makeCondition()); refreshCondCount(); };
+  el('add-group').onclick = () => activeGroup().querySelector('[data-children]').append(makeGroup('OR', 1));
+  el('run-search').onclick = () => { cursor = null; runSearch(false); };
+  el('load-more').onclick = () => runSearch(true);
+  el('sort').onchange = () => { cursor = null; runSearch(false); };
+  el('close-history').onclick = () => el('history-dialog').close();
+
+  (async () => {
+    root.append(makeGroup('AND', 0));
+    try { shipNames = await EVOHelper.get('/api/intel/ships'); } catch (_) { shipNames = []; }
+    renderHead();
+    activeGroup().querySelector('[data-children]').append(makeCondition());
+    await loadFilters();
+    refreshCondCount();
+    runSearch(false);
+  })();
+})();
+</script>
+{% endblock %}

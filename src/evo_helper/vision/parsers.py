@@ -49,42 +49,52 @@ REPORT_TIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})"
 #: strict origin + target + time match against a dispatch.
 GAME_DISPLAY_ZONE = UTC
 
-#: Ground defences observed in the 参战战舰 list. They share the layout of ship
-#: rows but are structures, so a snapshot must keep them apart from a fleet.
-DEFENCE_NAMES = frozenset(
-    {
-        "离子炮",
-        "火箭发射器",
-        "轻型激光炮",
-        "重型激光炮",
-        "MK2 加农炮",
-        "等离子炮",
-        "小型防护盾",
-        "大型防护盾",
-    }
+#: Fleet units, in the order the game lists them. Order is kept so a snapshot
+#: table reads the same way as the in-game list rather than alphabetically.
+#: Supplied by the user from the in-game catalogue on 2026-08-07.
+SHIP_ORDER: tuple[str, ...] = (
+    "轻型战斗机",
+    "重型战斗机",
+    "巡洋舰",
+    "战列舰",
+    "小型运输船",
+    "大型运输船",
+    "回收船",
+    "殖民船",
+    "探测器",
+    "无畏舰",
+    "轰炸机",
+    "毁灭者",
+    "裂变者",
+    "深空吞噬者",
+    "噬能截击者",
+    "钛能守卫者",
+    "收割者",
+    "湮灭之星",
 )
 
-#: Ship names observed in live attack reports and replays.
-SHIP_NAMES = frozenset(
-    {
-        "轻型战斗机",
-        "重型战斗机",
-        "巡洋舰",
-        "战列舰",
-        "无畏舰",
-        "轰炸机",
-        "毁灭者",
-        "裂变者",
-        "深空吞噬者",
-        "钛能守卫者",
-        "噬能截击者",
-        "回收船",
-        "间谍探测器",
-        "殖民船",
-        "运输舰",
-        "大型运输舰",
-    }
+#: Planet-side units in the same catalogue: missiles, satellites, shields and
+#: turrets. They share the fleet row layout but are not ships, so a snapshot
+#: must keep them apart from a fleet.
+DEFENCE_ORDER: tuple[str, ...] = (
+    "行星际导弹",
+    "太阳能卫星",
+    "拦截导弹",
+    "小型护盾",
+    "大型护盾",
+    "离子炮",
+    "火箭发射器",
+    "轻型激光炮",
+    "重型激光炮",
+    "MK2 加农炮",
+    "等离子炮",
 )
+
+SHIP_NAMES = frozenset(SHIP_ORDER)
+DEFENCE_NAMES = frozenset(DEFENCE_ORDER)
+
+#: Every catalogue name, in game order, for display and vocabulary checks.
+UNIT_ORDER: tuple[str, ...] = SHIP_ORDER + DEFENCE_ORDER
 
 #: ``名称`` followed by whitespace and a count. A count of ``0`` is a real row.
 FLEET_COLUMN_RE = re.compile(r"^(.+?)\s{1,}(\d{1,7})$")
