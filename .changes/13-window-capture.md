@@ -18,11 +18,16 @@ date: 2026-08-07
 - 结果做空白校验：Chrome 在 GPU 合成内容取不到时会返回纯色位图，`_is_blank` 通过颜色数判定，
   两条后端都拿不到有效图就报错，而不是把一张白图当成截图。
 
-实测（Chrome 窗口，位于副屏且非前台）：`PrintWindow` 返回 1936×1056、2095 种颜色的真实内容，
-证明该路径在 Chrome 上可用且不要求窗口在前台。
+实测已验证：
 
-**尚未验证**：该 Chrome 窗口当时的活动标签页不是游戏，因此还没证明 `PrintWindow` 能取到
-WebGL canvas（Chrome 的 GPU 合成内容是这条路径最容易失败的地方）。需要把游戏标签页切到活动状态后复测。
+- 游戏标签页为活动页时，`PrintWindow` 取到**完整的 WebGL canvas**——1550×838、135259 种颜色，
+  游戏画面全部渲染出来。Chrome 的 GPU 合成内容是这条路径最容易失败的地方，现已排除。
+- 窗口位于副屏且非前台时同样可用（1936×1056、2099 种颜色），不要求窗口置于前台。
+
+新增 `client_box` / `capture_window(client_only=True)` 裁到 client area。但普通 Chrome 窗口把
+标签栏、地址栏、书签栏画在 client area **之内**，裁剪只能去掉阴影，去不掉这些——每张样本都会带上
+用户的标签页标题和书签。因此游戏窗口**必须用 `--app` 模式启动**，实测其后只剩约 38px 标题栏，
+其下即页面视口；这也是旧项目 `expedition_reports.py` 的做法。
 
 同时把可选后端的类型忽略从行内注释改为 `pyproject.toml` 的 mypy overrides。CI 只装 `.[dev]`，
 这些包在 CI 上「不存在」、在本地装了 `vision` extra 后「存在但无类型」，两种情况的 error code 不同，

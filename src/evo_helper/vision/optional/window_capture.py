@@ -84,18 +84,41 @@ def find_window(title_contains: str) -> WindowInfo:
     return matches[0]
 
 
-def capture_window(window: WindowInfo) -> Any:
+def client_box(window: WindowInfo) -> tuple[int, int, int, int]:
+    """Return the client area as ``(left, top, right, bottom)`` in screen pixels.
+
+    The window rect includes the drop shadow and, for a normal Chrome window,
+    the tab strip and toolbar. Cropping to the client area drops the shadow;
+    launching the game with ``--app=<url>`` drops the rest, which is what makes
+    the client area equal the page viewport. Capturing the full window would
+    also put the user's tab titles and bookmarks into every sample.
+    """
+    import win32gui
+
+    left, top, right, bottom = win32gui.GetClientRect(window.handle)
+    origin_x, origin_y = win32gui.ClientToScreen(window.handle, (left, top))
+    return (origin_x, origin_y, origin_x + (right - left), origin_y + (bottom - top))
+
+
+def capture_window(window: WindowInfo, *, client_only: bool = True) -> Any:
     """Return a Pillow image of the window, or raise if neither backend works."""
     image = _print_window(window)
     if image is not None and not _is_blank(image):
-        return image
-    fallback = _grab_rect(window)
+        return _crop_client(image, window) if client_only else image
+    fallback = _grab_rect(window, client_only=client_only)
     if fallback is None or _is_blank(fallback):
         raise WindowCaptureError(
             f"captured a blank image for {window.title!r}; "
             "the window may be minimised or rendered on a surface neither backend can read"
         )
     return fallback
+
+
+def _crop_client(image: Any, window: WindowInfo) -> Any:
+    """Crop a whole-window render down to its client area."""
+    left, top, right, bottom = client_box(window)
+    offset_x, offset_y = left - window.rect[0], top - window.rect[1]
+    return image.crop((offset_x, offset_y, offset_x + (right - left), offset_y + (bottom - top)))
 
 
 def _print_window(window: WindowInfo) -> Any | None:
@@ -138,11 +161,11 @@ def _print_window(window: WindowInfo) -> Any | None:
         win32gui.DeleteObject(bitmap.GetHandle())
 
 
-def _grab_rect(window: WindowInfo) -> Any | None:
+def _grab_rect(window: WindowInfo, *, client_only: bool = True) -> Any | None:
     import mss
     from PIL import Image
 
-    left, top, right, bottom = window.rect
+    left, top, right, bottom = client_box(window) if client_only else window.rect
     with mss.mss() as sct:
         shot = sct.grab({"left": left, "top": top, "width": right - left, "height": bottom - top})
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")

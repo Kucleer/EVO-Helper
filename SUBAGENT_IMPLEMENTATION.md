@@ -1127,15 +1127,27 @@ CI 还需通过静态规则确认：
 `vision/optional/window_capture.py`：按标题定位**唯一**窗口，`PrintWindow(PW_RENDERFULLCONTENT)` 优先、
 `mss` 按窗口矩形兜底，只截指定窗口不整屏抓取，并对纯色位图做空白校验。
 
-- 已验证：Chrome 窗口位于副屏且非前台时，`PrintWindow` 仍返回 1936×1056、2095 种颜色的真实内容。
-- **未验证**：当时该窗口的活动标签页不是游戏，尚未证明能取到 WebGL canvas。
-  这是这条路径最可能失败的地方，需把游戏标签页切为活动状态后复测。
+**已验证可用**（2026-08-07 实测）：
+
+- 游戏标签页切为活动页后，`PrintWindow` 取到了**完整的 WebGL canvas**——1550×838、135259 种颜色，
+  游戏登录画面（飞船美术、星空、账号面板）全部渲染出来。Chrome 的 GPU 合成内容是这条路径最容易
+  失败的地方，这一点现已排除。
+- 窗口位于副屏且非前台时同样可用（1936×1056、2099 种颜色），因此不要求把游戏窗口置于前台。
 - 整屏 `mss` 方案已排除：会拍到用户私人窗口。
+
+**必须用 `--app` 模式启动游戏窗口。** 普通 Chrome 窗口把标签栏、地址栏、书签栏画在 *client area*
+之内，裁到 client area 只能去掉阴影，去不掉这些——每张样本都会带上用户的标签页标题和书签，
+既泄露隐私，也让页面视口的几何原点不稳定。实测 `--app=<url>` 后只剩约 38px 标题栏，
+其下即页面视口。这也正是旧项目 `expedition_reports.py` 的做法。
+
+```powershell
+chrome.exe --app=https://eternal-void.online/ --window-size=1280,900 --window-position=0,0
+```
 
 ### 25.12 下一步（按顺序）
 
-1. 把游戏标签页切为活动状态，复测 `PrintWindow` 能否取到 WebGL canvas；若不行，改用
-   Chrome DevTools Protocol 的 `Page.captureScreenshot`（由代码通过 `--remote-debugging-port` 调用）。
+1. 用 `--app` 模式启动游戏窗口，把 `capture_window` 接到 `ImageReportScreens`，
+   跑通「代码截图 → OCR → 入库 → Web 页面」的全代码链路（目前截图仍是人工提供）。
 2. 接通完整采集：定位 `第N回合` 横幅做滚动分段、翻页读满邮件列表。
 3. 补采多会话样本（含异常态），跑出第 7.4 节指标后再更新 UI 版本矩阵。
 4. 再进入 CP6 dry-run 与 CP7 影子运行。
