@@ -46,3 +46,30 @@ class TestBlankDetection:
 def test_print_window_flag_requests_gpu_composited_content() -> None:
     """Without PW_RENDERFULLCONTENT, Chrome's WebGL canvas renders empty."""
     assert PW_RENDERFULLCONTENT == 0x00000002
+
+
+class TestClientCrop:
+    def test_crop_drops_the_non_client_border(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A whole-window render includes the drop shadow; the crop removes it."""
+        from evo_helper.vision.optional import window_capture
+
+        window = WindowInfo(handle=1, title="EVO", rect=(-7, -7, 1543, 831))
+        monkeypatch.setattr(window_capture, "client_box", lambda _w: (0, 0, 1536, 824))
+        image = Image.new("RGB", (window.width, window.height))
+
+        cropped = window_capture._crop_client(image, window)
+
+        assert cropped.size == (1536, 824)
+
+    def test_crop_keeps_the_client_pixels(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evo_helper.vision.optional import window_capture
+
+        window = WindowInfo(handle=1, title="EVO", rect=(-7, -7, 13, 13))
+        monkeypatch.setattr(window_capture, "client_box", lambda _w: (0, 0, 10, 10))
+        image = Image.new("RGB", (20, 20), (0, 0, 0))
+        # (7, 7) in window space is the client origin.
+        image.putpixel((7, 7), (255, 0, 0))
+
+        cropped = window_capture._crop_client(image, window)
+
+        assert cropped.getpixel((0, 0)) == (255, 0, 0)
