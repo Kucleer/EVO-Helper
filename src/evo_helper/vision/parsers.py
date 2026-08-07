@@ -235,7 +235,61 @@ def classify_unit(name: str) -> str:
     return "unknown"
 
 
-def parse_fleet_column(text: str, source: str, confidence: float = 1.0) -> tuple[FleetLine, ...]:
+#: Names shorter than this are never snapped: one edit is too large a share of
+#: the string to attribute to OCR rather than to a genuinely different unit.
+MIN_SNAP_LENGTH = 3
+
+
+def snap_unit_name(raw: str, *, max_distance: int = 1) -> tuple[str, str]:
+    """Resolve an OCR'd unit name against the known vocabulary.
+
+    Unit names are a closed set, and reading the name column with ``chi_sim``
+    lands within one character (``无引舰`` for ``无畏舰``). Snapping recovers the
+    exact name, which matters because the name is the key a fleet timeline
+    diffs on — a garbled name makes every report look like a first sighting.
+
+    Returns ``(name, category)``. The raw name and ``"unknown"`` are returned
+    whenever the match is not unique or not close enough, so a genuinely new
+    unit is never rewritten into an existing one.
+    """
+    name = raw.strip()
+    exact = classify_unit(name)
+    if exact != "unknown":
+        return name, exact
+    if len(name) < MIN_SNAP_LENGTH:
+        return name, "unknown"
+    best: list[str] = []
+    best_distance = max_distance + 1
+    for candidate in (*SHIP_NAMES, *DEFENCE_NAMES):
+        distance = _edit_distance(name, candidate)
+        if distance < best_distance:
+            best_distance, best = distance, [candidate]
+        elif distance == best_distance:
+            best.append(candidate)
+    if best_distance > max_distance or len(best) != 1:
+        return name, "unknown"
+    return best[0], classify_unit(best[0])
+
+
+def _edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for i, lchar in enumerate(left, start=1):
+        current = [i]
+        for j, rchar in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (lchar != rchar),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def parse_fleet_column(
+    text: str, source: str, confidence: float = 1.0, *, snap: bool = True
+) -> tuple[FleetLine, ...]:
     """Parse one column of the 参战战舰 / 剩余战舰 list.
 
     Rows are ``名称`` then whitespace then a count. A row whose count is ``0``
@@ -250,13 +304,14 @@ def parse_fleet_column(text: str, source: str, confidence: float = 1.0) -> tuple
         name = match.group(1).strip()
         if not name:
             continue
+        resolved, category = snap_unit_name(name) if snap else (name, classify_unit(name))
         lines.append(
             FleetLine(
-                ship_type=name,
+                ship_type=resolved,
                 count=int(match.group(2)),
                 confidence=confidence,
                 sources=(source,),
-                category=classify_unit(name),
+                category=category,
             )
         )
     return tuple(lines)

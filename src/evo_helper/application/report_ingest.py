@@ -1,0 +1,77 @@
+"""Convert a read report into the domain records the repository persists."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from evo_helper.domain.records import BattleReport, FleetSnapshotEntry, UiObservation
+from evo_helper.vision.live_reports import LiveBattleReport
+from evo_helper.vision.models import FleetLine
+
+# The repository and Web service filter snapshots on these exact strings.
+ATTACKER = "attacker"
+DEFENDER = "defender"
+
+
+def to_battle_report(live: LiveBattleReport, *, report_id: UUID) -> BattleReport:
+    """Map a read report onto :class:`BattleReport`.
+
+    The report is stored unmatched and unreviewed. Matching a dispatch is the
+    repository's job, and it needs the origin, target and time to agree — this
+    function must not pre-assert a confidence it has not checked.
+    """
+    if not live.kind.is_dispatch_matchable:
+        raise ValueError(f"refusing to ingest a non-attack report: {live.kind.value}")
+    if live.reported_at_utc.tzinfo is None:
+        raise ValueError("reported_at_utc must be timezone-aware")
+
+    fleet: list[FleetSnapshotEntry] = []
+    fleet.extend(_entries(ATTACKER, live.participating_attacker, None))
+    fleet.extend(_entries(DEFENDER, live.participating_defender, None))
+    for round_ in live.rounds:
+        fleet.extend(_entries(ATTACKER, round_.attacker, round_.round_number))
+        fleet.extend(_entries(DEFENDER, round_.defender, round_.round_number))
+
+    return BattleReport(
+        report_id=report_id,
+        reported_at_utc=live.reported_at_utc,
+        attacker_origin=live.attacker.coordinate.value,
+        defender_target=live.defender.coordinate.value,
+        raw_time_text=live.raw_time_text,
+        # The row holds one version, so it holds the report screen's own.
+        # Section 3 forbids one label for the whole chain, so the replay
+        # version is recorded separately by ui_observations_for().
+        ui_version=live.ui_versions.get("battle_detail_ui_version"),
+        fleet=tuple(fleet),
+    )
+
+
+def ui_observations_for(
+    live: LiveBattleReport, *, observed_at: datetime
+) -> tuple[UiObservation, ...]:
+    """One observation per screen, so no version is implied by another's."""
+    screens = {
+        "battle_detail": live.ui_versions.get("battle_detail_ui_version"),
+        "battle_replay": live.ui_versions.get("battle_replay_ui_version"),
+    }
+    return tuple(
+        UiObservation(
+            observation_id=uuid4(),
+            screen=screen,
+            ui_version=version,
+            detection_result="report ingested",
+            confidence=1.0,
+            observed_at_utc=observed_at,
+        )
+        for screen, version in screens.items()
+    )
+
+
+def _entries(
+    side: str, lines: tuple[FleetLine, ...], round_no: int | None
+) -> list[FleetSnapshotEntry]:
+    return [
+        FleetSnapshotEntry(side=side, ship_type=line.ship_type, count=line.count, round_no=round_no)
+        for line in lines
+    ]
