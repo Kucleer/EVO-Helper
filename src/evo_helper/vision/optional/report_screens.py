@@ -124,13 +124,20 @@ class ImageReportScreens:
     def _read_fleet(self, region: Region) -> str:
         """Read a fleet column twice and take the best half of each pass.
 
-        Measured on the batch: ``chi_sim+eng`` gets every count right but drops
-        some names into Latin noise (``无畏舰`` -> ``AKER``), while ``chi_sim``
-        alone keeps the names within one character but corrupts counts
-        (``5`` -> ``日``). Neither pass is good enough alone, so names come from
-        the Chinese pass and counts from the mixed one, joined row by row.
+        Measured on the batch: a Chinese-capable pass keeps names within one
+        character but corrupts counts (``5`` -> ``日``), while an English pass
+        reads every count exactly but renders the names as Latin noise. Neither
+        is good enough alone, so names come from the Chinese pass and counts
+        from the English one, joined row by row.
+
+        The count pass runs ``eng`` rather than ``chi_sim+eng``: loading the
+        Chinese model costs ~0.43s per invocation and buys nothing here, since
+        only the trailing number is used. Measured 1.53s -> 0.66s for both
+        columns, with identical counts. A digit whitelist is *not* used — it
+        starves Tesseract of the glyphs it segments rows by, collapsing 15 rows
+        into 1.
         """
-        counts = _rows(self._read(region, OCR_PSM_COLUMN))
+        counts = _rows(self._read(region, OCR_PSM_COLUMN, language="eng"))
         names = _names(self._read(region, OCR_PSM_COLUMN, language="chi_sim"))
         if len(names) != len(counts):
             # Row counts disagree, so the two passes cannot be aligned. Fall
