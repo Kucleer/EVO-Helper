@@ -209,6 +209,8 @@ def _revisit_out(revisit: RevisitView) -> RevisitOut:
 _RUN_STATE_TONE = {
     "SCANNING": "ok",
     "DRAINING": "ok",
+    "AWAITING_REPORT": "warn",
+    "WAITING_SESSION": "warn",
     "COMPLETED": "ok",
     "ARMED": "warn",
     "WAITING_CAPACITY": "warn",
@@ -220,6 +222,8 @@ _RUN_STATE_TONE = {
 _RUN_STATE_GLYPH = {
     "SCANNING": "▶",
     "DRAINING": "▼",
+    "AWAITING_REPORT": "🕗",
+    "WAITING_SESSION": "🔑",
     "COMPLETED": "✓",
     "ARMED": "◷",
     "WAITING_CAPACITY": "⏸",
@@ -236,6 +240,8 @@ _RUN_STATE_LABEL = {
     "SCANNING": "扫描中",
     "WAITING_CAPACITY": "等待航线",
     "DRAINING": "收取战报",
+    "AWAITING_REPORT": "等待战报",
+    "WAITING_SESSION": "等待登录",
     "COMPLETED": "已完成",
     "PAUSED": "已暂停",
     "FAILED": "已失败",

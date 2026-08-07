@@ -76,6 +76,11 @@ class RunInstance(Base):
     pending_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     drained_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 松手等待期间该睡到什么时候。持久化是关键：派出后助手不持有会话，
+    #: 进程可以整个退出，恢复时靠这个字段判断现在该等还是该收。
+    resume_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 连续拿不到登录的次数，用于退避。拿到会话后归零。
+    session_attempts: Mapped[int] = mapped_column(Integer, default=0)
     finished_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 
@@ -152,6 +157,11 @@ class AttackDispatchRow(Base):
     dry_run: Mapped[bool] = mapped_column(Boolean)
     accepted: Mapped[bool] = mapped_column(Boolean)
     evidence_artifact_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    #: 派出时读到的飞行时长，以及据此算出的预计战报时间。
+    #: 助手派出后就松手，靠这个时间决定什么时候回来登录收报告。
+    #: 读不到飞行时间时为 NULL——那时改为立即尝试收取，而不是无限等待。
+    flight_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
 
 class BattleReportRow(Base):
