@@ -211,3 +211,142 @@ def test_plan_requires_a_preset_signature() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_console_pages_render() -> None:
+    """The two console pages must render; a template or service typo is a 500."""
+    client, _ = _make_client()
+
+    for path, marker in (("/missions", "任务中心"), ("/intel", "情报中心")):
+        response = client.get(path)
+        assert response.status_code == 200, (path, response.status_code)
+        assert marker in response.text
+
+
+def test_console_pages_show_the_dry_run_lock() -> None:
+    """The lock is informational and must never render as a toggle."""
+    client, _ = _make_client()
+
+    body = client.get("/missions").text
+    assert "dry run 已锁定" in body
+    assert 'type="checkbox"' not in body
+
+
+def test_static_console_stylesheet_is_served() -> None:
+    client, _ = _make_client()
+    response = client.get("/static/console.css")
+    assert response.status_code == 200
+    assert "--accent" in response.text
+
+
+def test_origin_outside_the_scan_range_is_accepted() -> None:
+    """The departure planet is the player's own and is normally outside the range.
+
+    Requiring it inside made the plan form unusable for real data: attacking
+    bots in 1:100-1:200 from your own planet at 2:137:18 was rejected.
+    """
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "morning-scan",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 100, "position": 1},
+                    "end": {"galaxy": 1, "system": 200, "position": 15},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "main-fleet",
+                    "fleet_preset_signature": "main-fleet-v1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["ranges"][0]["origin"] == {
+        "galaxy": 2,
+        "system": 137,
+        "position": 18,
+    }
+
+
+def test_a_reversed_scan_range_is_still_rejected() -> None:
+    """Dropping the origin rule must not loosen the range rule."""
+    client, _ = _make_client()
+
+    response = client.post(
+        "/api/plans",
+        headers=_headers(),
+        json={
+            "name": "bad-range",
+            "enabled": True,
+            "window_start": "08:00",
+            "window_end": "10:00",
+            "dry_run": True,
+            "ranges": [
+                {
+                    "start": {"galaxy": 1, "system": 200, "position": 1},
+                    "end": {"galaxy": 1, "system": 100, "position": 1},
+                    "origin": {"galaxy": 2, "system": 137, "position": 18},
+                    "fleet_preset": "main-fleet",
+                    "fleet_preset_signature": "main-fleet-v1",
+                    "priority": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "precede" in response.json()["detail"]
+
+
+def test_legacy_pages_redirect_into_the_console() -> None:
+    """Nav collapsed to two entries; the old paths must not become dead ends."""
+    client, _ = _make_client()
+
+    for path, destination in (("/", "/missions"), ("/plans", "/missions"), ("/targets", "/intel")):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 307, (path, response.status_code)
+        assert response.headers["location"] == destination
+
+
+def test_legacy_paths_land_on_a_rendered_page() -> None:
+    client, _ = _make_client()
+
+    assert "任务中心" in client.get("/").text
+    assert "情报中心" in client.get("/targets").text
+
+
+def test_auxiliary_pages_render_in_the_console_shell() -> None:
+    client, _ = _make_client()
+
+    for path, marker in (("/runs", "运行详情"), ("/diagnostics", "诊断")):
+        body = client.get(path).text
+        assert response_ok(client, path), path
+        assert marker in body
+        # The console shell, not the old bare markup.
+        assert "/static/console.css" in body
+
+
+def response_ok(client: TestClient, path: str) -> bool:
+    return client.get(path).status_code == 200
+
+
+def test_run_state_chips_pair_colour_with_a_glyph() -> None:
+    """Colour must never be the only signal for a state."""
+    from evo_helper.web.app import run_state_glyph, run_state_tone
+
+    for state in ("SCANNING", "PAUSED", "FAILED", "EMERGENCY_STOPPED", "COMPLETED"):
+        assert run_state_tone(state) != "", state
+        assert run_state_glyph(state) != "•", state
+
+    # An unknown state still renders something rather than blowing up.
+    assert run_state_tone("SOMETHING_NEW") == ""
+    assert run_state_glyph("SOMETHING_NEW") == "•"

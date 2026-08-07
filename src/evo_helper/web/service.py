@@ -310,8 +310,9 @@ class FakeApplicationService:
     def _validate_range(scan_range: ScanRangeView) -> None:
         if scan_range.end < scan_range.start:
             raise ServiceError("range end must not precede its start")
-        if not (scan_range.start <= scan_range.origin <= scan_range.end):
-            raise ServiceError("range origin must lie inside the range")
+        # The origin is deliberately not required to fall inside the range. It
+        # is the player's own planet, which normally sits well outside the
+        # coordinates being scanned.
 
     # ---- runs ------------------------------------------------------------
 

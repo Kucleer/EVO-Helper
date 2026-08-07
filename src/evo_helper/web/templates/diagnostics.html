@@ -1,56 +1,91 @@
 {% extends "base.html" %}
-{% block title %}Diagnostics{% endblock %}
+{% block title %}诊断 · EVO-Helper{% endblock %}
+{% block heading %}诊断{% endblock %}
 {% block content %}
-<h1>Diagnostics</h1>
-<h2>Request a revisit</h2>
-<form data-api="/api/revisits">
-  <p>
-    <label>Scope
-      <select name="scope"><option value="target">target</option><option value="plan">plan</option><option value="range">range</option></select>
-    </label>
-    <label>Reason <input name="reason" required></label>
+
+<section class="panel compact" aria-labelledby="request-revisit">
+  <h2 id="request-revisit">发起强制复查</h2>
+  <form data-api="/api/revisits" class="filter-bar">
+    <span class="inline-label">范围</span>
+    <select name="scope" aria-label="复查范围">
+      <option value="target">坐标</option>
+      <option value="plan">计划</option>
+      <option value="range">区段</option>
+    </select>
+    <span class="inline-label">坐标</span>
+    <input name="target_coordinate.galaxy" type="number" min="1" placeholder="1" size="3" aria-label="银河">
+    <span class="dash">:</span>
+    <input name="target_coordinate.system" type="number" min="1" placeholder="100" size="4" aria-label="恒星">
+    <span class="dash">:</span>
+    <input name="target_coordinate.position" type="number" min="1" placeholder="1" size="3" aria-label="行星">
+    <span class="sep" role="separator"></span>
+    <input name="reason" required placeholder="原因" size="22" aria-label="复查原因">
+    <button class="btn primary small" type="submit">提交</button>
+  </form>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    复查用于确认目标是否已被其他玩家攻击，或舰艇组合是否发生变化。坐标仅在范围为「坐标」时使用。
   </p>
-  <p>
-    <label>Target coordinate (galaxy:system:position, for target scope)
-      <input name="target_coordinate.galaxy" type="number" min="1" placeholder="1">
-      :<input name="target_coordinate.system" type="number" min="1" placeholder="1">
-      :<input name="target_coordinate.position" type="number" min="1" placeholder="1">
-    </label>
-  </p>
-  <button type="submit">Request revisit</button>
-</form>
-<h2>Revisits</h2>
-<table>
-  <thead><tr><th>Scope</th><th>Reason</th><th>Status</th><th>Coordinate</th><th>Requested (UTC)</th></tr></thead>
-  <tbody>
-  {% for revisit in revisits %}
-    <tr>
-      <td>{{ revisit.scope }}</td>
-      <td>{{ revisit.reason }}</td>
-      <td>{{ revisit.status }}</td>
-      <td>{{ revisit.target_coordinate.galaxy if revisit.target_coordinate else "-" }}:{{ revisit.target_coordinate.system if revisit.target_coordinate else "" }}:{{ revisit.target_coordinate.position if revisit.target_coordinate else "" }}</td>
-      <td>{{ revisit.requested_at_utc }}</td>
-    </tr>
-  {% else %}
-    <tr><td colspan="5" class="muted">No revisits yet.</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
-<h2>State events</h2>
-<table>
-  <thead><tr><th>Time (UTC)</th><th>Aggregate</th><th>Event</th><th>From</th><th>To</th></tr></thead>
-  <tbody>
-  {% for event in events %}
-    <tr>
-      <td>{{ event.occurred_at_utc }}</td>
-      <td>{{ event.aggregate }}:{{ event.aggregate_id }}</td>
-      <td>{{ event.event }}</td>
-      <td>{{ event.from_state or "-" }}</td>
-      <td>{{ event.to_state or "-" }}</td>
-    </tr>
-  {% else %}
-    <tr><td colspan="5" class="muted">No events yet.</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
+</section>
+
+<section class="panel" aria-labelledby="revisits">
+  <h2 id="revisits">复查请求</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">范围</th><th scope="col">原因</th><th scope="col">状态</th>
+          <th scope="col">坐标</th><th scope="col">请求时间 (UTC)</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for revisit in revisits %}
+        <tr>
+          <td>{{ revisit.scope }}</td>
+          <td>{{ revisit.reason }}</td>
+          <td>
+            <span class="chip {{ 'ok' if revisit.status == 'DONE' else 'warn' }}">
+              <span class="glyph" aria-hidden="true">{{ '✓' if revisit.status == 'DONE' else '…' }}</span>{{ revisit.status }}
+            </span>
+          </td>
+          <td class="coord">
+            {%- if revisit.target_coordinate -%}
+              {{ revisit.target_coordinate.galaxy }}:{{ revisit.target_coordinate.system }}:{{ revisit.target_coordinate.position }}
+            {%- else -%}—{%- endif -%}
+          </td>
+          <td>{{ revisit.requested_at_utc }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">还没有复查请求。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel" aria-labelledby="events">
+  <h2 id="events">状态事件</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">时间 (UTC)</th><th scope="col">聚合</th>
+          <th scope="col">事件</th><th scope="col">前</th><th scope="col">后</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for event in events %}
+        <tr>
+          <td>{{ event.occurred_at_utc }}</td>
+          <td class="muted">{{ event.aggregate }}:{{ event.aggregate_id }}</td>
+          <td>{{ event.event }}</td>
+          <td class="muted">{{ event.from_state or "—" }}</td>
+          <td>{{ event.to_state or "—" }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">还没有状态事件。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
 {% endblock %}

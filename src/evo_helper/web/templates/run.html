@@ -1,25 +1,42 @@
 {% extends "base.html" %}
-{% block title %}Run {{ run.run_id }}{% endblock %}
+{% block title %}运行 {{ run.run_id }} · EVO-Helper{% endblock %}
+{% block heading %}运行实例{% endblock %}
+{% block topbar_extra %}
+<span class="chip {{ run_state_tone(run.state) }}">
+  <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run.state }}
+</span>
+{% endblock %}
 {% block content %}
-<h1>Run status</h1>
-<p><a href="/runs">Back to runs</a></p>
-<table>
-  <tr><th>Run ID</th><td>{{ run.run_id }}</td></tr>
-  <tr><th>Plan ID</th><td>{{ run.plan_id }}</td></tr>
-  <tr><th>State</th><td>{{ run.state }}</td></tr>
-  <tr><th>Idempotency key</th><td>{{ run.idempotency_key }}</td></tr>
-  <tr><th>Target date</th><td>{{ run.target_date }}</td></tr>
-  <tr><th>Created (UTC)</th><td>{{ run.created_at }}</td></tr>
-  <tr><th>Started (UTC)</th><td>{{ run.started_at or "pending" }}</td></tr>
-  <tr><th>Finished (UTC)</th><td>{{ run.finished_at or "pending" }}</td></tr>
-</table>
-<form class="inline" data-api="/api/runs/{{ run.run_id }}/pause">
-  <button type="submit">Pause</button>
-</form>
-<form class="inline" data-api="/api/runs/{{ run.run_id }}/resume">
-  <button type="submit">Resume</button>
-</form>
-<form class="inline" data-api="/api/runs/{{ run.run_id }}/emergency-stop">
-  <button type="submit" class="danger">Emergency stop</button>
-</form>
+
+<section class="panel" aria-labelledby="run-detail">
+  <h2 id="run-detail">状态</h2>
+  <div class="table-wrap">
+    <table>
+      <tbody>
+        <tr><td class="muted">运行 ID</td><td class="coord">{{ run.run_id }}</td></tr>
+        <tr><td class="muted">计划</td><td>{{ run.plan_id }}</td></tr>
+        <tr><td class="muted">状态</td><td>{{ run.state }}</td></tr>
+        <tr><td class="muted">目标日期</td><td>{{ run.target_date }}</td></tr>
+        <tr><td class="muted">幂等键</td><td>{{ run.idempotency_key }}</td></tr>
+        <tr><td class="muted">创建 (UTC)</td><td>{{ run.created_at }}</td></tr>
+        <tr><td class="muted">开始 (UTC)</td><td>{{ run.started_at or "—" }}</td></tr>
+        <tr><td class="muted">结束 (UTC)</td><td>{{ run.finished_at or "—" }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="filter-bar" style="margin-top:12px">
+    <button class="btn small" type="button"
+            onclick="EVOHelper.post('/api/runs/{{ run.run_id }}/pause').then(() => location.reload())">暂停</button>
+    <button class="btn small" type="button"
+            onclick="EVOHelper.post('/api/runs/{{ run.run_id }}/resume').then(() => location.reload())">恢复</button>
+    <button class="btn small" type="button" style="border-color:#562b2a;color:var(--danger)"
+            onclick="EVOHelper.post('/api/runs/{{ run.run_id }}/emergency-stop').then(() => location.reload())">紧急停止</button>
+    <div style="flex:1"></div>
+    <a class="btn small ghost" href="/runs">返回列表</a>
+  </div>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    紧急停止优先于任何状态机动作。鼠标甩到屏幕左上角可立即中断正在进行的指针操作。
+  </p>
+</section>
 {% endblock %}

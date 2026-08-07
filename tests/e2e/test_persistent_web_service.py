@@ -88,3 +88,36 @@ def test_persistent_app_retains_plan_across_app_recreation(tmp_path: Path) -> No
     plans = second.get("/api/plans").json()
 
     assert [plan["name"] for plan in plans] == ["api-persisted"]
+
+
+def test_persistent_plan_accepts_an_origin_outside_the_range(tmp_path: Path) -> None:
+    """Both services enforce plan rules, so both must allow an outside origin.
+
+    The fake service was fixed first and the persistent one still rejected the
+    plan, which is what the console hit with real coordinates.
+    """
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'origin.db'}")
+    Base.metadata.create_all(engine)
+    service = PersistentApplicationService(create_session_factory(engine), now_utc=lambda: NOW)
+
+    plan = service.create_plan(
+        name="morning-scan",
+        enabled=True,
+        window_start=time(8),
+        window_end=time(10),
+        dry_run=True,
+        ranges=(
+            ScanRangeView(
+                Coordinate(1, 100, 1),
+                Coordinate(1, 200, 15),
+                Coordinate(2, 137, 18),
+                "探路",
+                "轻型战斗机:1",
+                0,
+            ),
+        ),
+    )
+
+    assert plan.ranges[0].origin == Coordinate(2, 137, 18)
+    assert plan.ranges[0].fleet_preset == "探路"
+    assert plan.ranges[0].fleet_preset_signature == "轻型战斗机:1"

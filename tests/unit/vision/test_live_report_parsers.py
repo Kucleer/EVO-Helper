@@ -308,3 +308,87 @@ class TestUnitNameSnapping:
         lines = parse_fleet_column("无引舰  95", "ocr", snap=False)
         assert lines[0].ship_type == "无引舰"
         assert lines[0].category == "unknown"
+
+
+class TestUnitCatalogue:
+    """The catalogue is the in-game list supplied by the user on 2026-08-07."""
+
+    def test_ships_and_defences_do_not_overlap(self) -> None:
+        from evo_helper.vision.parsers import DEFENCE_NAMES, SHIP_NAMES
+
+        assert SHIP_NAMES & DEFENCE_NAMES == frozenset()
+
+    def test_unit_order_covers_every_name_exactly_once(self) -> None:
+        from evo_helper.vision.parsers import DEFENCE_NAMES, SHIP_NAMES, UNIT_ORDER
+
+        assert len(UNIT_ORDER) == len(set(UNIT_ORDER))
+        assert set(UNIT_ORDER) == SHIP_NAMES | DEFENCE_NAMES
+
+    def test_order_matches_the_in_game_list(self) -> None:
+        from evo_helper.vision.parsers import SHIP_ORDER
+
+        assert SHIP_ORDER[:4] == ("轻型战斗机", "重型战斗机", "巡洋舰", "战列舰")
+        assert SHIP_ORDER[-4:] == ("噬能截击者", "钛能守卫者", "收割者", "湮灭之星")
+
+    def test_late_game_ships_are_classified_as_ships(self) -> None:
+        from evo_helper.vision.parsers import classify_unit
+
+        for name in ("收割者", "湮灭之星", "噬能截击者"):
+            assert classify_unit(name) == "ship", name
+
+    def test_missiles_and_shields_are_not_ships(self) -> None:
+        from evo_helper.vision.parsers import classify_unit
+
+        for name in ("行星际导弹", "拦截导弹", "太阳能卫星", "小型护盾", "大型护盾"):
+            assert classify_unit(name) == "defence", name
+
+    def test_transport_names_match_the_catalogue(self) -> None:
+        """The earlier guesses 运输舰 / 间谍探测器 were wrong."""
+        from evo_helper.vision.parsers import classify_unit
+
+        assert classify_unit("小型运输船") == "ship"
+        assert classify_unit("大型运输船") == "ship"
+        assert classify_unit("探测器") == "ship"
+        assert classify_unit("运输舰") == "unknown"
+
+
+class TestListColumnsAreRealUnits:
+    def test_every_list_column_is_in_the_catalogue(self) -> None:
+        from evo_helper.vision.parsers import UNIT_ORDER
+        from evo_helper.web.display import LIST_SHIP_COLUMNS
+
+        assert set(LIST_SHIP_COLUMNS) <= set(UNIT_ORDER)
+
+
+class TestPresetSignature:
+    """Safety invariant 9: the preset name AND its composition must match."""
+
+    def test_composition_signature_round_trips(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        assert composition_signature({"轻型战斗机": 1}) == "轻型战斗机:1"
+
+    def test_signature_is_order_independent(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        first = composition_signature({"轻型战斗机": 1, "巡洋舰": 2})
+        second = composition_signature({"巡洋舰": 2, "轻型战斗机": 1})
+        assert first == second
+
+    def test_different_counts_give_different_signatures(self) -> None:
+        from evo_helper.domain.fleet_preset import composition_signature
+
+        assert composition_signature({"轻型战斗机": 1}) != composition_signature({"轻型战斗机": 2})
+
+    def test_default_preset_is_the_scouting_preset(self) -> None:
+        from evo_helper.domain.fleet_preset import DEFAULT_PRESET
+
+        assert DEFAULT_PRESET.name == "探路"
+        assert DEFAULT_PRESET.signature == "轻型战斗机:1"
+
+    def test_a_two_character_name_is_below_the_snap_threshold(self) -> None:
+        """探路 cannot be OCR-repaired, which is why composition must also match."""
+        from evo_helper.vision.parsers import snap_unit_name
+
+        name, category = snap_unit_name("探路")
+        assert (name, category) == ("探路", "unknown")

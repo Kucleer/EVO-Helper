@@ -1,37 +1,57 @@
 {% extends "base.html" %}
-{% block title %}Runs{% endblock %}
+{% block title %}运行详情 · EVO-Helper{% endblock %}
+{% block heading %}运行详情{% endblock %}
 {% block content %}
-<h1>Runs</h1>
-<h2>Start a run</h2>
-<form data-api="/api/runs/start">
-  <p>
-    <label>Plan
-      <select name="plan_id" required>
-        {% for plan in plans %}<option value="{{ plan.id }}">{{ plan.name }}</option>{% endfor %}
-      </select>
-    </label>
+
+<section class="panel compact" aria-labelledby="start-run">
+  <h2 id="start-run">启动运行</h2>
+  <form data-api="/api/runs/start" class="filter-bar">
+    <span class="inline-label">计划</span>
+    <select name="plan_id" required aria-label="扫描计划">
+      {% for plan in plans %}<option value="{{ plan.id }}">{{ plan.name }}</option>{% endfor %}
+    </select>
+    <span class="sep" role="separator"></span>
+    <span class="inline-label">幂等键</span>
+    <input name="idempotency_key" id="idem-key" minlength="8" required size="34"
+           aria-label="幂等键" title="防止双击创建两个任务实例">
+    <button class="btn small" type="button"
+            onclick="document.getElementById('idem-key').value = crypto.randomUUID()">生成</button>
+    <button class="btn primary small" type="submit">启动</button>
+    <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>dry run</span>
+  </form>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    幂等键让重复点击只创建一个运行实例。打开本页本身不会启动任何任务。
   </p>
-  <p>
-    <label>Idempotency key <input name="idempotency_key" id="idem-key" minlength="8" required></label>
-    <button type="button" onclick="document.getElementById('idem-key').value = crypto.randomUUID()">Generate</button>
-  </p>
-  <button type="submit">Start run</button>
-</form>
-<h2>Recent runs</h2>
-<table>
-  <thead><tr><th>Run</th><th>Plan</th><th>State</th><th>Target date</th><th>Created (UTC)</th></tr></thead>
-  <tbody>
-  {% for run in runs %}
-    <tr>
-      <td><a href="/runs/{{ run.run_id }}">{{ run.run_id }}</a></td>
-      <td>{{ run.plan_id }}</td>
-      <td>{{ run.state }}</td>
-      <td>{{ run.target_date }}</td>
-      <td>{{ run.created_at }}</td>
-    </tr>
-  {% else %}
-    <tr><td colspan="5" class="muted">No runs yet.</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
+</section>
+
+<section class="panel" aria-labelledby="recent-runs">
+  <h2 id="recent-runs">运行实例</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">运行</th><th scope="col">计划</th><th scope="col">状态</th>
+          <th scope="col">目标日期</th><th scope="col">创建时间 (UTC)</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for run in runs %}
+        <tr onclick="location.href='/runs/{{ run.run_id }}'">
+          <td class="coord">{{ run.run_id }}</td>
+          <td class="muted">{{ run.plan_id }}</td>
+          <td>
+            <span class="chip {{ run_state_tone(run.state) }}">
+              <span class="glyph" aria-hidden="true">{{ run_state_glyph(run.state) }}</span>{{ run.state }}
+            </span>
+          </td>
+          <td>{{ run.target_date }}</td>
+          <td>{{ run.created_at }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">还没有运行实例。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
 {% endblock %}
