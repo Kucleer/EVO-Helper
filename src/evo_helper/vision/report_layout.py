@@ -21,7 +21,24 @@ from dataclasses import dataclass
 #: Plain grayscale plus a LANCZOS upscale reads every count on the batch
 #: correctly, and the filler is dim enough that Tesseract drops it anyway — the
 #: filler-heavy attacker column yields no spurious rows.
-OCR_UPSCALE = 4
+#:
+#: Measured 2026-08-07 on the ``evo-20260807-live`` report, comparing whole-report
+#: reads (all ROIs, three repeats, median):
+#:
+#: ==========  ========  ==============
+#: upscale     time      fully exact
+#: ==========  ========  ==============
+#: ``4``       7.70s     3/3
+#: ``3``       6.17s     **0/3**
+#: ``2``       5.72s     3/3
+#: ==========  ========  ==============
+#:
+#: ``2`` is 26% faster than ``4`` with byte-identical output, so it is the
+#: default. Tesseract is *not* monotonic in scale — ``3`` misreads a ship name
+#: that both neighbours get right — so this value cannot be tuned by
+#: interpolation. It is one sample; if a future report misreads, raise it back
+#: to ``4`` and re-measure rather than trying ``3``.
+OCR_UPSCALE = 2
 
 #: Multi-row column of text (fleet columns, mail rows).
 OCR_PSM_COLUMN = 6
