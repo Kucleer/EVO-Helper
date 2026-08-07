@@ -491,13 +491,18 @@ def create_persistent_app(
     local_token: str | None = None,
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
+    from .intel_routes import register_intel_routes
     from .persistent_service import PersistentApplicationService
 
-    return create_app(
+    app = create_app(
         service=PersistentApplicationService(session_factory),
         settings=settings,
         local_token=local_token,
     )
+    # Intel search reads fleet snapshots straight from SQL, so it takes the
+    # session factory rather than going through the application service.
+    register_intel_routes(app, session_factory)
+    return app
 
 
 __all__ = ["create_app", "create_persistent_app"]

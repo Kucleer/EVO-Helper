@@ -5,7 +5,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, String, UniqueConstraint, Uuid
+from sqlalchemy import (
+    Boolean,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base, UTCDateTime
@@ -225,3 +235,17 @@ class ArtifactRow(Base):
     source: Mapped[str] = mapped_column(String(64))
     retention_policy: Mapped[str] = mapped_column(String(32), default="KEEP")
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class IntelFilterRow(Base):
+    """A named, reusable intel query. The tree is stored as JSON text."""
+
+    __tablename__ = "intel_filters"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(120), index=True)
+    condition_tree: Mapped[str] = mapped_column(Text)
+    span_start: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    span_end: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
