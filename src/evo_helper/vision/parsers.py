@@ -8,7 +8,8 @@ instead of guessing.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from enum import Enum
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.vision.models import (
@@ -23,6 +24,9 @@ from evo_helper.vision.models import (
     NameParse,
     PageObservation,
     PresetSignatureCheck,
+    ReplayRound,
+    VersusBlock,
+    VersusSide,
 )
 
 COORDINATE_RE = re.compile(r"(?<!\d)(\d{1,3}):(\d{1,3}):(\d{1,3})(?!\d)")
@@ -32,6 +36,69 @@ FLEET_LINE_RE = re.compile(r"^([A-Za-z0-9_\- \u4e00-\u9fff]{2,40}?)\s*[xX\u00d7]
 ISO_TIME_RE = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:Z|[+-]\d{2}:?\d{2})?"
 )
+
+
+#: ``DD/MM/YYYY HH:MM:SS`` as rendered by the live mail list and report header.
+REPORT_TIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})")
+
+#: Ground defences observed in the 参战战舰 list. They share the layout of ship
+#: rows but are structures, so a snapshot must keep them apart from a fleet.
+DEFENCE_NAMES = frozenset(
+    {
+        "离子炮",
+        "火箭发射器",
+        "轻型激光炮",
+        "重型激光炮",
+        "MK2 加农炮",
+        "等离子炮",
+        "小型防护盾",
+        "大型防护盾",
+    }
+)
+
+#: Ship names observed in live attack reports and replays.
+SHIP_NAMES = frozenset(
+    {
+        "轻型战斗机",
+        "重型战斗机",
+        "巡洋舰",
+        "战列舰",
+        "无畏舰",
+        "轰炸机",
+        "毁灭者",
+        "裂变者",
+        "深空吞噬者",
+        "钛能守卫者",
+        "噬能截击者",
+        "回收船",
+        "间谍探测器",
+        "殖民船",
+        "运输舰",
+        "大型运输舰",
+    }
+)
+
+#: ``名称`` followed by whitespace and a count. A count of ``0`` is a real row.
+FLEET_COLUMN_RE = re.compile(r"^(.+?)\s{1,}(\d{1,7})$")
+
+
+class ReportKind(Enum):
+    """Mail report subjects that the report matcher must tell apart.
+
+    Only :attr:`ATTACK` may be matched against a dispatch. ``海盗攻击报告``
+    contains ``攻击报告`` as a substring but is a pirate battle, and matching it
+    to a bot dispatch would close the wrong attack.
+    """
+
+    ATTACK = "attack"
+    PIRATE = "pirate"
+    SCOUT = "scout"
+    SYSTEM = "system"
+    UNKNOWN = "unknown"
+
+    @property
+    def is_dispatch_matchable(self) -> bool:
+        return self is ReportKind.ATTACK
 
 
 class UnknownUiVersionError(RuntimeError):
@@ -47,6 +114,22 @@ def parse_coordinate(text: str, source: str, confidence: float = 1.0) -> Coordin
     except ValueError:
         return None
     return CoordinateParse(value=value, confidence=confidence, sources=(source,))
+
+
+def parse_all_coordinates(text: str, source: str, confidence: float = 1.0) -> list[CoordinateParse]:
+    """Return every coordinate in ``text`` in reading order.
+
+    A single OCR line can carry both sides of a report (``1:2:3 -> 9:8:7``), so
+    stopping at the first match would drop the defender.
+    """
+    parsed: list[CoordinateParse] = []
+    for match in COORDINATE_RE.finditer(text):
+        try:
+            value = Coordinate(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            continue
+        parsed.append(CoordinateParse(value=value, confidence=confidence, sources=(source,)))
+    return parsed
 
 
 def parse_name(text: str, source: str, confidence: float = 1.0) -> NameParse | None:
@@ -103,6 +186,192 @@ def parse_iso_utc(text: str) -> datetime | None:
         return None
 
 
+def parse_report_timestamp(text: str, display_zone: tzinfo) -> datetime | None:
+    """Parse the live ``DD/MM/YYYY HH:MM:SS`` report time and normalize to UTC.
+
+    ``display_zone`` is required rather than defaulted: the zone the game
+    renders report times in is a property of the account/server, and silently
+    assuming one would shift every report by whole hours and break strict
+    dispatch matching. Callers pass the configured zone and keep the raw text.
+    """
+    match = REPORT_TIME_RE.search(text)
+    if match is None:
+        return None
+    day, month, year, hour, minute, second = (int(value) for value in match.groups())
+    try:
+        local = datetime(year, month, day, hour, minute, second, tzinfo=display_zone)
+    except ValueError:
+        return None
+    return local.astimezone(UTC)
+
+
+def classify_report_subject(subject: str) -> ReportKind:
+    """Classify a mail subject. Order matters: pirate is checked before attack."""
+    text = subject.strip()
+    if "海盗" in text:
+        return ReportKind.PIRATE
+    if "攻击报告" in text:
+        return ReportKind.ATTACK
+    if "侦察报告" in text:
+        return ReportKind.SCOUT
+    if "战报" in text:
+        return ReportKind.SYSTEM
+    return ReportKind.UNKNOWN
+
+
+def classify_unit(name: str) -> str:
+    if name in SHIP_NAMES:
+        return "ship"
+    if name in DEFENCE_NAMES:
+        return "defence"
+    return "unknown"
+
+
+def parse_fleet_column(text: str, source: str, confidence: float = 1.0) -> tuple[FleetLine, ...]:
+    """Parse one column of the 参战战舰 / 剩余战舰 list.
+
+    Rows are ``名称`` then whitespace then a count. A row whose count is ``0``
+    is kept: the live UI renders zeroes explicitly and dropping them would make
+    a wiped-out ship type indistinguishable from one that never participated.
+    """
+    lines: list[FleetLine] = []
+    for raw in text.splitlines():
+        match = FLEET_COLUMN_RE.match(raw.strip())
+        if match is None:
+            continue
+        name = match.group(1).strip()
+        if not name:
+            continue
+        lines.append(
+            FleetLine(
+                ship_type=name,
+                count=int(match.group(2)),
+                confidence=confidence,
+                sources=(source,),
+                category=classify_unit(name),
+            )
+        )
+    return tuple(lines)
+
+
+def parse_versus_block(text: str, source: str, confidence: float = 1.0) -> VersusBlock | None:
+    """Parse the two-column VS block into attacker (left) and defender (right).
+
+    Returns ``None`` when either side is incomplete, so the caller fails closed
+    instead of attributing one side's coordinate to both.
+    """
+    left: list[str] = []
+    right: list[str] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = re.split(r"\s{2,}", raw.strip())
+        if len(parts) < 2:
+            return None
+        left.append(parts[0].strip())
+        right.append(parts[-1].strip())
+    if len(left) < 3 or len(right) < 3:
+        return None
+    attacker = _versus_side(left, source, confidence)
+    defender = _versus_side(right, source, confidence)
+    if attacker is None or defender is None:
+        return None
+    return VersusBlock(attacker=attacker, defender=defender)
+
+
+def parse_mail_rows_v2(
+    page: PageObservation,
+    rows: list[str],
+    display_zone: tzinfo,
+    source: str,
+) -> MailListObservation:
+    """Parse live mail rows of ``subject`` / ``sender`` / ``timestamp``.
+
+    Live rows carry no coordinate. ``MailItem.coordinate`` therefore stays
+    ``None``; the coordinate comes from opening the report, never from the list.
+    """
+    if page.ui_version is None:
+        raise UnknownUiVersionError("mail list UI version unknown; refusing to navigate")
+    if page.ui_version != "mail-list-v2":
+        raise UnknownUiVersionError(f"unsupported mail list UI version: {page.ui_version}")
+    items: list[MailItem] = []
+    for row in rows:
+        lines = [line.strip() for line in row.splitlines() if line.strip()]
+        if not lines:
+            continue
+        subject = lines[0]
+        raw_time = next((line for line in lines if REPORT_TIME_RE.search(line)), None)
+        sender = next(
+            (line for line in lines[1:] if line != raw_time),
+            None,
+        )
+        items.append(
+            MailItem(
+                subject=subject,
+                owner=NameParse(value=sender, confidence=page.confidence, sources=(source,))
+                if sender
+                else None,
+                coordinate=None,
+                raw_time_text=raw_time,
+            )
+        )
+    # display_zone is accepted so callers cannot forget it when they later
+    # normalize raw_time_text; the row itself keeps only the raw string.
+    _ = display_zone
+    return MailListObservation(
+        ui_version=page.ui_version,
+        items=tuple(items),
+        page_number=None,
+        confidence=page.confidence,
+    )
+
+
+def parse_replay_rounds(
+    rounds: list[tuple[int, str, str]],
+    source: str,
+    confidence: float = 1.0,
+) -> tuple[ReplayRound, ...]:
+    """Parse ``(round_number, attacker_column, defender_column)`` sections.
+
+    Rounds must arrive strictly increasing from 1. Out-of-order or duplicated
+    round numbers mean the scroll capture lost or repeated a section, which
+    would silently corrupt a fleet timeline.
+    """
+    parsed: list[ReplayRound] = []
+    for index, (number, attacker_text, defender_text) in enumerate(rounds, start=1):
+        if number != index:
+            raise ValueError(f"replay round out of sequence: expected {index}, got {number}")
+        parsed.append(
+            ReplayRound(
+                round_number=number,
+                attacker=parse_fleet_column(attacker_text, source, confidence),
+                defender=parse_fleet_column(defender_text, source, confidence),
+            )
+        )
+    return tuple(parsed)
+
+
+def _versus_side(lines: list[str], source: str, confidence: float) -> VersusSide | None:
+    coordinate = next(
+        (
+            parsed
+            for parsed in (parse_coordinate(line, source, confidence) for line in lines)
+            if parsed is not None
+        ),
+        None,
+    )
+    if coordinate is None:
+        return None
+    non_coordinate = [line for line in lines if COORDINATE_RE.search(line) is None]
+    if len(non_coordinate) < 2:
+        return None
+    return VersusSide(
+        player=non_coordinate[0],
+        planet=non_coordinate[1],
+        coordinate=coordinate,
+    )
+
+
 def parse_mail_list(page: PageObservation, ocr_text: str, source: str) -> MailListObservation:
     if page.ui_version is None:
         raise UnknownUiVersionError("mail list UI version unknown; refusing to navigate")
@@ -122,13 +391,8 @@ def parse_mail_list(page: PageObservation, ocr_text: str, source: str) -> MailLi
 def parse_battle_detail(page: PageObservation, ocr_text: str, source: str) -> BattleDetail:
     if page.ui_version not in {"battle-detail-v2", "battle-detail-v1"}:
         raise UnknownUiVersionError(f"unsupported battle detail UI version: {page.ui_version}")
-    coordinates = [
-        c
-        for c in (parse_coordinate(line, source) for line in ocr_text.splitlines())
-        if c is not None
-    ]
-    origin = coordinates[0] if coordinates else _missing_coordinate()
-    target = coordinates[1] if len(coordinates) > 1 else origin
+    coordinates = parse_all_coordinates(ocr_text, source)
+    origin, target = _require_both_coordinates(coordinates, "battle detail")
     attacker, defender = _split_fleet_sides(ocr_text, source)
     reported_at = parse_iso_utc(page.raw_time_text or ocr_text)
     return BattleDetail(
@@ -146,13 +410,8 @@ def parse_battle_detail(page: PageObservation, ocr_text: str, source: str) -> Ba
 def parse_battle_replay(page: PageObservation, ocr_text: str, source: str) -> BattleReplay:
     if page.ui_version not in {"battle-replay-v2", "battle-replay-v1"}:
         raise UnknownUiVersionError(f"unsupported battle replay UI version: {page.ui_version}")
-    coordinates = [
-        c
-        for c in (parse_coordinate(line, source) for line in ocr_text.splitlines())
-        if c is not None
-    ]
-    origin = coordinates[0] if coordinates else _missing_coordinate()
-    target = coordinates[1] if len(coordinates) > 1 else origin
+    coordinates = parse_all_coordinates(ocr_text, source)
+    origin, target = _require_both_coordinates(coordinates, "battle replay")
     attacker, defender = _split_fleet_sides(ocr_text, source)
     return BattleReplay(
         ui_version=page.ui_version,
@@ -237,5 +496,18 @@ def _split_fleet_sides(
     return tuple(attacker), tuple(defender)
 
 
-def _missing_coordinate() -> CoordinateParse:
-    return CoordinateParse(value=Coordinate(1, 1, 1), confidence=0.0, sources=())
+def _require_both_coordinates(
+    coordinates: list[CoordinateParse], screen: str
+) -> tuple[CoordinateParse, CoordinateParse]:
+    """Return the attacker and defender coordinates, or fail closed.
+
+    A report always shows both sides. Falling back to a placeholder or reusing
+    one side for the other would emit ``1:1:1`` — a real coordinate — or match a
+    dispatch against its own origin, so a short read is treated as an
+    unrecognised screen instead.
+    """
+    if len(coordinates) < 2:
+        raise UnknownUiVersionError(
+            f"{screen} needs an attacker and a defender coordinate; read {len(coordinates)}"
+        )
+    return coordinates[0], coordinates[1]

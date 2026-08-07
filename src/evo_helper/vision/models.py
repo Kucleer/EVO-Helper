@@ -36,6 +36,10 @@ class FleetLine:
     count: int
     confidence: float
     sources: tuple[str, ...] = ()
+    #: ``ship``, ``defence`` or ``unknown``. The live replay lists ground
+    #: defences alongside ships, and an unrecognised name is never guessed
+    #: into either bucket.
+    category: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,34 @@ class BattleReplay:
     attacker_fleet: tuple[FleetLine, ...]
     defender_fleet: tuple[FleetLine, ...]
     confidence: float
+
+
+@dataclass(frozen=True)
+class VersusSide:
+    """One side of the 战报 / 战斗回放 VS block."""
+
+    player: str
+    planet: str
+    coordinate: CoordinateParse
+
+    @property
+    def is_bot(self) -> bool:
+        return self.player.startswith("bot_")
+
+
+@dataclass(frozen=True)
+class VersusBlock:
+    attacker: VersusSide
+    defender: VersusSide
+
+
+@dataclass(frozen=True)
+class ReplayRound:
+    """Remaining ships for one 第N回合【剩余战舰】 section."""
+
+    round_number: int
+    attacker: tuple[FleetLine, ...]
+    defender: tuple[FleetLine, ...]
 
 
 @dataclass(frozen=True)
