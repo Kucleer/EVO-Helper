@@ -17,8 +17,8 @@ from evo_helper.domain.models import Coordinate
 from .display import LIST_SHIP_COLUMNS
 from .schemas import (
     BotTargetOut,
-    CoordinateScanOut,
     CoordinateModel,
+    CoordinateScanOut,
     DashboardOut,
     FleetChangeOut,
     FleetDiffOut,
@@ -482,7 +482,7 @@ def create_app(
             context={
                 "scans": [
                     {
-                        "coordinate": f"{s.coordinate.galaxy}:{s.coordinate.system}:{s.coordinate.position}",
+                        "coordinate": str(s.coordinate),
                         "owner_name": s.owner_name,
                         "is_bot": s.is_bot,
                         "scanned_at": s.scanned_at_utc,
