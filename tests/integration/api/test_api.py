@@ -558,3 +558,47 @@ def test_planets_page_drops_the_default_hint_once_a_filter_is_chosen() -> None:
 
     assert "默认只看 bot" in client.get("/planets").text
     assert "默认只看 bot" not in client.get("/planets?kind=free").text
+
+
+def test_planet_rows_link_to_the_coordinate_detail_page() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets").text
+
+    assert 'href="/targets/2:1:5?back=' in body
+
+
+def test_the_detail_page_returns_to_the_page_you_came_from() -> None:
+    """翻到第 7 页再点进去、回来从头开始，等于逼人重新翻一遍。"""
+    client, _service = _make_client()
+
+    body = client.get("/targets/2:1:5", params={"back": "/planets?kind=free&offset=300"}).text
+
+    assert 'href="/planets?kind=free&amp;offset=300"' in body
+
+
+def test_the_detail_page_refuses_an_offsite_back_target() -> None:
+    """back 来自查询参数，也就是来自任何人都能构造的链接。
+
+    原样塞进 href 就等于在本地控制台上开了个跳转到站外的口子。
+    """
+    for hostile in ("//evil.example", "https://evil.example", "javascript:alert(1)"):
+        body = client_for_back(hostile)
+        assert "evil.example" not in body
+        assert "javascript:" not in body
+        assert 'href="/planets"' in body
+
+
+def client_for_back(back: str) -> str:
+    client, _service = _make_client()
+    return client.get("/targets/2:1:5", params={"back": back}).text
+
+
+def test_the_detail_page_says_so_when_there_is_no_report_yet() -> None:
+    # 「还没有战报」是常态而不是异常：舰队组成要等真打过一仗才有。
+    client, _service = _make_client()
+
+    body = client.get("/targets/2:1:5").text
+
+    assert "还没有战报" in body

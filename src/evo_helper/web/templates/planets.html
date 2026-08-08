@@ -71,7 +71,13 @@
       <tbody>
       {% for row in page.rows %}
         <tr>
-          <td class="coord">{{ row.coordinate }}</td>
+          {#
+            带上 back：详情页看完要能回到**刚才那一页**，而不是回到筛选器的默认状态。
+            翻到第 7 页再点进去、回来从头开始，等于逼人重新翻。
+          #}
+          <td class="coord">
+            <a href="/targets/{{ row.coordinate }}?back={{ back_query }}">{{ row.coordinate }}</a>
+          </td>
           <td>{{ row.owner_name or '—' }}</td>
           <td>
             {% if row.kind == 'bot' %}

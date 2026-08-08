@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
@@ -266,6 +266,20 @@ _RUN_STATE_LABEL = {
     "FAILED": "已失败",
     "EMERGENCY_STOPPED": "已紧急停止",
 }
+
+
+def _safe_back_url(back: str | None, default: str = "/planets") -> str:
+    """把「返回」目标限制在本站内的相对路径。
+
+    `back` 来自查询参数，也就是来自任何人都能构造的链接。原样塞进 href 就等于
+    在本地控制台上开了一个跳转到站外的口子——`//evil.example` 和
+    `https://evil.example` 都会被浏览器当成绝对地址。只放行以单个 `/` 开头的路径。
+    """
+    if not back:
+        return default
+    if not back.startswith("/") or back.startswith("//"):
+        return default
+    return back
 
 
 def run_state_label(state: str) -> str:
@@ -553,6 +567,7 @@ def create_app(
                 "kind_labels": PLANET_KIND_LABELS,
                 "page_sizes": PLANET_PAGE_SIZES,
                 "default_kind": DEFAULT_PLANET_KIND,
+                "back_query": quote(page_url(offset), safe=""),
                 "prev_url": page_url(max(offset - limit, 0)) if offset > 0 else None,
                 "next_url": page_url(offset + limit) if page.has_more else None,
                 "active": "planets",
@@ -610,7 +625,9 @@ def create_app(
         return _diff_out(diff)
 
     @app.get("/targets/{coordinate}", response_class=HTMLResponse)
-    async def target_page(request: Request, coordinate: str) -> HTMLResponse:
+    async def target_page(
+        request: Request, coordinate: str, back: str | None = None
+    ) -> HTMLResponse:
         service = get_service(request)
         parsed = _parse_coordinate(coordinate)
         history = service.get_history(parsed)
@@ -622,6 +639,7 @@ def create_app(
                 "coordinate": coordinate,
                 "history": [_snapshot_out(s) for s in history],
                 "diff": _diff_out(diff) if diff else None,
+                "back_url": _safe_back_url(back),
             },
         )
 
