@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 #: 数量列的配方阶梯：放大倍数与重采样。最近邻保住相邻笔画之间的缝，
@@ -185,3 +185,37 @@ def _plurality(votes: dict[int, int]) -> int:
     if not votes:
         return 0
     return max(sorted(votes), key=lambda value: votes[value])
+
+
+def pick_count(votes: Mapping[str, int]) -> str:
+    """从多次读数里选一个值。**后缀让位于更长的候选。**
+
+    这个字体的失败模式是恒定的：**丢首位，从不凭空多字**。
+    实测 `74` 读成 `4` 21 次、读对 15 次；`210` 与 `10` 各 15 次打平。
+    单纯多数票会稳定选错短的那个——而短的恰恰是被截断的那个。
+
+    所以先把「是别人后缀」的票并给更长的那个，再取多数。
+    这条推理与坐标核对同源：错误只会漏读，不会凭空多读。
+    """
+    if not votes:
+        return ""
+    folded: dict[str, int] = {}
+    for text, count in votes.items():
+        longer = [other for other in votes if other != text and other.endswith(text)]
+        target = max(longer, key=len) if longer else text
+        folded[target] = folded.get(target, 0) + count
+    return max(sorted(folded), key=lambda value: folded[value])
+
+
+def row_grid(first_top: int, pitch: int, rows: int) -> list[int]:
+    """按等距网格排出每一行的顶端。
+
+    逐行检测靠不住：实测 17 行的表检出 18 行——`钛能守卫者` 整行没被认出来，
+    位置被一个 `sk` 碎片顶替，之后所有行的索引都错开一位。
+    行距本身很规整（实测 22px），拿第一行加行距推反而稳。
+
+    只用检测结果定**第一行位置和行距**，不用它定每一行。
+    """
+    if pitch <= 0:
+        raise ValueError(f"行距必须为正，收到 {pitch}")
+    return [first_top + index * pitch for index in range(rows)]

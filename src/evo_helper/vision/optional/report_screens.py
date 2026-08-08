@@ -26,6 +26,18 @@ from evo_helper.vision.scan_reading import COORD_RECIPES, COORD_WHITELIST, COORD
 
 OCR_LANGUAGES = "chi_sim+eng"
 
+#: 判定像素算不算墨迹的亮度门槛。
+NUMBER_INK_THRESHOLD = 150
+
+#: 名与数之间至少这么宽的空白才算「缝」。
+NUMBER_COLUMN_GAP = 6
+
+#: 量出来的数字列左右各留一点余量。
+NUMBER_COLUMN_PADDING = 4
+
+#: 一段墨迹至少这么宽才可能是数字列。面板边框只有两三像素宽。
+NUMBER_COLUMN_MIN_WIDTH = 10
+
 
 class _Ocr(Protocol):
     def image_to_string(self, image: Any, lang: str, config: str) -> str: ...
@@ -278,3 +290,52 @@ def locate_sections(image: Any, layout: ReportLayout, *, top: int = 300) -> list
         image, layout.attacker_column.left + 20, layout.defender_column.right - 20, top, bottom
     )
     return sections_from_banners(banner_bands(profile, top=top), bottom=bottom)
+
+
+def number_column(image: Any, band: ColumnBand, top: int, bottom: int) -> tuple[int, int]:
+    """在一列舰队里量出**数字子列**的横向范围。
+
+    不能写死。数字列的起点随内容变：短数（`117`）与长数（`5.73K`）落点不同，
+    不同来源的截图宽度也不一样（自采 1920、外部截图 1909）。实测两者的数字列
+    起点差 31px——按写死的左界裁，正好**切掉首位数字**，`210` 读成 `10`、
+    `74` 读成 `4`。这类错误在合计上看不出来，只在逐行比对时才现形。
+
+    做法：把这一列切成若干段连续墨迹，取**最右那段够宽的**。
+    不能取「最右的墨迹」——面板边框也在右边，实测边框那两三列像素会把结果
+    带到 1194 去，整个数字列反而落在外面。
+    """
+    grey = image.convert("L")
+    pixels = grey.load()
+    height = grey.size[1]
+    inked = [
+        x
+        for x in range(band.left, band.right)
+        if sum(1 for y in range(top, min(bottom, height)) if pixels[x, y] > NUMBER_INK_THRESHOLD)
+        > 1
+    ]
+    if not inked:
+        return (band.left, band.right)
+
+    runs: list[tuple[int, int]] = []
+    start = previous = inked[0]
+    for x in inked[1:]:
+        if x - previous > NUMBER_COLUMN_GAP:
+            runs.append((start, previous))
+            start = x
+        previous = x
+    runs.append((start, previous))
+
+    wide = [run for run in runs if run[1] - run[0] >= NUMBER_COLUMN_MIN_WIDTH]
+    chosen = wide[-1] if wide else runs[-1]
+    left, right = chosen
+
+    # 左界取「名与数之间那道缝的中点」，而不是数字墨迹的最左端。
+    # 数字是**左对齐**的，墨迹最左端就是首位笔画本身——贴着它裁，
+    # 首位就会被削掉：实测 `210` 读成 `10`、`74` 读成 `4`、`28` 读成 `8`。
+    # 缝里没有内容，多裁进来不会带入舰种名。
+    index = runs.index(chosen)
+    if index > 0:
+        left = (runs[index - 1][1] + left) // 2
+    else:
+        left -= NUMBER_COLUMN_PADDING
+    return (left, right + NUMBER_COLUMN_PADDING)

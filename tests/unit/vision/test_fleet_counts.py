@@ -13,8 +13,10 @@ from evo_helper.vision.fleet_counts import (
     FleetCountsUnresolved,
     FleetReading,
     nudge_offset,
+    pick_count,
     read_until_total,
     reconcile_counts,
+    row_grid,
 )
 
 TRUTH = (117, 31, 13, 11, 6, 8, 4, 1, 39, 17)
@@ -180,3 +182,42 @@ def test_a_tie_is_broken_deterministically() -> None:
     first = reconcile_counts([("甲", {6: 7, 5: 7})], 6)
     second = reconcile_counts([("甲", {5: 7, 6: 7})], 6)
     assert first.rows[0].count == second.rows[0].count == 5
+
+
+class TestPickCount:
+    """选票规则：后缀让位于更长的候选。"""
+
+    def test_a_truncated_reading_loses_to_the_full_one_even_with_more_votes(self) -> None:
+        # 实测：`74` 读成 `4` 21 次、读对 15 次。多数票会选错。
+        assert pick_count({"4": 21, "74": 15}) == "74"
+
+    def test_a_tie_goes_to_the_longer_reading(self) -> None:
+        # 实测：`210` 与 `10` 各 15 票。
+        assert pick_count({"210": 15, "10": 15}) == "210"
+
+    def test_unrelated_candidates_still_go_to_the_majority(self) -> None:
+        # 不是后缀关系就照常比票——这条规则只针对截断。
+        assert pick_count({"570": 20, "670": 9}) == "570"
+
+    def test_the_k_suffix_survives(self) -> None:
+        assert pick_count({"5.73K": 9, "73K": 4}) == "5.73K"
+
+    def test_no_votes_reads_as_empty(self) -> None:
+        assert pick_count({}) == ""
+
+
+class TestRowGrid:
+    """行位置用等距网格，不用逐行检测。"""
+
+    def test_rows_are_evenly_spaced_from_the_first(self) -> None:
+        assert row_grid(410, 22, 4) == [410, 432, 454, 476]
+
+    def test_the_grid_covers_rows_detection_missed(self) -> None:
+        """实测 17 行的表检出 18 行：一整行没被认出来，位置被碎片顶替，
+        之后所有索引错开一位。网格按真值行数排，漏检不影响其余行。
+        """
+        assert len(row_grid(410, 22, 17)) == 17
+
+    def test_a_nonsense_pitch_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="行距"):
+            row_grid(410, 0, 5)
