@@ -5,6 +5,7 @@ import pytest
 from evo_helper.game.game_window import (
     APP_TITLE_BAR_PX,
     CALIBRATED_VIEWPORT,
+    GAME_LOADING_TITLE,
     GAME_WINDOW_TITLE,
     ViewportPlan,
 )
@@ -49,6 +50,86 @@ class TestStrictTitleMatching:
             assert other.strip() != GAME_WINDOW_TITLE, other
 
 
+class TestLoadingIsNotMissing:
+    """页面重连时标题会临时退回域名。把它当成「窗口没了」会多拉一个窗口。"""
+
+    def test_waits_for_a_loading_window_instead_of_launching_a_second_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from evo_helper.game import game_window
+
+        # 前两次还在加载（标题是域名），第三次标题变成 EVO。
+        found: list[object] = [None, None]
+        launched: list[bool] = []
+        monkeypatch.setattr(
+            game_window,
+            "find_game_window",
+            lambda: found.pop(0) if found else _window("EVO"),
+        )
+        monkeypatch.setattr(
+            game_window, "find_loading_game_window", lambda: _window(GAME_LOADING_TITLE)
+        )
+        monkeypatch.setattr(game_window, "launch_game", lambda: launched.append(True))
+        monkeypatch.setattr(game_window, "resize_to_viewport", lambda w, p: p.viewport)
+
+        game_window.ensure_game_window(sleep=lambda _s: None)
+
+        # 关键断言：一个新窗口都没拉起来。
+        assert launched == []
+
+    def test_launches_only_when_nothing_is_loading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evo_helper.game import game_window
+
+        found: list[object] = [None]
+        launched: list[bool] = []
+        monkeypatch.setattr(
+            game_window,
+            "find_game_window",
+            lambda: found.pop(0) if found else _window("EVO"),
+        )
+        monkeypatch.setattr(game_window, "find_loading_game_window", lambda: None)
+        monkeypatch.setattr(game_window, "launch_game", lambda: launched.append(True))
+        monkeypatch.setattr(game_window, "resize_to_viewport", lambda w, p: p.viewport)
+
+        game_window.ensure_game_window(sleep=lambda _s: None)
+
+        assert launched == [True]
+
+    def test_a_stuck_loading_window_reports_instead_of_launching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from evo_helper.game import game_window
+
+        launched: list[bool] = []
+        monkeypatch.setattr(game_window, "find_game_window", lambda: None)
+        monkeypatch.setattr(
+            game_window, "find_loading_game_window", lambda: _window(GAME_LOADING_TITLE)
+        )
+        monkeypatch.setattr(game_window, "launch_game", lambda: launched.append(True))
+        monkeypatch.setattr(game_window, "LOAD_TIMEOUT_S", 0.0)
+
+        with pytest.raises(game_window.GameWindowError, match="加载"):
+            game_window.ensure_game_window(sleep=lambda _s: None)
+        assert launched == []
+
+    def test_duplicate_game_windows_are_refused_with_a_usable_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from evo_helper.game import game_window
+
+        monkeypatch.setattr(
+            game_window, "_windows_titled", lambda title: [_window(title), _window(title)]
+        )
+        with pytest.raises(game_window.GameWindowError, match="手动关掉"):
+            game_window.find_game_window()
+
+
+def _window(title: str) -> object:
+    from evo_helper.vision.optional.window_capture import WindowInfo
+
+    return WindowInfo(handle=1, title=title, rect=(0, 0, 1938, 926))
+
+
 class TestChromeDiscovery:
     def test_missing_chrome_is_reported_not_guessed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from pathlib import Path
@@ -81,6 +162,7 @@ class TestEnsureGameWindow:
         states = [None, None, object()]
         launched: list[bool] = []
         monkeypatch.setattr(game_window, "launch_game", lambda: launched.append(True))
+        monkeypatch.setattr(game_window, "find_loading_game_window", lambda: None)
         monkeypatch.setattr(
             game_window, "find_game_window", lambda: states.pop(0) if states else object()
         )
@@ -94,6 +176,7 @@ class TestEnsureGameWindow:
         from evo_helper.game import game_window
 
         monkeypatch.setattr(game_window, "launch_game", lambda: None)
+        monkeypatch.setattr(game_window, "find_loading_game_window", lambda: None)
         monkeypatch.setattr(game_window, "find_game_window", lambda: None)
 
         with pytest.raises(game_window.GameWindowError, match="没等到窗口"):
