@@ -319,6 +319,10 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates --status
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates
 
+# 常驻控制台：Alt+F8 起 / Alt+F9 停，右下角常驻状态窗（状态 + 持续工作时间）
+.venv/Scripts/python.exe -m evo_helper.tools.scan_console
+.venv/Scripts/python.exe -m evo_helper.tools.scan_console --stop-key ctrl+alt+f9
+
 # 旧的扫描结果入库（外部 JSON）
 .venv/Scripts/python.exe -m evo_helper.tools.ingest_scan --results <json> --run-id <uuid>
 ```
@@ -328,3 +332,8 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 
 > 扫描期间会**反复把游戏窗口提到前台并操作鼠标**，机器在此期间不能同时用于别的事。
 > 急停：把鼠标甩到屏幕左上角（`pyautogui.FAILSAFE`）。
+
+⚠️ **这台机器上 `Alt+F9` 与 `Alt+F10` 被 NVIDIA ShadowPlay 占用**
+（`RegisterHotKey` 返回错误码 1409）。控制台会逐个注册、逐个报告，
+能用的照常生效；换键用 `--stop-key ctrl+alt+f9`（实测空着），
+或去 GeForce Experience 里把录制快捷键改掉。状态窗右键=停止，不依赖任何注册。
