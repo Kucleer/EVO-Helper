@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.coordinates import POSITION_LIMIT, next_coordinate_after
+from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
@@ -71,7 +71,15 @@ class SqlAlchemyRepository:
                 if cursor is None or cursor < start:
                     next_coordinate: Coordinate | None = start
                 else:
-                    next_coordinate = next_coordinate_after(cursor, end, POSITION_LIMIT)
+                    # 位数窗口取自区间本身（例如 5–20），不是 POSITION_LIMIT。
+                    # 后者是每银河系的**恒星系数** 499，拿它当位数上限会让游标
+                    # 在每个恒星系里空转 479 个不存在的行星位。
+                    next_coordinate = next_coordinate_after(
+                        cursor,
+                        end,
+                        position_limit=range_row.end_position,
+                        first_position=range_row.start_position,
+                    )
                 if next_coordinate is None:
                     continue
                 _set_run_pending(run, next_coordinate)

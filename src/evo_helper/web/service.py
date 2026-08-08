@@ -97,6 +97,57 @@ class RunStatusView:
     finished_at: datetime | None = None
 
 
+#: 星球列表的筛选类型。`all` 不是一种星球，是「不过滤」。
+PLANET_KINDS: tuple[str, ...] = ("bot", "owned", "free", "all")
+
+#: 默认只看 bot：全量扫描里绝大多数坐标是空位，默认全展开没有信息量。
+DEFAULT_PLANET_KIND = "bot"
+
+
+def planet_kind(owner_name: str | None, is_bot: bool) -> str:
+    """一颗星球归哪一类。
+
+    分类只有这一份实现，持久化那边的 SQL 过滤条件必须与它一致——
+    「同一条规则在 Fake 和持久化各写一份」的坑已经踩过一次。
+    """
+    if is_bot:
+        return "bot"
+    return "owned" if owner_name else "free"
+
+
+@dataclass(frozen=True)
+class PlanetRow:
+    """星球列表里的一行：一颗星球的最新已知状态。"""
+
+    coordinate: Coordinate
+    owner_name: str | None
+    is_bot: bool
+    last_scan_at: datetime | None
+
+    @property
+    def kind(self) -> str:
+        return planet_kind(self.owner_name, self.is_bot)
+
+
+@dataclass(frozen=True)
+class PlanetPage:
+    """一页星球，外加足够让页面说清「这一页是全部还是一截」的计数。"""
+
+    rows: tuple[PlanetRow, ...]
+    #: 当前筛选下的总行数——**不是**本页行数。少了它，页面就只能拿本页行数冒充总数。
+    total: int
+    offset: int
+    limit: int
+    #: 当前银河系筛选下各类型各多少，用来标注筛选器而不必再查一次。
+    kind_counts: dict[str, int]
+    #: 每个银河系已扫过多少颗星球，用来填银河系下拉框。
+    galaxy_counts: dict[int, int]
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.rows) < self.total
+
+
 @dataclass(frozen=True)
 class BotTargetView:
     coordinate: Coordinate
@@ -203,6 +254,10 @@ class ApplicationService(Protocol):
     def emergency_stop_run(self, run_id: UUID) -> RunStatusView: ...
     def list_targets(self) -> list[BotTargetView]: ...
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
+    def count_scans(self) -> int: ...
+    def list_planets(
+        self, *, galaxy: int | None, kind: str, offset: int, limit: int
+    ) -> PlanetPage: ...
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]: ...
     def get_fleet_diff(self, coordinate: Coordinate) -> FleetDiffView | None: ...
     def list_events(self, limit: int) -> list[StateEventView]: ...
@@ -249,6 +304,7 @@ class FakeApplicationService:
         self._events: list[StateEventView] = []
         self._revisits: list[RevisitView] = []
         self._scans: list[CoordinateScanView] = []
+        self._planets: list[PlanetRow] = []
 
     # ---- plans -----------------------------------------------------------
 
@@ -457,6 +513,34 @@ class FakeApplicationService:
                 self._scans[:limit],
                 key=lambda s: (s.coordinate.galaxy, s.coordinate.system, s.coordinate.position),
             )
+
+    def count_scans(self) -> int:
+        with self._lock:
+            return len(self._scans)
+
+    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+        with self._lock:
+            planets = sorted(
+                self._planets,
+                key=lambda r: (r.coordinate.galaxy, r.coordinate.system, r.coordinate.position),
+            )
+        galaxy_counts: dict[int, int] = {}
+        for row in planets:
+            galaxy_counts[row.coordinate.galaxy] = galaxy_counts.get(row.coordinate.galaxy, 0) + 1
+        in_galaxy = [r for r in planets if galaxy is None or r.coordinate.galaxy == galaxy]
+        kind_counts = {k: 0 for k in PLANET_KINDS if k != "all"}
+        for row in in_galaxy:
+            kind_counts[row.kind] += 1
+        kind_counts["all"] = len(in_galaxy)
+        matched = [r for r in in_galaxy if kind == "all" or r.kind == kind]
+        return PlanetPage(
+            rows=tuple(matched[offset : offset + limit]),
+            total=len(matched),
+            offset=offset,
+            limit=limit,
+            kind_counts=kind_counts,
+            galaxy_counts=galaxy_counts,
+        )
 
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]:
         with self._lock:

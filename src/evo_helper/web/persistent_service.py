@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -25,6 +25,8 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     NotFoundError,
+    PlanetPage,
+    PlanetRow,
     PlanPatchView,
     RevisitView,
     RunStatusView,
@@ -32,6 +34,7 @@ from .service import (
     ScanRangeView,
     ServiceError,
     StateEventView,
+    planet_kind,
 )
 
 
@@ -217,6 +220,83 @@ class PersistentApplicationService:
                 for report in reports
                 if (view := self._report_view(session, coordinate, report))
             ]
+
+    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+        """按银河系与类型筛选星球，**在 SQL 里筛、在 SQL 里数**。
+
+        全量扫完是 71,856 颗星球。把它们全查出来再在 Python 里过滤，既慢又会诱使
+        页面拿「本页行数」冒充总数——`list_scans` 的 500 条上限就是这么变成
+        「扫描停在 2:32」的假象的。
+        """
+        with self._session_factory() as session:
+            base = select(orm.BotTargetRow)
+            if galaxy is not None:
+                base = base.where(orm.BotTargetRow.galaxy == galaxy)
+
+            counted = base.subquery()
+            kind_counts = {
+                "bot": 0,
+                "owned": 0,
+                "free": 0,
+            }
+            for is_bot, owner, count in session.execute(
+                select(counted.c.is_bot, counted.c.latest_owner_name, func.count())
+                .select_from(counted)
+                .group_by(counted.c.is_bot, counted.c.latest_owner_name.is_(None))
+            ):
+                kind_counts[planet_kind(owner, bool(is_bot))] += int(count)
+            kind_counts["all"] = sum(kind_counts.values())
+
+            filtered = base
+            clause = _planet_kind_clause(kind)
+            if clause is not None:
+                filtered = filtered.where(clause)
+
+            total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
+            rows = session.scalars(
+                filtered.order_by(
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                )
+                .offset(offset)
+                .limit(limit)
+            ).all()
+
+            galaxy_counts = {
+                int(g): int(count)
+                for g, count in session.execute(
+                    select(orm.BotTargetRow.galaxy, func.count())
+                    .group_by(orm.BotTargetRow.galaxy)
+                    .order_by(orm.BotTargetRow.galaxy)
+                )
+            }
+
+        return PlanetPage(
+            rows=tuple(
+                PlanetRow(
+                    coordinate=Coordinate(row.galaxy, row.system, row.position),
+                    owner_name=row.latest_owner_name,
+                    is_bot=bool(row.is_bot),
+                    last_scan_at=row.last_scanned_at_utc,
+                )
+                for row in rows
+            ),
+            total=total,
+            offset=offset,
+            limit=limit,
+            kind_counts=kind_counts,
+            galaxy_counts=galaxy_counts,
+        )
+
+    def count_scans(self) -> int:
+        """库里一共有多少条扫描事实。
+
+        `list_scans` 有上限，页面必须能说出「显示的是全部还是一截」——
+        只渲染前 500 条却不声明，看上去就像扫描停在了第 500 个坐标上。
+        """
+        with self._session_factory() as session:
+            return int(session.scalar(select(func.count()).select_from(orm.CoordinateScanRow)) or 0)
 
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]:
         """按坐标顺序列出扫描事实。
@@ -518,3 +598,21 @@ def _validate_lines(fleet_line_limit: int, reserved_lines: int) -> None:
             f"reserved_lines ({reserved_lines}) must be fewer than "
             f"fleet_line_limit ({fleet_line_limit}); the plan would never dispatch"
         )
+
+
+def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
+    """把 `planet_kind()` 的分类翻成 SQL 过滤条件。
+
+    两边必须一致。有用例拿同一批数据分别走这里和 `planet_kind()` 对答案，
+    改了一处忘了另一处会当场红。
+    """
+    if kind == "bot":
+        return orm.BotTargetRow.is_bot.is_(True)
+    if kind == "owned":
+        return and_(
+            orm.BotTargetRow.is_bot.is_(False),
+            orm.BotTargetRow.latest_owner_name.is_not(None),
+        )
+    if kind == "free":
+        return orm.BotTargetRow.latest_owner_name.is_(None)
+    return None

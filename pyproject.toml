@@ -67,8 +67,10 @@ module = [
   "mss.tools.*",
   "pytesseract.*",
   "ultralytics.*",
+  "win32api.*",
   "win32con.*",
   "win32gui.*",
+  "win32process.*",
   "win32ui.*",
   "pyautogui.*",
 ]

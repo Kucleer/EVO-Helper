@@ -1,10 +1,16 @@
+import html
+import re
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.web.app import create_app
-from evo_helper.web.service import FakeApplicationService, FleetEntryView
+from evo_helper.web.service import (
+    FakeApplicationService,
+    FleetEntryView,
+    PlanetRow,
+)
 
 
 def _make_client() -> tuple[TestClient, FakeApplicationService]:
@@ -457,3 +463,142 @@ def test_the_new_waiting_states_have_chinese_labels() -> None:
     for state in ("AWAITING_REPORT", "WAITING_SESSION"):
         assert run_state_tone(state) != ""
         assert run_state_glyph(state) != "•"
+
+
+def _seed_planets(service: FakeApplicationService, specs) -> None:
+    for galaxy, system, position, owner, is_bot in specs:
+        service._planets.append(
+            PlanetRow(
+                coordinate=Coordinate(galaxy, system, position),
+                owner_name=owner,
+                is_bot=is_bot,
+                last_scan_at=datetime(2026, 8, 8, tzinfo=UTC),
+            )
+        )
+
+
+MIXED = [
+    (2, 1, 5, "bot_2_1_5", True),
+    (2, 1, 6, None, False),
+    (2, 1, 7, "LilGriffith", False),
+    (3, 1, 5, "bot_3_1_5", True),
+    (3, 1, 6, None, False),
+]
+
+
+def test_planets_page_defaults_to_bots_only() -> None:
+    """全量扫描里绝大多数坐标是空位，默认全展开没有信息量。"""
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets").text
+
+    assert "bot_2_1_5" in body
+    assert "bot_3_1_5" in body
+    assert "LilGriffith" not in body
+
+
+def test_planets_page_filters_by_galaxy() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets?galaxy=2").text
+
+    assert "bot_2_1_5" in body
+    assert "bot_3_1_5" not in body
+
+
+def test_planets_page_kind_filter_reaches_the_unowned_slots() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets?kind=free").text
+
+    assert "2:1:6" in body
+    assert "bot_2_1_5" not in body
+
+
+def test_planets_page_reports_the_filtered_total_not_the_page_size() -> None:
+    """页面必须说得出当前筛选共多少颗，而不是拿本页行数冒充总数。
+
+    踩过：情报中心那张表只渲染前 500 条又不声明，扫描跑到 2:138 时页面停在 2:32。
+    """
+    client, service = _make_client()
+    _seed_planets(service, [(2, 1, 5 + i, f"bot_2_1_{5 + i}", True) for i in range(12)])
+
+    body = client.get("/planets?limit=5").text
+
+    assert "共 <strong>12</strong> 颗" in body
+    assert "1–5 颗" in body
+
+
+def test_planets_pagination_reaches_every_row() -> None:
+    """翻页要能走到最后一颗——分页不是另一种静默截断。"""
+    client, service = _make_client()
+    _seed_planets(service, [(2, 1, 5 + i, f"bot_2_1_{5 + i}", True) for i in range(12)])
+
+    seen: set[str] = set()
+    url = "/planets?limit=5"
+    for _ in range(10):
+        response = client.get(url)
+        body = response.text
+        seen |= {f"2:1:{5 + i}" for i in range(12) if f"2:1:{5 + i}" in body}
+        match = re.search(r'href="(/planets[?][^"]*)">下一页', body)
+        if not match:
+            break
+        url = html.unescape(match.group(1))
+
+    assert seen == {f"2:1:{5 + i}" for i in range(12)}
+
+
+def test_planets_page_drops_the_default_hint_once_a_filter_is_chosen() -> None:
+    """「默认只看 bot」这句在别的筛选下就是一句和当前视图矛盾的噪声。"""
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    assert "默认只看 bot" in client.get("/planets").text
+    assert "默认只看 bot" not in client.get("/planets?kind=free").text
+
+
+def test_planet_rows_link_to_the_coordinate_detail_page() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets").text
+
+    assert 'href="/targets/2:1:5?back=' in body
+
+
+def test_the_detail_page_returns_to_the_page_you_came_from() -> None:
+    """翻到第 7 页再点进去、回来从头开始，等于逼人重新翻一遍。"""
+    client, _service = _make_client()
+
+    body = client.get("/targets/2:1:5", params={"back": "/planets?kind=free&offset=300"}).text
+
+    assert 'href="/planets?kind=free&amp;offset=300"' in body
+
+
+def test_the_detail_page_refuses_an_offsite_back_target() -> None:
+    """back 来自查询参数，也就是来自任何人都能构造的链接。
+
+    原样塞进 href 就等于在本地控制台上开了个跳转到站外的口子。
+    """
+    for hostile in ("//evil.example", "https://evil.example", "javascript:alert(1)"):
+        body = client_for_back(hostile)
+        assert "evil.example" not in body
+        assert "javascript:" not in body
+        assert 'href="/planets"' in body
+
+
+def client_for_back(back: str) -> str:
+    client, _service = _make_client()
+    return client.get("/targets/2:1:5", params={"back": back}).text
+
+
+def test_the_detail_page_says_so_when_there_is_no_report_yet() -> None:
+    # 「还没有战报」是常态而不是异常：舰队组成要等真打过一仗才有。
+    client, _service = _make_client()
+
+    body = client.get("/targets/2:1:5").text
+
+    assert "还没有战报" in body

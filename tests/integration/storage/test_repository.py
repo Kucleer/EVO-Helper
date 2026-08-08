@@ -176,6 +176,39 @@ def test_pending_coordinate_is_retried_until_completed(session_factory, reposito
     assert advanced.coordinate > first.coordinate
 
 
+def test_cursor_carries_into_the_next_system_at_the_range_position_limit(
+    session_factory,
+    repository,
+) -> None:
+    """位数窗口来自区间本身（这里 5–7），不是 `POSITION_LIMIT` 的 499。
+
+    499 是每银河系的**恒星系数**。拿它当位数上限，游标会在每个恒星系里空转
+    几百个不存在的行星位——扫描看起来一直在跑，实际一个新坐标都没到。
+    """
+    _plan_id, run_id = _seed_run(
+        session_factory,
+        ranges=((Coordinate(2, 121, 5), Coordinate(2, 122, 7)),),
+    )
+
+    claimed = []
+    for _ in range(6):
+        claim = repository.claim_next_coordinate(run_id)
+        assert claim is not None
+        claimed.append(claim.coordinate)
+        repository.complete_coordinate(run_id, claim.coordinate)
+
+    assert claimed == [
+        Coordinate(2, 121, 5),
+        Coordinate(2, 121, 6),
+        Coordinate(2, 121, 7),
+        # 进位落到区间起始位 5，而不是海盗位 1。
+        Coordinate(2, 122, 5),
+        Coordinate(2, 122, 6),
+        Coordinate(2, 122, 7),
+    ]
+    assert repository.claim_next_coordinate(run_id) is None
+
+
 def test_claim_unknown_run_raises(repository) -> None:
     with pytest.raises(ValueError, match="unknown run"):
         repository.claim_next_coordinate(uuid4())
