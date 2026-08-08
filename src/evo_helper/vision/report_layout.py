@@ -9,7 +9,9 @@ exactly like a smaller fleet.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from statistics import median
 
 #: OCR recipe measured against Tesseract on the batch images.
 #:
@@ -154,3 +156,66 @@ def layout_for_viewport(width: int, height: int) -> ReportLayout:
             f"only {LAYOUT_VIEWPORT[0]}x{LAYOUT_VIEWPORT[1]} is calibrated"
         )
     return LIVE_LAYOUT
+
+
+#: 分节横幅是一条横贯面板的亮带。判据用亮度而不是文字——横幅上的
+#: 「第1回合【剩余战舰】」实测 OCR 只读出 `ee`，靠文字定位不住。
+BANNER_BRIGHTNESS_RATIO = 1.55
+BANNER_MIN_HEIGHT = 18
+
+#: 亮带与内容之间留一点余量，免得把横幅自身的像素读进行里。
+SECTION_PADDING = 3
+
+
+def banner_bands(
+    profile: Sequence[float],
+    *,
+    top: int,
+    ratio: float = BANNER_BRIGHTNESS_RATIO,
+    min_height: int = BANNER_MIN_HEIGHT,
+) -> list[tuple[int, int]]:
+    """从逐行亮度里找出分节横幅，返回每条亮带的 ``(起, 止)``。
+
+    `profile[i]` 是视口第 ``top + i`` 行在面板中列的平均亮度。基线取中位数——
+    面板大部分行是暗背景，中位数不受横幅本身影响。
+
+    只认够高的亮带：行内选中高亮、面板描边也会亮，但它们都薄。
+    """
+    if not profile:
+        return []
+    baseline = median(profile)
+    threshold = baseline * ratio
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(profile):
+        if value > threshold:
+            start = index if start is None else start
+            continue
+        if start is not None:
+            if index - start >= min_height:
+                bands.append((top + start, top + index - 1))
+            start = None
+    if start is not None and len(profile) - start >= min_height:
+        bands.append((top + start, top + len(profile) - 1))
+    return bands
+
+
+def sections_from_banners(
+    bands: Sequence[tuple[int, int]], *, bottom: int, padding: int = SECTION_PADDING
+) -> list[tuple[int, int]]:
+    """把横幅位置换算成各分节的行区间。
+
+    第 i 节 = 第 i 条横幅之下、第 i+1 条横幅之上。最后一节到 ``bottom`` 为止。
+
+    这是「参战战舰」与「第N回合」不能写死的原因：回放内容会滚动，
+    写死的下界会**穿透到下一节**——实测 `participating_rows` 的 750
+    把「第1回合【剩余战舰】」也框了进去，于是同一批数量被读了两遍。
+    """
+    sections: list[tuple[int, int]] = []
+    for index, (_start, end) in enumerate(bands):
+        following = bands[index + 1][0] if index + 1 < len(bands) else bottom
+        section_top = end + padding
+        section_bottom = following - padding
+        if section_bottom > section_top:
+            sections.append((section_top, section_bottom))
+    return sections
