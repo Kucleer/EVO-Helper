@@ -4,7 +4,11 @@ from fastapi.testclient import TestClient
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.web.app import create_app
-from evo_helper.web.service import FakeApplicationService, FleetEntryView
+from evo_helper.web.service import (
+    CoordinateScanView,
+    FakeApplicationService,
+    FleetEntryView,
+)
 
 
 def _make_client() -> tuple[TestClient, FakeApplicationService]:
@@ -457,3 +461,46 @@ def test_the_new_waiting_states_have_chinese_labels() -> None:
     for state in ("AWAITING_REPORT", "WAITING_SESSION"):
         assert run_state_tone(state) != ""
         assert run_state_glyph(state) != "•"
+
+
+def test_intel_page_reports_the_real_scan_total_not_just_what_it_rendered() -> None:
+    """扫描列表有 500 条上限，页面必须把**库里的总数**一并说出来。
+
+    踩过：库里 2115 条扫描、138 个 bot，页面只渲染前 500 条（止于 2:32:7、31 个 bot），
+    计数还写着「31 / 500 条」——读起来就是扫描死在 2:32 了，而扫描其实跑到了 2:138。
+    截断本身可以接受，不声明截断不行。
+    """
+    client, service = _make_client()
+    for index in range(502):
+        service._scans.append(
+            CoordinateScanView(
+                coordinate=Coordinate(2, 1 + index // 16, 5 + index % 16),
+                scanned_at_utc=datetime(2026, 8, 8, tzinfo=UTC),
+                owner_name=None,
+                is_bot=False,
+                confidence=1.0,
+            )
+        )
+
+    body = client.get("/intel").text
+
+    assert 'data-total="502"' in body
+    assert 'data-rendered="500"' in body
+
+
+def test_intel_page_total_matches_rendered_when_nothing_is_dropped() -> None:
+    client, service = _make_client()
+    service._scans.append(
+        CoordinateScanView(
+            coordinate=Coordinate(2, 1, 5),
+            scanned_at_utc=datetime(2026, 8, 8, tzinfo=UTC),
+            owner_name="bot_2_1_5",
+            is_bot=True,
+            confidence=1.0,
+        )
+    )
+
+    body = client.get("/intel").text
+
+    assert 'data-total="1"' in body
+    assert 'data-rendered="1"' in body

@@ -492,6 +492,9 @@ def create_app(
                     }
                     for s in service.list_scans()
                 ],
+                # 列表有上限。不把总数一并给出的话，页面只渲染前 500 条却看着像全部——
+                # 扫描到 2:138 时页面停在 2:32，读起来就是「扫描死在那儿了」。
+                "scan_total": service.count_scans(),
                 "active": "intel",
                 "list_ship_columns": list(LIST_SHIP_COLUMNS),
             },

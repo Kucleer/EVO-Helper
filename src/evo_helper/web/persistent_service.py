@@ -218,6 +218,15 @@ class PersistentApplicationService:
                 if (view := self._report_view(session, coordinate, report))
             ]
 
+    def count_scans(self) -> int:
+        """库里一共有多少条扫描事实。
+
+        `list_scans` 有上限，页面必须能说出「显示的是全部还是一截」——
+        只渲染前 500 条却不声明，看上去就像扫描停在了第 500 个坐标上。
+        """
+        with self._session_factory() as session:
+            return int(session.scalar(select(func.count()).select_from(orm.CoordinateScanRow)) or 0)
+
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]:
         """按坐标顺序列出扫描事实。
 
