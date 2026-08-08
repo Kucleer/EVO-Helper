@@ -300,10 +300,20 @@ class LiveDriver:
         self._human = HumanInput(self._gui)
 
     def window(self) -> Any:
+        """返回一个**可以往上点**的游戏窗口。
+
+        最小化的窗口 `find_game_window()` 照样找得到，但它的 rect 是 (-32000, -32000)，
+        照着算出来的点击坐标会落到屏幕角落——实测就是这样触发了 `pyautogui` 的急停。
+        急停兜住了，可依赖急停等于把「点到桌面上」当成正常路径。这里先还原再用。
+        """
+        import win32gui
+
         from evo_helper.game.game_window import ensure_game_window, find_game_window
 
         found = find_game_window()
-        return found if found is not None else ensure_game_window()
+        if found is None or win32gui.IsIconic(found.handle):
+            return ensure_game_window()
+        return found
 
     def _raise_to_front(self, handle: int) -> None:
         """试一次抢前台。被系统拒绝是常事，所以吞掉异常交给外层重试。

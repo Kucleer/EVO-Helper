@@ -73,7 +73,19 @@ class HumanInput:
         *,
         seed: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        allow_actions: bool = False,
     ) -> None:
+        """``allow_actions`` 是**动作闸门**，默认关。
+
+        关着时任何看起来像动作的标签都点不出去（见 `FORBIDDEN_LABELS`），
+        这正是扫描器要的：它只导航，不该有能力点攻击或派遣。
+
+        攻击侦查那条链路必须点「攻击」和「派遣」，所以它在构造时显式打开这个闸门——
+        **开关只有这一处**，翻一眼构造点就知道哪个进程有动作能力，
+        而不是靠在黑名单里删词（删了词，扫描器也就一并获得了这个能力）。
+
+        闸门只决定「有没有资格点」；「这一次该不该点」仍然是 ActionGuard 的事。
+        """
         if not backend.FAILSAFE:
             raise RuntimeError(
                 "pyautogui.FAILSAFE is disabled; the emergency stop would not work. "
@@ -82,9 +94,11 @@ class HumanInput:
         self._backend = backend
         self._random = random.Random(seed)
         self._sleep = sleep
+        self._allow_actions = allow_actions
 
     def click(self, x: int, y: int, *, label: str = "") -> None:
-        _reject_acting_label(label)
+        if not self._allow_actions:
+            _reject_acting_label(label)
         target_x, target_y = self._jitter(x, y)
         self._backend.moveTo(target_x, target_y, self._move_duration())
         self._backend.click()
@@ -92,7 +106,8 @@ class HumanInput:
 
     def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
         """Drag inside a panel. Game panels ignore the wheel and scroll only by drag."""
-        _reject_acting_label(label)
+        if not self._allow_actions:
+            _reject_acting_label(label)
         start_x, start_y = self._jitter(from_x, from_y)
         end_x, end_y = self._jitter(to_x, to_y)
         self._backend.moveTo(start_x, start_y, self._move_duration())
