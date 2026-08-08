@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}星球列表 · EVO-Helper{% endblock %}
+{% block heading %}星球列表{% endblock %}
+
+{#
+  筛选与翻页全部走 URL 查询参数，页面本身不带 JS：
+  - 每种筛选都有自己的链接，可收藏、可分享、后退键能用
+  - 行数由服务端决定，页面永远说得出「当前筛选共多少条」——
+    情报中心那张表就是因为只渲染前 500 条却不声明，看着像扫描停在 2:32
+#}
+{% block content %}
+
+<section class="panel" aria-labelledby="planet-filters">
+  <h2 id="planet-filters">筛选</h2>
+
+  <form method="get" action="/planets" class="filter-bar">
+    <label class="inline-label" for="galaxy">银河系</label>
+    <select id="galaxy" name="galaxy">
+      <option value="">全部银河系</option>
+      {% for g in all_galaxies %}
+        <option value="{{ g }}" {% if page.galaxy == g %}selected{% endif %}>
+          {{ g }} 系{% if page.galaxy_counts.get(g) %}（{{ page.galaxy_counts[g] }} 颗）{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="kind">类型</label>
+    <select id="kind" name="kind">
+      {% for value, label in kind_labels %}
+        <option value="{{ value }}" {% if page.kind == value %}selected{% endif %}>
+          {{ label }}（{{ page.kind_counts.get(value, 0) }}）
+        </option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="limit">每页</label>
+    <select id="limit" name="limit">
+      {% for size in page_sizes %}
+        <option value="{{ size }}" {% if page.limit == size %}selected{% endif %}>{{ size }}</option>
+      {% endfor %}
+    </select>
+
+    <button type="submit">应用</button>
+    <a href="/planets" class="muted" style="font-size:12px">重置</a>
+  </form>
+
+  <p class="muted" style="font-size:12px;margin:8px 0 0">
+    {% if page.total %}
+      当前筛选共 <strong>{{ page.total }}</strong> 颗，正在看第
+      {{ page.offset + 1 }}–{{ page.offset + page.rows | length }} 颗。
+    {% else %}
+      当前筛选没有匹配的星球。
+    {% endif %}
+    {# 这句只在还没动过类型筛选时说，否则会变成一句与当前视图矛盾的噪声。 #}
+    {% if page.kind == default_kind %}默认只看 bot——全量扫描里绝大多数坐标是空位。{% endif %}
+  </p>
+</section>
+
+<section class="panel" aria-labelledby="planet-list">
+  <h2 id="planet-list">星球</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">坐标</th>
+          <th scope="col">归属</th>
+          <th scope="col">类型</th>
+          <th scope="col">最近扫描 (UTC)</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in page.rows %}
+        <tr>
+          <td class="coord">{{ row.coordinate }}</td>
+          <td>{{ row.owner_name or '—' }}</td>
+          <td>
+            {% if row.kind == 'bot' %}
+              <span class="chip ok"><span class="glyph" aria-hidden="true">●</span>bot</span>
+            {% elif row.kind == 'owned' %}
+              <span class="chip warn"><span class="glyph" aria-hidden="true">◆</span>有主</span>
+            {% else %}
+              <span class="chip"><span class="glyph" aria-hidden="true">○</span>空位</span>
+            {% endif %}
+          </td>
+          <td class="muted">{{ row.last_scan_at or '—' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">没有匹配的星球。换个银河系或类型试试。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if prev_url or next_url %}
+    <div class="filter-bar" style="margin:10px 0 0">
+      {% if prev_url %}<a href="{{ prev_url }}">← 上一页</a>{% endif %}
+      <span class="spacer"></span>
+      {% if next_url %}<a href="{{ next_url }}">下一页 →</a>{% endif %}
+    </div>
+  {% endif %}
+</section>
+
+{% endblock %}

@@ -479,73 +479,14 @@
 
 <section class="panel" aria-labelledby="scan-facts">
   <h2 id="scan-facts">坐标扫描结果</h2>
-  <div class="filter-bar" style="margin:0 0 10px">
-    <label class="inline-label" for="scan-scope">显示</label>
-    <select id="scan-scope" aria-label="扫描结果范围">
-      <option value="bot" selected>仅 bot 星球</option>
-      <option value="owned">有主（含 bot）</option>
-      <option value="all">全部（含空位）</option>
-    </select>
-    <span class="muted" id="scan-count" style="font-size:12px"
-          data-rendered="{{ scans | length }}" data-total="{{ scan_total }}"></span>
-  </div>
-  <div class="table-wrap" style="max-height:460px;overflow:auto">
-    <table>
-      <thead>
-        <tr>
-          <th scope="col">坐标</th><th scope="col">归属</th>
-          <th scope="col">类型</th><th scope="col">扫描时间 (UTC)</th>
-        </tr>
-      </thead>
-      <tbody>
-      {% for scan in scans %}
-        <tr data-scan data-kind="{{ 'bot' if scan.is_bot else ('owned' if scan.owner_name else 'free') }}">
-          <td class="coord">{{ scan.coordinate }}</td>
-          <td>{{ scan.owner_name or '—' }}</td>
-          <td>
-            {% if scan.is_bot %}
-              <span class="chip ok"><span class="glyph" aria-hidden="true">●</span>bot</span>
-            {% elif scan.owner_name %}
-              <span class="chip warn"><span class="glyph" aria-hidden="true">◆</span>有主</span>
-            {% else %}
-              <span class="chip"><span class="glyph" aria-hidden="true">○</span>空位</span>
-            {% endif %}
-          </td>
-          <td class="muted">{{ scan.scanned_at }}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="4" class="muted">还没有坐标扫描记录。</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
+  <p class="muted">
+    已扫过 <strong>{{ planet_total }}</strong> 颗星球。完整列表在
+    <a href="/planets">星球列表</a>，可按银河系与类型筛选、分页查看。
+  </p>
+  <p class="muted" style="font-size:12px">
+    这张表原本长在本页，但它只渲染前 500 条又不声明，
+    扫描跑到 2:138 时页面停在 2:32，读起来像扫描死在那儿了。
+  </p>
 </section>
-
-<script>
-(() => {
-  // 默认只看 bot：全量扫描里绝大多数坐标是空位，默认全展开没有信息量。
-  const scope = document.getElementById('scan-scope');
-  const count = document.getElementById('scan-count');
-  const rows = [...document.querySelectorAll('[data-scan]')];
-  const visibleFor = (kind, mode) =>
-    mode === 'all' || (mode === 'owned' && kind !== 'free') || (mode === 'bot' && kind === 'bot');
-  function apply() {
-    let shown = 0;
-    for (const row of rows) {
-      const ok = visibleFor(row.dataset.kind, scope.value);
-      row.hidden = !ok;
-      if (ok) shown += 1;
-    }
-    // 列表只渲染前 N 条。截断必须说出来——不说的话，页面看着就像扫描停在最后一行。
-    const total = Number(count.dataset.total || rows.length);
-    const rendered = rows.length;
-    count.textContent = rendered < total
-      ? `${shown} / ${rendered} 条（列表只显示最前 ${rendered} 个坐标，库内共 ${total} 条）`
-      : `${shown} / ${rendered} 条`;
-  }
-  scope.addEventListener('change', apply);
-  apply();
-})();
-</script>
 
 {% endblock %}

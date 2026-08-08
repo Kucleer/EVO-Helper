@@ -1,3 +1,5 @@
+import html
+import re
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
@@ -5,9 +7,9 @@ from fastapi.testclient import TestClient
 from evo_helper.domain.models import Coordinate
 from evo_helper.web.app import create_app
 from evo_helper.web.service import (
-    CoordinateScanView,
     FakeApplicationService,
     FleetEntryView,
+    PlanetRow,
 )
 
 
@@ -463,44 +465,96 @@ def test_the_new_waiting_states_have_chinese_labels() -> None:
         assert run_state_glyph(state) != "•"
 
 
-def test_intel_page_reports_the_real_scan_total_not_just_what_it_rendered() -> None:
-    """扫描列表有 500 条上限，页面必须把**库里的总数**一并说出来。
-
-    踩过：库里 2115 条扫描、138 个 bot，页面只渲染前 500 条（止于 2:32:7、31 个 bot），
-    计数还写着「31 / 500 条」——读起来就是扫描死在 2:32 了，而扫描其实跑到了 2:138。
-    截断本身可以接受，不声明截断不行。
-    """
-    client, service = _make_client()
-    for index in range(502):
-        service._scans.append(
-            CoordinateScanView(
-                coordinate=Coordinate(2, 1 + index // 16, 5 + index % 16),
-                scanned_at_utc=datetime(2026, 8, 8, tzinfo=UTC),
-                owner_name=None,
-                is_bot=False,
-                confidence=1.0,
+def _seed_planets(service: FakeApplicationService, specs) -> None:
+    for galaxy, system, position, owner, is_bot in specs:
+        service._planets.append(
+            PlanetRow(
+                coordinate=Coordinate(galaxy, system, position),
+                owner_name=owner,
+                is_bot=is_bot,
+                last_scan_at=datetime(2026, 8, 8, tzinfo=UTC),
             )
         )
 
-    body = client.get("/intel").text
 
-    assert 'data-total="502"' in body
-    assert 'data-rendered="500"' in body
+MIXED = [
+    (2, 1, 5, "bot_2_1_5", True),
+    (2, 1, 6, None, False),
+    (2, 1, 7, "LilGriffith", False),
+    (3, 1, 5, "bot_3_1_5", True),
+    (3, 1, 6, None, False),
+]
 
 
-def test_intel_page_total_matches_rendered_when_nothing_is_dropped() -> None:
+def test_planets_page_defaults_to_bots_only() -> None:
+    """全量扫描里绝大多数坐标是空位，默认全展开没有信息量。"""
     client, service = _make_client()
-    service._scans.append(
-        CoordinateScanView(
-            coordinate=Coordinate(2, 1, 5),
-            scanned_at_utc=datetime(2026, 8, 8, tzinfo=UTC),
-            owner_name="bot_2_1_5",
-            is_bot=True,
-            confidence=1.0,
-        )
-    )
+    _seed_planets(service, MIXED)
 
-    body = client.get("/intel").text
+    body = client.get("/planets").text
 
-    assert 'data-total="1"' in body
-    assert 'data-rendered="1"' in body
+    assert "bot_2_1_5" in body
+    assert "bot_3_1_5" in body
+    assert "LilGriffith" not in body
+
+
+def test_planets_page_filters_by_galaxy() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets?galaxy=2").text
+
+    assert "bot_2_1_5" in body
+    assert "bot_3_1_5" not in body
+
+
+def test_planets_page_kind_filter_reaches_the_unowned_slots() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets?kind=free").text
+
+    assert "2:1:6" in body
+    assert "bot_2_1_5" not in body
+
+
+def test_planets_page_reports_the_filtered_total_not_the_page_size() -> None:
+    """页面必须说得出当前筛选共多少颗，而不是拿本页行数冒充总数。
+
+    踩过：情报中心那张表只渲染前 500 条又不声明，扫描跑到 2:138 时页面停在 2:32。
+    """
+    client, service = _make_client()
+    _seed_planets(service, [(2, 1, 5 + i, f"bot_2_1_{5 + i}", True) for i in range(12)])
+
+    body = client.get("/planets?limit=5").text
+
+    assert "共 <strong>12</strong> 颗" in body
+    assert "1–5 颗" in body
+
+
+def test_planets_pagination_reaches_every_row() -> None:
+    """翻页要能走到最后一颗——分页不是另一种静默截断。"""
+    client, service = _make_client()
+    _seed_planets(service, [(2, 1, 5 + i, f"bot_2_1_{5 + i}", True) for i in range(12)])
+
+    seen: set[str] = set()
+    url = "/planets?limit=5"
+    for _ in range(10):
+        response = client.get(url)
+        body = response.text
+        seen |= {f"2:1:{5 + i}" for i in range(12) if f"2:1:{5 + i}" in body}
+        match = re.search(r'href="(/planets[?][^"]*)">下一页', body)
+        if not match:
+            break
+        url = html.unescape(match.group(1))
+
+    assert seen == {f"2:1:{5 + i}" for i in range(12)}
+
+
+def test_planets_page_drops_the_default_hint_once_a_filter_is_chosen() -> None:
+    """「默认只看 bot」这句在别的筛选下就是一句和当前视图矛盾的噪声。"""
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    assert "默认只看 bot" in client.get("/planets").text
+    assert "默认只看 bot" not in client.get("/planets?kind=free").text
