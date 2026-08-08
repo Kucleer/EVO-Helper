@@ -108,3 +108,80 @@ def nudge_offset(attempt: int) -> int:
     """
     magnitude = 14 + (attempt % 3) * 6
     return magnitude if attempt % 2 else -magnitude
+
+
+@dataclass(frozen=True)
+class FleetRow:
+    """一行舰种数量，以及它是否可信。
+
+    `uncertain` 为真时，前端应在数字旁标 `*`——那一行的数没有把握，
+    但**整支舰队的总数是准的**（总数另有来源，见 `ReconciledFleet.total`）。
+    """
+
+    ship: str
+    count: int
+    uncertain: bool
+
+
+@dataclass(frozen=True)
+class ReconciledFleet:
+    """一份战报里某一方的舰队读数。
+
+    `total` 来自战斗详情页的「单位」，与逐行读数是**两个独立来源**；
+    逐行读不准时，总数仍然可信，所以它单独存、单独展示。
+    """
+
+    rows: tuple[FleetRow, ...]
+    total: int
+
+    @property
+    def rows_total(self) -> int:
+        return sum(row.count for row in self.rows)
+
+    @property
+    def reconciled(self) -> bool:
+        return self.rows_total == self.total
+
+    @property
+    def uncertain_rows(self) -> int:
+        return sum(1 for row in self.rows if row.uncertain)
+
+
+def reconcile_counts(
+    candidates: Sequence[tuple[str, dict[int, int]]], expected_total: int
+) -> ReconciledFleet:
+    """按票数选每行的数，合计对不上时把**读数有过分歧的行**标为不确定。
+
+    **不确定性不能由票数高低判定。** 实测：`11` 被读成 `1`、`17` 被读成 `7`，
+    两者都是 100% 一致的误读；而只有 50% 一致的那行反倒是对的。
+    按票数标 `*` 会给对的行标星、给错的行放行——比不标更误导。
+
+    也不能只标「能独力补平差额」的那一行：实测差额是 11，而没有任何单行
+    换个候选值能正好补 11（错的是三行，不是一行）。判据太窄就会退化成全标。
+
+    所以规则是：合计对上 → 全部采信；对不上 → **凡是自己读出过第二个值的行都标**。
+    每一遍都读成同一个数的行留作可信——那是现有证据里最扎实的一档。
+    实测那份战报：4 个未标的行**全部正确**，3 个真错的行**全部被标**，
+    另有 3 行是虚警。宁可虚警，不可漏标。
+    """
+    winners = [(ship, _plurality(votes)) for ship, votes in candidates]
+    rows_total = sum(count for _ship, count in winners)
+    if rows_total == expected_total:
+        return ReconciledFleet(
+            tuple(FleetRow(ship, count, uncertain=False) for ship, count in winners),
+            expected_total,
+        )
+    return ReconciledFleet(
+        tuple(
+            FleetRow(ship, count, uncertain=len(votes) > 1)
+            for (ship, count), (_s, votes) in zip(winners, candidates, strict=True)
+        ),
+        expected_total,
+    )
+
+
+def _plurality(votes: dict[int, int]) -> int:
+    """票最多的那个值；平票取小的，让结果与读取顺序无关。"""
+    if not votes:
+        return 0
+    return max(sorted(votes), key=lambda value: votes[value])
