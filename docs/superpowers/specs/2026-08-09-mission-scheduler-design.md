@@ -270,9 +270,14 @@ tick(now):
   `137, 136, 138, 135, 139 …`，等距时小的在前。越界系号**钳制**到
   `[1, SYSTEMS_PER_GALAXY]` 而非报错——半径填大了应当是「到边为止」。
 - `bot_targets_in_range(targets, galaxy, first, last)`：筛系号区间，保持坐标序。
-- `mission_command(kind, params)`：组命令行。
+- `scan_command()` / `pirate_command(systems)` / `bot_command(targets)`：组命令行。
+  **拆成三个而不是一个 `mission_command(kind, params)`**——三条链路的参数类型
+  本来就不通，合成一个入口就得让 `params` 退化成 `dict[str, Any]`，在 strict mypy
+  下等于放弃检查。下游（`MissionSupervisor`）按种类调对应的那个。
 
-`ORIGIN` 从两处硬编码抽到此模块当共用常量。
+`ORIGIN` 应当只有一份。**当前状态：仍是三份**（`domain/missions.py`、
+`tools/pirate_loop.py:69`、`tools/scan_coordinates.py:49`），因为波次 1 的并行拆分
+不允许 D 去改 runner 文件。收敛留到波次 1 合流后处理——见第十节的收尾。
 
 **校验**（不合格拒绝启用，不起进程）：半径 ≤ 0；系号区间首尾颠倒；范围内一个已记录
 bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限时报错而非截断。
@@ -358,6 +363,16 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
 
 波次 1 的四个单元文件不重叠，可同时开工。两个 runner 的改动**全部集中在 B**，
 避免两个 agent 同时改 `pirate_loop.py`。
+
+### 波次 1 合流后的收尾（这些是并行拆分欠下的债，不做就一直欠着）
+
+1. **收敛 `ORIGIN`**。把 `tools/pirate_loop.py:69` 与 `tools/scan_coordinates.py:49`
+   两处改成从 `domain.missions` 导入。并行时不能碰这两个文件，所以现在是三份——
+   主星改一次要改三处，正是本该消掉的问题。
+2. **删掉 `repository: Any` 的临时标注**。`tools/bot_loop.py` 里为了在 Task 7
+   落地前过 mypy strict 而放宽的两处，合流后应还原成正常类型。
+3. **`bot_dispatch_facts` 的返回类型**从 `list[Any]` 改成 `list[DispatchFact]`。
+   `DispatchFact` 是纯 domain dataclass，不构成 import 环，模块级 import 即可。
 
 ### 收尾
 
