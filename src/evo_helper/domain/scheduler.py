@@ -219,6 +219,21 @@ def has_work(
     assert_never(kind)
 
 
+def scheduling_order(task: TaskSnapshot) -> tuple[bool, int]:
+    """排序键：`(是不是 SCAN, priority)`。升序即调度次序。
+
+    `SCAN` 恒为 True，结构性地排到所有非 `SCAN` 之后，**不看数据库里 priority
+    的实际数值**。理由：`SCAN` 不派遣、没有完成态，`has_work()` 永远为真，
+    谁排在它后面就永远轮不到——海盗每天 32 次配额会在不知不觉间被扫描占满
+    窗口耗光。页面已经禁止拖动 `SCAN` 行、接口也拒绝写它的 priority，但那些
+    只挡得住用户；挡不住数据库里一条手改的坏行，所以领域层自己兜底一次。
+
+    抽成具名函数是为了让页面的展示次序和 `decide()` 的调度次序共用同一把尺子：
+    两处各写一遍，就会出现「页面上排第一、实际最后才跑」。
+    """
+    return (task.kind is MissionKind.SCAN, task.priority)
+
+
 def status_of(
     task: TaskSnapshot,
     facts: SchedulerFacts,
@@ -269,16 +284,7 @@ def decide(
     """
     candidates = sorted(
         (task for task in tasks if task.enabled and task.disabled_reason is None),
-        # 排序键是 (是不是 SCAN, priority)：SCAN 恒为 True，结构性地排到
-        # 所有非 SCAN 之后，不看数据库里 priority 的实际数值。
-        #
-        # 为什么不能让 SCAN 按 priority 数值参与排序、被拖到攻击任务前面：
-        # SCAN 不派遣、没有完成态，永远 has_work() == True。谁排在它后面
-        # 就永远轮不到——海盗每天 32 次配额会在不知不觉间被扫描占满窗口
-        # 耗光。页面已经禁止拖动 SCAN 行，但那只挡得住用户的鼠标，挡不住
-        # 数据库里一条手改的坏行；领域层必须自己站得住，所以在这里结构性
-        # 兜底一次。
-        key=lambda task: (task.kind is MissionKind.SCAN, task.priority),
+        key=scheduling_order,
     )
     wanted = next(
         (

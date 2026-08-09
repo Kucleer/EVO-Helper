@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -69,6 +70,26 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True)
+class SchedulerSnapshot:
+    """一眼看全的调度器现状，供 API 搬给页面和桌面悬浮窗。
+
+    事实与判据分开放：`facts` 原样来自数据库，状态那句话由
+    `domain.scheduler.status_of` 现算。这一层不解释任何事情——解释一旦在这里
+    再写一遍，页面显示的和调度器下一步要做的就会是两份判据。
+    """
+
+    enabled: bool
+    #: 点「开始」的时刻。页面上那块秒表的起点；`enabled` 为假时是 None。
+    started_at_utc: datetime | None
+    running: RunningChild | None
+    #: 上次没走正常关闭路径留下的进程号，只用来显示，**不拿它开枪**。
+    orphan_pid: int | None
+    tasks: tuple[orm.MissionTaskRow, ...]
+    config: orm.SchedulerConfigRow
+    facts: SchedulerFacts
+
+
 class MissionScheduler:
     """点一次「开始」就常驻运行，直到点「结束」。
 
@@ -91,6 +112,10 @@ class MissionScheduler:
         #: 不在这里另写一遍 SQL 判据。
         self._planner = planner or ReportWaitPlanner()
         self._enabled = False
+        self._started_at_utc: datetime | None = None
+        #: 开机时认出的孤儿进程号。只显示，不据此杀进程。用户点了「强制结束」
+        #: 就清掉——那一下的含义是「我知道了，别再提醒我」。
+        self._orphan_pid: int | None = None
         self._run_id: UUID | None = None
         #: tick 跑在后台线程里，而页面的「开始 / 结束」来自请求线程。没有这把锁，
         #: 一次「结束」可能正好落在 tick 的「起进程」中间——supervisor 停掉的是
@@ -114,27 +139,94 @@ class MissionScheduler:
 
         孤儿是上次没走正常关闭路径留下的行。**只标不杀**——pid 会被系统回收
         复用，照着一个可能已经换了主人的号码开枪比留个警告更糟。
+
+        pid 要在标记**之前**读：标完那些行就闭合了，事后再也认不出是哪一条。
         """
         with self._lock:
             now = self._clock()
             self._repository.ensure_mission_rows(now_utc=now)
+            self._orphan_pid = next(
+                (row.pid for row in self._repository.open_mission_runs() if row.pid is not None),
+                None,
+            )
             return self._repository.mark_orphan_mission_runs(ended_at_utc=now)
 
     def start(self) -> None:
         with self._lock:
+            # 已经在跑就不要把秒表按回零：连点两下「开始」不该让页面显示成
+            # 刚刚才启动。
+            if not self._enabled:
+                self._started_at_utc = self._clock()
             self._enabled = True
 
     def stop(self) -> None:
         """用户点「结束」。立刻杀，不等它跑完手上这一个。"""
         with self._lock:
             self._enabled = False
+            self._started_at_utc = None
             self._finish(self._supervisor.stop(StopReason.USER))
 
     def shutdown(self) -> None:
         """控制台关闭时清场，覆盖「正常重启」这条最常见的路径。"""
         with self._lock:
             self._enabled = False
+            self._started_at_utc = None
             self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
+
+    def force_kill(self) -> None:
+        """页面顶部那条红条上的「强制结束」。
+
+        只做两件事：**停掉我们自己手上的那个子进程**，**把台账里还没闭合的行
+        闭合掉**。绝不按 pid 去杀一个不认识的进程——pid 会被系统回收复用，
+        那一枪可能打在别人身上。
+
+        它顺带把调度器停掉（走 `stop()`）：只杀不停的话，下一个 tick 立刻又起
+        一个新的，按钮看上去毫无作用。「强制结束」的用户口径是全停。
+        """
+        with self._lock:
+            self.stop()
+            self._repository.mark_orphan_mission_runs(ended_at_utc=self._clock())
+            self._orphan_pid = None
+
+    def snapshot(self) -> SchedulerSnapshot:
+        """当前的完整现状。页面每几秒问一次，桌面悬浮窗也问同一个。
+
+        走的是和 `tick()` 同一套 `_facts`，所以页面上看到的判据依据与调度器
+        下一步据以行动的是同一份事实。
+        """
+        with self._lock:
+            tasks = self._repository.mission_tasks()
+            config = self._repository.scheduler_config()
+            return SchedulerSnapshot(
+                enabled=self._enabled,
+                started_at_utc=self._started_at_utc,
+                running=self._supervisor.running,
+                orphan_pid=self._orphan_pid,
+                tasks=tuple(tasks),
+                config=config,
+                facts=self._facts(tasks, config, self._clock()),
+            )
+
+    def begin_bot_round(self) -> None:
+        """页面上的「重开一轮」：把 `round_started_at_utc` 推到当前。
+
+        走调度器的时钟而不是调用方自己取一个 `now()`：本轮的起点和判定完成度
+        时用的「现在」必须同源，否则两个时钟差一点，刚开的一轮就可能把边界上
+        那条战报算成本轮的。
+        """
+        with self._lock:
+            self._repository.begin_bot_round(now_utc=self._clock())
+
+    def command_for(self, kind: MissionKind, params_json: str) -> list[str]:
+        """把一份参数换算成命令行，换不出来就抛 `MissionParamError`。
+
+        对外开放是为了让 API 能在**写库之前**用调度器自己的那把尺子量一遍：
+        范围内一个 bot 都没有、半径 ≤ 0、系号区间首尾颠倒，这些配置存下来只会
+        让调度器起一个必然空转的 runner，或者干脆在启动时把任务自动停用——
+        两种都要等用户下次看页面才发现。校验必须和启动走同一段代码，否则
+        「页面收下了、调度器起不来」这种分歧迟早出现。
+        """
+        return self._command_for(kind, params_json)
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -162,7 +254,7 @@ class MissionScheduler:
         facts = self._facts(tasks, config, now)
         running = self._supervisor.running
         decision = decide(
-            [_snapshot(row) for row in tasks if _known(row.kind)],
+            [task_snapshot(row) for row in tasks if _known(row.kind)],
             facts,
             running=(
                 None
@@ -187,7 +279,7 @@ class MissionScheduler:
         """
         row = _row_for(tasks, kind)
         try:
-            command = self._command_for(kind, row)
+            command = self._command_for(kind, row.params_json)
         except MissionParamError as exc:
             self._repository.disable_mission_task(kind, str(exc))
             return False
@@ -324,7 +416,7 @@ class MissionScheduler:
 
     # -- 参数换算 --------------------------------------------------------------
 
-    def _command_for(self, kind: MissionKind, row: orm.MissionTaskRow) -> list[str]:
+    def _command_for(self, kind: MissionKind, params_json: str) -> list[str]:
         """三条链路各有各的换算，`domain.missions` 里是纯函数。
 
         刻意不做成一个 `mission_command(kind, params)`：三条链路的参数类型本来
@@ -334,11 +426,17 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.PIRATE:
-            return pirate_command(pirate_systems(ORIGIN, _pirate_radius(row.params_json)))
-        return bot_command(bot_targets_in_range(self._bot_targets(), **_bot_range(row.params_json)))
+            return pirate_command(pirate_systems(ORIGIN, _pirate_radius(params_json)))
+        return bot_command(bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)))
 
 
-def _snapshot(row: orm.MissionTaskRow) -> TaskSnapshot:
+def task_snapshot(row: orm.MissionTaskRow) -> TaskSnapshot:
+    """一行 `mission_tasks` → 领域层认识的那个不可变快照。
+
+    公开是给 API 用的：页面要按 `domain.scheduler` 的判据算状态和展示次序，
+    而它拿到的只有 ORM 行。转换只能有一份，否则两边对「什么算已停用」的
+    理解迟早分家。
+    """
     return TaskSnapshot(
         kind=MissionKind(row.kind),
         enabled=row.enabled,

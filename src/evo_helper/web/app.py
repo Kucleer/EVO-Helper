@@ -28,15 +28,22 @@ from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import LIST_SHIP_COLUMNS
+
+# 模块级导入（而不是留在 `create_persistent_app` 里）：`register_mission_routes`
+# 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
+from .persistent_service import MissionConsoleService, PersistentApplicationService
 from .schemas import (
     BotTargetOut,
     CoordinateModel,
     CoordinateScanOut,
+    CurrentMissionOut,
     DashboardOut,
     FleetChangeOut,
     FleetDiffOut,
     FleetEntryOut,
     FleetSnapshotOut,
+    MissionTaskOut,
+    MissionTaskPatch,
     RevisitIn,
     RevisitOut,
     RunStartIn,
@@ -46,6 +53,7 @@ from .schemas import (
     ScanPlanPatch,
     ScanRangeIn,
     ScanRangeOut,
+    SchedulerOut,
     StateEventOut,
 )
 from .security import LocalSecurityMiddleware
@@ -60,12 +68,14 @@ from .service import (
     FleetDiffView,
     FleetEntryView,
     FleetSnapshotView,
+    MissionTaskView,
     NotFoundError,
     PlanPatchView,
     RevisitView,
     RunStatusView,
     ScanPlanView,
     ScanRangeView,
+    SchedulerView,
     ServiceError,
     StateEventView,
     _parse_coordinate,
@@ -757,6 +767,101 @@ def create_app(
     return app
 
 
+def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
+    return MissionTaskOut(
+        kind=task.kind,
+        label=task.label,
+        enabled=task.enabled,
+        priority=task.priority,
+        params=task.params,
+        status=task.status,
+        detail=task.detail,
+        summary=task.summary,
+        disabled_reason=task.disabled_reason,
+    )
+
+
+def _scheduler_out(view: SchedulerView) -> SchedulerOut:
+    return SchedulerOut(
+        running=view.running,
+        started_at_utc=view.started_at_utc,
+        current=(
+            None
+            if view.current is None
+            else CurrentMissionOut(
+                kind=view.current.kind,
+                label=view.current.label,
+                started_at_utc=view.current.started_at_utc,
+                log_path=view.current.log_path,
+            )
+        ),
+        orphan_pid=view.orphan_pid,
+        tasks=[_mission_task_out(task) for task in view.tasks],
+    )
+
+
+def register_mission_routes(app: FastAPI) -> None:
+    """调度台的一组接口。
+
+    只在持久化 app 上注册（同 `register_intel_routes`）：它需要一台真的调度器
+    和一个真的库，`FakeApplicationService` 那条路上两样都没有。
+
+    **全部写成同步 `def`**，让 FastAPI 把它们丢进线程池。这一组里的每个动作
+    都会阻塞：查库、`terminate()` 之后还要 `wait(5)`。写成 `async def` 就是在
+    事件循环里等那 5 秒，整台控制台连同页面一起卡住——lifespan 里那个
+    `asyncio.to_thread` 挡的正是这件事。
+    """
+
+    def get_console(request: Request) -> MissionConsoleService:
+        return cast(MissionConsoleService, request.app.state.mission_console)
+
+    @app.get("/api/scheduler", response_model=SchedulerOut)
+    def scheduler_state(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.scheduler_view())
+
+    @app.post("/api/scheduler/start", response_model=SchedulerOut)
+    def scheduler_start(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.start_scheduler())
+
+    @app.post("/api/scheduler/stop", response_model=SchedulerOut)
+    def scheduler_stop(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.stop_scheduler())
+
+    @app.post("/api/scheduler/force-kill", response_model=SchedulerOut)
+    def scheduler_force_kill(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        """孤儿红条上的「强制结束」。**不按 pid 杀不认识的进程。**"""
+        return _scheduler_out(console.force_kill())
+
+    @app.patch("/api/missions/{kind}", response_model=MissionTaskOut)
+    def patch_mission(
+        kind: str,
+        payload: MissionTaskPatch,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MissionTaskOut:
+        return _mission_task_out(
+            console.patch_mission(
+                kind,
+                enabled=payload.enabled,
+                priority=payload.priority,
+                params=payload.params,
+            )
+        )
+
+    @app.post("/api/missions/BOT/new-round", response_model=MissionTaskOut)
+    def restart_bot_round(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MissionTaskOut:
+        return _mission_task_out(console.restart_bot_round())
+
+
 async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:
     """每秒问一次调度器该干什么。
 
@@ -787,7 +892,6 @@ def create_persistent_app(
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
-    from .persistent_service import PersistentApplicationService
 
     scheduler = mission_scheduler or MissionScheduler(
         SqlAlchemyRepository(session_factory), MissionSupervisor()
@@ -818,6 +922,10 @@ def create_persistent_app(
     )
     # 调度器的开关**不持久化**：这个对象每次建进程都是新的，一律停在「已停止」。
     app.state.mission_scheduler = scheduler
+    app.state.mission_console = MissionConsoleService(
+        SqlAlchemyRepository(session_factory), scheduler
+    )
+    register_mission_routes(app)
     # Intel search reads fleet snapshots straight from SQL, so it takes the
     # session factory rather than going through the application service.
     register_intel_routes(app, session_factory)

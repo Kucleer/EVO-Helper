@@ -261,6 +261,47 @@ class DashboardView:
     pending_revisit_count: int
 
 
+@dataclass(frozen=True)
+class MissionTaskView:
+    """调度台上的一行。
+
+    `status` 与 `detail` 分开：状态是那六七个固定词之一（页面据此上色、
+    悬浮窗据此显示），`detail` 是随行的事实（今日 12/32、还剩 37 个未完成）。
+    合成一句的话，页面想给状态单独上色就只能去解析字符串。
+    """
+
+    kind: str
+    label: str
+    enabled: bool
+    priority: int
+    params: dict[str, int]
+    status: str
+    detail: str
+    #: 参数的人话回显：海盗半径实际覆盖到哪、bot 区间里有几个已记录目标。
+    #: 半径 10 是多大范围用户心里没数，回显出来才看得见填错没有。
+    summary: str
+    disabled_reason: str | None
+
+
+@dataclass(frozen=True)
+class CurrentMissionView:
+    kind: str
+    label: str
+    started_at_utc: datetime
+    log_path: str
+
+
+@dataclass(frozen=True)
+class SchedulerView:
+    running: bool
+    #: 点「开始」的时刻，供页面上那块秒表。停着时为 None。
+    started_at_utc: datetime | None
+    current: CurrentMissionView | None
+    #: 上次没走正常关闭路径留下的进程号。**只显示给人看**，不据此杀进程。
+    orphan_pid: int | None
+    tasks: tuple[MissionTaskView, ...]
+
+
 class ApplicationService(Protocol):
     def list_plans(self) -> list[ScanPlanView]: ...
     def get_plan(self, plan_id: UUID) -> ScanPlanView | None: ...
@@ -743,17 +784,20 @@ __all__ = [
     "ApplicationService",
     "BotTargetView",
     "ConflictError",
+    "CurrentMissionView",
     "DashboardView",
     "FakeApplicationService",
     "FleetChangeView",
     "FleetDiffView",
     "FleetEntryView",
     "FleetSnapshotView",
+    "MissionTaskView",
     "NotFoundError",
     "PlanPatchView",
     "RevisitView",
     "RunStatusView",
     "ScanPlanView",
+    "SchedulerView",
     "ScanRangeView",
     "ServiceError",
     "StateEventView",

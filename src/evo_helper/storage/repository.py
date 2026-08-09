@@ -872,6 +872,22 @@ class SqlAlchemyRepository:
                 ).all()
             )
 
+    def open_mission_runs(self) -> list[orm.MissionRunRow]:
+        """还没闭合的子进程记录，新的在前。
+
+        开机时必须**先读后标**：`mark_orphan_mission_runs` 会把这些行一并闭合，
+        之后就再也认不出「哪一条是孤儿、它的 pid 是多少」了，而页面上的红条
+        正要把那个 pid 显示给人看——让用户自己去任务管理器里核对。
+        """
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.MissionRunRow)
+                    .where(orm.MissionRunRow.ended_at_utc.is_(None))
+                    .order_by(orm.MissionRunRow.started_at_utc.desc())
+                ).all()
+            )
+
     def mark_orphan_mission_runs(self, *, ended_at_utc: datetime) -> int:
         """开机时把「上次没走正常关闭路径」的行标出来，返回条数。
 
