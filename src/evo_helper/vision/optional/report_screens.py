@@ -309,13 +309,31 @@ class ImageReportScreens:
         into 1.
         """
         counts = _rows(self._read(region, OCR_PSM_COLUMN, language="eng"))
-        names = _names(self._read(region, OCR_PSM_COLUMN, language="chi_sim"))
+        chinese = self._read(region, OCR_PSM_COLUMN, language="chi_sim")
+        names = _names(chinese)
         if len(names) != len(counts):
-            # Row counts disagree, so the two passes cannot be aligned. Fall
-            # back to the pass whose counts are trustworthy rather than pairing
-            # a name with another row's number.
-            return "\n".join(f"{name}  {count}" for name, count in counts)
-        return "\n".join(f"{name}  {count}" for name, (_, count) in zip(names, counts, strict=True))
+            # 中文那遍常多出几行装饰性噪声（实测：一行孤零零的 `”`、一行 `1 17`）。
+            # 舰种名是封闭词表，对不上词表的行就是噪声——去掉之后往往就能和
+            # 数字那遍对齐，而不必牺牲名称。
+            names = _vocabulary_names(names)
+        if len(names) == len(counts):
+            return "\n".join(
+                f"{name}  {count}" for name, (_, count) in zip(names, counts, strict=True)
+            )
+        # 仍然对不上。**绝不退回英文那遍的名字**：那一遍把 `轻型战斗机` 读成
+        # `SRLS HL`、`重型战斗机` 读成 `BHR`，而这些字符串会原样入库成舰种名。
+        # 2026-08-08 那份战报就是这么变成一屏拉丁乱码的，而且从头到尾没有报错——
+        # 数字是对的，看起来一切正常。名称是舰队时间线做差异的键，错了比缺了更糟：
+        # 每份战报都会显示成「首次出现」。
+        # 宁可交出中文那遍自己的数字（下游 `read_until_total` 会因为合计对不上
+        # 而拒收整列），也不交出一个数字漂亮、名字全错的结果。
+        from evo_helper.vision.parsers import snap_unit_name
+
+        return "\n".join(
+            f"{name}  {count}"
+            for name, count in _rows(chinese)
+            if snap_unit_name(name)[1] != "unknown"
+        )
 
     def _read_coordinate(self, region: Region) -> str:
         """逐套配方读坐标，读出合法三元组就采信。
@@ -400,6 +418,18 @@ def _rows(text: str) -> list[tuple[str, str]]:
             continue
         pairs.append((match.group(1).strip(), match.group(2)))
     return pairs
+
+
+def _vocabulary_names(names: list[str]) -> list[str]:
+    """只保留能落到已知舰种/防御设施词表上的行。
+
+    用 `snap_unit_name` 而不是精确相等：中文那遍读出来的名字通常差一个字
+    （`无晨舰` → `无畏舰`），差一个字仍是一行真数据，不能当噪声丢掉。
+    真正要丢的是 `”`、`1 17` 这种压根不像单位名的行。
+    """
+    from evo_helper.vision.parsers import snap_unit_name
+
+    return [name for name in names if snap_unit_name(name)[1] != "unknown"]
 
 
 def _names(text: str) -> list[str]:

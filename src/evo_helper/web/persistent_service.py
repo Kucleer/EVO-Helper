@@ -571,7 +571,14 @@ class PersistentApplicationService:
         rows = session.scalars(
             select(orm.FleetSnapshotRow)
             .where(
-                orm.FleetSnapshotRow.report_id == report.id, orm.FleetSnapshotRow.side == "defender"
+                orm.FleetSnapshotRow.report_id == report.id,
+                orm.FleetSnapshotRow.side == "defender",
+                # 只要战前的参战舰队。带 `round_no` 的是逐回合的剩余战舰，
+                # 混进来会把同一个舰种数两遍：实测 2:137:14 的详情弹窗显示
+                # 「合计 157」（= 参战 81 + 第1回合 76）、`重型战斗机` 出现两次，
+                # 而列表页用的 `_defender_counts` 一直是对的（8 种 / 81）。
+                # 同一条判据在两个地方各写一份，就会出现这种「列表对、详情错」。
+                orm.FleetSnapshotRow.round_no.is_(None),
             )
             .order_by(orm.FleetSnapshotRow.ship_type)
         ).all()
