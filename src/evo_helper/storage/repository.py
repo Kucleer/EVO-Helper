@@ -499,6 +499,40 @@ class SqlAlchemyRepository:
                 or 0
             )
 
+    def count_inflight(self, *, now_utc: datetime) -> int:
+        """还在天上飞的舰队有几支。**跨 kind**——航线是全局资源。
+
+        供调度器估算空闲航线：`usable_limit − 在飞数`。这个估算不含用户自己
+        派出去的舰队，因此是乐观的；`reserved_lines` 正是为这段误差留的缓冲，
+        而权威闸门仍在 runner 的 `LineCapacityGate`（看屏复核）。
+
+        与 `pending_reports_for_kind` 不是同一个查询：那个按 kind 分、不带
+        `> now`、也返回已闭合的行。这边问的是「舰队回来没有」，那边问的是
+        「战报收了没有」——预计时间已过的那条已经不占航线，却正是最该去收的。
+
+        飞行时间为 NULL 的不计入：读不到就当它不占位，宁可估高。估高了 runner
+        起来空跑一轮，估低了则是航线空着不派——前者有闸门兜底，后者没有。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.AttackDispatchRow)
+                    .outerjoin(
+                        orm.BattleReportRow,
+                        orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                    )
+                    .where(
+                        orm.AttackDispatchRow.accepted.is_(True),
+                        orm.AttackDispatchRow.dry_run.is_(False),
+                        orm.AttackDispatchRow.expected_report_at_utc > now_utc,
+                        orm.BattleReportRow.id.is_(None),
+                    )
+                )
+                or 0
+            )
+
     def pending_reports_for_kind(
         self,
         target_kind: str,

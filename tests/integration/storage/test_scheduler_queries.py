@@ -221,6 +221,124 @@ def test_a_long_flight_is_not_abandoned_for_being_old(repository, run_id) -> Non
     assert len(_pending(repository, TARGET_KIND_PIRATE, now)) == 1
 
 
+# -- 在飞数：航线估算的分子 --------------------------------------------------
+
+
+def test_inflight_counts_every_kind_together(repository, run_id, session_factory) -> None:  # type: ignore[no-untyped-def]
+    """航线是全局资源，不分海盗还是 bot。
+
+    按 kind 分开数会把两条链路各自算成「还有位子」，于是两个 runner 一起起来，
+    第二个到了游戏里才发现没航线——权威闸门拦得住，但一趟导航全白跑。
+    """
+    now = datetime.now(UTC)
+    for index, kind in enumerate((TARGET_KIND_PIRATE, TARGET_KIND_BOT)):
+        dispatch_id = _dispatch(
+            repository, run_id, kind, position=20 + index, dispatched_at=now - timedelta(minutes=5)
+        )
+        repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
+
+    assert repository.count_inflight(now_utc=now) == 2
+
+
+def test_an_arrived_dispatch_is_no_longer_inflight(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """预计时间已过就不再占航线——舰队回来了，位子空出来了。
+
+    这正是 `count_inflight` 与 `pending_reports_for_kind` 的分界：那边要的是
+    「还没收的战报」（到点了才更该收），这边要的是「还在天上飞的舰队」。
+    """
+    now = datetime.now(UTC)
+    dispatched_at = now - timedelta(hours=2)
+    dispatch_id = _dispatch(
+        repository, run_id, TARGET_KIND_PIRATE, position=22, dispatched_at=dispatched_at
+    )
+    repository.record_flight_time(dispatch_id, timedelta(minutes=10), dispatched_at)
+
+    assert repository.count_inflight(now_utc=now) == 0
+
+
+def test_a_dispatch_with_a_report_is_no_longer_inflight(
+    repository, run_id, session_factory
+) -> None:  # type: ignore[no-untyped-def]
+    """战报已经回来了，哪怕预计时间还没到，那条航线也已经空了。"""
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=23,
+        dispatched_at=now - timedelta(minutes=5),
+    )
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
+    _attach_report(session_factory, dispatch_id, now)
+
+    assert repository.count_inflight(now_utc=now) == 0
+
+
+def test_refused_and_rehearsal_dispatches_do_not_occupy_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """被游戏拒掉的和演习的都没有舰队飞出去，占不到航线。
+
+    把它们数进在飞数，估算出来的空闲航线会偏少，调度器于是不肯起攻击任务——
+    航线明明空着却一直只跑扫描。
+    """
+    now = datetime.now(UTC)
+    for index, (accepted, dry_run) in enumerate(((False, False), (True, True))):
+        dispatch_id = _dispatch(
+            repository,
+            run_id,
+            TARGET_KIND_PIRATE,
+            position=24 + index,
+            dispatched_at=now - timedelta(minutes=5),
+            accepted=accepted,
+            dry_run=dry_run,
+        )
+        repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
+
+    assert repository.count_inflight(now_utc=now) == 0
+
+
+def test_a_dispatch_with_no_flight_time_is_not_counted_as_inflight(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """飞行时间读不到的，估算里当作不占航线——**这是一个自觉的乐观口径**。
+
+    估高了空闲航线，最坏结果是 runner 起来发现没位子、空跑一轮就退；
+    估低了则是航线空着不派。权威闸门在 runner 里看屏复核，兜得住前者。
+    """
+    now = datetime.now(UTC)
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=26,
+        dispatched_at=now - timedelta(minutes=5),
+    )
+
+    assert repository.count_inflight(now_utc=now) == 0
+
+
+def _attach_report(session_factory, dispatch_id, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
+    """直接挂一份战报到指定派遣上。
+
+    不走 `append_report`：那条路要靠出发/目标坐标加时间容差去认领派遣，
+    在这里等于让测试依赖匹配算法，而这几条测的是「有没有战报」这一个事实。
+    """
+    from evo_helper.storage import models as orm
+
+    with session_factory() as session:
+        session.add(
+            orm.BattleReportRow(
+                id=uuid4(),
+                dispatch_id=dispatch_id,
+                reported_at_utc=reported_at,
+                attacker_origin_galaxy=2,
+                attacker_origin_system=137,
+                attacker_origin_position=18,
+                defender_target_galaxy=2,
+                defender_target_system=137,
+                defender_target_position=23,
+            )
+        )
+        session.commit()
+
+
 def _pending(repository, target_kind: str, now: datetime):  # type: ignore[no-untyped-def]
     return repository.pending_reports_for_kind(
         target_kind, now_utc=now, grace=GRACE, max_age=MAX_REPORT_AGE
