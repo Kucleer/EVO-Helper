@@ -41,6 +41,37 @@ class Action(Enum):
     IDLE = "IDLE"
 
 
+class TaskStatus(Enum):
+    """页面与桌面悬浮窗上显示的那一句话。
+
+    值直接是中文：显示层拿到就能用，不必再维护一张 `枚举 → 文案` 的映射表。
+    多一张表就多一处能和判据走散的地方，而这一层本来就只为显示存在。
+    （同 `domain.records.TARGET_KIND_LABELS`。）
+
+    它放在领域层而不是 `web/`，是因为**这句话必须和调度器的实际行为出自同一份
+    判据**：页面写着「等航线」而调度器其实在冷却，用户会去调航线数，调完还是
+    不动。所以 `status_of` 复用 `has_work`，只在它为假时再去问「为什么」。
+    """
+
+    #: 这条链路的子进程正在跑。
+    RUNNING = "运行中"
+    #: 有活干，只是还没轮到它（或者调度器整个停着）。
+    READY = "待命"
+    #: 估算的空闲航线为 0，且没有到期未收的战报。
+    WAITING_LINES = "等航线"
+    #: 在重启冷却里。和「等航线」分开说，是因为用户能做的事不一样：
+    #: 冷却只要等，等航线得看是不是航线数配小了。
+    COOLING_DOWN = "冷却中"
+    #: 当日 32 次用尽，或收到了游戏的超限硬信号。
+    QUOTA_EXHAUSTED = "配额用尽"
+    #: 仅 bot：本轮范围内每个目标都走完了流程。
+    DONE = "已完成"
+    #: 连续失败或参数不合格被自动停用，`disabled_reason` 里有原因。
+    DISABLED = "已停用"
+    #: 复选框没勾。**不能显示成「待命」**——它永远不会被起起来，那是句谎话。
+    OFF = "未启用"
+
+
 @dataclass(frozen=True)
 class TaskSnapshot:
     kind: MissionKind
@@ -114,6 +145,45 @@ class Decision:
     kind: MissionKind | None = None
 
 
+def cooling_down(
+    kind: MissionKind,
+    facts: SchedulerFacts,
+    *,
+    restart_cooldown: timedelta = RESTART_COOLDOWN,
+) -> bool:
+    """这条链路是不是还在两次启动之间的最小间隔里。
+
+    **`SCAN` 恒为假。** 冷却堵的 churn 是收战报特有的：`expected_report_at_utc`
+    为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。扫描没有这种循环，
+    它的游标持久化、随起随停没有代价。把冷却套上去只会制造纯空转——攻击轮两
+    分钟跑完、扫描还得再等三分钟才允许回来，而填这种空隙正是扫描存在的全部
+    理由。秒级来回由 `MIN_DWELL` 挡（它限制多快**离开**扫描），与这里限制多快
+    **回到**某条链路不重复，所以去掉这一档不会把来回放回来。
+    """
+    if kind is MissionKind.SCAN:
+        return False
+    last_started = facts.last_started_at_utc.get(kind)
+    return last_started is not None and facts.now_utc - last_started < restart_cooldown
+
+
+def pirate_quota_exhausted(facts: SchedulerFacts) -> bool:
+    """海盗当日还能不能打。两个判据取先到者。
+
+    单独成函数是为了让状态文案能复用它：「配额用尽」和「等航线」的处置完全
+    不同（一个要等到 UTC 00:00，一个等舰队回来），而重写一遍比较式就等于给
+    同一条判据留了第二份实现。
+    """
+    blocked_until = facts.pirate_blocked_until_utc
+    if blocked_until is not None and blocked_until > facts.now_utc:
+        return True
+    return facts.pirate_dispatches_today >= facts.pirate_quota
+
+
+def bot_round_complete(facts: SchedulerFacts) -> bool:
+    """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。"""
+    return facts.bot_targets_remaining <= 0
+
+
 def has_work(
     kind: MissionKind,
     facts: SchedulerFacts,
@@ -122,23 +192,12 @@ def has_work(
 ) -> bool:
     """这条链路现在有没有事可做。
 
-    冷却期内一律算「没活干」，顺位让给下一个——它是判据的一部分而不是启动前的
-    一道额外闸门，这样抢占那一路（`decide` 里靠 `wanted` 判断值不值得打断扫描）
-    自动跟着生效：一条正在冷却的链路不该把扫描打断成谁都不在跑。
-
-    **`SCAN` 跳过冷却。** 冷却堵的 churn 是收战报特有的：`expected_report_at_utc`
-    为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。扫描没有这种循环，
-    它的游标持久化、随起随停没有代价。把冷却套上去只会制造纯空转——攻击轮两
-    分钟跑完、扫描还得再等三分钟才允许回来，而填这种空隙正是扫描存在的全部
-    理由。秒级来回由 `MIN_DWELL` 挡（它限制多快**离开**扫描），与这里限制多快
-    **回到**某条链路不重复，所以去掉这一档不会把来回放回来。
+    冷却期内一律算「没活干」（`cooling_down`，`SCAN` 除外），顺位让给下一个——
+    它是判据的一部分而不是启动前的一道额外闸门，这样抢占那一路（`decide` 里靠
+    `wanted` 判断值不值得打断扫描）自动跟着生效：一条正在冷却的链路不该把扫描
+    打断成谁都不在跑。
     """
-    last_started = facts.last_started_at_utc.get(kind)
-    if (
-        kind is not MissionKind.SCAN
-        and last_started is not None
-        and facts.now_utc - last_started < restart_cooldown
-    ):
+    if cooling_down(kind, facts, restart_cooldown=restart_cooldown):
         return False
 
     if kind is MissionKind.SCAN:
@@ -146,23 +205,52 @@ def has_work(
         return True
 
     if kind is MissionKind.PIRATE:
-        if (
-            facts.pirate_blocked_until_utc is not None
-            and facts.pirate_blocked_until_utc > facts.now_utc
-        ):
-            return False
-        if facts.pirate_dispatches_today >= facts.pirate_quota:
+        if pirate_quota_exhausted(facts):
             return False
         return facts.free_lines > 0 or facts.pirate_reports_due
 
     if kind is MissionKind.BOT:
-        if facts.bot_targets_remaining <= 0:
+        if bot_round_complete(facts):
             return False
         return facts.free_lines > 0 or facts.bot_reports_due
 
     # 穷举到这里说明 MissionKind 加了新成员却没人补上面的分支——宁可让
     # strict mypy 在这里报错，也不要让新种类静默套用 BOT 的判据跑起来。
     assert_never(kind)
+
+
+def status_of(
+    task: TaskSnapshot,
+    facts: SchedulerFacts,
+    *,
+    running: RunningProcess | None,
+    restart_cooldown: timedelta = RESTART_COOLDOWN,
+) -> TaskStatus:
+    """这条链路现在该显示成什么。
+
+    次序即优先级，前面的更值得说：停用原因 > 没勾 > 正在跑 > 为什么不跑。
+
+    **不新写判据。** 「有没有活干」一律问 `has_work`；只有它说「没有」时才
+    再去问「为什么没有」，而那几个原因也都是复用出来的谓词。这样页面上的一句话
+    和调度器的下一步动作不可能走散——走散的后果是用户照着一句错话去调错参数。
+    """
+    if task.disabled_reason is not None:
+        return TaskStatus.DISABLED
+    if not task.enabled:
+        return TaskStatus.OFF
+    if running is not None and running.kind is task.kind:
+        return TaskStatus.RUNNING
+    if has_work(task.kind, facts, restart_cooldown=restart_cooldown):
+        return TaskStatus.READY
+    # 以下都是「没活干」的几种原因。先说结构性的（配额、完成），再说会自己
+    # 好起来的（冷却、航线）——前两种要用户动手，后两种只要等。
+    if task.kind is MissionKind.PIRATE and pirate_quota_exhausted(facts):
+        return TaskStatus.QUOTA_EXHAUSTED
+    if task.kind is MissionKind.BOT and bot_round_complete(facts):
+        return TaskStatus.DONE
+    if cooling_down(task.kind, facts, restart_cooldown=restart_cooldown):
+        return TaskStatus.COOLING_DOWN
+    return TaskStatus.WAITING_LINES
 
 
 def decide(
