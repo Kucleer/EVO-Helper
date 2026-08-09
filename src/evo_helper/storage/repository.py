@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.coordinates import next_coordinate_after
@@ -499,11 +499,31 @@ class SqlAlchemyRepository:
                 or 0
             )
 
-    def pending_reports_for_kind(self, target_kind: str) -> list[PendingReport]:
-        """某种目标下尚未闭合的派遣，供 `ReportWaitPlanner` 判「该等还是该收」。
+    def pending_reports_for_kind(
+        self,
+        target_kind: str,
+        *,
+        now_utc: datetime,
+        grace: timedelta,
+        max_age: timedelta,
+    ) -> list[PendingReport]:
+        """某种目标下尚未放弃的派遣，供 `ReportWaitPlanner` 判「该等还是该收」。
 
         按 `target_kind` 分开：混在一起，一条链路会替另一条判「该回去收了」。
+
+        **「已放弃」是这里现算的规则，不是别处先写好的标记。** 写标记要有人在
+        每次判缺失时去写，而那个人（调度器）还不存在；先落地标记再依赖它，
+        中间这段时间查询会一条都排不掉。规则两条：
+
+        1. 有预计时间的：过了预计时间再加 `grace` 还没战报 → 判缺失。
+        2. 预计时间为 NULL 的：按 `dispatched_at_utc` 算，超过 `max_age` → 判缺失。
+
+        第 2 条不能省。`plan()` 见到任何一条 NULL 就无条件返回 `COLLECT`，而库里
+        现存的派遣**全是 NULL**——只写第 1 条，NULL 的派遣既永远「可收」又永远不
+        被判缺失，海盗的「有活干」右半边被钉死为真，扫描永远抢不到空隙。
         """
+        _require_utc(now_utc, "now_utc")
+        expected = orm.AttackDispatchRow.expected_report_at_utc
         with self._session_factory() as session:
             rows = session.execute(
                 select(orm.AttackDispatchRow, orm.BattleReportRow.id)
@@ -518,6 +538,14 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_kind == target_kind,
                     orm.AttackDispatchRow.accepted.is_(True),
                     orm.AttackDispatchRow.dry_run.is_(False),
+                    or_(
+                        expected.is_(None),
+                        expected > now_utc - grace,
+                    ),
+                    or_(
+                        expected.is_not(None),
+                        orm.AttackDispatchRow.dispatched_at_utc > now_utc - max_age,
+                    ),
                 )
                 .order_by(orm.AttackDispatchRow.dispatched_at_utc)
             ).all()

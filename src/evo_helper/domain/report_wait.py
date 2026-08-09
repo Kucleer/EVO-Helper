@@ -26,6 +26,16 @@ _CN_DURATION_RE = re.compile(
 #: 顶部栏用的 `01:53:19` 冒号格式。
 _CLOCK_RE = re.compile(r"(?<!\d)(\d{1,3}):([0-5]\d):([0-5]\d)(?!\d)")
 
+#: 飞行时间读不到（`expected_report_at_utc` 为 NULL）时，按派出时刻算的放弃阈值。
+#:
+#: 没有这条阈值，NULL 的派遣就既永远「可收」、又永远不被判缺失：`plan()` 见到
+#: 任何一条 NULL 就无条件返回 `COLLECT`，于是调度器每个 tick 都去收一封永远不会
+#: 到的战报。6 小时按实机的最长一趟取，比它还久没闭合的只可能是丢了。
+#:
+#: **只管 NULL 那一档。** 飞行时间读到了的，老不老由它自己的预计时间加宽限期
+#: 说了算——拿派出时刻一起卡会把一发飞十小时、还没到的远征当成缺失排掉。
+MAX_REPORT_AGE = timedelta(hours=6)
+
 #: 首次重试等 30 秒，随后倍增。
 BASE_SESSION_BACKOFF = timedelta(seconds=30)
 
