@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -47,7 +48,14 @@ from evo_helper.domain.records import (
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.game import pirate_ui
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
-from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
+from evo_helper.game.system_navigator import (
+    NAV_LABEL_ROI,
+    PLANET_VIEW_BUTTON,
+    VIEW_MENU_BUTTON,
+    VIEW_SWITCH_WAIT_S,
+    SystemNavigator,
+    crop_reader,
+)
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
@@ -76,20 +84,32 @@ SCOUT_REPORT_RETRIES = 3
 #: 自己星球地表视图右上角的信箱入口。**底部导航里没有邮箱**，只有这一个入口。
 MAIL_BUTTON = (1131, 70)
 
-#: 地表视图顶部的星球名横条，用来确认「在不在地表」。
-#: 恒星系视图、派遣面板、飞行中列表上都读不到它。
-PLANET_TITLE_ROI = (880, 55, 1050, 90)
-PLANET_TITLE_TEXT = "奥格瑞玛"
-
-#: 信箱标题，用来确认信箱真的开了。
-MAIL_TITLE_ROI = (890, 55, 1040, 92)
-MAIL_TITLE_TEXT = "邮箱"
+#: 信箱按钮旁边的未读数。**地表视图独有**：恒星系视图那个位置是坐标输入框，
+#: 各种浮层则把它盖住。用它当「我在地表」的正面凭据。
+MAIL_BADGE_ROI = (1145, 55, 1200, 92)
 
 #: 信箱「报告」标签、邮件首行中心与行距（917 空间）。
 MAIL_REPORT_TAB = (897, 178)
 MAIL_FIRST_ROW_Y = 285
 MAIL_ROW_PITCH = 86
 MAIL_ROW_X = 900
+
+#: 一趟信箱最多翻几行。可见 6 行整行，第 7 行被切掉；侦察报告按时间倒序排在最上面。
+MAIL_SCAN_ROWS = 6
+
+#: 读之前把列表拖回顶部。面板会夹住，多拖一次无害，少拖一次就可能从半截邮件读起。
+MAIL_SCROLL_TO_TOP_DRAGS = 3
+
+#: 面板标题（那块金属牌上的大字），用来认出「现在是哪个面板」。
+#: 邮件列表是「邮箱」，报告详情页是「消息」——两者都是大字，读得很干净。
+#:
+#: ⚠️ **不要拿那两排分类标签当判据。** 试过，不行：标签是小字，而未读角标
+#: （`21`、`99+`、`16`）正压在它们上面，`--psm 7` 会读成
+#: `'oe. se. eee ee'` 这样的噪声——而画面明明就是邮件列表。
+#: 角标数字随邮件多少变，所以这个失败还是时好时坏的。
+PANEL_TITLE_ROI = (890, 55, 1040, 95)
+MAIL_LIST_TITLE = "邮箱"
+MAIL_DETAIL_TITLE = "消息"
 
 #: 信箱与详情页左上角的返回/关闭键（同一个位置，语义随页面变）。
 MAIL_BACK = (750, 71)
@@ -136,10 +156,48 @@ class PirateLoop:
     def _read(
         self, roi: tuple[int, int, int, int], *, digits: bool = False, upscale: int = 3
     ) -> str:
+        self._ensure_geometry()
         return crop_reader(self._driver.capture(), self._ocr)(roi, digits=digits, upscale=upscale)
+
+    def _ensure_geometry(self) -> None:
+        """每次读屏前核一次视口尺寸，漂了就调回来。
+
+        ⚠️ **窗口会在运行中自己缩回去。** 实机反复撞到：跑到中途窗口从 1920×917
+        变成 1536×733，于是所有 ROI 读的都是别处的像素、所有点击都落在别处——
+        而且**一声不响**：信箱明明开着，判据却读不到那两排标签，看起来像 OCR 不行。
+
+        校验很便宜（一次 `GetClientRect`），比事后从错误现象往回猜便宜得多。
+        """
+        from evo_helper.game.game_window import (
+            APP_TITLE_BAR_PX,
+            CALIBRATED_VIEWPORT,
+            ensure_game_window,
+        )
+        from evo_helper.vision.optional.window_capture import client_box
+
+        box = client_box(self._driver.window())
+        size = (box[2] - box[0], box[3] - box[1] - APP_TITLE_BAR_PX)
+        if size != CALIBRATED_VIEWPORT:
+            say(f"  视口漂到 {size[0]}x{size[1]}，调回 {CALIBRATED_VIEWPORT}")
+            ensure_game_window()
 
     def _nav_labels(self) -> str:
         return self._read(NAV_LABEL_ROI)
+
+    def _dump_frame(self, name: str, roi: tuple[int, int, int, int] | None = None) -> None:
+        """把当前这一帧（和一块 ROI 的读数）存到 `var/logs/`，供事后复盘。"""
+        from pathlib import Path
+
+        directory = Path("var/logs")
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%H%M%S")
+        image = self._driver.capture()
+        path = directory / f"dump-{name}-{stamp}.png"
+        image.save(path)
+        note = f"  已存现场 {path}（{image.width}x{image.height}）"
+        if roi is not None:
+            note += f"；ROI{roi} 读到 {self._read(roi)!r}"
+        say(note)
 
     def _preset_names(self) -> list[tuple[int, str]]:
         import pytesseract
@@ -167,13 +225,27 @@ class PirateLoop:
     # -- 派遣 ---------------------------------------------------------------
 
     def _briefing_mission(self) -> str:
-        return pirate_ui.snap_mission(self._read(pirate_ui.BRIEFING_MISSION_ROI)) or ""
+        """简报页上的任务类型。**要等它铺开**，不能只读一次。
+
+        实测四发攻击全部卡在这里：等 2.6 秒读一次读不出来，于是闸门判成
+        「简报不是攻击」而整发拒绝。页面是滑进来的，跟信箱标题一个毛病。
+        """
+        mission = ""
+
+        def read_once() -> bool:
+            nonlocal mission
+            mission = pirate_ui.snap_mission(self._read(pirate_ui.BRIEFING_MISSION_ROI)) or ""
+            return mission != ""
+
+        self._settle(read_once)
+        return mission
 
     def _launch(self, coordinate: Coordinate, mission: str) -> bool:
         """简报页核对任务类型，通过才点「出发！」。"""
         shown = self._briefing_mission()
         if shown != mission:
             say(f"  简报写的是 {shown or '（读不出）'}，不是{mission}；不点出发")
+            self._dump_frame("briefing-unrecognised", pirate_ui.BRIEFING_MISSION_ROI)
             self._driver.click(*pirate_ui.BRIEFING_BACK_BUTTON, label="返回")
             self._driver.wait(LAUNCH_WAIT_S)
             self._outcome.refused.append((coordinate, f"简报不是{mission}"))
@@ -230,11 +302,15 @@ class PirateLoop:
 
     # -- 侦察报告 -----------------------------------------------------------
 
-    def read_scout_report(self, coordinate: Coordinate) -> Any:
-        """去信箱把这个坐标的侦察报告读回来。读不到返回 None。
+    def collect_scout_reports(self, wanted: Sequence[Coordinate]) -> dict[Coordinate, Any]:
+        """**一次进信箱**，把最上面几封侦察报告全读出来，按目标坐标归档。
 
-        路径：自己星球地表 → ✉ → 「报告」标签 → 最上面那封侦察报告 →
-        慢拖两次到战舰清单 → 读。
+        为什么不是「一个目标进一次信箱」：进出信箱要切视图、开面板、翻标签，
+        每份报告还要慢拖两次，一趟十几秒。四个目标各跑一趟就是一分钟纯导航，
+        而它们的报告本来就并排躺在同一页上。
+
+        按**报告自己写的目标**归档，不按行号猜：行序会随新邮件变，
+        而报告开头那行写着「已对 [x:y:z] 完成侦察」，那是它自己的凭据。
         """
         from evo_helper.vision.optional.report_screens import ImageReportScreens
         from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
@@ -251,8 +327,23 @@ class PirateLoop:
         if not self._goto_planet_surface():
             raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
         self._open_mail()
-        # 「报告」标签页按时间倒序，侦察报告在最上面几行。逐行找发件人 Aries。
-        for row in range(3):
+        # 列表会记住上次滚到哪。不拖回顶部，第 0 行可能是一封只露半截的邮件——
+        # 读出来是空主题，而画面看着完全正常。侦察报告按时间倒序在最上面，
+        # 所以顶部才是要读的那几行。
+        for _ in range(MAIL_SCROLL_TO_TOP_DRAGS):
+            slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
+        found: dict[Coordinate, Any] = {}
+        remaining = set(wanted)
+        for row in range(MAIL_SCAN_ROWS):
+            if not remaining:
+                break
+            # ⚠️ **每翻一行都要先确认「还在邮件列表上」。** 实机踩过两次同一个错：
+            # 上一次返回没退到列表（或把整个信箱关掉了），接着照列表的行坐标点下去，
+            # 于是点在了地表 UI 上——一次点开了「取消任务」确认框，一次点开了「排名」。
+            # 认不出就停，别赌下一下点在哪。
+            if not self._settle(self._on_mail_list):
+                say(f"  第 {row} 行之前已经不在邮件列表上了；停止翻行")
+                break
             self._driver.click(
                 MAIL_ROW_X, MAIL_FIRST_ROW_Y + row * MAIL_ROW_PITCH, label="打开邮件"
             )
@@ -262,20 +353,47 @@ class PirateLoop:
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
             ships = screens()
             try:
-                reading = read_pirate_scout(header, ships, expected_target=coordinate)
+                reading = read_pirate_scout(header, ships)
             except ScoutReportUnreadable as error:
-                say(f"  第 {row} 行不是这个目标的侦察报告：{error}")
-                self._driver.click(*MAIL_BACK, label="返回")
-                self._driver.wait(2.0)
-                continue
-            # 读到了也要先从详情页退回列表，再关信箱。少退一层就会在列表页上
-            # 去点视图菜单——那个坐标此刻压在信箱面板下面。
+                say(f"  第 {row} 行读不出侦察报告：{error}")
+            else:
+                if reading.target in remaining:
+                    found[reading.target] = reading
+                    remaining.discard(reading.target)
+                    say(f"  第 {row} 行 → {reading.target} {reading.verdict}")
+                else:
+                    say(f"  第 {row} 行是 {reading.target} 的报告，不在本轮目标里")
+            # 退回列表再看下一行。
             self._driver.click(*MAIL_BACK, label="返回")
             self._driver.wait(2.0)
-            self._close_mail()
-            return reading
         self._close_mail()
-        return None
+        return found
+
+    def _panel_title(self) -> str:
+        return self._read(PANEL_TITLE_ROI)
+
+    def _settle(self, predicate: Callable[[], bool], *, tries: int = 4, pause: float = 1.0) -> bool:
+        """等某个判据成立，而不是只判一次。
+
+        ⚠️ 面板是**滑进来**的。实测：点开信箱后等 2.4 秒判一次「标题是不是邮箱」
+        判不到，而失败时存下来的那一帧（约一秒后）读得清清楚楚是「邮箱」——
+        判据没错，只是那一刻标题还在动画里。一次性判定会把「还没铺开」
+        误报成「不是这个面板」，然后整轮白停。
+        """
+        for attempt in range(tries):
+            if predicate():
+                return True
+            if attempt + 1 < tries:
+                self._driver.wait(pause)
+        return False
+
+    def _on_mail_list(self) -> bool:
+        """在不在信箱的邮件列表页上。判据是面板标题读到「邮箱」。"""
+        return MAIL_LIST_TITLE in self._panel_title()
+
+    def _on_mail_detail(self) -> bool:
+        """在不在报告详情页上。判据是面板标题读到「消息」。"""
+        return MAIL_DETAIL_TITLE in self._panel_title()
 
     def _open_mail(self) -> None:
         """去信箱。**每一步都要先认出这一屏，再点下一下。**
@@ -293,42 +411,54 @@ class PirateLoop:
             raise RuntimeError("不在自己星球地表视图上，拒绝去点信箱（认不出的画面不点）")
         self._driver.click(*MAIL_BUTTON, label="信箱")
         self._driver.wait(2.4)
-        if MAIL_TITLE_TEXT not in self._read(MAIL_TITLE_ROI):
+        if not self._settle(self._on_mail_list):
+            # 认不出就把那一帧和读到的字存下来。判据失败时最贵的事情是「不知道当时
+            # 画面长什么样」——存一帧的成本是一次写盘，省下的是一轮实机复现。
+            self._dump_frame("mail-list-unrecognised", PANEL_TITLE_ROI)
             raise RuntimeError("点了信箱却没读到「邮箱」标题；停止而不是继续盲点")
         self._driver.click(*MAIL_REPORT_TAB, label="报告标签")
         self._driver.wait(2.0)
 
     def _on_planet_surface(self) -> bool:
-        """在不在自己星球的地表视图上。
+        """在不在自己星球的地表视图上。正负两面各要一个凭据。
 
-        判据是地表视图右上角那个信箱按钮旁边的星球名横条——恒星系视图、
-        派遣面板、飞行中列表上都读不到它。
+        - **负**：读不到恒星系那排坐标输入框的标签（银河系/恒星系/行星）。
+        - **正**：右上角信箱旁边的未读数读得出数字（实机 `70`）。
+
+        为什么不用星球名：那行「奥格瑞玛」是描边橙字压在金属牌上，
+        实测 `chi_sim+eng` 读成 `“Rian`——拿读不准的东西当判据等于换个地方失败。
+
+        两面都要，是为了挡住浮层：信箱面板、派遣面板、飞行中列表也读不到坐标行，
+        但它们会盖住右上角那个未读数。只看「没有坐标行」会把浮层当成地表，
+        然后在浮层上照地表的坐标点下去——这就是本轮点到「取消任务」的那个错。
         """
-        return PLANET_TITLE_TEXT in self._read(PLANET_TITLE_ROI)
+        from evo_helper.game.system_navigator import on_system_view
 
-    def _goto_planet_surface(self) -> bool:
+        if on_system_view(self._nav_labels()):
+            return False
+        return self._read(MAIL_BADGE_ROI, digits=True).strip() != ""
+
+    def _goto_planet_surface(self, *, attempts: int = 3) -> bool:
         """从恒星系视图切回自己星球地表。切不过去返回 False。
 
-        ⚠️ **这一步还没标定完，所以现在一定返回 False（于是调用方安全停止）。**
-        实机确认（2026-08-09）：点底部导航的「行星」`NAV_PLANET` 打开的是
-        **行星列表浮层**（我的三颗星球各一行：奥格瑞玛 [2:137:18]、风暴哨壁 [9:250:8]、
-        纳克萨玛斯 [4:96:7]），每行右侧有一排图标，其中「前往此处」才是去地表的那个。
-        那个图标的坐标还没量，量之前不许往那一排图标上点——同一排里还有
-        「运输 / 部署 / 传送 / 转移 / 投送 / 保护 / 扩张」，点错任何一个都是真实操作。
+        走**视图菜单**：星球按钮 → 子菜单第二项（带环行星）。子菜单只列出你现在
+        不在的那些视图，所以这同一个像素在地表上是「回恒星系」、在恒星系里是
+        「去地表」——`ensure_system_view` 用的就是它，方向相反而已。
 
-        标定方法：`--systems 2:137`（只扫不派）跑到这里，用
-        `grab_template.py --region` 量「奥格瑞玛」那一行的「前往此处」中心。
+        ⚠️ **不要走底部导航的「行星」**（用户 2026-08-09 明确指出）。那个开出来的是
+        行星列表浮层，每颗星球一行、每行八个图标全是真实操作（运输/部署/传送/转移/
+        投送/保护/扩张），而且「前往此处」的位置随行走——在那上面找坐标既没必要又危险。
         """
-        if self._on_planet_surface():
-            return True
-        self._driver.click(*pirate_ui.NAV_PLANET, label="行星")
-        self._driver.wait(2.6)
-        if self._on_planet_surface():
-            return True
-        # 开出来的是行星列表浮层。关掉它，别把游戏留在一屏全是真实操作的界面上。
-        self._driver.click(*MAIL_BACK, label="关闭面板")
-        self._driver.wait(2.0)
-        return False
+        for attempt in range(attempts):
+            if self._on_planet_surface():
+                return True
+            self._driver.click(*VIEW_MENU_BUTTON, label="视图菜单")
+            self._driver.wait(1.0)
+            self._driver.click(*PLANET_VIEW_BUTTON, label="行星视图")
+            self._driver.wait(VIEW_SWITCH_WAIT_S * (attempt + 1))
+            # 视图换过之后导航栏里是什么已经不可知了。
+            self._navigator.invalidate()
+        return self._on_planet_surface()
 
     def _leave_dispatch_list(self) -> None:
         """派出之后游戏停在「飞行中」列表上，把它关掉并切回恒星系视图。
@@ -346,8 +476,8 @@ class PirateLoop:
         """回到恒星系视图。信箱是浮层，关掉之后还在自己星球的地表视图上。"""
         self._driver.click(*MAIL_BACK, label="关闭信箱")
         self._driver.wait(2.0)
-        if MAIL_TITLE_TEXT in self._read(MAIL_TITLE_ROI):
-            # 还在信箱里说明刚才那一下退的是详情页，再退一层。
+        if self._on_mail_list():
+            # 还在列表上说明刚才那一下退的是详情页，再退一层才关掉信箱。
             self._driver.click(*MAIL_BACK, label="关闭信箱")
             self._driver.wait(2.0)
         if not self._navigator.ensure_system_view(self._nav_labels):
@@ -410,6 +540,7 @@ class PirateLoop:
         from evo_helper.game.game_window import ensure_game_window
 
         ensure_game_window()
+        self._reset_to_known_screen()
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
 
@@ -419,19 +550,40 @@ class PirateLoop:
             if not pirates:
                 say("  1–4 位没有敌对海盗")
                 continue
-            if not self._options.scout:
-                continue
-            for coordinate in pirates:
-                self._navigator.goto(coordinate)
-                if not self.is_pirate(coordinate):
-                    continue
-                self.scout(coordinate)
+            if self._options.scout:
+                scouted_here = 0
+                for coordinate in pirates:
+                    self._navigator.goto(coordinate)
+                    if not self.is_pirate(coordinate):
+                        continue
+                    if self.scout(coordinate):
+                        scouted_here += 1
+                self._wait_for_reports(scouted_here)
             if not self._options.attack:
                 continue
-            self._wait_for_reports(len(self._outcome.scouted))
-            for coordinate in list(self._outcome.scouted):
-                self._decide_and_attack(coordinate)
+            # 一趟信箱把这一系的报告都读回来，再逐个判定。
+            # 只给 `--attack` 不给 `--scout` 时，用的就是信箱里已有的那几封。
+            reports = self.collect_scout_reports(pirates)
+            for coordinate in pirates:
+                self._decide_and_attack(coordinate, reports.get(coordinate))
         return self._outcome
+
+    def _reset_to_known_screen(self, *, attempts: int = 4) -> None:
+        """开工先把开着的浮层关掉，让画面回到「地表」或「恒星系」这两种认得出的状态。
+
+        上一轮跑到哪里结束，游戏就停在哪里——实测开工时遇到过信箱、飞行中列表、
+        排名面板。`ensure_system_view` 在浮层下面读不到导航栏标签，只会白点三次
+        视图菜单（而那个坐标此刻压在浮层底下）。
+
+        每种浮层左上角都是同一个 ✕，所以关浮层这件事不需要认出是哪一种浮层。
+        """
+        from evo_helper.game.system_navigator import on_system_view
+
+        for _attempt in range(attempts):
+            if on_system_view(self._nav_labels()) or self._on_planet_surface():
+                return
+            self._driver.click(*MAIL_BACK, label="关闭面板")
+            self._driver.wait(2.0)
 
     def _find_pirates(self, galaxy: int, system: int) -> list[Coordinate]:
         pirates: list[Coordinate] = []
@@ -452,10 +604,9 @@ class PirateLoop:
         say(f"等 {count} 份侦察报告（{SCOUT_REPORT_WAIT_S:.0f}s）")
         time.sleep(SCOUT_REPORT_WAIT_S)
 
-    def _decide_and_attack(self, coordinate: Coordinate) -> None:
+    def _decide_and_attack(self, coordinate: Coordinate, reading: Any) -> None:
         from evo_helper.vision.scout_reports import VERDICT_ATTACK
 
-        reading = self.read_scout_report(coordinate)
         if reading is None:
             say(f"  {coordinate} 读不到侦察报告；跳过")
             self._outcome.refused.append((coordinate, "读不到侦察报告"))
@@ -561,12 +712,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--systems", nargs="+", type=parse_system, required=True)
     parser.add_argument("--scout", action="store_true", help="真的派侦察出去")
-    parser.add_argument("--attack", action="store_true", help="判定为「打」时真的攻击")
+    parser.add_argument(
+        "--attack",
+        action="store_true",
+        help="判定为「打」时真的攻击。不配 --scout 时用信箱里已有的侦察报告",
+    )
     parser.add_argument("--preset", default=pirate_ui.ATTACK_PRESET_NAME)
     args = parser.parse_args(argv)
-
-    if args.attack and not args.scout:
-        parser.error("--attack 需要 --scout：没有侦察报告就没有判定依据")
 
     import ctypes
 
