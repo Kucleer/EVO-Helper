@@ -1,6 +1,10 @@
 """FastAPI application factory for the local EVO-Helper management UI."""
 
+import asyncio
+import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,11 +17,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.types import Lifespan
 
+from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
+from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import LIST_SHIP_COLUMNS
 from .schemas import (
@@ -79,6 +87,12 @@ PLANET_KIND_LABELS = (
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
+
+#: 调度器 tick 的间隔。一秒足够跟手（页面上的秒表也是一秒一跳），
+#: 而每次 tick 只是几条本地 SQLite 查询，代价可以忽略。
+MISSION_TICK_INTERVAL_S = 1.0
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _default_token() -> str:
@@ -328,14 +342,19 @@ def create_app(
     service: ApplicationService | None = None,
     settings: Settings | None = None,
     local_token: str | None = None,
+    *,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Build the local web application.
 
     ``local_token`` defaults to ``EVO_HELPER_WEB_TOKEN`` or a development
     fallback; mutating requests must pass the same-origin check or this token.
+
+    ``lifespan`` 走构造参数而不是事后往 ``app.router`` 上塞：常驻调度器的开机
+    补行、每秒 tick、关机清子进程全挂在它上面，而 FastAPI 只在构造时读一次。
     """
 
-    app = FastAPI(title="EVO-Helper", version="0.1.0")
+    app = FastAPI(title="EVO-Helper", version="0.1.0", lifespan=lifespan)
     app.state.service = service or FakeApplicationService()
     app.state.settings = settings or Settings()
     token = local_token or _default_token()
@@ -738,21 +757,67 @@ def create_app(
     return app
 
 
+async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:
+    """每秒问一次调度器该干什么。
+
+    收退出码不能只在页面轮询时做——没人开着页面时，那条记录会一直挂在
+    「运行中」，连续失败也就永远数不到三。
+
+    `to_thread`：tick 会查 SQLite、起进程，停子进程时还要 `wait(5)`。放在事件
+    循环里跑，那 5 秒会把整个控制台连同页面一起卡住。
+
+    一次 tick 抛异常只记日志、不退出循环：这条循环一停，整台调度器就静默地
+    再也不动了，而页面上仍然显示「运行中」——比多一行报错糟得多。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(scheduler.tick)
+        except Exception:
+            _LOGGER.exception("调度器 tick 失败，本轮跳过")
+
+
 def create_persistent_app(
     session_factory: sessionmaker[Session],
     *,
     settings: Settings | None = None,
     local_token: str | None = None,
+    mission_scheduler: MissionScheduler | None = None,
+    tick_interval_s: float = MISSION_TICK_INTERVAL_S,
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
     from .persistent_service import PersistentApplicationService
 
+    scheduler = mission_scheduler or MissionScheduler(
+        SqlAlchemyRepository(session_factory), MissionSupervisor()
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # 开机：补齐三行任务与单行配置，并把上次没走正常关闭路径的行标成
+        # UNKNOWN。**不按 pid 自动杀**——pid 会被系统回收复用，照着一个可能
+        # 已经换了主人的号码开枪比留个警告更糟；页面上给红条和「强制结束」。
+        app.state.mission_orphans = await asyncio.to_thread(scheduler.prepare)
+        task = asyncio.create_task(_mission_tick_loop(scheduler, tick_interval_s))
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            # 主动清子进程，覆盖「正常重启」这条最常见的路径。不清的话，控制台
+            # 关了，一个还在点鼠标的 runner 留在后台。
+            await asyncio.to_thread(scheduler.shutdown)
+
     app = create_app(
         service=PersistentApplicationService(session_factory),
         settings=settings,
         local_token=local_token,
+        lifespan=lifespan,
     )
+    # 调度器的开关**不持久化**：这个对象每次建进程都是新的，一律停在「已停止」。
+    app.state.mission_scheduler = scheduler
     # Intel search reads fleet snapshots straight from SQL, so it takes the
     # session factory rather than going through the application service.
     register_intel_routes(app, session_factory)

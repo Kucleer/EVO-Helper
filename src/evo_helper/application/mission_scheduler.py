@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -91,6 +92,12 @@ class MissionScheduler:
         self._planner = planner or ReportWaitPlanner()
         self._enabled = False
         self._run_id: UUID | None = None
+        #: tick 跑在后台线程里，而页面的「开始 / 结束」来自请求线程。没有这把锁，
+        #: 一次「结束」可能正好落在 tick 的「起进程」中间——supervisor 停掉的是
+        #: 上一个，紧接着 tick 又起了一个新的，于是控制台以为已经停了，实际还有
+        #: 一个 runner 在点鼠标。这直接违反「任何时刻最多一个子进程」。
+        #: 可重入锁：`stop()` 与 `tick()` 内部都会再调 `_finish()`。
+        self._lock = threading.RLock()
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -108,22 +115,26 @@ class MissionScheduler:
         孤儿是上次没走正常关闭路径留下的行。**只标不杀**——pid 会被系统回收
         复用，照着一个可能已经换了主人的号码开枪比留个警告更糟。
         """
-        now = self._clock()
-        self._repository.ensure_mission_rows(now_utc=now)
-        return self._repository.mark_orphan_mission_runs(ended_at_utc=now)
+        with self._lock:
+            now = self._clock()
+            self._repository.ensure_mission_rows(now_utc=now)
+            return self._repository.mark_orphan_mission_runs(ended_at_utc=now)
 
     def start(self) -> None:
-        self._enabled = True
+        with self._lock:
+            self._enabled = True
 
     def stop(self) -> None:
         """用户点「结束」。立刻杀，不等它跑完手上这一个。"""
-        self._enabled = False
-        self._finish(self._supervisor.stop(StopReason.USER))
+        with self._lock:
+            self._enabled = False
+            self._finish(self._supervisor.stop(StopReason.USER))
 
     def shutdown(self) -> None:
         """控制台关闭时清场，覆盖「正常重启」这条最常见的路径。"""
-        self._enabled = False
-        self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
+        with self._lock:
+            self._enabled = False
+            self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -131,14 +142,15 @@ class MissionScheduler:
         收退出码不能只在页面轮询时做——没人开着页面时，那条记录会一直挂在
         「运行中」，而连续失败也就永远数不到三。
         """
-        self._finish(self._supervisor.poll())
-        if not self._enabled:
-            return
-        # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
-        # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
-        for _ in range(len(MissionKind)):
-            if not self._step():
+        with self._lock:
+            self._finish(self._supervisor.poll())
+            if not self._enabled:
                 return
+            # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
+            # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
+            for _ in range(len(MissionKind)):
+                if not self._step():
+                    return
 
     # -- 一次决策 --------------------------------------------------------------
 
