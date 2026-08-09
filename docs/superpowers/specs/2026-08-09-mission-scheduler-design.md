@@ -35,7 +35,7 @@
 | 主星 `Coordinate(2,137,18)` 硬编码了两遍 | `tools/pirate_loop.py:69`、`tools/scan_coordinates.py:49` |
 | 系号上限常量 | `domain/scan_priority.py` `SYSTEMS_PER_GALAXY` |
 | web 服务单进程单 worker（`uvicorn.run` 收的是 app 对象） | `web/runtime.py:main` |
-| 供 supervisor 测试抄的 `FakeProcess` + 可注入 `Clock` | `tests/unit/tools/test_scan_console.py:19,48` |
+| 供 supervisor 测试抄的 `FakeProcess` + 可注入 `Clock` | 原在 `tests/unit/tools/test_scan_console.py`，第十一节改造后已随 `ScanSupervisor` 一并删除；现存于 `tests/unit/application/test_mission_supervisor.py` |
 
 ## 三、调度模型
 
@@ -471,7 +471,7 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
 
 ### 为什么这不是可选的优化
 
-它现在是全仓唯一真正 spawn runner 的地方（`scan_console.py:314`）。调度器一旦上线，
+它**曾经**是全仓唯一真正 spawn runner 的地方（改造前的 `scan_console.py`）。调度器一旦上线，
 就会有**两个互不知情的东西在抢同一个鼠标**：调度器以为只有自己在派，而 Alt+F8
 还能另起一个扫描进程。规格第八节第 1 条「任何时刻最多一个子进程在点鼠标」是硬
 不变量，靠约定守不住，只能靠**取消第二个启动器**。
