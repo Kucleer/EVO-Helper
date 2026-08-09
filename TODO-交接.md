@@ -172,11 +172,31 @@ python -m evo_helper.tools.pirate_loop --systems 2:137 --scout --attack   # 完�
 去信箱的每一步都先认屏再点，认不出就抛异常停下；开工先 `ensure_game_window()` 校几何
 （本轮两次发现窗口自己变回 1536×733，那时所有坐标一起失效且悄无声息）。
 
-### 第二步：需求 4
+### 第二步：需求 4 —— 控制台改成「选任务种类 + 开始/结束」（**下一步就是这个**）
 
-`missions.html` 现在以「时间窗口」为核心，要改成选任务种类
-（扫描 / 攻击侦查 / 海盗攻击）+ 开始/结束。`scan_plans` 的
-`window_start`/`window_end` 别处在用，删字段前先查引用。
+现在两条自动化都有了命令行入口，控制台还没接上：
+
+| 任务种类 | 命令行 | 判定依据 |
+|---|---|---|
+| 扫描 | `tools.scan_coordinates` | —— |
+| 攻击侦查 + 攻击 | `tools.bot_loop --probe --attack` | 战报守方「单位」总数分档（AAA/BBB/CCC） |
+| 海盗攻击 | `tools.pirate_loop --scout --attack` | 侦察报告四个判定舰种任一 > 1 |
+
+要做的：
+
+1. `scan_plans` 加一列 `mission_kind`（`scan` / `bot_probe` / `pirate`），带迁移。
+   默认 `scan`——存量计划都是扫描计划。
+2. `missions.html` 把「开始时间 / 结束时间」两个输入框换成任务种类下拉框。
+3. **`window_start`/`window_end` 两列先别删**，引用面比看起来宽：
+   `web/service.py`(13 处)、`web/persistent_service.py`(8)、`web/app.py`(3)、
+   `web/schemas.py`、`storage/models.py`、`tools/scan_coordinates.py`、
+   `tools/pirate_loop.py`。其中 `persistent_service._schedule_state()`
+   是按窗口算 ARMED/SCANNING 的，直接删会让运行状态失去含义。
+   **过渡办法**：建计划时一律写 `00:00`–`23:59`（等于不设时限），
+   界面不再问用户。等确认没别的地方依赖窗口语义了再删列。
+4. 开始/结束：`POST /api/runs`（开）已经有了；结束要一个显式的停止动作
+   （现在只有 `run.html` 里的状态流转）。按种类启动对应的 runner 进程时，
+   记得 `LiveDriver(allow_actions=...)` 只在派遣类任务上打开。
 
 ### 会话稳定性
 
