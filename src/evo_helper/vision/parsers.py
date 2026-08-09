@@ -652,7 +652,7 @@ def parse_dispatch_briefing(ocr_text: str) -> DispatchBriefing:
     if flight is None:
         raise UnknownUiVersionError("派遣简报缺少可读的飞行时间；面板可能仍在渲染")
 
-    arrival_line = _line_containing(ocr_text, "到达时间")
+    arrival_line = _line_containing(_join_wrapped_times(ocr_text), "到达时间")
     arrival = parse_report_timestamp(arrival_line, GAME_DISPLAY_ZONE) if arrival_line else None
     if arrival is None:
         raise UnknownUiVersionError("派遣简报缺少可读的预计到达时间；面板可能仍在渲染")
@@ -668,6 +668,39 @@ def _mission_type(ocr_text: str) -> MissionType:
         if label in line:
             return mission
     return MissionType.UNKNOWN
+
+
+#: 单独成行的 `HH:MM:SS`——就是被折到下一行的那半个时间戳。
+_BARE_TIME_LINE = re.compile(r"^\s*(\d{2}:\d{2}:\d{2})\s*$")
+
+#: 行尾的 `DD/MM/YYYY`，说明这一行的时间戳被截断了。
+_TRAILING_DATE = re.compile(r"\d{2}/\d{2}/\d{4}\s*$")
+
+
+def _join_wrapped_times(ocr_text: str) -> str:
+    """把折行的「预计到达时间」拼回一行。
+
+    实机简报页把到达时间排成两行——日期跟在标签后面，时分秒另起一行：
+
+        预计到达时间 ( 约 ) :        09/08/2026
+        02:04:27
+
+    而 `REPORT_TIME_RE` 要求日期和时间在同一行。不拼回去，
+    每一次派遣都会因为「缺少可读的预计到达时间」被拒——
+    简报页明明是好的，字段也确实在画面上。
+
+    只在**上一行以日期结尾、这一行只有一个时分秒**时才拼，
+    所以不会把两个不相干的字段粘到一起。
+    """
+    lines = ocr_text.splitlines()
+    merged: list[str] = []
+    for line in lines:
+        bare = _BARE_TIME_LINE.match(line)
+        if bare and merged and _TRAILING_DATE.search(merged[-1]):
+            merged[-1] = f"{merged[-1].rstrip()} {bare.group(1)}"
+            continue
+        merged.append(line)
+    return "\n".join(merged)
 
 
 def _line_containing(ocr_text: str, label: str) -> str | None:

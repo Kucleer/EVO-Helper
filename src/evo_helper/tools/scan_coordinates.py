@@ -293,11 +293,16 @@ def make_ocr() -> Any:
 class LiveDriver:
     """真实鼠标 + 窗口截图。窗口不见了就自己拉起来并重新定位。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_actions: bool = False) -> None:
+        """``allow_actions`` 默认关：扫描器只导航，不该有能力把舰队送出去。
+
+        攻击链路要点「攻击」和「出发！」，必须在构造时显式打开——
+        **开关只有这一处**，翻一眼构造点就知道哪个进程有动作能力。
+        """
         from evo_helper.game.human_input import HumanInput, load_pyautogui
 
         self._gui = load_pyautogui()
-        self._human = HumanInput(self._gui)
+        self._human = HumanInput(self._gui, allow_actions=allow_actions)
 
     def window(self) -> Any:
         """返回一个**可以往上点**的游戏窗口。
@@ -458,6 +463,15 @@ START_UPSCALE = 3
 START_THRESHOLD = 180
 
 #: 入口页（语言选择页）的标题与「进入」按钮。两处都读得很干净，不需要二值化。
+#: 掉线弹窗的正文行与那个绿色 ✓（截图 client 空间，实机量于 2026-08-09）。
+#:
+#: 弹窗只有一个按钮，所以按钮位置写死；但**是否要点它由那行字决定**——
+#: 读到「连接已断开」才点，读不到就停。绿色像素只用来量位置，不作判据：
+#: 派遣界面上的绿色 ✓ 长得一模一样，靠颜色认会在派遣页上点出一发舰队。
+DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
+DISCONNECT_BUTTON = (960, 583)
+DISCONNECT_UPSCALE = 3
+
 ENTRY_TITLE_ROI = (780, 305, 1140, 355)
 ENTRY_BUTTON_ROI = (999, 385, 1118, 430)
 ENTRY_UPSCALE = 3
@@ -499,8 +513,18 @@ def make_session_keeper(
         left, top, right, bottom = ENTRY_BUTTON_ROI
         return ((left + right) // 2, (top + bottom) // 2)
 
+    def disconnected(image: Any) -> bool:
+        """掉线弹窗在不在。"""
+        text = ocr(image.crop(DISCONNECT_TEXT_ROI), digits=False, upscale=DISCONNECT_UPSCALE)
+        return classify_screen(text) is ScreenState.DISCONNECTED
+
     def observe() -> ScreenState:
         image = driver.capture()
+        # **掉线要排在导航条之前判。** 弹窗是浮层，底下的导航条还在画面上，
+        # 「商店/联盟」照样读得出来——先判导航条就会把死会话认成在线，
+        # 之后每一步点击都石沉大海，而且全程不报错。实机上确认过这一屏。
+        if disconnected(image):
+            return ScreenState.DISCONNECTED
         state = classify_screen(
             ocr(image.crop(NAV_TEXT_ROI), digits=False, upscale=NAV_TEXT_UPSCALE)
         )
@@ -527,10 +551,16 @@ def make_session_keeper(
             raise RuntimeError("要点「进入」时却读不到它；停止而不是往固定坐标乱点")
         driver.click(*spot, label=ENTRY_BUTTON_TEXT)
 
+    def dismiss_disconnect() -> None:
+        if not disconnected(driver.capture()):
+            raise RuntimeError("要关掉线弹窗时却读不到那行字；停止而不是往固定坐标乱点")
+        driver.click(*DISCONNECT_BUTTON, label="确认掉线弹窗")
+
     return SessionKeeper(
         observe=observe,
         click_entry=click_entry,
         click_start=click_start,
+        dismiss_disconnect=dismiss_disconnect,
         clock=clock,
         sleep=sleep,
     )
