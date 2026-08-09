@@ -1,0 +1,218 @@
+"""子进程的起停。界面、数据库、真实 Popen 都不在这里，逻辑分支全在这。
+
+**这里绝不真的 Popen 一个 runner**——那会在 CI 上去点真实鼠标、派真实舰队。
+`launch` 一律注入假的。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from evo_helper.application.mission_supervisor import (
+    MissionSupervisor,
+    StopReason,
+    SupervisorBusyError,
+    log_path_for,
+)
+from evo_helper.domain.scheduler import MissionKind
+
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+
+
+class FakeProcess:
+    """可以按剧本「跑完」的假子进程。"""
+
+    def __init__(self, pid: int = 1234) -> None:
+        self.pid = pid
+        self.exit_code: int | None = None
+        self.terminated = False
+        self.wait_timeouts: list[float | None] = []
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.exit_code = -15
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeouts.append(timeout)
+        return self.exit_code if self.exit_code is not None else 0
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def make(clock: Clock | None = None) -> tuple[MissionSupervisor, list[FakeProcess]]:
+    spawned: list[FakeProcess] = []
+
+    def launch(kind: MissionKind, command: Sequence[str], log_path: Path) -> FakeProcess:
+        process = FakeProcess(pid=1000 + len(spawned))
+        spawned.append(process)
+        return process
+
+    return MissionSupervisor(launch=launch, clock=clock or Clock()), spawned
+
+
+SCAN_ARGV = ["python", "-m", "evo_helper.tools.scan_coordinates"]
+PIRATE_ARGV = ["python", "-m", "evo_helper.tools.pirate_loop", "--scout", "--attack"]
+
+
+def test_nothing_runs_until_something_is_started() -> None:
+    supervisor, spawned = make()
+
+    assert supervisor.running is None
+    assert spawned == []
+
+
+def test_starting_records_what_is_running() -> None:
+    supervisor, spawned = make()
+
+    child = supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+
+    assert len(spawned) == 1
+    assert child.kind is MissionKind.SCAN
+    assert child.pid == 1000
+    assert child.started_at_utc == NOW
+    assert supervisor.running == child
+
+
+def test_a_second_start_is_refused_while_one_is_running() -> None:
+    """一个游戏窗口，一个鼠标。两个子进程同时点，就是互相抢窗口。"""
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+
+    with pytest.raises(SupervisorBusyError):
+        supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+
+    assert len(spawned) == 1
+
+
+def test_stopping_kills_it_now_rather_than_waiting_out_the_round() -> None:
+    """用户口径：点了停就是停，不等它跑完手上这一个。"""
+    clock = Clock()
+    supervisor, spawned = make(clock)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    clock.advance(90)
+
+    exited = supervisor.stop(StopReason.USER)
+
+    assert spawned[0].terminated
+    assert spawned[0].wait_timeouts == [5]
+    assert exited is not None
+    assert exited.kind is MissionKind.SCAN
+    assert exited.stopped_by is StopReason.USER
+    assert exited.started_at_utc == NOW
+    assert exited.ended_at_utc == NOW + timedelta(seconds=90)
+    assert supervisor.running is None
+
+
+def test_stopping_when_nothing_runs_is_not_an_error() -> None:
+    """关闭、抢占、用户点停三条路都会调它，谁也不该先去判一遍有没有在跑。"""
+    supervisor, _ = make()
+
+    assert supervisor.stop(StopReason.SHUTDOWN) is None
+
+
+def test_a_process_that_will_not_die_does_not_hang_the_caller() -> None:
+    """`wait` 超时也要把状态清干净，否则控制台永远停在「运行中」，谁也起不来。"""
+
+    class Stubborn(FakeProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            raise TimeoutError("还没死")
+
+    supervisor = MissionSupervisor(launch=lambda kind, command, log: Stubborn(), clock=Clock())
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+
+    exited = supervisor.stop(StopReason.PREEMPTED)
+
+    assert exited is not None
+    assert exited.exit_code is None
+    assert supervisor.running is None
+
+
+def test_polling_a_live_process_reports_nothing() -> None:
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+
+    assert supervisor.poll() is None
+    assert supervisor.running is not None
+
+
+def test_polling_collects_a_clean_exit() -> None:
+    clock = Clock()
+    supervisor, spawned = make(clock)
+    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+    spawned[0].exit_code = 0
+    clock.advance(120)
+
+    exited = supervisor.poll()
+
+    assert exited is not None
+    assert exited.exit_code == 0
+    assert exited.stopped_by is StopReason.SELF
+    assert exited.ended_at_utc == NOW + timedelta(seconds=120)
+    assert supervisor.running is None
+
+
+def test_a_finished_attack_round_is_not_restarted() -> None:
+    """**这是与扫描控制台 `ScanSupervisor` 唯一的实质差别。**
+
+    自动续跑是扫描链路的特性：扫描不派遣，断在哪都能接着扫。攻击类任务自己
+    重启会连着再派一轮舰队——一轮 32 次配额可以在没人看着的时候悄悄打光。
+    起不起下一个由调度器按判据决定，不由子进程的退出来决定。
+    """
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+    spawned[0].exit_code = 0
+
+    supervisor.poll()
+    supervisor.poll()
+    supervisor.poll()
+
+    assert len(spawned) == 1
+
+
+def test_a_crashed_process_is_not_restarted_either() -> None:
+    """失败多半是「窗口抢不到前台」或「甩鼠标触发 FAILSAFE」，重启只会再来一遍。"""
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.BOT, ["python", "-m", "evo_helper.tools.bot_loop"])
+    spawned[0].exit_code = 3
+
+    exited = supervisor.poll()
+
+    assert exited is not None
+    assert exited.exit_code == 3
+    # 非 0 也算它自己退的：`stopped_by` 记的是「谁把它停了」，成败看 `exit_code`。
+    assert exited.stopped_by is StopReason.SELF
+    assert len(spawned) == 1
+
+
+def test_polling_after_the_exit_was_collected_reports_nothing_again() -> None:
+    """退出只该被收一次，否则每个 tick 都会再记一次失败，三次就误停用。"""
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    spawned[0].exit_code = 1
+
+    assert supervisor.poll() is not None
+    assert supervisor.poll() is None
+
+
+def test_each_chain_writes_its_own_log() -> None:
+    """三条链路混在一个文件里，出事时分不出是谁的输出。"""
+    paths = {log_path_for(kind) for kind in MissionKind}
+
+    assert len(paths) == 3
+    assert log_path_for(MissionKind.PIRATE).name == "mission-pirate.log"
