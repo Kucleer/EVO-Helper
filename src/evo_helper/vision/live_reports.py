@@ -101,6 +101,11 @@ class LiveBattleReport:
     rounds: tuple[ReplayRound, ...]
     #: Per-screen UI versions. Section 3 forbids one label for the whole chain.
     ui_versions: dict[str, str]
+    #: 战斗详情页的「单位」总数，双方各一。**不是** participating 之和——
+    #: 大舰队的数量是四舍五入显示（`5.36K`），相加凑不出精确总数。
+    #: 读不到时为 None，绝不用明细之和顶替。
+    attacker_units: int | None = None
+    defender_units: int | None = None
     #: How long this report took to read, split by stage.
     timing: ReadTiming = field(default_factory=ReadTiming)
 
@@ -231,6 +236,16 @@ class LiveReportReader:
         rounds = parse_replay_rounds(self._screens.round_columns(), self._source)
         timer.stage("rounds")
 
+        # 「单位」总数是独立来源，读不到就留空——**绝不用明细之和顶替**。
+        # 大舰队的逐行数量是四舍五入显示，相加得出的「总数」是假的。
+        #
+        # 用 getattr 取而不是写进协议：写进去会打断所有既有的 ReportScreens 实现，
+        # 而总数是增强项——提供不了的实现照样能读出一份完整报告。
+        reader = getattr(self._screens, "unit_totals", None)
+        totals = reader() if reader is not None else ("", "")
+        attacker_units = _unit_count(totals[0])
+        defender_units = _unit_count(totals[1])
+
         return LiveBattleReport(
             kind=kind,
             raw_time_text=raw_time,
@@ -244,6 +259,8 @@ class LiveReportReader:
                 "battle_detail_ui_version": str(detail_page.ui_version),
                 "battle_replay_ui_version": str(replay_page.ui_version),
             },
+            attacker_units=attacker_units,
+            defender_units=defender_units,
             timing=timer.finish(),
         )
 
@@ -266,3 +283,10 @@ def _time_text_from_header(header: str) -> str | None:
 
     match = REPORT_TIME_RE.search(header)
     return match.group(0) if match is not None else None
+
+
+def _unit_count(text: str) -> int | None:
+    """把「单位」读数解析成艘数；认不出返回 None。"""
+    from evo_helper.domain.fleet_tier import parse_fleet_count
+
+    return parse_fleet_count(text) if text else None

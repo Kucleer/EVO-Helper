@@ -569,6 +569,18 @@ def run_scan(
     def read_nav_labels() -> str:
         return str(ocr(driver.capture().crop(NAV_LABEL_ROI), digits=False, upscale=3))
 
+    # **先确认会话还在，再谈切视图。** 顺序反了会这样：中断后重启时会话已经掉了，
+    # 画面停在入口页或 START 页，导航栏标签自然读不到，`ensure_system_view` 就朝
+    # 视图菜单坐标盲点三次然后放弃——**永远走不到能重连的 SessionKeeper**。
+    # 实测这条路径把扫描卡了几千轮，日志里全是「切不到恒星系视图」，
+    # 一次都没提过巡检；而且那三次点击本身就违反「认不出的画面绝不点击」。
+    session = keeper.ensure_connected(force=True)
+    if session is not None and not session.ready:
+        say(f"会话不可用：{session.detail}；安全停止")
+        return 1
+    if session is not None and session.reconnected:
+        say("已重新登录")
+
     if not navigator.ensure_system_view(read_nav_labels):
         say("切不到恒星系视图；停止而不是往固定坐标乱点")
         return 1
@@ -635,6 +647,12 @@ def run_scan(
             # 记下来，否则这个坐标既没入库、游标又被后面的成功坐标带过去，就此消失。
             record_gap(coordinate, result.panel.coordinate_text)
             navigator.invalidate()
+            # 核对失败最常见的原因就是掉线。巡检十分钟才一次，等不到——
+            # 这里立刻查一次，否则接下来又会在入口页上朝视图菜单盲点。
+            dropped = keeper.ensure_connected(force=True)
+            if dropped is not None and not dropped.ready:
+                say(f"核对失败且会话不可用：{dropped.detail}；安全停止")
+                return 1
             # 游戏会自己回到行星视图；先确认还在恒星系视图再接着扫。
             if not navigator.ensure_system_view(read_nav_labels):
                 say("核对失败后切不回恒星系视图；安全停止")

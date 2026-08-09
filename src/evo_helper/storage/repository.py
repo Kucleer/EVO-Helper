@@ -236,6 +236,8 @@ class SqlAlchemyRepository:
                 manual_review_status=record.manual_review_status,
                 is_from_revisit=record.is_from_revisit,
                 ui_version=record.ui_version,
+                attacker_units=record.attacker_units,
+                defender_units=record.defender_units,
             )
             session.add(report_row)
             for entry in record.fleet:
@@ -246,6 +248,7 @@ class SqlAlchemyRepository:
                         ship_type=entry.ship_type,
                         count=entry.count,
                         round_no=entry.round_no,
+                        uncertain=entry.uncertain,
                     )
                 )
             close = [

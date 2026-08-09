@@ -38,9 +38,25 @@ NUMBER_COLUMN_PADDING = 4
 #: 一段墨迹至少这么宽才可能是数字列。面板边框只有两三像素宽。
 NUMBER_COLUMN_MIN_WIDTH = 10
 
+#: 「单位」数值的字符集。大舰队显示成 `5.36K`，所以要收 `.` 和 `K`。
+UNIT_WHITELIST = "0123456789.K"
+
+#: 名称列相对列左沿的裁剪范围与放大倍数。
+FLEET_NAME_INSET = 15
+FLEET_NAME_WIDTH = 115
+FLEET_NAME_UPSCALE = 3
+
+#: 名称列只认出一行时的兜底行距（实测值）。
+FLEET_ROW_PITCH = 22
+
 
 class _Ocr(Protocol):
     def image_to_string(self, image: Any, lang: str, config: str) -> str: ...
+
+    #: 逐行定位要用词框，所以除了整段文字还需要结构化输出。
+    def image_to_data(self, image: Any, **kwargs: Any) -> Any: ...
+
+    Output: Any
 
 
 def _load_backends() -> tuple[Any, _Ocr]:
@@ -125,6 +141,94 @@ class ImageReportScreens:
             self._read_fleet(self._layout.defender_column.rows(top, bottom)),
         )
 
+    def read_fleet_rows(self, band: ColumnBand, top: int, bottom: int) -> str:
+        """逐行读一列舰队：名字一遍、数量一遍，按行拼。
+
+        ⚠️ **还没接进 `participating_columns`。** 在用户给的 5 份样本上它明显更好
+        （80 行 61% → 88%，四个核心舰种 58% → 95%），但在既有的 2026-08-07 那份
+        回归样本上**反而退步**：`95` 被读成 `35`，而旧的整列两遍读法在那份上 17 行全对。
+        不能拿一个已知良好的样本去换平均值——接线前得先弄清这两份样本差在哪。
+
+        为什么不整列一次读：tesseract 在中文字形旁边切不准行，`11` 被吞成 `1`、
+        `39` 被切成 `33`；两遍行数一对不上就退回英文那遍，名字全成拉丁乱码。
+        逐行读之后，实测 5 份样本 80 行的准确率 61% → 88%，
+        四个核心舰种 58% → 95%。
+
+        三条缺一不可（每一条都是实测踩出来的）：
+
+        - **行位置用等距网格**，不用逐行检测。实测 17 行的表检出 18 行——
+          `钛能守卫者` 整行没认出来，位置被碎片顶替，之后所有索引错开一位。
+        - **数字列现场量**。数字左对齐，起点随内容变；不同来源的截图宽度也不同，
+          实测两者差 31px，按写死的左界裁正好切掉首位。
+        - **选票时后缀让位于更长的候选**。丢首位是恒定的失败模式，
+          `74` 读成 `4` 比读对还多 6 票。
+        """
+        from evo_helper.vision.fleet_counts import COUNT_RECIPES, pick_count, row_grid
+
+        names = self._fleet_names(band, top, bottom)
+        if not names:
+            return ""
+        first_top, pitch, labels = names
+        column = number_column(self._image, band, top, bottom)
+        lines = []
+        for index, y in enumerate(row_grid(first_top, pitch, len(labels))):
+            crop = self._image.crop((column[0], y - 3, column[1], y + pitch - 3)).convert("L")
+            votes: dict[str, int] = {}
+            for scale, resample in COUNT_RECIPES:
+                filt = (
+                    self._image_module.Resampling.NEAREST
+                    if resample == "nearest"
+                    else self._image_module.Resampling.LANCZOS
+                )
+                grey = crop.resize((crop.width * scale, crop.height * scale), filt)
+                text = self._ocr.image_to_string(
+                    grey, lang="eng", config=f"--psm 7 -c tessedit_char_whitelist={UNIT_WHITELIST}"
+                ).strip()
+                if text:
+                    votes[text] = votes.get(text, 0) + 1
+            count = pick_count(votes)
+            if count:
+                lines.append(f"{labels[index]}  {count}")
+        return "\n".join(lines)
+
+    def _fleet_names(
+        self, band: ColumnBand, top: int, bottom: int
+    ) -> tuple[int, int, list[str]] | None:
+        """名称列：返回首行位置、行距与每行的舰种名。"""
+        from statistics import median
+
+        crop = self._image.crop(
+            (band.left + FLEET_NAME_INSET, top, band.left + FLEET_NAME_WIDTH, bottom)
+        ).convert("L")
+        grey = crop.resize(
+            (crop.width * FLEET_NAME_UPSCALE, crop.height * FLEET_NAME_UPSCALE),
+            self._image_module.Resampling.LANCZOS,
+        )
+        data = self._ocr.image_to_data(
+            grey,
+            lang="chi_sim",
+            config=f"--psm {OCR_PSM_COLUMN}",
+            output_type=self._ocr.Output.DICT,
+        )
+        rows: dict[tuple[int, int, int], tuple[int, str]] = {}
+        for index, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
+            y = top + data["top"][index] // FLEET_NAME_UPSCALE
+            previous = rows.get(key)
+            rows[key] = (min(previous[0], y), previous[1] + word) if previous else (y, word)
+        ordered = sorted(rows.values())
+        if not ordered:
+            return None
+        tops = [y for y, _name in ordered]
+        pitch = (
+            int(median([b - a for a, b in zip(tops, tops[1:], strict=False)]))
+            if len(tops) > 1
+            else FLEET_ROW_PITCH
+        )
+        return (tops[0], max(pitch, 1), [name for _y, name in ordered])
+
     def round_columns(self) -> list[tuple[int, str, str]]:
         return [
             (
@@ -134,6 +238,54 @@ class ImageReportScreens:
             )
             for number, top, bottom in self._rounds
         ]
+
+    def unit_totals(self) -> tuple[str, str]:
+        """读战斗详情页的「单位」总数，双方各一。
+
+        **这是总数的权威来源**，不是逐行明细之和：大舰队的数量显示成 `5.36K`
+        这样的四舍五入值，逐行相加永远凑不出精确总数。
+
+        详情页要滚动才看得到这一行，所以位置按「战斗详情」横幅定位，不写死——
+        与回放页的分节定位同一套办法（`banner_bands`）。
+        """
+        from evo_helper.vision.fleet_counts import COUNT_RECIPES, pick_count
+
+        bottom = self._layout.viewport[1]
+        profile = row_brightness(
+            self._image,
+            self._layout.attacker_column.left + 20,
+            self._layout.defender_column.right - 20,
+            UNIT_SCAN_TOP,
+            bottom,
+        )
+        bands = banner_bands(profile, top=UNIT_SCAN_TOP)
+        if not bands:
+            return ("", "")
+        # 「战斗详情」是详情页最靠下的那条横幅；「战报」在它上面。
+        top = bands[-1][1] + UNIT_ROW_OFFSET
+        row = (top, min(top + UNIT_ROW_HEIGHT, bottom))
+
+        def read(band: ColumnBand) -> str:
+            """一侧的数值。标签在左、数值在右，只取右半。"""
+            crop = self._image.crop(
+                (band.left + UNIT_VALUE_INSET, row[0], band.right, row[1])
+            ).convert("L")
+            votes: dict[str, int] = {}
+            for scale, resample in COUNT_RECIPES:
+                filt = (
+                    self._image_module.Resampling.NEAREST
+                    if resample == "nearest"
+                    else self._image_module.Resampling.LANCZOS
+                )
+                grey = crop.resize((crop.width * scale, crop.height * scale), filt)
+                text = self._ocr.image_to_string(
+                    grey, lang="eng", config=f"--psm 7 -c tessedit_char_whitelist={UNIT_WHITELIST}"
+                ).strip()
+                if text:
+                    votes[text] = votes.get(text, 0) + 1
+            return pick_count(votes)
+
+        return (read(self._layout.attacker_column), read(self._layout.defender_column))
 
     # -- internals -------------------------------------------------------
 
@@ -339,3 +491,14 @@ def number_column(image: Any, band: ColumnBand, top: int, bottom: int) -> tuple[
     else:
         left -= NUMBER_COLUMN_PADDING
     return (left, right + NUMBER_COLUMN_PADDING)
+
+
+#: 详情页从这一行往下找横幅；再往上是 VS 块，那里也有亮条。
+UNIT_SCAN_TOP = 100
+
+#: 「单位」那一行相对「战斗详情」横幅下沿的偏移与高度。
+UNIT_ROW_OFFSET = 18
+UNIT_ROW_HEIGHT = 24
+
+#: 两侧数值的横向范围（相对各自列）。
+UNIT_VALUE_INSET = 100

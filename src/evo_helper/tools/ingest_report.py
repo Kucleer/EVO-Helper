@@ -72,6 +72,10 @@ class _CapturedScreens:
         # 一张截图里能看到几个回合就报几个；再往下的回合要滚动才拍得到。
         return self._replay.round_columns()
 
+    def unit_totals(self) -> tuple[str, str]:
+        # 「单位」总数在**详情页**，不在回放页。
+        return self._detail.unit_totals()
+
 
 def read_report(detail: Path, replay: Path, tesseract_cmd: str) -> LiveBattleReport:
     reader = LiveReportReader(_CapturedScreens(detail, replay, tesseract_cmd))

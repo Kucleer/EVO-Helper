@@ -55,6 +55,8 @@ class FleetSnapshotEntry:
     ship_type: str
     count: int
     round_no: int | None = None
+    #: 这一行的数没有把握，界面上要标出来。
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,10 @@ class BattleReport:
     manual_review_status: str = "PENDING"
     is_from_revisit: bool = False
     fleet: tuple[FleetSnapshotEntry, ...] = ()
+    #: 战斗详情页的「单位」总数，与 `fleet` 是两个独立来源；
+    #: 大舰队的逐行数量是四舍五入显示，相加凑不出这个数。
+    attacker_units: int | None = None
+    defender_units: int | None = None
 
 
 @dataclass(frozen=True)

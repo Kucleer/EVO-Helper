@@ -35,6 +35,8 @@ def to_battle_report(live: LiveBattleReport, *, report_id: UUID) -> BattleReport
 
     return BattleReport(
         report_id=report_id,
+        attacker_units=live.attacker_units,
+        defender_units=live.defender_units,
         reported_at_utc=live.reported_at_utc,
         attacker_origin=live.attacker.coordinate.value,
         defender_target=live.defender.coordinate.value,
