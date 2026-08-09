@@ -286,6 +286,17 @@ td.num, th.num { text-align: center; }
 td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
 td.coord { font-family: var(--mono); color: var(--accent-strong); }
 
+/* ---- 调度台的任务行 --------------------------------------------------- */
+
+/* 表格默认整行 hover 变手型（别处的行是可点开的），任务行不是链接，
+   给它按住能拖的手型，扫描那一行则明确地什么都不是。 */
+#mission-rows td { white-space: normal; vertical-align: top; }
+#mission-rows tr { cursor: default; }
+#mission-rows tr[draggable="true"] { cursor: grab; }
+#mission-rows tr[draggable="true"]:active { cursor: grabbing; }
+
+.drag-handle { color: var(--text-faint); font-size: 15px; user-select: none; }
+
 /* ---- history dialog -------------------------------------------------- */
 
 dialog {

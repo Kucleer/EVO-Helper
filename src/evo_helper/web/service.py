@@ -292,6 +292,25 @@ class CurrentMissionView:
 
 
 @dataclass(frozen=True)
+class MissionRunView:
+    """`mission_runs` 里的一行，翻成页面能直接摆出来的样子。
+
+    `command` 原样带出来：事后翻账时「那一轮到底打了谁」全靠它，
+    而参数早就被用户改过好几遍了。
+    """
+
+    kind: str
+    label: str
+    command: str
+    started_at_utc: datetime
+    ended_at_utc: datetime | None
+    exit_code: int | None
+    #: `USER` / `SELF` / `PREEMPTED` / `SHUTDOWN` / `UNKNOWN`，还没结束时为 None。
+    stopped_by: str | None
+    log_path: str
+
+
+@dataclass(frozen=True)
 class SchedulerView:
     running: bool
     #: 点「开始」的时刻，供页面上那块秒表。停着时为 None。
@@ -791,6 +810,7 @@ __all__ = [
     "FleetDiffView",
     "FleetEntryView",
     "FleetSnapshotView",
+    "MissionRunView",
     "MissionTaskView",
     "NotFoundError",
     "PlanPatchView",
