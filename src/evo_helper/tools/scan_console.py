@@ -268,7 +268,9 @@ class HotkeyListener:
         import ctypes
 
         if self._thread_id is not None:
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+            # `ctypes.windll` 只在 Windows 上存在。动态取属性是为了让 CI 上
+            # （Linux）的 mypy 也能过——仓库其余地方是同一个写法。
+            getattr(ctypes, "windll").user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         if self._thread is not None:
             self._thread.join(timeout=3)
 
@@ -276,14 +278,15 @@ class HotkeyListener:
         import ctypes
         import ctypes.wintypes
 
-        user32 = ctypes.windll.user32
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        windll = getattr(ctypes, "windll")  # Windows 专有，见 `stop()` 的注释
+        user32 = windll.user32
+        self._thread_id = windll.kernel32.GetCurrentThreadId()
         for binding in self._bindings:
             modifiers, vk = parse_hotkey(binding.text)
             if user32.RegisterHotKey(None, binding.action, modifiers, vk):
                 self.registered.append(binding)
             else:
-                code = ctypes.GetLastError()
+                code = getattr(ctypes, "GetLastError")()
                 reason = "已被其它程序占用" if code == 1409 else f"注册失败（错误码 {code}）"
                 self.rejected.append((binding, reason))
         self._ready.set()
@@ -337,7 +340,7 @@ def _work_area() -> tuple[int, int]:
 
     rect = _Rect()
     # SPI_GETWORKAREA = 0x0030
-    ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
+    getattr(ctypes, "windll").user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
     return int(rect.right), int(rect.bottom)
 
 
