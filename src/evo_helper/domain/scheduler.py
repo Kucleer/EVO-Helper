@@ -15,16 +15,14 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import assert_never
 
-#: 同一条链路两次启动之间的最小间隔。
+#: 同一条**攻击**链路两次启动之间的最小间隔。
 #:
 #: 堵的是「立即收取」的空转：`expected_report_at_utc` 为 NULL 时战报判据恒为
 #: 「该去收」，而战报可能只是还没到（同系短程飞行按分钟计）。runner 进信箱、
 #: 扑空、退出、下一 tick 判据仍为真、再起一次——不是死循环，但每轮几十秒的
 #: 导航全是白费，还一直占着鼠标不让扫描进来。
 #:
-#: 冷却对扫描一视同仁：`MIN_DWELL` 只限制多快离开扫描，冷却限制多快回到扫描，
-#: 两条合起来才挡得住「抢占—还回去—再抢占」的秒级来回，而每次来回都要
-#: `ensure_game_window()` + 认屏。代价是扫描被抢占后有几分钟没人干活。
+#: **`SCAN` 不受它约束**，见 `has_work` 里那段。
 RESTART_COOLDOWN = timedelta(minutes=5)
 
 
@@ -127,9 +125,20 @@ def has_work(
     冷却期内一律算「没活干」，顺位让给下一个——它是判据的一部分而不是启动前的
     一道额外闸门，这样抢占那一路（`decide` 里靠 `wanted` 判断值不值得打断扫描）
     自动跟着生效：一条正在冷却的链路不该把扫描打断成谁都不在跑。
+
+    **`SCAN` 跳过冷却。** 冷却堵的 churn 是收战报特有的：`expected_report_at_utc`
+    为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。扫描没有这种循环，
+    它的游标持久化、随起随停没有代价。把冷却套上去只会制造纯空转——攻击轮两
+    分钟跑完、扫描还得再等三分钟才允许回来，而填这种空隙正是扫描存在的全部
+    理由。秒级来回由 `MIN_DWELL` 挡（它限制多快**离开**扫描），与这里限制多快
+    **回到**某条链路不重复，所以去掉这一档不会把来回放回来。
     """
     last_started = facts.last_started_at_utc.get(kind)
-    if last_started is not None and facts.now_utc - last_started < restart_cooldown:
+    if (
+        kind is not MissionKind.SCAN
+        and last_started is not None
+        and facts.now_utc - last_started < restart_cooldown
+    ):
         return False
 
     if kind is MissionKind.SCAN:

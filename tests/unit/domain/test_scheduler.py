@@ -297,6 +297,31 @@ def test_a_cooling_chain_yields_its_turn_to_the_next_one() -> None:
     assert decision == Decision(Action.START, MissionKind.SCAN)
 
 
+def test_scan_is_never_held_back_by_the_cooldown() -> None:
+    """**扫描跳过冷却。** 刚被抢占、冷却期远未过，而攻击任务已经没活干了——
+    这一刻应当立刻回到扫描，不是空转等满五分钟。
+
+    冷却堵的 churn 是收战报特有的（NULL expected → 恒判「该去收」→ 进信箱扑空
+    → 再来）。扫描没有这种循环，游标持久化、随起随停没有代价。套上去只会制造
+    纯空转：攻击轮两分钟跑完、扫描还得再等三分钟，而填这种空隙正是扫描存在的
+    全部理由。秒级来回归 `MIN_DWELL` 管，两者不重复。
+    """
+    just_preempted = facts(
+        # 航线占满、没有到期战报 → 两条攻击链路都没活干。
+        free_lines=0,
+        last_started_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=10)},
+    )
+
+    assert has_work(MissionKind.SCAN, just_preempted, restart_cooldown=RESTART_COOLDOWN)
+    assert decide(
+        tasks(MissionKind.PIRATE, MissionKind.BOT, MissionKind.SCAN),
+        just_preempted,
+        running=None,
+        min_dwell=DWELL,
+        restart_cooldown=RESTART_COOLDOWN,
+    ) == Decision(Action.START, MissionKind.SCAN)
+
+
 def test_a_cooling_chain_does_not_preempt_the_running_scan() -> None:
     """冷却中的海盗不算「有活干」，因此不足以打断扫描。
 
