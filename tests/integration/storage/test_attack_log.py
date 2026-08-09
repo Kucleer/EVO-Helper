@@ -17,9 +17,11 @@ from evo_helper.domain.records import (
     TARGET_KIND_PIRATE,
     AttackDispatch,
     AttackIntent,
+    BattleReport,
 )
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.vision.pirate_reports import OUTCOME_VICTORY
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
 
@@ -109,6 +111,65 @@ def test_the_newest_attack_is_listed_first(tmp_path: Path) -> None:
     positions = [entry.target.position for entry in service.list_attack_log(50)]
 
     assert positions == [3, 1]
+
+
+def test_the_battle_result_reaches_the_log(tmp_path: Path) -> None:
+    """打完之后日志要能回答「打赢了吗、损了多少」。
+
+    海盗战报只记胜负与战损总数（用户口径 2026-08-09），所以这两样就是战果的全部；
+    日志页取的正是同一份数据，不另算一遍。
+    """
+    repo, service, run_id = _setup(tmp_path)
+    target = Coordinate(2, 137, 4)
+    intent = _intent(run_id, target, TARGET_KIND_PIRATE, 0)
+    repo.save_attack_intent(intent)
+    dispatched = CREATED + timedelta(minutes=1)
+    repo.save_dispatch(
+        AttackDispatch(
+            dispatch_id=uuid4(),
+            intent_id=intent.intent_id,
+            dispatched_at_utc=dispatched,
+            dry_run=False,
+            accepted=True,
+        )
+    )
+    repo.append_report(
+        BattleReport(
+            report_id=uuid4(),
+            reported_at_utc=dispatched + timedelta(minutes=20),
+            attacker_origin=ORIGIN,
+            defender_target=target,
+            outcome=OUTCOME_VICTORY,
+            attacker_losses=0,
+            defender_losses=783,
+        )
+    )
+
+    (entry,) = service.list_attack_log(50)
+
+    assert entry.outcome == OUTCOME_VICTORY
+    assert (entry.attacker_losses, entry.defender_losses) == (0, 783)
+
+
+def test_an_attack_still_in_flight_has_no_result_yet(tmp_path: Path) -> None:
+    """还没回战报的那一发，战果必须是空的——不能显示成「零损失」。"""
+    repo, service, run_id = _setup(tmp_path)
+    intent = _intent(run_id, Coordinate(2, 137, 4), TARGET_KIND_PIRATE, 0)
+    repo.save_attack_intent(intent)
+    repo.save_dispatch(
+        AttackDispatch(
+            dispatch_id=uuid4(),
+            intent_id=intent.intent_id,
+            dispatched_at_utc=CREATED + timedelta(minutes=1),
+            dry_run=False,
+            accepted=True,
+        )
+    )
+
+    (entry,) = service.list_attack_log(50)
+
+    assert entry.outcome is None
+    assert entry.attacker_losses is None
 
 
 def test_existing_rows_default_to_bot(tmp_path: Path) -> None:

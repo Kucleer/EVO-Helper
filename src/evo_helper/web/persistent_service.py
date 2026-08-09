@@ -361,13 +361,21 @@ class PersistentApplicationService:
         内连接会把它们静默滤掉，日志看起来一片干净，实际是漏了。
 
         按意图创建时间倒序：日志页第一眼要看的是最近发生了什么。
+
+        战报也是 `outerjoin` 接上来的：刚派出去的那一发还没有战报，而它必须照样在列。
+        战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
+        在这里按坐标重新配一次，等于把同一条判据写第二份。
         """
         with self._session_factory() as session:
             rows = session.execute(
-                select(orm.AttackIntentRow, orm.AttackDispatchRow)
+                select(orm.AttackIntentRow, orm.AttackDispatchRow, orm.BattleReportRow)
                 .outerjoin(
                     orm.AttackDispatchRow,
                     orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
                 )
                 .order_by(
                     orm.AttackIntentRow.created_at_utc.desc(),
@@ -393,8 +401,11 @@ class PersistentApplicationService:
                     dry_run=dispatch.dry_run if dispatch else None,
                     accepted=dispatch.accepted if dispatch else None,
                     expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
+                    outcome=report.outcome if report else None,
+                    attacker_losses=report.attacker_losses if report else None,
+                    defender_losses=report.defender_losses if report else None,
                 )
-                for intent, dispatch in rows
+                for intent, dispatch, report in rows
             ]
 
     def request_revisit(

@@ -235,6 +235,12 @@ class AttackLogView:
     dry_run: bool | None
     accepted: bool | None
     expected_report_at_utc: datetime | None
+    #: 战果，来自匹配上的那份战报：`VICTORY` / `FAIL` 与双方战损总数。
+    #: 还在飞、或者战报还没收，三个都是 None——**不能拿 0 顶替**，
+    #: 「零损失」和「还不知道」在日志上必须看得出区别。
+    outcome: str | None = None
+    attacker_losses: int | None = None
+    defender_losses: int | None = None
 
 
 @dataclass(frozen=True)

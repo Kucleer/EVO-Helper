@@ -32,6 +32,7 @@
           <th scope="col">出发</th>
           <th scope="col">预设</th>
           <th scope="col">结果</th>
+          <th scope="col">战果</th>
           <th scope="col">预计战报（游戏 UTC+0）</th>
         </tr>
       </thead>
@@ -62,10 +63,26 @@
               <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>被拒</span>
             {% endif %}
           </td>
+          <td>
+            {# 海盗战报只记胜负与战损总数，所以这一格就是战果的全部。 #}
+            {% if entry.outcome is none %}
+              <span class="muted">待战报</span>
+            {% else %}
+              {% if entry.outcome == 'VICTORY' %}
+                <span class="chip ok"><span class="glyph" aria-hidden="true">★</span>胜</span>
+              {% else %}
+                <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>负</span>
+              {% endif %}
+              <div class="muted" style="font-size:11px">
+                战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}
+                · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}
+              </div>
+            {% endif %}
+          </td>
           <td class="muted">{{ game_time(entry.expected_report_at_utc) }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="8" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>
+        <tr><td colspan="9" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>
       {% endfor %}
       </tbody>
     </table>
