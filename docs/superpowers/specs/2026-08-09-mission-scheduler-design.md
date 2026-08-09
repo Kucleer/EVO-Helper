@@ -25,7 +25,7 @@
 | 攻击意图与派遣已入库，含 `target_kind`、`expected_report_at_utc` | `storage/models.py` `attack_intents` / `attack_dispatches` |
 | `pirate_loop` 写这两张表 | `tools/pirate_loop.py:510,527` |
 | **`BotLoop` 是 `PirateLoop` 的子类**，写库走继承来的 `_record_intent`，其中 `target_kind=TARGET_KIND_PIRATE` **硬编码** → bot 的攻击会被错标成海盗，污染日配额计数 | `tools/bot_loop.py:69`、`tools/pirate_loop.py:501-522` |
-| **`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。简报数据在 `_launch()` 里读到了但没传出来 | `tools/pirate_loop.py:301,527`、`vision/parsers.py:603-618` |
+| **`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。原因不是「读到了没传出来」，而是**从来没人去读**：`_launch()` 只 OCR 了 `BRIEFING_MISSION_ROI` 一个 ROI，`BRIEFING_FLIGHT_ROI` / `BRIEFING_ARRIVAL_ROI` 定义了但零引用，`record_flight_time` 只有测试在调 | `tools/pirate_loop.py:237`、`game/pirate_ui.py:71-73`、`storage/repository.py:416` |
 | 「该等还是该收」已有纯函数判据，且已定义 NULL = 立即收取 | `domain/report_wait.py` `ReportWaitPlanner` |
 | 两个 runner 的 `run()` **已经是单趟就退出**（各遍历一遍输入列表就 return），因此**不需要 `--once`** | `tools/pirate_loop.py:541`、`tools/bot_loop.py:153` |
 | **`bot_loop` 每个目标在进程内 `time.sleep(600)` 等战报**，期间独占鼠标 | `tools/bot_loop.py:59,176` |
@@ -311,10 +311,16 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
    `target_kind=TARGET_KIND_PIRATE` 硬编码。改成可由子类覆盖的类属性，
    `BotLoop` 覆盖为 `TARGET_KIND_BOT`。不修这条，bot 每打一发都会占掉一格
    海盗的当日配额。
-2. **`expected_report_at_utc` 恒为 NULL**。简报在 `_launch()` 里已经读到
-   （`DispatchBriefing.expected_report_at_utc`），只是没传出来。让 `_launch()`
-   返回简报，`_record_dispatch()` 接收并写入 `flight_seconds` 与
-   `expected_report_at_utc`；读不到简报时仍写 NULL（保持现有降级语义）。
+2. **`expected_report_at_utc` 恒为 NULL**，因为**从来没人去读飞行时间**。
+   新增一个只读的 `_read_briefing()`，在点「出发！」**之前**读
+   `BRIEFING_FLIGHT_ROI`（出发后那一屏就没了），经 `parse_game_duration` 解析，
+   再由 `_record_dispatch()` 调 `record_flight_time` 写入。
+
+   **`_launch()` 的返回类型不动，仍是 `bool`**：让它返回简报会把「闸门拒绝、
+   根本没派出去」和「派出去了但飞行时间读不出来」混成同一个 `None`，
+   而这两者的处置完全相反。同理，**读不到飞行时间不阻止派遣**——它是闹钟
+   不是闸门，为一次 OCR 抖动毙掉一发健康的攻击是本末倒置。写 NULL，
+   靠既定的「未知即立即收取」降级。
 
 3. **`bot_loop` 拆掉进程内干睡**，改为「派出即退出」，一趟只推进每个目标一态。
    见上一节。
