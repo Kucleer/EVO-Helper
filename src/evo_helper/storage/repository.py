@@ -652,15 +652,23 @@ class SqlAlchemyRepository:
                 for preset_name, report_id in session.execute(statement).all()
             ]
 
-    def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime | None) -> None:
+    def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime) -> None:
         """把「分档说不值得打」记成本轮的一条 `target_revisits`。
 
         不记的话，下一趟又会重新分一次档、重新读一次战报，而结论不会变。
+
+        **`since` 必填，且本轮真的探过路才写。** 分档结论是对刚读到的那份战报
+        下的，本轮没有依据就没有判定可记。原先 `since` 可空，而 `None` 在查询侧
+        的含义是「不限时间范围」：手工跑一次 `--probe --attack`，只要有一个目标
+        被判成「不值得打」，这个坐标历史上每一轮的记录就全被刷掉。
+
+        一轮只写一条：同轮里探了两次、或者这一趟重跑了，都不该越堆越多。
         """
-        if since is not None:
-            _require_utc(since, "since")
+        _require_utc(since, "since")
         with self._session_factory() as session:
             if _tier_negligible(session, coordinate, since=since):
+                return
+            if _latest_bot_intent_at(session, coordinate, since=since) is None:
                 return
             session.add(
                 orm.TargetRevisitRow(
@@ -702,6 +710,28 @@ def _require_type[T](value: object, expected: type[T], label: str) -> T:
     if not isinstance(value, expected):
         raise TypeError(f"{label} must be {expected.__name__}, got {type(value).__name__}")
     return value
+
+
+def _latest_bot_intent_at(
+    session: Session, coordinate: Coordinate, *, since: datetime
+) -> datetime | None:
+    """本轮针对这个 bot 最新那条意图是什么时候建的；本轮没有则 None。
+
+    只取最新一条而不是「有没有」，是为了让「那一条」这个意思留在代码里：
+    分档结论是对**最近那份战报**下的，不是对这个坐标的全部历史下的。
+    """
+    return session.scalar(
+        select(orm.AttackIntentRow.created_at_utc)
+        .where(
+            orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+            orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
+            orm.AttackIntentRow.target_system == coordinate.system,
+            orm.AttackIntentRow.target_position == coordinate.position,
+            orm.AttackIntentRow.created_at_utc >= since,
+        )
+        .order_by(orm.AttackIntentRow.created_at_utc.desc())
+        .limit(1)
+    )
 
 
 def _tier_negligible(session: Session, coordinate: Coordinate, *, since: datetime | None) -> bool:

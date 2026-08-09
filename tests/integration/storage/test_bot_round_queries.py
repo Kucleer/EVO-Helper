@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from evo_helper.domain.bot_round import BotPhase, DispatchFact, phase_of
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.models import Coordinate
@@ -123,7 +125,6 @@ def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repositor
     )
 
 
-
 # -- 「不值得打」的标记 ------------------------------------------------------
 
 
@@ -179,6 +180,50 @@ def test_a_skip_is_not_counted_as_a_pending_revisit(repository, run_id) -> None:
     repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
 
     assert [row.status for row in _revisits(repository)] == ["DONE"]
+
+
+def test_skipping_a_target_with_nothing_this_round_marks_nothing(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**本轮没碰过这个目标就什么都不写。**
+
+    原先它把所有匹配行一起改，那句 `.order_by(created_at_utc)` 在「全部都改」
+    的语境下是死代码，恰恰说明作者想的是「那一条」。落到复查表上，「那一条」
+    就是「本轮真的探过路，才记这一轮的判定」——本轮没有依据，就没有判定可记。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=LAST_ROUND, has_report=True)
+
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    assert _revisits(repository) == []
+
+
+def test_the_skip_belongs_to_one_round_and_is_written_once(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """一轮一条。同轮里探了两次、或者这一趟重跑了，都不该越堆越多。"""
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+    _intent(
+        repository,
+        run_id,
+        preset=PROBE,
+        created_at=ROUND_START + timedelta(hours=1),
+        has_report=True,
+    )
+
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    rows = _revisits(repository)
+    assert len(rows) == 1
+    assert rows[0].requested_at_utc >= ROUND_START
+
+
+def test_a_missing_round_start_is_rejected_rather_than_wiping_history(repository) -> None:  # type: ignore[no-untyped-def]
+    """`since` 必填。**这条守的是那个删不掉的逃生口。**
+
+    原先它可空，而 `None` 在查询侧的含义是「不限时间范围」：手工跑一次
+    `--probe --attack`，只要有一个目标被判成「不值得打」，这个坐标历史上
+    每一轮的记录就全被刷掉。宁可当场报错，也不要静默改写历史。
+    """
+    with pytest.raises((TypeError, ValueError, AttributeError)):
+        repository.mark_bot_target_skipped(TARGET, since=None)
 
 
 def _intent_guard_statuses(repository):  # type: ignore[no-untyped-def]
