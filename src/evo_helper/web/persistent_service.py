@@ -47,6 +47,7 @@ from .service import (
     FleetDiffView,
     FleetEntryView,
     FleetSnapshotView,
+    MissionRunView,
     MissionTaskView,
     NotFoundError,
     PlanetPage,
@@ -698,6 +699,27 @@ class MissionConsoleService:
 
     def scheduler_view(self) -> SchedulerView:
         return self._view(self._scheduler.snapshot())
+
+    def recent_runs(self, *, limit: int = 50) -> list[MissionRunView]:
+        """`mission_runs` 的近况，新的在前。
+
+        `label` 在这里就翻好，页面不必再维护第二份 `kind → 中文名` 的表。
+        `kind` 认不出来时回落到原值：宁可显示英文，也不要让一条脏数据把
+        整张历史表打成 500。
+        """
+        return [
+            MissionRunView(
+                kind=row.kind,
+                label=MISSION_LABELS.get(row.kind, row.kind),
+                command=row.command,
+                started_at_utc=row.started_at_utc,
+                ended_at_utc=row.ended_at_utc,
+                exit_code=row.exit_code,
+                stopped_by=row.stopped_by,
+                log_path=row.log_path,
+            )
+            for row in self._repository.mission_runs(limit=limit)
+        ]
 
     # -- 开关 ------------------------------------------------------------------
 

@@ -26,7 +26,7 @@ from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.storage.repository import SqlAlchemyRepository
 
-from .display import LIST_SHIP_COLUMNS
+from .display import LIST_SHIP_COLUMNS, MISSION_LABELS, STATUS_GLYPHS, STATUS_TONES
 
 # 模块级导入（而不是留在 `create_persistent_app` 里）：`register_mission_routes`
 # 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
@@ -365,6 +365,11 @@ def create_app(
     token = local_token or default_local_token()
     app.add_middleware(LocalSecurityMiddleware, local_token=token)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    # `tojson` 默认 `ensure_ascii=True`，中文会变成 `运行中`。
+    # 调度台把八档状态文案当 JSON 传给页面脚本，转义之后既没法在浏览器里
+    # 一眼看懂，也没法在测试里对着那八个词断言。Jinja 的 `tojson` 仍会转义
+    # `<` `>` `&` `'`，放进 `<script>` 依然是安全的。
+    templates.env.policies["json.dumps_kwargs"] = {"sort_keys": True, "ensure_ascii": False}
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["run_state_tone"] = run_state_tone
     templates.env.globals["run_state_glyph"] = run_state_glyph
@@ -374,9 +379,6 @@ def create_app(
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
-
-    def settings_for(request: Request) -> Settings:
-        return cast(Settings, request.app.state.settings)
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
@@ -540,20 +542,27 @@ def create_app(
 
     @app.get("/missions", response_class=HTMLResponse)
     async def missions_page(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        dashboard = service.dashboard()
+        """调度台。
+
+        三行任务只在这里渲染出**壳**——名字、参数框、状态槽位。里面的每一个
+        字（状态、随行事实、参数回显）都由 `/api/scheduler` 下发并由页面上那段
+        轮询填进去。这不是偷懒：判据在页面上抄一份，就会出现「页面说的和调度器
+        做的不是一回事」，而那种错静默、且只有在舰队白飞一趟之后才看得见。
+
+        `mission_console` 用 `getattr` 取：它只挂在常驻 app 上
+        （`create_persistent_app`），假服务那条路上没有库也没有调度器。取不到就
+        渲染一张空的历史表，页面其余部分照常可用。
+        """
+        console = getattr(request.app.state, "mission_console", None)
         return templates.TemplateResponse(
             request=request,
             name="missions.html",
             context={
                 "active": "missions",
-                "plans": [_plan_out(plan) for plan in service.list_plans()],
-                "plan_count": dashboard.plan_count,
-                "active_runs": dashboard.active_run_count,
-                "target_count": dashboard.target_count,
-                "pending_revisits": dashboard.pending_revisit_count,
-                "default_preset": settings_for(request).default_fleet_preset,
-                "default_preset_signature": settings_for(request).default_fleet_preset_signature,
+                "mission_labels": MISSION_LABELS,
+                "status_tones": STATUS_TONES,
+                "status_glyphs": STATUS_GLYPHS,
+                "runs": [] if console is None else console.recent_runs(limit=50),
             },
         )
 
