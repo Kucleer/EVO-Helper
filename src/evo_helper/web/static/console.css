@@ -137,6 +137,11 @@ body {
 
 /* ---- chips ---------------------------------------------------------- */
 
+/* `.chip` 等等都显式设了 display，会盖掉浏览器自带的 `[hidden]` 规则。
+   页面上「孤儿红条」「错误提示」这类东西全靠 `el.hidden = true` 收起来，
+   少了这一条它们会一直挂在那儿。 */
+[hidden] { display: none !important; }
+
 .chip {
   display: inline-flex;
   align-items: center;
