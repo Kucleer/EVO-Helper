@@ -39,6 +39,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
+from evo_helper.domain import missions
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.records import (
     TARGET_KIND_PIRATE,
@@ -66,8 +67,9 @@ from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
 PLAN_NAME = "海盗侦查攻击循环"
 RUN_KEY = "pirate-loop-0001"
 
-#: 出发星球。飞行时间与战报匹配都要它。
-ORIGIN = Coordinate(2, 137, 18)
+#: 出发星球。飞行时间与战报匹配都要它。定义在 `domain.missions`，这里只转手——
+#: 主星原先在三个文件各写了一遍，改一次要改三处。
+ORIGIN = missions.ORIGIN
 
 #: 点「侦察」/「攻击」之后等派遣面板铺开。
 DISPATCH_WAIT_S = 2.4
