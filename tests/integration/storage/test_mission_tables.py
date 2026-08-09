@@ -112,7 +112,7 @@ def test_seeding_twice_does_not_duplicate_or_overwrite(repository) -> None:  # t
     """每次开机都会调一遍。第二遍要是覆盖，用户拖出来的优先级每次重启都被抹掉。"""
     now = datetime.now(UTC)
     repository.ensure_mission_rows(now_utc=now)
-    repository.set_mission_priority(MissionKind.PIRATE, 7)
+    repository.update_mission_task(MissionKind.PIRATE, priority=7)
 
     repository.ensure_mission_rows(now_utc=now)
 

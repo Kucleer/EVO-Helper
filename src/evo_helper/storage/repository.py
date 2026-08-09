@@ -777,11 +777,47 @@ class SqlAlchemyRepository:
                 raise ValueError("scheduler_config 还没初始化；先调 ensure_mission_rows()")
             return row
 
-    def set_mission_priority(self, kind: MissionKind, priority: int) -> None:
+    def update_mission_task(
+        self,
+        kind: MissionKind,
+        *,
+        enabled: bool | None = None,
+        priority: int | None = None,
+        params_json: str | None = None,
+    ) -> None:
+        """页面上改开关、拖顺序、编参数走这一个入口。
+
+        `None` 一律表示「这次不动它」，而不是「清空」：三样东西各自独立，
+        改一样就把另外两样重置回默认是页面上最容易出的那种错。
+
+        改任何一样都清掉 `disabled_reason`：自动停用是对**旧配置**下的判定，
+        用户既然动手改了，就该给它一次重新开始的机会——否则参数填错一次，
+        修好了也永远起不来。
+        """
         with self._session_factory() as session:
             row = _mission_task(session, kind)
-            row.priority = priority
+            if enabled is not None:
+                row.enabled = enabled
+            if priority is not None:
+                row.priority = priority
+            if params_json is not None:
+                row.params_json = params_json
+            row.disabled_reason = None
+            row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+
+    def begin_bot_round(self, *, now_utc: datetime) -> None:
+        """「重开一轮」：把 `round_started_at_utc` 推到当前。
+
+        上一轮的战报据此被排除在完成判据之外——不推的话，昨天打完的那批目标
+        今天仍然算「已完成」，新的一轮永远开不起来。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            row = _mission_task(session, MissionKind.BOT)
+            row.round_started_at_utc = now_utc
+            row.updated_at_utc = now_utc
             session.commit()
 
     def begin_mission_run(

@@ -322,9 +322,9 @@ def test_a_cooling_chain_does_not_preempt_the_running_scan() -> None:
 def test_the_quota_day_starts_at_utc_midnight_not_local_midnight() -> None:
     """重置点是 UTC 00:00，本地（UTC+8）是每天早上 8 点。
 
-    本地时间早上 3 点这一刻，当日配额已经从**昨天** UTC 00:00 起算了 19 小时。
-    按本地日历天截断会把起算点推到本地 0 点（= 昨天 UTC 16:00），于是 UTC
-    16:00–24:00 这段真实的派遣被漏数，海盗会以为还有额度，白飞一趟舰队。
+    本地时间早上 3 点这一刻，UTC 还停在前一天，当日配额已经起算了 19 小时。
+    按本地日历天截断会把起算点推到本地 0 点（= 那个 UTC 日的 16:00），于是该
+    UTC 日 00:00–16:00 这整段真实的派遣被漏数，海盗以为还有额度，白飞一趟舰队。
     """
     local_early_morning = datetime(2026, 8, 9, 3, 0, tzinfo=SHANGHAI)
 
