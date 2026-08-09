@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
@@ -592,14 +592,19 @@ class SqlAlchemyRepository:
                 for dispatch, report_id in rows
             ]
 
-    def bot_dispatch_facts(self, coordinate: Coordinate, *, since: datetime | None) -> list[Any]:
-        """本轮针对这个 bot 已经派过哪些发、战报回来了没有。
+    def bot_dispatch_facts(
+        self, coordinate: Coordinate, *, since: datetime | None
+    ) -> list[DispatchFact]:
+        """本轮针对这个 bot 已经**真的派出去**了哪些发、战报回来了没有。
 
         供 `domain.bot_round.phase_of` 判态。`since` 为空表示不限本轮
         （手工跑命令行时用）。
-        """
-        from evo_helper.domain.bot_round import DispatchFact
 
+        `accepted` / `dry_run` 两个过滤缺一不可，与兄弟方法
+        `count_dispatches_since` / `pending_reports_for_kind` 同口径：被游戏拒掉
+        的和演习的都不会产生战报，算进来就是一条「已派出且永远收不到战报」，
+        该目标永远停在 `AWAITING_ATTACK_REPORT`，bot 的完成态永远达不到。
+        """
         with self._session_factory() as session:
             statement = (
                 select(
@@ -620,6 +625,8 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
                     orm.AttackIntentRow.target_system == coordinate.system,
                     orm.AttackIntentRow.target_position == coordinate.position,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dry_run.is_(False),
                 )
             )
             if since is not None:
