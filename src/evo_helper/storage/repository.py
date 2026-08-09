@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
+    TARGET_KIND_BOT,
     AttackDispatch,
     AttackIntent,
     BattleReport,
@@ -30,6 +32,10 @@ from . import models as orm
 #: How far a report's timestamp may deviate from the dispatch time and still
 #: count as the same dispatch under the strict origin/target/time match rule.
 MATCH_TIME_TOLERANCE = timedelta(hours=12)
+
+#: 分档判定「不值得打」。写在意图的 guard_status 上——那一列本来就是
+#: 「这一发为什么没打出去」的记录位。
+GUARD_STATUS_SKIPPED = "SKIPPED_NEGLIGIBLE"
 
 
 class StorageConflictError(ValueError):
@@ -465,6 +471,127 @@ class SqlAlchemyRepository:
                 )
                 for dispatch, report_id in rows
             ]
+
+    # -- 调度器要问的事 --------------------------------------------------------
+
+    def count_dispatches_since(self, target_kind: str, *, since: datetime) -> int:
+        """某种目标在 `since` 之后真派出去了几发。
+
+        海盗每天 32 次是游戏硬限制，超了会收到邮件且攻击被强制返回。
+        只数**真实**派遣：演习记录不会消耗配额。
+        """
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.AttackDispatchRow)
+                    .join(
+                        orm.AttackIntentRow,
+                        orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                    )
+                    .where(
+                        orm.AttackIntentRow.target_kind == target_kind,
+                        orm.AttackDispatchRow.accepted.is_(True),
+                        orm.AttackDispatchRow.dry_run.is_(False),
+                        orm.AttackDispatchRow.dispatched_at_utc >= _require_utc(since, "since"),
+                    )
+                )
+                or 0
+            )
+
+    def pending_reports_for_kind(self, target_kind: str) -> list[PendingReport]:
+        """某种目标下尚未闭合的派遣，供 `ReportWaitPlanner` 判「该等还是该收」。
+
+        按 `target_kind` 分开：混在一起，一条链路会替另一条判「该回去收了」。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.AttackDispatchRow, orm.BattleReportRow.id)
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == target_kind,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dry_run.is_(False),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            ).all()
+            return [
+                PendingReport(
+                    dispatch_id=str(dispatch.id),
+                    expected_report_at_utc=dispatch.expected_report_at_utc,
+                    closed=report_id is not None,
+                )
+                for dispatch, report_id in rows
+            ]
+
+    def bot_dispatch_facts(self, coordinate: Coordinate, *, since: datetime | None) -> list[Any]:
+        """本轮针对这个 bot 已经派过哪些发、战报回来了没有。
+
+        供 `domain.bot_round.phase_of` 判态。`since` 为空表示不限本轮
+        （手工跑命令行时用）。
+        """
+        from evo_helper.domain.bot_round import DispatchFact
+
+        with self._session_factory() as session:
+            statement = (
+                select(
+                    orm.AttackIntentRow.preset_name,
+                    orm.BattleReportRow.id,
+                    orm.AttackIntentRow.guard_status,
+                )
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
+                    orm.AttackIntentRow.target_system == coordinate.system,
+                    orm.AttackIntentRow.target_position == coordinate.position,
+                )
+            )
+            if since is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+                )
+            return [
+                DispatchFact(
+                    preset_name=preset_name,
+                    has_report=report_id is not None,
+                    skipped=guard_status == GUARD_STATUS_SKIPPED,
+                )
+                for preset_name, report_id, guard_status in session.execute(statement).all()
+            ]
+
+    def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime | None) -> None:
+        """把「分档说不值得打」记在本轮那条探路意图上。
+
+        不记的话，下一趟又会重新分一次档、重新读一次战报，而结论不会变。
+        """
+        with self._session_factory() as session:
+            statement = select(orm.AttackIntentRow).where(
+                orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
+                orm.AttackIntentRow.target_system == coordinate.system,
+                orm.AttackIntentRow.target_position == coordinate.position,
+            )
+            if since is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+                )
+            for row in session.scalars(statement.order_by(orm.AttackIntentRow.created_at_utc)):
+                row.guard_status = GUARD_STATUS_SKIPPED
+            session.commit()
 
     def set_resume_at(self, run_id: UUID, resume_at_utc: datetime | None) -> None:
         with self._session_factory() as session:
