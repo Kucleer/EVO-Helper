@@ -343,3 +343,6 @@ class SchedulerConfigRow(Base):
     min_dwell_seconds: Mapped[int] = mapped_column(Integer, default=60)
     #: 过了预计战报时间再等这么久仍读不到，就判为「战报缺失」跳过。
     report_grace_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    #: 同一条链路两次启动之间的最小间隔。堵的是「战报还没到就反复进信箱扑空」
+    #: 的空转——每轮几十秒的导航全白费，还一直占着鼠标不让扫描进来。
+    restart_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)

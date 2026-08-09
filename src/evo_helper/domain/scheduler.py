@@ -9,11 +9,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import assert_never
+
+#: 同一条链路两次启动之间的最小间隔。
+#:
+#: 堵的是「立即收取」的空转：`expected_report_at_utc` 为 NULL 时战报判据恒为
+#: 「该去收」，而战报可能只是还没到（同系短程飞行按分钟计）。runner 进信箱、
+#: 扑空、退出、下一 tick 判据仍为真、再起一次——不是死循环，但每轮几十秒的
+#: 导航全是白费，还一直占着鼠标不让扫描进来。
+#:
+#: 冷却对扫描一视同仁：`MIN_DWELL` 只限制多快离开扫描，冷却限制多快回到扫描，
+#: 两条合起来才挡得住「抢占—还回去—再抢占」的秒级来回，而每次来回都要
+#: `ensure_game_window()` + 认屏。代价是扫描被抢占后有几分钟没人干活。
+RESTART_COOLDOWN = timedelta(minutes=5)
 
 
 class MissionKind(Enum):
@@ -73,6 +85,25 @@ class SchedulerFacts:
     #: 同上，针对 BOT 链路，同样必须来自对应的 `ReportWaitPlanner.plan(...)`。
     bot_reports_due: bool
     bot_targets_remaining: int
+    #: 每条链路上一次**启动**的时刻（不是上一次结束）。冷却按启动算：
+    #: 一个刚起来就秒退的 runner，正是最该被节流的那种。
+    #: 事实来自 `mission_runs` 里各 kind 的最大 `started_at_utc`，
+    #: 这一层不去查库。
+    last_started_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
+
+
+def quota_day_start_utc(now: datetime) -> datetime:
+    """当日配额从哪一刻起算。
+
+    游戏的重置点是 **UTC 00:00**，本地（UTC+8）是每天早上 8 点。做成具名函数
+    是因为调用方一旦自己写 `replace(hour=0)`，那个 `replace` 落在本地时刻上就
+    悄悄变成了本地日历天：本地早上 0–8 点这段，起算点会被推后到本地 0 点
+    （= 昨天 UTC 16:00），UTC 16:00 之后真实派出去的那些发被漏数，海盗会以为
+    还有额度——而超限的代价是舰队被强制返回，白飞一趟。
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("配额起算时刻必须带时区，否则无从判断它属于哪个 UTC 日")
+    return now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 @dataclass(frozen=True)
@@ -81,8 +112,22 @@ class Decision:
     kind: MissionKind | None = None
 
 
-def has_work(kind: MissionKind, facts: SchedulerFacts) -> bool:
-    """这条链路现在有没有事可做。"""
+def has_work(
+    kind: MissionKind,
+    facts: SchedulerFacts,
+    *,
+    restart_cooldown: timedelta = RESTART_COOLDOWN,
+) -> bool:
+    """这条链路现在有没有事可做。
+
+    冷却期内一律算「没活干」，顺位让给下一个——它是判据的一部分而不是启动前的
+    一道额外闸门，这样抢占那一路（`decide` 里靠 `wanted` 判断值不值得打断扫描）
+    自动跟着生效：一条正在冷却的链路不该把扫描打断成谁都不在跑。
+    """
+    last_started = facts.last_started_at_utc.get(kind)
+    if last_started is not None and facts.now_utc - last_started < restart_cooldown:
+        return False
+
     if kind is MissionKind.SCAN:
         # 扫描不派遣，因此不受航线约束，也没有完成态。它正是用来填空隙的。
         return True
@@ -113,6 +158,7 @@ def decide(
     *,
     running: RunningProcess | None,
     min_dwell: timedelta,
+    restart_cooldown: timedelta = RESTART_COOLDOWN,
 ) -> Decision:
     """下一步该做什么。
 
@@ -133,7 +179,14 @@ def decide(
         # 兜底一次。
         key=lambda task: (task.kind is MissionKind.SCAN, task.priority),
     )
-    wanted = next((task.kind for task in candidates if has_work(task.kind, facts)), None)
+    wanted = next(
+        (
+            task.kind
+            for task in candidates
+            if has_work(task.kind, facts, restart_cooldown=restart_cooldown)
+        ),
+        None,
+    )
 
     if running is not None:
         # 抢占只有一条规则：只有扫描会被打断。攻击轮中途杀掉可能正停在派遣面板上。

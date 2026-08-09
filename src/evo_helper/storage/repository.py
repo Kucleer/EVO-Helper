@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -25,6 +26,7 @@ from evo_helper.domain.records import (
     TargetRevisit,
 )
 from evo_helper.domain.report_wait import PendingReport
+from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
@@ -40,6 +42,22 @@ MATCH_TIME_TOLERANCE = timedelta(hours=12)
 #: `ALLOWED` / `REFUSED` 占着，`logs.html` 把它渲染成「未派出 · {guard_status}」；
 #: 塞第三套词汇进去，一发确实飞出去了的攻击会在日志页显示成「未派出」。
 REVISIT_SCOPE_TIER_NEGLIGIBLE = "BOT_TIER_NEGLIGIBLE"
+
+#: 孤儿行的 `stopped_by`：控制台重启时发现的、上次没走正常关闭路径的子进程。
+STOPPED_BY_UNKNOWN = "UNKNOWN"
+
+#: 三行任务的初始值：`(kind, enabled, priority, params_json)`。
+#:
+#: **扫描排最后**，它永远有活干，排在谁前面谁就永远轮不到。
+#:
+#: **只有扫描默认开着**：它不派遣、全程只读。两条攻击链路默认关着，理由和
+#: `evo_bot.AUTO_ENABLED` 默认 False 一样——装好就会派舰队不是好默认。bot 的
+#: 系号区间也没法猜，留空等页面上填。
+_MISSION_SEEDS: tuple[tuple[MissionKind, bool, int, str], ...] = (
+    (MissionKind.PIRATE, False, 0, '{"radius": 10}'),
+    (MissionKind.BOT, False, 1, "{}"),
+    (MissionKind.SCAN, True, 2, "{}"),
+)
 
 #: 这些复查行写 `DONE` 而不是默认的 `PENDING`。`persistent_service` 数的是
 #: PENDING 的条数、missions 页显示成「待复查」——分档说不值得打是一个已经
@@ -704,6 +722,207 @@ class SqlAlchemyRepository:
             attempts = row.session_attempts
             session.commit()
             return attempts
+
+    # -- 调度器的三行任务、单行配置与子进程台账 --------------------------------
+
+    def ensure_mission_rows(self, *, now_utc: datetime) -> None:
+        """补齐三行任务和单行配置，缺什么补什么。
+
+        迁移里没有 `bulk_insert`：种子数据放在迁移里，改一次默认值就得再写一条
+        迁移，而且老库和新库会各拿到一份不同的默认值。放这里则是每次开机对一遍。
+
+        **只补不改。** 第二遍要是覆盖，用户拖出来的优先级、填好的参数每次重启
+        都会被抹掉。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            existing = set(session.scalars(select(orm.MissionTaskRow.kind)).all())
+            for kind, enabled, priority, params in _MISSION_SEEDS:
+                if kind.value in existing:
+                    continue
+                session.add(
+                    orm.MissionTaskRow(
+                        kind=kind.value,
+                        enabled=enabled,
+                        priority=priority,
+                        params_json=params,
+                        consecutive_failures=0,
+                        created_at_utc=now_utc,
+                        updated_at_utc=now_utc,
+                    )
+                )
+            if session.get(orm.SchedulerConfigRow, 1) is None:
+                session.add(orm.SchedulerConfigRow(id=1))
+            session.commit()
+
+    def mission_tasks(self) -> list[orm.MissionTaskRow]:
+        """三条链路的当前配置，按 (priority, id) 升序。
+
+        并列的 priority 之间用 id 决出胜负：`priority` 列没有唯一约束，而
+        `decide()` 的排序是稳定排序——输入次序不确定，谁先起就成了随机的。
+        """
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.MissionTaskRow).order_by(
+                        orm.MissionTaskRow.priority, orm.MissionTaskRow.id
+                    )
+                ).all()
+            )
+
+    def scheduler_config(self) -> orm.SchedulerConfigRow:
+        with self._session_factory() as session:
+            row = session.get(orm.SchedulerConfigRow, 1)
+            if row is None:
+                raise ValueError("scheduler_config 还没初始化；先调 ensure_mission_rows()")
+            return row
+
+    def set_mission_priority(self, kind: MissionKind, priority: int) -> None:
+        with self._session_factory() as session:
+            row = _mission_task(session, kind)
+            row.priority = priority
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+
+    def begin_mission_run(
+        self,
+        kind: MissionKind,
+        *,
+        command: Sequence[str],
+        pid: int | None,
+        started_at_utc: datetime,
+        log_path: str,
+    ) -> UUID:
+        """起了一个子进程，记一行。返回的 id 用来在它结束时回填。"""
+        _require_utc(started_at_utc, "started_at_utc")
+        run_id = uuid4()
+        with self._session_factory() as session:
+            session.add(
+                orm.MissionRunRow(
+                    id=run_id,
+                    kind=kind.value,
+                    # 存成一行是给人看的。argv 列表在页面上排不开，而这一列的
+                    # 唯一用途就是事后翻账「那一轮到底打了谁」。
+                    command=" ".join(command),
+                    pid=pid,
+                    started_at_utc=started_at_utc,
+                    log_path=log_path,
+                )
+            )
+            session.commit()
+        return run_id
+
+    def finish_mission_run(
+        self, run_id: UUID, *, ended_at_utc: datetime, exit_code: int | None, stopped_by: str
+    ) -> None:
+        _require_utc(ended_at_utc, "ended_at_utc")
+        with self._session_factory() as session:
+            row = session.get(orm.MissionRunRow, run_id)
+            if row is None:
+                raise ValueError(f"mission run {run_id} not found")
+            row.ended_at_utc = ended_at_utc
+            row.exit_code = exit_code
+            row.stopped_by = stopped_by
+            session.commit()
+
+    def mission_runs(self, *, limit: int) -> list[orm.MissionRunRow]:
+        """最近的子进程记录，新的在前。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.MissionRunRow)
+                    .order_by(orm.MissionRunRow.started_at_utc.desc())
+                    .limit(limit)
+                ).all()
+            )
+
+    def mark_orphan_mission_runs(self, *, ended_at_utc: datetime) -> int:
+        """开机时把「上次没走正常关闭路径」的行标出来，返回条数。
+
+        **不按 pid 自动杀。** pid 会被系统回收复用，照着一个可能已经换了主人的
+        号码开枪，比留个警告糟得多。这里只标记，处置交给页面上的红条和
+        「强制结束」按钮。
+
+        `ended_at_utc` 也一并补上：留空的话这一行会永远显示成「运行中」，
+        而它恰恰是「我们已经不知道它死活了」的意思。
+        """
+        _require_utc(ended_at_utc, "ended_at_utc")
+        with self._session_factory() as session:
+            rows = list(
+                session.scalars(
+                    select(orm.MissionRunRow).where(orm.MissionRunRow.ended_at_utc.is_(None))
+                ).all()
+            )
+            for row in rows:
+                row.ended_at_utc = ended_at_utc
+                row.stopped_by = STOPPED_BY_UNKNOWN
+            session.commit()
+            return len(rows)
+
+    def last_mission_starts(self) -> dict[MissionKind, datetime]:
+        """每条链路上一次**启动**的时刻，供重启冷却判据用。
+
+        取启动而不是结束：一个刚起来就秒退的 runner 正是最该被节流的那种，
+        按结束时刻算等于对它完全不设防。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.MissionRunRow.kind, func.max(orm.MissionRunRow.started_at_utc)).group_by(
+                    orm.MissionRunRow.kind
+                )
+            ).all()
+        result: dict[MissionKind, datetime] = {}
+        for kind, started_at in rows:
+            try:
+                result[MissionKind(kind)] = started_at
+            except ValueError:
+                # 库里出现不认识的 kind（手改或旧版本留下的）不该让调度器崩掉：
+                # 它只是没有冷却记录而已。
+                continue
+        return result
+
+    def record_mission_failure(
+        self, kind: MissionKind, *, exit_code: int | None, limit: int
+    ) -> int:
+        """记一次异常退出，返回当前连续次数；到 `limit` 就自动停用。
+
+        没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。
+        失败多半是「窗口抢不到前台」或「甩鼠标触发 FAILSAFE」，重启只会再来一遍。
+        """
+        with self._session_factory() as session:
+            row = _mission_task(session, kind)
+            row.consecutive_failures += 1
+            if row.consecutive_failures >= limit and row.disabled_reason is None:
+                row.disabled_reason = (
+                    f"连续 {row.consecutive_failures} 次异常退出（退出码 {exit_code}）"
+                )
+            failures = row.consecutive_failures
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+            return failures
+
+    def clear_mission_failures(self, kind: MissionKind) -> None:
+        """跑完一轮且退出码为 0。「连续」是连续，中间成功过就重新数。"""
+        with self._session_factory() as session:
+            row = _mission_task(session, kind)
+            row.consecutive_failures = 0
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+
+    def disable_mission_task(self, kind: MissionKind, reason: str) -> None:
+        """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。"""
+        with self._session_factory() as session:
+            row = _mission_task(session, kind)
+            row.disabled_reason = reason
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+
+
+def _mission_task(session: Session, kind: MissionKind) -> orm.MissionTaskRow:
+    row = session.scalar(select(orm.MissionTaskRow).where(orm.MissionTaskRow.kind == kind.value))
+    if row is None:
+        raise ValueError(f"mission_tasks 里没有 {kind.value} 这一行；先调 ensure_mission_rows()")
+    return row
 
 
 def _require_type[T](value: object, expected: type[T], label: str) -> T:

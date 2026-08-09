@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
 
 from evo_helper.domain.scheduler import (
+    RESTART_COOLDOWN,
     Action,
     Decision,
     MissionKind,
@@ -17,10 +20,12 @@ from evo_helper.domain.scheduler import (
     TaskSnapshot,
     decide,
     has_work,
+    quota_day_start_utc,
 )
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 DWELL = timedelta(seconds=60)
+SHANGHAI = timezone(timedelta(hours=8))
 
 _DEFAULT_FACTS = SchedulerFacts(
     now_utc=NOW,
@@ -239,3 +244,100 @@ def test_nothing_to_do_is_idle_not_an_error() -> None:
     )
 
     assert decision == Decision(Action.IDLE, None)
+
+
+# -- 重启冷却 ------------------------------------------------------------------
+
+
+def test_a_chain_that_just_ran_is_held_back_by_the_restart_cooldown() -> None:
+    """堵的是「立即收取」的空转。
+
+    `expected_report_at_utc` 为 NULL 时战报判据恒为「该去收」，而战报可能只是
+    还没到：runner 进信箱、扑空、退出、下一 tick 判据仍为真、再起一次。不是
+    死循环，但每轮几十秒的导航全白费，还一直占着鼠标不让扫描进来。
+    """
+    just_ran = facts(
+        free_lines=0,
+        pirate_reports_due=True,
+        last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=1)},
+    )
+
+    assert not has_work(MissionKind.PIRATE, just_ran, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_the_cooldown_expires_and_the_chain_comes_back() -> None:
+    """冷却是节流不是停用——过了就该照常起。"""
+    cooled = facts(
+        free_lines=0,
+        pirate_reports_due=True,
+        last_started_at_utc={MissionKind.PIRATE: NOW - RESTART_COOLDOWN - timedelta(seconds=1)},
+    )
+
+    assert has_work(MissionKind.PIRATE, cooled, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_the_cooldown_only_holds_back_the_chain_that_just_ran() -> None:
+    """冷却按 kind 分。海盗刚跑完，不该连累 bot。"""
+    mixed = facts(last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=1)})
+
+    assert not has_work(MissionKind.PIRATE, mixed, restart_cooldown=RESTART_COOLDOWN)
+    assert has_work(MissionKind.BOT, mixed, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_a_cooling_chain_yields_its_turn_to_the_next_one() -> None:
+    """冷却期内该 kind 视为「没活干」，顺位让给下一个——这正是让扫描挤进来的口子。"""
+    decision = decide(
+        tasks(MissionKind.PIRATE, MissionKind.SCAN),
+        facts(last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=1)}),
+        running=None,
+        min_dwell=DWELL,
+        restart_cooldown=RESTART_COOLDOWN,
+    )
+
+    assert decision == Decision(Action.START, MissionKind.SCAN)
+
+
+def test_a_cooling_chain_does_not_preempt_the_running_scan() -> None:
+    """冷却中的海盗不算「有活干」，因此不足以打断扫描。
+
+    少了这一条，抢占那一路就绕过了冷却：扫描被打断、海盗因冷却起不来，
+    结果是谁都没在跑。
+    """
+    running = RunningProcess(kind=MissionKind.SCAN, started_at_utc=NOW - timedelta(minutes=5))
+
+    decision = decide(
+        tasks(MissionKind.PIRATE, MissionKind.SCAN),
+        facts(last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=1)}),
+        running=running,
+        min_dwell=DWELL,
+        restart_cooldown=RESTART_COOLDOWN,
+    )
+
+    assert decision == Decision(Action.IDLE, None)
+
+
+# -- 配额的起算时刻 ------------------------------------------------------------
+
+
+def test_the_quota_day_starts_at_utc_midnight_not_local_midnight() -> None:
+    """重置点是 UTC 00:00，本地（UTC+8）是每天早上 8 点。
+
+    本地时间早上 3 点这一刻，当日配额已经从**昨天** UTC 00:00 起算了 19 小时。
+    按本地日历天截断会把起算点推到本地 0 点（= 昨天 UTC 16:00），于是 UTC
+    16:00–24:00 这段真实的派遣被漏数，海盗会以为还有额度，白飞一趟舰队。
+    """
+    local_early_morning = datetime(2026, 8, 9, 3, 0, tzinfo=SHANGHAI)
+
+    assert quota_day_start_utc(local_early_morning) == datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
+
+
+def test_the_quota_day_start_is_the_same_instant_expressed_in_utc() -> None:
+    utc_noon = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+
+    assert quota_day_start_utc(utc_noon) == datetime(2026, 8, 9, 0, 0, tzinfo=UTC)
+
+
+def test_a_naive_timestamp_is_refused_rather_than_guessed() -> None:
+    """没有时区的时刻无从判断它属于哪个 UTC 日，猜错就是整段配额算错。"""
+    with pytest.raises(ValueError):
+        quota_day_start_utc(datetime(2026, 8, 9, 3, 0))
