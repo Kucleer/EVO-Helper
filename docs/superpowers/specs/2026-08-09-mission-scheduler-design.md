@@ -275,6 +275,13 @@ tick(now):
   2. 表里存 `pid`；启动时发现 `ended_at` 为空的行 → 标 `stopped_by=UNKNOWN`，页面顶部亮红条 +
      「强制结束」按钮。**不按 pid 自动开枪**——pid 会被系统回收复用。
 
+     ⚠️ **顺序要紧**：pid 必须在**标记之前**读出来。标记会把那些行闭合，闭完就再也
+     认不出哪条是孤儿，红条上的 pid 只会是空的。
+
+     「强制结束」按钮实际做三件事：停掉自己手上的子进程（走 `stop()`——只杀不停的话
+     下一 tick 立刻又起一个，按钮看着毫无作用）、兜底闭合、**清掉内存里的红条状态**。
+     第三件没有的话红条永远不消失。全程不按 pid 开枪。
+
 ## 六、页面
 
 `missions.html` 重做为「调度台」：
@@ -289,8 +296,13 @@ tick(now):
 ```
 
 - 拖拽改优先级，复选框控制参与，参数就地编辑。
-- 状态列取值：`运行中` / `等航线` / `待命` / `配额用尽（次日 08:00 恢复）` /
-  `已完成` / `已停用（原因）`。bot 显示 `已完成` 时同行给出「重开一轮」按钮。
+- 状态列取值：`运行中` / `等航线` / `冷却中` / `待命` / `未启用` /
+  `配额用尽（次日 08:00 恢复）` / `已完成` / `已停用（原因）`。
+  bot 显示 `已完成` 时同行给出「重开一轮」按钮。
+
+  `未启用` 与 `冷却中` 这两档不能拿别的顶替：复选框没勾的任务显示「待命」是**谎话**
+  （它永远不会被起起来）；处在重启冷却里的链路显示「等航线」会让用户去调航线数，
+  调完还是不动。
 - bot 的系号区间旁**实时回显「该范围内已记录 bot：N 个」**；N=0 时禁止启用该任务。
 - 海盗半径旁回显实际覆盖区间（如「2:127 – 2:147，21 个系」）。
 - 下方接 `mission_runs` 历史。
@@ -298,11 +310,34 @@ tick(now):
 
 ### API
 
-`GET /api/scheduler`（状态 + 三条任务 + 当前子进程）、
-`POST /api/scheduler/start`、`POST /api/scheduler/stop`、
-`PATCH /api/missions/{kind}`（开关 / 参数 / 优先级）、
-`POST /api/missions/bot/new-round`、
-`POST /api/missions/force-kill`（孤儿红条用）。
+`GET /api/scheduler`、`POST /api/scheduler/start`、`POST /api/scheduler/stop`、
+`PATCH /api/missions/{kind}`（开关 / 参数 / 优先级，kind 大小写不敏感）、
+`POST /api/missions/BOT/new-round`、
+`POST /api/scheduler/force-kill`（孤儿红条用——它动的是调度器不是某一行任务，
+所以挂在 scheduler 命名空间下）。
+
+`GET /api/scheduler` 的形状（两个消费者共用：页面与桌面悬浮窗）：
+
+```
+{running, started_at_utc, current: {kind, label, started_at_utc, log_path} | null,
+ orphan_pid,
+ tasks: [{kind, label, enabled, priority, params, status, detail, summary, disabled_reason}]}
+```
+
+`tasks` 已按 `scheduling_order` 排好（扫描恒最后）；`label` 是链路中文名，
+服务端下发，悬浮窗不用自己拼；`summary` 是参数回显；`detail` 是随行事实
+（「今日 12/32」「还剩 37 个未完成」）。
+
+**`PATCH /api/missions/SCAN` 带 `priority` 或非空 `params` 一律 400。**
+领域层已经结构性地把扫描钉在最后，所以「忽略」和「拒绝」行为上等价——
+正因等价才必须拒绝：默默收下一个不起作用的写入，页面会显示「排序已保存」、
+刷新后弹回原位，用户只能得出「拖拽坏了」的结论。
+
+**参数校验只在动了参数、或这一下在启用时做。** 只改优先级、或要关掉任务时不校验，
+否则参数填错一次连关都关不掉。
+
+**调度器自己的运行时长**同样不持久化（重启即无），记在 `MissionScheduler` 上。
+连点两下「开始」不会把秒表按回零。
 
 ## 七、参数换算
 
