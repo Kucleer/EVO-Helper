@@ -48,9 +48,7 @@ def _client(tmp_path: Path, *, with_report: bool) -> TestClient:
         window_end=time(20),
         dry_run=False,
         ranges=(
-            ScanRangeView(
-                Coordinate(2, 137, 1), TARGET, ORIGIN, PRESET.name, PRESET.signature, 0
-            ),
+            ScanRangeView(Coordinate(2, 137, 1), TARGET, ORIGIN, PRESET.name, PRESET.signature, 0),
         ),
     )
     run = service.start_run(plan.id, "log-page-0001")

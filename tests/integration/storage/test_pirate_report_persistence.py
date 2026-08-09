@@ -50,9 +50,7 @@ def _factory(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 def _stored(tmp_path: Path) -> orm.BattleReportRow:
     factory = _factory(tmp_path)
-    SqlAlchemyRepository(factory).append_report(
-        to_pirate_battle_report(READING, report_id=uuid4())
-    )
+    SqlAlchemyRepository(factory).append_report(to_pirate_battle_report(READING, report_id=uuid4()))
     with factory() as session:
         return session.scalars(select(orm.BattleReportRow)).one()
 
@@ -76,9 +74,7 @@ def test_zero_losses_are_stored_as_zero_not_null(tmp_path: Path) -> None:
 
 def test_no_fleet_detail_is_written(tmp_path: Path) -> None:
     factory = _factory(tmp_path)
-    SqlAlchemyRepository(factory).append_report(
-        to_pirate_battle_report(READING, report_id=uuid4())
-    )
+    SqlAlchemyRepository(factory).append_report(to_pirate_battle_report(READING, report_id=uuid4()))
 
     with factory() as session:
         assert session.scalars(select(orm.FleetSnapshotRow)).all() == []
