@@ -182,6 +182,8 @@ class BotLoop(PirateLoop):
         """本轮针对这个目标已经派过哪些发、战报回来了没有。"""
         # 仓储上的 `bot_dispatch_facts` 由调度器那一批任务提供。这里按 Any 取，
         # 好让这条链路能先独立合入——两边在同一波次里并行改。
+        # TODO(Task 7): `bot_dispatch_facts` 合流后删掉这个 Any，改回
+        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
         repository: Any = self._ensure_run()[0]
         return tuple(repository.bot_dispatch_facts(coordinate, since=self._bot.round_started_at))
 
@@ -220,6 +222,8 @@ class BotLoop(PirateLoop):
 
     def _mark_skipped(self, coordinate: Coordinate) -> None:
         """把「分档说不值得打」记进库，否则下一趟又会重新分一次档。"""
+        # TODO(Task 7): `mark_bot_target_skipped` 合流后删掉这个 Any，改回
+        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
         repository: Any = self._ensure_run()[0]
         repository.mark_bot_target_skipped(coordinate, since=self._bot.round_started_at)
 
