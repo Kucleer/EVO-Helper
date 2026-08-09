@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -56,7 +55,7 @@ from .schemas import (
     SchedulerOut,
     StateEventOut,
 )
-from .security import LocalSecurityMiddleware
+from .security import LocalSecurityMiddleware, default_local_token
 from .service import (
     DEFAULT_PLANET_KIND,
     PLANET_KINDS,
@@ -103,10 +102,6 @@ STATIC_DIR = Path(__file__).parent / "static"
 MISSION_TICK_INTERVAL_S = 1.0
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _default_token() -> str:
-    return os.environ.get("EVO_HELPER_WEB_TOKEN", "local-evo-helper-token")
 
 
 # ---- view model conversion ------------------------------------------------
@@ -367,7 +362,7 @@ def create_app(
     app = FastAPI(title="EVO-Helper", version="0.1.0", lifespan=lifespan)
     app.state.service = service or FakeApplicationService()
     app.state.settings = settings or Settings()
-    token = local_token or _default_token()
+    token = local_token or default_local_token()
     app.add_middleware(LocalSecurityMiddleware, local_token=token)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
