@@ -38,6 +38,7 @@ from typing import Any
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.tools.pirate_loop import (
     MAIL_FIRST_ROW_Y,
     MAIL_ROW_PITCH,
@@ -68,6 +69,8 @@ class BotOptions:
 
 class BotLoop(PirateLoop):
     """复用海盗那条链路的驱动，换成 bot 的识别与分档判定。"""
+
+    TARGET_KIND: str = TARGET_KIND_BOT
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。

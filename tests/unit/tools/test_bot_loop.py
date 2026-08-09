@@ -39,3 +39,17 @@ def test_targets_are_parsed_as_full_coordinates() -> None:
     target = parse_target("2:137:14")
 
     assert (target.galaxy, target.system, target.position) == (2, 137, 14)
+
+
+def test_bot_attacks_are_labelled_bot_not_pirate() -> None:
+    """BotLoop 继承 PirateLoop 的写库路径，标签必须跟着子类走。
+
+    标错的代价不是「日志难看」：海盗每天 32 次是游戏硬限制，bot 的发数
+    混进去会让助手以为配额还没用完，多打的那一发会被强制返回。
+    """
+    from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
+    from evo_helper.tools.bot_loop import BotLoop
+    from evo_helper.tools.pirate_loop import PirateLoop
+
+    assert PirateLoop.TARGET_KIND == TARGET_KIND_PIRATE
+    assert BotLoop.TARGET_KIND == TARGET_KIND_BOT

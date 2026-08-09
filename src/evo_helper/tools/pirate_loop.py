@@ -142,6 +142,10 @@ class Outcome:
 class PirateLoop:
     """驱动一轮「扫 1–4 位 → 侦察 → 判定 → 攻击」。"""
 
+    #: 这条链路打的是什么目标。子类覆盖它——`BotLoop` 走的是同一套写库路径，
+    #: 标签却必须不同：海盗每天 32 次是游戏硬限制，两者混在一起会数错配额。
+    TARGET_KIND: str = TARGET_KIND_PIRATE
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
         self._ocr = ocr
@@ -519,7 +523,7 @@ class PirateLoop:
                 ),
                 cycle_start_utc=now,
                 created_at_utc=now,
-                target_kind=TARGET_KIND_PIRATE,
+                target_kind=self.TARGET_KIND,
             )
         )
         return intent_id
