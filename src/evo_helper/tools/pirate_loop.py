@@ -60,7 +60,6 @@ from evo_helper.game.system_navigator import (
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
-from evo_helper.vision.parsers import DispatchBriefing, MissionType
 
 #: 这条链路自己的计划与幂等键，与坐标扫描分开：两者的游标含义不同，
 #: 共用一个运行实例会让「扫到哪了」和「打到哪了」互相踩。
@@ -271,11 +270,11 @@ class PirateLoop:
         self._settle(read_once)
         return mission
 
-    def _read_briefing(self) -> DispatchBriefing | None:
+    def _read_flight_time(self) -> timedelta | None:
         """把简报上的飞行时间读下来，**必须在点「出发！」之前**。
 
-        点完出发这一屏就没了，而它上面的抵达时间是助手松手之后唯一的回程闹钟
-        （见 `domain.report_wait` 的模块头）。这一列此前从来没被写入过——
+        点完出发这一屏就没了，而这个时长是助手松手之后唯一的回程闹钟
+        （见 `domain.report_wait` 的模块头）。对应的那一列此前从来没被写入过——
         实测库里 4 条派遣全是 NULL，于是整个「派出后松手、到点回来收战报」是死的。
 
         和任务类型那道闸门一样**要等它铺开**：页面是滑进来的，读一次读不到
@@ -285,9 +284,14 @@ class PirateLoop:
         为它加一道闸门等于让一次 OCR 抖动就废掉一发完全正常的攻击——
         这条链路已经因为「ROI 与放大倍数不配」白白拦下过四发。
 
-        读出来但大得离谱的，同样返回 None（见 `MAX_CREDIBLE_FLIGHT`）：
-        这里只有时长这一个来源，没有绝对到达时间可以互相验，
-        所以量级错只能靠上界拦。
+        读出来但大得离谱的，同样返回 None（见 `MAX_CREDIBLE_FLIGHT`）。
+
+        ⚠️ **只返回时长，不拼一个 `DispatchBriefing` 出来。** 那个类型带着
+        `mission_type` 与绝对到达时间两个字段，而这里两样都没有证据：任务类型的闸门
+        在这之后才跑，绝对到达时间的 ROI（`BRIEFING_ARRIVAL_ROI`）还没标定。
+        硬填的话 `duration_agrees()` 会变成 `now+flight` 和 `now+flight` 相比——
+        一道交叉校验降级成同义反复，比没有更糟：下一个人会以为它验过了。
+        正因为这里拿不到第二个来源，才需要 `MAX_CREDIBLE_FLIGHT` 那道上界。
         """
         flight: timedelta | None = None
 
@@ -306,14 +310,7 @@ class PirateLoop:
                 "当读错处理，回程闹钟留空"
             )
             return None
-        return DispatchBriefing(
-            mission_type=MissionType.ATTACK,
-            flight=flight,
-            # 抵达时间由飞行时长推出。写库只用得上 flight——`record_flight_time`
-            # 自己算 dispatched_at + flight——这里推一个自洽的值即可，
-            # 不去 OCR 简报上那个绝对时间戳（它跨行折行，另有一套解析要标定）。
-            arrival_at_utc=datetime.now(UTC) + flight,
-        )
+        return flight
 
     def _launch(self, coordinate: Coordinate, mission: str) -> bool:
         """简报页核对任务类型，通过才点「出发！」。"""
@@ -370,12 +367,14 @@ class PirateLoop:
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
         intent_id = self._record_intent(coordinate, preset=wanted)
-        # 简报只在出发之前存在，所以闹钟要在这里读，读完再过闸门。
-        briefing = self._read_briefing()
+        # ⚠️ **这一行必须留在 `_launch` 之前。** 点完「出发！」简报页就没了，
+        # 挪到后面读，四次重试全会落空，飞行时间永久恒为 NULL——而且一声不响，
+        # 看起来只是「一直在等」。
+        flight = self._read_flight_time()
         if not self._launch(coordinate, "攻击"):
             self._leave_dispatch_list()
             return False
-        self._record_dispatch(intent_id, briefing)
+        self._record_dispatch(intent_id, flight)
         self._outcome.attacked.append(coordinate)
         say(f"  已发动攻击 → {coordinate}（预设 {wanted}）")
         self._leave_dispatch_list()
@@ -601,11 +600,11 @@ class PirateLoop:
         )
         return intent_id
 
-    def _record_dispatch(self, intent_id: UUID, briefing: DispatchBriefing | None) -> None:
-        """记下这一发，并把简报上的抵达时间存成回程闹钟。
+    def _record_dispatch(self, intent_id: UUID, flight: timedelta | None) -> None:
+        """记下这一发，并把简报上的飞行时间存成回程闹钟。
 
-        读不到简报时飞行时间写 NULL——`ReportWaitPlanner` 把「未知」当成
-        「立即尝试收取」，而不是无限等一个不知道何时抵达的战报。
+        读不到时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
+        而不是无限等一个不知道何时抵达的战报。
         """
         repository, _run_id = self._ensure_run()
         dispatch_id = uuid4()
@@ -619,11 +618,7 @@ class PirateLoop:
                 accepted=True,
             )
         )
-        repository.record_flight_time(
-            dispatch_id,
-            briefing.flight if briefing is not None else None,
-            dispatched_at,
-        )
+        repository.record_flight_time(dispatch_id, flight, dispatched_at)
 
     # -- 主循环 -------------------------------------------------------------
 

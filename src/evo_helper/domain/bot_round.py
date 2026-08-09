@@ -11,9 +11,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-#: 攻击侦查用的预设标题。与 `tools.bot_loop.PROBE_PRESET` 同源，
-#: 但这里不 import 那个模块——domain 层不依赖 tools 层。
-PROBE_PRESET_NAME = "探路"
+from evo_helper.domain.fleet_preset import DEFAULT_PRESET
+
+#: 攻击侦查用的预设标题。取自 `domain.fleet_preset` 这个**同层**的权威来源，
+#: 而不是抄一份字面量：`tools.bot_loop.PROBE_PRESET` 也是从这里取的，
+#: 两边同源才不会有一天各自改成不同的字。
+PROBE_PRESET_NAME = DEFAULT_PRESET.name
 
 
 class BotPhase(Enum):
@@ -37,7 +40,8 @@ class DispatchFact:
 
     preset_name: str
     has_report: bool
-    #: 分档判定为「不值得打」，本轮不会再有攻击发。
+    #: **只对探路发有意义**：分档判定为「不值得打」，本轮不会再有攻击发。
+    #: 攻击发的战报收不到该怎么办，见 `phase_of` 的前置条件。
     skipped: bool = False
 
 
@@ -45,6 +49,15 @@ def phase_of(dispatches: Sequence[DispatchFact]) -> BotPhase:
     """这个目标本轮该干什么。
 
     判据只看预设标题：探路发用「探路」，攻击发用分档预设。
+
+    ⚠️ **前置条件：调用方必须先把「已判定战报永远不会来」的派遣剔除掉。**
+    这个函数只认「战报回来了没有」，不判定超时——判超时要知道派出时刻、
+    飞行时间、战报有效期，那些事实在仓储那一侧，不在这里。
+
+    没剔干净的后果不是报错，是**静默卡死**：一发攻击的战报永远不到，
+    这个目标就永远停在 `AWAITING_ATTACK_REPORT`，于是整个 bot 任务永远不退出，
+    而画面上看起来只是「在等」。`DispatchFact.skipped` 挡不住这一条——
+    它只表达探路之后「分档说不值得打」，不表达「这一发的战报丢了」。
     """
     if not dispatches:
         return BotPhase.NEEDS_PROBE
@@ -59,12 +72,11 @@ def phase_of(dispatches: Sequence[DispatchFact]) -> BotPhase:
             else BotPhase.AWAITING_ATTACK_REPORT
         )
 
+    # 走到这里 `attacks` 必空。它是 `probes` 的补集而 `dispatches` 非空，
+    # 所以 `probes` 必非空——不必再判一次「没有探路发」。
     if any(item.skipped for item in probes):
         # 分档说不值得打。它不会再产生攻击发，算走完。
         return BotPhase.DONE
-
-    if not probes:
-        return BotPhase.NEEDS_PROBE
 
     return (
         BotPhase.NEEDS_ATTACK
