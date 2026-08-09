@@ -188,6 +188,13 @@ class BattleReportRow(Base):
     #: 可空：早先入库的战报没有这个数，补 0 会让它看起来像「舰队为空」。
     attacker_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
     defender_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 详情页那行大字：`VICTORY` / `FAIL`（游戏画面原文，不翻译）。
+    #: 可空：这个字段之前入库的战报没读过胜负，填个值等于凭空造战果。
+    outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: 详情页的「损失单位」总数，双方各一。海盗战报只记胜负 + 这两个数，
+    #: 不写 `fleet_snapshots`（用户口径 2026-08-09，为省性能）。
+    attacker_losses: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    defender_losses: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("attack_dispatches.id"),
         unique=True,

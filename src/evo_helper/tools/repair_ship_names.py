@@ -30,7 +30,7 @@ from evo_helper.config import Settings
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.vision.parsers import snap_unit_name
-from evo_helper.vision.report_layout import layout_for_viewport
+from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -72,8 +72,8 @@ def read_section_names(
     found = screens._fleet_names(band, top, bottom)  # type: ignore[arg-type]
     if not found:
         return []
-    _first_top, _pitch, labels = found
-    return [snap_unit_name(label)[0] for label in labels]
+    _pitch, rows = found
+    return [snap_unit_name(label)[0] for _y, label in rows]
 
 
 def in_catalogue_order(names: Sequence[str]) -> bool:
@@ -183,7 +183,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from evo_helper.vision.optional.report_screens import locate_sections
 
-    image = Image.open(args.replay)
+    # 先裁掉 Chrome --app 那条 38px 标题栏：整窗截图是 1920x917，版面标定是 1920x879。
+    image = crop_to_viewport(Image.open(args.replay))
     layout = layout_for_viewport(image.width, image.height)
     sections = locate_sections(image, layout)
     if not sections:

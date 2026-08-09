@@ -239,6 +239,9 @@ class SqlAlchemyRepository:
                 ui_version=record.ui_version,
                 attacker_units=record.attacker_units,
                 defender_units=record.defender_units,
+                outcome=record.outcome,
+                attacker_losses=record.attacker_losses,
+                defender_losses=record.defender_losses,
             )
             session.add(report_row)
             for entry in record.fleet:

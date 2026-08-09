@@ -87,6 +87,15 @@ class BattleReport:
     #: 大舰队的逐行数量是四舍五入显示，相加凑不出这个数。
     attacker_units: int | None = None
     defender_units: int | None = None
+    #: 详情页那行大字：`VICTORY` / `FAIL`。存游戏画面上的原文，不翻译——
+    #: 界面要显示中文是渲染层的事，库里只存读到的那个词。
+    #: 可空：这个字段加进来之前入库的战报没读过胜负，填 `FAIL` 会凭空造出败仗。
+    outcome: str | None = None
+    #: 详情页的「损失单位」总数，双方各一。**海盗战报只记这个和 `outcome`**
+    #: （用户口径 2026-08-09，为省性能）：明细要进回放页，一份报告多花两三秒，
+    #: 而海盗全是同一个预设打的，逐舰种没有分析价值。
+    attacker_losses: int | None = None
+    defender_losses: int | None = None
 
 
 @dataclass(frozen=True)
