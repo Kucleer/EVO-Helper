@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from statistics import median
+from typing import Any
 
 #: OCR recipe measured against Tesseract on the batch images.
 #:
@@ -141,6 +142,33 @@ LIVE_LAYOUT = ReportLayout(
     defender_column=ColumnBand(960, 1210),
     participating_rows=(405, 750),
 )
+
+
+def crop_to_viewport(image: Any) -> Any:
+    """把整窗截图裁成版面标定用的游戏视口。
+
+    `capture_window(client_only=True)` 交出来的是 **操作系统意义上的** client 区，
+    而 Chrome `--app` 窗口把自己那条 38px 标题栏也画在 client 区里，于是实拍是
+    1920×917。版面 ROI 当年是对着裁掉标题栏的 1920×879 量的（`var/logs/vp-*.png`
+    就是那批），两者差的正好是 `APP_TITLE_BAR_PX`。
+
+    ⚠️ **不要反过来去改 `capture_window`。** 点击坐标（`system_navigator`、
+    `game.pirate_ui`）全部是在含标题栏的 917 空间里量的，截图与点击由此自洽；
+    动了截图，整条点击链路会整体偏移 38px。差异只在版面这一侧，就只在这里补。
+
+    高度对不上任何一种已知形态时直接抛错，不猜。
+    """
+    from evo_helper.game.game_window import APP_TITLE_BAR_PX
+
+    width, height = image.width, image.height
+    if (width, height) == LAYOUT_VIEWPORT:
+        return image
+    if (width, height - APP_TITLE_BAR_PX) == LAYOUT_VIEWPORT:
+        return image.crop((0, APP_TITLE_BAR_PX, width, height))
+    raise ValueError(
+        f"截图 {width}x{height} 既不是标定视口 {LAYOUT_VIEWPORT[0]}x{LAYOUT_VIEWPORT[1]}，"
+        f"也不是它加上 {APP_TITLE_BAR_PX}px 标题栏；采集设置漂了，先修采集"
+    )
 
 
 def layout_for_viewport(width: int, height: int) -> ReportLayout:

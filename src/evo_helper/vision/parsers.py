@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.text import edit_distance
 from evo_helper.vision.models import (
     BattleDetail,
     BattleFleetSnapshot,
@@ -272,7 +273,7 @@ def snap_unit_name(raw: str, *, max_distance: int = 1) -> tuple[str, str]:
     best: list[str] = []
     best_distance = max_distance + 1
     for candidate in (*SHIP_NAMES, *DEFENCE_NAMES):
-        distance = _edit_distance(name, candidate)
+        distance = edit_distance(name, candidate)
         if distance < best_distance:
             best_distance, best = distance, [candidate]
         elif distance == best_distance:
@@ -280,22 +281,6 @@ def snap_unit_name(raw: str, *, max_distance: int = 1) -> tuple[str, str]:
     if best_distance > max_distance or len(best) != 1:
         return name, "unknown"
     return best[0], classify_unit(best[0])
-
-
-def _edit_distance(left: str, right: str) -> int:
-    previous = list(range(len(right) + 1))
-    for i, lchar in enumerate(left, start=1):
-        current = [i]
-        for j, rchar in enumerate(right, start=1):
-            current.append(
-                min(
-                    previous[j] + 1,
-                    current[j - 1] + 1,
-                    previous[j - 1] + (lchar != rchar),
-                )
-            )
-        previous = current
-    return previous[-1]
 
 
 def parse_fleet_column(

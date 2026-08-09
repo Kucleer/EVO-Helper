@@ -382,6 +382,18 @@ class LiveDriver:
         origin_x, origin_y = self.origin()
         self._human.click(origin_x + x, origin_y + y, label=label)
 
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
+        """面板内拖动。预设栏一屏只放得下两个预设，其余的要横向拖出来。"""
+        self.focus()
+        origin_x, origin_y = self.origin()
+        self._human.drag(
+            origin_x + from_x,
+            origin_y + from_y,
+            origin_x + to_x,
+            origin_y + to_y,
+            label=label,
+        )
+
     def type_number(self, value: int) -> None:
         import random
 
