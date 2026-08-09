@@ -97,6 +97,57 @@ class RunStatusView:
     finished_at: datetime | None = None
 
 
+#: 星球列表的筛选类型。`all` 不是一种星球，是「不过滤」。
+PLANET_KINDS: tuple[str, ...] = ("bot", "owned", "free", "all")
+
+#: 默认只看 bot：全量扫描里绝大多数坐标是空位，默认全展开没有信息量。
+DEFAULT_PLANET_KIND = "bot"
+
+
+def planet_kind(owner_name: str | None, is_bot: bool) -> str:
+    """一颗星球归哪一类。
+
+    分类只有这一份实现，持久化那边的 SQL 过滤条件必须与它一致——
+    「同一条规则在 Fake 和持久化各写一份」的坑已经踩过一次。
+    """
+    if is_bot:
+        return "bot"
+    return "owned" if owner_name else "free"
+
+
+@dataclass(frozen=True)
+class PlanetRow:
+    """星球列表里的一行：一颗星球的最新已知状态。"""
+
+    coordinate: Coordinate
+    owner_name: str | None
+    is_bot: bool
+    last_scan_at: datetime | None
+
+    @property
+    def kind(self) -> str:
+        return planet_kind(self.owner_name, self.is_bot)
+
+
+@dataclass(frozen=True)
+class PlanetPage:
+    """一页星球，外加足够让页面说清「这一页是全部还是一截」的计数。"""
+
+    rows: tuple[PlanetRow, ...]
+    #: 当前筛选下的总行数——**不是**本页行数。少了它，页面就只能拿本页行数冒充总数。
+    total: int
+    offset: int
+    limit: int
+    #: 当前银河系筛选下各类型各多少，用来标注筛选器而不必再查一次。
+    kind_counts: dict[str, int]
+    #: 每个银河系已扫过多少颗星球，用来填银河系下拉框。
+    galaxy_counts: dict[int, int]
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.rows) < self.total
+
+
 @dataclass(frozen=True)
 class BotTargetView:
     coordinate: Coordinate
@@ -161,6 +212,38 @@ class StateEventView:
 
 
 @dataclass(frozen=True)
+class AttackLogView:
+    """攻击日志的一行：一次派遣，或一个还没派出去的意图。
+
+    只存 `dispatched_at_utc` 一个瞬时，不存两份时间。游戏内时间是 UTC+0
+    （`vision.parsers.GAME_DISPLAY_ZONE`），现实时间是 UTC+8
+    （`domain.scheduling.SHANGHAI_OFFSET`）——同一个瞬时的两种写法，
+    存两遍只会让它们迟早对不上。渲染时各显示一次，都标明时区。
+    """
+
+    intent_id: UUID
+    target: Coordinate
+    origin: Coordinate
+    #: `bot` 或 `pirate`。
+    target_kind: str
+    preset_name: str
+    preset_signature: str
+    guard_status: str
+    created_at_utc: datetime
+    #: 真正点下「出发！」的时刻。意图被闸门拦下或还没派出时为 None。
+    dispatched_at_utc: datetime | None
+    dry_run: bool | None
+    accepted: bool | None
+    expected_report_at_utc: datetime | None
+    #: 战果，来自匹配上的那份战报：`VICTORY` / `FAIL` 与双方战损总数。
+    #: 还在飞、或者战报还没收，三个都是 None——**不能拿 0 顶替**，
+    #: 「零损失」和「还不知道」在日志上必须看得出区别。
+    outcome: str | None = None
+    attacker_losses: int | None = None
+    defender_losses: int | None = None
+
+
+@dataclass(frozen=True)
 class RevisitView:
     revisit_id: UUID
     scope: str
@@ -203,6 +286,10 @@ class ApplicationService(Protocol):
     def emergency_stop_run(self, run_id: UUID) -> RunStatusView: ...
     def list_targets(self) -> list[BotTargetView]: ...
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
+    def count_scans(self) -> int: ...
+    def list_planets(
+        self, *, galaxy: int | None, kind: str, offset: int, limit: int
+    ) -> PlanetPage: ...
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]: ...
     def get_fleet_diff(self, coordinate: Coordinate) -> FleetDiffView | None: ...
     def list_events(self, limit: int) -> list[StateEventView]: ...
@@ -210,6 +297,7 @@ class ApplicationService(Protocol):
         self, scope: str, reason: str, target_coordinate: Coordinate | None
     ) -> RevisitView: ...
     def list_revisits(self) -> list[RevisitView]: ...
+    def list_attack_log(self, limit: int) -> list[AttackLogView]: ...
     def dashboard(self) -> DashboardView: ...
 
 
@@ -249,6 +337,7 @@ class FakeApplicationService:
         self._events: list[StateEventView] = []
         self._revisits: list[RevisitView] = []
         self._scans: list[CoordinateScanView] = []
+        self._planets: list[PlanetRow] = []
 
     # ---- plans -----------------------------------------------------------
 
@@ -458,6 +547,34 @@ class FakeApplicationService:
                 key=lambda s: (s.coordinate.galaxy, s.coordinate.system, s.coordinate.position),
             )
 
+    def count_scans(self) -> int:
+        with self._lock:
+            return len(self._scans)
+
+    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+        with self._lock:
+            planets = sorted(
+                self._planets,
+                key=lambda r: (r.coordinate.galaxy, r.coordinate.system, r.coordinate.position),
+            )
+        galaxy_counts: dict[int, int] = {}
+        for row in planets:
+            galaxy_counts[row.coordinate.galaxy] = galaxy_counts.get(row.coordinate.galaxy, 0) + 1
+        in_galaxy = [r for r in planets if galaxy is None or r.coordinate.galaxy == galaxy]
+        kind_counts = {k: 0 for k in PLANET_KINDS if k != "all"}
+        for row in in_galaxy:
+            kind_counts[row.kind] += 1
+        kind_counts["all"] = len(in_galaxy)
+        matched = [r for r in in_galaxy if kind == "all" or r.kind == kind]
+        return PlanetPage(
+            rows=tuple(matched[offset : offset + limit]),
+            total=len(matched),
+            offset=offset,
+            limit=limit,
+            kind_counts=kind_counts,
+            galaxy_counts=galaxy_counts,
+        )
+
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]:
         with self._lock:
             return list(self._snapshots.get(coordinate, []))
@@ -591,6 +708,14 @@ class FakeApplicationService:
     def list_events(self, limit: int) -> list[StateEventView]:
         with self._lock:
             return list(self._events[-limit:])
+
+    def list_attack_log(self, limit: int) -> list[AttackLogView]:
+        """Fake 服务不模拟派遣，所以攻击日志恒为空。
+
+        返回空列表而不是抛未实现：页面在演示服务上也要打得开，
+        并且要显示「还没有攻击记录」而不是 500。
+        """
+        return []
 
     def dashboard(self) -> DashboardView:
         with self._lock:

@@ -380,11 +380,17 @@ class TestPresetSignature:
 
         assert composition_signature({"轻型战斗机": 1}) != composition_signature({"轻型战斗机": 2})
 
-    def test_default_preset_is_the_scouting_preset(self) -> None:
+    def test_default_preset_matches_the_one_in_the_game(self) -> None:
+        """实机核对（2026-08-08）：游戏预设面板里 探路 = 小型运输船 × 1。
+
+        这里曾经写的是 `轻型战斗机:1`，与实机不符。签名对不上，`workflow` 会判定
+        preset 不匹配并安全暂停——也就是永远派不出去，而且报错看着像识别问题。
+        改这个常量必须对着游戏里的预设面板核，不能照抄文档。
+        """
         from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 
         assert DEFAULT_PRESET.name == "探路"
-        assert DEFAULT_PRESET.signature == "轻型战斗机:1"
+        assert DEFAULT_PRESET.signature == "小型运输船:1"
 
     def test_a_two_character_name_is_below_the_snap_threshold(self) -> None:
         """探路 cannot be OCR-repaired, which is why composition must also match."""

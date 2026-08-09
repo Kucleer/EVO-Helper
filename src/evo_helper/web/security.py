@@ -1,8 +1,12 @@
-"""Loopback-only request security: same-origin CSRF protection or a local token.
+"""Request security: same-origin CSRF protection or a local token.
 
 Mutating requests must either come from the same origin (browser forms) or carry
-an ``X-Evo-Helper-Token`` header matching the locally configured token.  The
-service never binds beyond ``127.0.0.1``.
+an ``X-Evo-Helper-Token`` header matching the locally configured token.
+
+⚠️ 服务现在默认绑 `0.0.0.0`（局域网可访问，用户明确要求且确认不加口令）。
+同源校验挡的是**跨站请求伪造**，不是局域网里的人——局域网设备直接打开控制台
+就是同源的，因此读写都不受阻。这一层没有身份认证，也不打算有：
+安全边界是「这个网段可信」，不是这个中间件。
 """
 
 from starlette.responses import JSONResponse

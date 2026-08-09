@@ -3,11 +3,27 @@ import pytest
 from evo_helper.config import Settings
 
 
-def test_defaults_are_dry_run_and_loopback_only() -> None:
+def test_dry_run_stays_the_default() -> None:
+    """绑定地址已按需求放开到局域网，但**演习模式仍然是默认**。
+
+    这两件事从前写在同一个断言里，放开监听时很容易顺手把 dry_run 一起改掉。
+    拆开是为了让「默认不真的点游戏」单独有人守着。
+    """
+    assert Settings().dry_run is True
+
+
+def test_the_console_listens_on_the_lan_by_default() -> None:
+    """局域网可访问是明确需求；端口刻意避开 8000。"""
     settings = Settings()
 
-    assert settings.dry_run is True
-    assert settings.host == "127.0.0.1"
+    assert settings.host == "0.0.0.0"  # noqa: S104 - 见 Settings.host 的说明
+    assert settings.port == 8770
+    assert settings.lan_exposed is True
+
+
+def test_loopback_binding_is_not_reported_as_exposed() -> None:
+    """设回 127.0.0.1 时不该再打「已暴露」的警告，否则警告会被无视。"""
+    assert Settings(host="127.0.0.1").lan_exposed is False
 
 
 class TestDispatchBriefingGuard:

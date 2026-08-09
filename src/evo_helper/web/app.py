@@ -1,8 +1,11 @@
 """FastAPI application factory for the local EVO-Helper management UI."""
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
@@ -13,6 +16,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import TARGET_KIND_LABELS
+from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 
 from .display import LIST_SHIP_COLUMNS
 from .schemas import (
@@ -37,6 +42,9 @@ from .schemas import (
 )
 from .security import LocalSecurityMiddleware
 from .service import (
+    DEFAULT_PLANET_KIND,
+    PLANET_KINDS,
+    SHANGHAI,
     ApplicationService,
     BotTargetView,
     FakeApplicationService,
@@ -54,6 +62,19 @@ from .service import (
     StateEventView,
     _parse_coordinate,
     _parse_window,
+)
+
+#: 星球列表的每页行数。全量扫完是 71,856 颗，整表渲染不是选项。
+DEFAULT_PLANET_PAGE_SIZE = 200
+MAX_PLANET_PAGE_SIZE = 1000
+PLANET_PAGE_SIZES = (50, 200, 500, 1000)
+
+#: 类型筛选的中文标签。`all` 不是一种星球，是「不过滤」。
+PLANET_KIND_LABELS = (
+    ("bot", "仅 bot"),
+    ("owned", "有主（非 bot）"),
+    ("free", "空位"),
+    ("all", "全部"),
 )
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -250,6 +271,43 @@ _RUN_STATE_LABEL = {
 }
 
 
+#: 攻击日志一页显示多少条。日志是给人翻的，不是给人滚的。
+ATTACK_LOG_LIMIT = 300
+
+
+def game_time(moment: datetime | None) -> str:
+    """游戏内时间。游戏一律按 UTC+0 显示（`vision.parsers.GAME_DISPLAY_ZONE`）。"""
+    if moment is None:
+        return "—"
+    return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def local_time(moment: datetime | None) -> str:
+    """现实时间，也就是用户的墙上时钟（UTC+8）。
+
+    和游戏时间是**同一个瞬时的两种写法**，差 8 小时。日志上两个都写出来，
+    是因为战报里的时间是游戏时间、而人回忆「我当时在干嘛」用的是现实时间——
+    只给一个，另一个就得每次心算，迟早算错。
+    """
+    if moment is None:
+        return "—"
+    return moment.astimezone(SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _safe_back_url(back: str | None, default: str = "/planets") -> str:
+    """把「返回」目标限制在本站内的相对路径。
+
+    `back` 来自查询参数，也就是来自任何人都能构造的链接。原样塞进 href 就等于
+    在本地控制台上开了一个跳转到站外的口子——`//evil.example` 和
+    `https://evil.example` 都会被浏览器当成绝对地址。只放行以单个 `/` 开头的路径。
+    """
+    if not back:
+        return default
+    if not back.startswith("/") or back.startswith("//"):
+        return default
+    return back
+
+
 def run_state_label(state: str) -> str:
     """未知状态回落到原值，宁可显示英文也不要显示空白。"""
     return _RUN_STATE_LABEL.get(state, state)
@@ -287,6 +345,8 @@ def create_app(
     templates.env.globals["run_state_tone"] = run_state_tone
     templates.env.globals["run_state_glyph"] = run_state_glyph
     templates.env.globals["run_state_label"] = run_state_label
+    templates.env.globals["game_time"] = game_time
+    templates.env.globals["local_time"] = local_time
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
@@ -483,17 +543,62 @@ def create_app(
             request=request,
             name="intel.html",
             context={
-                "scans": [
-                    {
-                        "coordinate": str(s.coordinate),
-                        "owner_name": s.owner_name,
-                        "is_bot": s.is_bot,
-                        "scanned_at": s.scanned_at_utc,
-                    }
-                    for s in service.list_scans()
-                ],
+                # 坐标扫描表已经搬到 /planets：它要按银河系和类型筛选、按页取数，
+                # 塞在这一页里只能整表渲染，最终必然重演「只渲染前 500 条却看着像全部」。
+                "planet_total": service.count_scans(),
                 "active": "intel",
                 "list_ship_columns": list(LIST_SHIP_COLUMNS),
+            },
+        )
+
+    @app.get("/planets", response_class=HTMLResponse)
+    async def planets_page(
+        request: Request,
+        galaxy: int | None = None,
+        kind: str = DEFAULT_PLANET_KIND,
+        offset: int = 0,
+        limit: int = DEFAULT_PLANET_PAGE_SIZE,
+    ) -> HTMLResponse:
+        """星球列表：按银河系与类型筛选，默认只看 bot。
+
+        筛选与翻页都走查询参数，所以每种视图都有自己的可分享链接。
+        取数在服务端分页——全量扫完是 71,856 颗星球，整表渲染不是选项。
+        """
+        service = get_service(request)
+        if kind not in PLANET_KINDS:
+            kind = DEFAULT_PLANET_KIND
+        limit = min(max(limit, 1), MAX_PLANET_PAGE_SIZE)
+        offset = max(offset, 0)
+        page = service.list_planets(galaxy=galaxy, kind=kind, offset=offset, limit=limit)
+
+        def page_url(new_offset: int) -> str:
+            params = {"kind": kind, "limit": limit, "offset": new_offset}
+            if galaxy is not None:
+                params["galaxy"] = galaxy
+            return "/planets?" + urlencode(params)
+
+        return templates.TemplateResponse(
+            request=request,
+            name="planets.html",
+            context={
+                "page": SimpleNamespace(
+                    rows=page.rows,
+                    total=page.total,
+                    offset=page.offset,
+                    limit=page.limit,
+                    kind_counts=page.kind_counts,
+                    galaxy_counts=page.galaxy_counts,
+                    galaxy=galaxy,
+                    kind=kind,
+                ),
+                "all_galaxies": list(range(1, TOTAL_GALAXIES + 1)),
+                "kind_labels": PLANET_KIND_LABELS,
+                "page_sizes": PLANET_PAGE_SIZES,
+                "default_kind": DEFAULT_PLANET_KIND,
+                "back_query": quote(page_url(offset), safe=""),
+                "prev_url": page_url(max(offset - limit, 0)) if offset > 0 else None,
+                "next_url": page_url(offset + limit) if page.has_more else None,
+                "active": "planets",
             },
         )
 
@@ -548,7 +653,9 @@ def create_app(
         return _diff_out(diff)
 
     @app.get("/targets/{coordinate}", response_class=HTMLResponse)
-    async def target_page(request: Request, coordinate: str) -> HTMLResponse:
+    async def target_page(
+        request: Request, coordinate: str, back: str | None = None
+    ) -> HTMLResponse:
         service = get_service(request)
         parsed = _parse_coordinate(coordinate)
         history = service.get_history(parsed)
@@ -560,6 +667,7 @@ def create_app(
                 "coordinate": coordinate,
                 "history": [_snapshot_out(s) for s in history],
                 "diff": _diff_out(diff) if diff else None,
+                "back_url": _safe_back_url(back),
             },
         )
 
@@ -586,6 +694,28 @@ def create_app(
             else None
         )
         return _revisit_out(service.request_revisit(payload.scope, payload.reason, target))
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def attack_log_page(request: Request, kind: str = "all") -> HTMLResponse:
+        """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
+
+        筛选走查询参数，所以「只看海盗」有自己可分享的链接。
+        """
+        service = get_service(request)
+        entries = service.list_attack_log(ATTACK_LOG_LIMIT)
+        if kind in TARGET_KIND_LABELS:
+            entries = [entry for entry in entries if entry.target_kind == kind]
+        return templates.TemplateResponse(
+            request=request,
+            name="logs.html",
+            context={
+                "active": "logs",
+                "entries": entries,
+                "kind": kind,
+                "kind_labels": TARGET_KIND_LABELS,
+                "limit": ATTACK_LOG_LIMIT,
+            },
+        )
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     async def diagnostics_page(request: Request) -> HTMLResponse:

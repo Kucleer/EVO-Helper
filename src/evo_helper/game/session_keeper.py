@@ -35,6 +35,14 @@ START_POLL_S = 3.0
 #: 结果在线的会话被判成「认不出」。
 IN_GAME_MARKERS: tuple[str, ...] = ("商店", "联盟", "银河系", "恒星系")
 
+#: 掉线弹窗上的字。实测原文：「连接已断开，无法重新连接。」
+#:
+#: ⚠️ **这一屏最危险的地方是它看起来像在线。** 弹窗是浮层，底下的导航条
+#: 还完整地画在画面上，`IN_GAME_MARKERS` 里的「商店」「联盟」照样读得出来——
+#: 于是会话判定给出 IN_GAME，而实际上任何点击都没有效果。
+#: 所以判掉线**必须排在判 IN_GAME 之前**，和「先判入口页再判 START」同一类陷阱。
+DISCONNECT_MARKERS: tuple[str, ...] = ("连接已断开", "无法重新连接")
+
 
 class ScreenState(Enum):
     """重连流程认得的画面。认不出的一律 UNKNOWN，然后停止。"""
@@ -45,6 +53,8 @@ class ScreenState(Enum):
     START = "start"
     #: 已在游戏内。
     IN_GAME = "in_game"
+    #: 掉线弹窗，只有一个绿色 ✓。点掉它才能回到入口序列。
+    DISCONNECTED = "disconnected"
     #: 加载转圈。
     LOADING = "loading"
     #: 认不出——必须停止并保留证据。
@@ -54,9 +64,15 @@ class ScreenState(Enum):
 def classify_screen(text: str) -> ScreenState:
     """按画面上的文字判断当前处于哪一屏。
 
-    顺序有讲究：START 页的背景里也印着淡淡的 ETERNAL VOID，所以先判 START。
+    顺序有讲究，两处都是实机踩出来的：
+
+    - **先判掉线**：掉线弹窗底下的导航条仍在画面里，后判会读出「商店/联盟」
+      并给出 IN_GAME，于是助手在一个死会话上一路点下去，全程不报错。
+    - **再判 START**：START 页的背景里也印着淡淡的 ETERNAL VOID。
     """
     haystack = text or ""
+    if any(marker in haystack for marker in DISCONNECT_MARKERS):
+        return ScreenState.DISCONNECTED
     if "START" in haystack.upper():
         return ScreenState.START
     if "ETERNAL VOID" in haystack.upper() or "点击任意位置继续" in haystack:
@@ -86,6 +102,7 @@ class SessionKeeper:
         observe: Callable[[], ScreenState],
         click_entry: Callable[[], None],
         click_start: Callable[[], None],
+        dismiss_disconnect: Callable[[], None] | None = None,
         interval_s: float = HEALTH_CHECK_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -93,6 +110,7 @@ class SessionKeeper:
         self._observe = observe
         self._click_entry = click_entry
         self._click_start = click_start
+        self._dismiss_disconnect = dismiss_disconnect
         self._interval = interval_s
         self._clock = clock
         self._sleep = sleep
@@ -119,6 +137,20 @@ class SessionKeeper:
         if state is ScreenState.UNKNOWN:
             # 认不出的画面不乱点：可能是弹窗、维护公告或改版。
             return ReconnectOutcome(state, reconnected=False, detail="unrecognised screen")
+
+        if state is ScreenState.DISCONNECTED:
+            if self._dismiss_disconnect is None:
+                # 没给关闭动作就停在这里，而不是把掉线当成「认不出」——
+                # 前者说得清「卡在哪一屏」，后者查起来只能翻截图。
+                return ReconnectOutcome(
+                    state, reconnected=False, detail="disconnected dialog with no way to dismiss it"
+                )
+            self._dismiss_disconnect()
+            # 点掉弹窗之后回到的是入口序列的某一屏，具体是哪一屏不假设——
+            # 重新观察，让判据来自画面本身。
+            state = self._wait_for(
+                {ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME}, ENTRY_TIMEOUT_S
+            )
 
         if state is ScreenState.ENTRY:
             self._click_entry()

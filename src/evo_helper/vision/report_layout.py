@@ -9,7 +9,10 @@ exactly like a smaller fleet.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from statistics import median
+from typing import Any
 
 #: OCR recipe measured against Tesseract on the batch images.
 #:
@@ -141,6 +144,33 @@ LIVE_LAYOUT = ReportLayout(
 )
 
 
+def crop_to_viewport(image: Any) -> Any:
+    """把整窗截图裁成版面标定用的游戏视口。
+
+    `capture_window(client_only=True)` 交出来的是 **操作系统意义上的** client 区，
+    而 Chrome `--app` 窗口把自己那条 38px 标题栏也画在 client 区里，于是实拍是
+    1920×917。版面 ROI 当年是对着裁掉标题栏的 1920×879 量的（`var/logs/vp-*.png`
+    就是那批），两者差的正好是 `APP_TITLE_BAR_PX`。
+
+    ⚠️ **不要反过来去改 `capture_window`。** 点击坐标（`system_navigator`、
+    `game.pirate_ui`）全部是在含标题栏的 917 空间里量的，截图与点击由此自洽；
+    动了截图，整条点击链路会整体偏移 38px。差异只在版面这一侧，就只在这里补。
+
+    高度对不上任何一种已知形态时直接抛错，不猜。
+    """
+    from evo_helper.game.game_window import APP_TITLE_BAR_PX
+
+    width, height = image.width, image.height
+    if (width, height) == LAYOUT_VIEWPORT:
+        return image
+    if (width, height - APP_TITLE_BAR_PX) == LAYOUT_VIEWPORT:
+        return image.crop((0, APP_TITLE_BAR_PX, width, height))
+    raise ValueError(
+        f"截图 {width}x{height} 既不是标定视口 {LAYOUT_VIEWPORT[0]}x{LAYOUT_VIEWPORT[1]}，"
+        f"也不是它加上 {APP_TITLE_BAR_PX}px 标题栏；采集设置漂了，先修采集"
+    )
+
+
 def layout_for_viewport(width: int, height: int) -> ReportLayout:
     """Return the layout for this viewport, or fail closed.
 
@@ -154,3 +184,66 @@ def layout_for_viewport(width: int, height: int) -> ReportLayout:
             f"only {LAYOUT_VIEWPORT[0]}x{LAYOUT_VIEWPORT[1]} is calibrated"
         )
     return LIVE_LAYOUT
+
+
+#: 分节横幅是一条横贯面板的亮带。判据用亮度而不是文字——横幅上的
+#: 「第1回合【剩余战舰】」实测 OCR 只读出 `ee`，靠文字定位不住。
+BANNER_BRIGHTNESS_RATIO = 1.55
+BANNER_MIN_HEIGHT = 18
+
+#: 亮带与内容之间留一点余量，免得把横幅自身的像素读进行里。
+SECTION_PADDING = 3
+
+
+def banner_bands(
+    profile: Sequence[float],
+    *,
+    top: int,
+    ratio: float = BANNER_BRIGHTNESS_RATIO,
+    min_height: int = BANNER_MIN_HEIGHT,
+) -> list[tuple[int, int]]:
+    """从逐行亮度里找出分节横幅，返回每条亮带的 ``(起, 止)``。
+
+    `profile[i]` 是视口第 ``top + i`` 行在面板中列的平均亮度。基线取中位数——
+    面板大部分行是暗背景，中位数不受横幅本身影响。
+
+    只认够高的亮带：行内选中高亮、面板描边也会亮，但它们都薄。
+    """
+    if not profile:
+        return []
+    baseline = median(profile)
+    threshold = baseline * ratio
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(profile):
+        if value > threshold:
+            start = index if start is None else start
+            continue
+        if start is not None:
+            if index - start >= min_height:
+                bands.append((top + start, top + index - 1))
+            start = None
+    if start is not None and len(profile) - start >= min_height:
+        bands.append((top + start, top + len(profile) - 1))
+    return bands
+
+
+def sections_from_banners(
+    bands: Sequence[tuple[int, int]], *, bottom: int, padding: int = SECTION_PADDING
+) -> list[tuple[int, int]]:
+    """把横幅位置换算成各分节的行区间。
+
+    第 i 节 = 第 i 条横幅之下、第 i+1 条横幅之上。最后一节到 ``bottom`` 为止。
+
+    这是「参战战舰」与「第N回合」不能写死的原因：回放内容会滚动，
+    写死的下界会**穿透到下一节**——实测 `participating_rows` 的 750
+    把「第1回合【剩余战舰】」也框了进去，于是同一批数量被读了两遍。
+    """
+    sections: list[tuple[int, int]] = []
+    for index, (_start, end) in enumerate(bands):
+        following = bands[index + 1][0] if index + 1 < len(bands) else bottom
+        section_top = end + padding
+        section_bottom = following - padding
+        if section_bottom > section_top:
+            sections.append((section_top, section_bottom))
+    return sections

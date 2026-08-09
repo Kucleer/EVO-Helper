@@ -20,58 +20,33 @@ from evo_helper.domain.records import CoordinateScan
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 
-#: 玩家名以此开头即判定为 bot（方案第 2 节）。
-BOT_PREFIX = "bot_"
+# 判定规则只有一份，扫描器和这里共用——各留一份的坑已经踩过。
+from evo_helper.vision.scan_reading import (
+    BOT_PREFIX,
+    UNOWNED_NAMES,
+    coordinate_confirmed,
+    digits_of,
+    is_bot_name,
+    normalise_bot_name,
+    owner_of,
+)
 
-#: 系统占位行星，不是玩家，也不是可攻击目标。
-UNOWNED_NAMES = {"荒芜行星", "未知", ""}
-
-
-def digits_of(text: str) -> str:
-    """取出文本里的数字序列。
-
-    坐标里的冒号又细又矮，OCR 会漏读（``[2:122:9]`` 读成 ``[2122:9]``）。
-    但我们不是在自由解析坐标——我们在核对面板显示的是否**就是请求的那个**坐标。
-    数字序列相等即可证明这一点，且对漏读分隔符免疫。
-    """
-    return "".join(ch for ch in text if ch.isdigit())
-
-
-def coordinate_confirmed(requested: str, raw_text: str) -> bool:
-    return bool(raw_text) and digits_of(raw_text) == digits_of(requested)
+__all__ = [
+    "BOT_PREFIX",
+    "UNOWNED_NAMES",
+    "coordinate_confirmed",
+    "digits_of",
+    "is_bot_name",
+    "main",
+    "normalise_bot_name",
+    "owner_of",
+    "parse_coordinate",
+]
 
 
 def parse_coordinate(text: str) -> Coordinate:
     galaxy, system, position = (int(part) for part in text.split(":"))
     return Coordinate(galaxy, system, position)
-
-
-#: bot 名形如 ``bot_<银河>_<恒星>_<行星>``，`bot_` 之后只有数字和下划线。
-#: OCR 在这种小字号上会把 1 读成 l、2 读成 e、0 读成 O。
-_BOT_DIGIT_FIX = {"l": "1", "I": "1", "e": "2", "O": "0", "o": "0", "S": "5", "B": "8"}
-
-
-def is_bot_name(name: str | None) -> bool:
-    return bool(name) and str(name).startswith(BOT_PREFIX)
-
-
-def normalise_bot_name(name: str) -> str:
-    """把 bot 名后半段里被误读成字母的数字还原。
-
-    只在 ``bot_`` 前缀之后动手，且只替换已知的混淆字符——前缀本身不碰，
-    因为 bot 判定就靠它，改前缀等于改判定结果。
-    """
-    if not is_bot_name(name):
-        return name
-    head, tail = name[: len(BOT_PREFIX)], name[len(BOT_PREFIX) :]
-    return head + "".join(_BOT_DIGIT_FIX.get(ch, ch) for ch in tail)
-
-
-def owner_of(name: str | None) -> str | None:
-    """占位行星没有归属；返回 None 而不是把「荒芜行星」当成玩家名。"""
-    if name is None or name.strip() in UNOWNED_NAMES:
-        return None
-    return name.strip()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,48 +1,82 @@
 {% extends "base.html" %}
-{% block title %}History {{ coordinate }}{% endblock %}
+{% block title %}{{ coordinate }} · 战报历史{% endblock %}
+{% block heading %}{{ coordinate }} 战报历史{% endblock %}
 {% block content %}
-<h1>Coordinate history: {{ coordinate }}</h1>
-<p><a href="/targets">Back to targets</a></p>
-{% if diff %}
-<h2>Latest fleet diff</h2>
-<table>
-  <tr><th>Total before</th><td>{{ diff.total_before }}</td></tr>
-  <tr><th>Total after</th><td>{{ diff.total_after }}</td></tr>
-  <tr><th>Delta</th><td>{{ diff.total_after - diff.total_before }}</td></tr>
-  <tr><th>First seen</th><td>{{ diff.first_seen|join(", ") or "-" }}</td></tr>
-  <tr><th>Disappeared</th><td>{{ diff.disappeared|join(", ") or "-" }}</td></tr>
-  <tr><th>Added</th><td>{{ diff.added|map(attribute="ship_type")|join(", ") or "-" }}</td></tr>
-  <tr><th>Removed</th><td>{{ diff.removed|map(attribute="ship_type")|join(", ") or "-" }}</td></tr>
-</table>
-{% if diff.changes %}
-<table>
-  <thead><tr><th>Ship</th><th>Before</th><th>After</th><th>Delta</th><th>%</th></tr></thead>
-  <tbody>
-  {% for change in diff.changes %}
-    <tr><td>{{ change.ship_type }}</td><td>{{ change.before }}</td><td>{{ change.after }}</td><td>{{ change.delta }}</td><td>{{ "%+.1f"|format(change.percent) }}</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-{% else %}
-<p class="muted">No snapshots for this coordinate.</p>
-{% endif %}
-<h2>Snapshot timeline</h2>
-<table>
-  <thead><tr><th>Captured (UTC)</th><th>Side</th><th>Total</th><th>Revisit</th><th>Confidence</th><th>Review</th></tr></thead>
-  <tbody>
-  {% for snapshot in history %}
-    <tr>
-      <td>{{ snapshot.captured_at_utc }}</td>
-      <td>{{ snapshot.side }}</td>
-      <td>{{ snapshot.total }}</td>
-      <td>{{ snapshot.is_revisit }}</td>
-      <td>{{ snapshot.match_confidence }}</td>
-      <td>{{ snapshot.review_status }}</td>
-    </tr>
+
+<p><a href="{{ back_url }}">← 返回列表</a></p>
+
+<section class="panel" aria-labelledby="fleet-diff">
+  <h2 id="fleet-diff">最近一次舰队变化</h2>
+  {% if diff %}
+    <div class="table-wrap">
+      <table>
+        <tr><th scope="row">变化前总数</th><td>{{ diff.total_before }}</td></tr>
+        <tr><th scope="row">变化后总数</th><td>{{ diff.total_after }}</td></tr>
+        <tr><th scope="row">净变化</th><td>{{ diff.total_after - diff.total_before }}</td></tr>
+        <tr><th scope="row">首次出现</th><td>{{ diff.first_seen|join("、") or "—" }}</td></tr>
+        <tr><th scope="row">已消失</th><td>{{ diff.disappeared|join("、") or "—" }}</td></tr>
+        <tr><th scope="row">新增</th><td>{{ diff.added|map(attribute="ship_type")|join("、") or "—" }}</td></tr>
+        <tr><th scope="row">减少</th><td>{{ diff.removed|map(attribute="ship_type")|join("、") or "—" }}</td></tr>
+      </table>
+    </div>
+    {% if diff.changes %}
+      <div class="table-wrap" style="margin-top:10px">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">舰种</th><th scope="col">变化前</th><th scope="col">变化后</th>
+              <th scope="col">净变化</th><th scope="col">百分比</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for change in diff.changes %}
+            <tr>
+              <td>{{ change.ship_type }}</td>
+              <td>{{ change.before }}</td>
+              <td>{{ change.after }}</td>
+              <td>{{ change.delta }}</td>
+              <td>{{ "%+.1f"|format(change.percent) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
   {% else %}
-    <tr><td colspan="6" class="muted">No snapshots yet.</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
+    {#
+      这颗星球「还没有战报」是常态而不是异常：坐标扫描只记录归属，
+      舰队组成要等真打过一仗、战报入库之后才有。说清楚，免得看着像功能坏了。
+    #}
+    <p class="muted">这颗星球还没有战报。舰队组成要等对它发起攻击、战报入库之后才会出现。</p>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="snapshot-timeline">
+  <h2 id="snapshot-timeline">舰队快照时间线</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">采集时间 (UTC)</th><th scope="col">阵营</th><th scope="col">总数</th>
+          <th scope="col">复查</th><th scope="col">匹配置信度</th><th scope="col">人工复核</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for snapshot in history %}
+        <tr>
+          <td class="muted">{{ snapshot.captured_at_utc }}</td>
+          <td>{{ snapshot.side }}</td>
+          <td>{{ snapshot.total }}</td>
+          <td>{{ "是" if snapshot.is_revisit else "否" }}</td>
+          <td>{{ snapshot.match_confidence }}</td>
+          <td>{{ snapshot.review_status }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted">还没有快照。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
 {% endblock %}

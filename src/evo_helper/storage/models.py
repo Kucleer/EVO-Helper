@@ -146,6 +146,8 @@ class AttackIntentRow(Base):
     guard_status: Mapped[str] = mapped_column(String(32), default="PENDING")
     forced_revisit: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: `bot` 或 `pirate`（见 `domain.records.TARGET_KIND_*`）。攻击日志按它分类。
+    target_kind: Mapped[str] = mapped_column(String(16), default="bot", server_default="bot")
 
 
 class AttackDispatchRow(Base):
@@ -181,6 +183,18 @@ class BattleReportRow(Base):
     manual_review_status: Mapped[str] = mapped_column(String(16), default="PENDING")
     is_from_revisit: Mapped[bool] = mapped_column(Boolean, default=False)
     ui_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 战斗详情页的「单位」总数，双方各一。**不是**逐行明细之和——
+    #: 大舰队的数量显示成 `5.36K` 这样的四舍五入值，逐行相加凑不出精确总数。
+    #: 可空：早先入库的战报没有这个数，补 0 会让它看起来像「舰队为空」。
+    attacker_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    defender_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 详情页那行大字：`VICTORY` / `FAIL`（游戏画面原文，不翻译）。
+    #: 可空：这个字段之前入库的战报没读过胜负，填个值等于凭空造战果。
+    outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: 详情页的「损失单位」总数，双方各一。海盗战报只记胜负 + 这两个数，
+    #: 不写 `fleet_snapshots`（用户口径 2026-08-09，为省性能）。
+    attacker_losses: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    defender_losses: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("attack_dispatches.id"),
         unique=True,
@@ -197,6 +211,9 @@ class FleetSnapshotRow(Base):
     ship_type: Mapped[str] = mapped_column(String(64))
     count: Mapped[int] = mapped_column(Integer)
     round_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 这一行的数没有把握。攻击判断只看总数分档，个别行不准不影响决策，
+    #: 但必须让人看得出哪几行不能信。
+    uncertain: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class TargetRevisitRow(Base):

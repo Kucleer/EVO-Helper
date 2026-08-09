@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.coordinates import POSITION_LIMIT, next_coordinate_after
+from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
@@ -71,7 +71,15 @@ class SqlAlchemyRepository:
                 if cursor is None or cursor < start:
                     next_coordinate: Coordinate | None = start
                 else:
-                    next_coordinate = next_coordinate_after(cursor, end, POSITION_LIMIT)
+                    # 位数窗口取自区间本身（例如 5–20），不是 POSITION_LIMIT。
+                    # 后者是每银河系的**恒星系数** 499，拿它当位数上限会让游标
+                    # 在每个恒星系里空转 479 个不存在的行星位。
+                    next_coordinate = next_coordinate_after(
+                        cursor,
+                        end,
+                        position_limit=range_row.end_position,
+                        first_position=range_row.start_position,
+                    )
                 if next_coordinate is None:
                     continue
                 _set_run_pending(run, next_coordinate)
@@ -181,6 +189,7 @@ class SqlAlchemyRepository:
                     guard_status=record.guard_status,
                     forced_revisit=record.forced_revisit,
                     created_at_utc=record.created_at_utc,
+                    target_kind=record.target_kind,
                 )
             )
             session.commit()
@@ -228,6 +237,11 @@ class SqlAlchemyRepository:
                 manual_review_status=record.manual_review_status,
                 is_from_revisit=record.is_from_revisit,
                 ui_version=record.ui_version,
+                attacker_units=record.attacker_units,
+                defender_units=record.defender_units,
+                outcome=record.outcome,
+                attacker_losses=record.attacker_losses,
+                defender_losses=record.defender_losses,
             )
             session.add(report_row)
             for entry in record.fleet:
@@ -238,6 +252,7 @@ class SqlAlchemyRepository:
                         ship_type=entry.ship_type,
                         count=entry.count,
                         round_no=entry.round_no,
+                        uncertain=entry.uncertain,
                     )
                 )
             close = [

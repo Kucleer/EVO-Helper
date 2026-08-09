@@ -14,6 +14,14 @@ from uuid import UUID
 
 from .models import Coordinate, FleetPresetRef
 
+#: 攻击目标的两类。字符串常量而不是枚举：它要原样进数据库、也要原样进接口，
+#: 而枚举在这两处都得来回转换，转换点越多越容易两边写成不同的字面量。
+TARGET_KIND_BOT = "bot"
+TARGET_KIND_PIRATE = "pirate"
+
+#: 界面上的中文标签。日志页只显示中文，库里存的仍是上面的英文常量。
+TARGET_KIND_LABELS = {TARGET_KIND_BOT: "bot", TARGET_KIND_PIRATE: "海盗"}
+
 
 @dataclass(frozen=True)
 class CoordinateScan:
@@ -37,6 +45,10 @@ class AttackIntent:
     created_at_utc: datetime
     guard_status: str = "PENDING"
     forced_revisit: bool = False
+    #: 打的是 bot 还是海盗。两种目标的判定链路、预设、收益都不一样，
+    #: 事后翻日志时「这一发是打谁的」是第一个要回答的问题。
+    #: 默认 `bot`：这个字段加进来之前的存量意图全部来自 bot 攻击链路。
+    target_kind: str = TARGET_KIND_BOT
 
 
 @dataclass(frozen=True)
@@ -55,6 +67,8 @@ class FleetSnapshotEntry:
     ship_type: str
     count: int
     round_no: int | None = None
+    #: 这一行的数没有把握，界面上要标出来。
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,19 @@ class BattleReport:
     manual_review_status: str = "PENDING"
     is_from_revisit: bool = False
     fleet: tuple[FleetSnapshotEntry, ...] = ()
+    #: 战斗详情页的「单位」总数，与 `fleet` 是两个独立来源；
+    #: 大舰队的逐行数量是四舍五入显示，相加凑不出这个数。
+    attacker_units: int | None = None
+    defender_units: int | None = None
+    #: 详情页那行大字：`VICTORY` / `FAIL`。存游戏画面上的原文，不翻译——
+    #: 界面要显示中文是渲染层的事，库里只存读到的那个词。
+    #: 可空：这个字段加进来之前入库的战报没读过胜负，填 `FAIL` 会凭空造出败仗。
+    outcome: str | None = None
+    #: 详情页的「损失单位」总数，双方各一。**海盗战报只记这个和 `outcome`**
+    #: （用户口径 2026-08-09，为省性能）：明细要进回放页，一份报告多花两三秒，
+    #: 而海盗全是同一个预设打的，逐舰种没有分析价值。
+    attacker_losses: int | None = None
+    defender_losses: int | None = None
 
 
 @dataclass(frozen=True)

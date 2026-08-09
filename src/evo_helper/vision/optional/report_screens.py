@@ -11,22 +11,59 @@ never binarized, and why coordinates get their own single-line ROI.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
+from evo_helper.vision.fleet_counts import COUNT_RECIPES
 from evo_helper.vision.report_layout import (
-    OCR_COORDINATE_WHITELIST,
     OCR_PSM_COLUMN,
     OCR_PSM_LINE,
     ColumnBand,
     Region,
     ReportLayout,
+    banner_bands,
+    sections_from_banners,
 )
+from evo_helper.vision.scan_reading import COORD_RECIPES, COORD_WHITELIST, COORDINATE_RE
 
 OCR_LANGUAGES = "chi_sim+eng"
+
+#: 判定像素算不算墨迹的亮度门槛。
+NUMBER_INK_THRESHOLD = 150
+
+#: 名与数之间至少这么宽的空白才算「缝」。
+NUMBER_COLUMN_GAP = 6
+
+#: 量出来的数字列左右各留一点余量。
+NUMBER_COLUMN_PADDING = 4
+
+#: 一段墨迹至少这么宽才可能是数字列。面板边框只有两三像素宽。
+NUMBER_COLUMN_MIN_WIDTH = 10
+
+#: 「单位」数值的字符集。大舰队显示成 `5.36K`，所以要收 `.` 和 `K`。
+UNIT_WHITELIST = "0123456789.K"
+
+#: 名称列相对列左沿的裁剪范围与放大倍数。
+FLEET_NAME_INSET = 15
+FLEET_NAME_WIDTH = 115
+FLEET_NAME_UPSCALE = 3
+
+#: 名称列只认出一行时的兜底行距（实测值）。
+FLEET_ROW_PITCH = 22
+
+#: 按名字取数时，名称列依次试这几档放大倍数。
+#: 不同倍数漏掉的行不一样——侦察报告那 21 行里，3× 整行漏掉 `钛能守卫者`，
+#: 而漏掉的恰好是判定要看的四个舰种之一。多试一档比调参稳。
+NAME_PASS_UPSCALES: tuple[int, ...] = (FLEET_NAME_UPSCALE, 4, 2)
 
 
 class _Ocr(Protocol):
     def image_to_string(self, image: Any, lang: str, config: str) -> str: ...
+
+    #: 逐行定位要用词框，所以除了整段文字还需要结构化输出。
+    def image_to_data(self, image: Any, **kwargs: Any) -> Any: ...
+
+    Output: Any
 
 
 def _load_backends() -> tuple[Any, _Ocr]:
@@ -54,6 +91,7 @@ class ImageReportScreens:
         layout: ReportLayout,
         *,
         rounds: list[tuple[int, int, int]] | None = None,
+        participating_rows: tuple[int, int] | None = None,
         tesseract_cmd: str | None = None,
     ) -> None:
         """``rounds`` is ``(round_number, top, bottom)`` per located round banner.
@@ -68,6 +106,13 @@ class ImageReportScreens:
         self._image = image
         self._layout = layout
         self._rounds = rounds or []
+        #: 覆盖布局里写死的参战区行界。回放会滚动，写死的下界会穿透到下一节——
+        #: 实测 750 把「第1回合【剩余战舰】」框了进去，同一批数量被读了两遍。
+        self._participating_rows = participating_rows
+        #: 「单位」/「损失单位」两行的锚点。一屏只找一次——找它本身就要读一遍数值，
+        #: 而「单位」和「损失单位」会各问一次。
+        self._details_anchor: int | None = None
+        self._details_anchor_read = False
 
     # -- ReportScreens ---------------------------------------------------
 
@@ -101,10 +146,225 @@ class ImageReportScreens:
         return _compose_versus(left, right, attacker, defender)
 
     def participating_columns(self) -> tuple[str, str]:
+        top, bottom = self._participating_rows or self._layout.participating_rows
         return (
-            self._read_fleet(self._layout.participating(self._layout.attacker_column)),
-            self._read_fleet(self._layout.participating(self._layout.defender_column)),
+            self._read_fleet(self._layout.attacker_column.rows(top, bottom)),
+            self._read_fleet(self._layout.defender_column.rows(top, bottom)),
         )
+
+    def read_fleet_rows(self, band: ColumnBand, top: int, bottom: int) -> str:
+        """逐行读一列舰队：名字一遍、数量一遍，按行拼。
+
+        ⚠️ **还没接进 `participating_columns`。** 在用户给的 5 份样本上它明显更好
+        （80 行 61% → 88%，四个核心舰种 58% → 95%），但在既有的 2026-08-07 那份
+        回归样本上**反而退步**：`95` 被读成 `35`，而旧的整列两遍读法在那份上 17 行全对。
+        不能拿一个已知良好的样本去换平均值——接线前得先弄清这两份样本差在哪。
+
+        为什么不整列一次读：tesseract 在中文字形旁边切不准行，`11` 被吞成 `1`、
+        `39` 被切成 `33`；两遍行数一对不上就退回英文那遍，名字全成拉丁乱码。
+        逐行读之后，实测 5 份样本 80 行的准确率 61% → 88%，
+        四个核心舰种 58% → 95%。
+
+        三条缺一不可（每一条都是实测踩出来的）：
+
+        - **行位置用等距网格**，不用逐行检测。实测 17 行的表检出 18 行——
+          `钛能守卫者` 整行没认出来，位置被碎片顶替，之后所有索引错开一位。
+        - **数字列现场量**。数字左对齐，起点随内容变；不同来源的截图宽度也不同，
+          实测两者差 31px，按写死的左界裁正好切掉首位。
+        - **选票时后缀让位于更长的候选**。丢首位是恒定的失败模式，
+          `74` 读成 `4` 比读对还多 6 票。
+        """
+        from evo_helper.vision.fleet_counts import COUNT_RECIPES, pick_count, row_grid
+
+        names = self._fleet_names(band, top, bottom)
+        if not names:
+            return ""
+        pitch, rows = names
+        first_top = rows[0][0]
+        labels = [label for _y, label in rows]
+        column = number_column(self._image, band, top, bottom)
+        lines = []
+        for index, y in enumerate(row_grid(first_top, pitch, len(labels))):
+            crop = self._image.crop((column[0], y - 3, column[1], y + pitch - 3)).convert("L")
+            votes: dict[str, int] = {}
+            for scale, resample in COUNT_RECIPES:
+                filt = (
+                    self._image_module.Resampling.NEAREST
+                    if resample == "nearest"
+                    else self._image_module.Resampling.LANCZOS
+                )
+                grey = crop.resize((crop.width * scale, crop.height * scale), filt)
+                text = self._ocr.image_to_string(
+                    grey, lang="eng", config=f"--psm 7 -c tessedit_char_whitelist={UNIT_WHITELIST}"
+                ).strip()
+                if text:
+                    votes[text] = votes.get(text, 0) + 1
+            count = pick_count(votes)
+            if count:
+                lines.append(f"{labels[index]}  {count}")
+        return "\n".join(lines)
+
+    def _fleet_names(
+        self, band: ColumnBand, top: int, bottom: int, *, upscale: int = FLEET_NAME_UPSCALE
+    ) -> tuple[int, list[tuple[int, str]]] | None:
+        """名称列：返回行距与**每一行自己量到的** `(顶端, 舰种名)`。
+
+        为什么连每行的 y 一起交出去：等距网格在长清单上会漂。侦察报告的战舰清单
+        行距是 27.5px，取整成 27 之后到第 12 行就差了半行——实测 `钛能守卫者`
+        那一行的数字因此落在裁剪框外，读成空；再往下每隔一行空一次。
+        按名字取数的场合，名字自己那一行的 y 才是最准的锚点。
+
+        （`read_fleet_rows` 仍然用等距网格，那边是刻意的：它要处理「某一行整个
+        没被认出来」的情况，网格能把缺的那一行补上位置，而这里缺席就直接缺席。）
+
+        `upscale` 可换档：同一列在不同倍数下漏掉的行不一样。
+        """
+        from statistics import median
+
+        crop = self._image.crop(
+            (band.left + FLEET_NAME_INSET, top, band.left + FLEET_NAME_WIDTH, bottom)
+        ).convert("L")
+        grey = crop.resize(
+            (crop.width * upscale, crop.height * upscale),
+            self._image_module.Resampling.LANCZOS,
+        )
+        data = self._ocr.image_to_data(
+            grey,
+            lang="chi_sim",
+            config=f"--psm {OCR_PSM_COLUMN}",
+            output_type=self._ocr.Output.DICT,
+        )
+        rows: dict[tuple[int, int, int], tuple[int, str]] = {}
+        for index, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
+            y = top + data["top"][index] // upscale
+            previous = rows.get(key)
+            rows[key] = (min(previous[0], y), previous[1] + word) if previous else (y, word)
+        ordered = sorted(rows.values())
+        if not ordered:
+            return None
+        tops = [y for y, _name in ordered]
+        pitch = (
+            int(median([b - a for a, b in zip(tops, tops[1:], strict=False)]))
+            if len(tops) > 1
+            else FLEET_ROW_PITCH
+        )
+        return (max(pitch, 1), ordered)
+
+    def named_counts(
+        self,
+        wanted: Sequence[str],
+        band: ColumnBand,
+        top: int,
+        bottom: int,
+        *,
+        count_band: tuple[int, int] | None = None,
+    ) -> dict[str, int]:
+        """在一张清单里**按名字**取数量，而不是按行序对位。
+
+        侦察报告的战舰清单有 21 行，按行序对位的读法在实机上会掉行——实测
+        `钛能守卫者` 整行没被认出来，于是它后面每一行的数字都串了位，
+        `拦截导弹` 读成 5（真值 0）。**串位比读不出更坏**：数字看着都合理。
+
+        海盗打不打只取决于四个舰种，所以这里改成「找到那几行，各读各的数」：
+        名字自己就是这一行的凭据，掉行只会让那个名字缺席，不会让别人顶替它。
+        缺席的名字**不出现在返回值里**——是当 0 还是整份拒收，由调用方决定：
+        「这一屏没滚到」和「这个舰种真的是 0」在这里分不出来，也不该在这里猜。
+
+        ⚠️ **`count_band` 要传。** 不传就退回 `number_column()` 现场量，而那在
+        「整列都是 0」的清单上会量错：单个 `0` 太窄，够宽的墨迹段只剩下面板左边
+        那层水印（`-17003` / `COMMAND OFFICERS`），于是量出来的「数字列」是 (731, 808)，
+        读到的「数量」其实是水印里的数字。
+        **实机后果：一个四项全 0 的海盗被读成有舰队，真的挨了一发攻击**（2026-08-09）。
+        """
+        from evo_helper.vision.parsers import snap_unit_name
+
+        column = count_band or number_column(self._image, band, top, bottom)
+        counts: dict[str, int] = {}
+        # 换档补漏：同一列在不同放大倍数下漏掉的行不一样（实测 3× 整行漏掉
+        # `钛能守卫者`，4× 读得出来）。只补没找到的名字，已经读到的不重读。
+        for upscale in NAME_PASS_UPSCALES:
+            if all(name in counts for name in wanted):
+                break
+            found = self._fleet_names(band, top, bottom, upscale=upscale)
+            if not found:
+                continue
+            pitch, rows = found
+            for row_top, label in rows:
+                name = snap_unit_name(label)[0]
+                if name not in wanted or name in counts:
+                    continue
+                value = self._count_at(column, row_top, pitch)
+                if value is not None:
+                    counts[name] = value
+        return counts
+
+    def _count_at(self, column: tuple[int, int], top: int, pitch: int) -> int | None:
+        """读一行的数量；读不出返回 None。
+
+        **非 0 的读数要求至少两套配方读出同一个字符串**，0 只要一套就采信。
+
+        这条不对称是有意的：非 0 会让判定变成「打」，也就是真的送出舰队，
+        所以它需要旁证；而 0 只会让我们跳过一个目标，代价是白跑一趟。
+        实测那个孤零零的 `0` 只有 2× 那一档读得出来（见 `TOTALS_RECIPES`），
+        对它要求两票就等于永远读不出 0——那会把「这里是空的」变成「不知道」。
+        """
+        from evo_helper.domain.fleet_tier import parse_fleet_count
+        from evo_helper.vision.fleet_counts import pick_count
+
+        crop = self._image.crop((column[0], top - 3, column[1], top + pitch - 3)).convert("L")
+        votes: dict[str, int] = {}
+        for scale, resample in TOTALS_RECIPES:
+            filt = (
+                self._image_module.Resampling.NEAREST
+                if resample == "nearest"
+                else self._image_module.Resampling.LANCZOS
+            )
+            grey = crop.resize((crop.width * scale, crop.height * scale), filt)
+            text = self._ocr.image_to_string(
+                grey, lang="eng", config=f"--psm 7 -c tessedit_char_whitelist={UNIT_WHITELIST}"
+            ).strip()
+            if text:
+                votes[text] = votes.get(text, 0) + 1
+        picked = pick_count(votes)
+        if not picked:
+            return None
+        value = parse_fleet_count(picked)
+        if value is None:
+            return None
+        if value != 0 and votes.get(picked, 0) < COUNT_MIN_AGREEMENT:
+            # 只有一套配方读出这个非 0 值，旁证不足。宁可当成「没读到」——
+            # 调用方那边「没读到」不会变成「打」，而一个假的非 0 会。
+            return None
+        return value
+
+    def scout_intro_texts(self) -> list[str]:
+        """侦察报告开头那行的候选读法，一套配方一个。
+
+        那行是「你从[2:137:18]…已对[2:137:4]…」，坐标嵌在中文句子里。
+        **中英混读这一行读不出坐标**：实测 `[2:137:18]` 读成 `[e:137:18]`、
+        `[2:137:4]` 读成 `[137:4]`——首位被吃掉，而 `137:4` 仍然像个合法片段。
+        所以这里改用数字白名单 + `eng`，把整行当数字串读。
+
+        代价是会读出噪声（实测 `2:137:18 382:137:4 3`——`38` 是被并进来的中文笔画）。
+        所以**不在这里判对错**：交出全部候选，由 `scout_reports.parse_intro_coordinates`
+        按「恰好两个、且都在银河/恒星系/位号范围内」去挑。判据留在纯函数里才测得动。
+        """
+        from evo_helper.vision.scout_reports import SCOUT_INTRO_LINE_ROI
+
+        return [
+            self._read(
+                SCOUT_INTRO_LINE_ROI,
+                OCR_PSM_COLUMN,
+                language="eng",
+                whitelist=COORD_WHITELIST,
+                scale=scale,
+                resample=resample,
+            )
+            for scale, resample in COORD_RECIPES
+        ]
 
     def round_columns(self) -> list[tuple[int, str, str]]:
         return [
@@ -115,6 +375,113 @@ class ImageReportScreens:
             )
             for number, top, bottom in self._rounds
         ]
+
+    def unit_totals(self) -> tuple[str, str]:
+        """读战斗详情页的「单位」总数，双方各一。
+
+        **这是总数的权威来源**，不是逐行明细之和：大舰队的数量显示成 `5.36K`
+        这样的四舍五入值，逐行相加永远凑不出精确总数。
+
+        详情页要滚动才看得到这一行，所以位置按「战斗详情」横幅定位，不写死——
+        与回放页的分节定位同一套办法（`banner_bands`）。
+        """
+        return self._totals_row(0)
+
+    def loss_totals(self) -> tuple[str, str]:
+        """读「损失单位」总数，双方各一。这是海盗战报要记的「战损」。
+
+        它紧跟在「单位」下面一行，所以用同一个横幅锚点、往下挪一行。
+
+        ⚠️ **必须在详情页拖到底的那一屏上读。** 未滚动时这一行正好被面板下沿切掉，
+        读出来是半行字（实机上「损失单位」只露出上半截）。拖到底是可标定的姿势：
+        实测同一份报告拖 280px 与拖 520px 落点完全一致——面板夹到底了，
+        所以这一行相对横幅的偏移是固定的。
+        """
+        return self._totals_row(1)
+
+    def outcome_banner(self) -> str:
+        """详情页上那行 `VICTORY` / `FAIL`。海盗战报的胜负就取自这里。
+
+        只跑 `eng`：这一行没有中文，多加载一个中文模型白花约 0.4 秒。
+        不限字符集——白名单会让 tesseract 失去切分依据，实测大字反而读不出来。
+        """
+        from evo_helper.vision.pirate_reports import OUTCOME_ROI
+
+        return self._read(OUTCOME_ROI, OCR_PSM_LINE, language="eng")
+
+    def _totals_row(self, row_index: int) -> tuple[str, str]:
+        """「战斗详情」横幅之下第 `row_index` 行的双方数值。"""
+        anchor = self._details_banner_bottom()
+        if anchor is None:
+            return ("", "")
+        return self._row_values(anchor + UNIT_ROW_OFFSET + row_index * UNIT_ROW_PITCH)
+
+    def _row_values(self, top: int) -> tuple[str, str]:
+        """一行里双方的数值。标签在左、数值在右，只取右半。
+
+        数值用数字白名单读，因为这一行背后压着 `-17003` / `TOTAL CREW` 那层水印——
+        不限字符集会把水印的数字一起读进来。
+        """
+        from evo_helper.vision.fleet_counts import pick_count
+
+        bottom = min(top + UNIT_ROW_HEIGHT, self._layout.viewport[1])
+
+        def read(band: ColumnBand) -> str:
+            crop = self._image.crop(
+                (band.left + UNIT_VALUE_INSET, top, band.right, bottom)
+            ).convert("L")
+            votes: dict[str, int] = {}
+            for scale, resample in TOTALS_RECIPES:
+                filt = (
+                    self._image_module.Resampling.NEAREST
+                    if resample == "nearest"
+                    else self._image_module.Resampling.LANCZOS
+                )
+                grey = crop.resize((crop.width * scale, crop.height * scale), filt)
+                text = self._ocr.image_to_string(
+                    grey, lang="eng", config=f"--psm 7 -c tessedit_char_whitelist={UNIT_WHITELIST}"
+                ).strip()
+                if text:
+                    votes[text] = votes.get(text, 0) + 1
+            return pick_count(votes)
+
+        return (read(self._layout.attacker_column), read(self._layout.defender_column))
+
+    def _details_banner_bottom(self) -> int | None:
+        """「战斗详情」横幅的下沿；找不到返回 None。一屏只算一次。
+
+        ⚠️ **不能直接取最靠下的那条亮带。** 详情页拖到底之后，最靠下的亮带是那个
+        黄色的「查看战斗回放」按钮——照它算出来的行落在按钮下面的空白上，
+        读回来是空字符串，于是报「战损读不出来」，而真正的毛病是锚点找错了。
+        实机踩过：未滚动那屏按钮不在可视区，取最后一条恰好是对的，
+        所以这个错要等到拖到底之后才暴露。
+
+        判据是**那条亮带下面第一行是不是两个能解析的数**。不用回读标签：
+        「单位:」那几个字是暗灰小字，`chi_sim` 实测读成 `后亿:`／`下`，
+        拿读不准的东西当判据等于换了个地方失败。而这两个数本来就是要读的，
+        读得出来即证明锚点对了——判据和答案是同一件事。
+        """
+        if self._details_anchor_read:
+            return self._details_anchor
+        from evo_helper.domain.fleet_tier import parse_fleet_count
+
+        profile = row_brightness(
+            self._image,
+            self._layout.attacker_column.left + 20,
+            self._layout.defender_column.right - 20,
+            UNIT_SCAN_TOP,
+            self._layout.viewport[1],
+        )
+        anchor: int | None = None
+        for _start, end in reversed(banner_bands(profile, top=UNIT_SCAN_TOP)):
+            left, right = self._row_values(end + UNIT_ROW_OFFSET)
+            if left and right and parse_fleet_count(left) is not None:
+                if parse_fleet_count(right) is not None:
+                    anchor = end
+                    break
+        self._details_anchor = anchor
+        self._details_anchor_read = True
+        return anchor
 
     # -- internals -------------------------------------------------------
 
@@ -138,21 +505,55 @@ class ImageReportScreens:
         into 1.
         """
         counts = _rows(self._read(region, OCR_PSM_COLUMN, language="eng"))
-        names = _names(self._read(region, OCR_PSM_COLUMN, language="chi_sim"))
+        chinese = self._read(region, OCR_PSM_COLUMN, language="chi_sim")
+        names = _names(chinese)
         if len(names) != len(counts):
-            # Row counts disagree, so the two passes cannot be aligned. Fall
-            # back to the pass whose counts are trustworthy rather than pairing
-            # a name with another row's number.
-            return "\n".join(f"{name}  {count}" for name, count in counts)
-        return "\n".join(f"{name}  {count}" for name, (_, count) in zip(names, counts, strict=True))
+            # 中文那遍常多出几行装饰性噪声（实测：一行孤零零的 `”`、一行 `1 17`）。
+            # 舰种名是封闭词表，对不上词表的行就是噪声——去掉之后往往就能和
+            # 数字那遍对齐，而不必牺牲名称。
+            names = _vocabulary_names(names)
+        if len(names) == len(counts):
+            return "\n".join(
+                f"{name}  {count}" for name, (_, count) in zip(names, counts, strict=True)
+            )
+        # 仍然对不上。**绝不退回英文那遍的名字**：那一遍把 `轻型战斗机` 读成
+        # `SRLS HL`、`重型战斗机` 读成 `BHR`，而这些字符串会原样入库成舰种名。
+        # 2026-08-08 那份战报就是这么变成一屏拉丁乱码的，而且从头到尾没有报错——
+        # 数字是对的，看起来一切正常。名称是舰队时间线做差异的键，错了比缺了更糟：
+        # 每份战报都会显示成「首次出现」。
+        # 宁可交出中文那遍自己的数字（下游 `read_until_total` 会因为合计对不上
+        # 而拒收整列），也不交出一个数字漂亮、名字全错的结果。
+        from evo_helper.vision.parsers import snap_unit_name
+
+        return "\n".join(
+            f"{name}  {count}"
+            for name, count in _rows(chinese)
+            if snap_unit_name(name)[1] != "unknown"
+        )
 
     def _read_coordinate(self, region: Region) -> str:
-        return self._read(
-            region,
-            OCR_PSM_LINE,
-            language="eng",
-            whitelist=OCR_COORDINATE_WHITELIST,
-        ).strip()
+        """逐套配方读坐标，读出合法三元组就采信。
+
+        单套配方在这一行上不够。实测同一屏、同一形状的两个 ROI，守方读出
+        `[2:137:14]`，攻方却只读出 `]`——于是 `parse_versus_block` 判成「单边战报」
+        并整份拒收，而战报本身是好的。
+
+        两条对策与坐标扫描器那边同源（`vision.scan_reading.COORD_RECIPES`）：
+        方括号从白名单里去掉（`]` 会被读成数字，反过来也会吃掉相邻字符），
+        放大兼用最近邻（LANCZOS 会把细笔画之间的缝插值糊掉）。
+        """
+        for scale, resample in COORD_RECIPES:
+            text = self._read(
+                region,
+                OCR_PSM_LINE,
+                language="eng",
+                whitelist=COORD_WHITELIST,
+                scale=scale,
+                resample=resample,
+            ).strip()
+            if COORDINATE_RE.search(text):
+                return text
+        return text
 
     def _read(
         self,
@@ -161,13 +562,16 @@ class ImageReportScreens:
         *,
         language: str = OCR_LANGUAGES,
         whitelist: str | None = None,
+        scale: int | None = None,
+        resample: str = "lanczos",
     ) -> str:
         crop = self._image.crop(region.as_box()).convert("L")
-        scale = self._layout.ocr_upscale
-        crop = crop.resize(
-            (crop.width * scale, crop.height * scale),
-            self._image_module.Resampling.LANCZOS,
-        )
+        scale = scale or self._layout.ocr_upscale
+        filters = {
+            "lanczos": self._image_module.Resampling.LANCZOS,
+            "nearest": self._image_module.Resampling.NEAREST,
+        }
+        crop = crop.resize((crop.width * scale, crop.height * scale), filters[resample])
         config = f"--psm {psm}"
         if whitelist:
             config += f" -c tessedit_char_whitelist={whitelist}"
@@ -212,6 +616,18 @@ def _rows(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _vocabulary_names(names: list[str]) -> list[str]:
+    """只保留能落到已知舰种/防御设施词表上的行。
+
+    用 `snap_unit_name` 而不是精确相等：中文那遍读出来的名字通常差一个字
+    （`无晨舰` → `无畏舰`），差一个字仍是一行真数据，不能当噪声丢掉。
+    真正要丢的是 `”`、`1 17` 这种压根不像单位名的行。
+    """
+    from evo_helper.vision.parsers import snap_unit_name
+
+    return [name for name in names if snap_unit_name(name)[1] != "unknown"]
+
+
 def _names(text: str) -> list[str]:
     """Take the leading name from each non-empty line of the name-only pass.
 
@@ -230,3 +646,108 @@ def _names(text: str) -> list[str]:
         if name:
             names.append(name)
     return names
+
+
+def row_brightness(
+    image: Any, left: int, right: int, top: int, bottom: int, step: int = 4
+) -> list[float]:
+    """面板中列的逐行平均亮度，喂给 `banner_bands` 定位分节横幅。"""
+    grey = image.convert("L")
+    pixels = grey.load()
+    columns = range(left, right, step)
+    return [sum(pixels[x, y] for x in columns) / len(columns) for y in range(top, bottom)]
+
+
+def locate_sections(image: Any, layout: ReportLayout, *, top: int = 300) -> list[tuple[int, int]]:
+    """定位回放页的各分节行区间：第 0 节是参战战舰，其后每节对应一个回合。
+
+    从 `top` 往下扫，跳过上方的 VS 块与增益表——那里也有亮条，会被误认成分节横幅。
+    """
+    bottom = layout.viewport[1]
+    profile = row_brightness(
+        image, layout.attacker_column.left + 20, layout.defender_column.right - 20, top, bottom
+    )
+    return sections_from_banners(banner_bands(profile, top=top), bottom=bottom)
+
+
+def number_column(image: Any, band: ColumnBand, top: int, bottom: int) -> tuple[int, int]:
+    """在一列舰队里量出**数字子列**的横向范围。
+
+    不能写死。数字列的起点随内容变：短数（`117`）与长数（`5.73K`）落点不同，
+    不同来源的截图宽度也不一样（自采 1920、外部截图 1909）。实测两者的数字列
+    起点差 31px——按写死的左界裁，正好**切掉首位数字**，`210` 读成 `10`、
+    `74` 读成 `4`。这类错误在合计上看不出来，只在逐行比对时才现形。
+
+    做法：把这一列切成若干段连续墨迹，取**最右那段够宽的**。
+    不能取「最右的墨迹」——面板边框也在右边，实测边框那两三列像素会把结果
+    带到 1194 去，整个数字列反而落在外面。
+    """
+    grey = image.convert("L")
+    pixels = grey.load()
+    height = grey.size[1]
+    inked = [
+        x
+        for x in range(band.left, band.right)
+        if sum(1 for y in range(top, min(bottom, height)) if pixels[x, y] > NUMBER_INK_THRESHOLD)
+        > 1
+    ]
+    if not inked:
+        return (band.left, band.right)
+
+    runs: list[tuple[int, int]] = []
+    start = previous = inked[0]
+    for x in inked[1:]:
+        if x - previous > NUMBER_COLUMN_GAP:
+            runs.append((start, previous))
+            start = x
+        previous = x
+    runs.append((start, previous))
+
+    wide = [run for run in runs if run[1] - run[0] >= NUMBER_COLUMN_MIN_WIDTH]
+    chosen = wide[-1] if wide else runs[-1]
+    left, right = chosen
+
+    # 左界取「名与数之间那道缝的中点」，而不是数字墨迹的最左端。
+    # 数字是**左对齐**的，墨迹最左端就是首位笔画本身——贴着它裁，
+    # 首位就会被削掉：实测 `210` 读成 `10`、`74` 读成 `4`、`28` 读成 `8`。
+    # 缝里没有内容，多裁进来不会带入舰种名。
+    index = runs.index(chosen)
+    if index > 0:
+        left = (runs[index - 1][1] + left) // 2
+    else:
+        left -= NUMBER_COLUMN_PADDING
+    return (left, right + NUMBER_COLUMN_PADDING)
+
+
+#: 详情页从这一行往下找横幅；再往上是 VS 块，那里也有亮条。
+UNIT_SCAN_TOP = 100
+
+#: 「单位」那一行相对「战斗详情」横幅下沿的偏移与高度。
+#:
+#: 高度是 20 而不是行距 22：**行窗不能碰到下一行**。「单位」下面紧跟着「损失单位」，
+#: 窗口取 24 时下一行的顶边会挤进来，`--psm 7`（单行）当场读空——
+#: 实测同一张图 height=20 读出 `100`、height=24 读出空字符串。
+UNIT_ROW_OFFSET = 18
+UNIT_ROW_HEIGHT = 20
+
+#: 「单位」到「损失单位」的行距（实机量于 2026-08-09 的海盗战报详情页）。
+UNIT_ROW_PITCH = 22
+
+
+#: 两侧数值的横向范围（相对各自列）。
+UNIT_VALUE_INSET = 100
+
+#: 「单位」/「损失单位」两行的配方阶梯：比 `COUNT_RECIPES` 多一档 **2×**。
+#:
+#: 战损常常是孤零零一个 `0`（我方一艘没损失），而实测**只有 2× 才读得出它**：
+#: 3×/4×/5×/6×/8× 配数字白名单一律读空。放大反而更差不是笔误——
+#: 白名单剥掉了 tesseract 用来定位字形的上下文，单个窄字形放得越大越像噪点。
+#: 白名单本身不能去掉：这一行背后压着 `-17003` / `COMMAND OFFICERS` 那层水印。
+#:
+#: 2× 只加在这两行上，不动 `COUNT_RECIPES`——那套阶梯是对着舰队明细列标定的，
+#: 而「读得对」在那边是靠合计校验兜住的，这边没有合计可校。
+TOTALS_RECIPES: tuple[tuple[int, str], ...] = ((2, "lanczos"), *COUNT_RECIPES)
+
+#: 非 0 的数量至少要几套配方读出同一个字符串才采信。
+#: 见 `_count_at`：非 0 会让判定变成「打」，需要旁证；0 只要一套。
+COUNT_MIN_AGREEMENT = 2

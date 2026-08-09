@@ -20,7 +20,7 @@ from evo_helper.storage.database import create_database_engine, create_session_f
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.live_reports import LiveBattleReport, LiveReportReader
 from evo_helper.vision.models import PageObservation
-from evo_helper.vision.report_layout import layout_for_viewport
+from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -31,10 +31,20 @@ class _CapturedScreens:
     def __init__(self, detail: Path, replay: Path, tesseract_cmd: str) -> None:
         from PIL import Image
 
-        from evo_helper.vision.optional.report_screens import ImageReportScreens
+        from evo_helper.vision.optional.report_screens import (
+            ImageReportScreens,
+            locate_sections,
+        )
 
-        detail_image = Image.open(detail)
-        replay_image = Image.open(replay)
+        # 整窗截图带着 Chrome --app 那条 38px 标题栏（1920x917），版面标定是
+        # 裁掉它之后的 1920x879。不裁就整份报告读不出来。
+        detail_image = crop_to_viewport(Image.open(detail))
+        replay_image = crop_to_viewport(Image.open(replay))
+        # 参战区与各回合的行界按亮带现场定位。回放内容会滚动，布局里写死的下界
+        # 会穿透到下一节——同一批数量被读两遍，合计凭空变形。
+        sections = locate_sections(replay_image, layout_for_viewport(*replay_image.size))
+        participating = sections[0] if sections else None
+        rounds = [(index + 1, top, bottom) for index, (top, bottom) in enumerate(sections[1:])]
         self._detail = ImageReportScreens(
             detail_image,
             layout_for_viewport(detail_image.width, detail_image.height),
@@ -43,6 +53,8 @@ class _CapturedScreens:
         self._replay = ImageReportScreens(
             replay_image,
             layout_for_viewport(replay_image.width, replay_image.height),
+            rounds=rounds,
+            participating_rows=participating,
             tesseract_cmd=tesseract_cmd,
         )
 
@@ -59,9 +71,12 @@ class _CapturedScreens:
         return self._replay.participating_columns()
 
     def round_columns(self) -> list[tuple[int, str, str]]:
-        # Round sections need scroll-driven capture; a single screenshot holds
-        # only the participating list, so no round is claimed here.
-        return []
+        # 一张截图里能看到几个回合就报几个；再往下的回合要滚动才拍得到。
+        return self._replay.round_columns()
+
+    def unit_totals(self) -> tuple[str, str]:
+        # 「单位」总数在**详情页**，不在回放页。
+        return self._detail.unit_totals()
 
 
 def read_report(detail: Path, replay: Path, tesseract_cmd: str) -> LiveBattleReport:

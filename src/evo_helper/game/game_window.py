@@ -25,6 +25,13 @@ GAME_URL = "https://eternal-void.online/"
 #: app 模式下游戏窗口的标题恰好是这个。精确匹配，不做子串匹配。
 GAME_WINDOW_TITLE = "EVO"
 
+#: 页面把标题设成 `EVO` **之前**，窗口标题是游戏域名。
+#:
+#: 这是「正在加载」，不是「不存在」。分不清这两者的代价很大：页面一重连（实测会发生），
+#: 标题就临时退回域名，此时按「窗口没了」去拉一个新的，就会多出**第二个**游戏窗口——
+#: 而 `find_game_window()` 一见到两个就拒绝工作，扫描从此再也起不来，还得人工关窗口。
+GAME_LOADING_TITLE = "eternal-void.online"
+
 #: app 模式窗口里 Chrome 自绘的标题栏高度（物理像素，实测）。
 APP_TITLE_BAR_PX = 38
 
@@ -83,8 +90,7 @@ def launch_game(url: str = GAME_URL) -> None:
     )
 
 
-def find_game_window() -> WindowInfo | None:
-    """按**精确**标题找游戏窗口，找不到返回 None。"""
+def _windows_titled(title: str) -> list[WindowInfo]:
     import win32gui
 
     from evo_helper.vision.optional.window_capture import WindowInfo
@@ -94,16 +100,32 @@ def find_game_window() -> WindowInfo | None:
     def _visit(handle: int, _acc: object) -> None:
         if not win32gui.IsWindowVisible(handle):
             return
-        if win32gui.GetWindowText(handle).strip() != GAME_WINDOW_TITLE:
+        if win32gui.GetWindowText(handle).strip() != title:
             return
-        rect = win32gui.GetWindowRect(handle)
-        found.append(WindowInfo(handle=handle, title=GAME_WINDOW_TITLE, rect=rect))
+        found.append(WindowInfo(handle=handle, title=title, rect=win32gui.GetWindowRect(handle)))
 
     win32gui.EnumWindows(_visit, None)
+    return found
+
+
+def find_game_window() -> WindowInfo | None:
+    """按**精确**标题找游戏窗口，找不到返回 None。"""
+    found = _windows_titled(GAME_WINDOW_TITLE)
     if len(found) > 1:
         raise GameWindowError(
-            f"有 {len(found)} 个标题为 {GAME_WINDOW_TITLE!r} 的窗口，无法判断用哪个"
+            f"有 {len(found)} 个标题为 {GAME_WINDOW_TITLE!r} 的窗口，无法判断用哪个。"
+            "多半是先前把「正在加载」当成「窗口没了」又拉起了一个；请手动关掉多余的那个。"
         )
+    return found[0] if found else None
+
+
+def find_loading_game_window() -> WindowInfo | None:
+    """找一个正在加载游戏的窗口（标题还是域名）。
+
+    这里**不做**「只能有一个」的检查：多个加载中的窗口不影响判断——我们只用它回答
+    「是不是已经有窗口在加载了」，答案是「是」就该等，而不是再拉一个。
+    """
+    found = _windows_titled(GAME_LOADING_TITLE)
     return found[0] if found else None
 
 
@@ -133,9 +155,25 @@ def resize_to_viewport(window: WindowInfo, plan: ViewportPlan | None = None) -> 
     return target.viewport_from_client(box[2] - box[0], box[3] - box[1])
 
 
-#: 拉起窗口后等它出现的轮询上限。
-LAUNCH_TIMEOUT_S = 30.0
+#: 拉起窗口后等它出现的轮询上限。冷启动要开 Chrome、下载资源、初始化 WebGL，
+#: 30s 不够——实测超时后果不是「重试一次」，而是多出一个再也关不掉的重复窗口。
+LAUNCH_TIMEOUT_S = 120.0
+
+#: 已经有窗口在加载时的等待上限。这条路径不拉新窗口，等久一点没有副作用。
+LOAD_TIMEOUT_S = 180.0
+
 LAUNCH_POLL_S = 1.0
+
+
+def _wait_for_game_window(
+    timeout_s: float, pause: Callable[[float], None], clock: Callable[[], float] = time.monotonic
+) -> WindowInfo | None:
+    deadline = clock() + timeout_s
+    window = find_game_window()
+    while window is None and clock() < deadline:
+        pause(LAUNCH_POLL_S)
+        window = find_game_window()
+    return window
 
 
 def ensure_game_window(
@@ -147,18 +185,25 @@ def ensure_game_window(
     """返回一个尺寸正确的游戏窗口；窗口不存在就自己拉起来。
 
     用户随时会关掉游戏或切换登录，所以「窗口不见了」是正常情形，不是故障。
+    但**页面重连时标题会临时退回域名**，那是「正在加载」——这时只能等，
+    再拉一个会留下第二个游戏窗口，把扫描彻底卡死。
     尺寸调不到标定视口则抛错——几何不对时继续截图只会喂给解析器错位的 ROI。
     """
     pause = sleep or time.sleep
     window = find_game_window()
     if window is None:
-        launch_game()
-        deadline = time.monotonic() + timeout_s
-        while window is None and time.monotonic() < deadline:
-            pause(LAUNCH_POLL_S)
-            window = find_game_window()
-        if window is None:
-            raise GameWindowError(f"拉起游戏后 {timeout_s:.0f}s 内没等到窗口出现")
+        if find_loading_game_window() is not None:
+            window = _wait_for_game_window(LOAD_TIMEOUT_S, pause)
+            if window is None:
+                raise GameWindowError(
+                    f"已有窗口在加载游戏，但 {LOAD_TIMEOUT_S:.0f}s 内标题没变成 "
+                    f"{GAME_WINDOW_TITLE!r}；没有再拉一个，请人工确认那个窗口的状态"
+                )
+        else:
+            launch_game()
+            window = _wait_for_game_window(timeout_s, pause)
+            if window is None:
+                raise GameWindowError(f"拉起游戏后 {timeout_s:.0f}s 内没等到窗口出现")
 
     target = plan or ViewportPlan()
     actual = resize_to_viewport(window, target)

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -16,6 +16,7 @@ from evo_helper.storage import models as orm
 
 from .service import (
     SHANGHAI,
+    AttackLogView,
     BotTargetView,
     ConflictError,
     CoordinateScanView,
@@ -25,6 +26,8 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     NotFoundError,
+    PlanetPage,
+    PlanetRow,
     PlanPatchView,
     RevisitView,
     RunStatusView,
@@ -32,6 +35,7 @@ from .service import (
     ScanRangeView,
     ServiceError,
     StateEventView,
+    planet_kind,
 )
 
 
@@ -218,6 +222,83 @@ class PersistentApplicationService:
                 if (view := self._report_view(session, coordinate, report))
             ]
 
+    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+        """按银河系与类型筛选星球，**在 SQL 里筛、在 SQL 里数**。
+
+        全量扫完是 71,856 颗星球。把它们全查出来再在 Python 里过滤，既慢又会诱使
+        页面拿「本页行数」冒充总数——`list_scans` 的 500 条上限就是这么变成
+        「扫描停在 2:32」的假象的。
+        """
+        with self._session_factory() as session:
+            base = select(orm.BotTargetRow)
+            if galaxy is not None:
+                base = base.where(orm.BotTargetRow.galaxy == galaxy)
+
+            counted = base.subquery()
+            kind_counts = {
+                "bot": 0,
+                "owned": 0,
+                "free": 0,
+            }
+            for is_bot, owner, count in session.execute(
+                select(counted.c.is_bot, counted.c.latest_owner_name, func.count())
+                .select_from(counted)
+                .group_by(counted.c.is_bot, counted.c.latest_owner_name.is_(None))
+            ):
+                kind_counts[planet_kind(owner, bool(is_bot))] += int(count)
+            kind_counts["all"] = sum(kind_counts.values())
+
+            filtered = base
+            clause = _planet_kind_clause(kind)
+            if clause is not None:
+                filtered = filtered.where(clause)
+
+            total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
+            rows = session.scalars(
+                filtered.order_by(
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                )
+                .offset(offset)
+                .limit(limit)
+            ).all()
+
+            galaxy_counts = {
+                int(g): int(count)
+                for g, count in session.execute(
+                    select(orm.BotTargetRow.galaxy, func.count())
+                    .group_by(orm.BotTargetRow.galaxy)
+                    .order_by(orm.BotTargetRow.galaxy)
+                )
+            }
+
+        return PlanetPage(
+            rows=tuple(
+                PlanetRow(
+                    coordinate=Coordinate(row.galaxy, row.system, row.position),
+                    owner_name=row.latest_owner_name,
+                    is_bot=bool(row.is_bot),
+                    last_scan_at=row.last_scanned_at_utc,
+                )
+                for row in rows
+            ),
+            total=total,
+            offset=offset,
+            limit=limit,
+            kind_counts=kind_counts,
+            galaxy_counts=galaxy_counts,
+        )
+
+    def count_scans(self) -> int:
+        """库里一共有多少条扫描事实。
+
+        `list_scans` 有上限，页面必须能说出「显示的是全部还是一截」——
+        只渲染前 500 条却不声明，看上去就像扫描停在了第 500 个坐标上。
+        """
+        with self._session_factory() as session:
+            return int(session.scalar(select(func.count()).select_from(orm.CoordinateScanRow)) or 0)
+
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]:
         """按坐标顺序列出扫描事实。
 
@@ -270,6 +351,61 @@ class PersistentApplicationService:
                     row.after_state,
                 )
                 for row in reversed(rows)
+            ]
+
+    def list_attack_log(self, limit: int) -> list[AttackLogView]:
+        """攻击日志：每条意图一行，派出去的带上派遣事实。
+
+        用 `outerjoin` 而不是 `join`：**被闸门拦下、或者读简报没通过的意图
+        没有对应的派遣行**，而这些恰恰是最需要在日志里看到的——
+        内连接会把它们静默滤掉，日志看起来一片干净，实际是漏了。
+
+        按意图创建时间倒序：日志页第一眼要看的是最近发生了什么。
+
+        战报也是 `outerjoin` 接上来的：刚派出去的那一发还没有战报，而它必须照样在列。
+        战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
+        在这里按坐标重新配一次，等于把同一条判据写第二份。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.AttackIntentRow, orm.AttackDispatchRow, orm.BattleReportRow)
+                .outerjoin(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .order_by(
+                    orm.AttackIntentRow.created_at_utc.desc(),
+                    orm.AttackIntentRow.id.desc(),
+                )
+                .limit(limit)
+            ).all()
+            return [
+                AttackLogView(
+                    intent_id=intent.id,
+                    target=Coordinate(
+                        intent.target_galaxy, intent.target_system, intent.target_position
+                    ),
+                    origin=Coordinate(
+                        intent.origin_galaxy, intent.origin_system, intent.origin_position
+                    ),
+                    target_kind=intent.target_kind,
+                    preset_name=intent.preset_name,
+                    preset_signature=intent.preset_signature,
+                    guard_status=intent.guard_status,
+                    created_at_utc=intent.created_at_utc,
+                    dispatched_at_utc=dispatch.dispatched_at_utc if dispatch else None,
+                    dry_run=dispatch.dry_run if dispatch else None,
+                    accepted=dispatch.accepted if dispatch else None,
+                    expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
+                    outcome=report.outcome if report else None,
+                    attacker_losses=report.attacker_losses if report else None,
+                    defender_losses=report.defender_losses if report else None,
+                )
+                for intent, dispatch, report in rows
             ]
 
     def request_revisit(
@@ -491,7 +627,14 @@ class PersistentApplicationService:
         rows = session.scalars(
             select(orm.FleetSnapshotRow)
             .where(
-                orm.FleetSnapshotRow.report_id == report.id, orm.FleetSnapshotRow.side == "defender"
+                orm.FleetSnapshotRow.report_id == report.id,
+                orm.FleetSnapshotRow.side == "defender",
+                # 只要战前的参战舰队。带 `round_no` 的是逐回合的剩余战舰，
+                # 混进来会把同一个舰种数两遍：实测 2:137:14 的详情弹窗显示
+                # 「合计 157」（= 参战 81 + 第1回合 76）、`重型战斗机` 出现两次，
+                # 而列表页用的 `_defender_counts` 一直是对的（8 种 / 81）。
+                # 同一条判据在两个地方各写一份，就会出现这种「列表对、详情错」。
+                orm.FleetSnapshotRow.round_no.is_(None),
             )
             .order_by(orm.FleetSnapshotRow.ship_type)
         ).all()
@@ -518,3 +661,21 @@ def _validate_lines(fleet_line_limit: int, reserved_lines: int) -> None:
             f"reserved_lines ({reserved_lines}) must be fewer than "
             f"fleet_line_limit ({fleet_line_limit}); the plan would never dispatch"
         )
+
+
+def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
+    """把 `planet_kind()` 的分类翻成 SQL 过滤条件。
+
+    两边必须一致。有用例拿同一批数据分别走这里和 `planet_kind()` 对答案，
+    改了一处忘了另一处会当场红。
+    """
+    if kind == "bot":
+        return orm.BotTargetRow.is_bot.is_(True)
+    if kind == "owned":
+        return and_(
+            orm.BotTargetRow.is_bot.is_(False),
+            orm.BotTargetRow.latest_owner_name.is_not(None),
+        )
+    if kind == "free":
+        return orm.BotTargetRow.latest_owner_name.is_(None)
+    return None
