@@ -24,7 +24,9 @@
 | 航线闸门已存在（在飞 + 游戏自报空位 + 保留航线三者取交） | `game/capacity.py` `LineCapacityGate` |
 | 攻击意图与派遣已入库，含 `target_kind`、`expected_report_at_utc` | `storage/models.py` `attack_intents` / `attack_dispatches` |
 | `pirate_loop` 写这两张表 | `tools/pirate_loop.py:510,527` |
-| **`bot_loop` 完全不写库** | `tools/bot_loop.py`（无任何 orm 引用） |
+| **`BotLoop` 是 `PirateLoop` 的子类**，写库走继承来的 `_record_intent`，其中 `target_kind=TARGET_KIND_PIRATE` **硬编码** → bot 的攻击会被错标成海盗，污染日配额计数 | `tools/bot_loop.py:69`、`tools/pirate_loop.py:501-522` |
+| **`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。简报数据在 `_launch()` 里读到了但没传出来 | `tools/pirate_loop.py:301,527`、`vision/parsers.py:603-618` |
+| 「该等还是该收」已有纯函数判据，且已定义 NULL = 立即收取 | `domain/report_wait.py` `ReportWaitPlanner` |
 | 主星 `Coordinate(2,137,18)` 硬编码了两遍 | `tools/pirate_loop.py:69`、`tools/scan_coordinates.py:49` |
 | 系号上限常量 | `domain/scan_priority.py` `SYSTEMS_PER_GALAXY` |
 | web 服务单进程单 worker（`uvicorn.run` 收的是 app 对象） | `web/runtime.py:main` |
@@ -50,8 +52,13 @@
 - **bot**：本轮范围内仍有未收到战报的目标 **且**（估算空闲航线 > 0 **或** 有到期未收的 `BOT` 战报）
 - **扫描**：恒为真
 
-「有到期未收的战报」= 存在 `attack_dispatches` 行，其 `expected_report_at_utc <= now`
-且尚无对应 `battle_report`，且未被判为「战报缺失」（见下文防卡死）。
+「有到期未收的战报」**不另写判据，复用 `domain/report_wait.py` 的 `ReportWaitPlanner`**：
+把该 `target_kind` 下尚无战报、且未被判为「战报缺失」的派遣组成 `PendingReport` 列表，
+`plan(...).action is WaitAction.COLLECT` 即为真。
+
+这条复用不是省事，是避免同一判据出现第二份实现。它还顺带带来了正确的
+NULL 语义：`expected_report_at_utc` 为空时立即收取（「宁可白跑，也不能无限等一个
+不知道何时到的战报」）——而该列**目前恒为 NULL**，见下一节的前置缺口。
 
 用户那条「同时有 2 个攻击任务，前序占满航线时不开下一个」不需要单独实现——它是
 「估算空闲航线 > 0」这个判据的自然结果。
@@ -262,18 +269,31 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
 
 ## 十、交付分段与并行拆分
 
-### 第一段：`bot_loop` 补持久化
+### 第一段：修正攻击记录的两个缺陷
 
-`bot_loop` 现在一个字都不写库，而 bot 的完成判据整个建立在
-`attack_intents` / `attack_dispatches` 之上。抄 `pirate_loop:510,527` 的现成写法，
-`target_kind=TARGET_KIND_BOT`。
+调度器的两条核心判据（日配额、bot 完成度）都建立在 `attack_intents` /
+`attack_dispatches` 之上，而这两张表现在记错了、也记漏了：
 
-独立价值：做完 `/logs` 立刻能看到 bot 的攻击。
+1. **`target_kind` 错标**。`BotLoop` 继承 `PirateLoop._record_intent`，那里
+   `target_kind=TARGET_KIND_PIRATE` 硬编码。改成可由子类覆盖的类属性，
+   `BotLoop` 覆盖为 `TARGET_KIND_BOT`。不修这条，bot 每打一发都会占掉一格
+   海盗的当日配额。
+2. **`expected_report_at_utc` 恒为 NULL**。简报在 `_launch()` 里已经读到
+   （`DispatchBriefing.expected_report_at_utc`），只是没传出来。让 `_launch()`
+   返回简报，`_record_dispatch()` 接收并写入 `flight_seconds` 与
+   `expected_report_at_utc`；读不到简报时仍写 NULL（保持现有降级语义）。
+
+**不做历史数据回填**：库里现有 14 条 intent 全标着 `pirate`，而无法从坐标可靠地
+反推哪些其实是 bot（bot 与海盗都可能落在同一批坐标上）。样本只有 4 条派遣，
+凭空改标签比留着更糟。计划里改为**核对**：修完之后跑一次统计，确认新记录的
+标签分得开。
+
+独立价值：做完 `/logs` 上 bot 与海盗分得开，且战报等待时间第一次真正可用。
 
 ### 第二段：调度核心
 
-`domain/missions.py` + `domain/scheduler.py` + 三张表与迁移 + `MissionSupervisor` +
-两个 runner 的 `--once`。命令行先跑通。
+`domain/missions.py` + `domain/scheduler.py` + 三张表与迁移 + 仓储查询 +
+`MissionSupervisor`。命令行先跑通。（两个 runner 的 `--once` 已在第一段随 B 落地。）
 
 ### 第三段：页面
 
@@ -286,14 +306,15 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
 | 波次 | 单元 | 触碰的文件 | 依赖 |
 |---|---|---|---|
 | 1 | **A** `domain/scheduler.py` 纯函数 + 测试 | 新文件 | 无 |
-| 1 | **B** `bot_loop` 持久化 + `--once` | `tools/bot_loop.py` | 无 |
+| 1 | **B** `target_kind` 可覆盖 + 简报写入 dispatch + 两个 runner 的 `--once` | `tools/pirate_loop.py`、`tools/bot_loop.py` | 无 |
 | 1 | **C** 三张表 + 迁移 + 仓储查询（配额 / 完成判据 / 在飞数） | `storage/models.py`、`storage/repository.py`、`alembic/` | 无 |
-| 1 | **D** `domain/missions.py` 参数换算 + `pirate_loop --once` | 新文件、`tools/pirate_loop.py` | 无 |
+| 1 | **D** `domain/missions.py` 参数换算 + 测试 | 新文件 | 无 |
 | 2 | **E** `MissionSupervisor` | `application/` 新文件 | A、C |
 | 3 | **F** API | `web/app.py`、`web/schemas.py`、`web/persistent_service.py` | C、E |
 | 3 | **G** 页面 | `web/templates/missions.html` | F |
 
-波次 1 的四个单元文件不重叠，可同时开工。`B` 与 `D` 都改 runner 但各改各的文件。
+波次 1 的四个单元文件不重叠，可同时开工。两个 runner 的改动**全部集中在 B**，
+避免两个 agent 同时改 `pirate_loop.py`。
 
 ### 收尾
 
