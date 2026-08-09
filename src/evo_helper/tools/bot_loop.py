@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from evo_helper.domain.bot_round import BotPhase, DispatchFact, phase_of
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
@@ -160,7 +161,6 @@ class BotLoop(PirateLoop):
         `attack_dispatches.expected_report_at_utc`，到点由调度器把这条链路
         重新叫起来——这正是 `domain.report_wait` 模块头写的那条路。
         """
-        from evo_helper.domain.bot_round import BotPhase
         from evo_helper.game.game_window import ensure_game_window
 
         ensure_game_window()
@@ -178,26 +178,20 @@ class BotLoop(PirateLoop):
             # 其余三态这一趟没事可做：等战报，或已走完。
         return self._outcome
 
-    def _phase_of(self, coordinate: Coordinate) -> Any:
+    def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。
 
         **只认目标模式（默认档，一次点击都不做）不查库。** 那一档根本不派，
         没有派遣事实可言，查库只会凭空要求一个数据库。`_probe` 自己会在
         `probe=False` 时停在识别那一步，所以这里直接当成「该去看一眼」。
         """
-        from evo_helper.domain.bot_round import BotPhase, phase_of
-
         if not self._bot.probe:
             return BotPhase.NEEDS_PROBE
         return phase_of(self._dispatch_facts(coordinate))
 
-    def _dispatch_facts(self, coordinate: Coordinate) -> tuple[Any, ...]:
+    def _dispatch_facts(self, coordinate: Coordinate) -> tuple[DispatchFact, ...]:
         """本轮针对这个目标已经派过哪些发、战报回来了没有。"""
-        # 仓储上的 `bot_dispatch_facts` 由调度器那一批任务提供。这里按 Any 取，
-        # 好让这条链路能先独立合入——两边在同一波次里并行改。
-        # TODO(Task 7): `bot_dispatch_facts` 合流后删掉这个 Any，改回
-        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
-        repository: Any = self._ensure_run()[0]
+        repository, _run_id = self._ensure_run()
         return tuple(repository.bot_dispatch_facts(coordinate, since=self._round_start()))
 
     def _probe(self, coordinate: Coordinate) -> None:
@@ -235,9 +229,7 @@ class BotLoop(PirateLoop):
 
     def _mark_skipped(self, coordinate: Coordinate) -> None:
         """把「分档说不值得打」记进库，否则下一趟又会重新分一次档。"""
-        # TODO(Task 7): `mark_bot_target_skipped` 合流后删掉这个 Any，改回
-        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
-        repository: Any = self._ensure_run()[0]
+        repository, _run_id = self._ensure_run()
         repository.mark_bot_target_skipped(coordinate, since=self._round_start())
 
     def _round_start(self) -> datetime:
