@@ -151,9 +151,22 @@ tick(now):
   同样计入完成——它已经走完该走的流程。
 - **扫描**：无完成态。
 
-**防卡死**：过了 `expected_report_at_utc` 再加宽限期 `REPORT_GRACE`（默认 30 分钟）
-仍读不到战报的目标，写一条 `target_revisits`（`scope=BOT_REPORT_MISSING`）并**跳过**，
-不计入未完成集合。一份读不出来的战报不得把任务 2 永久卡住。
+**防卡死**要两条规则，缺一条就会反转成永久卡死：
+
+1. 有 `expected_report_at_utc` 的：过了它再加宽限期 `REPORT_GRACE`（默认 30 分钟）
+   仍读不到战报 → 判缺失。
+2. **`expected_report_at_utc` 为 NULL 的：按 `dispatched_at_utc` 算**，超过
+   `MAX_REPORT_AGE`（默认 6 小时）仍未闭合 → 同样判缺失。
+
+第 2 条不能省。`ReportWaitPlanner` 见到任何一条 NULL 就无条件返回 `COLLECT`，
+而库里**现存的派遣全部是 NULL**（飞行时间从来没人读过，历史也不回填）。
+只写第 1 条的话，NULL 的派遣既永远「可收」、又永远不被判缺失——海盗的
+「有活干」右半边被钉死为真，调度器每个 tick 都去收一封永远不会到的战报，
+扫描永远抢不到空隙。**防卡死机制会原样变成卡死机制。**
+
+判为缺失的目标写一条 `target_revisits`（`scope=BOT_REPORT_MISSING`）并**跳过**，
+不计入未完成集合，也**必须从 `pending_reports_for_kind` 的结果里排除**——
+否则它照样把 `COLLECT` 钉死。
 
 ## 四、数据模型
 
@@ -190,6 +203,15 @@ tick(now):
 - bot 完成判据：查 `battle_reports ⋈ attack_dispatches ⋈ attack_intents`，
   取 `intent.target` 落在范围内、且战报晚于 `round_started_at_utc` 的目标集合。
 - 战报缺失被跳过的目标：写已有的 `target_revisits`（其语义正是「需要复查的目标」）。
+- 分档判为「不值得打」的目标：同样写 `target_revisits`，用另一个 scope
+  （`BOT_TIER_NEGLIGIBLE`）。**不要写 `attack_intents.guard_status`**——那一列已经
+  被 `application/workflow.py` 用 `ALLOWED` / `REFUSED` 占着，`logs.html` 会把它
+  渲染成「未派出 · {原因}」。往里塞第三套词汇，日志页会给出错误的未派出原因。
+
+**在飞数**（航线估算用，**跨 kind 的全局量**——航线是全局资源）：
+`accepted=true` 且 `expected_report_at_utc > now` 且尚无 `battle_report` 的条数。
+这与 `pending_reports_for_kind` 不是同一个查询：那个按 kind 分、不带 `> now`、
+也返回已闭合的行。
 
 ### 调度器开关不持久化
 
@@ -373,6 +395,16 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
    落地前过 mypy strict 而放宽的两处，合流后应还原成正常类型。
 3. **`bot_dispatch_facts` 的返回类型**从 `list[Any]` 改成 `list[DispatchFact]`。
    `DispatchFact` 是纯 domain dataclass，不构成 import 环，模块级 import 即可。
+4. **`pending_reports_for_kind` 补时间下界并排除已判缺失的派遣**（见第三节防卡死）。
+   现状会让「有到期未收的战报」永久为真。
+5. **补 `count_inflight()`**（跨 kind 的在飞数），波次 1 漏做了。
+6. **`bot_dispatch_facts` 补 `accepted` / `dry_run` 过滤**。兄弟方法都过滤了，
+   这个漏了：一条被游戏拒掉的派遣会被当成「已派出且永远收不到战报」，
+   该目标就永远停在待收状态，bot 的完成态永远达不到。
+7. **`mark_bot_target_skipped` 只改最新一条**，`since` 改成必填。现在它改所有匹配
+   行，且 `since=None` 分支会把该坐标历史上每一轮的每一条 intent 全刷成跳过。
+8. **给 `bot_dispatch_facts` / `mark_bot_target_skipped` 补集成测试**。规格第九节
+   点名的四件事，波次 1 只测了两件。
 
 ### 收尾
 
