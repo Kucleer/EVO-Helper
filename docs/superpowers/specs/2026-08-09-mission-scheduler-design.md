@@ -27,6 +27,9 @@
 | **`BotLoop` 是 `PirateLoop` 的子类**，写库走继承来的 `_record_intent`，其中 `target_kind=TARGET_KIND_PIRATE` **硬编码** → bot 的攻击会被错标成海盗，污染日配额计数 | `tools/bot_loop.py:69`、`tools/pirate_loop.py:501-522` |
 | **`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。简报数据在 `_launch()` 里读到了但没传出来 | `tools/pirate_loop.py:301,527`、`vision/parsers.py:603-618` |
 | 「该等还是该收」已有纯函数判据，且已定义 NULL = 立即收取 | `domain/report_wait.py` `ReportWaitPlanner` |
+| 两个 runner 的 `run()` **已经是单趟就退出**（各遍历一遍输入列表就 return），因此**不需要 `--once`** | `tools/pirate_loop.py:541`、`tools/bot_loop.py:153` |
+| **`bot_loop` 每个目标在进程内 `time.sleep(600)` 等战报**，期间独占鼠标 | `tools/bot_loop.py:59,176` |
+| 海盗的进程内等待只有 45 秒，不构成问题 | `tools/pirate_loop.py:81` |
 | 主星 `Coordinate(2,137,18)` 硬编码了两遍 | `tools/pirate_loop.py:69`、`tools/scan_coordinates.py:49` |
 | 系号上限常量 | `domain/scan_priority.py` `SYSTEMS_PER_GALAXY` |
 | web 服务单进程单 worker（`uvicorn.run` 收的是 app 对象） | `web/runtime.py:main` |
@@ -49,8 +52,19 @@
 ### 「有活干」判据
 
 - **海盗**：当日配额未用尽 **且**（估算空闲航线 > 0 **或** 有到期未收的 `PIRATE` 战报）
-- **bot**：本轮范围内仍有未收到战报的目标 **且**（估算空闲航线 > 0 **或** 有到期未收的 `BOT` 战报）
+- **bot**：本轮范围内存在**未完成**的目标 **且**（估算空闲航线 > 0 **或** 有到期未收的 `BOT` 战报）
 - **扫描**：恒为真
+
+bot 的每个目标在一轮里走三态，**状态从库里推导，不新增列**——本轮该目标的
+`attack_intents` 里，`preset_name` 等于探路预设（`DEFAULT_PRESET.name`）的是探路发，
+等于分档预设（AAA / BBB / CCC）的是攻击发：
+
+| 态 | 库里的样子 | 需要什么 |
+|---|---|---|
+| 待探路 | 本轮无该目标的 intent | 空航线 |
+| 待分档攻击 | 有探路 intent 且其战报已到 | 空航线 |
+| 待收攻击战报 | 有攻击 intent 但战报未到 | 到期 |
+| **完成** | 有攻击 intent 且其战报已到 | —— |
 
 「有到期未收的战报」**不另写判据，复用 `domain/report_wait.py` 的 `ReportWaitPlanner`**：
 把该 `target_kind` 下尚无战报、且未被判为「战报缺失」的派遣组成 `PendingReport` 列表，
@@ -124,8 +138,10 @@ tick(now):
 ### 完成态
 
 - **海盗**：当日配额用尽 → 退出调度，到 UTC 00:00 自动复活。
-- **bot**：本轮范围内每个目标都**收到战报** → 任务完成并退出，只剩扫描。
-  **不自动开新一轮**；页面提供显式的「重开一轮」按钮（把 `round_started_at_utc` 推到当前）。
+- **bot**：本轮范围内每个目标都收到**攻击发**（非探路预设）的战报 → 任务完成并退出，
+  只剩扫描。**不自动开新一轮**；页面提供显式的「重开一轮」按钮
+  （把 `round_started_at_utc` 推到当前）。分档判定为「不值得打」而没派攻击的目标，
+  同样计入完成——它已经走完该走的流程。
 - **扫描**：无完成态。
 
 **防卡死**：过了 `expected_report_at_utc` 再加宽限期 `REPORT_GRACE`（默认 30 分钟）
@@ -175,11 +191,21 @@ tick(now):
 
 ## 五、runner 契约与进程生命周期
 
-### `--once`
+### 单趟即退，不在进程内等战报
 
-`pirate_loop` 与 `bot_loop` 各加 `--once`：**跑完当前这一轮**（把可用航线派满 /
-收完到期战报）**就正常退出**。`scan_coordinates` 不需要——它本来就可中断，调度器直接
-`terminate`。
+两个 runner 的 `run()` 已经是单趟就退出，**不需要 `--once`**。
+
+但 `bot_loop` 现在每个目标 `time.sleep(600)` 等战报，期间独占鼠标——5 个目标就是
+50 分钟，扫描一次也插不进去。这与「等待攻击路线时进行扫描」的需求直接冲突。
+
+**改为「派出即退出」**：拆掉 `REPORT_WAIT_S` 的干睡，一趟只推进每个目标一态
+（派探路 / 读战报后分档攻击），把 `expected_report_at_utc` 写进库然后退出。
+调度器拿这段时间去跑扫描，到点再把 bot 起来。这正是 `domain/report_wait.py` 开头
+写下的设计意图：「派出之后助手**不持有会话**……到点再回来登录收报告」。
+
+海盗的 `SCOUT_REPORT_WAIT_S = 45` 秒不动——45 秒不值得为它拆流程。
+
+`scan_coordinates` 不需要改，它本来就可中断，调度器直接 `terminate`。
 
 **退出码是唯一的进程间协议**：0 = 这一轮正常跑完，非 0 = 异常。调度器不解析 stdout，
 所有判据一律查库——这样调度器看到的和 `/logs` 页面看到的是同一份事实。
@@ -283,17 +309,21 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
    返回简报，`_record_dispatch()` 接收并写入 `flight_seconds` 与
    `expected_report_at_utc`；读不到简报时仍写 NULL（保持现有降级语义）。
 
+3. **`bot_loop` 拆掉进程内干睡**，改为「派出即退出」，一趟只推进每个目标一态。
+   见上一节。
+
 **不做历史数据回填**：库里现有 14 条 intent 全标着 `pirate`，而无法从坐标可靠地
 反推哪些其实是 bot（bot 与海盗都可能落在同一批坐标上）。样本只有 4 条派遣，
 凭空改标签比留着更糟。计划里改为**核对**：修完之后跑一次统计，确认新记录的
 标签分得开。
 
-独立价值：做完 `/logs` 上 bot 与海盗分得开，且战报等待时间第一次真正可用。
+独立价值：做完 `/logs` 上 bot 与海盗分得开，战报等待时间第一次真正可用，
+且 bot 链路不再一睡 50 分钟。
 
 ### 第二段：调度核心
 
 `domain/missions.py` + `domain/scheduler.py` + 三张表与迁移 + 仓储查询 +
-`MissionSupervisor`。命令行先跑通。（两个 runner 的 `--once` 已在第一段随 B 落地。）
+`MissionSupervisor`。命令行先跑通。（runner 侧的改动全在第一段的 B 里。）
 
 ### 第三段：页面
 
@@ -306,7 +336,7 @@ bot 都没有；命令行长度逼近 Windows `CreateProcess` 的 32767 上限�
 | 波次 | 单元 | 触碰的文件 | 依赖 |
 |---|---|---|---|
 | 1 | **A** `domain/scheduler.py` 纯函数 + 测试 | 新文件 | 无 |
-| 1 | **B** `target_kind` 可覆盖 + 简报写入 dispatch + 两个 runner 的 `--once` | `tools/pirate_loop.py`、`tools/bot_loop.py` | 无 |
+| 1 | **B** `target_kind` 可覆盖 + 简报写入 dispatch + `bot_loop` 改「派出即退出」 | `tools/pirate_loop.py`、`tools/bot_loop.py` | 无 |
 | 1 | **C** 三张表 + 迁移 + 仓储查询（配额 / 完成判据 / 在飞数） | `storage/models.py`、`storage/repository.py`、`alembic/` | 无 |
 | 1 | **D** `domain/missions.py` 参数换算 + 测试 | 新文件 | 无 |
 | 2 | **E** `MissionSupervisor` | `application/` 新文件 | A、C |
