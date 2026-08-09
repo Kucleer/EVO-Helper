@@ -2,9 +2,9 @@
 
 用户的实际需求不是精确数量，是**落在哪一档**：
 
-    2K–5K   → 攻击组合甲
-    5K–8K   → 攻击组合乙
-    8K+     → 攻击组合丙
+    2K–5K   → 预设 AAA
+    5K–8K   → 预设 BBB
+    8K+     → 预设 CCC
 
 所以识别的目标随之改变：`5.36K` 读成 `5.35K` 无所谓，读成 `.36K` 才致命——
 差一个数量级就会换错组合。防的是**量级错**，不是末位误差。
@@ -38,10 +38,16 @@ class FleetTier(Enum):
         return _TIER_PRESETS.get(self)
 
 
+#: 各档用的**游戏内预设标题**。用户确认（2026-08-09）：甲=AAA、乙=BBB、丙=CCC。
+#:
+#: 这里存的必须是**标题原文**，因为派遣链路是按标题在预设条上 OCR 找的
+#: （`game.preset_picker`）。原先写的是「攻击组合甲/乙/丙」——游戏里没有这些预设，
+#: 照它去找一定找不到，整发放弃。**改这里之前对着游戏的预设条核一遍标题。**
+#: 预设里装了什么由用户在游戏里维护，助手不读也不校验。
 _TIER_PRESETS = {
-    FleetTier.ALPHA: "攻击组合甲",
-    FleetTier.BETA: "攻击组合乙",
-    FleetTier.GAMMA: "攻击组合丙",
+    FleetTier.ALPHA: "AAA",
+    FleetTier.BETA: "BBB",
+    FleetTier.GAMMA: "CCC",
 }
 
 #: 档位边界（单位：艘）。
