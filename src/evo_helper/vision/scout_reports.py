@@ -51,11 +51,22 @@ MAX_SYSTEM = SYSTEMS_PER_GALAXY
 MAX_POSITION_VALUE = MAX_POSITION
 
 #: 战舰清单的横向范围与可读的纵向范围（拖到底那一屏，879 空间）。
-#: 名字在左、数量右对齐，中间是背景水印——`number_column()` 现场量数字列，
-#: 不写死左界：写死会切掉首位数字，`22` 读成 `2`。
 SCOUT_SHIP_BAND = ColumnBand(720, 1210)
 SCOUT_SHIP_TOP = 200
 SCOUT_SHIP_BOTTOM = 762
+
+#: 数量列的横向范围。**写死，不现场量。**
+#:
+#: ⚠️ 这是一次真实事故的补丁（2026-08-09）：原先用 `number_column()` 现场量，
+#: 而这份清单**整列都是 0** 时每格只有一个窄窄的 `0`，够宽的墨迹段只剩下面板左边
+#: 那层水印（`-17003` / `COMMAND OFFICERS`）——量出来的「数字列」是 (731, 808)，
+#: 于是读到的「数量」是水印里的数字。判定因此把一个四项全 0 的海盗当成有舰队，
+#: **真的打了一发出去**。日志里同一封报告两次读成 `{'噬能截击者': 8}` 与
+#: `{'深空吞噬者': 2}`，前后不一致本身就是这个错的指纹。
+#:
+#: 这一列右对齐、贴着面板右沿，位置本来就是固定的；写死既准又挡住了水印。
+#: 左界给到 1090 是为了容下 `5.36K` 这样的五字符读数（水印最右到 x≈950）。
+SCOUT_COUNT_BAND = (1090, 1195)
 
 
 class ScoutReportUnreadable(RuntimeError):
@@ -112,7 +123,13 @@ class ScoutReportScreens(Protocol):
     def scout_intro_texts(self) -> list[str]: ...
 
     def named_counts(
-        self, wanted: tuple[str, ...], band: ColumnBand, top: int, bottom: int
+        self,
+        wanted: tuple[str, ...],
+        band: ColumnBand,
+        top: int,
+        bottom: int,
+        *,
+        count_band: tuple[int, int] | None = ...,
     ) -> dict[str, int]: ...
 
 
@@ -170,7 +187,11 @@ def read_pirate_scout(
         )
 
     counts = ships.named_counts(
-        PIRATE_TRIGGER_SHIPS, SCOUT_SHIP_BAND, SCOUT_SHIP_TOP, SCOUT_SHIP_BOTTOM
+        PIRATE_TRIGGER_SHIPS,
+        SCOUT_SHIP_BAND,
+        SCOUT_SHIP_TOP,
+        SCOUT_SHIP_BOTTOM,
+        count_band=SCOUT_COUNT_BAND,
     )
     missing = tuple(name for name in PIRATE_TRIGGER_SHIPS if name not in counts)
     if len(missing) == len(PIRATE_TRIGGER_SHIPS):

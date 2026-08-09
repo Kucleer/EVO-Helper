@@ -46,7 +46,10 @@ class _Screens:
     def scout_intro_texts(self) -> list[str]:
         return self._intro
 
-    def named_counts(self, wanted, band, top, bottom) -> dict[str, int]:  # type: ignore[no-untyped-def]
+    def named_counts(self, wanted, band, top, bottom, *, count_band=None) -> dict[str, int]:  # type: ignore[no-untyped-def]
+        # `count_band` 必须由调用方传进来：不传就会退回现场量数字列，而那在
+        # 「整列全 0」的清单上会量到面板左边的水印上去（实机因此误打了一发）。
+        assert count_band is not None, "数量列必须写死传入，不能现场量"
         return {name: value for name, value in self._counts.items() if name in wanted}
 
 

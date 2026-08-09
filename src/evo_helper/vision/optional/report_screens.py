@@ -254,7 +254,13 @@ class ImageReportScreens:
         return (max(pitch, 1), ordered)
 
     def named_counts(
-        self, wanted: Sequence[str], band: ColumnBand, top: int, bottom: int
+        self,
+        wanted: Sequence[str],
+        band: ColumnBand,
+        top: int,
+        bottom: int,
+        *,
+        count_band: tuple[int, int] | None = None,
     ) -> dict[str, int]:
         """在一张清单里**按名字**取数量，而不是按行序对位。
 
@@ -266,10 +272,16 @@ class ImageReportScreens:
         名字自己就是这一行的凭据，掉行只会让那个名字缺席，不会让别人顶替它。
         缺席的名字**不出现在返回值里**——是当 0 还是整份拒收，由调用方决定：
         「这一屏没滚到」和「这个舰种真的是 0」在这里分不出来，也不该在这里猜。
+
+        ⚠️ **`count_band` 要传。** 不传就退回 `number_column()` 现场量，而那在
+        「整列都是 0」的清单上会量错：单个 `0` 太窄，够宽的墨迹段只剩下面板左边
+        那层水印（`-17003` / `COMMAND OFFICERS`），于是量出来的「数字列」是 (731, 808)，
+        读到的「数量」其实是水印里的数字。
+        **实机后果：一个四项全 0 的海盗被读成有舰队，真的挨了一发攻击**（2026-08-09）。
         """
         from evo_helper.vision.parsers import snap_unit_name
 
-        column = number_column(self._image, band, top, bottom)
+        column = count_band or number_column(self._image, band, top, bottom)
         counts: dict[str, int] = {}
         # 换档补漏：同一列在不同放大倍数下漏掉的行不一样（实测 3× 整行漏掉
         # `钛能守卫者`，4× 读得出来）。只补没找到的名字，已经读到的不重读。
@@ -290,7 +302,15 @@ class ImageReportScreens:
         return counts
 
     def _count_at(self, column: tuple[int, int], top: int, pitch: int) -> int | None:
-        """读一行的数量；读不出返回 None。"""
+        """读一行的数量；读不出返回 None。
+
+        **非 0 的读数要求至少两套配方读出同一个字符串**，0 只要一套就采信。
+
+        这条不对称是有意的：非 0 会让判定变成「打」，也就是真的送出舰队，
+        所以它需要旁证；而 0 只会让我们跳过一个目标，代价是白跑一趟。
+        实测那个孤零零的 `0` 只有 2× 那一档读得出来（见 `TOTALS_RECIPES`），
+        对它要求两票就等于永远读不出 0——那会把「这里是空的」变成「不知道」。
+        """
         from evo_helper.domain.fleet_tier import parse_fleet_count
         from evo_helper.vision.fleet_counts import pick_count
 
@@ -309,7 +329,16 @@ class ImageReportScreens:
             if text:
                 votes[text] = votes.get(text, 0) + 1
         picked = pick_count(votes)
-        return parse_fleet_count(picked) if picked else None
+        if not picked:
+            return None
+        value = parse_fleet_count(picked)
+        if value is None:
+            return None
+        if value != 0 and votes.get(picked, 0) < COUNT_MIN_AGREEMENT:
+            # 只有一套配方读出这个非 0 值，旁证不足。宁可当成「没读到」——
+            # 调用方那边「没读到」不会变成「打」，而一个假的非 0 会。
+            return None
+        return value
 
     def scout_intro_texts(self) -> list[str]:
         """侦察报告开头那行的候选读法，一套配方一个。
@@ -718,3 +747,7 @@ UNIT_VALUE_INSET = 100
 #: 2× 只加在这两行上，不动 `COUNT_RECIPES`——那套阶梯是对着舰队明细列标定的，
 #: 而「读得对」在那边是靠合计校验兜住的，这边没有合计可校。
 TOTALS_RECIPES: tuple[tuple[int, str], ...] = ((2, "lanczos"), *COUNT_RECIPES)
+
+#: 非 0 的数量至少要几套配方读出同一个字符串才采信。
+#: 见 `_count_at`：非 0 会让判定变成「打」，需要旁证；0 只要一套。
+COUNT_MIN_AGREEMENT = 2
