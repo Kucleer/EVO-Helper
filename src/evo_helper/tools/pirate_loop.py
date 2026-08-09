@@ -84,7 +84,7 @@ SCOUT_REPORT_RETRIES = 3
 
 #: 简报上的飞行时间超过这个上界，就当**读错了**，回程闹钟写 NULL。
 #:
-#: 这道护栏补的是 `_read_briefing` 丢掉的那道交叉校验：`DispatchBriefing`
+#: 这道护栏补的是 `_read_flight_time` 拿不到的那道交叉校验：`DispatchBriefing`
 #: 本来用「绝对到达时间 vs 当前时间+时长」互相验（见 `duration_agrees`），
 #: 而这里只读时长这一个来源，读错了没有第二处能揭穿它。
 #:
