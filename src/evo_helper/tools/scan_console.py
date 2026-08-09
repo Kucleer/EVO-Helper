@@ -1,183 +1,438 @@
-"""扫描任务的常驻控制台：全局快捷键启停 + 屏幕角落的状态窗。
+"""任务调度器的桌面瘦客户端：屏幕角落的状态窗 + 全局快捷键。
 
-    Alt+F8  开始扫描（可用 --start-key 换）
-    Alt+F9  结束扫描（可用 --stop-key 换）
+    Alt+F8  开始调度（可用 --start-key 换）
+    Alt+F9  结束调度（可用 --stop-key 换）
 
-状态窗右键=停止、双击=退出、左键拖动。右键只停不启，是快捷键被别的程序占掉时的退路。
-
-扫描期间游戏窗口一直占着前台，控制台窗口被压在后面看不见——没有这个状态窗，
-「它还在不在跑、跑了多久」就只能靠猜。所以状态窗必须**置顶且不抢焦点**：
-它一旦抢了焦点，扫描下一次点击就会打到它身上。
+状态窗右键=结束调度、双击=只关窗（调度器照跑）、左键拖动。右键只停不启，是快捷键
+被别的程序占掉时的退路。双击不再顺带停调度器：旧版本里两者绑在一起，是因为那时
+窗口一关子进程就没人管了；现在进程归调度器管，关掉状态窗只是不看了。
 
     python -m evo_helper.tools.scan_console
+
+**这个模块一个进程都不起。** 它以前会自己拉起扫描 runner，那是全仓唯一的第二个
+启动器。调度器上线后就成了两个互不知情的东西抢同一个鼠标：调度器以为只有自己在
+派舰队，而 Alt+F8 还能另开一轮扫描。设计规格第八节第 1 条「任何时刻最多一个子进程
+在点鼠标」（一个游戏窗口，一个鼠标）靠约定守不住，只能靠取消第二个启动器——
+起进程那份职责现在整个在 `application/mission_supervisor.MissionSupervisor` 那边。
+所以这里所有的动作都只是往 `POST /api/scheduler/{start,stop}` 发一个请求。
+
+任务期间游戏窗口一直占着前台，浏览器里的控制台被压在后面看不见——没有这个状态窗，
+「现在跑的是哪条链路、跑了多久」就只能靠猜。所以状态窗必须**置顶且不抢焦点**：
+它一旦抢了焦点，runner 下一次点击就会打到它身上。
+
+HTTP 走标准库 `urllib`，不用 `requests`：`requests` 在本仓是可选依赖，
+而缺依赖导致的「未连接」和服务真的没起的「未连接」在这个 200×92 的小窗上长得
+一模一样，用户只会去重启一台其实好好的服务。
 """
 
 from __future__ import annotations
 
+import json
 import queue
-import subprocess
 import sys
 import threading
-import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
+from urllib.request import Request
 
-#: 扫描安全停止后隔多久自动续扫。安全停止多半是「用户正在用电脑」这类瞬时原因，
-#: 退避重试比直接放弃合适；60 秒既不打扰人，也不会让机器长时间空转。
-RETRY_BACKOFF_S = 60.0
+from evo_helper.web.security import default_local_token
 
 #: 状态窗尺寸与离工作区右下角的边距（物理像素）。
 WINDOW_SIZE = (200, 92)
 WINDOW_MARGIN = 40
 
-#: 状态窗刷新间隔。秒级计时器，200ms 足够跟手又不费电。
+#: 状态窗重画间隔。秒级计时器，200ms 足够跟手又不费电。
+#: 这只是重画——问服务要状态是后台线程的事，见 `SchedulerPoller`。
 REFRESH_MS = 200
 
-LOG_PATH = Path("var/logs/scan-priority.log")
+#: 后台线程多久问一次调度器。页面上的秒表也是一秒一跳，对得上。
+POLL_INTERVAL_S = 1.0
+
+#: 单次请求的等待上限。本机回环，正常是毫秒级；这个数只用来兜住服务卡住的情况。
+REQUEST_TIMEOUT_S = 3.0
+
+#: 连着几次拿不到状态才认「未连接」。
+#:
+#: 一次问不到就翻脸是错的：调度器抢占扫描那一下会 `terminate()` 之后再 `wait(5)`，
+#: 那几秒里状态问不出来，而它其实正在好好地派舰队。显示成断线会让用户去重启一台
+#: 没坏的服务，甚至以为要自己动手补一轮。
+OFFLINE_AFTER_MISSES = 3
+
+#: 一句提示在第三行停留多久。过期后退回快捷键提示——注册失败时用户得知道该按什么。
+NOTICE_TTL_S = 5.0
+
+#: 连不上时按快捷键给的话。**只提示，不做任何事**：调度器可能其实正在跑、
+#: 只是一时接不上，那时自己再起一个进程正是要防的双主人。
+NOTICE_OFFLINE = "服务未启动"
+#: 403：服务活着，但不认这个令牌。跟「服务没起」提示同一句话的话，
+#: 用户会去重启一台没坏的服务，而真正该做的是对一下 `EVO_HELPER_WEB_TOKEN`。
+NOTICE_DENIED = "令牌不符"
 
 
-class ScanState(Enum):
-    """状态窗上直接显示这些字。"""
+class ConsoleState(Enum):
+    """状态窗第一行的四档。链路名由服务端下发，只在它为空时才退回这里的字。"""
 
-    IDLE = "已停止"
-    RUNNING = "扫描中"
-    BACKOFF = "等待重试"
-    DONE = "已扫完"
-
-
-class Process(Protocol):
-    """`subprocess.Popen` 里这个模块用到的那一小部分。"""
-
-    def poll(self) -> int | None: ...
-
-    def terminate(self) -> None: ...
-
-    def wait(self, timeout: float | None = ...) -> int: ...
+    OFFLINE = "未连接"
+    STOPPED = "已停止"
+    IDLE = "待命"
+    RUNNING = "运行中"
 
 
 def format_duration(seconds: float) -> str:
-    """把秒数排成 `H:MM:SS`。跨小时的扫描很常见，所以小时位不省。"""
+    """把秒数排成 `H:MM:SS`。跨小时的任务很常见，所以小时位不省。"""
     total = max(int(seconds), 0)
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}"
 
 
-@dataclass
-class ScanSupervisor:
-    """管扫描子进程的起停与自动续扫，并对外报状态。
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
-    这里刻意不碰界面也不碰 Win32：起停逻辑是这个功能里唯一有分支的部分，
-    把它单独摘出来才测得了。
+
+# -- 调度器接口 ----------------------------------------------------------------
+
+
+class SchedulerProtocolError(ValueError):
+    """服务回的东西不是一份调度器状态。"""
+
+
+@dataclass(frozen=True)
+class CurrentMission:
+    """正在跑的那条链路。`label` 是服务端下发的中文名，这边不自己拼。"""
+
+    kind: str
+    label: str
+    started_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class SchedulerSnapshot:
+    """`GET /api/scheduler` 里悬浮窗用得上的那三个字段。
+
+    其余字段（`tasks`、`orphan_pid`）是页面的事：这个 200×92 的小窗放不下一张
+    任务表，硬塞进来只会让两边对同一份数据各写一套解释。
     """
 
-    launch: Callable[[], Process]
-    clock: Callable[[], float] = time.monotonic
-    backoff_s: float = RETRY_BACKOFF_S
+    running: bool
+    started_at_utc: datetime | None = None
+    current: CurrentMission | None = None
 
-    state: ScanState = ScanState.IDLE
-    _process: Process | None = None
-    _started_at: float | None = None
-    _stopped_elapsed: float = 0.0
-    _retry_at: float | None = None
-    _restarts: int = 0
 
-    # -- 对外操作 --------------------------------------------------------------
+def parse_moment(value: object) -> datetime | None:
+    """把接口给的时刻字符串译成带时区的 UTC 时刻。
+
+    认不出来就返回 None 而不是抛错：秒表少一格，远好过整个状态窗因为一个时间字段
+    黑掉——它唯一的用处就是在 runner 把游戏顶在前台时还能看见状态。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # 服务端下发的一律带时区；不带的按 UTC 认，免得减出一个差八小时的秒表。
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _parse_current(payload: object) -> CurrentMission | None:
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    label = payload.get("label")
+    return CurrentMission(
+        kind=kind if isinstance(kind, str) else "",
+        label=label if isinstance(label, str) else "",
+        started_at_utc=parse_moment(payload.get("started_at_utc")),
+    )
+
+
+def parse_scheduler(payload: object) -> SchedulerSnapshot:
+    """解 `GET /api/scheduler` 的回包。
+
+    只有 `running` 缺失或不是布尔才算「这不是调度器状态」——那种情况多半是
+    连到了别的服务，或者被中间的什么东西塞了一页 HTML 回来。其余字段一律容错：
+    接口以后多一个字段、少一个字段，都不该让状态窗一片空白。
+    """
+    if not isinstance(payload, dict):
+        raise SchedulerProtocolError(f"调度器状态不是一个对象：{type(payload).__name__}")
+    running = payload.get("running")
+    if not isinstance(running, bool):
+        raise SchedulerProtocolError("调度器状态里没有 running，这不像是控制台")
+    return SchedulerSnapshot(
+        running=running,
+        started_at_utc=parse_moment(payload.get("started_at_utc")),
+        current=_parse_current(payload.get("current")),
+    )
+
+
+#: 监听所有网卡的写法。这些**不是能连的地址**，要连得回落到回环。
+WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "*"})
+
+
+def scheduler_base_url(host: str, port: int) -> str:
+    """控制台的地址。
+
+    端口从 `config.Settings` 来（可被 `EVO_HELPER_PORT` 改掉），不写死。
+    绑在通配地址上时连回环——`0.0.0.0` 是「监听所有网卡」，不是一个能连的地址。
+    """
+    dial = "127.0.0.1" if host in WILDCARD_HOSTS else host
+    # IPv6 字面量在 URL 里必须加方括号，不然端口那个冒号分不出来。
+    if ":" in dial:
+        dial = f"[{dial}]"
+    return f"http://{dial}:{port}"
+
+
+class CommandResult(Enum):
+    """一次「开始 / 结束」的下场。三档各自对应一句不同的提示。"""
+
+    OK = "ok"
+    DENIED = "denied"
+    UNREACHABLE = "unreachable"
+
+
+ACTION_START = "start"
+ACTION_STOP = "stop"
+
+_ACTION_PATHS = {ACTION_START: "/api/scheduler/start", ACTION_STOP: "/api/scheduler/stop"}
+
+#: `RegisterHotKey` 的动作号。两个键控制的是**整个调度器**，等同于网页上的开始/结束。
+HOTKEY_START = 1
+HOTKEY_STOP = 2
+
+#: 快捷键 → 动作。右键不在这张表里，它恒为 `ACTION_STOP`，见 `request_stop()`。
+_HOTKEY_ACTIONS = {HOTKEY_START: ACTION_START, HOTKEY_STOP: ACTION_STOP}
+
+Opener = Callable[[Request, float], bytes]
+
+
+def _urlopen(request: Request, timeout: float) -> bytes:  # pragma: no cover - 真的去连服务
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return cast(bytes, response.read())
+
+
+@dataclass
+class SchedulerClient:
+    """对着 `GET/POST /api/scheduler*` 说话。**它只发请求，不做任何决定。**
+
+    `opener` 可注入，测试一律给假的：这个类唯一的副作用就是网络。
+    """
+
+    base_url: str
+    token: str
+    opener: Opener = _urlopen
+    timeout_s: float = REQUEST_TIMEOUT_S
+
+    def fetch(self) -> SchedulerSnapshot | None:
+        """要一份状态。任何拿不到、看不懂的情况都返回 None（= 这一轮没答案）。
+
+        故障不细分：读路径上唯一的下一步都是「先留着上一份状态，攒够次数再说
+        未连接」，分出三种错来也不会做出不同的事。
+        """
+        try:
+            body = self._call("GET", "/api/scheduler")
+        except (urllib.error.URLError, OSError):
+            return None
+        try:
+            return parse_scheduler(json.loads(body))
+        except (ValueError, SchedulerProtocolError):
+            # `json.JSONDecodeError` 是 `ValueError` 的子类，一并收在这里。
+            return None
+
+    def command(self, action: str) -> CommandResult:
+        """发一次开始 / 结束。"""
+        try:
+            self._call("POST", _ACTION_PATHS[action])
+        except urllib.error.HTTPError as exc:
+            return CommandResult.DENIED if exc.code == 403 else CommandResult.UNREACHABLE
+        except (urllib.error.URLError, OSError):
+            return CommandResult.UNREACHABLE
+        return CommandResult.OK
+
+    def _call(self, method: str, path: str) -> bytes:
+        request = Request(f"{self.base_url}{path}", method=method)  # noqa: S310 - 地址本模块拼
+        # 悬浮窗是本机进程、不是浏览器，**没有 Origin 可言**，所以写请求只能走
+        # 令牌那条路。令牌与服务端同源同解（`web.security.default_local_token`），
+        # 两边各读一次同一个环境变量，不需要任何握手。
+        request.add_header("X-Evo-Helper-Token", self.token)
+        return self.opener(request, self.timeout_s)
+
+
+# -- 后台轮询 ------------------------------------------------------------------
+
+
+class SchedulerLike(Protocol):
+    """`SchedulerPoller` 用到的那一小部分。"""
+
+    def fetch(self) -> SchedulerSnapshot | None: ...
+
+    def command(self, action: str) -> CommandResult: ...
+
+
+class SchedulerPoller:
+    """在自己的线程里问状态、代发开始/结束。
+
+    HTTP 不能在 tkinter 线程里做。调度器抢占扫描那一下会 `terminate()` 之后再
+    `wait(5)`，那几秒里 `GET /api/scheduler` 不回话——跟着一起卡住的是整个状态窗，
+    连拖都拖不动。这和 `HotkeyListener` 另起线程是同一个理由：主循环只泵自己的事，
+    结果一律经队列递回去。
+
+    命令走队列而不是直接调：按下 Alt+F9 那一下如果同步等在界面线程里，
+    用户看到的就是窗口先僵住再变字。塞进队列还顺带让它立刻醒过来，
+    不用等下一个轮询周期。
+    """
+
+    _CLOSE = "__close__"
+
+    def __init__(self, client: SchedulerLike, *, interval_s: float = POLL_INTERVAL_S) -> None:
+        self._client = client
+        self._interval_s = interval_s
+        self._commands: queue.Queue[str] = queue.Queue()
+        self.snapshots: queue.Queue[SchedulerSnapshot | None] = queue.Queue()
+        self.outcomes: queue.Queue[CommandResult] = queue.Queue()
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """开始扫描。已经在跑就什么都不做——快捷键会被手抖按两下。"""
-        if self.state in {ScanState.RUNNING, ScanState.BACKOFF}:
-            return
-        self._started_at = self.clock()
-        self._stopped_elapsed = 0.0
-        self._restarts = 0
-        self._spawn()
+        self._thread = threading.Thread(target=self._run, name="scheduler-poll", daemon=True)
+        self._thread.start()
 
-    def stop(self) -> None:
-        """结束扫描。停在退避等待里也要能停——那也算「在岗」。"""
-        if self.state is ScanState.IDLE:
-            return
-        self._stopped_elapsed = self.elapsed_s
-        self._kill()
-        self._retry_at = None
-        self.state = ScanState.IDLE
+    def submit(self, action: str) -> None:
+        self._commands.put(action)
 
-    def poll(self) -> None:
-        """由界面定时调用：收子进程的退出码，到点则续扫。"""
-        if self.state is ScanState.RUNNING:
-            self._poll_running()
-        elif self.state is ScanState.BACKOFF:
-            self._poll_backoff()
+    def close(self) -> None:
+        self._commands.put(self._CLOSE)
+        if self._thread is not None:
+            self._thread.join(timeout=REQUEST_TIMEOUT_S + 1)
 
-    # -- 状态 ------------------------------------------------------------------
+    def _run(self) -> None:
+        while True:
+            try:
+                action = self._commands.get(timeout=self._interval_s)
+            except queue.Empty:
+                action = ""
+            if action == self._CLOSE:
+                return
+            if action:
+                self.outcomes.put(self._client.command(action))
+            # 命令之后紧跟一次取状态：那一下的结果就是用户按键想看到的反馈。
+            self.snapshots.put(self._client.fetch())
+
+
+# -- 显示与按键 ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConsoleView:
+    """一次重画要显示的全部内容。"""
+
+    state: ConsoleState
+    #: 第一行：链路名，或「未连接 / 已停止 / 待命」。
+    text: str
+    #: 第二行秒表。没有起始时刻时是空串，不摆一个静止的 0:00:00 当噪音。
+    timer: str
+    #: 第三行：临时提示，或常驻的快捷键提示。
+    hint: str
+
+
+@dataclass
+class ConsoleController:
+    """状态窗上显示什么、一次按键该发什么动作。
+
+    tkinter 与 Win32 那两截测不了，所以判断全部收在这里；它不碰界面也不碰网络，
+    输入只有「上一次轮询的结果」和「按了哪个键」。
+    """
+
+    clock: Callable[[], datetime] = _utc_now
+    #: 常驻的快捷键提示。注册失败的键不会出现在里面，所以由界面那边拼好传进来。
+    hint: str = ""
+    offline_after: int = OFFLINE_AFTER_MISSES
+    notice_ttl_s: float = NOTICE_TTL_S
+
+    snapshot: SchedulerSnapshot | None = None
+    misses: int = 0
+    notice: str = ""
+    notice_until: datetime | None = None
 
     @property
-    def elapsed_s(self) -> float:
-        """持续工作时间。
+    def connected(self) -> bool:
+        return self.snapshot is not None
 
-        退避等待也算在内——那时扫描仍然「在岗」，只是在等机器空出来；
-        把它排除掉会让一段被频繁打断的扫描看起来只干了几分钟活。
+    def absorb(self, snapshot: SchedulerSnapshot | None) -> None:
+        """收一次轮询结果。None = 这一轮没答案。"""
+        if snapshot is not None:
+            self.snapshot = snapshot
+            self.misses = 0
+            return
+        self.misses += 1
+        if self.misses >= self.offline_after:
+            self.snapshot = None
+
+    def press(self, hotkey: int) -> str | None:
+        """按下快捷键该发什么动作；连不上就只提示，什么都不发。"""
+        action = _HOTKEY_ACTIONS.get(hotkey)
+        if action is None:
+            return None
+        return self._issue(action)
+
+    def request_stop(self) -> str | None:
+        """右键 = 结束调度，**只停不启**。
+
+        停是安全动作，必须在任何状态下都说得准。做成「切换」的话，在状态刚变过的
+        那一瞬右键就会变成又起一轮——实机上撞见过：本想停，结果多起了一轮。
+        所以这里不看 `snapshot.running`，恒发 stop。
         """
-        if self._started_at is None:
-            return self._stopped_elapsed
-        if self.state is ScanState.IDLE:
-            return self._stopped_elapsed
-        return self.clock() - self._started_at
+        return self._issue(ACTION_STOP)
 
-    @property
-    def status_line(self) -> str:
-        text = self.state.value
-        if self.state is ScanState.BACKOFF and self._retry_at is not None:
-            text = f"{text} {max(int(self._retry_at - self.clock()), 0)}s"
-        if self._restarts and self.state is not ScanState.IDLE:
-            text = f"{text}· 续{self._restarts}"
-        return text
+    def report(self, outcome: CommandResult) -> None:
+        """收一次开始/结束的下场。"""
+        if outcome is CommandResult.OK:
+            self.notice, self.notice_until = "", None
+            return
+        self._warn(NOTICE_DENIED if outcome is CommandResult.DENIED else NOTICE_OFFLINE)
 
-    @property
-    def running(self) -> bool:
-        return self.state in {ScanState.RUNNING, ScanState.BACKOFF}
+    def view(self) -> ConsoleView:
+        now = self.clock()
+        state, text, since = self._state(now)
+        timer = "" if since is None else format_duration((now - since).total_seconds())
+        return ConsoleView(state=state, text=text, timer=timer, hint=self._hint(now))
 
     # -- 内部 ------------------------------------------------------------------
 
-    def _spawn(self) -> None:
-        self._process = self.launch()
-        self._retry_at = None
-        self.state = ScanState.RUNNING
+    def _issue(self, action: str) -> str | None:
+        if not self.connected:
+            self._warn(NOTICE_OFFLINE)
+            return None
+        return action
 
-    def _poll_running(self) -> None:
-        if self._process is None:  # pragma: no cover - 只有 start 才会进 RUNNING
-            return
-        code = self._process.poll()
-        if code is None:
-            return
-        self._process = None
-        if code == 0:
-            # 扫描自己跑完了整段计划。这不是故障，别再续扫。
-            self.state = ScanState.DONE
-            self._stopped_elapsed = self.elapsed_s
-            self._started_at = None
-            return
-        self._retry_at = self.clock() + self.backoff_s
-        self.state = ScanState.BACKOFF
+    def _warn(self, text: str) -> None:
+        self.notice = text
+        self.notice_until = self.clock() + timedelta(seconds=self.notice_ttl_s)
 
-    def _poll_backoff(self) -> None:
-        if self._retry_at is None or self.clock() < self._retry_at:
-            return
-        self._restarts += 1
-        self._spawn()
+    def _state(self, now: datetime) -> tuple[ConsoleState, str, datetime | None]:
+        snapshot = self.snapshot
+        if snapshot is None:
+            return ConsoleState.OFFLINE, ConsoleState.OFFLINE.value, None
+        if not snapshot.running:
+            # 停着的时候服务不给起始时刻，秒表自然是空的。
+            return ConsoleState.STOPPED, ConsoleState.STOPPED.value, None
+        current = snapshot.current
+        if current is None:
+            # 调度器在跑但手上没活：秒表退回它自己开机以来的时长。
+            return ConsoleState.IDLE, ConsoleState.IDLE.value, snapshot.started_at_utc
+        # 秒表走的是**这条链路**跑了多久，不是调度器的总时长——「现在这一轮跑了
+        # 几分钟」才是要判断该不该去看一眼的那个数。
+        label = current.label or ConsoleState.RUNNING.value
+        return ConsoleState.RUNNING, label, current.started_at_utc
 
-    def _kill(self) -> None:
-        process, self._process = self._process, None
-        if process is None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except Exception:  # noqa: BLE001 - 收不到退出码也不该让界面卡住
-            pass
+    def _hint(self, now: datetime) -> str:
+        if self.notice and (self.notice_until is None or now < self.notice_until):
+            return self.notice
+        return self.hint
 
 
 # -- 全局快捷键 ----------------------------------------------------------------
@@ -193,9 +448,6 @@ _VK_F1 = 0x70
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
-
-HOTKEY_START = 1
-HOTKEY_STOP = 2
 
 DEFAULT_START_KEY = "alt+f8"
 DEFAULT_STOP_KEY = "alt+f9"
@@ -303,21 +555,6 @@ class HotkeyListener:
 # -- 界面 ----------------------------------------------------------------------
 
 
-def scan_command() -> list[str]:
-    """扫描子进程的命令行。用当前解释器，免得撞上系统 Python 缺依赖。"""
-    return [sys.executable, "-u", "-m", "evo_helper.tools.scan_coordinates"]
-
-
-def launch_scan() -> Process:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handle = LOG_PATH.open("a", encoding="utf-8")
-    return subprocess.Popen(  # noqa: S603 - 命令行完全由本模块构造
-        scan_command(),
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-    )
-
-
 def window_position(work_right: int, work_bottom: int) -> tuple[int, int]:
     """状态窗左上角坐标：贴工作区右下角，留出边距。
 
@@ -344,14 +581,25 @@ def _work_area() -> tuple[int, int]:
     return int(rect.right), int(rect.bottom)
 
 
-def run_console(start_key: str, stop_key: str) -> int:  # pragma: no cover - 界面与 Win32
+#: 四档状态各自的颜色。「未连接」用红：它不是一种正常的停着。
+TONES = {
+    ConsoleState.RUNNING: "#3fb950",
+    ConsoleState.IDLE: "#58a6ff",
+    ConsoleState.STOPPED: "#8b949e",
+    ConsoleState.OFFLINE: "#f85149",
+}
+
+
+def run_console(  # pragma: no cover - 界面与 Win32
+    start_key: str, stop_key: str, *, base_url: str, token: str
+) -> int:
     import ctypes
     import tkinter as tk
 
     # 系统缩放 125%：不声明 DPI 感知，tkinter 拿到的是逻辑像素，窗口会摆错地方。
     getattr(ctypes, "windll").shcore.SetProcessDpiAwareness(2)
 
-    supervisor = ScanSupervisor(launch=launch_scan)
+    poller = SchedulerPoller(SchedulerClient(base_url=base_url, token=token))
     listener = HotkeyListener(
         [HotkeyBinding(HOTKEY_START, start_key), HotkeyBinding(HOTKEY_STOP, stop_key)]
     )
@@ -359,13 +607,24 @@ def run_console(start_key: str, stop_key: str) -> int:  # pragma: no cover - 界
     for binding, reason in listener.rejected:
         print(f"⚠ {format_hotkey(binding.text)} {reason}", flush=True)
     for binding in listener.registered:
-        action = "开始" if binding.action == HOTKEY_START else "结束"
+        action = "开始调度" if binding.action == HOTKEY_START else "结束调度"
         print(f"  {format_hotkey(binding.text)} {action}", flush=True)
     if listener.rejected:
-        print("  换个键：--stop-key ctrl+alt+f9；或右键点状态窗停止", flush=True)
+        print("  换个键：--stop-key ctrl+alt+f9；或右键点状态窗结束调度", flush=True)
+
+    live = {binding.action: format_hotkey(binding.text) for binding in listener.registered}
+    hint = " ".join(
+        part
+        for part in (
+            f"{live[HOTKEY_START]}起" if HOTKEY_START in live else "",
+            f"{live[HOTKEY_STOP]}停" if HOTKEY_STOP in live else "右键停",
+        )
+        if part
+    )
+    controller = ConsoleController(hint=hint)
 
     root = tk.Tk()
-    root.title("EVO 扫描")
+    root.title("EVO 调度")
     root.overrideredirect(True)  # 无边框：这是个状态灯，不是窗口
     root.attributes("-topmost", True)
     width, height = WINDOW_SIZE
@@ -379,64 +638,67 @@ def run_console(start_key: str, stop_key: str) -> int:  # pragma: no cover - 界
     status.pack(anchor="w", padx=10, pady=(7, 0))
     timer = tk.Label(root, text="", font=("Consolas", 14), bg="#0d1117", fg="#c9d1d9")
     timer.pack(anchor="w", padx=10)
+    # 第三行平时是快捷键提示，出事时被临时提示顶掉。
+    footer = tk.Label(root, text=hint, font=("Microsoft YaHei UI", 8), bg="#0d1117", fg="#6e7681")
+    footer.pack(anchor="w", padx=10)
 
-    tones = {
-        ScanState.RUNNING: "#3fb950",
-        ScanState.BACKOFF: "#d29922",
-        ScanState.DONE: "#58a6ff",
-        ScanState.IDLE: "#8b949e",
-    }
-
-    live = {binding.action: format_hotkey(binding.text) for binding in listener.registered}
-    hint = " ".join(
-        part
-        for part in (
-            f"{live[HOTKEY_START]}起" if HOTKEY_START in live else "",
-            f"{live[HOTKEY_STOP]}停" if HOTKEY_STOP in live else "右键停",
-        )
-        if part
-    )
-
-    def tick() -> None:
+    def drain() -> None:
+        """把三个队列各抽干。全在界面线程里做，因此不需要另加锁。"""
         while True:
             try:
                 hotkey = listener.events.get_nowait()
             except queue.Empty:
                 break
-            if hotkey == HOTKEY_START:
-                supervisor.start()
-            elif hotkey == HOTKEY_STOP:
-                supervisor.stop()
-        supervisor.poll()
-        status.configure(text=supervisor.status_line, fg=tones[supervisor.state])
-        timer.configure(text=format_duration(supervisor.elapsed_s))
+            action = controller.press(hotkey)
+            if action is not None:
+                poller.submit(action)
+        while True:
+            try:
+                controller.absorb(poller.snapshots.get_nowait())
+            except queue.Empty:
+                break
+        while True:
+            try:
+                controller.report(poller.outcomes.get_nowait())
+            except queue.Empty:
+                break
+
+    def tick() -> None:
+        drain()
+        view = controller.view()
+        status.configure(text=view.text, fg=TONES[view.state])
+        timer.configure(text=view.timer)
+        footer.configure(text=view.hint)
         root.after(REFRESH_MS, tick)
 
     def quit_console(_event: Any = None) -> None:
-        supervisor.stop()
+        """双击 = 关窗，**不停调度器**。这一条和旧版本不一样，不是漏改。
+
+        以前双击会连子进程一起停掉，因为那时进程是这个窗口自己起的——窗口一关它就
+        没人管了，只能在关之前先停。现在进程归 web 服务里的调度器管，活得比这个窗口
+        久：关掉一个状态灯不该停掉整台调度器，那等于关遥控器就把电视关了。
+
+        用户要的是「临时**开关快捷键**」，开关是快捷键，不是窗口的生死。停的入口
+        两个都还在：Alt+F9 与右键。
+        """
         listener.stop()
+        poller.close()
         root.destroy()
 
-    def stop_scan(_event: Any = None) -> None:
-        """右键 = 停，**只停不启**。
+    def stop_scheduler(_event: Any = None) -> None:
+        action = controller.request_stop()
+        if action is not None:
+            poller.submit(action)
 
-        停是安全动作，必须在任何状态下都说得准。做成「切换」的话，在状态刚变过的
-        那一瞬右键就会变成又起一轮扫描——实机上就撞见过：本想停，结果多起了一轮。
-        """
-        supervisor.stop()
-
-    # 无边框窗口没有关闭按钮：双击退出，右键停止，左键拖动。
+    # 无边框窗口没有关闭按钮：双击退出，右键结束调度，左键拖动。
     root.bind("<Double-Button-1>", quit_console)
-    root.bind("<Button-3>", stop_scan)
-    for child in (status, timer):
+    root.bind("<Button-3>", stop_scheduler)
+    for child in (status, timer, footer):
         child.bind("<Double-Button-1>", quit_console)
-        child.bind("<Button-3>", stop_scan)
-    _make_draggable(root, (status, timer))
-    # 快捷键提示放第三行：注册失败时，用户得知道现在到底该按什么。
-    tk.Label(root, text=hint, font=("Microsoft YaHei UI", 8), bg="#0d1117", fg="#6e7681").pack(
-        anchor="w", padx=10
-    )
+        child.bind("<Button-3>", stop_scheduler)
+    _make_draggable(root, (status, timer, footer))
 
+    poller.start()
     tick()
     root.mainloop()
     return 0
@@ -459,17 +721,24 @@ def _make_draggable(root: Any, children: Sequence[Any] = ()) -> None:  # pragma:
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - 入口
     import argparse
 
+    from evo_helper.config import Settings
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-key", default=DEFAULT_START_KEY, help="开始扫描的全局快捷键")
-    parser.add_argument("--stop-key", default=DEFAULT_STOP_KEY, help="结束扫描的全局快捷键")
+    parser.add_argument("--start-key", default=DEFAULT_START_KEY, help="开始调度的全局快捷键")
+    parser.add_argument("--stop-key", default=DEFAULT_STOP_KEY, help="结束调度的全局快捷键")
     args = parser.parse_args(argv)
     for text in (args.start_key, args.stop_key):
         try:
             parse_hotkey(text)
         except HotkeyError as exc:
             parser.error(str(exc))
-    print("扫描控制台已启动。右键状态窗=停止，双击=退出，左键可拖动。", flush=True)
-    return run_console(args.start_key, args.stop_key)
+    settings = Settings()
+    base_url = scheduler_base_url(settings.host, settings.port)
+    print(f"调度器状态窗已启动，连 {base_url}。", flush=True)
+    print("右键状态窗=结束调度，双击=只关窗（任务照跑），左键可拖动。", flush=True)
+    return run_console(
+        args.start_key, args.stop_key, base_url=base_url, token=default_local_token()
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
