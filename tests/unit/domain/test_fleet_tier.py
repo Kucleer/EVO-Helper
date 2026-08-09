@@ -38,9 +38,9 @@ class TestParsing:
 
 class TestTiers:
     def test_each_bucket_maps_to_its_preset(self) -> None:
-        assert tier_for(3000).preset == "攻击组合甲"
-        assert tier_for(6000).preset == "攻击组合乙"
-        assert tier_for(9000).preset == "攻击组合丙"
+        assert tier_for(3000).preset == "AAA"
+        assert tier_for(6000).preset == "BBB"
+        assert tier_for(9000).preset == "CCC"
 
     def test_below_two_thousand_gets_no_preset(self) -> None:
         # 用户明确说过 2K 以下的误差可以完全忽略。
@@ -75,7 +75,7 @@ class TestBoundarySensitivity:
     def test_the_verdict_carries_the_preset(self) -> None:
         verdict = classify(6000)
         assert verdict.tier is FleetTier.BETA
-        assert verdict.preset == "攻击组合乙"
+        assert verdict.preset == "BBB"
         assert verdict.total == 6000
 
     def test_a_rounded_reading_does_not_change_the_bucket(self) -> None:

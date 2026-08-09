@@ -1,0 +1,259 @@
+"""bot 目标的「攻击侦查 → 分档 → 攻击」自动化。
+
+    # 只看目标认不认得出，一次点击都不派（默认）
+    python -m evo_helper.tools.bot_loop --targets 2:137:14
+
+    # 攻击侦查：用「探路」预设打一发，回来读战报分档
+    python -m evo_helper.tools.bot_loop --targets 2:137:14 --probe
+
+    # 完整：侦查 → 分档 → 用该档预设攻击
+    python -m evo_helper.tools.bot_loop --targets 2:137:14 --probe --attack
+
+与海盗那条链路的区别只在**判定依据**：
+
+- 海盗看侦察报告里几个特定舰种的数量（`vision.scout_reports`），
+  因为海盗要么有舰队要么没有，不需要分档。
+- bot 看**攻击侦查打回来的战报**里守方的「单位」总数，按 `domain.fleet_tier`
+  分成 2K–5K / 5K–8K / 8K+ 三档，各档一个预设（AAA / BBB / CCC）。
+  2K 以下不派——用户明确说过那个量级不值得为它挑组合。
+
+所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
+这里只换目标识别与判定。
+
+## 为什么读「单位」总数而不是逐舰种明细
+
+分档防的是**量级错**，不是末位误差（见 `domain.fleet_tier` 模块头）。「单位」总数是
+详情页上独立给出的一个数，一个 ROI 就读到；逐舰种明细要进回放页、读两列、
+还要反复重拍到合计对上，一份报告多花两三秒，而它对分档没有增量价值。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from evo_helper.domain.fleet_preset import DEFAULT_PRESET
+from evo_helper.domain.fleet_tier import FleetTier, tier_for
+from evo_helper.domain.models import Coordinate
+from evo_helper.tools.pirate_loop import (
+    MAIL_FIRST_ROW_Y,
+    MAIL_ROW_PITCH,
+    MAIL_ROW_X,
+    MAIL_SCAN_ROWS,
+    PANEL_DRAG_FROM_Y,
+    PANEL_DRAG_TO_Y,
+    LoopOptions,
+    PirateLoop,
+    say,
+    slow_drag,
+)
+from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
+
+#: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
+PROBE_PRESET = DEFAULT_PRESET.name
+
+#: 打完之后等战报。bot 目标同系内飞行按分钟计，留足余量；读不到就报出来，不硬等。
+REPORT_WAIT_S = 600.0
+
+
+@dataclass
+class BotOptions:
+    targets: tuple[Coordinate, ...]
+    probe: bool
+    attack: bool
+
+
+class BotLoop(PirateLoop):
+    """复用海盗那条链路的驱动，换成 bot 的识别与分档判定。"""
+
+    def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
+        # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
+        super().__init__(
+            driver,
+            ocr,
+            LoopOptions(
+                systems=(), scout=options.probe, attack=options.attack, preset=PROBE_PRESET
+            ),
+        )
+        self._bot = options
+
+    # -- 识别 ---------------------------------------------------------------
+
+    def is_bot_target(self, coordinate: Coordinate) -> bool:
+        """行星面板上是不是这个 bot。
+
+        名字与坐标都要核，判据与坐标扫描器共用一套（`vision.scan_reading`）：
+        导航栏偶尔会停在别的位号上，那时面板是真的、只是不是请求的那一位。
+        """
+        from evo_helper.game.system_navigator import crop_reader
+        from evo_helper.vision.scan_reading import read_panel_confirming
+
+        requested = f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
+        panel = read_panel_confirming(crop_reader(self._driver.capture(), self._ocr), requested)
+        if not panel.confirms(requested):
+            say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
+            return False
+        if not panel.is_bot:
+            say(f"  {coordinate} 不是 bot（面板名 {panel.display_name!r}）")
+            return False
+        return True
+
+    # -- 判定 ---------------------------------------------------------------
+
+    def read_defender_units(self, coordinate: Coordinate) -> int | None:
+        """去信箱把这个目标最近那份攻击报告的守方「单位」总数读回来。
+
+        只读详情页的一个 ROI。找报告靠**VS 块里的目标坐标**核对，不靠行号：
+        行序随新邮件变，而报告自己写着打的是谁。
+        """
+        from evo_helper.vision.optional.report_screens import ImageReportScreens
+        from evo_helper.vision.parsers import parse_versus_block
+        from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
+
+        def screens() -> Any:
+            image = crop_to_viewport(self._driver.capture())
+            return ImageReportScreens(
+                image,
+                layout_for_viewport(image.width, image.height),
+                tesseract_cmd=_tesseract(),
+            )
+
+        if not self._goto_planet_surface():
+            raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
+        self._open_mail()
+        for _ in range(3):
+            slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
+        found: int | None = None
+        for row in range(MAIL_SCAN_ROWS):
+            if not self._settle(self._on_mail_list):
+                say(f"  第 {row} 行之前已经不在邮件列表上了；停止翻行")
+                break
+            self._driver.click(
+                MAIL_ROW_X, MAIL_FIRST_ROW_Y + row * MAIL_ROW_PITCH, label="打开邮件"
+            )
+            self._driver.wait(2.4)
+            page = screens()
+            versus = parse_versus_block(page.versus_block(), "ocr")
+            if versus is not None and versus.defender.coordinate.value == coordinate:
+                units = page.unit_totals()[1]
+                found = _count(units)
+                say(f"  第 {row} 行是 {coordinate} 的战报：守方单位 {units!r} → {found}")
+            self._driver.click(*_mail_back(), label="返回")
+            self._driver.wait(2.0)
+            if found is not None:
+                break
+        self._close_mail()
+        return found
+
+    # -- 主循环 -------------------------------------------------------------
+
+    def run(self) -> Any:  # noqa: D401 - 覆盖父类的海盗循环
+        from evo_helper.game.game_window import ensure_game_window
+
+        ensure_game_window()
+        self._reset_to_known_screen()
+        if not self._navigator.ensure_system_view(self._nav_labels):
+            raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
+
+        for coordinate in self._bot.targets:
+            say(f"目标 {coordinate}")
+            self._navigator.goto(coordinate)
+            if not self.is_bot_target(coordinate):
+                continue
+            self._outcome.pirates.append(coordinate)
+            if not self._bot.probe:
+                continue
+            # 攻击侦查：用「探路」预设打一发。走的是攻击链路，所以简报上写的是「攻击」。
+            if not self.attack(coordinate, preset=PROBE_PRESET):
+                continue
+            self._outcome.scouted.append(coordinate)
+            if not self._bot.attack:
+                continue
+            say(f"  等战报（最多 {REPORT_WAIT_S:.0f}s）")
+            time.sleep(REPORT_WAIT_S)
+            units = self.read_defender_units(coordinate)
+            if units is None:
+                say(f"  {coordinate} 读不到战报里的守方单位数；不打")
+                self._outcome.refused.append((coordinate, "读不到守方单位数"))
+                continue
+            tier = tier_for(units)
+            preset = tier.preset
+            say(f"  {coordinate} 守方 {units} → {tier.value}；预设 {preset or '（不派）'}")
+            if preset is None:
+                self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
+                continue
+            self._navigator.goto(coordinate)
+            if not self.is_bot_target(coordinate):
+                self._outcome.refused.append((coordinate, "攻击前面板认不出"))
+                continue
+            self.attack(coordinate, preset=preset)
+        return self._outcome
+
+
+def _count(text: str) -> int | None:
+    from evo_helper.domain.fleet_tier import parse_fleet_count
+
+    return parse_fleet_count(text) if text else None
+
+
+def _mail_back() -> tuple[int, int]:
+    from evo_helper.tools.pirate_loop import MAIL_BACK
+
+    return MAIL_BACK
+
+
+def _tesseract() -> str:
+    from evo_helper.tools.scan_coordinates import TESSERACT_PATH
+
+    return str(TESSERACT_PATH)
+
+
+def parse_target(text: str) -> Coordinate:
+    parts = text.split(":")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            f"坐标要写成 银河:恒星系:行星，例如 2:137:14（收到 {text!r}）"
+        )
+    galaxy, system, position = (int(part) for part in parts)
+    return Coordinate(galaxy, system, position)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--targets", nargs="+", type=parse_target, required=True)
+    parser.add_argument("--probe", action="store_true", help="真的用「探路」打一发攻击侦查")
+    parser.add_argument("--attack", action="store_true", help="拿到战报后按档位真的攻击")
+    args = parser.parse_args(argv)
+
+    if args.attack and not args.probe:
+        parser.error("--attack 需要 --probe：没有攻击侦查打回来的战报就没有分档依据")
+
+    import ctypes
+
+    getattr(ctypes, "windll").shcore.SetProcessDpiAwareness(2)
+
+    options = BotOptions(targets=tuple(args.targets), probe=args.probe, attack=args.attack)
+    mode = "只认目标" if not args.probe else ("侦查+攻击" if args.attack else "只侦查")
+    listed = ", ".join(str(target) for target in options.targets)
+    say(f"模式：{mode}；目标 {listed}")
+
+    driver = LiveDriver(allow_actions=args.probe or args.attack)
+    driver.window()
+    outcome = BotLoop(driver, make_ocr(), options).run()
+    say(
+        f"完成：目标 {len(outcome.pirates)} 个，侦查 {len(outcome.scouted)} 发，"
+        f"攻击 {len(outcome.attacked)} 发，拦下 {len(outcome.refused)} 次"
+    )
+    for coordinate, reason in outcome.refused:
+        say(f"  [拦下] {coordinate} {reason}")
+    return 0
+
+
+__all__ = ["BotLoop", "BotOptions", "FleetTier", "main"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

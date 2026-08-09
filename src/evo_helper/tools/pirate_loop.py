@@ -269,34 +269,38 @@ class PirateLoop:
         self._leave_dispatch_list()
         return True
 
-    def attack(self, coordinate: Coordinate) -> bool:
+    def attack(self, coordinate: Coordinate, *, preset: str | None = None) -> bool:
         """用预设攻击。闸门是「预设标题选中了」与「简报写着攻击」。
+
+        `preset` 允许按次指定：bot 那条链路先用「探路」做攻击侦查，再按分档换预设
+        （见 `tools.bot_loop`），而海盗链路始终用同一个。
 
         **只按标题选预设，不读预设内容**（用户口径 2026-08-09）：内容是用户自己在
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
         """
+        wanted = preset or self._options.preset
         self._driver.click(*pirate_ui.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
 
         picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
         try:
-            picker.pick(self._options.preset)
+            picker.pick(wanted)
         except PresetNotFound as error:
             say(f"  {error}；关掉面板，不打这一发")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
-            self._outcome.refused.append((coordinate, "找不到预设"))
+            self._outcome.refused.append((coordinate, f"找不到预设 {wanted}"))
             return False
 
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
-        intent_id = self._record_intent(coordinate)
+        intent_id = self._record_intent(coordinate, preset=wanted)
         if not self._launch(coordinate, "攻击"):
             self._leave_dispatch_list()
             return False
         self._record_dispatch(intent_id)
         self._outcome.attacked.append(coordinate)
-        say(f"  已发动攻击 → {coordinate}（预设 {self._options.preset}）")
+        say(f"  已发动攻击 → {coordinate}（预设 {wanted}）")
         self._leave_dispatch_list()
         return True
 
@@ -494,7 +498,7 @@ class PirateLoop:
         self._run_id = _ensure_run_row(session_factory)
         return self._repository, self._run_id
 
-    def _record_intent(self, coordinate: Coordinate) -> UUID:
+    def _record_intent(self, coordinate: Coordinate, *, preset: str | None = None) -> UUID:
         """**在点出发之前**写意图。
 
         顺序是有意的：被闸门拦下的那些恰恰最该出现在日志里，而它们没有派遣行。
@@ -510,8 +514,8 @@ class PirateLoop:
                 origin=ORIGIN,
                 target=coordinate,
                 preset=FleetPresetRef(
-                    name=self._options.preset,
-                    signature=_preset_signature(self._options.preset),
+                    name=preset or self._options.preset,
+                    signature=_preset_signature(preset or self._options.preset),
                 ),
                 cycle_start_utc=now,
                 created_at_utc=now,
