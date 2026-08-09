@@ -11,6 +11,8 @@
 
 **做（用户 2026-08-09 追加）**：改造 `tools/scan_console.py` 那个桌面悬浮窗，
 让它显示**当前任务**状态并保留快捷键当临时开关。见第十一节。
+
+**不做**：
 - 不碰 `scan_plans` / `scan_ranges` / `run_instances` / `time_window_start` / `time_window_end`。
   这些是各 runner 自己的账，继续归 runner 管。交接文档里那份「window 列引用面很宽、
   先别删」的清单**整条作废**——不是推迟删除，是不再需要删。
