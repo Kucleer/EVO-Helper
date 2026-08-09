@@ -83,6 +83,31 @@ LAUNCH_WAIT_S = 2.8
 SCOUT_REPORT_WAIT_S = 45.0
 SCOUT_REPORT_RETRIES = 3
 
+#: 简报上的飞行时间超过这个上界，就当**读错了**，回程闹钟写 NULL。
+#:
+#: 这道护栏补的是 `_read_briefing` 丢掉的那道交叉校验：`DispatchBriefing`
+#: 本来用「绝对到达时间 vs 当前时间+时长」互相验（见 `duration_agrees`），
+#: 而这里只读时长这一个来源，读错了没有第二处能揭穿它。
+#:
+#: 危险的不是读不出来——那返回 None，走「立即尝试收取」，白跑一趟而已。
+#: 危险的是**读出一个能解析但偏大的值**：`parse_game_duration` 同时认
+#: `X天Y时Z分W秒` 和 `01:53:19`，`8分3秒` 被读成 `8时3分` 就是 60 倍，
+#: 于是调度器安安静静等 8 小时，那条链路整整停摆且不报错。
+#:
+#: 取 6 小时的依据：
+#: - 这个方法只在 `attack()` 里调用，而这条链路打的是**同系目标**
+#:   （`ORIGIN` 2:137:18 → 2:137:x），飞行按分钟计。
+#: - 仓库里最长的一份实测简报是 `28分 21秒`，而那还是一趟**深空探索**——
+#:   比这条链路任何一发都远得多。6 小时留了十倍以上余量。
+#: - 反过来它拦得住最典型的量级错：任何真实时长 ≥6 分钟的一发，
+#:   被「分」读成「时」之后都超过上界；带「天」的误读一律超过。
+#: - 战报有有效期（见 `report_wait.MAX_SESSION_BACKOFF` 的注释），
+#:   真等到 6 小时之后也多半已经读不到了，放弃这个值没有实际损失。
+#:
+#: 误杀的代价是可接受的那一侧：把一次合法的长途飞行判成读错，
+#: 只是让助手立刻去收一次、扑空、退出。
+MAX_CREDIBLE_FLIGHT = timedelta(hours=6)
+
 #: 自己星球地表视图右上角的信箱入口。**底部导航里没有邮箱**，只有这一个入口。
 MAIL_BUTTON = (1131, 70)
 
@@ -259,6 +284,10 @@ class PirateLoop:
         读不出来返回 None，而**不是**拦下这一发：飞行时间只是闹钟，不是闸门。
         为它加一道闸门等于让一次 OCR 抖动就废掉一发完全正常的攻击——
         这条链路已经因为「ROI 与放大倍数不配」白白拦下过四发。
+
+        读出来但大得离谱的，同样返回 None（见 `MAX_CREDIBLE_FLIGHT`）：
+        这里只有时长这一个来源，没有绝对到达时间可以互相验，
+        所以量级错只能靠上界拦。
         """
         flight: timedelta | None = None
 
@@ -269,6 +298,13 @@ class PirateLoop:
 
         if not self._settle(read_once) or flight is None:
             say("  简报上读不到飞行时间；这一发照派，回程闹钟留空")
+            return None
+        if flight > MAX_CREDIBLE_FLIGHT:
+            # 宁可白跑一趟，也不要安安静静等一个读错的钟。
+            say(
+                f"  简报上的飞行时间读作 {flight}，超过 {MAX_CREDIBLE_FLIGHT} 的上界；"
+                "当读错处理，回程闹钟留空"
+            )
             return None
         return DispatchBriefing(
             mission_type=MissionType.ATTACK,

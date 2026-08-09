@@ -70,3 +70,60 @@ def test_an_unreadable_briefing_still_records_the_dispatch_with_no_flight_time()
     assert len(repository.flight_calls) == 1
     _dispatch_id, flight, _dispatched = repository.flight_calls[0]
     assert flight is None
+
+
+class _FakeDriver:
+    """`_settle` 判据不成立时会 `wait` 一下。测试里不真的睡。"""
+
+    def wait(self, seconds: float) -> None:
+        return None
+
+
+def _loop_reading(text: str) -> object:
+    """造一个「简报上的飞行时间 ROI 读作 text」的 loop。"""
+    from evo_helper.tools.pirate_loop import PirateLoop
+
+    loop = PirateLoop.__new__(PirateLoop)
+    loop._driver = _FakeDriver()  # type: ignore[attr-defined]
+    loop._read = lambda *_args, **_kwargs: text  # type: ignore[attr-defined]
+    return loop
+
+
+def test_a_credible_flight_time_becomes_the_return_alarm() -> None:
+    loop = _loop_reading("8分3秒")
+
+    briefing = loop._read_briefing()  # type: ignore[attr-defined]
+
+    assert briefing is not None
+    assert briefing.flight == timedelta(minutes=8, seconds=3)
+
+
+def test_an_implausibly_long_flight_time_is_treated_as_a_misread() -> None:
+    """`8分3秒` 被读成 `8时3分` 是 60 倍——而且不会报错，只会看起来像「在等」。
+
+    这里只有时长这一个来源，没有绝对到达时间可以交叉验证
+    （`DispatchBriefing.duration_agrees` 那道校验用不上），所以量级错只能靠上界拦。
+    拦下来写 NULL，等待调度器据此改为「立即尝试收取」：白跑一趟，
+    而不是让这条链路安静地停摆八小时。
+    """
+    loop = _loop_reading("8时3分")
+
+    assert loop._read_briefing() is None  # type: ignore[attr-defined]
+
+
+def test_a_flight_time_in_days_is_never_believed() -> None:
+    """`parse_game_duration` 认得 `X天…`，而这条链路打的是同系目标。"""
+    loop = _loop_reading("42天17时34分58秒")
+
+    assert loop._read_briefing() is None  # type: ignore[attr-defined]
+
+
+def test_the_ceiling_leaves_room_for_the_longest_briefing_ever_observed() -> None:
+    """上界不能收得太紧，否则误杀合法的长途飞行。
+
+    仓库里最长的实测简报是 `28分 21秒`（`tests/unit/vision/test_dispatch_briefing.py`），
+    而那是一趟深空探索，比这条链路任何一发都远。上界要留足余量。
+    """
+    from evo_helper.tools.pirate_loop import MAX_CREDIBLE_FLIGHT
+
+    assert MAX_CREDIBLE_FLIGHT >= timedelta(minutes=28, seconds=21) * 10
