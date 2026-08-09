@@ -220,7 +220,10 @@ class TargetRevisitRow(Base):
     __tablename__ = "target_revisits"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    scope: Mapped[str] = mapped_column(String(16))
+    #: 32 而不是 16：调度器要写的 `BOT_TIER_NEGLIGIBLE` / `BOT_REPORT_MISSING`
+    #: 都超过 16 字。SQLite 不校验 VARCHAR 长度，所以超了也照存不误——正因为
+    #: 现在不报错，声明与实际存的东西对不上这件事才必须在这里改掉。
+    scope: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(String(255))
     target_galaxy: Mapped[int | None] = mapped_column(Integer, nullable=True)
     target_system: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from uuid import UUID
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,9 +33,18 @@ from . import models as orm
 #: count as the same dispatch under the strict origin/target/time match rule.
 MATCH_TIME_TOLERANCE = timedelta(hours=12)
 
-#: 分档判定「不值得打」。写在意图的 guard_status 上——那一列本来就是
-#: 「这一发为什么没打出去」的记录位。
-GUARD_STATUS_SKIPPED = "SKIPPED_NEGLIGIBLE"
+#: 分档判定「不值得打」的目标，记在 `target_revisits` 上（其语义正是「需要复查的
+#: 目标」），用独立 scope 与「战报缺失」那批分开。
+#:
+#: **不写 `attack_intents.guard_status`。** 那一列被 `application/workflow.py` 用
+#: `ALLOWED` / `REFUSED` 占着，`logs.html` 把它渲染成「未派出 · {guard_status}」；
+#: 塞第三套词汇进去，一发确实飞出去了的攻击会在日志页显示成「未派出」。
+REVISIT_SCOPE_TIER_NEGLIGIBLE = "BOT_TIER_NEGLIGIBLE"
+
+#: 这些复查行写 `DONE` 而不是默认的 `PENDING`。`persistent_service` 数的是
+#: PENDING 的条数、missions 页显示成「待复查」——分档说不值得打是一个已经
+#: 下完的判定，不是等人去做的活，用 PENDING 会凭空撑起那个计数。
+REVISIT_STATUS_DONE = "DONE"
 
 
 class StorageConflictError(ValueError):
@@ -604,14 +613,14 @@ class SqlAlchemyRepository:
         `count_dispatches_since` / `pending_reports_for_kind` 同口径：被游戏拒掉
         的和演习的都不会产生战报，算进来就是一条「已派出且永远收不到战报」，
         该目标永远停在 `AWAITING_ATTACK_REPORT`，bot 的完成态永远达不到。
+
+        `skipped` 查的是 `target_revisits`，**按坐标+本轮**取，不是逐条派遣取：
+        「分档说这个目标不值得打」是对**这一轮的这个坐标**下的判定，复查表里
+        也没有指回某一条意图的列。`phase_of` 只用 `any(...)`，粒度对得上。
         """
         with self._session_factory() as session:
             statement = (
-                select(
-                    orm.AttackIntentRow.preset_name,
-                    orm.BattleReportRow.id,
-                    orm.AttackIntentRow.guard_status,
-                )
+                select(orm.AttackIntentRow.preset_name, orm.BattleReportRow.id)
                 .join(
                     orm.AttackDispatchRow,
                     orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
@@ -633,33 +642,38 @@ class SqlAlchemyRepository:
                 statement = statement.where(
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
+            skipped = _tier_negligible(session, coordinate, since=since)
             return [
                 DispatchFact(
                     preset_name=preset_name,
                     has_report=report_id is not None,
-                    skipped=guard_status == GUARD_STATUS_SKIPPED,
+                    skipped=skipped,
                 )
-                for preset_name, report_id, guard_status in session.execute(statement).all()
+                for preset_name, report_id in session.execute(statement).all()
             ]
 
     def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime | None) -> None:
-        """把「分档说不值得打」记在本轮那条探路意图上。
+        """把「分档说不值得打」记成本轮的一条 `target_revisits`。
 
         不记的话，下一趟又会重新分一次档、重新读一次战报，而结论不会变。
         """
+        if since is not None:
+            _require_utc(since, "since")
         with self._session_factory() as session:
-            statement = select(orm.AttackIntentRow).where(
-                orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
-                orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
-                orm.AttackIntentRow.target_system == coordinate.system,
-                orm.AttackIntentRow.target_position == coordinate.position,
-            )
-            if since is not None:
-                statement = statement.where(
-                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+            if _tier_negligible(session, coordinate, since=since):
+                return
+            session.add(
+                orm.TargetRevisitRow(
+                    id=uuid4(),
+                    scope=REVISIT_SCOPE_TIER_NEGLIGIBLE,
+                    reason="分档判定不值得打",
+                    target_galaxy=coordinate.galaxy,
+                    target_system=coordinate.system,
+                    target_position=coordinate.position,
+                    requested_at_utc=datetime.now(UTC),
+                    status=REVISIT_STATUS_DONE,
                 )
-            for row in session.scalars(statement.order_by(orm.AttackIntentRow.created_at_utc)):
-                row.guard_status = GUARD_STATUS_SKIPPED
+            )
             session.commit()
 
     def set_resume_at(self, run_id: UUID, resume_at_utc: datetime | None) -> None:
@@ -688,6 +702,27 @@ def _require_type[T](value: object, expected: type[T], label: str) -> T:
     if not isinstance(value, expected):
         raise TypeError(f"{label} must be {expected.__name__}, got {type(value).__name__}")
     return value
+
+
+def _tier_negligible(session: Session, coordinate: Coordinate, *, since: datetime | None) -> bool:
+    """本轮这个坐标有没有被分档判成「不值得打」。
+
+    读写两侧共用，判据才不会分叉：写的时候拿它去重（一轮写一条就够），
+    读的时候拿它填 `DispatchFact.skipped`。
+    """
+    statement = (
+        select(func.count())
+        .select_from(orm.TargetRevisitRow)
+        .where(
+            orm.TargetRevisitRow.scope == REVISIT_SCOPE_TIER_NEGLIGIBLE,
+            orm.TargetRevisitRow.target_galaxy == coordinate.galaxy,
+            orm.TargetRevisitRow.target_system == coordinate.system,
+            orm.TargetRevisitRow.target_position == coordinate.position,
+        )
+    )
+    if since is not None:
+        statement = statement.where(orm.TargetRevisitRow.requested_at_utc >= since)
+    return bool(session.scalar(statement) or 0)
 
 
 def _require_utc(value: datetime, label: str) -> datetime:

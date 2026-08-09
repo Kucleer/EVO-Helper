@@ -21,6 +21,7 @@ from evo_helper.domain.records import (
     AttackIntent,
     FleetPresetRef,
 )
+from evo_helper.storage.repository import REVISIT_SCOPE_TIER_NEGLIGIBLE
 
 TARGET = Coordinate(2, 137, 14)
 PROBE = DEFAULT_PRESET.name
@@ -120,6 +121,91 @@ def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repositor
     assert (
         phase_of(repository.bot_dispatch_facts(TARGET, since=ROUND_START)) is BotPhase.NEEDS_ATTACK
     )
+
+
+
+# -- 「不值得打」的标记 ------------------------------------------------------
+
+
+def test_a_skipped_target_counts_as_done(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """分档判定不值得打，本轮就不会再有攻击发，算走完。"""
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+
+    assert [fact.skipped for fact in facts] == [True]
+    assert phase_of(facts) is BotPhase.DONE
+
+
+def test_skipping_leaves_the_guard_status_alone(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**`guard_status` 已经被别人占着。**
+
+    `application/workflow.py` 往那一列写 `ALLOWED` / `REFUSED`，`logs.html` 把它
+    渲染成「未派出 · {guard_status}」。塞第三套词汇进去，日志页会给出错误的
+    未派出原因——一发确实飞出去了的攻击，会显示成「未派出 · SKIPPED_NEGLIGIBLE」。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+    before = _intent_guard_statuses(repository)
+
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    assert _intent_guard_statuses(repository) == before
+
+
+def test_the_skip_is_recorded_as_a_revisit_with_its_own_scope(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """记在 `target_revisits` 上，用独立 scope，与「战报缺失」那批分得开。"""
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    rows = _revisits(repository)
+    assert [row.scope for row in rows] == [REVISIT_SCOPE_TIER_NEGLIGIBLE]
+    assert [(row.target_galaxy, row.target_system, row.target_position) for row in rows] == [
+        (TARGET.galaxy, TARGET.system, TARGET.position)
+    ]
+
+
+def test_a_skip_is_not_counted_as_a_pending_revisit(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**别把控制台的「待复查」计数撑起来。**
+
+    `persistent_service` 数的是 `status == "PENDING"` 的复查行，missions 页把它
+    显示成「待复查」。分档说不值得打是一个**已经下完的判定**，不是等人去做的
+    活；用默认的 PENDING 写进去，每跳过一个 bot 就凭空多一条谁也不会去执行的
+    复查请求。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+
+    repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
+
+    assert [row.status for row in _revisits(repository)] == ["DONE"]
+
+
+def _intent_guard_statuses(repository):  # type: ignore[no-untyped-def]
+    from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    with repository._session_factory() as session:  # noqa: SLF001 - 直接看列，不经查询
+        return [
+            row.guard_status
+            for row in session.scalars(
+                select(orm.AttackIntentRow).order_by(orm.AttackIntentRow.created_at_utc)
+            )
+        ]
+
+
+def _revisits(repository):  # type: ignore[no-untyped-def]
+    from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    with repository._session_factory() as session:  # noqa: SLF001
+        return list(
+            session.scalars(
+                select(orm.TargetRevisitRow).order_by(orm.TargetRevisitRow.requested_at_utc)
+            )
+        )
 
 
 def _intent(  # type: ignore[no-untyped-def]
