@@ -34,7 +34,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -45,6 +45,7 @@ from evo_helper.domain.records import (
     AttackDispatch,
     AttackIntent,
 )
+from evo_helper.domain.report_wait import parse_game_duration
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.game import pirate_ui
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
@@ -80,6 +81,31 @@ LAUNCH_WAIT_S = 2.8
 #: 侦察报告的等待：实机上 17 秒回报，留足余量再读，读不到就再等一轮。
 SCOUT_REPORT_WAIT_S = 45.0
 SCOUT_REPORT_RETRIES = 3
+
+#: 简报上的飞行时间超过这个上界，就当**读错了**，回程闹钟写 NULL。
+#:
+#: 这道护栏补的是 `_read_flight_time` 拿不到的那道交叉校验：`DispatchBriefing`
+#: 本来用「绝对到达时间 vs 当前时间+时长」互相验（见 `duration_agrees`），
+#: 而这里只读时长这一个来源，读错了没有第二处能揭穿它。
+#:
+#: 危险的不是读不出来——那返回 None，走「立即尝试收取」，白跑一趟而已。
+#: 危险的是**读出一个能解析但偏大的值**：`parse_game_duration` 同时认
+#: `X天Y时Z分W秒` 和 `01:53:19`，`8分3秒` 被读成 `8时3分` 就是 60 倍，
+#: 于是调度器安安静静等 8 小时，那条链路整整停摆且不报错。
+#:
+#: 取 6 小时的依据：
+#: - 这个方法只在 `attack()` 里调用，而这条链路打的是**同系目标**
+#:   （`ORIGIN` 2:137:18 → 2:137:x），飞行按分钟计。
+#: - 仓库里最长的一份实测简报是 `28分 21秒`，而那还是一趟**深空探索**——
+#:   比这条链路任何一发都远得多。6 小时留了十倍以上余量。
+#: - 反过来它拦得住最典型的量级错：任何真实时长 ≥6 分钟的一发，
+#:   被「分」读成「时」之后都超过上界；带「天」的误读一律超过。
+#: - 战报有有效期（见 `report_wait.MAX_SESSION_BACKOFF` 的注释），
+#:   真等到 6 小时之后也多半已经读不到了，放弃这个值没有实际损失。
+#:
+#: 误杀的代价是可接受的那一侧：把一次合法的长途飞行判成读错，
+#: 只是让助手立刻去收一次、扑空、退出。
+MAX_CREDIBLE_FLIGHT = timedelta(hours=6)
 
 #: 自己星球地表视图右上角的信箱入口。**底部导航里没有邮箱**，只有这一个入口。
 MAIL_BUTTON = (1131, 70)
@@ -141,6 +167,10 @@ class Outcome:
 
 class PirateLoop:
     """驱动一轮「扫 1–4 位 → 侦察 → 判定 → 攻击」。"""
+
+    #: 这条链路打的是什么目标。子类覆盖它——`BotLoop` 走的是同一套写库路径，
+    #: 标签却必须不同：海盗每天 32 次是游戏硬限制，两者混在一起会数错配额。
+    TARGET_KIND: str = TARGET_KIND_PIRATE
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
@@ -240,6 +270,48 @@ class PirateLoop:
         self._settle(read_once)
         return mission
 
+    def _read_flight_time(self) -> timedelta | None:
+        """把简报上的飞行时间读下来，**必须在点「出发！」之前**。
+
+        点完出发这一屏就没了，而这个时长是助手松手之后唯一的回程闹钟
+        （见 `domain.report_wait` 的模块头）。对应的那一列此前从来没被写入过——
+        实测库里 4 条派遣全是 NULL，于是整个「派出后松手、到点回来收战报」是死的。
+
+        和任务类型那道闸门一样**要等它铺开**：页面是滑进来的，读一次读不到
+        不代表这一行不存在（`_briefing_mission` 的注释记着同一个坑）。
+
+        读不出来返回 None，而**不是**拦下这一发：飞行时间只是闹钟，不是闸门。
+        为它加一道闸门等于让一次 OCR 抖动就废掉一发完全正常的攻击——
+        这条链路已经因为「ROI 与放大倍数不配」白白拦下过四发。
+
+        读出来但大得离谱的，同样返回 None（见 `MAX_CREDIBLE_FLIGHT`）。
+
+        ⚠️ **只返回时长，不拼一个 `DispatchBriefing` 出来。** 那个类型带着
+        `mission_type` 与绝对到达时间两个字段，而这里两样都没有证据：任务类型的闸门
+        在这之后才跑，绝对到达时间的 ROI（`BRIEFING_ARRIVAL_ROI`）还没标定。
+        硬填的话 `duration_agrees()` 会变成 `now+flight` 和 `now+flight` 相比——
+        一道交叉校验降级成同义反复，比没有更糟：下一个人会以为它验过了。
+        正因为这里拿不到第二个来源，才需要 `MAX_CREDIBLE_FLIGHT` 那道上界。
+        """
+        flight: timedelta | None = None
+
+        def read_once() -> bool:
+            nonlocal flight
+            flight = parse_game_duration(self._read(pirate_ui.BRIEFING_FLIGHT_ROI))
+            return flight is not None
+
+        if not self._settle(read_once) or flight is None:
+            say("  简报上读不到飞行时间；这一发照派，回程闹钟留空")
+            return None
+        if flight > MAX_CREDIBLE_FLIGHT:
+            # 宁可白跑一趟，也不要安安静静等一个读错的钟。
+            say(
+                f"  简报上的飞行时间读作 {flight}，超过 {MAX_CREDIBLE_FLIGHT} 的上界；"
+                "当读错处理，回程闹钟留空"
+            )
+            return None
+        return flight
+
     def _launch(self, coordinate: Coordinate, mission: str) -> bool:
         """简报页核对任务类型，通过才点「出发！」。"""
         shown = self._briefing_mission()
@@ -295,10 +367,14 @@ class PirateLoop:
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
         intent_id = self._record_intent(coordinate, preset=wanted)
+        # ⚠️ **这一行必须留在 `_launch` 之前。** 点完「出发！」简报页就没了，
+        # 挪到后面读，四次重试全会落空，飞行时间永久恒为 NULL——而且一声不响，
+        # 看起来只是「一直在等」。
+        flight = self._read_flight_time()
         if not self._launch(coordinate, "攻击"):
             self._leave_dispatch_list()
             return False
-        self._record_dispatch(intent_id)
+        self._record_dispatch(intent_id, flight)
         self._outcome.attacked.append(coordinate)
         say(f"  已发动攻击 → {coordinate}（预设 {wanted}）")
         self._leave_dispatch_list()
@@ -519,22 +595,30 @@ class PirateLoop:
                 ),
                 cycle_start_utc=now,
                 created_at_utc=now,
-                target_kind=TARGET_KIND_PIRATE,
+                target_kind=self.TARGET_KIND,
             )
         )
         return intent_id
 
-    def _record_dispatch(self, intent_id: UUID) -> None:
+    def _record_dispatch(self, intent_id: UUID, flight: timedelta | None) -> None:
+        """记下这一发，并把简报上的飞行时间存成回程闹钟。
+
+        读不到时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
+        而不是无限等一个不知道何时抵达的战报。
+        """
         repository, _run_id = self._ensure_run()
+        dispatch_id = uuid4()
+        dispatched_at = datetime.now(UTC)
         repository.save_dispatch(
             AttackDispatch(
-                dispatch_id=uuid4(),
+                dispatch_id=dispatch_id,
                 intent_id=intent_id,
-                dispatched_at_utc=datetime.now(UTC),
+                dispatched_at_utc=dispatched_at,
                 dry_run=False,
                 accepted=True,
             )
         )
+        repository.record_flight_time(dispatch_id, flight, dispatched_at)
 
     # -- 主循环 -------------------------------------------------------------
 

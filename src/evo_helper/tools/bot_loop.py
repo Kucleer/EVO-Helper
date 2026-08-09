@@ -31,13 +31,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.tools.pirate_loop import (
     MAIL_FIRST_ROW_Y,
     MAIL_ROW_PITCH,
@@ -55,19 +56,20 @@ from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
 #: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
 PROBE_PRESET = DEFAULT_PRESET.name
 
-#: 打完之后等战报。bot 目标同系内飞行按分钟计，留足余量；读不到就报出来，不硬等。
-REPORT_WAIT_S = 600.0
-
 
 @dataclass
 class BotOptions:
     targets: tuple[Coordinate, ...]
     probe: bool
     attack: bool
+    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态。
+    round_started_at: datetime | None = None
 
 
 class BotLoop(PirateLoop):
     """复用海盗那条链路的驱动，换成 bot 的识别与分档判定。"""
+
+    TARGET_KIND: str = TARGET_KIND_BOT
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
@@ -151,6 +153,14 @@ class BotLoop(PirateLoop):
     # -- 主循环 -------------------------------------------------------------
 
     def run(self) -> Any:  # noqa: D401 - 覆盖父类的海盗循环
+        """一趟只把每个目标推进一态，然后退出。
+
+        **不在进程内等战报。** 原先每个目标 `time.sleep(600)`，五个目标就是
+        五十分钟独占鼠标，而这段时间本该拿去跑扫描。抵达时间已经写进
+        `attack_dispatches.expected_report_at_utc`，到点由调度器把这条链路
+        重新叫起来——这正是 `domain.report_wait` 模块头写的那条路。
+        """
+        from evo_helper.domain.bot_round import BotPhase
         from evo_helper.game.game_window import ensure_game_window
 
         ensure_game_window()
@@ -159,38 +169,92 @@ class BotLoop(PirateLoop):
             raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
 
         for coordinate in self._bot.targets:
-            say(f"目标 {coordinate}")
-            self._navigator.goto(coordinate)
-            if not self.is_bot_target(coordinate):
-                continue
-            self._outcome.pirates.append(coordinate)
-            if not self._bot.probe:
-                continue
-            # 攻击侦查：用「探路」预设打一发。走的是攻击链路，所以简报上写的是「攻击」。
-            if not self.attack(coordinate, preset=PROBE_PRESET):
-                continue
-            self._outcome.scouted.append(coordinate)
-            if not self._bot.attack:
-                continue
-            say(f"  等战报（最多 {REPORT_WAIT_S:.0f}s）")
-            time.sleep(REPORT_WAIT_S)
-            units = self.read_defender_units(coordinate)
-            if units is None:
-                say(f"  {coordinate} 读不到战报里的守方单位数；不打")
-                self._outcome.refused.append((coordinate, "读不到守方单位数"))
-                continue
-            tier = tier_for(units)
-            preset = tier.preset
-            say(f"  {coordinate} 守方 {units} → {tier.value}；预设 {preset or '（不派）'}")
-            if preset is None:
-                self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
-                continue
-            self._navigator.goto(coordinate)
-            if not self.is_bot_target(coordinate):
-                self._outcome.refused.append((coordinate, "攻击前面板认不出"))
-                continue
-            self.attack(coordinate, preset=preset)
+            phase = self._phase_of(coordinate)
+            say(f"目标 {coordinate}（{phase.value}）")
+            if phase is BotPhase.NEEDS_PROBE:
+                self._probe(coordinate)
+            elif phase is BotPhase.NEEDS_ATTACK:
+                self._tier_and_attack(coordinate)
+            # 其余三态这一趟没事可做：等战报，或已走完。
         return self._outcome
+
+    def _phase_of(self, coordinate: Coordinate) -> Any:
+        """这个目标这一趟走到哪一步了。
+
+        **只认目标模式（默认档，一次点击都不做）不查库。** 那一档根本不派，
+        没有派遣事实可言，查库只会凭空要求一个数据库。`_probe` 自己会在
+        `probe=False` 时停在识别那一步，所以这里直接当成「该去看一眼」。
+        """
+        from evo_helper.domain.bot_round import BotPhase, phase_of
+
+        if not self._bot.probe:
+            return BotPhase.NEEDS_PROBE
+        return phase_of(self._dispatch_facts(coordinate))
+
+    def _dispatch_facts(self, coordinate: Coordinate) -> tuple[Any, ...]:
+        """本轮针对这个目标已经派过哪些发、战报回来了没有。"""
+        # 仓储上的 `bot_dispatch_facts` 由调度器那一批任务提供。这里按 Any 取，
+        # 好让这条链路能先独立合入——两边在同一波次里并行改。
+        # TODO(Task 7): `bot_dispatch_facts` 合流后删掉这个 Any，改回
+        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
+        repository: Any = self._ensure_run()[0]
+        return tuple(repository.bot_dispatch_facts(coordinate, since=self._round_start()))
+
+    def _probe(self, coordinate: Coordinate) -> None:
+        """派一发探路。走的是攻击链路，所以简报上写的是「攻击」。"""
+        self._navigator.goto(coordinate)
+        if not self.is_bot_target(coordinate):
+            return
+        self._outcome.pirates.append(coordinate)
+        if not self._bot.probe:
+            return
+        if self.attack(coordinate, preset=PROBE_PRESET):
+            self._outcome.scouted.append(coordinate)
+
+    def _tier_and_attack(self, coordinate: Coordinate) -> None:
+        """探路战报已回：读守方单位数、分档、按档位真打。"""
+        if not self._bot.attack:
+            return
+        units = self.read_defender_units(coordinate)
+        if units is None:
+            say(f"  {coordinate} 读不到战报里的守方单位数；不打")
+            self._outcome.refused.append((coordinate, "读不到守方单位数"))
+            return
+        tier = tier_for(units)
+        preset = tier.preset
+        say(f"  {coordinate} 守方 {units} → {tier.value}；预设 {preset or '（不派）'}")
+        if preset is None:
+            self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
+            self._mark_skipped(coordinate)
+            return
+        self._navigator.goto(coordinate)
+        if not self.is_bot_target(coordinate):
+            self._outcome.refused.append((coordinate, "攻击前面板认不出"))
+            return
+        self.attack(coordinate, preset=preset)
+
+    def _mark_skipped(self, coordinate: Coordinate) -> None:
+        """把「分档说不值得打」记进库，否则下一趟又会重新分一次档。"""
+        # TODO(Task 7): `mark_bot_target_skipped` 合流后删掉这个 Any，改回
+        # `repository, _run_id = self._ensure_run()`，让 mypy 真的检查这个调用。
+        repository: Any = self._ensure_run()[0]
+        repository.mark_bot_target_skipped(coordinate, since=self._round_start())
+
+    def _round_start(self) -> datetime:
+        """本轮从何时算起。**绝不返回 None。**
+
+        `--round-started-at` 是可选的（手工跑时没人会填），但 `None` 一路传到
+        仓储那边就是「不限时间范围」：`mark_bot_target_skipped(since=None)` 会把
+        这个坐标**历史上每一轮的每一条 intent** 全刷成跳过。手工跑一次
+        `--probe --attack`，只要有一个目标被分档判成「不值得打」就会触发。
+
+        所以这里兜底成**当日 UTC 00:00**。取当天而不是「此刻」，是因为一趟里
+        先派出的那几发必须仍算本轮；取 UTC 而不是本地时区，是因为游戏内时间
+        一律 UTC+0（见 `vision.parsers` 的 `GAME_DISPLAY_ZONE`）。
+        """
+        if self._bot.round_started_at is not None:
+            return self._bot.round_started_at
+        return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _count(text: str) -> int | None:
@@ -211,6 +275,25 @@ def _tesseract() -> str:
     return str(TESSERACT_PATH)
 
 
+def parse_round_start(text: str) -> datetime:
+    """本轮起始时刻。**必须带时区**，否则拒收。
+
+    `datetime.fromisoformat` 对 naive 值一声不响地照收，而这个值是要拿去和库里
+    的 UTC 时间戳比大小的。SQLite 上比较 naive 与 aware 不报错，只是结果悄悄偏
+    掉时差——上一轮的派遣被算进本轮，于是这一轮的目标看起来「已经打过了」。
+    仓储那边用 `_require_utc` 守同一条线，这里在入口就守住。
+    """
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"认不出的 ISO 8601 时刻 {text!r}：{error}") from error
+    if value.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} 没带时区。要写成 UTC，例如 2026-08-09T00:00:00+00:00 或 …Z"
+        )
+    return value.astimezone(UTC)
+
+
 def parse_target(text: str) -> Coordinate:
     parts = text.split(":")
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
@@ -226,6 +309,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--targets", nargs="+", type=parse_target, required=True)
     parser.add_argument("--probe", action="store_true", help="真的用「探路」打一发攻击侦查")
     parser.add_argument("--attack", action="store_true", help="拿到战报后按档位真的攻击")
+    parser.add_argument(
+        "--round-started-at",
+        type=parse_round_start,
+        default=None,
+        help="本轮起始时刻（ISO 8601，必须带时区）。调度器会传；手工跑不给则按当日 UTC 00:00 算",
+    )
     args = parser.parse_args(argv)
 
     if args.attack and not args.probe:
@@ -235,7 +324,12 @@ def main(argv: list[str] | None = None) -> int:
 
     getattr(ctypes, "windll").shcore.SetProcessDpiAwareness(2)
 
-    options = BotOptions(targets=tuple(args.targets), probe=args.probe, attack=args.attack)
+    options = BotOptions(
+        targets=tuple(args.targets),
+        probe=args.probe,
+        attack=args.attack,
+        round_started_at=args.round_started_at,
+    )
     mode = "只认目标" if not args.probe else ("侦查+攻击" if args.attack else "只侦查")
     listed = ", ".join(str(target) for target in options.targets)
     say(f"模式：{mode}；目标 {listed}")
