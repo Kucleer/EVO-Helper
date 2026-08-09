@@ -14,6 +14,14 @@ from uuid import UUID
 
 from .models import Coordinate, FleetPresetRef
 
+#: 攻击目标的两类。字符串常量而不是枚举：它要原样进数据库、也要原样进接口，
+#: 而枚举在这两处都得来回转换，转换点越多越容易两边写成不同的字面量。
+TARGET_KIND_BOT = "bot"
+TARGET_KIND_PIRATE = "pirate"
+
+#: 界面上的中文标签。日志页只显示中文，库里存的仍是上面的英文常量。
+TARGET_KIND_LABELS = {TARGET_KIND_BOT: "bot", TARGET_KIND_PIRATE: "海盗"}
+
 
 @dataclass(frozen=True)
 class CoordinateScan:
@@ -37,6 +45,10 @@ class AttackIntent:
     created_at_utc: datetime
     guard_status: str = "PENDING"
     forced_revisit: bool = False
+    #: 打的是 bot 还是海盗。两种目标的判定链路、预设、收益都不一样，
+    #: 事后翻日志时「这一发是打谁的」是第一个要回答的问题。
+    #: 默认 `bot`：这个字段加进来之前的存量意图全部来自 bot 攻击链路。
+    target_kind: str = TARGET_KIND_BOT
 
 
 @dataclass(frozen=True)

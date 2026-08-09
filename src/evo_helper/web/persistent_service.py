@@ -16,6 +16,7 @@ from evo_helper.storage import models as orm
 
 from .service import (
     SHANGHAI,
+    AttackLogView,
     BotTargetView,
     ConflictError,
     CoordinateScanView,
@@ -350,6 +351,50 @@ class PersistentApplicationService:
                     row.after_state,
                 )
                 for row in reversed(rows)
+            ]
+
+    def list_attack_log(self, limit: int) -> list[AttackLogView]:
+        """攻击日志：每条意图一行，派出去的带上派遣事实。
+
+        用 `outerjoin` 而不是 `join`：**被闸门拦下、或者读简报没通过的意图
+        没有对应的派遣行**，而这些恰恰是最需要在日志里看到的——
+        内连接会把它们静默滤掉，日志看起来一片干净，实际是漏了。
+
+        按意图创建时间倒序：日志页第一眼要看的是最近发生了什么。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.AttackIntentRow, orm.AttackDispatchRow)
+                .outerjoin(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .order_by(
+                    orm.AttackIntentRow.created_at_utc.desc(),
+                    orm.AttackIntentRow.id.desc(),
+                )
+                .limit(limit)
+            ).all()
+            return [
+                AttackLogView(
+                    intent_id=intent.id,
+                    target=Coordinate(
+                        intent.target_galaxy, intent.target_system, intent.target_position
+                    ),
+                    origin=Coordinate(
+                        intent.origin_galaxy, intent.origin_system, intent.origin_position
+                    ),
+                    target_kind=intent.target_kind,
+                    preset_name=intent.preset_name,
+                    preset_signature=intent.preset_signature,
+                    guard_status=intent.guard_status,
+                    created_at_utc=intent.created_at_utc,
+                    dispatched_at_utc=dispatch.dispatched_at_utc if dispatch else None,
+                    dry_run=dispatch.dry_run if dispatch else None,
+                    accepted=dispatch.accepted if dispatch else None,
+                    expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
+                )
+                for intent, dispatch in rows
             ]
 
     def request_revisit(

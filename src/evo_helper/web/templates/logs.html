@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}攻击日志 · EVO-Helper{% endblock %}
+{% block heading %}攻击日志{% endblock %}
+{% block topbar_extra %}
+<span class="chip"><span class="glyph" aria-hidden="true">🕗</span>游戏时间 UTC+0 · 现实时间 UTC+8</span>
+{% endblock %}
+{% block content %}
+
+<section class="panel compact" aria-labelledby="log-filter">
+  <h2 id="log-filter" class="visually-hidden">筛选</h2>
+  <div class="filter-bar">
+    <span class="inline-label">事件类型</span>
+    <a class="btn small {{ 'primary' if kind == 'all' else '' }}" href="/logs?kind=all">全部</a>
+    {% for value, label in kind_labels.items() %}
+      <a class="btn small {{ 'primary' if kind == value else '' }}" href="/logs?kind={{ value }}">{{ label }}</a>
+    {% endfor %}
+    <span class="spacer"></span>
+    <span class="muted">最多显示最近 {{ limit }} 条</span>
+  </div>
+</section>
+
+<section class="panel" aria-labelledby="log-table">
+  <h2 id="log-table">派遣记录 <span class="muted">（{{ entries | length }} 条）</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">发动时间（游戏 UTC+0）</th>
+          <th scope="col">发动时间（现实 UTC+8）</th>
+          <th scope="col">事件类型</th>
+          <th scope="col">目标</th>
+          <th scope="col">出发</th>
+          <th scope="col">预设</th>
+          <th scope="col">结果</th>
+          <th scope="col">预计战报（游戏 UTC+0）</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for entry in entries %}
+        {# 未派出的意图也占一行：被闸门拦下才是最该看见的记录。 #}
+        {% set moment = entry.dispatched_at_utc or entry.created_at_utc %}
+        <tr>
+          <td>{{ game_time(moment) }}{% if not entry.dispatched_at_utc %} <span class="muted">（仅意图）</span>{% endif %}</td>
+          <td>{{ local_time(moment) }}</td>
+          <td>
+            <span class="chip">{{ kind_labels.get(entry.target_kind, entry.target_kind) }}</span>
+          </td>
+          <td><a href="/targets/{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}?back=%2Flogs">{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}</a></td>
+          <td class="muted">{{ entry.origin.galaxy }}:{{ entry.origin.system }}:{{ entry.origin.position }}</td>
+          <td>
+            {{ entry.preset_name }}
+            <div class="muted" style="font-size:11px">{{ entry.preset_signature }}</div>
+          </td>
+          <td>
+            {% if entry.dispatched_at_utc is none %}
+              <span class="chip"><span class="glyph" aria-hidden="true">◷</span>未派出 · {{ entry.guard_status }}</span>
+            {% elif entry.dry_run %}
+              <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>演习</span>
+            {% elif entry.accepted %}
+              <span class="chip ok"><span class="glyph" aria-hidden="true">▶</span>已派出</span>
+            {% else %}
+              <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>被拒</span>
+            {% endif %}
+          </td>
+          <td class="muted">{{ game_time(entry.expected_report_at_utc) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}

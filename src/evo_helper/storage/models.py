@@ -146,6 +146,8 @@ class AttackIntentRow(Base):
     guard_status: Mapped[str] = mapped_column(String(32), default="PENDING")
     forced_revisit: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: `bot` 或 `pirate`（见 `domain.records.TARGET_KIND_*`）。攻击日志按它分类。
+    target_kind: Mapped[str] = mapped_column(String(16), default="bot", server_default="bot")
 
 
 class AttackDispatchRow(Base):

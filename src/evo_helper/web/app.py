@@ -1,6 +1,7 @@
 """FastAPI application factory for the local EVO-Helper management UI."""
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 
 from .display import LIST_SHIP_COLUMNS
@@ -42,6 +44,7 @@ from .security import LocalSecurityMiddleware
 from .service import (
     DEFAULT_PLANET_KIND,
     PLANET_KINDS,
+    SHANGHAI,
     ApplicationService,
     BotTargetView,
     FakeApplicationService,
@@ -268,6 +271,29 @@ _RUN_STATE_LABEL = {
 }
 
 
+#: 攻击日志一页显示多少条。日志是给人翻的，不是给人滚的。
+ATTACK_LOG_LIMIT = 300
+
+
+def game_time(moment: datetime | None) -> str:
+    """游戏内时间。游戏一律按 UTC+0 显示（`vision.parsers.GAME_DISPLAY_ZONE`）。"""
+    if moment is None:
+        return "—"
+    return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def local_time(moment: datetime | None) -> str:
+    """现实时间，也就是用户的墙上时钟（UTC+8）。
+
+    和游戏时间是**同一个瞬时的两种写法**，差 8 小时。日志上两个都写出来，
+    是因为战报里的时间是游戏时间、而人回忆「我当时在干嘛」用的是现实时间——
+    只给一个，另一个就得每次心算，迟早算错。
+    """
+    if moment is None:
+        return "—"
+    return moment.astimezone(SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _safe_back_url(back: str | None, default: str = "/planets") -> str:
     """把「返回」目标限制在本站内的相对路径。
 
@@ -319,6 +345,8 @@ def create_app(
     templates.env.globals["run_state_tone"] = run_state_tone
     templates.env.globals["run_state_glyph"] = run_state_glyph
     templates.env.globals["run_state_label"] = run_state_label
+    templates.env.globals["game_time"] = game_time
+    templates.env.globals["local_time"] = local_time
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
@@ -666,6 +694,28 @@ def create_app(
             else None
         )
         return _revisit_out(service.request_revisit(payload.scope, payload.reason, target))
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def attack_log_page(request: Request, kind: str = "all") -> HTMLResponse:
+        """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
+
+        筛选走查询参数，所以「只看海盗」有自己可分享的链接。
+        """
+        service = get_service(request)
+        entries = service.list_attack_log(ATTACK_LOG_LIMIT)
+        if kind in TARGET_KIND_LABELS:
+            entries = [entry for entry in entries if entry.target_kind == kind]
+        return templates.TemplateResponse(
+            request=request,
+            name="logs.html",
+            context={
+                "active": "logs",
+                "entries": entries,
+                "kind": kind,
+                "kind_labels": TARGET_KIND_LABELS,
+                "limit": ATTACK_LOG_LIMIT,
+            },
+        )
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     async def diagnostics_page(request: Request) -> HTMLResponse:

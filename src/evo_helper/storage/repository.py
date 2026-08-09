@@ -189,6 +189,7 @@ class SqlAlchemyRepository:
                     guard_status=record.guard_status,
                     forced_revisit=record.forced_revisit,
                     created_at_utc=record.created_at_utc,
+                    target_kind=record.target_kind,
                 )
             )
             session.commit()

@@ -212,6 +212,32 @@ class StateEventView:
 
 
 @dataclass(frozen=True)
+class AttackLogView:
+    """攻击日志的一行：一次派遣，或一个还没派出去的意图。
+
+    只存 `dispatched_at_utc` 一个瞬时，不存两份时间。游戏内时间是 UTC+0
+    （`vision.parsers.GAME_DISPLAY_ZONE`），现实时间是 UTC+8
+    （`domain.scheduling.SHANGHAI_OFFSET`）——同一个瞬时的两种写法，
+    存两遍只会让它们迟早对不上。渲染时各显示一次，都标明时区。
+    """
+
+    intent_id: UUID
+    target: Coordinate
+    origin: Coordinate
+    #: `bot` 或 `pirate`。
+    target_kind: str
+    preset_name: str
+    preset_signature: str
+    guard_status: str
+    created_at_utc: datetime
+    #: 真正点下「出发！」的时刻。意图被闸门拦下或还没派出时为 None。
+    dispatched_at_utc: datetime | None
+    dry_run: bool | None
+    accepted: bool | None
+    expected_report_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
 class RevisitView:
     revisit_id: UUID
     scope: str
@@ -265,6 +291,7 @@ class ApplicationService(Protocol):
         self, scope: str, reason: str, target_coordinate: Coordinate | None
     ) -> RevisitView: ...
     def list_revisits(self) -> list[RevisitView]: ...
+    def list_attack_log(self, limit: int) -> list[AttackLogView]: ...
     def dashboard(self) -> DashboardView: ...
 
 
@@ -675,6 +702,14 @@ class FakeApplicationService:
     def list_events(self, limit: int) -> list[StateEventView]:
         with self._lock:
             return list(self._events[-limit:])
+
+    def list_attack_log(self, limit: int) -> list[AttackLogView]:
+        """Fake 服务不模拟派遣，所以攻击日志恒为空。
+
+        返回空列表而不是抛未实现：页面在演示服务上也要打得开，
+        并且要显示「还没有攻击记录」而不是 500。
+        """
+        return []
 
     def dashboard(self) -> DashboardView:
         with self._lock:
