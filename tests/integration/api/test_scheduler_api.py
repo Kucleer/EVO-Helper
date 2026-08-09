@@ -24,6 +24,7 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.tools.scan_console import parse_scheduler
 from evo_helper.web.app import create_persistent_app
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
@@ -374,6 +375,34 @@ def test_force_kill_stops_the_child_we_do_know_about(console: Console) -> None:
     body = console.get()
     assert body["current"] is None
     assert body["running"] is False
+
+
+# -- 桌面悬浮窗的契约 -----------------------------------------------------------
+
+
+def test_the_desktop_window_can_read_this_endpoint(console: Console) -> None:
+    """桌面悬浮窗（`tools/scan_console.py`）解的就是这个回包。
+
+    悬浮窗那边只能拿假回包测自己，接口这边只能测自己的字段——两边都绿、
+    形状却对不上，是这种「服务端下发、客户端照抄」的接口最典型的失效方式，
+    而它在实机上表现为状态窗一直显示「未连接」，没有任何报错。
+    所以在真接口的回包上跑一遍悬浮窗的解析器。
+    """
+    stopped = parse_scheduler(console.get())
+    assert stopped.running is False
+    assert stopped.current is None
+
+    console.client.post("/api/scheduler/start")
+    console.scheduler.tick()
+    console.clock.now = NOW + timedelta(minutes=2)
+
+    snapshot = parse_scheduler(console.get())
+    assert snapshot.running is True
+    assert snapshot.started_at_utc == NOW
+    assert snapshot.current is not None
+    # 链路名由服务端下发，悬浮窗不自己拼——两处各写一份就会有一天对不上。
+    assert snapshot.current.label == "扫描全星系 bot"
+    assert snapshot.current.started_at_utc == NOW
 
 
 # -- 旧页面 ---------------------------------------------------------------------

@@ -9,10 +9,29 @@ an ``X-Evo-Helper-Token`` header matching the locally configured token.
 安全边界是「这个网段可信」，不是这个中间件。
 """
 
+import os
+
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: 没配 `EVO_HELPER_WEB_TOKEN` 时两边共用的开发值。
+DEFAULT_LOCAL_TOKEN = "local-evo-helper-token"
+
+
+def default_local_token() -> str:
+    """本机令牌。**服务端和桌面悬浮窗都调这一个函数。**
+
+    悬浮窗（`tools/scan_console.py`）是本机进程、不是浏览器，没有 Origin 可言，
+    所以它的写请求只能走令牌那条路。令牌不做任何握手：两边各读一次同一个环境
+    变量，读法必须逐字一致——各写一份 `os.environ.get(..., "…")`，哪天默认值改了
+    就是一边 403、另一边看着服务活得好好的。
+
+    刻意只读 `os.environ` 而不走 `Settings`：`Settings` 会顺带读 `.env`，
+    而服务端从一开始就是这个读法，改成读 `.env` 会让已经在跑的部署换一个令牌。
+    """
+    return os.environ.get("EVO_HELPER_WEB_TOKEN", DEFAULT_LOCAL_TOKEN)
 
 
 def _origin_allowed(origin: bytes | None, host: bytes | None) -> bool:
@@ -48,4 +67,9 @@ class LocalSecurityMiddleware:
         await self.app(scope, receive, send)
 
 
-__all__ = ["LocalSecurityMiddleware", "MUTATING_METHODS"]
+__all__ = [
+    "DEFAULT_LOCAL_TOKEN",
+    "MUTATING_METHODS",
+    "LocalSecurityMiddleware",
+    "default_local_token",
+]

@@ -377,7 +377,9 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates --status
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates
 
-# 常驻控制台：Alt+F8 起 / Alt+F9 停，右下角常驻状态窗（状态 + 持续工作时间）
+# 桌面状态窗：调度器的瘦客户端。右下角显示「现在跑的是哪条链路 + 跑了多久」，
+# Alt+F8 开始调度 / Alt+F9 结束调度（等同网页上的开始/结束）。
+# **它自己不起任何进程**，得先把上面那台 Web 服务跑起来，否则只显示「未连接」。
 .venv/Scripts/python.exe -m evo_helper.tools.scan_console
 .venv/Scripts/python.exe -m evo_helper.tools.scan_console --stop-key ctrl+alt+f9
 
@@ -394,4 +396,5 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 ⚠️ **这台机器上 `Alt+F9` 与 `Alt+F10` 被 NVIDIA ShadowPlay 占用**
 （`RegisterHotKey` 返回错误码 1409）。控制台会逐个注册、逐个报告，
 能用的照常生效；换键用 `--stop-key ctrl+alt+f9`（实测空着），
-或去 GeForce Experience 里把录制快捷键改掉。状态窗右键=停止，不依赖任何注册。
+或去 GeForce Experience 里把录制快捷键改掉。状态窗右键=结束调度，不依赖任何注册。
+（右键**只停不启**：做成切换的话，在状态刚变过的那一瞬右键会变成又起一轮。）
