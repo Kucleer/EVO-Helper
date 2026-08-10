@@ -148,7 +148,9 @@ class TestChromeDiscovery:
 
         from evo_helper.game import game_window
 
-        monkeypatch.setattr(game_window, "CHROME_CANDIDATES", (Path("/nope/chrome.exe"),))
+        monkeypatch.setattr(
+            game_window, "chrome_candidates", lambda env=None: (Path("/nope/chrome.exe"),)
+        )
         with pytest.raises(game_window.GameWindowError, match="Chrome"):
             game_window.chrome_path()
 

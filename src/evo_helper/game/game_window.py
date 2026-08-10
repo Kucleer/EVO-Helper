@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -58,13 +58,33 @@ CALIBRATED_SCALE_FACTOR = 1.25
 #: 落在 `var/` 下：那里已经在 .gitignore 里，而 profile 有几十 MB。
 CHROME_PROFILE_DIR = Path(__file__).resolve().parents[3] / "var" / "chrome-profile"
 
-#: Chrome 的落点。**用户级安装（`%LOCALAPPDATA%`）才是安装器的默认选项**，
-#: 只列 `Program Files` 会在一台明明装着 Chrome 的机器上报「找不到 Chrome」。
-CHROME_CANDIDATES = (
-    Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+#: 系统级安装的两个落点。用户级那个要看环境变量，见 `chrome_candidates()`。
+SYSTEM_CHROME_CANDIDATES = (
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
 )
+
+
+def chrome_candidates(env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """Chrome 的落点候选，按优先级排。
+
+    **用户级安装（`%LOCALAPPDATA%`）才是安装器的默认选项**，只列 `Program Files`
+    会在一台明明装着 Chrome 的机器上报「找不到 Chrome」，所以它排在最前。
+
+    做成函数而不是模块常量，有两个理由：
+
+    1. 常量会在 **import 那一刻**把环境变量烤进去。既测不了（CI 在 Linux 上跑，
+       根本没有 `LOCALAPPDATA`），也会在环境变量后设时读到空值。
+    2. `LOCALAPPDATA` 缺失时必须**整条略过**，不能拼出 `Path("")/"Google"/...`
+       ——那是个**相对路径**，会去匹配当前工作目录下的同名文件。找 Chrome 找到
+       工作目录里去，是那种查起来要命的错。
+    """
+    source = os.environ if env is None else env
+    local = source.get("LOCALAPPDATA", "")
+    if not local:
+        return SYSTEM_CHROME_CANDIDATES
+    user_level = Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe"
+    return (user_level, *SYSTEM_CHROME_CANDIDATES)
 
 
 class GameWindowError(RuntimeError):
@@ -127,7 +147,7 @@ def chrome_path() -> Path:
         if not explicit.is_file():
             raise GameWindowError(f"配置里的 Chrome 路径不存在：{explicit}")
         return explicit
-    for candidate in CHROME_CANDIDATES:
+    for candidate in chrome_candidates():
         if candidate.is_file():
             return candidate
     raise GameWindowError("找不到 Chrome；无法拉起游戏窗口")

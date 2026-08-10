@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     #: 装到别处（或装的是 portable 版）时用 `EVO_HELPER_TESSERACT_PATH` 指过去。
     tesseract_path: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-    #: Chrome 可执行文件。留空则按 `game.game_window.CHROME_CANDIDATES` 依次找。
+    #: Chrome 可执行文件。留空则按 `game.game_window.chrome_candidates()` 依次找。
     #: 显式指定时**找不到就报错**，不回落到候选列表——回落的话用户以为跑的是
     #: 自己指定的那个（比如带着已登录 profile 的），实际跑的是另一个。
     chrome_path: str | None = None

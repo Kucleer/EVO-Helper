@@ -74,20 +74,32 @@ class TestTesseractPath:
 
 
 class TestChromePath:
-    def test_the_user_level_install_is_a_candidate(self) -> None:
+    def test_the_user_level_install_is_the_first_candidate(self) -> None:
         """Chrome 默认装在 `%LOCALAPPDATA%`，不是 `Program Files`。
 
         只列系统级路径时，一台按默认方式装 Chrome 的机器会直接报「找不到
         Chrome」，而机器上明明装着。
+
+        env 是**注入的**，不读本机的——CI 在 Linux 上跑，那里根本没有
+        `LOCALAPPDATA`。读本机的话这条测试在 CI 上必挂（实际挂过一次）。
         """
-        import os
+        from evo_helper.game.game_window import chrome_candidates
 
-        from evo_helper.game.game_window import CHROME_CANDIDATES
-
-        local = os.environ.get("LOCALAPPDATA")
-        assert local, "本机没有 LOCALAPPDATA，这条测试的前提不成立"
+        local = r"C:\Users\someone\AppData\Local"
+        candidates = chrome_candidates({"LOCALAPPDATA": local})
         expected = Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe"
-        assert expected in CHROME_CANDIDATES, CHROME_CANDIDATES
+        assert candidates[0] == expected, candidates
+
+    def test_a_missing_localappdata_drops_the_candidate_rather_than_going_relative(self) -> None:
+        """`LOCALAPPDATA` 缺失时整条略过，不许拼出相对路径。
+
+        `Path("") / "Google" / ...` 是**相对路径**，会去匹配当前工作目录下的
+        同名文件——找 Chrome 找到工作目录里去，是那种查起来要命的错。
+        """
+        from evo_helper.game.game_window import SYSTEM_CHROME_CANDIDATES, chrome_candidates
+
+        assert chrome_candidates({}) == SYSTEM_CHROME_CANDIDATES
+        assert all(candidate.is_absolute() for candidate in chrome_candidates({}))
 
     def test_an_explicit_path_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from evo_helper.game import game_window
