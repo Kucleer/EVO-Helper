@@ -201,21 +201,26 @@ class BotLoop(PirateLoop):
 
     # -- 主循环 -------------------------------------------------------------
 
-    def run(self) -> Any:  # noqa: D401 - 覆盖父类的海盗循环
+    def _sweep(self) -> None:
         """一趟只把每个目标推进一态，然后退出。
 
         **不在进程内等战报。** 原先每个目标 `time.sleep(600)`，五个目标就是
         五十分钟独占鼠标，而这段时间本该拿去跑扫描。抵达时间已经写进
         `attack_dispatches.expected_report_at_utc`，到点由调度器把这条链路
         重新叫起来——这正是 `domain.report_wait` 模块头写的那条路。
+
+        ⚠️ **覆盖的是 `_sweep` 而不是 `run`。** 原先这里覆盖 `run()`，把开工前置
+        （校几何、确认会话、复位画面、切视图）抄了一遍，还漏了父类那个
+        `except RoundExhausted`。两个后果都在实机上发生过：
+
+        - `RoundExhausted("同时派遣的舰队数量已达上限")` 从这里漏出去，进程按
+          退出码 1 收场；航线占满是**必然**会发生的事，连撞三次调度器就把整条
+          bot 链路自动停用了（2026-08-11 02:43 实测）。
+        - 后来给父类 `run()` 加的断线重连，这条链路一行都没吃到——因为它压根
+          不走父类的 `run()`。
+
+        覆盖 `_sweep` 之后这两件事都由父类统一管，不会再各写一份。
         """
-        from evo_helper.game.game_window import ensure_game_window
-
-        ensure_game_window()
-        self._reset_to_known_screen()
-        if not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
-
         for coordinate in self._bot.targets:
             phase = self._phase_of(coordinate)
             say(f"目标 {coordinate}（{phase.value}）")
@@ -224,7 +229,6 @@ class BotLoop(PirateLoop):
             elif phase is BotPhase.NEEDS_ATTACK:
                 self._tier_and_attack(coordinate)
             # 其余三态这一趟没事可做：等战报，或已走完。
-        return self._outcome
 
     def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。

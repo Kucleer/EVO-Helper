@@ -95,6 +95,10 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
     loop._outcome = Outcome()
     loop._navigator = _FakeNavigator()
     loop._reset_to_known_screen = lambda: None
+    # `run()` 现在归父类管（开工前置 + `RoundExhausted` 收尾），会话巡检要真截屏，
+    # 这条测试只关心分态路由，桩掉即可。
+    loop._ensure_session = lambda **_k: False
+    loop._nav_labels = lambda: ""
     loop._phase_of = lambda coordinate: phase
     loop._probe = lambda coordinate: calls.append("probe")
     loop._tier_and_attack = lambda coordinate: calls.append("tier_and_attack")
@@ -186,3 +190,36 @@ def test_a_round_start_is_normalised_to_utc() -> None:
 def test_an_unparseable_round_start_is_rejected() -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_round_start("昨天")
+
+
+def test_running_out_of_lines_ends_the_round_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """航线占满是**必然**会发生的事，不能算失败。
+
+    事故（2026-08-11 02:43，调度器跑着）：`BotLoop` 当时覆盖的是 `run()` 而不是
+    `_sweep()`，把开工前置抄了一遍、却漏了父类那个 `except RoundExhausted`。于是
+
+        RoundExhausted: 同时派遣的舰队数量已达上限
+
+    从 `_probe` 一路漏到进程外，退出码 1。调度器连撞三次就把整条 bot 链路
+    **自动停用**了——而它只是需要等舰队飞回来。
+
+    同一个覆盖还让父类 `run()` 里的断线重连对这条链路完全失效。两个洞同一个根。
+    """
+    from evo_helper.game import game_window
+    from evo_helper.tools.pirate_loop import Outcome, RoundExhausted
+
+    monkeypatch.setattr(game_window, "ensure_game_window", lambda: None)
+
+    loop = BotLoop.__new__(BotLoop)
+    loop._bot = BotOptions(targets=(TARGET,), probe=True, attack=True)
+    loop._outcome = Outcome()
+    loop._navigator = _FakeNavigator()
+    loop._reset_to_known_screen = lambda: None
+    loop._ensure_session = lambda **_k: False
+    loop._nav_labels = lambda: ""
+    loop._phase_of = lambda _c: BotPhase.NEEDS_PROBE
+    loop._probe = lambda _c: (_ for _ in ()).throw(RoundExhausted("同时派遣的舰队数量已达上限"))
+
+    outcome = loop.run()  # 不抛就算过：退出码 0，不计入连续失败
+
+    assert isinstance(outcome, Outcome)
