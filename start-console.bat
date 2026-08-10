@@ -61,27 +61,39 @@ if exist ".venv\Scripts\python.exe" (
 )
 
 rem ---- 网页服务：前台运行 ----------------------------------------
-where uv >nul 2>nul
-if errorlevel 1 goto use_venv
+rem !! 用 venv 的解释器，不要用 uv run。
+rem
+rem uv run 每次都会先重新同步 venv（把项目重装一遍）。而上面刚起的悬浮窗用的
+rem 正是 venv 里那个解释器，它把 venv 里的 .pyd 占着——于是同步时删不掉
+rem greenlet 的 _greenlet.cp312-win_amd64.pyd，报「拒绝访问 (os error 5)」，
+rem 网页服务直接退出码 2。实机踩过：这个 bat 自己把自己锁死了。
+rem
+rem 直接用 venv 解释器则什么都不改动，也省掉每次启动的同步开销。
+rem venv 不存在时才退回 uv——那多半是刚 clone 完还没 uv sync。
+rem
+rem 另：本文件不能出现 GBK 编不出来的字符。cmd 按 OEM 代码页解析，那种字符
+rem 会让整行变成乱码命令。同一个坑今天在 runtime.py、say() 和这里各踩过一次。
+if not exist ".venv\Scripts\python.exe" goto use_uv
 
-echo   解释器: uv run evo-web
+echo   解释器: .venv\Scripts\python.exe
 echo   启动中。下面会打印本机与局域网地址。按 Ctrl+C 停止。
 echo.
-uv run evo-web
+.venv\Scripts\python.exe -c "from evo_helper.web.runtime import main; raise SystemExit(main())"
 goto ended
 
-:use_venv
-if not exist ".venv\Scripts\python.exe" (
-    echo   [停止] 既找不到 uv，也找不到 .venv\Scripts\python.exe。
+:use_uv
+where uv >nul 2>nul
+if errorlevel 1 (
+    echo   [停止] 既没有 .venv 里的解释器，也找不到 uv。
     echo   先装依赖：uv sync
     echo.
     pause
     exit /b 1
 )
-echo   解释器: .venv\Scripts\python.exe
-echo   启动中。下面会打印本机与局域网地址。按 Ctrl+C 停止。
+echo   解释器: uv run evo-web （没有 venv，退回这条）
+echo   启动中。按 Ctrl+C 停止。
 echo.
-.venv\Scripts\python.exe -c "from evo_helper.web.runtime import main; raise SystemExit(main())"
+uv run evo-web
 
 :ended
 echo.

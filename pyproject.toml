@@ -27,7 +27,22 @@ dev = [
 vision = [
   "mss>=9,<11",
   "opencv-python>=4.9,<5",
+  "pillow>=10,<12",
   "pytesseract>=0.3.10,<1",
+]
+# 实机自动化：开窗口、认几何、真点鼠标。
+#
+# 这三个原先**一个都没声明**，全靠 venv 里手动装着。任何一次 `uv sync` 都会把
+# 它们清掉（实机踩过：清掉之后网页服务起不来，报 No module named 'evo_helper'），
+# 换台机器更是 `uv sync` 完了照样跑不起来——而这恰恰是部署到别的机器要解决的事。
+live = [
+  "pyautogui>=0.9.54,<1",
+  "pywin32>=306",
+]
+# YOLO 单独一组：它拖 torch，几百 MB，而且只有 `vision/optional/yolo.py` 用得上，
+# 实机链路一次都不碰。放在 vision 里会让 `uv sync --extra vision` 因为下载它超时
+# 而整组装不上——实机就是这么卡住的。
+yolo = [
   "ultralytics>=8.2,<9",
 ]
 
