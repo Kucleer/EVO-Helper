@@ -92,7 +92,6 @@ class PersistentApplicationService:
         enabled: bool,
         window_start: time,
         window_end: time,
-        dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
         fleet_line_limit: int = 1,
         reserved_lines: int = 0,
@@ -107,7 +106,6 @@ class PersistentApplicationService:
                 time_window_start=window_start.strftime("%H:%M"),
                 time_window_end=window_end.strftime("%H:%M"),
                 timezone_name="Asia/Shanghai",
-                dry_run=dry_run,
                 fleet_line_limit=fleet_line_limit,
                 reserved_lines=reserved_lines,
                 created_at_utc=now,
@@ -136,8 +134,6 @@ class PersistentApplicationService:
                 row.enabled = patch.enabled
             row.time_window_start = start.strftime("%H:%M")
             row.time_window_end = end.strftime("%H:%M")
-            if patch.dry_run is not None:
-                row.dry_run = patch.dry_run
             if patch.ranges is not None:
                 self._replace_ranges(session, row.id, patch.ranges)
             row.updated_at_utc = self._now()
@@ -422,7 +418,6 @@ class PersistentApplicationService:
                     guard_status=intent.guard_status,
                     created_at_utc=intent.created_at_utc,
                     dispatched_at_utc=dispatch.dispatched_at_utc if dispatch else None,
-                    dry_run=dispatch.dry_run if dispatch else None,
                     accepted=dispatch.accepted if dispatch else None,
                     expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
                     outcome=report.outcome if report else None,
@@ -533,7 +528,6 @@ class PersistentApplicationService:
             row.enabled,
             time.fromisoformat(row.time_window_start),
             time.fromisoformat(row.time_window_end),
-            row.dry_run,
             tuple(
                 ScanRangeView(
                     Coordinate(item.start_galaxy, item.start_system, item.start_position),

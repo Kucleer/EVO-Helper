@@ -30,7 +30,6 @@ class PresetObservation:
 @dataclass(frozen=True)
 class DispatchResult:
     accepted: bool
-    dry_run: bool
 
 
 @dataclass(frozen=True)

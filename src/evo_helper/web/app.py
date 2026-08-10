@@ -133,7 +133,6 @@ def _plan_out(plan: ScanPlanView) -> ScanPlanOut:
         enabled=plan.enabled,
         window_start=plan.window_start.strftime("%H:%M"),
         window_end=plan.window_end.strftime("%H:%M"),
-        dry_run=plan.dry_run,
         fleet_line_limit=plan.fleet_line_limit,
         reserved_lines=plan.reserved_lines,
         ranges=[_range_out(item) for item in plan.ranges],
@@ -430,7 +429,6 @@ def create_app(
             enabled=payload.enabled,
             window_start=_parse_window(payload.window_start),
             window_end=_parse_window(payload.window_end),
-            dry_run=payload.dry_run,
             fleet_line_limit=payload.fleet_line_limit,
             reserved_lines=payload.reserved_lines,
             ranges=tuple(_range_view(item) for item in payload.ranges),
@@ -458,7 +456,6 @@ def create_app(
             enabled=payload.enabled,
             window_start=(_parse_window(payload.window_start) if payload.window_start else None),
             window_end=_parse_window(payload.window_end) if payload.window_end else None,
-            dry_run=payload.dry_run,
             ranges=(
                 tuple(_range_view(item) for item in payload.ranges)
                 if payload.ranges is not None

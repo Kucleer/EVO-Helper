@@ -193,6 +193,11 @@ class PirateLoop:
     #: 标签却必须不同：海盗每天 32 次是游戏硬限制，两者混在一起会数错配额。
     TARGET_KIND: str = TARGET_KIND_PIRATE
 
+    #: 行星面板上「攻击」按钮的位置。**必须由子类按目标类型覆盖**：无主星球
+    #: （敌对海盗）和有主星球（bot）的面板是两套完全不同的布局，见
+    #: `pirate_ui.BOT_ATTACK_BUTTON` 的注释。
+    ATTACK_BUTTON: tuple[int, int] = pirate_ui.ATTACK_BUTTON
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
         self._ocr = ocr
@@ -457,7 +462,7 @@ class PirateLoop:
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
         """
         wanted = preset or self._options.preset
-        self._driver.click(*pirate_ui.ATTACK_BUTTON, label="攻击")
+        self._driver.click(*self.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
 
         picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
@@ -467,6 +472,13 @@ class PirateLoop:
             say(f"  {error}；关掉面板，不打这一发")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
+            # 派遣面板开过之后导航栏里是什么已经不可知了，和 `_leave_dispatch_list`
+            # / `_close_mail` 同理。**这一处原来漏了**，代价是实机上最贵的一次故障：
+            # 缓存仍以为停在原坐标，于是下一个目标的 `goto` 跳过「重设银河系」，
+            # 那一下「设恒星系」落到了银河系框上，游戏把 136 截断成最大值 9。
+            # 此后导航栏是 9:137，而缓存说 2:137——银河系再也不会被重设，连续
+            # 44 个目标坐标核对全不过，13 分钟一发没派。
+            self._navigator.invalidate()
             self._outcome.refused.append((coordinate, f"找不到预设 {wanted}"))
             return False
 
@@ -734,7 +746,6 @@ class PirateLoop:
                 dispatch_id=dispatch_id,
                 intent_id=intent_id,
                 dispatched_at_utc=dispatched_at,
-                dry_run=False,
                 accepted=True,
                 mission_kind=mission_kind,
             )
@@ -765,18 +776,11 @@ class PirateLoop:
     def _sweep(self) -> None:
         for galaxy, system in self._options.systems:
             say(f"恒星系 {galaxy}:{system}")
-            pirates = self._find_pirates(galaxy, system)
+            pirates, scouted_here = self._find_pirates(galaxy, system)
             if not pirates:
                 say("  1–4 位没有敌对海盗")
                 continue
             if self._options.scout:
-                scouted_here = 0
-                for coordinate in pirates:
-                    self._navigator.goto(coordinate)
-                    if not self.is_pirate(coordinate):
-                        continue
-                    if self.scout(coordinate):
-                        scouted_here += 1
                 self._wait_for_reports(scouted_here)
             if not self._options.attack:
                 continue
@@ -803,18 +807,36 @@ class PirateLoop:
             self._driver.click(*MAIL_BACK, label="关闭面板")
             self._driver.wait(2.0)
 
-    def _find_pirates(self, galaxy: int, system: int) -> list[Coordinate]:
+    def _find_pirates(self, galaxy: int, system: int) -> tuple[list[Coordinate], int]:
+        """走一遍 1–4 位；开了 `--scout` 就**当场**把侦察发出去。
+
+        返回 (认出的海盗, 已派出的侦察数)。
+
+        以前这里只管认，认完回到 `_sweep` 再对每个海盗 `goto` 一次才侦察。两趟
+        导航的代价不只是慢一倍：实测首发侦察要等到开跑后 **68 秒**，而这 68 秒
+        里日志只有几行「敌对海盗」，从外面看不出它到底在不在干活。用户据此判定
+        「侦查和攻击都没触发」，43 秒就把进程停了——那一轮确实一发都没派出去，
+        但原因是还没轮到派，不是派不出去。
+
+        认出海盗的那一刻，面板已经开着、侦察按钮就在眼前，没有任何理由先走开再
+        回来。融合之后首发提前到 ~25 秒，链路本身一行没改。
+        """
         pirates: list[Coordinate] = []
+        scouted = 0
         for position in PIRATE_POSITIONS:
             coordinate = Coordinate(galaxy, system, position)
             self._navigator.goto(coordinate)
-            if self.is_pirate(coordinate):
-                say(f"  {coordinate} 敌对海盗")
-                pirates.append(coordinate)
-                self._outcome.pirates.append(coordinate)
-            else:
+            if not self.is_pirate(coordinate):
                 say(f"  {coordinate} 不是海盗")
-        return pirates
+                continue
+            say(f"  {coordinate} 敌对海盗")
+            pirates.append(coordinate)
+            self._outcome.pirates.append(coordinate)
+            # 站在这颗星球上就把侦察发掉。`scout()` 抛 RoundExhausted 时直接往上
+            # 传到 `run()`：那是「资源耗尽、这一轮到此为止」，不是失败。
+            if self._options.scout and self.scout(coordinate):
+                scouted += 1
+        return pirates, scouted
 
     def _wait_for_reports(self, count: int) -> None:
         if not count:
@@ -901,7 +923,6 @@ def _ensure_run_row(session_factory: Any) -> UUID:
                 enabled=True,
                 time_window_start="00:00",
                 time_window_end="23:59",
-                dry_run=False,
                 created_at_utc=now,
                 updated_at_utc=now,
             )

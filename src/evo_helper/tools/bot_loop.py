@@ -40,6 +40,7 @@ from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
+from evo_helper.game import pirate_ui
 from evo_helper.tools.pirate_loop import (
     MAIL_FIRST_ROW_Y,
     MAIL_ROW_PITCH,
@@ -74,6 +75,11 @@ class BotLoop(PirateLoop):
 
     TARGET_KIND: str = TARGET_KIND_BOT
 
+    #: bot 星球是**有主**面板，按钮排布和敌对海盗那套完全不同。不覆盖的话每一发
+    #: 都会点在空白处，然后倒在「找不到预设 探路」上——实机上这条链路就是这么
+    #: 一发都没派出去过的。
+    ATTACK_BUTTON: tuple[int, int] = pirate_ui.BOT_ATTACK_BUTTON
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
         super().__init__(
@@ -84,8 +90,37 @@ class BotLoop(PirateLoop):
             ),
         )
         self._bot = options
+        self._coord_dumps = 0
 
     # -- 识别 ---------------------------------------------------------------
+
+    #: 坐标核对失败时最多存这么多张现场图。实机踩过一次「连续 44 个目标全部核对
+    #: 不过」，不设上限会写出上百张几乎一样的图；前几张就够定位了。
+    MAX_COORD_DUMPS: int = 3
+
+    def _goto_confirmed(self, coordinate: Coordinate) -> bool:
+        """导航过去并核对面板；核对不过就复位画面再试一次。
+
+        实机（2026-08-11 00:55–01:08）：第一个目标走到派遣面板时预设条读成空，
+        之后**连续 44 个目标**每一次坐标核对都不过，读数一律多出个 `:9` 前缀——
+        画面从某一刻起整体偏了。而每个目标只试一次、失败就跳下一个，于是这 13
+        分钟一发都没派出去，日志里也只有一行文字、连张图都没留。
+
+        判据本身没有放松的余地：那一轮里有一次读到的是**上一个目标的星系**
+        （请求 2:321:5，面板显示 2:320:5），放松判据就等于打错星球。能改的只是
+        失败之后怎么办——把浮层关掉、重新导航、再读一次。
+        """
+        self._navigator.goto(coordinate)
+        if self.is_bot_target(coordinate):
+            return True
+        say("  复位画面后重试一次")
+        self._reset_to_known_screen()
+        # 清缓存是这条重试的**全部意义**。导航器认为某个字段已经对了就不去重设，
+        # 所以只要它的记忆和导航栏实际值分了岔，不清缓存的重试会一字不差地重演
+        # 上一次的失败——实机验证过：重试读回来的还是那个 `[9:137:12]`。
+        self._navigator.invalidate()
+        self._navigator.goto(coordinate)
+        return self.is_bot_target(coordinate)
 
     def is_bot_target(self, coordinate: Coordinate) -> bool:
         """行星面板上是不是这个 bot。
@@ -100,6 +135,11 @@ class BotLoop(PirateLoop):
         panel = read_panel_confirming(crop_reader(self._driver.capture(), self._ocr), requested)
         if not panel.confirms(requested):
             say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
+            # 只有一行文字复盘不了「画面到底成了什么样」——实机那 13 分钟就是这么
+            # 白丢的。存图，但要封顶，否则一轮能写出上百张几乎一样的现场。
+            if self._coord_dumps < self.MAX_COORD_DUMPS:
+                self._coord_dumps += 1
+                self._dump_frame("bot-coord-mismatch")
             return False
         if not panel.is_bot:
             say(f"  {coordinate} 不是 bot（面板名 {panel.display_name!r}）")
@@ -198,8 +238,7 @@ class BotLoop(PirateLoop):
 
     def _probe(self, coordinate: Coordinate) -> None:
         """派一发探路。走的是攻击链路，所以简报上写的是「攻击」。"""
-        self._navigator.goto(coordinate)
-        if not self.is_bot_target(coordinate):
+        if not self._goto_confirmed(coordinate):
             return
         self._outcome.pirates.append(coordinate)
         if not self._bot.probe:
@@ -223,8 +262,7 @@ class BotLoop(PirateLoop):
             self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
             self._mark_skipped(coordinate)
             return
-        self._navigator.goto(coordinate)
-        if not self.is_bot_target(coordinate):
+        if not self._goto_confirmed(coordinate):
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return
         self.attack(coordinate, preset=preset)

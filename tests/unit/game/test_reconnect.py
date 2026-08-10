@@ -31,7 +31,7 @@ class Game:
         return PresetObservation(preset.name, preset.signature, 1.0)
 
     def dispatch_attack(self, _command: DispatchCommand) -> DispatchResult:
-        return DispatchResult(accepted=True, dry_run=False)
+        return DispatchResult(accepted=True)
 
     def list_inflight(self) -> list[InflightFleet]:
         return []

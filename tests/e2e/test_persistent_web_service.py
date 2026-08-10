@@ -24,7 +24,6 @@ def test_web_configuration_and_run_survive_service_restart(tmp_path: Path) -> No
         enabled=True,
         window_start=time(8),
         window_end=time(20),
-        dry_run=True,
         ranges=(
             ScanRangeView(
                 Coordinate(1, 1, 1),
@@ -66,7 +65,6 @@ def test_persistent_app_retains_plan_across_app_recreation(tmp_path: Path) -> No
             "name": "api-persisted",
             "window_start": "08:00",
             "window_end": "20:00",
-            "dry_run": True,
             "ranges": [
                 {
                     "start": {"galaxy": 1, "system": 1, "position": 1},
@@ -105,7 +103,6 @@ def test_persistent_plan_accepts_an_origin_outside_the_range(tmp_path: Path) -> 
         enabled=True,
         window_start=time(8),
         window_end=time(10),
-        dry_run=True,
         ranges=(
             ScanRangeView(
                 Coordinate(1, 100, 1),

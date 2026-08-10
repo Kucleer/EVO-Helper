@@ -20,7 +20,6 @@ def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> 
             "name": "runtime-plan",
             "window_start": "08:00",
             "window_end": "20:00",
-            "dry_run": True,
             "ranges": [
                 {
                     "start": {"galaxy": 1, "system": 1, "position": 1},

@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from evo_helper.application.bindings import DatabaseBindingResolver
 from evo_helper.application.runner import WorkflowRunner
 from evo_helper.application.workflow import IntegrationWorkflow, TargetRecognition
-from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef, RunState
 from evo_helper.domain.ports import ReportNavigationResult
 from evo_helper.domain.records import BattleReport, FleetSnapshotEntry
@@ -43,8 +42,7 @@ def test_runner_persists_waiting_and_draining_states(tmp_path: Path) -> None:
         game,
         Reader(),
         DatabaseBindingResolver(sessions, run_id),
-        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(1)),
-        dry_run=True,
+        DispatchCoordinator(ActionGuard(), LineCapacityGate(1)),
         now_utc=lambda: NOW,
         game_feedback_slots=lambda: slots[0],
     )
@@ -54,7 +52,7 @@ def test_runner_persists_waiting_and_draining_states(tmp_path: Path) -> None:
     assert repository.run_state(run_id) is RunState.WAITING_CAPACITY
 
     slots[0] = 1
-    assert runner.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert runner.scan_once(run_id).status == "DISPATCHED"
     assert repository.run_state(run_id) is RunState.SCANNING
     assert runner.scan_once(run_id).status == "DRAINING"
     assert repository.run_state(run_id) is RunState.DRAINING
@@ -75,13 +73,12 @@ def test_runner_pauses_when_battle_reports_cannot_be_opened(tmp_path: Path) -> N
         game,
         Reader(),
         DatabaseBindingResolver(sessions, run_id),
-        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(1)),
-        dry_run=True,
+        DispatchCoordinator(ActionGuard(), LineCapacityGate(1)),
         now_utc=lambda: NOW,
     )
     runner = WorkflowRunner(workflow, repository)
 
-    assert runner.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert runner.scan_once(run_id).status == "DISPATCHED"
     assert runner.scan_once(run_id).status == "DRAINING"
     assert runner.drain_reports(run_id, []).status == "SAFETY_PAUSED"
     assert repository.run_state(run_id) is RunState.PAUSED
@@ -103,8 +100,7 @@ def test_runner_persists_drained_report_before_completing(tmp_path: Path) -> Non
         game,
         Reader(),
         DatabaseBindingResolver(sessions, run_id),
-        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(1)),
-        dry_run=True,
+        DispatchCoordinator(ActionGuard(), LineCapacityGate(1)),
         now_utc=lambda: NOW,
     )
     runner = WorkflowRunner(workflow, repository)
@@ -116,7 +112,7 @@ def test_runner_persists_drained_report_before_completing(tmp_path: Path) -> Non
         fleet=(FleetSnapshotEntry("defender", "fighter", 9),),
     )
 
-    assert runner.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert runner.scan_once(run_id).status == "DISPATCHED"
     assert runner.scan_once(run_id).status == "DRAINING"
     outcome = runner.drain_reports(run_id, [report])
 

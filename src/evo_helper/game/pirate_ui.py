@@ -31,9 +31,20 @@ PIRATE_TITLE_ROI = (760, 350, 1160, 392)
 PIRATE_COORD_ROI = (850, 396, 1070, 426)
 PIRATE_TITLE_TEXT = "敌对海盗"
 
-#: 行星面板上的两个动作按钮。
+#: 行星面板上的两个动作按钮。**这两个只对无主星球（敌对海盗 / 荒芜行星）有效。**
 SCOUT_BUTTON = (886, 540)
 ATTACK_BUTTON = (1032, 540)
+
+#: 有主星球（bot / 真人）的面板是**另一套布局**，按钮既不同也不在同一处：
+#: 无主面板中间只有「侦察 / 攻击」两个大图标（y≈540）；有主面板上面先列
+#: 坐标/玩家/联盟三行，下面是「攻击 / 侦察 / 扫描 / 回收」四个小图标一排
+#: （图标 y≈398、标签 y≈435），再下一排是「邮件 / 书签」。
+#:
+#: 照 `ATTACK_BUTTON` 往 bot 面板上点，(1032, 540) 落在图标排和舰船格之间的
+#: **空白处**——什么都没发生，接着去读预设条自然读到一堆噪声（实机读到
+#: `['4', 'i]']`），于是每一发都倒在「找不到预设 探路」上。bot 链路因此从来
+#: 没有真正派出过一发。
+BOT_ATTACK_BUTTON = (821, 398)
 
 #: 派遣面板：关闭、确认目标（绿 ✓）、预设条展开/收起。
 DISPATCH_CLOSE = (750, 71)
@@ -221,6 +232,7 @@ __all__ = [
     "ATTACK_BUTTON",
     "ATTACK_PRESET_COUNTS",
     "ATTACK_PRESET_NAME",
+    "BOT_ATTACK_BUTTON",
     "BRIEFING_LAUNCH_BUTTON",
     "BRIEFING_MISSION_ROI",
     "DISPATCH_CONFIRM",

@@ -41,6 +41,23 @@ PRESET_OPEN_WAIT_S = 1.6
 #: 一次拖动之后等惯性停下。
 PRESET_DRAG_WAIT_S = 1.2
 
+#: 相邻两个词框中心相距不超过这么多像素，就当成**同一个预设名被 OCR 拆开了**。
+#:
+#: tesseract 的分词对中文是按字切的：`AAA` 读回来是一个词，`探路` 读回来是
+#: `探` 和 `路` 两个。逐词做 `name in text` 于是永远匹配不上中文预设名——
+#: 实机后果是 bot 链路每一发都倒在「找不到预设 探路」，而预设条上明明有它。
+#:
+#: 阈值取 40 的依据（2026-08-11 实测，预设条拖到左端后的词框中心）：
+#:
+#:     AAA  x=747
+#:     探   x=984
+#:     路   x=994      ← 同名相邻两字差 10px
+#:                       不同预设之间差 237px
+#:
+#: 两个量级中间隔着一个数量级，40 离两边都远。这个余量比精确值重要：
+#: 拆得更碎（比如三字名）时字距仍是十几像素，而预设之间永远隔着大半个格子。
+PRESET_WORD_GAP_PX = 40
+
 
 class PresetDriver(Protocol):
     def click(self, x: int, y: int, *, label: str = ...) -> None: ...
@@ -97,12 +114,13 @@ class PresetPicker:
         """
         self.expand()
         entries = self.scroll_to_left_end()
-        hits = [x for x, text in entries if name in text]
+        runs = merged_names(entries)
+        hits = [x for x, text in runs if name in text]
         if not hits:
             raise PresetNotFound(
-                f"预设条上找不到 {name!r}；这一屏读到的是 {[text for _x, text in entries]}"
+                f"预设条上找不到 {name!r}；这一屏读到的是 {[text for _x, text in runs]}"
             )
-        # 同名多个只可能是 OCR 把一个名字拆成了两块词，取最左那个即可。
+        # 命中多个只可能是同一个名字在条上出现了两次，取最左那个即可。
         target = min(hits)
         self.driver.click(target, PRESET_NAME_ROW_Y, label=f"预设 {name}")
         self.driver.wait(PRESET_DRAG_WAIT_S)
@@ -133,6 +151,22 @@ def name_words(image: Any, ocr: Any) -> list[tuple[int, str]]:
     return words
 
 
+def merged_names(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
+    """把靠得足够近的相邻词框合成一个预设名，返回 `(中心 x, 完整名字)`。
+
+    见 `PRESET_WORD_GAP_PX`：中文名会被 tesseract 按字切开，不合并就永远匹配
+    不上。中心 x 取整段的中点而不是首字——点在名字正中离相邻预设最远。
+    """
+    ordered = sorted(entries)
+    runs: list[list[tuple[int, str]]] = []
+    for x, text in ordered:
+        if runs and x - runs[-1][-1][0] <= PRESET_WORD_GAP_PX:
+            runs[-1].append((x, text))
+        else:
+            runs.append([(x, text)])
+    return [((run[0][0] + run[-1][0]) // 2, "".join(text for _x, text in run)) for run in runs]
+
+
 def _lanczos(image: Any) -> Any:
     from PIL import Image
 
@@ -146,7 +180,9 @@ def _names_of(entries: Sequence[tuple[int, str]]) -> list[str]:
 
 __all__ = [
     "PRESET_NAME_ROI",
+    "PRESET_WORD_GAP_PX",
     "PresetNotFound",
     "PresetPicker",
+    "merged_names",
     "name_words",
 ]
