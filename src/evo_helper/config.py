@@ -20,7 +20,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"  # noqa: S104 - 局域网可访问是明确需求，见上
     #: 避开 8000/8080/8888 这类常规端口，减少与本机其他开发服务撞车。
     port: int = 8770
-    dry_run: bool = True
     database_url: str = "sqlite:///var/evo-helper.db"
     #: In-game fleet preset used for scanning. Its signature is still
     #: verified before any dispatch; this only prefills the plan form.

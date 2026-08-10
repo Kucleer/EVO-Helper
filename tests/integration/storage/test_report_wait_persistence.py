@@ -34,7 +34,6 @@ def _plan_and_run(tmp_path: Path, name: str):  # type: ignore[no-untyped-def]
         enabled=True,
         window_start=time(8),
         window_end=time(10),
-        dry_run=True,
         ranges=(
             ScanRangeView(
                 Coordinate(1, 100, 1),
@@ -69,7 +68,6 @@ def _real_dispatch(repo: SqlAlchemyRepository, run_id, target: Coordinate):  # t
             dispatch_id=dispatch_id,
             intent_id=intent_id,
             dispatched_at_utc=DISPATCHED,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -124,9 +122,9 @@ def test_an_arrived_fleet_makes_the_run_collect(tmp_path: Path) -> None:
     engine.dispose()
 
 
-def test_a_dry_run_dispatch_never_holds_the_run_open(tmp_path: Path) -> None:
-    """演习模式不会产生战报；算进来运行就永远等不完。"""
-    engine, factory, run = _plan_and_run(tmp_path, "dry.db")
+def test_a_rejected_dispatch_never_holds_the_run_open(tmp_path: Path) -> None:
+    """被游戏拒掉的那一发没有舰队飞出去，也就不会有战报；算进来运行就永远等不完。"""
+    engine, factory, run = _plan_and_run(tmp_path, "rejected.db")
     repo = SqlAlchemyRepository(factory)
     intent_id, dispatch_id = uuid4(), uuid4()
     repo.save_attack_intent(
@@ -146,7 +144,6 @@ def test_a_dry_run_dispatch_never_holds_the_run_open(tmp_path: Path) -> None:
             dispatch_id=dispatch_id,
             intent_id=intent_id,
             dispatched_at_utc=DISPATCHED,
-            dry_run=True,
             accepted=False,
         )
     )

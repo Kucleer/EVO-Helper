@@ -139,7 +139,6 @@ def ensure_run(session_factory: Any) -> tuple[UUID, Coordinate | None]:
                 enabled=True,
                 time_window_start="00:00",
                 time_window_end="23:59",
-                dry_run=True,
                 created_at_utc=now,
                 updated_at_utc=now,
             )

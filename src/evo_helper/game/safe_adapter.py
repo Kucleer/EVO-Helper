@@ -49,23 +49,23 @@ class SafeGameAdapter:
         decision = self._guard.evaluate(command, self._inner.observe())
         self._intents.append((command, decision))
         if not decision.allowed:
-            return DispatchResult(accepted=False, dry_run=True)
+            return DispatchResult(accepted=False)
         if command.target not in self._known_targets:
             self._intents[-1] = (
                 command,
                 ActionGuardDecision(False, "target not in configured scan range"),
             )
-            return DispatchResult(accepted=False, dry_run=True)
+            return DispatchResult(accepted=False)
         # Fresh re-observation immediately before the click.
         token = decision.token
         assert token is not None
         final = self._guard.verify_and_consume(token, self._inner.observe())
         self._intents[-1] = (command, final)
         if not final.allowed:
-            return DispatchResult(accepted=False, dry_run=True)
+            return DispatchResult(accepted=False)
         if self._click is not None:
             self._click(command)
-        return DispatchResult(accepted=True, dry_run=False)
+        return DispatchResult(accepted=True)
 
     def list_inflight(self) -> list[InflightFleet]:
         return self._inner.list_inflight()

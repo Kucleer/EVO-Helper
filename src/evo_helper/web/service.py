@@ -65,7 +65,6 @@ class ScanPlanView:
     enabled: bool
     window_start: time
     window_end: time
-    dry_run: bool
     ranges: tuple[ScanRangeView, ...]
     created_at: datetime
     updated_at: datetime
@@ -81,7 +80,6 @@ class PlanPatchView:
     enabled: bool | None = None
     window_start: time | None = None
     window_end: time | None = None
-    dry_run: bool | None = None
     ranges: tuple[ScanRangeView, ...] | None = None
 
 
@@ -232,7 +230,6 @@ class AttackLogView:
     created_at_utc: datetime
     #: 真正点下「出发！」的时刻。意图被闸门拦下或还没派出时为 None。
     dispatched_at_utc: datetime | None
-    dry_run: bool | None
     accepted: bool | None
     expected_report_at_utc: datetime | None
     #: 战果，来自匹配上的那份战报：`VICTORY` / `FAIL` 与双方战损总数。
@@ -331,7 +328,6 @@ class ApplicationService(Protocol):
         enabled: bool,
         window_start: time,
         window_end: time,
-        dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
         fleet_line_limit: int = 1,
         reserved_lines: int = 0,
@@ -416,7 +412,6 @@ class FakeApplicationService:
         enabled: bool,
         window_start: time,
         window_end: time,
-        dry_run: bool,
         ranges: tuple[ScanRangeView, ...],
         fleet_line_limit: int = 1,
         reserved_lines: int = 0,
@@ -432,7 +427,6 @@ class FakeApplicationService:
             enabled=enabled,
             window_start=window_start,
             window_end=window_end,
-            dry_run=dry_run,
             ranges=ranges,
             created_at=now,
             updated_at=now,
@@ -460,7 +454,6 @@ class FakeApplicationService:
                 enabled=patch.enabled if patch.enabled is not None else current.enabled,
                 window_start=window_start,
                 window_end=window_end,
-                dry_run=patch.dry_run if patch.dry_run is not None else current.dry_run,
                 ranges=ranges,
                 created_at=current.created_at,
                 updated_at=self._now(),

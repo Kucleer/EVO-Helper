@@ -734,7 +734,6 @@ class PirateLoop:
                 dispatch_id=dispatch_id,
                 intent_id=intent_id,
                 dispatched_at_utc=dispatched_at,
-                dry_run=False,
                 accepted=True,
                 mission_kind=mission_kind,
             )
@@ -901,7 +900,6 @@ def _ensure_run_row(session_factory: Any) -> UUID:
                 enabled=True,
                 time_window_start="00:00",
                 time_window_end="23:59",
-                dry_run=False,
                 created_at_utc=now,
                 updated_at_utc=now,
             )

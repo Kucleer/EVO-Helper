@@ -159,7 +159,6 @@ body {
 .chip.ok { color: var(--ok); border-color: #24503c; }
 .chip.warn { color: var(--warn); border-color: #524220; }
 .chip.danger { color: var(--danger); border-color: #562b2a; }
-.chip.locked { color: var(--accent); border-color: #234a55; }
 
 /* ---- stat tiles ----------------------------------------------------- */
 

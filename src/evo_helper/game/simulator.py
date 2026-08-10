@@ -1,7 +1,8 @@
 """A deterministic simulated game implementing GamePort.
 
-The simulator never clicks: dispatching records an intent and reports the
-configured dry-run flag. It is used for tests and for shadow/dry-run runs.
+测试专用的替身：只有 `tests/` 构造它，生产链路（`tools/pirate_loop.py` 等）
+从不经过这里。它把派遣建模成「记下命令，占一条航线，航线满了就拒」，
+不点任何东西——因为它压根没有窗口可点，而不是因为有什么开关拦着。
 """
 
 from __future__ import annotations
@@ -20,8 +21,7 @@ from evo_helper.domain.ports import (
 class SimulatedGameAdapter:
     """Fake GamePort that models state transitions deterministically."""
 
-    def __init__(self, dry_run: bool = True, capacity: int = 3) -> None:
-        self.dry_run = dry_run
+    def __init__(self, capacity: int = 3) -> None:
         self.capacity = capacity
         self._screen = "galaxy"
         self._ui_version = "galaxy-v2"
@@ -50,12 +50,10 @@ class SimulatedGameAdapter:
 
     def dispatch_attack(self, command: DispatchCommand) -> DispatchResult:
         self._dispatches.append(command)
-        if self.dry_run:
-            return DispatchResult(accepted=True, dry_run=True)
         if len(self._inflight) >= self.capacity:
-            return DispatchResult(accepted=False, dry_run=False)
+            return DispatchResult(accepted=False)
         self._inflight.append(InflightFleet(target=command.target))
-        return DispatchResult(accepted=True, dry_run=False)
+        return DispatchResult(accepted=True)
 
     def list_inflight(self) -> list[InflightFleet]:
         return list(self._inflight)

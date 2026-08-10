@@ -49,7 +49,6 @@ def test_todays_pirate_dispatches_are_counted_from_utc_midnight(repository, run_
                 dispatch_id=uuid4(),
                 intent_id=intent_id,
                 dispatched_at_utc=dispatched_at,
-                dry_run=False,
                 accepted=True,
             )
         )
@@ -78,7 +77,6 @@ def test_bot_dispatches_do_not_count_towards_the_pirate_quota(repository, run_id
             dispatch_id=uuid4(),
             intent_id=intent_id,
             dispatched_at_utc=now,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -108,7 +106,6 @@ def test_pending_reports_are_scoped_by_target_kind(repository, run_id) -> None: 
             dispatch_id=uuid4(),
             intent_id=intent_id,
             dispatched_at_utc=now,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -138,7 +135,6 @@ def test_a_dispatch_with_no_flight_time_is_reported_as_unknown(repository, run_i
             dispatch_id=uuid4(),
             intent_id=intent_id,
             dispatched_at_utc=now,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -390,24 +386,22 @@ def test_scouts_are_not_waited_for_as_battle_reports(repository, run_id) -> None
     assert _pending(repository, TARGET_KIND_PIRATE, now) == []
 
 
-def test_refused_and_rehearsal_dispatches_do_not_occupy_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """被游戏拒掉的和演习的都没有舰队飞出去，占不到航线。
+def test_refused_dispatches_do_not_occupy_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """被游戏拒掉的那一发没有舰队飞出去，占不到航线。
 
-    把它们数进在飞数，估算出来的空闲航线会偏少，调度器于是不肯起攻击任务——
+    把它数进在飞数，估算出来的空闲航线会偏少，调度器于是不肯起攻击任务——
     航线明明空着却一直只跑扫描。
     """
     now = datetime.now(UTC)
-    for index, (accepted, dry_run) in enumerate(((False, False), (True, True))):
-        dispatch_id = _dispatch(
-            repository,
-            run_id,
-            TARGET_KIND_PIRATE,
-            position=24 + index,
-            dispatched_at=now - timedelta(minutes=5),
-            accepted=accepted,
-            dry_run=dry_run,
-        )
-        repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=24,
+        dispatched_at=now - timedelta(minutes=5),
+        accepted=False,
+    )
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
 
     assert repository.count_inflight(now_utc=now) == 0
 
@@ -469,7 +463,6 @@ def _dispatch(  # type: ignore[no-untyped-def]
     position: int,
     dispatched_at: datetime,
     accepted: bool = True,
-    dry_run: bool = False,
     preset_name: str = "AAA",
     mission_kind: str = MISSION_KIND_ATTACK,
 ):
@@ -493,7 +486,6 @@ def _dispatch(  # type: ignore[no-untyped-def]
             dispatch_id=dispatch_id,
             intent_id=intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=dry_run,
             accepted=accepted,
             mission_kind=mission_kind,
         )

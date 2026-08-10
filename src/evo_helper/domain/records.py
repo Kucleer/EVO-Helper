@@ -67,7 +67,6 @@ class AttackDispatch:
     dispatch_id: UUID
     intent_id: UUID
     dispatched_at_utc: datetime
-    dry_run: bool
     accepted: bool
     evidence_artifact_id: UUID | None = None
     #: 这一发是攻击还是侦察（见 `MISSION_KIND_*`）。默认 `ATTACK`：这个字段

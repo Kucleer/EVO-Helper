@@ -41,7 +41,6 @@ def _setup(tmp_path: Path):  # type: ignore[no-untyped-def]
         enabled=True,
         window_start=datetime(2026, 1, 1, 8).time(),
         window_end=datetime(2026, 1, 1, 10).time(),
-        dry_run=True,
         ranges=(
             ScanRangeView(
                 Coordinate(2, 137, 1),
@@ -89,7 +88,6 @@ def test_a_dispatched_intent_carries_the_dispatch_facts(tmp_path: Path) -> None:
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=CREATED + timedelta(minutes=1),
-            dry_run=False,
             accepted=True,
         )
     )
@@ -98,7 +96,6 @@ def test_a_dispatched_intent_carries_the_dispatch_facts(tmp_path: Path) -> None:
 
     assert entry.dispatched_at_utc == CREATED + timedelta(minutes=1)
     assert entry.accepted is True
-    assert entry.dry_run is False
     assert entry.preset_name == "探路"
 
 
@@ -129,7 +126,6 @@ def test_the_battle_result_reaches_the_log(tmp_path: Path) -> None:
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -161,7 +157,6 @@ def test_an_attack_still_in_flight_has_no_result_yet(tmp_path: Path) -> None:
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=CREATED + timedelta(minutes=1),
-            dry_run=False,
             accepted=True,
         )
     )

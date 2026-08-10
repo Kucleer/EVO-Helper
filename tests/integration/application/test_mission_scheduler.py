@@ -93,7 +93,6 @@ def dispatch(  # type: ignore[no-untyped-def]
             dispatch_id=dispatch_id,
             intent_id=intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=False,
             accepted=True,
         )
     )

@@ -1,9 +1,9 @@
-"""Safe scan, dry-run dispatch, and report-draining orchestration.
+"""Safe scan, dispatch, and report-draining orchestration.
 
 This module is intentionally the only integration seam that composes the game
 adapter, visual recognition result, ActionGuard, and persistence ports.  It
-never performs a browser click itself; in dry-run mode it records the proposed
-dispatch without invoking :meth:`GamePort.dispatch_attack`.
+never clicks by itself: every dispatch goes out through
+:meth:`GamePort.dispatch_attack`, and only after ActionGuard has cleared it.
 """
 
 from __future__ import annotations
@@ -102,7 +102,6 @@ class IntegrationWorkflow:
         bindings: BindingResolver,
         coordinator: DispatchCoordinator,
         *,
-        dry_run: bool = True,
         now_utc: Callable[[], datetime] | None = None,
         game_feedback_slots: Callable[[], int | None] | None = None,
     ) -> None:
@@ -111,7 +110,6 @@ class IntegrationWorkflow:
         self._target_reader = target_reader
         self._bindings = bindings
         self._coordinator = coordinator
-        self._dry_run = dry_run
         self._now_utc = now_utc or (lambda: datetime.now(UTC))
         self._game_feedback_slots = game_feedback_slots or (lambda: None)
 
@@ -203,19 +201,6 @@ class IntegrationWorkflow:
         )
         self._repository.save_attack_intent(intent)
 
-        if self._dry_run:
-            self._repository.save_dispatch(
-                AttackDispatch(
-                    dispatch_id=uuid4(),
-                    intent_id=intent.intent_id,
-                    dispatched_at_utc=now,
-                    dry_run=True,
-                    accepted=False,
-                )
-            )
-            self._append_event(run_id, "dry_run_dispatch_recorded", "SCANNING", "SCANNING")
-            self._repository.complete_coordinate(run_id, coordinate)
-            return ScanOutcome("DRY_RUN_RECORDED", coordinate, intent_id=intent.intent_id)
         if not plan.dispatchable or plan.guard.token is None:
             return self._safety_pause(run_id, coordinate, plan.guard.reason, intent.intent_id)
         final_guard = self._coordinator.authorize_final_dispatch(
@@ -229,7 +214,6 @@ class IntegrationWorkflow:
                 dispatch_id=uuid4(),
                 intent_id=intent.intent_id,
                 dispatched_at_utc=self._now_utc(),
-                dry_run=False,
                 accepted=result.accepted,
             )
         )
