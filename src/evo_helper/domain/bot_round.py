@@ -19,6 +19,17 @@ from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 PROBE_PRESET_NAME = DEFAULT_PRESET.name
 
 
+def is_probe_preset(preset_name: str) -> bool:
+    """这一发是不是探路（攻击侦查）。
+
+    判据抽成函数是因为它有**两个**消费者，而两边的错法完全不同：`phase_of`
+    用它区分探路发和攻击发；`report_wait.line_free_at` 用它决定航线按 1× 还是
+    2× 释放（探路舰队会在攻击中损失，没有返程）。各写一份的话，改预设名时
+    只改一处，另一处会静默地按错的倍数记账。
+    """
+    return preset_name == PROBE_PRESET_NAME
+
+
 class BotPhase(Enum):
     """一个目标本轮走到哪一步了。"""
 
@@ -62,8 +73,8 @@ def phase_of(dispatches: Sequence[DispatchFact]) -> BotPhase:
     if not dispatches:
         return BotPhase.NEEDS_PROBE
 
-    probes = [item for item in dispatches if item.preset_name == PROBE_PRESET_NAME]
-    attacks = [item for item in dispatches if item.preset_name != PROBE_PRESET_NAME]
+    probes = [item for item in dispatches if is_probe_preset(item.preset_name)]
+    attacks = [item for item in dispatches if not is_probe_preset(item.preset_name)]
 
     if attacks:
         return (

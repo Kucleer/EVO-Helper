@@ -42,6 +42,8 @@ from evo_helper.config import Settings
 from evo_helper.domain import missions
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.records import (
+    MISSION_KIND_ATTACK,
+    MISSION_KIND_SCOUT,
     TARGET_KIND_PIRATE,
     AttackDispatch,
     AttackIntent,
@@ -70,6 +72,15 @@ RUN_KEY = "pirate-loop-0001"
 #: 出发星球。飞行时间与战报匹配都要它。定义在 `domain.missions`，这里只转手——
 #: 主星原先在三个文件各写了一遍，改一次要改三处。
 ORIGIN = missions.ORIGIN
+
+#: 侦察发在库里的「预设」名。
+#:
+#: 侦察**不选预设**（派遣面板的终点自动预填），但 `attack_intents.preset_name`
+#: 不可空，日志页也要显示点什么。写一个自明的词，而不是借用当次的攻击预设名：
+#: 借用的话日志会把一发侦察显示成一发 AAA 攻击，而 `domain.bot_round.phase_of`
+#: 只按预设名分探路发和攻击发，看到非探路的名字就当成攻击发。
+#: 真正把侦察分出来的是 `mission_kind`，这个名字只管好看和可读。
+SCOUT_PRESET_NAME = "侦察"
 
 #: 点「侦察」/「攻击」之后等派遣面板铺开。
 DISPATCH_WAIT_S = 2.4
@@ -329,14 +340,37 @@ class PirateLoop:
         return True
 
     def scout(self, coordinate: Coordinate) -> bool:
-        """派一发侦察。派遣面板的终点是自动预填的，侦察也不需要选预设。"""
+        """派一发侦察。派遣面板的终点是自动预填的，侦察也不需要选预设。
+
+        **侦察一样要记账。** 它占航线（而且会飞回来，2× 返航），一条记录都不写
+        的话，一轮最多 4 发侦察对调度器完全隐形：它以为航线空着就去派攻击，
+        撞上游戏的「同时派遣的舰队数量已达上限。」。写进去时 `mission_kind`
+        必须是 `SCOUT`——日配额只按 `target_kind` 过滤，照攻击发记会让每一发
+        侦察吃掉一次当日攻击额度。
+
+        意图与派遣的先后和 `attack()` 一个语义：意图在点「出发！」之前写，
+        派遣在之后写，两者之差就是「想派但被闸门拦下了」。
+        """
         self._driver.click(*pirate_ui.SCOUT_BUTTON, label="侦察")
         self._driver.wait(DISPATCH_WAIT_S)
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
+        intent_id = self._record_intent(coordinate, preset=SCOUT_PRESET_NAME)
+        # ⚠️ **这一行必须留在 `_launch` 之前**，理由与 `attack()` 里那一行相同：
+        # 点完「出发！」简报页就没了。不读的话 `line_free_at_utc` 恒为 NULL，
+        # 而 NULL 的既定语义是**不计入在飞数**——记了账等于没记，那 4 条侦察航线
+        # 对调度器仍然完全隐形。
+        #
+        # 侦察简报是同一块面板（只是「任务类型」显示为侦察），所以 ROI 沿用
+        # `BRIEFING_FLIGHT_ROI`。⚠️ 万一它在侦察简报上对不上：读不出来会先走
+        # `_read_flight_time` 里 `_settle` 的重试（约 3 秒），`_launch` 里还会再走
+        # 一遍，于是**每发侦察多花约 6 秒、一轮 4 发就是 24 秒**。那是 ROI 没对上的
+        # 症状，不是别的毛病——第一次实机发现侦察变慢，先去核这个 ROI。
+        flight = self._read_flight_time()
         if not self._launch(coordinate, "侦察"):
             self._leave_dispatch_list()
             return False
+        self._record_dispatch(intent_id, flight, mission_kind=MISSION_KIND_SCOUT)
         self._outcome.scouted.append(coordinate)
         say(f"  已派出侦察 → {coordinate}")
         # 派出之后停在「飞行中」列表上，必须自己退出来。
@@ -602,11 +636,20 @@ class PirateLoop:
         )
         return intent_id
 
-    def _record_dispatch(self, intent_id: UUID, flight: timedelta | None) -> None:
+    def _record_dispatch(
+        self,
+        intent_id: UUID,
+        flight: timedelta | None,
+        *,
+        mission_kind: str = MISSION_KIND_ATTACK,
+    ) -> None:
         """记下这一发，并把简报上的飞行时间存成回程闹钟。
 
         读不到时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
         而不是无限等一个不知道何时抵达的战报。
+
+        `mission_kind` 默认攻击。侦察发必须显式传 `SCOUT`：它占航线但不消耗
+        当日 32 次的攻击配额，也不会产生战报，三笔账靠这一个字段分开。
         """
         repository, _run_id = self._ensure_run()
         dispatch_id = uuid4()
@@ -618,6 +661,7 @@ class PirateLoop:
                 dispatched_at_utc=dispatched_at,
                 dry_run=False,
                 accepted=True,
+                mission_kind=mission_kind,
             )
         )
         repository.record_flight_time(dispatch_id, flight, dispatched_at)

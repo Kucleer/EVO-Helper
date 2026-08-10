@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 
+from evo_helper.domain.bot_round import is_probe_preset
+from evo_helper.domain.records import MISSION_KIND_SCOUT
+
 #: `X天Y时Z分W秒`，缺省段会被省略（`8时3分20秒`、`45秒`）。
 _CN_DURATION_RE = re.compile(
     r"(?:(\d+)\s*天)?\s*(?:(\d+)\s*时)?\s*(?:(\d+)\s*分)?\s*(?:(\d+)\s*秒)?"
@@ -59,6 +62,42 @@ MAX_SESSION_BACKOFF = timedelta(minutes=8)
 
 #: 默认重试次数。超过就安全暂停，交回人工。
 DEFAULT_MAX_SESSION_ATTEMPTS = 8
+
+
+def line_free_at(
+    dispatched_at_utc: datetime,
+    flight: timedelta | None,
+    *,
+    mission_kind: str,
+    preset_name: str,
+) -> datetime | None:
+    """这条航线什么时候空出来。读不到飞行时长时返回 None。
+
+    **派出之后有两个钟，用错一个就白飞一趟舰队：**
+
+    | 问题 | 时刻 |
+    |---|---|
+    | 什么时候回去收战报？ | 出发 + 飞行时长 × 1（战报在抵达时产生） |
+    | 什么时候能再派？ | 出发 + 飞行时长 × 本函数给的倍数 |
+
+    倍数按发次类型分岔：
+
+    - **攻击发** × 2——打完还要飞回来。
+    - **探路发** × 1——探路舰队会在攻击中损失，**没有返程**。
+    - **侦察发** × 2——探测器会飞回来。侦察根本不选预设，所以它由
+      `mission_kind` 认，且**先于**预设名判：那一发不会损失，哪怕预设名恰好
+      写成了探路，也仍然要飞回来。
+
+    返回 None 的那些**不计入在飞数**，也就是当作不占航线。这是一个自觉的
+    乐观口径：估高了空闲航线，最坏结果是 runner 起来发现没位子、空跑一轮就退，
+    权威闸门（`game.capacity.LineCapacityGate`，它看屏）兜得住；估低了则是
+    航线空着不派，那一侧没人兜。
+    """
+    if flight is None:
+        return None
+    if mission_kind == MISSION_KIND_SCOUT:
+        return dispatched_at_utc + flight * 2
+    return dispatched_at_utc + (flight if is_probe_preset(preset_name) else flight * 2)
 
 
 class WaitAction(Enum):

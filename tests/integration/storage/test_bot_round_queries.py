@@ -17,6 +17,8 @@ from evo_helper.domain.bot_round import BotPhase, DispatchFact, phase_of
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
+    MISSION_KIND_ATTACK,
+    MISSION_KIND_SCOUT,
     TARGET_KIND_BOT,
     TARGET_KIND_PIRATE,
     AttackDispatch,
@@ -114,6 +116,27 @@ def test_a_pirate_intent_on_the_same_coordinate_is_not_a_bot_fact(repository, ru
     )
 
     assert repository.bot_dispatch_facts(TARGET, since=ROUND_START) == []
+
+
+def test_a_scout_dispatch_is_not_a_bot_round_fact(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**侦察发不产生战报，判态时算进来就是永久卡死。**
+
+    `phase_of` 只按预设名分探路发和攻击发，认不出「这一发根本不会有战报」。
+    一条侦察发若带着非探路的预设名混进来，它会被当成攻击发：目标永远停在
+    `AWAITING_ATTACK_REPORT`，bot 任务永远不退出，而画面上只是「在等」。
+    """
+    _intent(
+        repository,
+        run_id,
+        preset="侦察",
+        created_at=ROUND_START,
+        mission_kind=MISSION_KIND_SCOUT,
+    )
+
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+
+    assert facts == []
+    assert phase_of(facts) is BotPhase.NEEDS_PROBE
 
 
 def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -263,6 +286,7 @@ def _intent(  # type: ignore[no-untyped-def]
     accepted: bool = True,
     dry_run: bool = False,
     has_report: bool = False,
+    mission_kind: str = MISSION_KIND_ATTACK,
 ):
     """一条针对 `TARGET` 的意图 + 它的派遣（+ 可选的战报）。"""
     intent_id = uuid4()
@@ -288,6 +312,7 @@ def _intent(  # type: ignore[no-untyped-def]
             dispatched_at_utc=created_at,
             dry_run=dry_run,
             accepted=accepted,
+            mission_kind=mission_kind,
         )
     )
     if has_report:

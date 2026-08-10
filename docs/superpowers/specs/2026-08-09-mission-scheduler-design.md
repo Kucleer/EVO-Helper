@@ -27,7 +27,7 @@
 | 攻击意图与派遣已入库，含 `target_kind`、`expected_report_at_utc` | `storage/models.py` `attack_intents` / `attack_dispatches` |
 | `pirate_loop` 写这两张表 | `tools/pirate_loop.py:510,527` |
 | **`BotLoop` 是 `PirateLoop` 的子类**，写库走继承来的 `_record_intent`，其中 `target_kind=TARGET_KIND_PIRATE` **硬编码** → bot 的攻击会被错标成海盗，污染日配额计数 | `tools/bot_loop.py:69`、`tools/pirate_loop.py:501-522` |
-| **`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。原因不是「读到了没传出来」，而是**从来没人去读**：`_launch()` 只 OCR 了 `BRIEFING_MISSION_ROI` 一个 ROI，`BRIEFING_FLIGHT_ROI` / `BRIEFING_ARRIVAL_ROI` 定义了但零引用，`record_flight_time` 只有测试在调 | `tools/pirate_loop.py:237`、`game/pirate_ui.py:71-73`、`storage/repository.py:416` |
+| ~~**`expected_report_at_utc` 从未被写入**（实测库中 4 条派遣全为 NULL）。原因不是「读到了没传出来」，而是**从来没人去读**~~ **已修复**（`attack()` 与 `scout()` 现在都读 `BRIEFING_FLIGHT_ROI`）。保留这条是因为它是后续所有改动的因由；`BRIEFING_ARRIVAL_ROI` 至今仍是零引用 | `tools/pirate_loop.py`、`game/pirate_ui.py:71-73` |
 | 「该等还是该收」已有纯函数判据，且已定义 NULL = 立即收取 | `domain/report_wait.py` `ReportWaitPlanner` |
 | 两个 runner 的 `run()` **已经是单趟就退出**（各遍历一遍输入列表就 return），因此**不需要 `--once`** | `tools/pirate_loop.py:541`、`tools/bot_loop.py:153` |
 | **`bot_loop` 每个目标在进程内 `time.sleep(600)` 等战报**，期间独占鼠标 | `tools/bot_loop.py:59,176` |
@@ -173,8 +173,9 @@ tick(now):
 
 ### 侦察发也占航线，但现在完全没记（用户 2026-08-10 确认）
 
-`pirate_loop.scout()` 只调 `_launch`，**不写 `attack_intents` / `attack_dispatches`**。
-而侦察**占航线且 2× 返航**。海盗一轮最多派 4 发侦察 → 最多 4 条航线对调度器**完全隐形**
+~~`pirate_loop.scout()` 只调 `_launch`，**不写 `attack_intents` / `attack_dispatches`**。~~
+**已修复**——但下面这段因果要留着，它是「为什么非得在 `_launch` 之前读飞行时长」的
+唯一理由：侦察**占航线且 2× 返航**，海盗一轮最多派 4 发侦察 → 最多 4 条航线对调度器**完全隐形**
 → 它以为航线空着就去派攻击 → 撞上「同时派遣的舰队数量已达上限」。这多半就是那个
 弹窗的直接来源。
 

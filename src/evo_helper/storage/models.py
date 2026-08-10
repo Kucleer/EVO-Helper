@@ -18,6 +18,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from evo_helper.domain.records import MISSION_KIND_ATTACK
+
 from .database import Base, UTCDateTime
 
 
@@ -164,6 +166,20 @@ class AttackDispatchRow(Base):
     #: 读不到飞行时间时为 NULL——那时改为立即尝试收取，而不是无限等待。
     flight_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expected_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: **第二个钟**：这条航线什么时候空出来（出发 + 飞行时长 × 1 或 × 2，
+    #: 见 `domain.report_wait.line_free_at`）。与上面那一列是两个不同的时刻——
+    #: 战报在**抵达**时产生，航线要等舰队**飞回来**才释放。
+    #: 拿战报那个钟去判航线，调度器会在航线其实还占着时就去派，撞上游戏的
+    #: 「同时派遣的舰队数量已达上限。」。
+    #: 飞行时长读不到时同样为 NULL，NULL 不计入在飞数（宁可估高空闲航线）。
+    line_free_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 这一发是攻击还是侦察（见 `domain.records.MISSION_KIND_*`）。
+    #: **日配额只数 `ATTACK`**：侦察也是打向海盗的，不分开数的话一轮 4 发侦察
+    #: 就吃掉 4 次攻击额度。**在飞数两者都数**：侦察一样占航线。
+    #: 存量行一律算 `ATTACK`——这一列加进来之前，侦察压根没有记录。
+    mission_kind: Mapped[str] = mapped_column(
+        String(16), default=MISSION_KIND_ATTACK, server_default=MISSION_KIND_ATTACK
+    )
 
 
 class BattleReportRow(Base):

@@ -14,6 +14,7 @@ from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
+    MISSION_KIND_ATTACK,
     TARGET_KIND_BOT,
     AttackDispatch,
     AttackIntent,
@@ -25,7 +26,7 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
-from evo_helper.domain.report_wait import PendingReport
+from evo_helper.domain.report_wait import PendingReport, line_free_at
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.state_machine import require_transition
 
@@ -242,6 +243,7 @@ class SqlAlchemyRepository:
                     dry_run=record.dry_run,
                     accepted=record.accepted,
                     evidence_artifact_id=record.evidence_artifact_id,
+                    mission_kind=record.mission_kind,
                 )
             )
             target = _bot_target_for(
@@ -449,10 +451,17 @@ class SqlAlchemyRepository:
     def record_flight_time(
         self, dispatch_id: UUID, flight: timedelta | None, dispatched_at_utc: datetime
     ) -> None:
-        """存下飞行时长与预计战报时间。
+        """存下飞行时长，以及由它派生的**两个钟**。
 
-        读不到飞行时间时两列都留空。等待调度器会把「未知」当成「立即尝试收取」，
-        而不是无限等一个不知道何时抵达的战报。
+        - `expected_report_at_utc`：出发 + 飞行时长 × 1。战报在抵达时产生。
+        - `line_free_at_utc`：航线什么时候空出来。倍数按发次分岔，见
+          `domain.report_wait.line_free_at`。
+
+        两个钟一起算、一起存，是为了让「用错列」这个错误没有藏身之处：
+        谁要改其中一个，另一个就在同一屏里。
+
+        读不到飞行时间时三列都留空。等待调度器会把「未知」当成「立即尝试收取」，
+        而不是无限等一个不知道何时抵达的战报；航线那一侧的 NULL 则当作不占航线。
         """
         with self._session_factory() as session:
             row = session.get(orm.AttackDispatchRow, dispatch_id)
@@ -461,10 +470,19 @@ class SqlAlchemyRepository:
             if flight is None:
                 row.flight_seconds = None
                 row.expected_report_at_utc = None
+                row.line_free_at_utc = None
             else:
+                dispatched = _require_utc(dispatched_at_utc, "dispatched_at_utc")
+                intent = session.get(orm.AttackIntentRow, row.intent_id)
+                if intent is None:  # pragma: no cover - 外键保证不会发生
+                    raise ValueError(f"dispatch {dispatch_id} has no intent")
                 row.flight_seconds = int(flight.total_seconds())
-                row.expected_report_at_utc = (
-                    _require_utc(dispatched_at_utc, "dispatched_at_utc") + flight
+                row.expected_report_at_utc = dispatched + flight
+                row.line_free_at_utc = line_free_at(
+                    dispatched,
+                    flight,
+                    mission_kind=row.mission_kind,
+                    preset_name=intent.preset_name,
                 )
             session.commit()
 
@@ -502,10 +520,14 @@ class SqlAlchemyRepository:
     # -- 调度器要问的事 --------------------------------------------------------
 
     def count_dispatches_since(self, target_kind: str, *, since: datetime) -> int:
-        """某种目标在 `since` 之后真派出去了几发。
+        """某种目标在 `since` 之后真**打**出去了几发。
 
         海盗每天 32 次是游戏硬限制，超了会收到邮件且攻击被强制返回。
         只数**真实**派遣：演习记录不会消耗配额。
+
+        **只数攻击发。** 侦察也是打向海盗的，只按 `target_kind` 过滤的话，
+        一轮 4 发侦察会各吃掉一次攻击额度——当天 32 次以 4 倍速度消失，
+        而且完全静默、不报任何错。侦察占的是航线，不是配额，见 `count_inflight`。
         """
         with self._session_factory() as session:
             return int(
@@ -518,6 +540,7 @@ class SqlAlchemyRepository:
                     )
                     .where(
                         orm.AttackIntentRow.target_kind == target_kind,
+                        orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                         orm.AttackDispatchRow.accepted.is_(True),
                         orm.AttackDispatchRow.dry_run.is_(False),
                         orm.AttackDispatchRow.dispatched_at_utc >= _require_utc(since, "since"),
@@ -527,18 +550,30 @@ class SqlAlchemyRepository:
             )
 
     def count_inflight(self, *, now_utc: datetime) -> int:
-        """还在天上飞的舰队有几支。**跨 kind**——航线是全局资源。
+        """还占着航线的舰队有几支。**跨 kind**——航线是全局资源。
 
         供调度器估算空闲航线：`usable_limit − 在飞数`。这个估算不含用户自己
         派出去的舰队，因此是乐观的；`reserved_lines` 正是为这段误差留的缓冲，
         而权威闸门仍在 runner 的 `LineCapacityGate`（看屏复核）。
 
-        与 `pending_reports_for_kind` 不是同一个查询：那个按 kind 分、不带
-        `> now`、也返回已闭合的行。这边问的是「舰队回来没有」，那边问的是
-        「战报收了没有」——预计时间已过的那条已经不占航线，却正是最该去收的。
+        **判据是 `line_free_at_utc`，不是 `expected_report_at_utc`。** 这两列是
+        派出之后的两个不同的钟：战报在**抵达**时产生（1×），航线要等舰队
+        **飞回来**才释放（攻击发 2×，探路发 1×，侦察发 2×）。这里问的是
+        「舰队回来没有」，用错列就变成了问「战报出来没有」——于是调度器在
+        航线其实还占着的时候就去派，撞上游戏的「同时派遣的舰队数量已达上限。」，
+        白跑一整轮。（曾经就是这么写的。）
 
-        飞行时间为 NULL 的不计入：读不到就当它不占位，宁可估高。估高了 runner
-        起来空跑一轮，估低了则是航线空着不派——前者有闸门兜底，后者没有。
+        **同理不看有没有战报。** 攻击发的战报在 1× 就到手，那时舰队还在往回飞；
+        拿「战报已收」当作航线已空，等于把刚修掉的 1× 判据从侧门放回来。
+
+        与 `pending_reports_for_kind` 不是同一个查询：那个按 kind 分、不带
+        `> now`、也返回已闭合的行。
+
+        **侦察发照数**：它一样占航线。它不进的是配额，见 `count_dispatches_since`。
+
+        飞行时间为 NULL 的不计入：读不到就当它不占位，宁可估高空闲航线。
+        估高了 runner 起来空跑一轮，估低了则是航线空着不派——前者有闸门兜底，
+        后者没有。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
@@ -546,15 +581,10 @@ class SqlAlchemyRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(orm.AttackDispatchRow)
-                    .outerjoin(
-                        orm.BattleReportRow,
-                        orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
-                    )
                     .where(
                         orm.AttackDispatchRow.accepted.is_(True),
                         orm.AttackDispatchRow.dry_run.is_(False),
-                        orm.AttackDispatchRow.expected_report_at_utc > now_utc,
-                        orm.BattleReportRow.id.is_(None),
+                        orm.AttackDispatchRow.line_free_at_utc > now_utc,
                     )
                 )
                 or 0
@@ -582,6 +612,10 @@ class SqlAlchemyRepository:
         第 2 条不能省。`plan()` 见到任何一条 NULL 就无条件返回 `COLLECT`，而库里
         现存的派遣**全是 NULL**——只写第 1 条，NULL 的派遣既永远「可收」又永远不
         被判缺失，海盗的「有活干」右半边被钉死为真，扫描永远抢不到空隙。
+
+        **侦察发一律排除。** 它不产生 `battle_reports`（侦察报告走信箱里另一条路），
+        所以那一行永远不会闭合。留在结果里就是第三种「永远可收又永远不缺失」，
+        和上面那条 NULL 是同一个形状：防卡死机制原样反转成卡死机制。
         """
         _require_utc(now_utc, "now_utc")
         expected = orm.AttackDispatchRow.expected_report_at_utc
@@ -597,6 +631,7 @@ class SqlAlchemyRepository:
                 )
                 .where(
                     orm.AttackIntentRow.target_kind == target_kind,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                     orm.AttackDispatchRow.accepted.is_(True),
                     orm.AttackDispatchRow.dry_run.is_(False),
                     or_(
@@ -632,6 +667,11 @@ class SqlAlchemyRepository:
         的和演习的都不会产生战报，算进来就是一条「已派出且永远收不到战报」，
         该目标永远停在 `AWAITING_ATTACK_REPORT`，bot 的完成态永远达不到。
 
+        `mission_kind` 是第三个同口径的过滤，理由一样：侦察发也收不到
+        `battle_reports`。而 `phase_of` 只按预设名分探路发和攻击发，认不出
+        「这一发根本不会有战报」——一条带着非探路预设名的侦察发混进来，
+        就会被当成攻击发，把目标永久钉在等战报上。
+
         `skipped` 查的是 `target_revisits`，**按坐标+本轮**取，不是逐条派遣取：
         「分档说这个目标不值得打」是对**这一轮的这个坐标**下的判定，复查表里
         也没有指回某一条意图的列。`phase_of` 只用 `any(...)`，粒度对得上。
@@ -649,6 +689,7 @@ class SqlAlchemyRepository:
                 )
                 .where(
                     orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                     orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
                     orm.AttackIntentRow.target_system == coordinate.system,
                     orm.AttackIntentRow.target_position == coordinate.position,
