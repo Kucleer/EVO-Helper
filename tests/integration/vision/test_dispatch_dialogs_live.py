@@ -21,7 +21,13 @@ from pathlib import Path
 
 import pytest
 
-from evo_helper.game.pirate_ui import DIALOG_NO_MISSION, DIALOG_NO_SHIPS, DIALOG_TEXT_ROI
+from evo_helper.game.pirate_ui import (
+    DIALOG_LINES_FULL,
+    DIALOG_NO_MISSION,
+    DIALOG_NO_SHIPS,
+    DIALOG_TEXT_ROI,
+    snap_dialog,
+)
 
 Image = pytest.importorskip("PIL.Image", reason="requires the vision extra")
 pytest.importorskip("pytesseract", reason="requires the vision extra")
@@ -29,12 +35,13 @@ pytest.importorskip("pytesseract", reason="requires the vision extra")
 #: 两屏实拍（2026-08-10）。视口坐标，1920×879。
 NO_MISSION_SHOT = Path("var/logs/dialog-no-mission-viewport.png")
 NO_SHIPS_SHOT = Path("var/logs/dialog-no-ships-viewport.png")
+LINES_FULL_SHOT = Path("var/logs/dialog-lines-full-viewport.png")
 
 #: 仓库常量是 client 空间，视口图要减掉这条标题栏。
 TITLE_BAR_PX = 38
 
 pytestmark = pytest.mark.skipif(
-    not (NO_MISSION_SHOT.exists() and NO_SHIPS_SHOT.exists()),
+    not (NO_MISSION_SHOT.exists() and NO_SHIPS_SHOT.exists() and LINES_FULL_SHOT.exists()),
     reason="缺实拍截图（var/logs/dialog-*.png）",
 )
 
@@ -107,3 +114,48 @@ def test_the_two_dialogs_are_told_apart_by_text_alone(ocr) -> None:  # type: ign
     no_ships = _read_dialog(Image.open(NO_SHIPS_SHOT), ocr, upscale=3)
     assert DIALOG_NO_SHIPS not in no_mission, f"「没有可执行的任务」那屏读成了 {no_mission!r}"
     assert DIALOG_NO_MISSION not in no_ships, f"「未选择任何战舰」那屏读成了 {no_ships!r}"
+
+
+def test_the_longest_dialog_is_not_clipped_by_the_roi(ocr) -> None:  # type: ignore[no-untyped-def]
+    """ROI 的宽度按**最长**那句留——短的那两句读得好好的不代表框够宽。
+
+    实测踩过：按前两个弹窗（7–8 字）标出来的框，读第三个（14 字）时头尾都被
+    裁掉，读成 `'[派遣的舰队数量已达上'`。关键词匹配不上 → 弹窗认不出 →
+    runner 停下，但停的理由与真实原因无关。
+    """
+    text = _read_dialog(Image.open(LINES_FULL_SHOT), ocr, upscale=3)
+    assert snap_dialog(text) == DIALOG_LINES_FULL, f"读成了 {text!r}"
+
+
+@pytest.mark.parametrize(
+    ("shot", "expected"),
+    [
+        (NO_MISSION_SHOT, DIALOG_NO_MISSION),
+        (NO_SHIPS_SHOT, DIALOG_NO_SHIPS),
+        (LINES_FULL_SHOT, DIALOG_LINES_FULL),
+    ],
+)
+def test_every_dialog_snaps_to_itself(shot: Path, expected: str, ocr) -> None:  # type: ignore[no-untyped-def]
+    """三屏各自贴回自己，一个都不许贴错。
+
+    贴错的代价是把两类处理做反：「跳过这个目标」和「停下整轮等航线」。
+    """
+    assert snap_dialog(_read_dialog(Image.open(shot), ocr, upscale=3)) == expected
+
+
+def test_a_one_character_misread_still_snaps(ocr) -> None:  # type: ignore[no-untyped-def]
+    """差一个字仍要认得出——这不是假设，是实测。
+
+    实机把「派**遣**」读成了「派**遗**」。子串判断在这里直接漏，所以判据
+    必须走编辑距离；`snap_mission` 因为「攻击」→「政击」踩过同一个坑。
+    """
+    assert snap_dialog("同时派遗的舰队数量已达上限。") == DIALOG_LINES_FULL
+
+
+def test_an_unknown_dialog_is_not_forced_into_a_known_one() -> None:
+    """没见过的弹窗要返回 None，而不是硬贴到最像的那个。
+
+    硬贴的话，一个全新的游戏提示会被当成「航线满」处理——停下整轮等一个
+    永远不会来的返航，而且不留痕迹。
+    """
+    assert snap_dialog("服务器维护中，请稍后再试") is None
