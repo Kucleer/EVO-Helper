@@ -36,6 +36,9 @@ class _Navigator:
     def goto(self, coordinate: Coordinate) -> None:
         self._events.append(f"goto {coordinate.system}")
 
+    def invalidate(self) -> None:
+        self._events.append("清缓存")
+
 
 def _loop(events: list[str], verdicts: list[bool]) -> Any:
     loop = BotLoop.__new__(BotLoop)
@@ -64,7 +67,13 @@ def test_a_clean_read_costs_nothing_extra() -> None:
 
 
 def test_a_failed_read_resets_the_screen_and_retries() -> None:
-    """这条是本文件的重点：失败之后必须复位并重新导航，而不是直接放弃。"""
+    """这条是本文件的重点：失败之后必须复位、**清缓存**、重新导航。
+
+    「清缓存」不是可有可无的一步，而是整条重试的全部意义。导航器认为某个字段
+    已经对了就不去重设（`SystemNavigator.goto` 里那三个 `if`），所以只要它的
+    记忆和导航栏实际值分了岔，不清缓存的重试会一字不差地重演上一次失败。
+    实机验证过：重试读回来的还是同一个 `[9:137:12]`。
+    """
     events: list[str] = []
     loop = _loop(events, [False, True])
 
@@ -73,6 +82,7 @@ def test_a_failed_read_resets_the_screen_and_retries() -> None:
         "goto 321",
         "核对 不过",
         "复位画面",
+        "清缓存",
         "goto 321",
         "核对 过",
     ]

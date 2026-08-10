@@ -193,6 +193,11 @@ class PirateLoop:
     #: 标签却必须不同：海盗每天 32 次是游戏硬限制，两者混在一起会数错配额。
     TARGET_KIND: str = TARGET_KIND_PIRATE
 
+    #: 行星面板上「攻击」按钮的位置。**必须由子类按目标类型覆盖**：无主星球
+    #: （敌对海盗）和有主星球（bot）的面板是两套完全不同的布局，见
+    #: `pirate_ui.BOT_ATTACK_BUTTON` 的注释。
+    ATTACK_BUTTON: tuple[int, int] = pirate_ui.ATTACK_BUTTON
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
         self._ocr = ocr
@@ -457,7 +462,7 @@ class PirateLoop:
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
         """
         wanted = preset or self._options.preset
-        self._driver.click(*pirate_ui.ATTACK_BUTTON, label="攻击")
+        self._driver.click(*self.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
 
         picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
@@ -467,6 +472,13 @@ class PirateLoop:
             say(f"  {error}；关掉面板，不打这一发")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
+            # 派遣面板开过之后导航栏里是什么已经不可知了，和 `_leave_dispatch_list`
+            # / `_close_mail` 同理。**这一处原来漏了**，代价是实机上最贵的一次故障：
+            # 缓存仍以为停在原坐标，于是下一个目标的 `goto` 跳过「重设银河系」，
+            # 那一下「设恒星系」落到了银河系框上，游戏把 136 截断成最大值 9。
+            # 此后导航栏是 9:137，而缓存说 2:137——银河系再也不会被重设，连续
+            # 44 个目标坐标核对全不过，13 分钟一发没派。
+            self._navigator.invalidate()
             self._outcome.refused.append((coordinate, f"找不到预设 {wanted}"))
             return False
 

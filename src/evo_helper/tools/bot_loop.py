@@ -40,6 +40,7 @@ from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
+from evo_helper.game import pirate_ui
 from evo_helper.tools.pirate_loop import (
     MAIL_FIRST_ROW_Y,
     MAIL_ROW_PITCH,
@@ -73,6 +74,11 @@ class BotLoop(PirateLoop):
     """复用海盗那条链路的驱动，换成 bot 的识别与分档判定。"""
 
     TARGET_KIND: str = TARGET_KIND_BOT
+
+    #: bot 星球是**有主**面板，按钮排布和敌对海盗那套完全不同。不覆盖的话每一发
+    #: 都会点在空白处，然后倒在「找不到预设 探路」上——实机上这条链路就是这么
+    #: 一发都没派出去过的。
+    ATTACK_BUTTON: tuple[int, int] = pirate_ui.BOT_ATTACK_BUTTON
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
@@ -109,6 +115,10 @@ class BotLoop(PirateLoop):
             return True
         say("  复位画面后重试一次")
         self._reset_to_known_screen()
+        # 清缓存是这条重试的**全部意义**。导航器认为某个字段已经对了就不去重设，
+        # 所以只要它的记忆和导航栏实际值分了岔，不清缓存的重试会一字不差地重演
+        # 上一次的失败——实机验证过：重试读回来的还是那个 `[9:137:12]`。
+        self._navigator.invalidate()
         self._navigator.goto(coordinate)
         return self.is_bot_target(coordinate)
 
