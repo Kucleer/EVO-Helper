@@ -171,6 +171,32 @@ tick(now):
 判据与 `domain/bot_round.phase_of` 用的是同一条（按 `preset_name` 认探路发），
 不要另写第二份。
 
+### 侦察发也占航线，但现在完全没记（用户 2026-08-10 确认）
+
+`pirate_loop.scout()` 只调 `_launch`，**不写 `attack_intents` / `attack_dispatches`**。
+而侦察**占航线且 2× 返航**。海盗一轮最多派 4 发侦察 → 最多 4 条航线对调度器**完全隐形**
+→ 它以为航线空着就去派攻击 → 撞上「同时派遣的舰队数量已达上限」。这多半就是那个
+弹窗的直接来源。
+
+**补记录时有一个必须避开的陷阱**：配额查询 `count_dispatches_since` 只按
+`target_kind` 过滤。侦察若照 `target_kind=PIRATE` 写进去，**每派一发侦察就吃掉一次
+攻击配额**——一轮 4 发，32 次额度会以 4 倍速度消失，而且完全静默。
+
+所以要加一列区分派遣性质（`attack_dispatches.mission_kind`：`ATTACK` / `SCOUT`）：
+
+| 用途 | 口径 |
+|---|---|
+| 日配额计数 | 只数 `mission_kind=ATTACK` 且 `target_kind=PIRATE` |
+| 在飞数（航线） | **全都数**，攻击和侦察一样占航线 |
+
+倍数表因此变成三行：
+
+| 发次 | `mission_kind` | 判据 | 倍数 |
+|---|---|---|---|
+| 海盗攻击 / bot 分档攻击 | `ATTACK` | `preset_name` 非探路 | × 2 |
+| bot 探路（攻击侦查） | `ATTACK` | `preset_name` 是探路 | **× 1**（单程，会损失） |
+| 侦察探测器 | `SCOUT` | —— | × 2（会飞回来） |
+
 **曾经的错误**：`count_inflight()` 用 `expected_report_at_utc > now` 数在飞数，
 也就是按 1× 判定航线已空。它的文档字符串写着「这边问的是**舰队回来没有**」——
 意图是对的，用的那一列却回答的是「战报出来没有」。后果是调度器在航线其实还占着
