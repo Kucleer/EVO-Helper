@@ -27,7 +27,6 @@ from typing import Any
 from uuid import UUID
 
 from evo_helper.config import Settings
-from evo_helper.domain import missions
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import CoordinateScan
 from evo_helper.domain.scan_bounds import ScanBounds
@@ -46,9 +45,6 @@ from evo_helper.vision.scan_reading import (
 PLAN_NAME = "全宇宙优先级扫描"
 RUN_KEY = "priority-scan-0001"
 
-#: 出发星球（计划表要求非空）。扫描本身用不到它——扫描不派遣。
-#: 定义在 `domain.missions`，这里只转手：主星原先在三个文件各写了一遍。
-ORIGIN = missions.ORIGIN
 PRESET_NAME = "探路"
 PRESET_SIGNATURE = "轻型战斗机:1"
 
@@ -75,7 +71,23 @@ GAP_LOG = Path("var/logs/scan-gaps.txt")
 #: `--scan-full-systems` 可关掉它，把这条假设变回可撤销的。
 ONE_BOT_PER_SYSTEM = True
 
-TESSERACT_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+
+def origin() -> Coordinate:
+    """出发星球。默认值在 `domain.missions.ORIGIN`，换账号用 `EVO_HELPER_ORIGIN` 覆盖。
+
+    主星原先在三个文件各写了一遍，现在解析只有这一份，另外两条链路借用它
+    （`pirate_loop` 直接 import，调度器由 `application` 层注入）。
+
+    做成函数而不是模块常量：常量在 import 那一刻就把值定死了，之后 `.env` 或
+    环境变量再改都不生效——而「配置改了却没生效」完全不报错，只是舰队从上一个
+    账号的主星出发，飞行时间和战报匹配跟着一起错。
+    """
+    return Settings().origin_coordinate
+
+
+def tesseract_path() -> Path:
+    """Tesseract 可执行文件。同上，函数而非常量，理由见 `origin`。"""
+    return Path(Settings().tesseract_path)
 
 
 # -- 输出 ---------------------------------------------------------------------
@@ -95,6 +107,8 @@ def ensure_run(session_factory: Any) -> tuple[UUID, Coordinate | None]:
     from evo_helper.storage import models as orm
 
     now = datetime.now(UTC)
+    # 计划表要求出发星球非空。扫描本身用不到它——扫描不派遣。
+    home = origin()
     with session_factory() as session:
         run = session.scalar(
             select(orm.RunInstance).where(orm.RunInstance.idempotency_key == RUN_KEY)
@@ -127,9 +141,9 @@ def ensure_run(session_factory: Any) -> tuple[UUID, Coordinate | None]:
                         end_galaxy=end.galaxy,
                         end_system=end.system,
                         end_position=end.position,
-                        origin_galaxy=ORIGIN.galaxy,
-                        origin_system=ORIGIN.system,
-                        origin_position=ORIGIN.position,
+                        origin_galaxy=home.galaxy,
+                        origin_system=home.system,
+                        origin_position=home.position,
                         fleet_preset_name=PRESET_NAME,
                         fleet_preset_signature=PRESET_SIGNATURE,
                         priority=index,
@@ -262,7 +276,7 @@ def make_ocr() -> Any:
     import pytesseract
     from PIL import Image
 
-    pytesseract.pytesseract.tesseract_cmd = str(TESSERACT_PATH)
+    pytesseract.pytesseract.tesseract_cmd = str(tesseract_path())
 
     filters = {"lanczos": Image.Resampling.LANCZOS, "nearest": Image.Resampling.NEAREST}
 

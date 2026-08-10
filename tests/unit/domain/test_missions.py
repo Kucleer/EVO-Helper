@@ -118,17 +118,19 @@ def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:
         bot_command(many)
 
 
-def test_the_home_planet_is_defined_in_exactly_one_place() -> None:
-    """主星只能有一份。
+def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:
+    """主星只能有一份解析。
 
     原先 `domain.missions`、`tools.pirate_loop`、`tools.scan_coordinates` 各写了
     一遍同一个坐标：改一次主星要改三处，漏掉任何一处的后果都是舰队从错误的
     星球出发，而三处彼此不核对，谁也不会报错。
 
-    用 `is` 而不是 `==`：值相等只说明这一刻碰巧一样，同一个对象才说明它们
-    真的是同一份定义。
+    现在主星可配（换账号就得换），所以「同一个常量」变成了「同一个解析函数」：
+    `domain.missions.ORIGIN` 只是默认值——`domain` 不许 import `config`——
+    真正的取值由 `tools.scan_coordinates.origin()` 一处从 Settings 读。
+    用 `is` 而不是 `==`：值相等只说明这一刻碰巧一样。
     """
     from evo_helper.tools import pirate_loop, scan_coordinates
 
-    assert pirate_loop.ORIGIN is ORIGIN
-    assert scan_coordinates.ORIGIN is ORIGIN
+    assert pirate_loop.origin is scan_coordinates.origin
+    assert scan_coordinates.origin() == ORIGIN

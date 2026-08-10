@@ -897,8 +897,14 @@ def create_persistent_app(
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
 
+    # 主星在这里从 Settings 解析、往下注入：`domain` 不许 import `config`，
+    # 所以 `domain.missions.ORIGIN` 只是默认值，真正的取值由这个组装点决定。
+    # 解析失败要在建 app 时就炸——比舰队从错的星球飞出去之后再发现好得多。
+    resolved = settings or Settings()
     scheduler = mission_scheduler or MissionScheduler(
-        SqlAlchemyRepository(session_factory), MissionSupervisor()
+        SqlAlchemyRepository(session_factory),
+        MissionSupervisor(),
+        origin=resolved.origin_coordinate,
     )
 
     @asynccontextmanager
@@ -920,7 +926,7 @@ def create_persistent_app(
 
     app = create_app(
         service=PersistentApplicationService(session_factory),
-        settings=settings,
+        settings=resolved,
         local_token=local_token,
         lifespan=lifespan,
     )

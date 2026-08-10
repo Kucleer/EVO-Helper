@@ -17,7 +17,6 @@ from evo_helper.application.mission_scheduler import (
     task_snapshot,
 )
 from evo_helper.domain.missions import (
-    ORIGIN,
     MissionParamError,
     bot_targets_in_range,
     pirate_systems,
@@ -890,21 +889,26 @@ class MissionConsoleService:
             return self._bot_summary(params)
         return "—"
 
-    @staticmethod
-    def _pirate_summary(params: dict[str, int]) -> str:
-        """半径 10 是多大范围，用户心里没数；把实际覆盖区间回显出来。"""
+    def _pirate_summary(self, params: dict[str, int]) -> str:
+        """半径 10 是多大范围，用户心里没数；把实际覆盖区间回显出来。
+
+        主星取**调度器认定的那个**，不另读一次默认值：两边各读一次的话，
+        配了 `EVO_HELPER_ORIGIN` 之后页面会显示旧主星、舰队却从新主星出发，
+        而用户看着「没问题」。
+        """
         radius = params.get("radius")
         if radius is None:
             return "未设置半径"
+        origin = self._scheduler.origin
         try:
-            systems = pirate_systems(ORIGIN, radius)
+            systems = pirate_systems(origin, radius)
         except MissionParamError as exc:
             return f"参数不合格：{exc}"
         # `pirate_systems` 按离主星的距离排，不是按系号排，所以取首尾要先排序。
         numbers = sorted(system for _, system in systems)
         return (
-            f"半径 {radius} · {ORIGIN.galaxy}:{numbers[0]} – "
-            f"{ORIGIN.galaxy}:{numbers[-1]}，{len(numbers)} 个系"
+            f"半径 {radius} · {origin.galaxy}:{numbers[0]} – "
+            f"{origin.galaxy}:{numbers[-1]}，{len(numbers)} 个系"
         )
 
     def _bot_summary(self, params: dict[str, int]) -> str:

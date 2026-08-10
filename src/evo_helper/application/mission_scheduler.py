@@ -104,10 +104,19 @@ class MissionScheduler:
         *,
         clock: Callable[[], datetime] = _utc_now,
         planner: ReportWaitPlanner | None = None,
+        origin: Coordinate = ORIGIN,
     ) -> None:
         self._repository = repository
         self._supervisor = supervisor
         self._clock = clock
+        #: 主星。默认值来自 `domain.missions`，真正的取值由建这个对象的那一层
+        #: （`web.app`）从 Settings 解析后注入——`domain` 不许 import `config`，
+        #: 否则纯领域层就绑死在配置上。
+        #:
+        #: 页面回显的范围也读这里（`web.persistent_service`），不另读一次默认值：
+        #: 两边各读一次的话，配了 `EVO_HELPER_ORIGIN` 之后页面显示旧主星、
+        #: 舰队却从新主星出发，而用户看着「没问题」。
+        self._origin = origin
         #: 「该等还是该收」只能有一份实现，所以复用 runner 那一套 planner，
         #: 不在这里另写一遍 SQL 判据。
         self._planner = planner or ReportWaitPlanner()
@@ -125,6 +134,11 @@ class MissionScheduler:
         self._lock = threading.RLock()
 
     # -- 对外 ------------------------------------------------------------------
+
+    @property
+    def origin(self) -> Coordinate:
+        """本次运行认定的主星。页面回显必须读这个，而不是再读一次默认值。"""
+        return self._origin
 
     @property
     def enabled(self) -> bool:
@@ -426,7 +440,7 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.PIRATE:
-            return pirate_command(pirate_systems(ORIGIN, _pirate_radius(params_json)))
+            return pirate_command(pirate_systems(self._origin, _pirate_radius(params_json)))
         return bot_command(bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)))
 
 

@@ -22,8 +22,6 @@ from evo_helper.vision.live_reports import LiveBattleReport, LiveReportReader
 from evo_helper.vision.models import PageObservation
 from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
-DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 
 class _CapturedScreens:
     """A ``ReportScreens`` stitched from one detail and one replay screenshot."""
@@ -87,16 +85,26 @@ def read_report(detail: Path, replay: Path, tesseract_cmd: str) -> LiveBattleRep
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """`--tesseract` 的默认值从配置读，不写死。
+
+    在这里读（而不是模块级常量）是有意的：常量在 import 那一刻就定死了，
+    `.env` 或环境变量之后再改都不生效，而那种不生效不报错。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--detail", type=Path, required=True, help="attack report screenshot")
     parser.add_argument("--replay", type=Path, required=True, help="battle replay screenshot")
-    parser.add_argument("--tesseract", default=DEFAULT_TESSERACT)
+    parser.add_argument("--tesseract", default=Settings().tesseract_path)
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the parsed report without writing to the database",
     )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     log_path = configure_logging()
 
