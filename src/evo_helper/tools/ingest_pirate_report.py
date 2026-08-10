@@ -32,8 +32,6 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.pirate_reports import PirateReportReading, read_pirate_report
 from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
-DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 
 def _screens(path: Path, tesseract_cmd: str) -> object:
     from PIL import Image
@@ -58,12 +56,22 @@ def read_report(detail: Path, bottom: Path, tesseract_cmd: str) -> PirateReportR
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """`--tesseract` 的默认值从配置读，不写死。
+
+    在这里读（而不是模块级常量）是有意的：常量在 import 那一刻就定死了，
+    `.env` 或环境变量之后再改都不生效，而那种不生效不报错。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--detail", type=Path, required=True, help="未滚动的详情页截图")
     parser.add_argument("--bottom", type=Path, required=True, help="拖到底的详情页截图")
-    parser.add_argument("--tesseract", default=DEFAULT_TESSERACT)
+    parser.add_argument("--tesseract", default=Settings().tesseract_path)
     parser.add_argument("--dry-run", action="store_true", help="只打印读数，不写库")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     log_path = configure_logging()
 

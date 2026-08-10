@@ -262,9 +262,9 @@ def _mail_back() -> tuple[int, int]:
 
 
 def _tesseract() -> str:
-    from evo_helper.tools.scan_coordinates import TESSERACT_PATH
+    from evo_helper.tools.scan_coordinates import tesseract_path
 
-    return str(TESSERACT_PATH)
+    return str(tesseract_path())
 
 
 def parse_round_start(text: str) -> datetime:

@@ -39,7 +39,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
-from evo_helper.domain import missions
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -62,16 +61,16 @@ from evo_helper.game.system_navigator import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
+from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin
 
 #: 这条链路自己的计划与幂等键，与坐标扫描分开：两者的游标含义不同，
 #: 共用一个运行实例会让「扫到哪了」和「打到哪了」互相踩。
 PLAN_NAME = "海盗侦查攻击循环"
 RUN_KEY = "pirate-loop-0001"
 
-#: 出发星球。飞行时间与战报匹配都要它。定义在 `domain.missions`，这里只转手——
-#: 主星原先在三个文件各写了一遍，改一次要改三处。
-ORIGIN = missions.ORIGIN
+# 出发星球（`origin()`，从 `tools.scan_coordinates` 借来）。飞行时间与战报
+# 匹配都要它。主星原先在三个文件各写了一遍，改一次要改三处；现在解析只有
+# 一份，而且换账号可以用 `EVO_HELPER_ORIGIN` 配。
 
 #: 侦察发在库里的「预设」名。
 #:
@@ -108,7 +107,7 @@ SCOUT_REPORT_RETRIES = 3
 #:
 #: 取 6 小时的依据：
 #: - 这个方法只在 `attack()` 里调用，而这条链路打的是**同系目标**
-#:   （`ORIGIN` 2:137:18 → 2:137:x），飞行按分钟计。
+#:   （主星 2:137:18 → 2:137:x），飞行按分钟计。
 #: - 仓库里最长的一份实测简报是 `28分 21秒`，而那还是一趟**深空探索**——
 #:   比这条链路任何一发都远得多。6 小时留了十倍以上余量。
 #: - 反过来它拦得住最典型的量级错：任何真实时长 ≥6 分钟的一发，
@@ -623,7 +622,7 @@ class PirateLoop:
             AttackIntent(
                 intent_id=intent_id,
                 run_id=run_id,
-                origin=ORIGIN,
+                origin=origin(),
                 target=coordinate,
                 preset=FleetPresetRef(
                     name=preset or self._options.preset,
@@ -792,9 +791,9 @@ def _preset_signature(name: str) -> str:
 
 
 def _tesseract_path() -> Any:
-    from evo_helper.tools.scan_coordinates import TESSERACT_PATH
+    from evo_helper.tools.scan_coordinates import tesseract_path
 
-    return TESSERACT_PATH
+    return tesseract_path()
 
 
 def _ensure_run_row(session_factory: Any) -> UUID:

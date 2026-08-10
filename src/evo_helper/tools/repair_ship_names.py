@@ -32,8 +32,6 @@ from evo_helper.storage.database import create_database_engine, create_session_f
 from evo_helper.vision.parsers import snap_unit_name
 from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
-DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 #: 参战区在 `locate_sections` 的结果里排第一，其后依次是各回合。
 PARTICIPATING = None
 
@@ -166,14 +164,24 @@ def _find_report(session: Session, needle: str) -> orm.BattleReportRow:
     return matches[0]
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """`--tesseract` 的默认值从配置读，不写死。
+
+    在这里读（而不是模块级常量）是有意的：常量在 import 那一刻就定死了，
+    `.env` 或环境变量之后再改都不生效，而那种不生效不报错。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--replay", type=Path, required=True, help="这份战报的回放截图")
     parser.add_argument(
         "--report", required=True, help="战报 id，或时间文本的一段（如 08/08/2026）"
     )
-    parser.add_argument("--tesseract", default=DEFAULT_TESSERACT)
+    parser.add_argument("--tesseract", default=Settings().tesseract_path)
     parser.add_argument("--apply", action="store_true", help="真的写库；不给就只打印")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if not args.replay.is_file():
