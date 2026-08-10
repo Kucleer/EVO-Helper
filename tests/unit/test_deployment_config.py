@@ -96,10 +96,15 @@ class TestChromePath:
         `Path("") / "Google" / ...` 是**相对路径**，会去匹配当前工作目录下的
         同名文件——找 Chrome 找到工作目录里去，是那种查起来要命的错。
         """
+        from pathlib import PureWindowsPath
+
         from evo_helper.game.game_window import SYSTEM_CHROME_CANDIDATES, chrome_candidates
 
         assert chrome_candidates({}) == SYSTEM_CHROME_CANDIDATES
-        assert all(candidate.is_absolute() for candidate in chrome_candidates({}))
+        # 用 `PureWindowsPath` 而不是 `Path.is_absolute()`：在 Linux（CI 就在那儿跑）
+        # 上 `Path(r"C:\...")` 是 PosixPath，没有前导 `/`，`is_absolute()` 恒为 False。
+        # 这条断言的第一版就是这么挂的——和它要防的那个 bug 是同一类平台假设。
+        assert all(PureWindowsPath(str(c)).is_absolute() for c in chrome_candidates({}))
 
     def test_an_explicit_path_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from evo_helper.game import game_window
