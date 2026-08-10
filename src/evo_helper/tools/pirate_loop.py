@@ -528,7 +528,17 @@ class PirateLoop:
                 tesseract_cmd=str(_tesseract_path()),
             )
 
+        # 先把浮层关掉再切地表。`_on_planet_surface()` 的**正面凭据是右上角那个未读
+        # 数**，而它自己的注释就写着「浮层会盖住它」——`_goto_planet_surface` 却不关
+        # 浮层，只会反复点视图菜单（而那个坐标此刻压在浮层底下）。
+        #
+        # 这一步偏偏紧跟在 `_wait_for_reports` 的 45 秒等待之后，正是舰队返航之类的
+        # 通知最容易冒出来的时刻。实机（2026-08-11 02:10 / 03:35 / 03:46）三次都倒在
+        # 这里，而每次都已经先派出 4 发侦察——报告读不到，那 4 发就白飞。
+        self._reset_to_known_screen()
         if not self._goto_planet_surface():
+            # 判据失败时最贵的事是「不知道当时画面长什么样」。存一帧的成本是一次写盘。
+            self._dump_frame("planet-surface-unreachable", MAIL_BADGE_ROI)
             raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
         self._open_mail()
         # 列表会记住上次滚到哪。不拖回顶部，第 0 行可能是一封只露半截的邮件——
