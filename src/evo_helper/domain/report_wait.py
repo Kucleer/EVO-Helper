@@ -44,6 +44,13 @@ MAX_REPORT_AGE = timedelta(hours=6)
 #: 现在还留着 1 分钟，只是让每一份战报都白白晚收将近一分钟。
 DEFAULT_MARGIN = timedelta(seconds=5)
 
+#: 战报批量收取的分组窗口：与最早那份相差不超过这么久的，并进同一趟收。
+#:
+#: 每一趟收取都要 `ensure_game_window()` + 认屏 + 进信箱，中间还夹一次任务切换。
+#: 10:00:00 和 10:00:30 各一份，分两趟收就是把这套开销付两遍，而并成一趟只需要
+#: 多等 30 秒。60 秒是「多等一会儿」与「压着已到的战报不收」之间的取舍点。
+BATCH_WINDOW = timedelta(seconds=60)
+
 #: 首次重试等 30 秒，随后倍增。
 BASE_SESSION_BACKOFF = timedelta(seconds=30)
 
@@ -87,13 +94,19 @@ class WaitPlan:
 class ReportWaitPlanner:
     """根据已派出的攻击和当前时间，决定该等还是该收。"""
 
-    def __init__(self, margin: timedelta = DEFAULT_MARGIN) -> None:
-        """``margin`` 是唤醒时间上加的余量。
+    def __init__(
+        self,
+        margin: timedelta = DEFAULT_MARGIN,
+        *,
+        batch_window: timedelta = BATCH_WINDOW,
+    ) -> None:
+        """``margin`` 是唤醒时间上加的余量，``batch_window`` 是批量分组的宽度。
 
         提前登录只是白跑一趟，但每一趟都要抢一次会话——而用户可能正在玩。
         宁可晚几秒，也不要为了抢早而多顶一次号。
         """
         self._margin = margin
+        self._batch_window = batch_window
 
     def plan(self, pending: Sequence[PendingReport], *, now_utc: datetime) -> WaitPlan:
         open_reports = [item for item in pending if not item.closed]
@@ -101,26 +114,31 @@ class ReportWaitPlanner:
             return WaitPlan(WaitAction.COMPLETE, detail="all dispatches closed")
 
         # 飞行时间没读到的，立即尝试收取。宁可白跑，也不能无限等一个不知道何时到的战报。
+        #
+        # 这一档**不参与批量分组**：它根本没有可比的到期时间，没法判断该并进哪一组。
+        # 让它跟着某个邻居一起等，等于把「未知即立即收取」这条既定降级悄悄改成了延迟。
         if any(item.expected_report_at_utc is None for item in open_reports):
             return WaitPlan(WaitAction.COLLECT, detail="a dispatch has no expected report time")
 
-        due = [
-            item
-            for item in open_reports
-            if item.expected_report_at_utc is not None and item.expected_report_at_utc <= now_utc
-        ]
-        if due:
-            # 先收能收的，剩下的下一轮继续等。
-            return WaitPlan(WaitAction.COLLECT, detail=f"{len(due)} report(s) due")
-
-        earliest = min(
+        expected = sorted(
             item.expected_report_at_utc
             for item in open_reports
             if item.expected_report_at_utc is not None
         )
+        # 一组 = 最早那份，加上所有与它相差不超过 `batch_window` 的。等到组里**最晚**
+        # 那份到期再去收，一趟读完，省掉重复的认屏与进信箱。
+        #
+        # 分组按「距最早那份多远」算，**不是**一份挨一份地传递着续下去。续着算的话，
+        # 每隔 59 秒来一份就能把收取无限期往后推，本该有界的等待会变成永远不收；
+        # 按这个写法，等待封顶在 `batch_window + margin`。
+        earliest = expected[0]
+        batch = [moment for moment in expected if moment - earliest <= self._batch_window]
+        collect_at = batch[-1] + self._margin
+        if collect_at <= now_utc:
+            return WaitPlan(WaitAction.COLLECT, detail=f"{len(batch)} report(s) due")
         return WaitPlan(
             WaitAction.WAIT,
-            resume_at_utc=earliest + self._margin,
+            resume_at_utc=collect_at,
             detail=f"{len(open_reports)} report(s) still in flight",
         )
 
