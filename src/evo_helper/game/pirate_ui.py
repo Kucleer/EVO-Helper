@@ -70,6 +70,24 @@ PRESET_MAX_DRAGS = 8
 #: 教训：ROI 与放大倍数是一对，换一个就要重新验另一个。
 BRIEFING_MISSION_ROI = (1068, 338, 1160, 372)
 BRIEFING_FLIGHT_ROI = (1050, 452, 1210, 482)
+
+#: 读飞行时间的配方，按顺序试到第一个能解析成时长的为止。
+#:
+#: ⚠️ **不二值化就读不出来**——这一行是绿字压在蓝底上，灰度化之后对比度不够。
+#: 实机（2026-08-10，侦察简报，真值「14秒」）实测：
+#:
+#:     upscale=3 threshold=None  -> '-'      ← 调用方原先用的就是这个默认
+#:     upscale=2 threshold=None  -> '_'
+#:     upscale=2 threshold=120   -> '14秒'   ← 对
+#:
+#: 也就是说这个 ROI 从落地起就**从来没读出过东西**，而 `parse_game_duration('-')`
+#: 返回 None、不抛异常，于是 `expected_report_at_utc` 与 `line_free_at_utc` 恒为
+#: NULL——整套「派出后松手、到点回来收战报」和航线释放时刻全是空转的，一路无声。
+#: 单元测试注入的是假 OCR，所以全绿；变异也全红；唯独没人拿真实像素验过。
+#:
+#: 多配方而不是单配方：照 `COORD_RECIPES` 的做法，一套读不出换下一套，
+#: 比赌一个阈值稳。
+FLIGHT_RECIPES = ((2, 120), (2, 100), (4, 120), (3, 120))
 BRIEFING_ARRIVAL_ROI = (1050, 490, 1210, 540)
 BRIEFING_BACK_BUTTON = (841, 815)
 BRIEFING_LAUNCH_BUTTON = (1077, 815)

@@ -196,10 +196,24 @@ class PirateLoop:
     # -- 读屏 ---------------------------------------------------------------
 
     def _read(
-        self, roi: tuple[int, int, int, int], *, digits: bool = False, upscale: int = 3
+        self,
+        roi: tuple[int, int, int, int],
+        *,
+        digits: bool = False,
+        upscale: int = 3,
+        threshold: int | None = None,
     ) -> str:
+        """读一块 ROI。
+
+        `threshold` 是二值化阈值。多数行不需要，但有些行不二值化就是读不出来
+        ——飞行时间那一行是绿字压在蓝底上，见 `pirate_ui.FLIGHT_RECIPES`。
+        参数加在这里而不是另开一个读屏方法：多一条读屏路径就会绕过调用方的
+        桩，也就是「同一件事两份实现」。
+        """
         self._ensure_geometry()
-        return crop_reader(self._driver.capture(), self._ocr)(roi, digits=digits, upscale=upscale)
+        return crop_reader(self._driver.capture(), self._ocr)(
+            roi, digits=digits, upscale=upscale, threshold=threshold
+        )
 
     def _ensure_geometry(self) -> None:
         """每次读屏前核一次视口尺寸，漂了就调回来。
@@ -309,8 +323,17 @@ class PirateLoop:
 
         def read_once() -> bool:
             nonlocal flight
-            flight = parse_game_duration(self._read(pirate_ui.BRIEFING_FLIGHT_ROI))
-            return flight is not None
+            # 逐个配方试。**必须二值化**：这一行是绿字压在蓝底上，灰度化之后
+            # 对比度不够，调用方原先用的默认（3× 不二值化）在实机上读出来是
+            # `'-'`——见 `pirate_ui.FLIGHT_RECIPES` 的注释。
+            for upscale, threshold in pirate_ui.FLIGHT_RECIPES:
+                text = self._read(
+                    pirate_ui.BRIEFING_FLIGHT_ROI, upscale=upscale, threshold=threshold
+                )
+                flight = parse_game_duration(text)
+                if flight is not None:
+                    return True
+            return False
 
         if not self._settle(read_once) or flight is None:
             say("  简报上读不到飞行时间；这一发照派，回程闹钟留空")
