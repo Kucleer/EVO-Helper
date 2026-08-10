@@ -36,6 +36,14 @@ _CLOCK_RE = re.compile(r"(?<!\d)(\d{1,3}):([0-5]\d):([0-5]\d)(?!\d)")
 #: 说了算——拿派出时刻一起卡会把一发飞十小时、还没到的远征当成缺失排掉。
 MAX_REPORT_AGE = timedelta(hours=6)
 
+#: 唤醒余量：预计时间之上再等这么久才去收。
+#:
+#: 5 秒足够，因为预计时间本来就是**本地记的发出时刻**加上简报里读到的飞行时长
+#: （`repository.record_flight_time`），不依赖任何一次现场识别。原先的 1 分钟是
+#: 在没有可靠预计时间的年代留的：那时预计时间靠猜，余量得大到能盖住猜错。
+#: 现在还留着 1 分钟，只是让每一份战报都白白晚收将近一分钟。
+DEFAULT_MARGIN = timedelta(seconds=5)
+
 #: 首次重试等 30 秒，随后倍增。
 BASE_SESSION_BACKOFF = timedelta(seconds=30)
 
@@ -79,11 +87,11 @@ class WaitPlan:
 class ReportWaitPlanner:
     """根据已派出的攻击和当前时间，决定该等还是该收。"""
 
-    def __init__(self, margin: timedelta = timedelta(minutes=1)) -> None:
+    def __init__(self, margin: timedelta = DEFAULT_MARGIN) -> None:
         """``margin`` 是唤醒时间上加的余量。
 
         提前登录只是白跑一趟，但每一趟都要抢一次会话——而用户可能正在玩。
-        宁可晚一分钟，也不要为了抢早而多顶一次号。
+        宁可晚几秒，也不要为了抢早而多顶一次号。
         """
         self._margin = margin
 

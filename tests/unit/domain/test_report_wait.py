@@ -15,6 +15,10 @@ from evo_helper.domain.report_wait import (
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 
+#: 改为 5 秒之后的默认唤醒余量。预计时间是本地记的发出时刻加简报读到的飞行时长，
+#: 精度足够，不需要原先那 1 分钟——那是没有可靠预计时间的年代留下的。
+MARGIN = timedelta(seconds=5)
+
 
 class TestGameDuration:
     """游戏内倒计时格式：`X天Y时Z分W秒`，缺省段会被省略。"""
@@ -59,6 +63,15 @@ def pending(minutes: int, closed: bool = False) -> PendingReport:
     )
 
 
+def pending_s(seconds: int, closed: bool = False) -> PendingReport:
+    """秒级的到期时间——批量分组的窗口是 60 秒，用分钟表达不出来。"""
+    return PendingReport(
+        dispatch_id=f"s{seconds}",
+        expected_report_at_utc=NOW + timedelta(seconds=seconds),
+        closed=closed,
+    )
+
+
 class TestWaitPlanner:
     def planner(self) -> ReportWaitPlanner:
         return ReportWaitPlanner()
@@ -78,12 +91,12 @@ class TestWaitPlanner:
     def test_a_future_report_makes_the_run_wait(self) -> None:
         plan = self.planner().plan((pending(90),), now_utc=NOW)
         assert plan.action is WaitAction.WAIT
-        # 默认余量 1 分钟。
-        assert plan.resume_at_utc == NOW + timedelta(minutes=91)
+        # 默认余量 5 秒。
+        assert plan.resume_at_utc == NOW + timedelta(minutes=90) + MARGIN
 
     def test_wait_targets_the_earliest_pending_report(self) -> None:
         plan = self.planner().plan((pending(200), pending(45), pending(120)), now_utc=NOW)
-        assert plan.resume_at_utc == NOW + timedelta(minutes=46)
+        assert plan.resume_at_utc == NOW + timedelta(minutes=45) + MARGIN
 
     def test_the_default_margin_is_conservative_but_small(self) -> None:
         """余量存在是为了少抢一次会话，但不能大到错过战报有效期。"""
@@ -121,6 +134,10 @@ class TestWaitPlanner:
     def test_margin_does_not_delay_an_already_due_report(self) -> None:
         planner = ReportWaitPlanner(margin=timedelta(minutes=2))
         assert planner.plan((pending(-10),), now_utc=NOW).action is WaitAction.COLLECT
+
+    def test_the_default_margin_is_five_seconds(self) -> None:
+        plan = self.planner().plan((pending_s(600),), now_utc=NOW)
+        assert plan.resume_at_utc == NOW + timedelta(seconds=600) + MARGIN
 
 
 class TestSessionBackoff:
