@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from evo_helper.vision.optional.window_capture import WindowInfo
@@ -38,9 +38,6 @@ APP_TITLE_BAR_PX = 38
 #: 已标定的页面视口。布局几何只对这个尺寸成立。
 CALIBRATED_VIEWPORT = (1920, 879)
 
-#: 窗口边框：client = window - (宽 18, 高 9)（实测）。
-_BORDER_W, _BORDER_H = 18, 9
-
 CHROME_CANDIDATES = (
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
@@ -53,7 +50,13 @@ class GameWindowError(RuntimeError):
 
 @dataclass(frozen=True)
 class ViewportPlan:
-    """把目标页面视口换算成窗口尺寸。"""
+    """目标页面视口与它对应的 client 尺寸。
+
+    刻意**不**再往上算「窗口尺寸」：窗口比 client 大多少（边框）跟**系统 DPI**
+    走，本机实测的那对常量换台机器就偏，一把设过去就调不到标定 client，
+    于是 `ensure_game_window` 抛错、整条链路在那台机器上直接起不来。
+    现在由 `resize_to_viewport` 量着调，见那里。
+    """
 
     viewport: tuple[int, int] = CALIBRATED_VIEWPORT
     title_bar: int = APP_TITLE_BAR_PX
@@ -61,10 +64,6 @@ class ViewportPlan:
     @property
     def client(self) -> tuple[int, int]:
         return (self.viewport[0], self.viewport[1] + self.title_bar)
-
-    @property
-    def window(self) -> tuple[int, int]:
-        return (self.client[0] + _BORDER_W, self.client[1] + _BORDER_H)
 
     def viewport_from_client(self, width: int, height: int) -> tuple[int, int]:
         return (width, height - self.title_bar)
@@ -129,30 +128,113 @@ def find_loading_game_window() -> WindowInfo | None:
     return found[0] if found else None
 
 
-def resize_to_viewport(window: WindowInfo, plan: ViewportPlan | None = None) -> tuple[int, int]:
+class WindowDriver(Protocol):
+    """`resize_to_viewport` 用到的三件事，抽出来是为了测得了。
+
+    真窗口既不能在测试里移动也不能测量，所以这一层必须可替换。
+    """
+
+    def restore(self) -> None: ...
+
+    def set_size(self, width: int, height: int) -> None: ...
+
+    def measure_client(self) -> tuple[int, int]: ...
+
+
+class _Win32Driver:
+    """真窗口。"""
+
+    def __init__(self, window: WindowInfo) -> None:
+        self._handle = window.handle
+        self._size = (0, 0)
+
+    def restore(self) -> None:
+        import win32con
+        import win32gui
+
+        if win32gui.GetWindowPlacement(self._handle)[1] != win32con.SW_SHOWNORMAL:
+            win32gui.ShowWindow(self._handle, win32con.SW_SHOWNORMAL)
+            time.sleep(1.2)
+
+    def set_size(self, width: int, height: int) -> None:
+        import win32gui
+
+        win32gui.MoveWindow(self._handle, 0, 0, width, height, True)
+
+    def measure_client(self) -> tuple[int, int]:
+        from evo_helper.vision.optional.window_capture import client_box
+
+        current = find_game_window()
+        if current is None:  # pragma: no cover - 窗口在调整过程中被关掉
+            raise GameWindowError("调整尺寸时窗口消失了")
+        box = client_box(current)
+        return (box[2] - box[0], box[3] - box[1])
+
+
+#: 量-调-复验最多来回几次。收敛不了就停：窗口有最小尺寸、会被贴边吸附、
+#: 也可能压根调不动，无限逼近一个到不了的目标只会把链路挂在这里。
+MAX_RESIZE_ATTEMPTS = 3
+
+#: 每次 `MoveWindow` 之后等窗口稳定的时长。测的是稳定之后的 client，
+#: 量早了会读到中间态，于是「差值」算出来是噪声，越调越偏。
+RESIZE_SETTLE_S = 1.5
+
+
+def next_window_size(
+    target_client: tuple[int, int],
+    measured_client: tuple[int, int],
+    window_size: tuple[int, int],
+) -> tuple[int, int]:
+    """下一次该把窗口设成多大。
+
+    纯函数，所以测得了——`MoveWindow` 和真实窗口测不了。
+    做的事就是把这次 client 差了多少，原样补到窗口尺寸上：边框宽度是什么、
+    跟不跟系统 DPI 走，都不需要知道，量出来就是了。
+    """
+    return (
+        window_size[0] + (target_client[0] - measured_client[0]),
+        window_size[1] + (target_client[1] - measured_client[1]),
+    )
+
+
+def resize_to_viewport(
+    window: WindowInfo,
+    plan: ViewportPlan | None = None,
+    *,
+    driver: WindowDriver | None = None,
+    pause: Callable[[float], None] | None = None,
+) -> tuple[int, int]:
     """把窗口调到标定视口，返回实际视口。
 
     最大化的窗口对 ``SetWindowPos`` 免疫，所以先还原再调——这一点踩过坑。
+
+    **量着调，不假定边框宽度。** 窗口比 client 大多少跟系统 DPI 走（不跟
+    Chrome 的 forced DPR 走），所以本机实测的那对常量换台机器就偏；照它一把
+    设过去，client 就调不到 1920x917，`ensure_game_window` 直接抛错、代码在
+    那台机器上根本起不来。改成先按 client 尺寸试一次，量出实际 client，按差
+    值再设一次，直到复验相等——边框常量就整个不需要了。
     """
-    import win32con
-    import win32gui
-
-    from evo_helper.vision.optional.window_capture import client_box
-
     target = plan or ViewportPlan()
-    handle = window.handle
-    if win32gui.GetWindowPlacement(handle)[1] != win32con.SW_SHOWNORMAL:
-        win32gui.ShowWindow(handle, win32con.SW_SHOWNORMAL)
-        time.sleep(1.2)
+    hardware = driver or _Win32Driver(window)
+    wait = pause or time.sleep
+    hardware.restore()
 
-    win32gui.MoveWindow(handle, 0, 0, *target.window, True)
-    time.sleep(1.5)
+    # 第一次先按 client 尺寸设：边框恒为非负，第一发必然偏小，差多少下一轮补回来。
+    size = target.client
+    measured = (0, 0)
+    for _ in range(MAX_RESIZE_ATTEMPTS):
+        hardware.set_size(*size)
+        wait(RESIZE_SETTLE_S)
+        measured = hardware.measure_client()
+        if measured == target.client:
+            return target.viewport_from_client(*measured)
+        size = next_window_size(target.client, measured, size)
 
-    current = find_game_window()
-    if current is None:  # pragma: no cover - 窗口在调整过程中被关掉
-        raise GameWindowError("调整尺寸时窗口消失了")
-    box = client_box(current)
-    return target.viewport_from_client(box[2] - box[0], box[3] - box[1])
+    raise GameWindowError(
+        f"调了 {MAX_RESIZE_ATTEMPTS} 次仍收敛不到标定 client "
+        f"{target.client[0]}x{target.client[1]}，最后一次量到 "
+        f"{measured[0]}x{measured[1]}；几何不符时拒绝继续采集"
+    )
 
 
 #: 拉起窗口后等它出现的轮询上限。冷启动要开 Chrome、下载资源、初始化 WebGL，
