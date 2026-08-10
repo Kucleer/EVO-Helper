@@ -514,6 +514,14 @@ DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
 
+#: 各种浮层左上角的关闭键。信箱、消息详情、飞行中列表、派遣面板共用这一个位置，
+#: 所以关浮层这件事不需要先认出是哪一种浮层（`pirate_loop.MAIL_BACK` 是同一个点）。
+OVERLAY_CLOSE_BUTTON = (750, 71)
+
+#: 关浮层最多点这么多下。每种浮层最多套两层（列表 → 详情），4 下留了余量；
+#: 点空了也无害，那个位置在恒星系视图上什么都不是。
+OVERLAY_CLOSE_ATTEMPTS = 4
+
 ENTRY_TITLE_ROI = (780, 305, 1140, 355)
 ENTRY_BUTTON_ROI = (999, 385, 1118, 430)
 ENTRY_UPSCALE = 3
@@ -608,6 +616,34 @@ def make_session_keeper(
     )
 
 
+def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> Any:
+    """`UNKNOWN` 先当成「浮层压着导航条」处理：关掉浮层再巡检一次。
+
+    `classify_screen` 靠底部导航条的字判 IN_GAME，而信箱、飞行中列表、派遣面板
+    都把它盖住。真掉线时画面是 ENTRY / START / DISCONNECTED，**落不到 UNKNOWN**，
+    所以 UNKNOWN 基本只剩「有浮层」这一种解释。
+
+    实机（2026-08-11 02:38）：上一条链路把游戏停在一个面板上，扫描开工时读到
+    UNKNOWN，1.5 秒就「安全停止」并返回 1；连着三次，调度器把扫描整条**自动停用**。
+    日志里只有三行「会话不可用：unrecognised screen」，而会话好好的。
+
+    这里对 UNKNOWN 放行去点关闭键并没有破坏「认不出的画面绝不点击」：那个位置在
+    恒星系视图上什么都不是，点空无害；而真掉线的三种画面走的是守护自己的入口序列。
+    """
+    from evo_helper.game.session_keeper import ScreenState
+
+    if session is None or session.state is not ScreenState.UNKNOWN:
+        return session
+    say("画面认不出（多半是浮层）；关掉浮层后重新巡检")
+    for _attempt in range(OVERLAY_CLOSE_ATTEMPTS):
+        driver.click(*OVERLAY_CLOSE_BUTTON, label="关闭面板")
+        driver.wait(2.0)
+        session = keeper.ensure_connected(force=True)
+        if session is None or session.state is not ScreenState.UNKNOWN:
+            return session
+    return session
+
+
 def run_scan(
     *,
     limit: int | None,
@@ -647,6 +683,7 @@ def run_scan(
     # 实测这条路径把扫描卡了几千轮，日志里全是「切不到恒星系视图」，
     # 一次都没提过巡检；而且那三次点击本身就违反「认不出的画面绝不点击」。
     session = keeper.ensure_connected(force=True)
+    session = dismiss_overlays_if_unrecognised(session, driver, keeper)
     if session is not None and not session.ready:
         say(f"会话不可用：{session.detail}；安全停止")
         return 1
