@@ -161,6 +161,15 @@ PANEL_DRAG_TO_Y = 300
 #: 实机上 `print` 一个 OCR 读出来的 `™` 就把整个 runner 弄崩过，见那边的注释。
 
 
+class RoundExhausted(RuntimeError):
+    """这一轮没料了：舰队全在外面，或者航线占满。
+
+    **这不是失败。** 抛到 `run()` 就正常收尾、退出码 0——调度器据此不计入连续
+    失败计数。反过来当成失败的话：航线占满是必然会发生的事，连撞三次就把整条
+    链路自动停用了，而它其实只是需要等舰队飞回来。
+    """
+
+
 @dataclass
 class LoopOptions:
     systems: tuple[tuple[int, int], ...]
@@ -296,6 +305,36 @@ class PirateLoop:
         self._settle(read_once)
         return mission
 
+    def _dialog(self) -> str | None:
+        """当前屏上有没有那种单按钮弹窗；有就返回贴回词表之后的文案。
+
+        三个弹窗共用同一个框、同一个绿 ✓，只有文字不同，所以判据只能是文字。
+        贴不上返回 None——**这不等于「没有弹窗」**，也可能是个没见过的新弹窗；
+        那种情况由既有的那几道闸门（简报任务类型、面板标题）去挡。
+        """
+        return pirate_ui.snap_dialog(self._read(pirate_ui.DIALOG_TEXT_ROI))
+
+    def _handle_dialog(self, coordinate: Coordinate) -> bool:
+        """认出弹窗就关掉它，并决定这一轮还能不能继续。
+
+        返回 True 表示「没有弹窗，照常往下走」；False 表示「这个目标跳过」。
+        资源耗尽则抛 `RoundExhausted`——那不是失败，是这一轮没料了。
+
+        ⚠️ 三个弹窗**分两类，处理方式相反**。把「没有可执行的任务」也当成停轮，
+        一个被别人打过、正在保护期里的目标就能让整轮空转，而它后面可能还排着
+        一堆能打的。
+        """
+        message = self._dialog()
+        if message is None:
+            return True
+        self._driver.click(*pirate_ui.DIALOG_CONFIRM, label="关闭弹窗")
+        self._driver.wait(DISPATCH_WAIT_S)
+        if message == pirate_ui.DIALOG_NO_MISSION:
+            say(f"  {coordinate} 在保护期内（{message}）；跳过这个目标")
+            self._outcome.refused.append((coordinate, message))
+            return False
+        raise RoundExhausted(message)
+
     def _read_flight_time(self) -> timedelta | None:
         """把简报上的飞行时间读下来，**必须在点「出发！」之前**。
 
@@ -359,7 +398,11 @@ class PirateLoop:
             return False
         self._driver.click(*pirate_ui.BRIEFING_LAUNCH_BUTTON, label="出发")
         self._driver.wait(LAUNCH_WAIT_S)
-        return True
+        # ⚠️ **点完「出发！」不等于派出去了。** 航线占满时游戏在这里弹
+        # 「同时派遣的舰队数量已达上限。」，而这一发根本没飞。不检查的话调用方会
+        # 记下一条**根本不存在的派遣**：调度器据此以为一条航线被占着，等一份永远
+        # 不会来的战报，要到 `MAX_REPORT_AGE`（6 小时）才被判缺失清掉。
+        return self._handle_dialog(coordinate)
 
     def scout(self, coordinate: Coordinate) -> bool:
         """派一发侦察。派遣面板的终点是自动预填的，侦察也不需要选预设。
@@ -377,6 +420,11 @@ class PirateLoop:
         self._driver.wait(DISPATCH_WAIT_S)
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
+        # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
+        # 这里弹的是那种单按钮弹窗。**先认再走**，而且要在记意图之前。
+        if not self._handle_dialog(coordinate):
+            self._leave_dispatch_list()
+            return False
         intent_id = self._record_intent(coordinate, preset=SCOUT_PRESET_NAME)
         # ⚠️ **这一行必须留在 `_launch` 之前**，理由与 `attack()` 里那一行相同：
         # 点完「出发！」简报页就没了。不读的话 `line_free_at_utc` 恒为 NULL，
@@ -424,6 +472,11 @@ class PirateLoop:
 
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
+        # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
+        # 这里弹的是那种单按钮弹窗。**先认再走**，而且要在记意图之前。
+        if not self._handle_dialog(coordinate):
+            self._leave_dispatch_list()
+            return False
         intent_id = self._record_intent(coordinate, preset=wanted)
         # ⚠️ **这一行必须留在 `_launch` 之前。** 点完「出发！」简报页就没了，
         # 挪到后面读，四次重试全会落空，飞行时间永久恒为 NULL——而且一声不响，
@@ -700,6 +753,16 @@ class PirateLoop:
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
 
+        try:
+            self._sweep()
+        except RoundExhausted as exhausted:
+            # 资源耗尽**不是失败**：正常收尾、退出码 0。当成失败的话，航线占满
+            # （必然会发生）连撞三次就把整条链路自动停用了，而它只是需要等舰队
+            # 飞回来。调度器看到 0 就只走冷却，到点再来。
+            say(f"这一轮到此为止：{exhausted}")
+        return self._outcome
+
+    def _sweep(self) -> None:
         for galaxy, system in self._options.systems:
             say(f"恒星系 {galaxy}:{system}")
             pirates = self._find_pirates(galaxy, system)
@@ -722,7 +785,6 @@ class PirateLoop:
             reports = self.collect_scout_reports(pirates)
             for coordinate in pirates:
                 self._decide_and_attack(coordinate, reports.get(coordinate))
-        return self._outcome
 
     def _reset_to_known_screen(self, *, attempts: int = 4) -> None:
         """开工先把开着的浮层关掉，让画面回到「地表」或「恒星系」这两种认得出的状态。
