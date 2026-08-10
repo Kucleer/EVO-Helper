@@ -131,6 +131,8 @@ def test_the_round_ends_cleanly_when_resources_run_out(monkeypatch: pytest.Monke
     loop._navigator = type("N", (), {"ensure_system_view": lambda _s, _f: True})()  # type: ignore[attr-defined]
     loop._nav_labels = lambda: ""  # type: ignore[attr-defined, assignment]
     loop._reset_to_known_screen = lambda: None  # type: ignore[attr-defined, assignment]
+    # 会话巡检要真截屏，这条测试只关心 `RoundExhausted` 的收尾，桩掉即可。
+    loop._ensure_session = lambda **_k: False  # type: ignore[attr-defined, assignment]
     loop._sweep = lambda: (_ for _ in ()).throw(  # type: ignore[attr-defined, assignment]
         RoundExhausted(pirate_ui.DIALOG_LINES_FULL)
     )

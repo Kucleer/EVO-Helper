@@ -114,7 +114,13 @@ class BotLoop(PirateLoop):
         if self.is_bot_target(coordinate):
             return True
         say("  复位画面后重试一次")
+        # 先看会话还在不在。掉线时这一屏是 START 登录页，面板**永远**读不出来，
+        # 复位和重新导航都是白费——实机（2026-08-11 02:11）就这么对着登录页把
+        # 目标一个个试下去，每个 ~35 秒，日志里全是「面板读作 ''」。
+        reconnected = self._ensure_session(force=True)
         self._reset_to_known_screen()
+        if reconnected and not self._navigator.ensure_system_view(self._nav_labels):
+            raise RuntimeError("重连后切不到恒星系视图；安全停止")
         # 清缓存是这条重试的**全部意义**。导航器认为某个字段已经对了就不去重设，
         # 所以只要它的记忆和导航栏实际值分了岔，不清缓存的重试会一字不差地重演
         # 上一次的失败——实机验证过：重试读回来的还是那个 `[9:137:12]`。

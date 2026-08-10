@@ -52,8 +52,13 @@ def _loop(events: list[str], verdicts: list[bool]) -> Any:
     def _reset() -> None:
         events.append("复位画面")
 
+    def _session(*, force: bool = False) -> bool:
+        events.append("查会话")
+        return False
+
     loop.is_bot_target = _confirm  # type: ignore[assignment, method-assign]
     loop._reset_to_known_screen = _reset  # type: ignore[assignment, method-assign]
+    loop._ensure_session = _session  # type: ignore[assignment, method-assign]
     return loop
 
 
@@ -81,6 +86,7 @@ def test_a_failed_read_resets_the_screen_and_retries() -> None:
     assert events == [
         "goto 321",
         "核对 不过",
+        "查会话",
         "复位画面",
         "清缓存",
         "goto 321",

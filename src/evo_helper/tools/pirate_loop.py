@@ -206,6 +206,7 @@ class PirateLoop:
         self._outcome = Outcome()
         self._repository: SqlAlchemyRepository | None = None
         self._run_id: UUID | None = None
+        self._session_keeper: Any = None
 
     # -- 读屏 ---------------------------------------------------------------
 
@@ -752,6 +753,42 @@ class PirateLoop:
         )
         repository.record_flight_time(dispatch_id, flight, dispatched_at)
 
+    # -- 会话 ---------------------------------------------------------------
+
+    def _keeper(self) -> Any:
+        """惰性建一个会话守护，整轮共用一个（它内部按时间节流巡检）。"""
+        from evo_helper.tools.scan_coordinates import make_session_keeper
+
+        if self._session_keeper is None:
+            self._session_keeper = make_session_keeper(self._driver, self._ocr)
+        return self._session_keeper
+
+    def _ensure_session(self, *, force: bool = False) -> bool:
+        """确认会话还在；掉了就接回去。返回「刚刚重连过」。
+
+        **必须排在切视图之前。** 顺序反了会这样（`run_scan` 里有同一段注释，
+        这两条链路当时漏抄了）：会话掉了的时候画面停在入口页或 START 页，导航栏
+        标签自然读不到，`ensure_system_view` 于是朝视图菜单坐标盲点三次然后放弃，
+        **永远走不到能重连的 SessionKeeper**。
+
+        实机（2026-08-11 02:10）：会话在海盗那轮读信箱时掉了，报「切不到自己星球
+        地表」；调度器接着起 bot，bot 对着登录页把 80 个目标一个个试，每个 ~35 秒
+        ——45 分钟白点，日志里全是「坐标核对不过：面板读作 ''」。留下的现场图上
+        是 START 登录页。
+
+        重连之后一定要清导航缓存：那份记忆记的是掉线前的坐标。
+        """
+        session = self._keeper().ensure_connected(force=force)
+        if session is None:
+            return False
+        if not session.ready:
+            raise RuntimeError(f"会话不可用：{session.detail}；安全停止")
+        if session.reconnected:
+            say("已重新登录")
+            self._navigator.invalidate()
+            return True
+        return False
+
     # -- 主循环 -------------------------------------------------------------
 
     def run(self) -> Outcome:
@@ -760,6 +797,7 @@ class PirateLoop:
         from evo_helper.game.game_window import ensure_game_window
 
         ensure_game_window()
+        self._ensure_session(force=True)
         self._reset_to_known_screen()
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
