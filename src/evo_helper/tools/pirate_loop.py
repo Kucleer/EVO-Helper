@@ -778,11 +778,26 @@ class PirateLoop:
 
         重连之后一定要清导航缓存：那份记忆记的是掉线前的坐标。
         """
+        from evo_helper.game.session_keeper import ScreenState
+
         session = self._keeper().ensure_connected(force=force)
         if session is None:
             return False
-        if not session.ready:
-            raise RuntimeError(f"会话不可用：{session.detail}；安全停止")
+        if session.state is ScreenState.UNKNOWN:
+            # 认不出**多半是浮层压着导航条**（信箱、飞行中列表、派遣面板），不是
+            # 掉线：`classify_screen` 把登录页判成 ENTRY/START，落不到 UNKNOWN。
+            # 所以先把浮层关掉再问一次，而不是当场判死——上一轮停在哪个面板就能
+            # 让下一轮开不了工。实机 02:24 就是这么报「会话不可用：unrecognised
+            # screen」的，而那时会话好好的。
+            #
+            # 这里对 UNKNOWN 放行去点关闭键，并没有破坏「认不出的画面绝不点击」：
+            # 真掉线时画面是 ENTRY/START/DISCONNECTED，走的是守护自己的入口序列。
+            say("  画面认不出（多半是浮层）；关掉浮层后重新巡检")
+            self._reset_to_known_screen()
+            session = self._keeper().ensure_connected(force=True)
+        if session is None or not session.ready:
+            detail = session.detail if session else "巡检没返回结果"
+            raise RuntimeError(f"会话不可用：{detail}；安全停止")
         if session.reconnected:
             say("已重新登录")
             self._navigator.invalidate()
