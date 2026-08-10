@@ -73,6 +73,46 @@ class TestTesseractPath:
         assert parser.parse_args(required).tesseract == r"D:\ocr\tesseract.exe"
 
 
+class TestChromePath:
+    def test_the_user_level_install_is_a_candidate(self) -> None:
+        """Chrome 默认装在 `%LOCALAPPDATA%`，不是 `Program Files`。
+
+        只列系统级路径时，一台按默认方式装 Chrome 的机器会直接报「找不到
+        Chrome」，而机器上明明装着。
+        """
+        import os
+
+        from evo_helper.game.game_window import CHROME_CANDIDATES
+
+        local = os.environ.get("LOCALAPPDATA")
+        assert local, "本机没有 LOCALAPPDATA，这条测试的前提不成立"
+        expected = Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe"
+        assert expected in CHROME_CANDIDATES, CHROME_CANDIDATES
+
+    def test_an_explicit_path_wins(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from evo_helper.game import game_window
+
+        fake = tmp_path / "chrome.exe"
+        fake.write_bytes(b"")
+        monkeypatch.setenv("EVO_HELPER_CHROME_PATH", str(fake))
+        assert game_window.chrome_path() == fake
+
+    def test_an_explicit_path_that_is_wrong_is_reported_not_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """配了却找不到时**不能**悄悄回落到候选列表。
+
+        回落的话，用户以为在跑自己指定的那个 Chrome（比如带着已登录的
+        profile），实际跑的是另一个——差别要等到登录失败才看得出来。
+        """
+        from evo_helper.game import game_window
+
+        missing = tmp_path / "nope.exe"
+        monkeypatch.setenv("EVO_HELPER_CHROME_PATH", str(missing))
+        with pytest.raises(game_window.GameWindowError, match="nope.exe"):
+            game_window.chrome_path()
+
+
 class TestOrigin:
     def test_the_default_still_matches_the_domain_constant(self) -> None:
         """默认值必须和 `domain.missions.ORIGIN` 一致。

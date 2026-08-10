@@ -27,11 +27,31 @@ class Settings(BaseSettings):
     default_fleet_preset: str = DEFAULT_PRESET.name
     default_fleet_preset_signature: str = DEFAULT_PRESET.signature
 
-    # -- 部署相关（换机器 / 换账号就要改的地方）---------------------------------
+    # -- 部署相关（换机器 / 换账号就要改的三处）---------------------------------
 
     #: Tesseract 可执行文件。默认是 Windows 安装器的落点。
     #: 装到别处（或装的是 portable 版）时用 `EVO_HELPER_TESSERACT_PATH` 指过去。
     tesseract_path: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+    #: Chrome 可执行文件。留空则按 `game.game_window.CHROME_CANDIDATES` 依次找。
+    #: 显式指定时**找不到就报错**，不回落到候选列表——回落的话用户以为跑的是
+    #: 自己指定的那个（比如带着已登录 profile 的），实际跑的是另一个。
+    chrome_path: str | None = None
+
+    #: 页面 DPR。传给 Chrome 的 `--force-device-scale-factor`。
+    #:
+    #: 所有点击坐标和 OCR 的 ROI 编码的是**「窗口物理尺寸 ÷ 缩放率」**得到的
+    #: CSS 版面，不是物理尺寸。本机物理 1920x1080、系统缩放 125%，窗口 client
+    #: 1920x917 物理，游戏按 1536x703 CSS 排版；换到 100% 缩放的机器，同样的
+    #: 物理窗口会变成 1920x879 CSS，版面完全不同、坐标全废，而几何校验只看物理
+    #: 尺寸，一路都是绿的。钉死这个值，CSS 版面就跟目标机器的系统缩放无关了。
+    #:
+    #: **这不是偏好项，是标定常量。** 列在这里只为了把它显式写出来：取值必须
+    #: 等于 `game.game_window.CALIBRATED_SCALE_FACTOR`，填别的会被当场拦下。
+    #: 判据放在 `game_window.verified_scale_factor()`——它要跟同一次标定出来的
+    #: `APP_TITLE_BAR_PX`、`CALIBRATED_VIEWPORT` 住在一起，而本模块反过来
+    #: import 那边会成环（那边要读 Settings）。
+    device_scale_factor: float = 1.25
 
     #: 主星，写成 `星系:恒星系:位置`。换账号就要换——飞行时间、战报匹配、
     #: 海盗巡航范围全都从它算起。
