@@ -49,10 +49,12 @@ from evo_helper.tools.pirate_loop import (
     PANEL_DRAG_TO_Y,
     LoopOptions,
     PirateLoop,
-    say,
     slow_drag,
 )
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr
+
+# `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
+# `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
+from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, say
 
 #: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
 PROBE_PRESET = DEFAULT_PRESET.name

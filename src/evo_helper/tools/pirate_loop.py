@@ -61,7 +61,7 @@ from evo_helper.game.system_navigator import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin
+from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin, say
 
 #: 这条链路自己的计划与幂等键，与坐标扫描分开：两者的游标含义不同，
 #: 共用一个运行实例会让「扫到哪了」和「打到哪了」互相踩。
@@ -157,8 +157,8 @@ PANEL_DRAG_FROM_Y = 700
 PANEL_DRAG_TO_Y = 300
 
 
-def say(message: str) -> None:
-    print(f"{datetime.now().strftime('%H:%M:%S')} {message}", flush=True)
+#: 借 `scan_coordinates` 那一份，不再各写一遍。它是编码安全的——
+#: 实机上 `print` 一个 OCR 读出来的 `™` 就把整个 runner 弄崩过，见那边的注释。
 
 
 @dataclass
