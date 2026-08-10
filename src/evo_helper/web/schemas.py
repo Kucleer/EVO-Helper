@@ -170,6 +170,53 @@ class StateEventOut(BaseModel):
     to_state: str | None = None
 
 
+class MissionTaskOut(BaseModel):
+    kind: str
+    #: 界面上的名字。桌面悬浮窗是个瘦客户端，它只认接口给的这个字符串。
+    label: str
+    enabled: bool
+    priority: int
+    params: dict[str, int]
+    #: `运行中` / `待命` / `等航线` / `冷却中` / `配额用尽` / `已完成` /
+    #: `已停用` / `未启用`，由 `domain.scheduler.status_of` 判定。
+    status: str
+    #: 状态旁边那句随行的事实：`今日 12/32`、`还剩 37 个未完成`。
+    detail: str
+    #: 参数的人话回显：半径实际覆盖到哪、区间里有几个已记录的 bot。
+    summary: str
+    disabled_reason: str | None = None
+
+
+class MissionTaskPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: 三样各自独立，`None` 一律表示「这次不动它」而不是「清空」。
+    enabled: bool | None = None
+    priority: int | None = None
+    #: 海盗 `{"radius": N}`、bot `{"galaxy": G, "first_system": A, "last_system": B}`。
+    #: 只收整数：`{"radius": true}` 这种会被当成半径 1，悄悄打出一圈不是用户
+    #: 想要的范围。
+    params: dict[str, int] | None = None
+
+
+class CurrentMissionOut(BaseModel):
+    kind: str
+    label: str
+    started_at_utc: datetime
+    log_path: str
+
+
+class SchedulerOut(BaseModel):
+    running: bool
+    #: 点「开始」的时刻，供页面与悬浮窗上那块秒表。停着时为 None。
+    started_at_utc: datetime | None = None
+    current: CurrentMissionOut | None = None
+    #: 上次没走正常关闭路径留下的进程号。**只显示给人看**，不据此杀进程——
+    #: pid 会被系统回收复用。
+    orphan_pid: int | None = None
+    tasks: list[MissionTaskOut]
+
+
 class DashboardOut(BaseModel):
     plan_count: int
     active_run_count: int
@@ -180,11 +227,14 @@ class DashboardOut(BaseModel):
 __all__ = [
     "BotTargetOut",
     "CoordinateModel",
+    "CurrentMissionOut",
     "DashboardOut",
     "FleetChangeOut",
     "FleetDiffOut",
     "FleetEntryOut",
     "FleetSnapshotOut",
+    "MissionTaskOut",
+    "MissionTaskPatch",
     "RevisitIn",
     "RevisitOut",
     "RunStartIn",
@@ -194,5 +244,6 @@ __all__ = [
     "ScanPlanPatch",
     "ScanRangeIn",
     "ScanRangeOut",
+    "SchedulerOut",
     "StateEventOut",
 ]

@@ -27,6 +27,7 @@ from typing import Any
 from uuid import UUID
 
 from evo_helper.config import Settings
+from evo_helper.domain import missions
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import CoordinateScan
 from evo_helper.domain.scan_bounds import ScanBounds
@@ -46,7 +47,8 @@ PLAN_NAME = "全宇宙优先级扫描"
 RUN_KEY = "priority-scan-0001"
 
 #: 出发星球（计划表要求非空）。扫描本身用不到它——扫描不派遣。
-ORIGIN = Coordinate(2, 137, 18)
+#: 定义在 `domain.missions`，这里只转手：主星原先在三个文件各写了一遍。
+ORIGIN = missions.ORIGIN
 PRESET_NAME = "探路"
 PRESET_SIGNATURE = "轻型战斗机:1"
 

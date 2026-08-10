@@ -1,6 +1,9 @@
 """FastAPI application factory for the local EVO-Helper management UI."""
 
-import os
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,22 +16,33 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.types import Lifespan
 
+from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
+from evo_helper.storage.repository import SqlAlchemyRepository
 
-from .display import LIST_SHIP_COLUMNS
+from .display import LIST_SHIP_COLUMNS, MISSION_LABELS, STATUS_GLYPHS, STATUS_TONES
+
+# 模块级导入（而不是留在 `create_persistent_app` 里）：`register_mission_routes`
+# 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
+from .persistent_service import MissionConsoleService, PersistentApplicationService
 from .schemas import (
     BotTargetOut,
     CoordinateModel,
     CoordinateScanOut,
+    CurrentMissionOut,
     DashboardOut,
     FleetChangeOut,
     FleetDiffOut,
     FleetEntryOut,
     FleetSnapshotOut,
+    MissionTaskOut,
+    MissionTaskPatch,
     RevisitIn,
     RevisitOut,
     RunStartIn,
@@ -38,9 +52,10 @@ from .schemas import (
     ScanPlanPatch,
     ScanRangeIn,
     ScanRangeOut,
+    SchedulerOut,
     StateEventOut,
 )
-from .security import LocalSecurityMiddleware
+from .security import LocalSecurityMiddleware, default_local_token
 from .service import (
     DEFAULT_PLANET_KIND,
     PLANET_KINDS,
@@ -52,12 +67,14 @@ from .service import (
     FleetDiffView,
     FleetEntryView,
     FleetSnapshotView,
+    MissionTaskView,
     NotFoundError,
     PlanPatchView,
     RevisitView,
     RunStatusView,
     ScanPlanView,
     ScanRangeView,
+    SchedulerView,
     ServiceError,
     StateEventView,
     _parse_coordinate,
@@ -80,9 +97,11 @@ PLANET_KIND_LABELS = (
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
 
+#: 调度器 tick 的间隔。一秒足够跟手（页面上的秒表也是一秒一跳），
+#: 而每次 tick 只是几条本地 SQLite 查询，代价可以忽略。
+MISSION_TICK_INTERVAL_S = 1.0
 
-def _default_token() -> str:
-    return os.environ.get("EVO_HELPER_WEB_TOKEN", "local-evo-helper-token")
+_LOGGER = logging.getLogger(__name__)
 
 
 # ---- view model conversion ------------------------------------------------
@@ -328,19 +347,29 @@ def create_app(
     service: ApplicationService | None = None,
     settings: Settings | None = None,
     local_token: str | None = None,
+    *,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Build the local web application.
 
     ``local_token`` defaults to ``EVO_HELPER_WEB_TOKEN`` or a development
     fallback; mutating requests must pass the same-origin check or this token.
+
+    ``lifespan`` 走构造参数而不是事后往 ``app.router`` 上塞：常驻调度器的开机
+    补行、每秒 tick、关机清子进程全挂在它上面，而 FastAPI 只在构造时读一次。
     """
 
-    app = FastAPI(title="EVO-Helper", version="0.1.0")
+    app = FastAPI(title="EVO-Helper", version="0.1.0", lifespan=lifespan)
     app.state.service = service or FakeApplicationService()
     app.state.settings = settings or Settings()
-    token = local_token or _default_token()
+    token = local_token or default_local_token()
     app.add_middleware(LocalSecurityMiddleware, local_token=token)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    # `tojson` 默认 `ensure_ascii=True`，中文会变成 `运行中`。
+    # 调度台把八档状态文案当 JSON 传给页面脚本，转义之后既没法在浏览器里
+    # 一眼看懂，也没法在测试里对着那八个词断言。Jinja 的 `tojson` 仍会转义
+    # `<` `>` `&` `'`，放进 `<script>` 依然是安全的。
+    templates.env.policies["json.dumps_kwargs"] = {"sort_keys": True, "ensure_ascii": False}
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["run_state_tone"] = run_state_tone
     templates.env.globals["run_state_glyph"] = run_state_glyph
@@ -350,9 +379,6 @@ def create_app(
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
-
-    def settings_for(request: Request) -> Settings:
-        return cast(Settings, request.app.state.settings)
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
@@ -516,20 +542,27 @@ def create_app(
 
     @app.get("/missions", response_class=HTMLResponse)
     async def missions_page(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        dashboard = service.dashboard()
+        """调度台。
+
+        三行任务只在这里渲染出**壳**——名字、参数框、状态槽位。里面的每一个
+        字（状态、随行事实、参数回显）都由 `/api/scheduler` 下发并由页面上那段
+        轮询填进去。这不是偷懒：判据在页面上抄一份，就会出现「页面说的和调度器
+        做的不是一回事」，而那种错静默、且只有在舰队白飞一趟之后才看得见。
+
+        `mission_console` 用 `getattr` 取：它只挂在常驻 app 上
+        （`create_persistent_app`），假服务那条路上没有库也没有调度器。取不到就
+        渲染一张空的历史表，页面其余部分照常可用。
+        """
+        console = getattr(request.app.state, "mission_console", None)
         return templates.TemplateResponse(
             request=request,
             name="missions.html",
             context={
                 "active": "missions",
-                "plans": [_plan_out(plan) for plan in service.list_plans()],
-                "plan_count": dashboard.plan_count,
-                "active_runs": dashboard.active_run_count,
-                "target_count": dashboard.target_count,
-                "pending_revisits": dashboard.pending_revisit_count,
-                "default_preset": settings_for(request).default_fleet_preset,
-                "default_preset_signature": settings_for(request).default_fleet_preset_signature,
+                "mission_labels": MISSION_LABELS,
+                "status_tones": STATUS_TONES,
+                "status_glyphs": STATUS_GLYPHS,
+                "runs": [] if console is None else console.recent_runs(limit=50),
             },
         )
 
@@ -738,21 +771,165 @@ def create_app(
     return app
 
 
+def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
+    return MissionTaskOut(
+        kind=task.kind,
+        label=task.label,
+        enabled=task.enabled,
+        priority=task.priority,
+        params=task.params,
+        status=task.status,
+        detail=task.detail,
+        summary=task.summary,
+        disabled_reason=task.disabled_reason,
+    )
+
+
+def _scheduler_out(view: SchedulerView) -> SchedulerOut:
+    return SchedulerOut(
+        running=view.running,
+        started_at_utc=view.started_at_utc,
+        current=(
+            None
+            if view.current is None
+            else CurrentMissionOut(
+                kind=view.current.kind,
+                label=view.current.label,
+                started_at_utc=view.current.started_at_utc,
+                log_path=view.current.log_path,
+            )
+        ),
+        orphan_pid=view.orphan_pid,
+        tasks=[_mission_task_out(task) for task in view.tasks],
+    )
+
+
+def register_mission_routes(app: FastAPI) -> None:
+    """调度台的一组接口。
+
+    只在持久化 app 上注册（同 `register_intel_routes`）：它需要一台真的调度器
+    和一个真的库，`FakeApplicationService` 那条路上两样都没有。
+
+    **全部写成同步 `def`**，让 FastAPI 把它们丢进线程池。这一组里的每个动作
+    都会阻塞：查库、`terminate()` 之后还要 `wait(5)`。写成 `async def` 就是在
+    事件循环里等那 5 秒，整台控制台连同页面一起卡住——lifespan 里那个
+    `asyncio.to_thread` 挡的正是这件事。
+    """
+
+    def get_console(request: Request) -> MissionConsoleService:
+        return cast(MissionConsoleService, request.app.state.mission_console)
+
+    @app.get("/api/scheduler", response_model=SchedulerOut)
+    def scheduler_state(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.scheduler_view())
+
+    @app.post("/api/scheduler/start", response_model=SchedulerOut)
+    def scheduler_start(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.start_scheduler())
+
+    @app.post("/api/scheduler/stop", response_model=SchedulerOut)
+    def scheduler_stop(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        return _scheduler_out(console.stop_scheduler())
+
+    @app.post("/api/scheduler/force-kill", response_model=SchedulerOut)
+    def scheduler_force_kill(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> SchedulerOut:
+        """孤儿红条上的「强制结束」。**不按 pid 杀不认识的进程。**"""
+        return _scheduler_out(console.force_kill())
+
+    @app.patch("/api/missions/{kind}", response_model=MissionTaskOut)
+    def patch_mission(
+        kind: str,
+        payload: MissionTaskPatch,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MissionTaskOut:
+        return _mission_task_out(
+            console.patch_mission(
+                kind,
+                enabled=payload.enabled,
+                priority=payload.priority,
+                params=payload.params,
+            )
+        )
+
+    @app.post("/api/missions/BOT/new-round", response_model=MissionTaskOut)
+    def restart_bot_round(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MissionTaskOut:
+        return _mission_task_out(console.restart_bot_round())
+
+
+async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:
+    """每秒问一次调度器该干什么。
+
+    收退出码不能只在页面轮询时做——没人开着页面时，那条记录会一直挂在
+    「运行中」，连续失败也就永远数不到三。
+
+    `to_thread`：tick 会查 SQLite、起进程，停子进程时还要 `wait(5)`。放在事件
+    循环里跑，那 5 秒会把整个控制台连同页面一起卡住。
+
+    一次 tick 抛异常只记日志、不退出循环：这条循环一停，整台调度器就静默地
+    再也不动了，而页面上仍然显示「运行中」——比多一行报错糟得多。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(scheduler.tick)
+        except Exception:
+            _LOGGER.exception("调度器 tick 失败，本轮跳过")
+
+
 def create_persistent_app(
     session_factory: sessionmaker[Session],
     *,
     settings: Settings | None = None,
     local_token: str | None = None,
+    mission_scheduler: MissionScheduler | None = None,
+    tick_interval_s: float = MISSION_TICK_INTERVAL_S,
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
-    from .persistent_service import PersistentApplicationService
+
+    scheduler = mission_scheduler or MissionScheduler(
+        SqlAlchemyRepository(session_factory), MissionSupervisor()
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # 开机：补齐三行任务与单行配置，并把上次没走正常关闭路径的行标成
+        # UNKNOWN。**不按 pid 自动杀**——pid 会被系统回收复用，照着一个可能
+        # 已经换了主人的号码开枪比留个警告更糟；页面上给红条和「强制结束」。
+        app.state.mission_orphans = await asyncio.to_thread(scheduler.prepare)
+        task = asyncio.create_task(_mission_tick_loop(scheduler, tick_interval_s))
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            # 主动清子进程，覆盖「正常重启」这条最常见的路径。不清的话，控制台
+            # 关了，一个还在点鼠标的 runner 留在后台。
+            await asyncio.to_thread(scheduler.shutdown)
 
     app = create_app(
         service=PersistentApplicationService(session_factory),
         settings=settings,
         local_token=local_token,
+        lifespan=lifespan,
     )
+    # 调度器的开关**不持久化**：这个对象每次建进程都是新的，一律停在「已停止」。
+    app.state.mission_scheduler = scheduler
+    app.state.mission_console = MissionConsoleService(
+        SqlAlchemyRepository(session_factory), scheduler
+    )
+    register_mission_routes(app)
     # Intel search reads fleet snapshots straight from SQL, so it takes the
     # session factory rather than going through the application service.
     register_intel_routes(app, session_factory)

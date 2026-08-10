@@ -1,107 +1,174 @@
 {% extends "base.html" %}
-{% block title %}任务中心 · EVO-Helper{% endblock %}
-{% block heading %}任务中心{% endblock %}
+{% block title %}调度台 · EVO-Helper{% endblock %}
+{% block heading %}调度台{% endblock %}
 {% block topbar_extra %}
-<span class="chip {{ 'ok' if active_runs else '' }}">
-  <span class="glyph" aria-hidden="true">{{ '▶' if active_runs else '■' }}</span>
-  {{ '运行中 ' ~ active_runs if active_runs else '空闲' }}
+<span class="chip" id="sched-chip">
+  <span class="glyph" aria-hidden="true" id="sched-glyph">■</span><span id="sched-word">已停止</span>
 </span>
-<span class="chip">
-  <span class="glyph" aria-hidden="true">🕗</span>时间窗口 UTC+8
-</span>
+<span class="chip" id="sched-elapsed" hidden><span class="glyph" aria-hidden="true">◷</span><span id="sched-elapsed-text">0:00:00</span></span>
 {% endblock %}
 {% block content %}
 
-<div class="grid-12">
-  <div class="col-3 tile"><div class="label">扫描计划</div><div class="value">{{ plan_count }}</div></div>
-  <div class="col-3 tile"><div class="label">运行中实例</div><div class="value">{{ active_runs }}</div></div>
-  <div class="col-3 tile"><div class="label">已记录 bot</div><div class="value">{{ target_count }}</div></div>
-  <div class="col-3 tile"><div class="label">待复查</div><div class="value">{{ pending_revisits }}</div></div>
-</div>
-
-<section class="panel" aria-labelledby="new-task">
-  <h2 id="new-task">新建扫描任务</h2>
-  {# No data-api: base.html's generic handler would post flat FormData and
-     double-submit. This form builds its own structured payload below. #}
-  <form id="plan-form">
-    <div class="grid-12">
-      <div class="col-4">
-        <label for="name">任务名称</label>
-        <input id="name" name="name" required style="width:100%">
-      </div>
-      <div class="col-3">
-        <label for="window_start">开始时间 (UTC+8)</label>
-        <input id="window_start" name="window_start" value="08:00" required style="width:100%">
-      </div>
-      <div class="col-3">
-        <label for="window_end">结束时间 (UTC+8)</label>
-        <input id="window_end" name="window_end" value="10:00" required style="width:100%">
-      </div>
-      <div class="col-2">
-        <label for="priority">优先级</label>
-        <input id="priority" name="priority" type="number" value="0" style="width:100%">
-      </div>
-      <div class="col-3">
-        <label for="fleet_line_limit">航线数量上限</label>
-        <input id="fleet_line_limit" type="number" min="1" max="99" value="1" style="width:100%"
-               title="本任务最多同时占用多少条舰队航线">
-      </div>
-      <div class="col-3">
-        <label for="reserved_lines">保留自由航线</label>
-        <input id="reserved_lines" type="number" min="0" max="99" value="0" style="width:100%"
-               title="始终留给你自己派遣的航线数，助手永不占用">
-      </div>
-      <div class="col-6" style="display:flex;align-items:flex-end">
-        <p class="muted" style="margin:0;font-size:12px">
-          助手最多同时占用「上限 − 保留」条航线。保留数必须小于上限，否则任务永远无法派遣。
-        </p>
-      </div>
-    </div>
-
-    <h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin:18px 0 8px">
-      扫描区段 <span class="muted" style="text-transform:none;letter-spacing:0">（起止坐标均包含）</span>
-    </h3>
-    <div id="ranges"></div>
-    <button class="btn small" type="button" id="add-range">+ 增加区段</button>
-
-    <div class="field-row" style="margin-top:18px">
-      <button class="btn primary" type="submit">创建任务</button>
-      <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>创建后仍为演习模式</span>
-    </div>
-  </form>
+{#
+  孤儿红条：上次控制台没走正常关闭路径，台账里留下一个可能还活着的进程号。
+  「强制结束」走 /api/scheduler/force-kill，那个接口只停我们自己认识的子进程、
+  只闭合没闭合的台账行——**绝不按 pid 去杀一个不认识的进程**，pid 会被系统
+  回收复用。这里显示 pid 纯粹是给人看的线索。
+#}
+<section class="panel compact" id="orphan-banner" aria-labelledby="orphan-head" hidden>
+  <h2 id="orphan-head" class="visually-hidden">上次遗留的进程</h2>
+  <div class="filter-bar">
+    <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>上次没有正常收尾</span>
+    <span class="muted">遗留进程号 <span class="coord" id="orphan-pid">—</span>，它可能还在点鼠标。</span>
+    <span class="spacer"></span>
+    <button class="btn small" type="button" id="btn-force-kill"
+            data-endpoint="/api/scheduler/force-kill"
+            title="只停控制台自己认识的那个子进程，不按进程号乱杀">强制结束</button>
+  </div>
 </section>
 
-<section class="panel" aria-labelledby="history">
-  <h2 id="history">历史任务</h2>
+<section class="panel compact" aria-labelledby="sched-head">
+  <h2 id="sched-head">调度器</h2>
+  <div class="filter-bar">
+    <span class="inline-label">状态</span>
+    <span class="chip" id="sched-state"><span class="glyph" aria-hidden="true">■</span>已停止</span>
+    <span class="muted" id="sched-uptime"></span>
+    <span class="sep" role="separator"></span>
+    <span class="inline-label">当前</span>
+    <span id="current-line" class="muted">没有任务在跑</span>
+    <span class="spacer"></span>
+    <button class="btn primary small" type="button" id="btn-start"
+            data-endpoint="/api/scheduler/start">开始</button>
+    <button class="btn small" type="button" id="btn-stop"
+            data-endpoint="/api/scheduler/stop">结束</button>
+  </div>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    点「开始」之后调度器常驻运行，自己决定什么时候起哪条链路，直到点「结束」。
+    任何时刻最多一个子进程在点鼠标。控制台重启后一律停在「已停止」。
+  </p>
+</section>
+
+<section class="panel" aria-labelledby="tasks-head">
+  <h2 id="tasks-head">任务链路</h2>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th scope="col">名称</th><th scope="col">时间窗口</th><th scope="col">区段数</th>
-          <th scope="col" class="num">航线</th><th scope="col" class="num">保留</th>
-          <th scope="col">状态</th><th scope="col">演习模式</th>
+          <th scope="col" style="width:26px"><span class="visually-hidden">排序</span></th>
+          <th scope="col" style="width:34px"><span class="visually-hidden">是否参与</span></th>
+          <th scope="col">任务</th>
+          <th scope="col">参数</th>
+          <th scope="col">状态</th>
+        </tr>
+      </thead>
+      <tbody id="mission-rows">
+      {#
+        三行只渲染壳。状态、随行事实、参数回显、参数当前值全部由
+        /api/scheduler 下发——判据在页面上抄一份就会和调度器走散。
+      #}
+      {% for kind, label in mission_labels.items() %}
+        {% set is_scan = kind == 'SCAN' %}
+        <tr class="mission-row" data-kind="{{ kind }}"
+            draggable="{{ 'false' if is_scan else 'true' }}">
+          <td>
+            {% if is_scan %}
+              <span class="muted" aria-hidden="true" title="扫描恒在最后一位，不参与排序">·</span>
+            {% else %}
+              <span class="drag-handle" aria-hidden="true" title="拖拽调整优先级">⠿</span>
+            {% endif %}
+          </td>
+          <td>
+            <input type="checkbox" class="mission-enabled" aria-label="让「{{ label }}」参与调度">
+          </td>
+          <td>
+            <div>{{ label }}</div>
+            {% if is_scan %}
+              {#
+                这句话必须在页面上，不能只靠「拖不动」让用户自己猜。扫描永远有
+                活干，排在它后面的链路就永远轮不到——把它拖到海盗前面等于当天
+                32 次配额悄无声息地全流失。只想跑扫描的话，取消另外两个复选框。
+              #}
+              <div class="muted" style="font-size:11px">
+                始终填空隙 · 不参与排序（它永远有活干，排它后面的链路就永远轮不到）
+              </div>
+            {% endif %}
+          </td>
+          <td>
+            {% if kind == 'PIRATE' %}
+              <span class="inline-label">半径</span>
+              <input type="number" class="mission-param" data-param="radius" min="1" max="999"
+                     style="width:78px" aria-label="海盗攻击半径">
+            {% elif kind == 'BOT' %}
+              <span class="inline-label">星系</span>
+              <input type="number" class="mission-param" data-param="galaxy" min="1"
+                     style="width:60px" aria-label="星系号">
+              <span class="inline-label">系号</span>
+              <input type="number" class="mission-param" data-param="first_system" min="1"
+                     style="width:78px" aria-label="起始系号">
+              <span class="dash">–</span>
+              <input type="number" class="mission-param" data-param="last_system" min="1"
+                     style="width:78px" aria-label="结束系号">
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+            <div class="muted mission-summary" style="font-size:11px">…</div>
+          </td>
+          <td>
+            <span class="chip mission-status"><span class="glyph" aria-hidden="true">·</span><span class="mission-status-word">读取中</span></span>
+            <div class="muted mission-detail" style="font-size:11px"></div>
+            {% if kind == 'BOT' %}
+              {#
+                bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人
+                看着的时候一直派舰队。开新一轮只能是用户按下的这一下。
+              #}
+              <button class="btn small mission-new-round" type="button" style="margin-top:6px"
+                      data-endpoint="/api/missions/BOT/new-round" hidden>重开一轮</button>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {# 400 一律显示在这里。静默失败等于把后端那句中文说明扔了。 #}
+  <p class="chip danger" id="mission-error" role="status" style="margin:10px 0 0" hidden></p>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。
+  </p>
+</section>
+
+<section class="panel" aria-labelledby="runs-head">
+  <h2 id="runs-head">运行历史</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">任务</th>
+          <th scope="col">开始（现实 UTC+8）</th>
+          <th scope="col">结束（现实 UTC+8）</th>
+          <th scope="col">结束方式</th>
+          <th scope="col" class="num">退出码</th>
+          <th scope="col">日志</th>
         </tr>
       </thead>
       <tbody>
-      {% for plan in plans %}
-        <tr onclick="location.href='/runs'">
-          <td>{{ plan.name }}</td>
-          <td>{{ plan.window_start }} – {{ plan.window_end }} <span class="muted">UTC+8</span></td>
-          <td class="num">{{ plan.ranges | length }}</td>
-          <td class="num">{{ plan.fleet_line_limit }}</td>
-          <td class="num">{{ plan.reserved_lines }}</td>
+      {% for run in runs %}
+        <tr>
+          <td>{{ run.label }}</td>
+          <td>{{ local_time(run.started_at_utc) }}</td>
+          <td>{{ local_time(run.ended_at_utc) }}</td>
           <td>
-            <span class="chip {{ 'ok' if plan.enabled else '' }}">
-              <span class="glyph" aria-hidden="true">{{ '●' if plan.enabled else '○' }}</span>
-              {{ '已启用' if plan.enabled else '已停用' }}
-            </span>
+            {% if run.ended_at_utc is none %}
+              <span class="chip ok"><span class="glyph" aria-hidden="true">▶</span>进行中</span>
+            {% else %}
+              <span class="chip">{{ run.stopped_by or 'UNKNOWN' }}</span>
+            {% endif %}
           </td>
-          <td>
-            <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>{{ '是' if plan.dry_run else '否' }}</span>
-          </td>
+          <td class="num">{{ run.exit_code if run.exit_code is not none else '—' }}</td>
+          <td class="muted coord" style="font-size:11px">{{ run.log_path }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="7" class="muted">还没有扫描计划。</td></tr>
+        <tr><td colspan="6" class="muted">还没有运行记录。调度器起过子进程之后，每一轮都会记在这里。</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -110,73 +177,234 @@
 
 <script>
 (() => {
-  const container = document.getElementById('ranges');
-  const DEFAULT_PRESET = {{ default_preset | tojson }};
-  const DEFAULT_PRESET_SIGNATURE = {{ default_preset_signature | tojson }};
+  // 状态的色调与字形由服务端下发：八档各占一格，少一格就意味着有两档被当成了
+  // 同一件事。**这里只做「文案 → 颜色」的映射，不判断该不该跑**——状态那句话
+  // 由 /api/scheduler 算好送来。
+  const STATUS_TONES = {{ status_tones | tojson }};
+  const STATUS_GLYPHS = {{ status_glyphs | tojson }};
 
-  function addRange() {
-    const row = document.createElement('div');
-    row.className = 'grid-12';
-    row.style.marginBottom = '8px';
-    row.dataset.range = '';
-    row.innerHTML = `
-      <div class="col-3"><label>起点坐标</label><input class="r-start" placeholder="1:100:1" style="width:100%"></div>
-      <div class="col-3"><label>终点坐标</label><input class="r-end" placeholder="1:200:15" style="width:100%"></div>
-      <div class="col-3"><label>出发星球</label><input class="r-origin" placeholder="2:137:18" style="width:100%"></div>
-      <div class="col-2"><label>舰队预设</label><input class="r-preset" value="${DEFAULT_PRESET}" style="width:100%"></div>
-      <div class="col-1" style="display:flex;align-items:flex-end">
-        <button class="btn small ghost" type="button" aria-label="移除区段">✕</button>
-      </div>`;
-    row.querySelector('button').onclick = () => row.remove();
-    container.append(row);
+  const rows = document.getElementById('mission-rows');
+  const errorBox = document.getElementById('mission-error');
+  const orphanBanner = document.getElementById('orphan-banner');
+  const orphanPid = document.getElementById('orphan-pid');
+  const schedChip = document.getElementById('sched-chip');
+  const schedGlyph = document.getElementById('sched-glyph');
+  const schedWord = document.getElementById('sched-word');
+  const schedState = document.getElementById('sched-state');
+  const elapsedChip = document.getElementById('sched-elapsed');
+  const elapsedText = document.getElementById('sched-elapsed-text');
+  const uptimeText = document.getElementById('sched-uptime');
+  const currentLine = document.getElementById('current-line');
+
+  // 参数框只在第一次拿到数据时填一次。每轮轮询都写回去的话，用户正在输入的
+  // 半径会被上一次保存的值顶掉——这正是「状态区单独轮询、不刷整页」要躲的坑。
+  let paramsPrimed = false;
+  // 拖拽进行中不重排，否则行会在手底下跳走。
+  let dragging = null;
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.hidden = !message;
   }
 
-  document.getElementById('add-range').onclick = addRange;
-  addRange();
+  function fail(error) {
+    // 后端的 400 带中文说明（范围内零个 bot、半径 ≤ 0、系号区间颠倒……）。
+    // 吞掉它，用户只会看到「点了没反应」。
+    showError(error.detail || error.message || String(error));
+  }
 
-  // The plan API takes structured coordinates, so the form's text inputs are
-  // parsed here rather than posted raw.
-  document.getElementById('plan-form').addEventListener('submit', (event) => {
-    event.preventDefault();
-    const parse = (text, label) => {
-      const parts = String(text).trim().split(':').map(Number);
-      if (parts.length !== 3 || parts.some((n) => !Number.isInteger(n) || n < 1)) {
-        throw new Error(`${label} 需要形如 1:100:1 的完整坐标`);
+  function rowFor(kind) {
+    return rows.querySelector(`[data-kind="${kind}"]`);
+  }
+
+  function elapsed(startedIso, now) {
+    // 时区后缀缺失时按 UTC 读。少了它，`Date.parse` 会按浏览器本地时区解释，
+    // 而本机是 UTC+8——秒表会凭空少 8 小时（或者干脆变成负数被钳成 0）。
+    const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(startedIso) ? startedIso : `${startedIso}Z`;
+    const seconds = Math.max(0, Math.floor((now - Date.parse(stamped)) / 1000));
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${Math.floor(seconds / 3600)}:${pad(Math.floor(seconds / 60) % 60)}:${pad(seconds % 60)}`;
+  }
+
+  // ---- 渲染 ---------------------------------------------------------------
+
+  let latest = null;
+
+  function render(state) {
+    latest = state;
+
+    schedChip.className = state.running ? 'chip ok' : 'chip';
+    schedGlyph.textContent = state.running ? '▶' : '■';
+    schedWord.textContent = state.running ? '运行中' : '已停止';
+    schedState.className = state.running ? 'chip ok' : 'chip';
+    schedState.innerHTML = '';
+    const stateGlyph = document.createElement('span');
+    stateGlyph.className = 'glyph';
+    stateGlyph.setAttribute('aria-hidden', 'true');
+    stateGlyph.textContent = state.running ? '▶' : '■';
+    schedState.append(stateGlyph, state.running ? '运行中' : '已停止');
+
+    document.getElementById('btn-start').disabled = state.running;
+    document.getElementById('btn-stop').disabled = !state.running;
+
+    orphanBanner.hidden = state.orphan_pid === null || state.orphan_pid === undefined;
+    if (!orphanBanner.hidden) orphanPid.textContent = state.orphan_pid;
+
+    // tasks 已经按调度次序排好（扫描恒最后），页面照抄，不自己排。
+    // **次序没变就一个节点都不动**：把 <tr> 搬来搬去会让里面正在编辑的输入框
+    // 失焦，每两秒一次，参数就永远填不完。
+    const wanted = state.tasks.map((task) => task.kind).join(',');
+    const shown = [...rows.querySelectorAll('.mission-row')].map((row) => row.dataset.kind).join(',');
+    if (!dragging && wanted !== shown) {
+      for (const task of state.tasks) {
+        const row = rowFor(task.kind);
+        if (row) rows.append(row);
       }
-      return { galaxy: parts[0], system: parts[1], position: parts[2] };
-    };
-    try {
-      const ranges = [...container.querySelectorAll('[data-range]')].map((row) => ({
-        start: parse(row.querySelector('.r-start').value, '起点坐标'),
-        end: parse(row.querySelector('.r-end').value, '终点坐标'),
-        origin: parse(row.querySelector('.r-origin').value, '出发星球'),
-        fleet_preset: row.querySelector('.r-preset').value.trim(),
-        // The signature is the composition, not the name: a two-character
-        // preset name cannot be OCR-repaired, so the ship counts carry the check.
-        fleet_preset_signature: DEFAULT_PRESET_SIGNATURE,
-        priority: 0,
-      }));
-      if (!ranges.length) throw new Error('至少需要一个扫描区段');
-      const lineLimit = Number(document.getElementById('fleet_line_limit').value);
-      const reserved = Number(document.getElementById('reserved_lines').value);
-      if (reserved >= lineLimit) {
-        throw new Error('保留自由航线必须小于航线数量上限，否则任务永远无法派遣');
+    }
+
+    for (const task of state.tasks) {
+      const row = rowFor(task.kind);
+      if (!row) continue;
+
+      // 复选框**无条件**跟库走，哪怕它此刻还带着焦点：勾了却被 400 拒掉
+      // （范围内零个 bot、半径填错）时，它必须自己弹回去。留在勾上，页面就在
+      // 说一句谎——用户会以为这条链路已经参与调度了。
+      row.querySelector('.mission-enabled').checked = task.enabled;
+
+      const chip = row.querySelector('.mission-status');
+      const tone = STATUS_TONES[task.status] || '';
+      chip.className = `chip mission-status ${tone}`.trim();
+      chip.querySelector('.glyph').textContent = STATUS_GLYPHS[task.status] || '·';
+      chip.querySelector('.mission-status-word').textContent = task.status;
+
+      row.querySelector('.mission-detail').textContent = task.detail || '';
+      row.querySelector('.mission-summary').textContent = task.summary || '';
+
+      const newRound = row.querySelector('.mission-new-round');
+      // 「已完成」这个判断由服务端给出，页面只认那个词。
+      if (newRound) newRound.hidden = task.status !== '已完成';
+
+      if (!paramsPrimed) {
+        for (const input of row.querySelectorAll('.mission-param')) {
+          const value = task.params[input.dataset.param];
+          input.value = value === undefined ? '' : value;
+        }
       }
-      EVOHelper.post('/api/plans', {
-        name: document.getElementById('name').value.trim(),
-        enabled: true,
-        window_start: document.getElementById('window_start').value.trim(),
-        window_end: document.getElementById('window_end').value.trim(),
-        dry_run: true,
-        fleet_line_limit: lineLimit,
-        reserved_lines: reserved,
-        ranges,
-      }).then(() => window.location.reload())
-        .catch((error) => alert(error.detail || error.message));
-    } catch (error) {
-      alert(error.message);
+    }
+    paramsPrimed = true;
+    tickClock();
+  }
+
+  function tickClock() {
+    if (!latest) return;
+    const now = Date.now();
+    elapsedChip.hidden = !latest.started_at_utc;
+    // 调度器自己的运行时长不持久化（控制台重启即无），连点两下「开始」也不会
+    // 把秒表按回零——这两条都在服务端，页面只管把它显示出来。
+    const uptime = latest.started_at_utc ? `已运行 ${elapsed(latest.started_at_utc, now)}` : '';
+    if (latest.started_at_utc) elapsedText.textContent = elapsed(latest.started_at_utc, now);
+    uptimeText.textContent = uptime;
+    if (latest.current) {
+      currentLine.textContent =
+        `${latest.current.label} · 已运行 ${elapsed(latest.current.started_at_utc, now)} · ${latest.current.log_path}`;
+      currentLine.className = '';
+    } else {
+      currentLine.textContent = latest.running ? '空转中，暂时没有链路有活干' : '没有任务在跑';
+      currentLine.className = 'muted';
+    }
+  }
+
+  // ---- 读写 ---------------------------------------------------------------
+
+  function refresh() {
+    return EVOHelper.get('/api/scheduler').then(render).catch(fail);
+  }
+
+  function command(endpoint) {
+    showError('');
+    return EVOHelper.post(endpoint).then(refresh).catch(fail);
+  }
+
+  function patch(kind, payload) {
+    showError('');
+    return EVOHelper.request('PATCH', `/api/missions/${kind}`, payload)
+      .then(refresh)
+      .catch((error) => { fail(error); return refresh(); });
+  }
+
+  for (const id of ['btn-start', 'btn-stop', 'btn-force-kill']) {
+    document.getElementById(id).onclick = (event) => command(event.currentTarget.dataset.endpoint);
+  }
+
+  rows.addEventListener('click', (event) => {
+    const button = event.target.closest('.mission-new-round');
+    if (button) command(button.dataset.endpoint);
+  });
+
+  rows.addEventListener('change', (event) => {
+    const row = event.target.closest('.mission-row');
+    if (!row) return;
+    const kind = row.dataset.kind;
+    if (event.target.matches('.mission-enabled')) {
+      patch(kind, { enabled: event.target.checked });
+      return;
+    }
+    if (event.target.matches('.mission-param')) {
+      const params = {};
+      for (const input of row.querySelectorAll('.mission-param')) {
+        // 空框不往上送：`Number('')` 是 0，会把「还没填」变成一个合法的 0。
+        if (input.value.trim() !== '') params[input.dataset.param] = Number(input.value);
+      }
+      patch(kind, { params });
     }
   });
+
+  // ---- 拖拽排序 -----------------------------------------------------------
+  //
+  // 扫描那一行 draggable="false"，而且这里还挡住「把别人拖到它后面」：
+  // PATCH /api/missions/SCAN 带 priority 一律 400，用户不该拖完了才发现。
+
+  rows.addEventListener('dragstart', (event) => {
+    const row = event.target.closest('.mission-row');
+    if (!row || row.getAttribute('draggable') !== 'true') return;
+    dragging = row;
+    event.dataTransfer.effectAllowed = 'move';
+    // Firefox 不带数据的拖拽根本起不来。
+    event.dataTransfer.setData('text/plain', row.dataset.kind);
+  });
+
+  rows.addEventListener('dragover', (event) => {
+    const row = event.target.closest('.mission-row');
+    if (!dragging || !row || row === dragging) return;
+    if (row.getAttribute('draggable') !== 'true') return;  // 扫描恒在最后
+    event.preventDefault();
+    const box = row.getBoundingClientRect();
+    const before = event.clientY < box.top + box.height / 2;
+    row.parentNode.insertBefore(dragging, before ? row : row.nextSibling);
+  });
+
+  // 行已经在 dragover 里就位了，这里只是把浏览器的默认落点行为挡掉——
+  // 不挡的话，某些浏览器会拿 text/plain 的内容当地址栏输入。
+  rows.addEventListener('drop', (event) => event.preventDefault());
+
+  rows.addEventListener('dragend', () => {
+    if (!dragging) return;
+    dragging = null;
+    // 只给能排序的那些行下发新次序；扫描不带 priority。
+    const movable = [...rows.querySelectorAll('.mission-row[draggable="true"]')];
+    movable
+      .reduce(
+        (chain, row, index) => chain.then(() => patch(row.dataset.kind, { priority: index })),
+        Promise.resolve(),
+      )
+      .then(refresh);
+  });
+
+  refresh();
+  // 状态区单独轮询，**不刷整页**——刷整页会清掉用户正在输入的参数框。
+  setInterval(refresh, 2000);
+  // 秒表本地走，免得只有轮询到了才跳一下。
+  setInterval(tickClock, 1000);
 })();
 </script>
 {% endblock %}

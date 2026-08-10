@@ -18,6 +18,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from evo_helper.domain.records import MISSION_KIND_ATTACK
+
 from .database import Base, UTCDateTime
 
 
@@ -164,6 +166,20 @@ class AttackDispatchRow(Base):
     #: 读不到飞行时间时为 NULL——那时改为立即尝试收取，而不是无限等待。
     flight_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     expected_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: **第二个钟**：这条航线什么时候空出来（出发 + 飞行时长 × 1 或 × 2，
+    #: 见 `domain.report_wait.line_free_at`）。与上面那一列是两个不同的时刻——
+    #: 战报在**抵达**时产生，航线要等舰队**飞回来**才释放。
+    #: 拿战报那个钟去判航线，调度器会在航线其实还占着时就去派，撞上游戏的
+    #: 「同时派遣的舰队数量已达上限。」。
+    #: 飞行时长读不到时同样为 NULL，NULL 不计入在飞数（宁可估高空闲航线）。
+    line_free_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 这一发是攻击还是侦察（见 `domain.records.MISSION_KIND_*`）。
+    #: **日配额只数 `ATTACK`**：侦察也是打向海盗的，不分开数的话一轮 4 发侦察
+    #: 就吃掉 4 次攻击额度。**在飞数两者都数**：侦察一样占航线。
+    #: 存量行一律算 `ATTACK`——这一列加进来之前，侦察压根没有记录。
+    mission_kind: Mapped[str] = mapped_column(
+        String(16), default=MISSION_KIND_ATTACK, server_default=MISSION_KIND_ATTACK
+    )
 
 
 class BattleReportRow(Base):
@@ -220,7 +236,10 @@ class TargetRevisitRow(Base):
     __tablename__ = "target_revisits"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    scope: Mapped[str] = mapped_column(String(16))
+    #: 32 而不是 16：调度器要写的 `BOT_TIER_NEGLIGIBLE` / `BOT_REPORT_MISSING`
+    #: 都超过 16 字。SQLite 不校验 VARCHAR 长度，所以超了也照存不误——正因为
+    #: 现在不报错，声明与实际存的东西对不上这件事才必须在这里改掉。
+    scope: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(String(255))
     target_galaxy: Mapped[int | None] = mapped_column(Integer, nullable=True)
     target_system: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -279,3 +298,67 @@ class IntelFilterRow(Base):
     span_end: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class MissionTaskRow(Base):
+    """三条任务链路各一行。优先级由用户在页面上拖出来。"""
+
+    __tablename__ = "mission_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    #: `PIRATE` / `BOT` / `SCAN`
+    kind: Mapped[str] = mapped_column(String(16), unique=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: 升序即优先级。
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    #: 各链路自己的参数。海盗 `{"radius": N}`，bot
+    #: `{"galaxy": G, "first_system": A, "last_system": B}`，扫描 `{}`。
+    #: 存 JSON 而不是逐列：以后加任务种类不用再动表结构。
+    params_json: Mapped[str] = mapped_column(Text, default="{}")
+    #: 仅 bot 用：本轮从何时算起。早于这个时刻的战报属于上一轮。
+    round_started_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 仅海盗用：收到游戏超限邮件时写下的封锁截止时刻。比计数更硬的信号。
+    quota_exhausted_until_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 连续异常退出次数。到阈值就自动停用，免得调度循环在一个坏掉的任务上空转。
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    disabled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class MissionRunRow(Base):
+    """调度器每起一个子进程记一行。"""
+
+    __tablename__ = "mission_runs"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    #: 实际拉起的命令行。事后翻账时「那一轮到底打了谁」全靠它。
+    command: Mapped[str] = mapped_column(Text)
+    #: 用来在控制台重启后认出可能还活着的孤儿进程。
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    ended_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: `USER` / `SELF` / `PREEMPTED` / `SHUTDOWN` / `UNKNOWN`
+    stopped_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    log_path: Mapped[str] = mapped_column(String(255))
+
+
+class SchedulerConfigRow(Base):
+    """单行配置。航线是全局资源，不属于任何单个任务。"""
+
+    __tablename__ = "scheduler_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    fleet_line_limit: Mapped[int] = mapped_column(Integer, default=1)
+    reserved_lines: Mapped[int] = mapped_column(Integer, default=0)
+    #: 游戏硬限制。超了会收到邮件且攻击被强制返回。
+    pirate_daily_quota: Mapped[int] = mapped_column(Integer, default=32)
+    #: 扫描起来后至少跑这么久才允许被抢占。防止航线一空一占引起秒级反复切换。
+    min_dwell_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    #: 过了预计战报时间再等这么久仍读不到，就判为「战报缺失」跳过。
+    report_grace_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    #: 同一条链路两次启动之间的最小间隔。堵的是「战报还没到就反复进信箱扑空」
+    #: 的空转——每轮几十秒的导航全白费，还一直占着鼠标不让扫描进来。
+    restart_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)

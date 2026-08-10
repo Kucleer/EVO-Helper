@@ -230,12 +230,20 @@ def test_console_pages_render() -> None:
 
 
 def test_console_pages_show_the_dry_run_lock() -> None:
-    """锁只是提示，绝不能渲染成开关。"""
+    """锁只是提示，绝不能渲染成开关。
+
+    断言从「整页不许有任何 checkbox」收紧到「这个 chip 里没有任何可点的控件」：
+    调度台的三条链路各带一个「是否参与调度」的复选框，原来那条粗口径会把它们
+    一并禁掉，而它们和演习模式锁是两回事。
+    """
     client, _ = _make_client()
 
     body = client.get("/missions").text
     assert "演习模式 已锁定" in body
-    assert 'type="checkbox"' not in body
+
+    lock = body[body.index('<span class="chip locked"') : body.index("演习模式 已锁定")]
+    for control in ("<input", "<button", "<select", "<a "):
+        assert control not in lock, control
 
 
 def test_static_console_stylesheet_is_served() -> None:

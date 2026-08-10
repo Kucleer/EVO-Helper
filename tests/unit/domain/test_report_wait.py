@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from evo_helper.domain.report_wait import (
+    BATCH_WINDOW,
     MAX_SESSION_BACKOFF,
     PendingReport,
     ReportWaitPlanner,
@@ -14,6 +15,10 @@ from evo_helper.domain.report_wait import (
 )
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+
+#: 改为 5 秒之后的默认唤醒余量。预计时间是本地记的发出时刻加简报读到的飞行时长，
+#: 精度足够，不需要原先那 1 分钟——那是没有可靠预计时间的年代留下的。
+MARGIN = timedelta(seconds=5)
 
 
 class TestGameDuration:
@@ -59,6 +64,15 @@ def pending(minutes: int, closed: bool = False) -> PendingReport:
     )
 
 
+def pending_s(seconds: int, closed: bool = False) -> PendingReport:
+    """秒级的到期时间——批量分组的窗口是 60 秒，用分钟表达不出来。"""
+    return PendingReport(
+        dispatch_id=f"s{seconds}",
+        expected_report_at_utc=NOW + timedelta(seconds=seconds),
+        closed=closed,
+    )
+
+
 class TestWaitPlanner:
     def planner(self) -> ReportWaitPlanner:
         return ReportWaitPlanner()
@@ -78,12 +92,13 @@ class TestWaitPlanner:
     def test_a_future_report_makes_the_run_wait(self) -> None:
         plan = self.planner().plan((pending(90),), now_utc=NOW)
         assert plan.action is WaitAction.WAIT
-        # 默认余量 1 分钟。
-        assert plan.resume_at_utc == NOW + timedelta(minutes=91)
+        # 默认余量 5 秒。
+        assert plan.resume_at_utc == NOW + timedelta(minutes=90) + MARGIN
 
     def test_wait_targets_the_earliest_pending_report(self) -> None:
+        """三份相隔都远超批量窗口，所以只等最早那一份，不并组。"""
         plan = self.planner().plan((pending(200), pending(45), pending(120)), now_utc=NOW)
-        assert plan.resume_at_utc == NOW + timedelta(minutes=46)
+        assert plan.resume_at_utc == NOW + timedelta(minutes=45) + MARGIN
 
     def test_the_default_margin_is_conservative_but_small(self) -> None:
         """余量存在是为了少抢一次会话，但不能大到错过战报有效期。"""
@@ -121,6 +136,76 @@ class TestWaitPlanner:
     def test_margin_does_not_delay_an_already_due_report(self) -> None:
         planner = ReportWaitPlanner(margin=timedelta(minutes=2))
         assert planner.plan((pending(-10),), now_utc=NOW).action is WaitAction.COLLECT
+
+    def test_the_default_margin_is_five_seconds(self) -> None:
+        plan = self.planner().plan((pending_s(600),), now_utc=NOW)
+        assert plan.resume_at_utc == NOW + timedelta(seconds=600) + MARGIN
+
+
+class TestReportBatching:
+    """同一个读取窗口里到期的战报，一趟收完。
+
+    每一趟收取都要 `ensure_game_window()` + 认屏 + 进信箱，中间还夹一次任务切换。
+    10:00:00 和 10:00:30 各一份就跑两趟，是纯粹的浪费。
+    """
+
+    def planner(self) -> ReportWaitPlanner:
+        return ReportWaitPlanner()
+
+    def test_a_due_report_waits_for_a_near_neighbour(self) -> None:
+        """**这条是批量分组的看门狗。**
+
+        一份 10 秒前就到期了、另一份 30 秒后到期。按「有任一份到期就去收」会
+        立刻起一趟，然后 30 秒后再起第二趟；批量分组要求把这一下并成一趟。
+        去掉分组这条会立刻变红。
+        """
+        plan = self.planner().plan((pending_s(-10), pending_s(30)), now_utc=NOW)
+        assert plan.action is WaitAction.WAIT
+        assert plan.resume_at_utc == NOW + timedelta(seconds=30) + MARGIN
+
+    def test_the_group_is_collected_once_its_latest_member_is_due(self) -> None:
+        """等到组里**最晚**的那份到期（再加余量）才去收，那时一趟能读全。"""
+        at = NOW + timedelta(seconds=30) + MARGIN
+        plan = self.planner().plan((pending_s(-10), pending_s(30)), now_utc=at)
+        assert plan.action is WaitAction.COLLECT
+
+    def test_a_distant_report_does_not_join_the_group(self) -> None:
+        """窗口外的那份不并进来——为它多等下去就不是省一趟，是白白压着已到的战报。"""
+        plan = self.planner().plan((pending_s(-10), pending_s(300)), now_utc=NOW)
+        assert plan.action is WaitAction.COLLECT
+
+    def test_the_group_is_measured_from_the_earliest_not_transitively(self) -> None:
+        """分组按「距最早那份多远」算，不是一份挨一份地续下去。
+
+        续着算的话，每 59 秒来一份就能把收取无限期推后——本该有界的等待
+        变成永远不收。这里 100 秒那份必须落在组外，等待封顶在
+        `BATCH_WINDOW + margin`。
+        """
+        plan = self.planner().plan((pending_s(0), pending_s(50), pending_s(100)), now_utc=NOW)
+        assert plan.resume_at_utc == NOW + timedelta(seconds=50) + MARGIN
+        assert plan.resume_at_utc is not None
+        assert plan.resume_at_utc - NOW <= BATCH_WINDOW + MARGIN
+
+    def test_an_unknown_expected_time_is_never_batched(self) -> None:
+        """NULL 没有可比的到期时间，不参与分组，也不该被组里那份拖住。
+
+        「读不到飞行时间就立即收取」是既定的降级语义（宁可白跑，也不能无限等）。
+        让它去等一个 60 秒后的邻居，等于把这条降级悄悄改成了延迟。
+        """
+        unknown = PendingReport(dispatch_id="d?", expected_report_at_utc=None, closed=False)
+        plan = self.planner().plan((unknown, pending_s(30)), now_utc=NOW)
+        assert plan.action is WaitAction.COLLECT
+
+    def test_closed_reports_do_not_drag_the_group_forward(self) -> None:
+        """已闭合的不在待收之列，更不能把收取时刻往后拖。"""
+        plan = self.planner().plan((pending_s(-10), pending_s(30, closed=True)), now_utc=NOW)
+        assert plan.action is WaitAction.COLLECT
+
+    def test_the_batch_window_is_configurable(self) -> None:
+        planner = ReportWaitPlanner(margin=timedelta(0), batch_window=timedelta(seconds=10))
+        # 30 秒那份落在 10 秒的窗口外，于是已到期的那份立刻收。
+        plan = planner.plan((pending_s(-5), pending_s(30)), now_utc=NOW)
+        assert plan.action is WaitAction.COLLECT
 
 
 class TestSessionBackoff:

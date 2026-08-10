@@ -22,6 +22,17 @@ TARGET_KIND_PIRATE = "pirate"
 #: 界面上的中文标签。日志页只显示中文，库里存的仍是上面的英文常量。
 TARGET_KIND_LABELS = {TARGET_KIND_BOT: "bot", TARGET_KIND_PIRATE: "海盗"}
 
+#: 一次派遣的**性质**：真打出去的一发，还是一发侦察探测器。
+#:
+#: 与 `TARGET_KIND_*` 是两个正交的维度，缺一个就会算错两笔账：侦察也是打向海盗的，
+#: 只按 `target_kind` 分的话，日配额查询会把每一发侦察都当成一次攻击——一轮 4 发，
+#: 当天 32 次额度以 4 倍速度消失，而且完全静默。反过来，侦察**确实占航线**，
+#: 所以在飞数两者都要数。
+#:
+#: 同样是字符串常量而不是枚举，理由与 `TARGET_KIND_*` 一致：原样进库、原样出接口。
+MISSION_KIND_ATTACK = "ATTACK"
+MISSION_KIND_SCOUT = "SCOUT"
+
 
 @dataclass(frozen=True)
 class CoordinateScan:
@@ -59,6 +70,9 @@ class AttackDispatch:
     dry_run: bool
     accepted: bool
     evidence_artifact_id: UUID | None = None
+    #: 这一发是攻击还是侦察（见 `MISSION_KIND_*`）。默认 `ATTACK`：这个字段
+    #: 加进来之前入库的派遣全部来自攻击链路，侦察那时压根没有记录。
+    mission_kind: str = MISSION_KIND_ATTACK
 
 
 @dataclass(frozen=True)
