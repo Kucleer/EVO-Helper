@@ -58,6 +58,24 @@ CALIBRATED_SCALE_FACTOR = 1.25
 #: 落在 `var/` 下：那里已经在 .gitignore 里，而 profile 有几十 MB。
 CHROME_PROFILE_DIR = Path(__file__).resolve().parents[3] / "var" / "chrome-profile"
 
+#: 专用 profile 是全新的，所以 Chrome 的首次运行 UI 会冒出来。这些开关关掉它们。
+#:
+#: ⚠️ **`--disable-features=Translate` 实测关不掉右上角那个翻译气泡**
+#: （Chrome 现行版本，2026-08-10 实机验过两次，换成 `Translate,TranslateUI`
+#: 也一样）。保留它只是因为它是官方的 translate 特性开关。
+#:
+#: 现状与风险：气泡**不压任何现有 ROI**，也不会自己翻译——只有点了才会。
+#: 但真被触发一次，页面文字整体改写，而认屏、关键词、OCR 全靠原文，
+#: 所有判据会同时失效，现象是「哪儿都读不出来」，看不出是翻译干的。
+#: 目前靠「首次登录时人工关掉，状态留在 profile 里」兜着。
+#: 要彻底关，得在建 profile 时写 `Default/Preferences` 里的 `translate.enabled`
+#: ——那是确定性的做法，但要单独做并单独验证，不该在别的改动里顺手塞。
+FRESH_PROFILE_FLAGS = (
+    "--disable-features=Translate",
+    "--no-first-run",
+    "--no-default-browser-check",
+)
+
 #: 系统级安装的两个落点。用户级那个要看环境变量，见 `chrome_candidates()`。
 SYSTEM_CHROME_CANDIDATES = (
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
@@ -193,6 +211,7 @@ def launch_game(
             f"--app={url}",
             f"--force-device-scale-factor={scale}",
             f"--user-data-dir={profile}",
+            *FRESH_PROFILE_FLAGS,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

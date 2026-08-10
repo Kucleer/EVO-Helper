@@ -94,7 +94,22 @@ def tesseract_path() -> Path:
 
 
 def say(message: str) -> None:
-    print(f"{datetime.now().strftime('%H:%M:%S')} {message}", flush=True)
+    """打一行带时刻的日志。**编码安全：这一句永远不许把进程弄死。**
+
+    实机事故（2026-08-10 首次真派遣）：OCR 从简报上读出来的字里带了个 `™`，
+    而 stdout 被调度器重定向到文件、Python 用的是本地代码页 GBK，`print` 当场
+    抛 `UnicodeEncodeError`。要命的是这一句正在 `_dump_frame` 的**诊断路径**上：
+    本来是「简报认不出，安全地不派这一发」，结果变成整个 runner 崩在半路、
+    游戏被留在一个开着的面板上，接着填空隙的扫描也认不出画面、连挂三次被自动停用。
+    一个可恢复的判定失败，就这样级联成了整条链路停摆。
+
+    OCR 的输出本来就什么字符都可能有，所以这里按当前流的编码兜一层：
+    编不出来的字换成替代符，宁可丢一个字符也不能丢一个进程。
+    """
+    line = f"{datetime.now().strftime('%H:%M:%S')} {message}"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe, flush=True)
 
 
 # -- 计划与游标 ----------------------------------------------------------------

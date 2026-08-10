@@ -242,6 +242,26 @@ class TestPinnedDevicePixelRatio:
         argv = _launch_argv(monkeypatch, tmp_path)
         assert f"--force-device-scale-factor={CALIBRATED_SCALE_FACTOR}" in argv
 
+    def test_the_translate_feature_switch_is_passed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """翻译一开，整页文字被改写，认屏、关键词、OCR 会同时失效。
+
+        实测：专用 profile 是全新的，第一次打开游戏时右上角就弹了翻译气泡。
+        它本身只是遮挡（不压任何现有 ROI），但只要触发一次翻译，所有判据
+        一起失效，而且看不出是翻译干的——现象是「哪儿都读不出来」。
+        """
+        argv = _launch_argv(monkeypatch, tmp_path)
+        assert "--disable-features=Translate" in argv
+
+    def test_the_first_run_prompts_are_suppressed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """首次运行向导和默认浏览器询问会盖在页面上，挡住要认的东西。"""
+        argv = _launch_argv(monkeypatch, tmp_path)
+        assert "--no-first-run" in argv
+        assert "--no-default-browser-check" in argv
+
     def test_the_flag_really_comes_from_the_setting(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
