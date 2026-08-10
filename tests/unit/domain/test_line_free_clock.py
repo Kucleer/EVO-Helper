@@ -20,9 +20,7 @@ FLIGHT = timedelta(minutes=30)
 def test_an_attack_holds_the_line_for_the_round_trip() -> None:
     """打完还要飞回来，所以是 2×。"""
     assert (
-        line_free_at(
-            DISPATCHED, FLIGHT, mission_kind=MISSION_KIND_ATTACK, preset_name="AAA"
-        )
+        line_free_at(DISPATCHED, FLIGHT, mission_kind=MISSION_KIND_ATTACK, preset_name="AAA")
         == DISPATCHED + FLIGHT * 2
     )
 
@@ -47,9 +45,7 @@ def test_a_scout_flies_home() -> None:
     判据是 `mission_kind`，不是预设名——侦察根本不选预设。
     """
     assert (
-        line_free_at(
-            DISPATCHED, FLIGHT, mission_kind=MISSION_KIND_SCOUT, preset_name="侦察"
-        )
+        line_free_at(DISPATCHED, FLIGHT, mission_kind=MISSION_KIND_SCOUT, preset_name="侦察")
         == DISPATCHED + FLIGHT * 2
     )
 
@@ -78,6 +74,5 @@ def test_an_unknown_flight_time_leaves_the_clock_unset() -> None:
     有 `LineCapacityGate` 兜底；估低则是航线空着不派，没人兜。
     """
     assert (
-        line_free_at(DISPATCHED, None, mission_kind=MISSION_KIND_ATTACK, preset_name="AAA")
-        is None
+        line_free_at(DISPATCHED, None, mission_kind=MISSION_KIND_ATTACK, preset_name="AAA") is None
     )
