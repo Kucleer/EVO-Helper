@@ -1,8 +1,8 @@
 # EVO-Helper
 
 EVO-Helper is a local, safety-first assistant for scanning configured coordinate ranges, identifying
-`bot_` targets, preserving evidence, and planning dispatches. It starts in `dry_run=true` mode and is
-designed so that browser automation cannot dispatch unless every safety invariant has been satisfied.
+`bot_` targets, preserving evidence, and dispatching fleets. Dispatches are always real; the design
+is such that automation cannot dispatch unless every safety invariant has been satisfied.
 
 ## Status
 

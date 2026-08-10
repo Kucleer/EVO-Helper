@@ -34,7 +34,6 @@ def _plan_payload(clock: FakeApplicationService) -> ScanPlanView:
         enabled=True,
         window_start=datetime.strptime("08:00", "%H:%M").time(),
         window_end=datetime.strptime("20:00", "%H:%M").time(),
-        dry_run=True,
         ranges=(scan_range,),
     )
 

@@ -55,8 +55,6 @@
           <td>
             {% if entry.dispatched_at_utc is none %}
               <span class="chip"><span class="glyph" aria-hidden="true">◷</span>未派出 · {{ entry.guard_status }}</span>
-            {% elif entry.dry_run %}
-              <span class="chip locked"><span class="glyph" aria-hidden="true">🔒</span>演习</span>
             {% elif entry.accepted %}
               <span class="chip ok"><span class="glyph" aria-hidden="true">▶</span>已派出</span>
             {% else %}

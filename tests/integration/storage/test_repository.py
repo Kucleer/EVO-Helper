@@ -288,7 +288,6 @@ def test_dispatch_requires_known_intent(repository) -> None:
         dispatch_id=uuid4(),
         intent_id=uuid4(),
         dispatched_at_utc=datetime(2026, 8, 6, 1, 0, tzinfo=UTC),
-        dry_run=True,
         accepted=True,
     )
     with pytest.raises(ValueError, match="unknown attack intent"):
@@ -308,7 +307,6 @@ def test_report_strict_matching_closes_dispatch_once(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -355,7 +353,6 @@ def test_report_outside_time_tolerance_is_unmatched(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=False,
             accepted=True,
         )
     )
@@ -369,10 +366,11 @@ def test_report_outside_time_tolerance_is_unmatched(
     assert report.dispatch_id is None
 
 
-def test_report_never_matches_a_dry_run_dispatch(
+def test_report_never_matches_a_rejected_dispatch(
     session_factory,
     repository,
 ) -> None:
+    """被游戏拒掉的派遣不该被任何战报认领——那一发根本没飞出去。"""
     _plan_id, run_id = _seed_run(session_factory)
     intent = _intent(run_id)
     repository.save_attack_intent(intent)
@@ -382,7 +380,6 @@ def test_report_never_matches_a_dry_run_dispatch(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=True,
             accepted=False,
         )
     )
@@ -409,7 +406,6 @@ def test_fleet_diff_computes_statuses_and_first_seen(
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=dispatched_at,
-            dry_run=False,
             accepted=True,
         )
     )

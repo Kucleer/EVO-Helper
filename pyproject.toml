@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "evo-helper"
 version = "0.1.0"
-description = "Safety-first local assistant for auditable EVO scans and dry-run dispatch planning."
+description = "Safety-first local assistant for auditable EVO scans and fleet dispatch."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

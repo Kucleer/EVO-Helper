@@ -29,7 +29,6 @@ def _create_plan(client: TestClient) -> str:
         "enabled": True,
         "window_start": "08:00",
         "window_end": "20:00",
-        "dry_run": True,
         "ranges": [
             {
                 "start": {"galaxy": 1, "system": 1, "position": 1},
@@ -51,7 +50,6 @@ def test_plan_crud_flow() -> None:
 
     plan_id = _create_plan(client)
     assert client.get("/api/plans").json()[0]["name"] == "daily-scan"
-    assert client.get(f"/api/plans/{plan_id}").json()["dry_run"] is True
 
     updated = client.put(
         f"/api/plans/{plan_id}",
@@ -229,23 +227,6 @@ def test_console_pages_render() -> None:
         assert marker in response.text
 
 
-def test_console_pages_show_the_dry_run_lock() -> None:
-    """锁只是提示，绝不能渲染成开关。
-
-    断言从「整页不许有任何 checkbox」收紧到「这个 chip 里没有任何可点的控件」：
-    调度台的三条链路各带一个「是否参与调度」的复选框，原来那条粗口径会把它们
-    一并禁掉，而它们和演习模式锁是两回事。
-    """
-    client, _ = _make_client()
-
-    body = client.get("/missions").text
-    assert "演习模式 已锁定" in body
-
-    lock = body[body.index('<span class="chip locked"') : body.index("演习模式 已锁定")]
-    for control in ("<input", "<button", "<select", "<a "):
-        assert control not in lock, control
-
-
 def test_static_console_stylesheet_is_served() -> None:
     client, _ = _make_client()
     response = client.get("/static/console.css")
@@ -269,7 +250,6 @@ def test_origin_outside_the_scan_range_is_accepted() -> None:
             "enabled": True,
             "window_start": "08:00",
             "window_end": "10:00",
-            "dry_run": True,
             "ranges": [
                 {
                     "start": {"galaxy": 1, "system": 100, "position": 1},
@@ -303,7 +283,6 @@ def test_a_reversed_scan_range_is_still_rejected() -> None:
             "enabled": True,
             "window_start": "08:00",
             "window_end": "10:00",
-            "dry_run": True,
             "ranges": [
                 {
                     "start": {"galaxy": 1, "system": 200, "position": 1},
@@ -377,7 +356,6 @@ def test_plan_carries_fleet_line_configuration() -> None:
             "enabled": True,
             "window_start": "08:00",
             "window_end": "10:00",
-            "dry_run": True,
             "fleet_line_limit": 6,
             "reserved_lines": 2,
             "ranges": [
@@ -422,7 +400,6 @@ def test_reserving_every_line_is_rejected() -> None:
             "enabled": True,
             "window_start": "08:00",
             "window_end": "10:00",
-            "dry_run": True,
             "fleet_line_limit": 3,
             "reserved_lines": 3,
             "ranges": [
@@ -453,13 +430,18 @@ def test_run_states_render_in_chinese() -> None:
     assert run_state_label("SOMETHING_NEW") == "SOMETHING_NEW"
 
 
-def test_console_shows_no_english_dry_run_wording() -> None:
+def test_console_never_mentions_a_rehearsal_mode() -> None:
+    """演习模式这个概念已经整体删掉了，界面上不许再冒出来。
+
+    它曾经是每一页顶栏上那枚 🔒 徽标。留一条断言守着，是因为「派遣其实没真派」
+    这种暗示一旦回到界面上，用户就会去找那个并不存在的开关。
+    """
     client, _ = _make_client()
 
-    for path in ("/missions", "/runs", "/diagnostics"):
+    for path in ("/missions", "/runs", "/diagnostics", "/logs"):
         body = client.get(path).text
-        assert "dry run" not in body, path
-        assert "演习模式" in body, path
+        for wording in ("演习", "dry run", "dry_run"):
+            assert wording not in body, (path, wording)
 
 
 def test_the_new_waiting_states_have_chinese_labels() -> None:

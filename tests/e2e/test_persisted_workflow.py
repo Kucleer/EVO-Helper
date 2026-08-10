@@ -11,7 +11,6 @@ from evo_helper.application.workflow import (
     IntegrationWorkflow,
     TargetRecognition,
 )
-from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.game.action_guard import ActionGuard
 from evo_helper.game.capacity import LineCapacityGate
@@ -47,8 +46,7 @@ def _workflow(repository: SqlAlchemyRepository) -> IntegrationWorkflow:
         game,
         Reader(),
         Bindings(),
-        DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(3)),
-        dry_run=True,
+        DispatchCoordinator(ActionGuard(), LineCapacityGate(3)),
         now_utc=lambda: NOW,
     )
 

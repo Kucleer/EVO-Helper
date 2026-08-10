@@ -240,7 +240,6 @@ class SqlAlchemyRepository:
                     id=record.dispatch_id,
                     intent_id=record.intent_id,
                     dispatched_at_utc=record.dispatched_at_utc,
-                    dry_run=record.dry_run,
                     accepted=record.accepted,
                     evidence_artifact_id=record.evidence_artifact_id,
                     mission_kind=record.mission_kind,
@@ -489,7 +488,8 @@ class SqlAlchemyRepository:
     def pending_reports(self, run_id: UUID) -> list[PendingReport]:
         """本次运行已派出的攻击，以及各自是否已闭合。
 
-        只看**真实**派遣：演习模式的记录不会产生战报，把它们算进来会让运行永远等不完。
+        只看被游戏**接受**的那些：被拒的没有舰队飞出去，也就永远不会有战报，
+        算进来会让运行永远等不完。
         """
         with self._session_factory() as session:
             rows = session.execute(
@@ -504,7 +504,6 @@ class SqlAlchemyRepository:
                 .where(
                     orm.AttackIntentRow.run_id == run_id,
                     orm.AttackDispatchRow.accepted.is_(True),
-                    orm.AttackDispatchRow.dry_run.is_(False),
                 )
                 .order_by(orm.AttackDispatchRow.dispatched_at_utc)
             ).all()
@@ -523,7 +522,7 @@ class SqlAlchemyRepository:
         """某种目标在 `since` 之后真**打**出去了几发。
 
         海盗每天 32 次是游戏硬限制，超了会收到邮件且攻击被强制返回。
-        只数**真实**派遣：演习记录不会消耗配额。
+        只数被游戏**接受**的：被拒的那一发没有舰队飞出去，不消耗配额。
 
         **只数攻击发。** 侦察也是打向海盗的，只按 `target_kind` 过滤的话，
         一轮 4 发侦察会各吃掉一次攻击额度——当天 32 次以 4 倍速度消失，
@@ -542,7 +541,6 @@ class SqlAlchemyRepository:
                         orm.AttackIntentRow.target_kind == target_kind,
                         orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                         orm.AttackDispatchRow.accepted.is_(True),
-                        orm.AttackDispatchRow.dry_run.is_(False),
                         orm.AttackDispatchRow.dispatched_at_utc >= _require_utc(since, "since"),
                     )
                 )
@@ -583,7 +581,6 @@ class SqlAlchemyRepository:
                     .select_from(orm.AttackDispatchRow)
                     .where(
                         orm.AttackDispatchRow.accepted.is_(True),
-                        orm.AttackDispatchRow.dry_run.is_(False),
                         orm.AttackDispatchRow.line_free_at_utc > now_utc,
                     )
                 )
@@ -633,7 +630,6 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_kind == target_kind,
                     orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                     orm.AttackDispatchRow.accepted.is_(True),
-                    orm.AttackDispatchRow.dry_run.is_(False),
                     or_(
                         expected.is_(None),
                         expected > now_utc - grace,
@@ -662,12 +658,12 @@ class SqlAlchemyRepository:
         供 `domain.bot_round.phase_of` 判态。`since` 为空表示不限本轮
         （手工跑命令行时用）。
 
-        `accepted` / `dry_run` 两个过滤缺一不可，与兄弟方法
-        `count_dispatches_since` / `pending_reports_for_kind` 同口径：被游戏拒掉
-        的和演习的都不会产生战报，算进来就是一条「已派出且永远收不到战报」，
+        `accepted` 这个过滤不能省，与兄弟方法 `count_dispatches_since` /
+        `pending_reports_for_kind` 同口径：被游戏拒掉的那一发没有舰队飞出去，
+        也就不会产生战报，算进来就是一条「已派出且永远收不到战报」，
         该目标永远停在 `AWAITING_ATTACK_REPORT`，bot 的完成态永远达不到。
 
-        `mission_kind` 是第三个同口径的过滤，理由一样：侦察发也收不到
+        `mission_kind` 是另一个同口径的过滤，理由一样：侦察发也收不到
         `battle_reports`。而 `phase_of` 只按预设名分探路发和攻击发，认不出
         「这一发根本不会有战报」——一条带着非探路预设名的侦察发混进来，
         就会被当成攻击发，把目标永久钉在等战报上。
@@ -694,7 +690,6 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_system == coordinate.system,
                     orm.AttackIntentRow.target_position == coordinate.position,
                     orm.AttackDispatchRow.accepted.is_(True),
-                    orm.AttackDispatchRow.dry_run.is_(False),
                 )
             )
             if since is not None:
@@ -1139,7 +1134,6 @@ def _unmatched_dispatch_candidates(
             orm.AttackIntentRow.target_system == report.defender_target.system,
             orm.AttackIntentRow.target_position == report.defender_target.position,
             orm.AttackDispatchRow.accepted.is_(True),
-            orm.AttackDispatchRow.dry_run.is_(False),
             orm.AttackDispatchRow.id.not_in(linked),
         )
         .order_by(orm.AttackDispatchRow.dispatched_at_utc)

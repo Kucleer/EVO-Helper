@@ -22,8 +22,8 @@ those contracts; the domain package does not depend on their frameworks.
 ## Safety boundary
 
 `DispatchCommand` is a declarative request only. No frozen port or domain type performs a click.
-An adapter may execute a final dispatch only after an application-level ActionGuard decision; the
-default setting is always `dry_run=true`.
+An adapter may execute a final dispatch only after an application-level ActionGuard decision.
+There is no rehearsal path that records a dispatch without making it.
 
 ## API baseline
 

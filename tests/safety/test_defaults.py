@@ -3,15 +3,6 @@ import pytest
 from evo_helper.config import Settings
 
 
-def test_dry_run_stays_the_default() -> None:
-    """绑定地址已按需求放开到局域网，但**演习模式仍然是默认**。
-
-    这两件事从前写在同一个断言里，放开监听时很容易顺手把 dry_run 一起改掉。
-    拆开是为了让「默认不真的点游戏」单独有人守着。
-    """
-    assert Settings().dry_run is True
-
-
 def test_the_console_listens_on_the_lan_by_default() -> None:
     """局域网可访问是明确需求；端口刻意避开 8000。"""
     settings = Settings()

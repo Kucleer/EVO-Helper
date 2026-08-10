@@ -46,7 +46,6 @@ def _client(tmp_path: Path, *, with_report: bool) -> TestClient:
         enabled=True,
         window_start=time(8),
         window_end=time(20),
-        dry_run=False,
         ranges=(
             ScanRangeView(Coordinate(2, 137, 1), TARGET, ORIGIN, PRESET.name, PRESET.signature, 0),
         ),
@@ -69,7 +68,6 @@ def _client(tmp_path: Path, *, with_report: bool) -> TestClient:
             dispatch_id=uuid4(),
             intent_id=intent.intent_id,
             dispatched_at_utc=DISPATCHED,
-            dry_run=False,
             accepted=True,
         )
     )

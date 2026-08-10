@@ -4,8 +4,8 @@
 
 Browser capture supplies evidence for the vision and game adapters. It must not
 create a dispatch, submit a game form, read credentials, cookies, local storage,
-or session tokens. Production automation stays `dry_run=true` until the CP6
-evidence gate is complete.
+or session tokens. Capture is read-only by construction: it has no dispatch
+path at all, so nothing here depends on a global mode flag.
 
 Only the root agent controls the logged-in browser session. A capture session
 records screenshots and its manifest under a unique `session_id`; no account

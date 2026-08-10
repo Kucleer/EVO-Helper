@@ -1,7 +1,6 @@
 """ActionGuard: the only path that may authorize a final dispatch click.
 
 Safety invariants (docs/safety.md, frozen contracts):
-- dry_run=true is the default and always refuses.
 - A dispatch requires a fresh, consistent re-observation immediately before the
   click; stale or uncertain observations are refused.
 - Tokens are single-use, short-lived, and bound to one dispatch command.
@@ -13,7 +12,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from evo_helper.config import Settings
 from evo_helper.domain.models import DispatchCommand
 from evo_helper.domain.ports import ScreenObservation
 
@@ -38,13 +36,11 @@ class ActionGuard:
 
     def __init__(
         self,
-        settings: Settings,
         *,
         ttl: timedelta = timedelta(seconds=30),
         min_page_confidence: float = 0.99,
         required_page: str = "attack",
     ) -> None:
-        self._settings = settings
         self._ttl = ttl
         self._min_page_confidence = min_page_confidence
         self._required_page = required_page
@@ -55,8 +51,6 @@ class ActionGuard:
         self, command: DispatchCommand, observation: ScreenObservation
     ) -> ActionGuardDecision:
         """Run the pre-dispatch gate; on success a token is issued (not yet used)."""
-        if self._settings.dry_run:
-            return ActionGuardDecision(False, "dry_run=true: dispatch refused by ActionGuard")
         if observation.ui_version is None:
             return ActionGuardDecision(False, "UI version unknown: refusing dispatch")
         if observation.screen != self._required_page:

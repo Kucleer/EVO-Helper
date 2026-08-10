@@ -67,18 +67,6 @@ def test_a_refused_dispatch_does_not_leave_the_target_awaiting_a_report(reposito
     assert phase_of(facts) is BotPhase.NEEDS_PROBE
 
 
-def test_a_rehearsal_dispatch_does_not_leave_the_target_awaiting_a_report(
-    repository, run_id
-) -> None:  # type: ignore[no-untyped-def]
-    """演习模式不会产生战报，同样不能算成「已派出」。"""
-    _intent(repository, run_id, preset="AAA", created_at=ROUND_START, dry_run=True)
-
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
-
-    assert facts == []
-    assert phase_of(facts) is BotPhase.NEEDS_PROBE
-
-
 def test_an_intent_with_no_dispatch_at_all_is_not_a_fact(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """闸门拦下、根本没走到派遣面板的意图不构成派遣事实。"""
     repository.save_attack_intent(
@@ -284,7 +272,6 @@ def _intent(  # type: ignore[no-untyped-def]
     created_at: datetime,
     target_kind: str = TARGET_KIND_BOT,
     accepted: bool = True,
-    dry_run: bool = False,
     has_report: bool = False,
     mission_kind: str = MISSION_KIND_ATTACK,
 ):
@@ -310,7 +297,6 @@ def _intent(  # type: ignore[no-untyped-def]
             dispatch_id=dispatch_id,
             intent_id=intent_id,
             dispatched_at_utc=created_at,
-            dry_run=dry_run,
             accepted=accepted,
             mission_kind=mission_kind,
         )

@@ -33,7 +33,6 @@ class ScanPlan(Base):
     time_window_start: Mapped[str] = mapped_column(String(5), default="08:00")
     time_window_end: Mapped[str] = mapped_column(String(5), default="20:00")
     timezone_name: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
-    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
     #: Fleet lines this plan may occupy, and how many stay free for the user.
     fleet_line_limit: Mapped[int] = mapped_column(Integer, default=1)
     reserved_lines: Mapped[int] = mapped_column(Integer, default=0)
@@ -158,7 +157,6 @@ class AttackDispatchRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     intent_id: Mapped[UUID] = mapped_column(ForeignKey("attack_intents.id"), unique=True)
     dispatched_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
-    dry_run: Mapped[bool] = mapped_column(Boolean)
     accepted: Mapped[bool] = mapped_column(Boolean)
     evidence_artifact_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
     #: 派出时读到的飞行时长，以及据此算出的预计战报时间。

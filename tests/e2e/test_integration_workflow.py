@@ -10,7 +10,6 @@ from evo_helper.application.workflow import (
     IntegrationWorkflow,
     TargetRecognition,
 )
-from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.ports import CoordinateClaim, ScreenObservation
 from evo_helper.domain.records import BattleReport, FleetSnapshotEntry
@@ -74,27 +73,26 @@ def _workflow(
     *,
     game_feedback_slots: int | None = None,
 ) -> IntegrationWorkflow:
-    coordinator = DispatchCoordinator(ActionGuard(Settings()), LineCapacityGate(user_limit=3))
+    coordinator = DispatchCoordinator(ActionGuard(), LineCapacityGate(user_limit=3))
     return IntegrationWorkflow(
         repository,
         game,
         Reader(),
         Bindings(),
         coordinator,
-        dry_run=True,
         now_utc=lambda: NOW,
         game_feedback_slots=lambda: game_feedback_slots,
     )
 
 
-def test_dry_run_scan_dispatch_drain_closure_never_clicks() -> None:
+def test_scan_dispatch_drain_closure_runs_end_to_end() -> None:
     repository = MemoryRepository(deque([BOT, NON_BOT]))
-    game = SimulatedGameAdapter(dry_run=False)
+    game = SimulatedGameAdapter()
     game.register_preset(PRESET)
     workflow = _workflow(repository, game)
     run_id = uuid4()
 
-    assert workflow.scan_once(run_id).status == "DRY_RUN_RECORDED"
+    assert workflow.scan_once(run_id).status == "DISPATCHED"
     assert workflow.scan_once(run_id).status == "SCANNED_NON_BOT"
     assert workflow.scan_once(run_id).status == "DRAINING"
 
@@ -109,9 +107,10 @@ def test_dry_run_scan_dispatch_drain_closure_never_clicks() -> None:
     assert len(repository.scans) == 2
     assert len(repository.intents) == 1
     assert len(repository.dispatches) == 1
-    assert repository.dispatches[0].dry_run is True
+    assert repository.dispatches[0].accepted is True
     assert repository.reports == [report]
-    assert game.dispatched == ()
+    # 只有 bot 那颗被派了，非 bot 那颗一路走到「扫过但不打」。
+    assert [command.target for command in game.dispatched] == [BOT]
 
 
 def test_new_workflow_instance_resumes_from_repository_cursor() -> None:
@@ -142,7 +141,7 @@ def test_unknown_attack_ui_pauses_before_recording_an_intent() -> None:
     assert game.dispatched == ()
 
 
-def test_full_capacity_waits_before_recording_a_dry_run_dispatch() -> None:
+def test_full_capacity_waits_before_recording_a_dispatch() -> None:
     repository = MemoryRepository(deque([BOT]))
     game = SimulatedGameAdapter()
     game.register_preset(PRESET)
