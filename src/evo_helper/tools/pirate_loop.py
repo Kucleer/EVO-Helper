@@ -1238,7 +1238,9 @@ class PirateLoop:
             return ReportIngest.UNREADABLE
         repository, _run_id = self._ensure_run()
         if repository.has_report_at(reading.defender_target, reading.reported_at_utc):
-            say(f"  第 {row.index} 行 → {reading.defender_target} {reading.outcome}（库里已有）")
+            note = rematch_note(repository, reading.defender_target, reading.reported_at_utc)
+            target = reading.defender_target
+            say(f"  第 {row.index} 行 → {target} {reading.outcome}（库里已有{note}）")
             return ReportIngest.KNOWN
         repository.append_report(to_pirate_battle_report(reading, report_id=uuid4()))
         say(
@@ -1255,13 +1257,48 @@ class PirateLoop:
         都必然更旧、也必然已经在库里——再开下去只是一封封确认「已有」，每封约 8 秒。
         这条对「同一天多次启动」尤其要紧：每次重启都要重新翻一遍信箱。
 
+        ⚠️ **但早停要先问过那张单子。** 「库里已有 ⇒ 往下都读过了」这个假定有个
+        实机踩到的盲点：报告确实在库里，**却没接到该接的那一发派遣上**
+        （`repository.rematch_report_at` 记着 2026-08-11 那四发的全过程）。
+        那时早停会把这几发永久钉在「待战报」——每一趟都在第一封就收工，
+        而要找的那几封就躺在它下面。
+
+        所以两条并存，取舍是**单子说了算**：
+        `repository.due_attack_dispatches()` 里还有条目，就接着往下开；
+        单子空了（该有的战报都认领上了）才收工。单子本身是有界的——
+        超过 `MAX_REPORT_AGE` 的派遣不在里面，所以一发真丢了的战报不会让这一趟
+        永远开下去；开封数照旧封在 `MAIL_MAX_OPENS`。
+
+        单子是**每封重查**而不是开工时算一次就拿着走：刚刚那一封入库/重认之后，
+        它认领的那一发就该从单子上消失。一次本地 SQLite 查询与一封八秒的开封
+        比起来可以忽略，而拿着一张过期的单子只会多开几封。
+
         ⚠️ **只停开封，不停这一趟。** 数数还要接着往下翻（见 `_scan_mail_rows` 的
         `observe`）：库里已有多少份和信箱里今天有多少份是两件事，而配额要的是后者。
         """
         if self._ingest_report(row, page) is not ReportIngest.KNOWN:
             return False
+        outstanding = self._due_dispatches(datetime.now(UTC))
+        if outstanding:
+            say(
+                f"  这一封库里已有，但单子上还有 {len(outstanding)} 发到点没战报"
+                f"（{_targets_note(outstanding)}）；接着往下开"
+            )
+            return False
         say("  往下都是更旧的报告，不再开封")
         return True
+
+    def _due_dispatches(self, now: datetime) -> list[Any]:
+        """那张单子：已派出、理论上战报早该到了、库里却还没有的那些攻击发。
+
+        判据全在 `repository.due_attack_dispatches`；这里只负责把仓储接上。
+        """
+        from evo_helper.domain.report_wait import MAX_REPORT_AGE
+
+        repository, _run_id = self._ensure_run()
+        return list(
+            repository.due_attack_dispatches(self.TARGET_KIND, now_utc=now, max_age=MAX_REPORT_AGE)
+        )
 
     def _bottom_screens(self) -> Any:
         """把详情页拖到底再拍一屏：「单位」与「损失单位」两行都在那里。
@@ -1357,6 +1394,13 @@ class PirateLoop:
         now = datetime.now(UTC)
         day_start = quota_day_start_utc(now)
         say(f"开工：读回{self.REPORT_LABEL}，并数一遍 UTC {day_start:%Y-%m-%d} 打了几发")
+        # **先问库要单子，再进信箱。** 这一句就是「由库驱动」那条口径的落点：
+        # 带着「哪几发理论上已经该有战报了」去找，而不是翻到什么算什么。
+        outstanding = self._due_dispatches(now)
+        if outstanding:
+            say(f"  库里有 {len(outstanding)} 发到点还没战报：{_targets_note(outstanding)}")
+        else:
+            say("  库里没有到点还没战报的派遣；这一趟只补没入库的和数今天的份数")
         tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
         try:
             self._scan_mail_rows(
@@ -1375,7 +1419,7 @@ class PirateLoop:
             # 不写记录，下一轮再试。
             say(f"  开工翻不了信箱（{error}）；这一轮先按库内计数走")
             return
-        repository.record_daily_reconciliation(
+        status = repository.record_daily_reconciliation(
             self.TARGET_KIND,
             day_utc=day_start,
             observed_reports=tally.observed,
@@ -1384,6 +1428,14 @@ class PirateLoop:
         )
         note = "翻到底了" if tally.complete else "没翻到底，这是「至少」"
         say(f"  今天已有 {tally.observed} 份（{note}）")
+        # 当天状态已经固化进 `daily_reconciliations`，重启之后一行就能读回
+        # （用户口径 2026-08-11：「每天的海盗次数（状态）也可以存库，快速回读」）。
+        if status is not None:
+            say(
+                f"  今日已用 {status.attacks_used} 发"
+                f"（库内 {status.dispatched_count} · 信箱 {status.observed_reports}），"
+                f"还有 {status.awaiting_reports} 发在等战报"
+            )
 
     def _report_floor(self, day_start: datetime, *, now: datetime) -> datetime:
         """这一趟最早翻到哪一行为止。默认就是今天的 UTC 日界。
@@ -1796,6 +1848,27 @@ class PirateLoop:
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return
         self.attack(coordinate)
+
+
+def _targets_note(dispatches: Sequence[Any]) -> str:
+    """把单子上那几发写成一行人话。日志里没有坐标就无从判断该不该往下翻。"""
+    return "、".join(str(item.target) for item in dispatches)
+
+
+def rematch_note(repository: Any, target: Coordinate, reported_at: datetime) -> str:
+    """撞见一封「库里已有」时，顺手把那一行**重新认领一次**，并交回一句话。
+
+    这是 2026-08-11 那四发 AAA 的出口：战报早就读进库了，只是当初认领判据把
+    自己那一发侦察也当成了候选，于是记 `AMBIGUOUS`、`dispatch_id` 留空
+    （来龙去脉写在 `repository._unmatched_dispatch_candidates`）。判据修好之后，
+    已经在库里的那些行**不会自己接上**——而 `has_report_at` 那道去重又保证了
+    它们永远不会被重新读一遍。所以要在这里主动重认一次。
+
+    不重开邮件、不重读像素，只是拿现在的判据把旧行重算一遍：一次本地写库。
+    """
+    if repository.rematch_report_at(target, reported_at):
+        return "；这一份原先没认上派遣，刚补认上了"
+    return ""
 
 
 def _coordinate_order(coordinate: Coordinate) -> tuple[int, int, int]:

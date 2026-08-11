@@ -16,6 +16,7 @@ bot 那条链路的同一个死结刚修过（PR #91）：没人读战报 → `b
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -71,15 +72,25 @@ class _Screens:
 
 
 class _Repository:
-    def __init__(self, *, already_stored: bool = False) -> None:
+    def __init__(self, *, already_stored: bool = False, due: int = 0) -> None:
         self.already_stored = already_stored
         self.appended: list[Any] = []
+        #: 单子上还剩几发到点没战报（`due_attack_dispatches` 的条数）。
+        self.due = due
+        self.rematched: list[tuple[Coordinate, datetime]] = []
 
     def has_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
         return self.already_stored
 
     def append_report(self, report: Any) -> None:
         self.appended.append(report)
+
+    def rematch_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
+        self.rematched.append((target, reported_at_utc))
+        return False
+
+    def due_attack_dispatches(self, target_kind: str, **_fields: Any) -> list[Any]:
+        return [SimpleNamespace(target=TARGET) for _ in range(self.due)]
 
 
 def _loop(repository: _Repository, *, bottom: _Screens | None = None) -> tuple[Any, list[str]]:
@@ -197,8 +208,36 @@ def test_a_known_report_stops_the_opening() -> None:
     """读到库里已有的那一份就不再开封（用户口径 2026-08-11）。
 
     信箱从新往旧排、入库也从新往旧写，所以它往下的每一份都必然已经在库里了。
+    **前提是那张单子已经空了**——见下一条。
     """
     repository = _Repository(already_stored=True)
     loop, _events = _loop(repository)
 
     assert loop._ingest_report_row(ROW, _Screens()) is True
+
+
+def test_a_known_report_does_not_stop_while_dispatches_still_await_reports() -> None:
+    """⚠️ 单子上还有到点没战报的派遣时，**撞见一封「已有」不许收工**。
+
+    早停假定「库里已有 ⇒ 往下都读过了」。实机（2026-08-11）推翻了它：那四发 AAA
+    的战报**确实在库里**，只是没接到该接的那一发派遣上，于是每一趟都在第一封
+    就收工，而要找的那几封就躺在它下面——那几个目标永远停在「待战报」。
+    """
+    repository = _Repository(already_stored=True, due=2)
+    loop, _events = _loop(repository)
+
+    assert loop._ingest_report_row(ROW, _Screens()) is False
+
+
+def test_a_known_report_is_rematched_against_its_dispatch() -> None:
+    """撞见「库里已有」时要顺手**重认一次**，否则那几行永远接不上。
+
+    判据修好了也不会让已经在库里的行自己回头认领；而 `has_report_at` 那道去重
+    又保证它们永远不会被重新读一遍。不重开邮件、不重读像素，只是一次本地写库。
+    """
+    repository = _Repository(already_stored=True)
+    loop, _events = _loop(repository)
+
+    loop._ingest_report(ROW, _Screens())
+
+    assert repository.rematched == [(TARGET, REPORTED_AT)]
