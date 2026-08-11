@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Annotated, Any, cast
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BeforeValidator
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import Lifespan
 
@@ -339,6 +340,30 @@ def run_state_glyph(state: str) -> str:
     return _RUN_STATE_GLYPH.get(state, "•")
 
 
+def _blank_to_none(value: Any) -> Any:
+    """把 `?galaxy=` 这种空串当成「没给这个参数」。
+
+    星球列表页那个下拉框里，「全部银河系」那一项的 `value` 就是空串——浏览器提交
+    表单时必然带上 `galaxy=`。而参数声明成 `int | None` 时 FastAPI 会拿空串去解析
+    整数，直接 422：
+
+        {"detail":[{"type":"int_parsing","loc":["query","galaxy"],
+                    "msg":"Input should be a valid integer, ...","input":""}]}
+
+    也就是说**这一页自带的默认筛选项点下去就报错**，还是 JSON 报错页，不是页面。
+    翻页链接自己不会带空串（`page_url` 只在非 None 时才拼 `galaxy`），所以这个坑
+    只有走表单才踩得到——而那正是用户会走的那条路。
+
+    `offset` / `limit` 一并按这条处理：它们现在是下拉框，不会提交空串，但共享出去
+    的链接被人手改成 `?limit=` 是同一个 422，而这类修补一处漏一处的成本比统一处理高。
+    """
+    return None if value == "" else value
+
+
+#: 允许空串的整数查询参数。空串→None，由处理函数各自决定落回什么默认值。
+BlankableInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
+
+
 # ---- application factory --------------------------------------------------
 
 
@@ -584,10 +609,10 @@ def create_app(
     @app.get("/planets", response_class=HTMLResponse)
     async def planets_page(
         request: Request,
-        galaxy: int | None = None,
+        galaxy: BlankableInt = None,
         kind: str = DEFAULT_PLANET_KIND,
-        offset: int = 0,
-        limit: int = DEFAULT_PLANET_PAGE_SIZE,
+        offset: BlankableInt = 0,
+        limit: BlankableInt = DEFAULT_PLANET_PAGE_SIZE,
     ) -> HTMLResponse:
         """星球列表：按银河系与类型筛选，默认只看 bot。
 
@@ -597,8 +622,11 @@ def create_app(
         service = get_service(request)
         if kind not in PLANET_KINDS:
             kind = DEFAULT_PLANET_KIND
-        limit = min(max(limit, 1), MAX_PLANET_PAGE_SIZE)
-        offset = max(offset, 0)
+        # 空串已经在 `BlankableInt` 那一层变成了 None，这里落回各自的默认值。
+        limit = min(
+            max(DEFAULT_PLANET_PAGE_SIZE if limit is None else limit, 1), MAX_PLANET_PAGE_SIZE
+        )
+        offset = max(offset or 0, 0)
         page = service.list_planets(galaxy=galaxy, kind=kind, offset=offset, limit=limit)
 
         def page_url(new_offset: int) -> str:
