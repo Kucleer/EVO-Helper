@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -25,7 +26,7 @@ from evo_helper.domain.records import (
     FleetPresetRef,
 )
 from evo_helper.domain.report_wait import MAX_REPORT_AGE
-from evo_helper.domain.scheduler import RESTART_COOLDOWN, MissionKind
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, RESTART_COOLDOWN, MissionKind
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -81,7 +82,7 @@ def dispatch(  # type: ignore[no-untyped-def]
 ):
     """记一发被游戏接受的派遣。
 
-    `flight` 不传就留空航线钟，那一档按 `UNKNOWN_LINE_HOLD`（6 小时）算**仍然
+    `flight` 不传就留空航线钟，那一档按 `UNKNOWN_LINE_HOLD`（90 分钟）算**仍然
     占着航线**——测试若只想验别的事，就得把飞行时间给上，否则这一发会一直压着
     航线让链路起不来。
     """
@@ -216,6 +217,68 @@ def test_stopping_kills_the_child_and_closes_its_run(scheduler, repository, laun
     row = repository.mission_runs(limit=1)[0]
     assert row.stopped_by == "USER"
     assert row.ended_at_utc == NOW
+
+
+class SlowRepository(SqlAlchemyRepository):
+    """把「读事实」拖住，模拟一次真实的 `_facts()`。
+
+    生产库里 bot 范围有 4237 个目标，一次 `_facts()` 要按目标逐个问库，实测
+    0.32 秒；而 tick 每秒一次、页面每 2 秒问一次状态、桌面悬浮窗还有一次。
+    这里只是把那段时间拉长成一把测试握得住的闸门。
+    """
+
+    def __init__(self, session_factory) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(session_factory)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def last_mission_starts(self):  # type: ignore[no-untyped-def, override]
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return super().last_mission_starts()
+
+
+def test_stopping_does_not_queue_behind_a_tick_that_is_reading_facts(  # type: ignore[no-untyped-def]
+    session_factory, launcher, clock
+) -> None:
+    """**用户口径：「控制台无法结束任务」。**
+
+    实机 2026-08-11：页面显示「运行中，已运行 2:29:08」，点「结束」毫无反应、
+    秒表照走。成因是「结束」和「读事实」共用同一把锁：读事实没有上界（4237 个
+    bot 目标逐个问库），而 `RLock` 没有公平性，排在一群反复重取的线程后面可以
+    饿任意久；FastAPI 的同步接口又跑在容量 40 的线程池里，状态轮询全卡在锁上
+    之后，那个 POST 连线程都分不到——页面上就是「点了没反应」。
+
+    这里把 tick 卡在读事实中间，然后要求「结束」照样立刻杀掉子进程。
+    锁一旦重新护住读事实，`join(2)` 会超时，这条就红。
+    """
+    repository = SlowRepository(session_factory)
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    enable(repository, MissionKind.PIRATE)
+    scheduler.start()
+    repository.release.set()
+    scheduler.tick()  # 起一个子进程；这一趟不拦
+    assert launcher.kinds == [MissionKind.PIRATE]
+
+    repository.release.clear()
+    ticking = threading.Thread(target=scheduler.tick, daemon=True)
+    ticking.start()
+    assert repository.entered.wait(timeout=5), "tick 没有走到读事实这一步"
+
+    stopping = threading.Thread(target=scheduler.stop, daemon=True)
+    stopping.start()
+    stopping.join(timeout=2)
+
+    assert not stopping.is_alive(), "「结束」被读事实堵住了"
+    assert launcher.latest.terminated
+    assert not scheduler.enabled
+    repository.release.set()
+    ticking.join(timeout=5)
+    # 那一轮 tick 拿的是「结束」之前的事实。它醒来之后绝不能照着旧决策再起一个
+    # ——否则控制台以为已经停了，实际还有一个 runner 在点鼠标。
+    assert len(launcher.spawned) == 1
+    assert scheduler.current is None
 
 
 def test_shutdown_clears_the_child_so_it_does_not_outlive_the_console(  # type: ignore[no-untyped-def]
@@ -594,6 +657,115 @@ def test_three_consecutive_crashes_disable_the_chain(  # type: ignore[no-untyped
     clock.now = NOW + timedelta(days=1)
     scheduler.tick()
     assert len(launcher.spawned) == MAX_CONSECUTIVE_FAILURES
+
+
+def _crash_scan(scheduler, launcher, clock, *, at: datetime) -> bool:  # type: ignore[no-untyped-def]
+    """让扫描在 `at` 起来、14 秒后崩掉。返回它这一趟到底起没起来。
+
+    收退出码的那一 tick **不许顺手再起一个**：那正是「崩了就立刻重来」的样子，
+    43 秒连崩三次就是这么来的。
+    """
+    before = len(launcher.spawned)
+    clock.now = at
+    scheduler.tick()
+    if len(launcher.spawned) == before:
+        return False
+    launcher.latest.exit_code = 1
+    clock.now = at + timedelta(seconds=14)
+    scheduler.tick()
+    assert len(launcher.spawned) == before + 1, "刚崩完就又起了一个"
+    return True
+
+
+def test_a_burst_of_scan_crashes_does_not_disable_the_chain(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """**实机 2026-08-11 08:40:30 / 08:40:45 / 08:40:59。**
+
+    同一个「游戏窗口抢不到前台」（用户正在用别的窗口）把扫描连崩三次，每次
+    14 秒，`consecutive_failures` 到 3，整条链路被停用——而扫描的定位恰恰是
+    「始终填空隙」。43 秒里的三次是**同一阵故障**，不是三次独立的证据。
+
+    冷却之后它一趟只起得来一次，所以这 43 秒里只该有一次失败记录。
+    """
+    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    started = [
+        _crash_scan(scheduler, launcher, clock, at=NOW + timedelta(seconds=offset))
+        for offset in (0, 15, 29)
+    ]
+
+    assert started == [True, False, False]
+    assert len(launcher.spawned) == 1
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 1
+    assert task(repository, MissionKind.SCAN).disabled_reason is None
+
+
+def test_a_scan_that_keeps_crashing_for_ten_minutes_still_gets_disabled(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """**冷却是节流，不是豁免。** 真坏了还得数到三，否则调度循环会在一个坏掉的
+    任务上满速空转——而扫描没有别的闸门拦着它。
+    """
+    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    # 扫描的冷却从**崩掉那一刻**起算（不是启动那一刻），所以每一轮要多留出
+    # 它跑那 14 秒。
+    for index in range(MAX_CONSECUTIVE_FAILURES):
+        moment = NOW + (RESTART_COOLDOWN + timedelta(seconds=20)) * index
+        assert _crash_scan(scheduler, launcher, clock, at=moment)
+
+    assert task(repository, MissionKind.SCAN).disabled_reason is not None
+
+
+def test_the_environment_busy_code_never_reaches_the_failure_counter(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """runner 说「这会儿轮不到我」时，连撞多少次都不该把链路停用。
+
+    但它照样要吃冷却：用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
+    """
+    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    # 冷却从崩掉那一刻起算，所以每轮要多留出它跑的那 14 秒。
+    for index in range(MAX_CONSECUTIVE_FAILURES + 2):
+        clock.now = NOW + (RESTART_COOLDOWN + timedelta(seconds=20)) * index
+        scheduler.tick()
+        launcher.latest.exit_code = EXIT_ENVIRONMENT_BUSY
+        clock.now += timedelta(seconds=14)
+        scheduler.tick()
+
+    assert len(launcher.spawned) == MAX_CONSECUTIVE_FAILURES + 2
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 0
+    assert task(repository, MissionKind.SCAN).disabled_reason is None
+
+
+def test_the_environment_busy_code_does_not_clear_a_real_failure_streak(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """「轮不到我」不是「跑成功了」。
+
+    当成成功去清零的话，崩一次、轮不到一次、再崩一次……的链路永远数不到三，
+    自动停用就等于没有。清零只认退出码 0。
+    """
+    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    for index, code in enumerate((1, EXIT_ENVIRONMENT_BUSY)):
+        clock.now = NOW + (RESTART_COOLDOWN + timedelta(seconds=20)) * index
+        scheduler.tick()
+        launcher.latest.exit_code = code
+        clock.now += timedelta(seconds=14)
+        scheduler.tick()
+
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 1
 
 
 def test_a_clean_round_clears_the_failure_streak(  # type: ignore[no-untyped-def]

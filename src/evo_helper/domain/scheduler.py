@@ -22,8 +22,22 @@ from typing import assert_never
 #: 扑空、退出、下一 tick 判据仍为真、再起一次——不是死循环，但每轮几十秒的
 #: 导航全是白费，还一直占着鼠标不让扫描进来。
 #:
-#: **`SCAN` 不受它约束**，见 `has_work` 里那段。
+#: **`SCAN` 只在崩过之后才受它约束**，见 `cooling_down` 里那段。
 RESTART_COOLDOWN = timedelta(minutes=5)
+
+#: runner 用这个退出码说：**不是我坏了，是这会儿轮不到我**。
+#:
+#: 目前唯一的成因是「游戏窗口抢不到前台」——用户正在用别的窗口，而抢不到前台时
+#: 唯一正确的动作是停下（把点击打到别人窗口上比什么都不做糟得多）。它和「这条
+#: 链路坏了」在进程间协议上必须分得开：前者重试有意义、且**不该**计入连续失败，
+#: 后者重试只会再来一遍。
+#:
+#: 取 75 是 BSD `sysexits.h` 的 `EX_TEMPFAIL`（"temporary failure; user is invited
+#: to retry"），语义正好，也不会和 Python 未捕获异常的 1、`argparse` 的 2 撞上。
+#:
+#: ⚠️ **不能退化成「所有退出码 1 都不算失败」**：那样真坏了也永远不会停用，
+#: 调度循环会在一个坏掉的任务上变成满速空转的重启循环。
+EXIT_ENVIRONMENT_BUSY = 75
 
 
 class MissionKind(Enum):
@@ -132,6 +146,13 @@ class SchedulerFacts:
     #: 「下一条什么时候来」——`free_lines` 被现场推翻之后，只有后者能给出一个
     #: 值得再试的时刻。
     next_line_free_at_utc: datetime | None = None
+    #: 每条链路上一次**自己退、且退出码非 0** 的时刻（正常收尾、抢占、用户点停
+    #: 都不算）。只有 `cooling_down` 用它，而且只对 `SCAN` 用——理由写在那里。
+    #:
+    #: 口径比「算不算连续失败」宽一档：`EXIT_ENVIRONMENT_BUSY` 不计入失败，
+    #: 但照样要冷却——用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
+    #: 由调用方按本次控制台运行期间的记忆填，这一层不去查库。
+    last_failure_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
 
 
 def quota_day_start_utc(now: datetime) -> datetime:
@@ -166,15 +187,27 @@ def cooling_down(
 ) -> bool:
     """这条链路是不是还在两次启动之间的最小间隔里。
 
-    **`SCAN` 恒为假。** 冷却堵的 churn 是收战报特有的：`expected_report_at_utc`
-    为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。扫描没有这种循环，
-    它的游标持久化、随起随停没有代价。把冷却套上去只会制造纯空转——攻击轮两
-    分钟跑完、扫描还得再等三分钟才允许回来，而填这种空隙正是扫描存在的全部
-    理由。秒级来回由 `MIN_DWELL` 挡（它限制多快**离开**扫描），与这里限制多快
-    **回到**某条链路不重复，所以去掉这一档不会把来回放回来。
+    **`SCAN` 只在上一次是异常退出时才冷却。** 冷却堵的 churn 是收战报特有的：
+    `expected_report_at_utc` 为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。
+    扫描没有这种循环，它的游标持久化、随起随停没有代价，所以正常跑完之后不必等
+    ——攻击轮两分钟跑完、扫描还得再等三分钟才允许回来，而填这种空隙正是扫描存在
+    的全部理由。秒级来回由 `MIN_DWELL` 挡（它限制多快**离开**扫描），与这里限制
+    多快**回到**某条链路不重复。
+
+    **崩掉的那一档不一样，它有代价。** 扫描起来 14 秒就崩（实机
+    2026-08-11 08:40:30 / 08:40:45 / 08:40:59，同一个「窗口抢不到前台」），
+    而 `MAX_CONSECUTIVE_FAILURES` 是 3——不冷却的话，**43 秒**就把这条链路
+    自动停用了，而另外两条有冷却的链路要撞满 10 分钟才落到同一个下场。于是最该
+    一直有活干的那条，反而最容易被一阵前台争抢误判成坏掉。让它和别人一样等：
+    三次连崩就意味着「持续十分钟起不来」，而不是「四十三秒里连崩三次」。
+
+    起算点两档不同，也必须不同：别人按**启动**算（刚起来就秒退的 runner 正是最
+    该被节流的那种），扫描按**上一次崩**算——按启动算就等于把它那条「跑完随时
+    可以再来」的特性一起砍掉了。
     """
     if kind is MissionKind.SCAN:
-        return False
+        last_failure = facts.last_failure_at_utc.get(kind)
+        return last_failure is not None and facts.now_utc - last_failure < restart_cooldown
     last_started = facts.last_started_at_utc.get(kind)
     return last_started is not None and facts.now_utc - last_started < restart_cooldown
 
@@ -231,7 +264,14 @@ def waiting_for_a_line(kind: MissionKind, facts: SchedulerFacts) -> bool:
     **因此它不可能变成永久不起**：压到的那个时刻是库里查出来的，到点自动解除。
     而且它只挡「去派」这半边判据，「回去收战报」那半边一个字都不动——收报告不占
     航线，压着它只会让战报烂在信箱里。
+
+    **`SCAN` 恒为假。** 它压根不派遣，航线满不满与它无关；而 `came_back_empty`
+    对它恒为真（它永远不会出现在 `last_dispatch_at_utc` 里），不挡一道的话，
+    一条只是在崩溃冷却里的扫描会被 `status_of` 说成「等航线」——一句用户照着
+    去调航线数、调完也不会有任何变化的假话。
     """
+    if kind is MissionKind.SCAN:
+        return False
     if not came_back_empty(kind, facts):
         return False
     next_free = facts.next_line_free_at_utc
@@ -251,8 +291,9 @@ def has_work(
 ) -> bool:
     """这条链路现在有没有事可做。
 
-    冷却期内一律算「没活干」（`cooling_down`，`SCAN` 除外），顺位让给下一个——
-    它是判据的一部分而不是启动前的一道额外闸门，这样抢占那一路（`decide` 里靠
+    冷却期内一律算「没活干」（`cooling_down`；`SCAN` 只在崩过之后才有冷却），
+    顺位让给下一个——它是判据的一部分而不是启动前的一道额外闸门，这样抢占那一路
+    （`decide` 里靠
     `wanted` 判断值不值得打断扫描）自动跟着生效：一条正在冷却的链路不该把扫描
     打断成谁都不在跑。
 

@@ -143,10 +143,28 @@ def test_a_chain_waiting_for_a_line_says_so_rather_than_cooling_down() -> None:
     assert empty_round is TaskStatus.WAITING_LINES
 
 
-def test_scanning_is_never_cooled_down() -> None:
-    """冷却只管攻击链路。套在扫描上就是纯空转——填空隙正是它存在的理由。"""
+def test_scanning_is_not_cooled_down_just_for_having_run() -> None:
+    """跑完就冷却的话就是纯空转——填空隙正是它存在的理由。"""
     recent = {MissionKind.SCAN: NOW - timedelta(seconds=1)}
     assert status(MissionKind.SCAN, last_started_at_utc=recent) is TaskStatus.READY
+
+
+def test_a_scan_that_just_crashed_says_cooling_down_not_waiting_for_lines() -> None:
+    """崩过之后它也要等一轮冷却，而那句话必须说对是哪一种等。
+
+    「等航线」对扫描是句假话（它压根不派遣），用户照着去调航线数只会白调。
+    """
+    just_crashed = status(
+        MissionKind.SCAN,
+        free_lines=0,
+        # 它刚跑过、且从来不派遣，所以「上一轮空手而归」对它恒为真——正是这一点
+        # 会把它误判成「等航线」。
+        last_started_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=15)},
+        last_failure_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=14)},
+        next_line_free_at_utc=NOW + timedelta(minutes=20),
+    )
+
+    assert just_crashed is TaskStatus.COOLING_DOWN
 
 
 def test_scanning_is_ready_even_with_no_lines() -> None:

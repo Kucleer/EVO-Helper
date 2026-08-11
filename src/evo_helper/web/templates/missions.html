@@ -116,6 +116,15 @@
           <td>
             <span class="chip mission-status"><span class="glyph" aria-hidden="true">·</span><span class="mission-status-word">读取中</span></span>
             <div class="muted mission-detail" style="font-size:11px"></div>
+            {#
+              自动停用是对**当时那一阵**的判定，不是墓碑：连崩三次多半是「窗口
+              抢不到前台」这种环境原因，人回到座位上它就好了。而停用时复选框
+              仍然是勾着的，页面上没有这个按钮的话，用户只能靠「取消勾选再勾回来」
+              猜出恢复的办法。PATCH `enabled: true` 会连 `disabled_reason` 和
+              连续失败计数一起清掉（参数不合格的话照样会被 400 拦下）。
+            #}
+            <button class="btn small mission-revive" type="button" style="margin-top:6px"
+                    hidden>恢复</button>
             {% if kind == 'BOT' %}
               {#
                 bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人
@@ -284,6 +293,10 @@
       // 「已完成」这个判断由服务端给出，页面只认那个词。
       if (newRound) newRound.hidden = task.status !== '已完成';
 
+      // 同上，「已停用」也由服务端判。停用时复选框仍然是勾着的，所以「再勾一次」
+      // 这条恢复路径在页面上本来看不见——这个按钮就是把它显式化。
+      row.querySelector('.mission-revive').hidden = task.status !== '已停用';
+
       if (!paramsPrimed) {
         for (const input of row.querySelectorAll('.mission-param')) {
           const value = task.params[input.dataset.param];
@@ -339,6 +352,10 @@
   rows.addEventListener('click', (event) => {
     const button = event.target.closest('.mission-new-round');
     if (button) command(button.dataset.endpoint);
+    const revive = event.target.closest('.mission-revive');
+    // 走的是和复选框同一个 PATCH：`enabled: true` 顺带清掉停用原因与失败计数，
+    // 而参数不合格的链路照样会被 400 拦下（错误显示在下面那条红字里）。
+    if (revive) patch(revive.closest('.mission-row').dataset.kind, { enabled: true });
   });
 
   rows.addEventListener('change', (event) => {

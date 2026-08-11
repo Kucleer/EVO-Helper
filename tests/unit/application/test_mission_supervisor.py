@@ -18,7 +18,7 @@ from evo_helper.application.mission_supervisor import (
     SupervisorBusyError,
     log_path_for,
 )
-from evo_helper.domain.scheduler import MissionKind
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, MissionKind
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
@@ -198,6 +198,55 @@ def test_a_crashed_process_is_not_restarted_either() -> None:
     # 非 0 也算它自己退的：`stopped_by` 记的是「谁把它停了」，成败看 `exit_code`。
     assert exited.stopped_by is StopReason.SELF
     assert len(spawned) == 1
+
+
+def test_a_crash_counts_as_a_failure() -> None:
+    """`failed` 是连续失败自停唯一的判据，正面这一半必须钉住。
+
+    少了它，下面那两条豁免可以退化成「什么都不算失败」而没人发现——那样真坏了
+    也永远不会停用，调度循环会在一个坏掉的任务上满速空转地重启。
+    """
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    spawned[0].exit_code = 1
+
+    exited = supervisor.poll()
+
+    assert exited is not None and exited.failed
+
+
+def test_being_stopped_by_us_is_never_a_failure() -> None:
+    """抢占、用户点停、控制台关闭：我们自己动的手，任务本身没毛病。
+
+    实机 2026-08-11 01:16–01:32 扫描被抢占了 7 次（`terminate()` 之后退出码
+    照样是 1）。算进去的话，最该一直有活干、也最容易被抢占的那条链路，三次就
+    被自动停用了。
+    """
+    for reason in (StopReason.PREEMPTED, StopReason.USER, StopReason.SHUTDOWN):
+        supervisor, spawned = make()
+        supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+
+        exited = supervisor.stop(reason)
+
+        assert exited is not None
+        assert exited.exit_code != 0, "terminate() 之后退出码非 0，豁免不能靠它"
+        assert not exited.failed
+
+
+def test_the_environment_busy_code_is_not_a_failure() -> None:
+    """runner 明说「这会儿轮不到我」（用户正在用别的窗口）不算它坏了。
+
+    ⚠️ 豁免只认这一个码。`1` 仍然是故障——见上面那条正面用例。
+    """
+    supervisor, spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    spawned[0].exit_code = EXIT_ENVIRONMENT_BUSY
+
+    exited = supervisor.poll()
+
+    assert exited is not None
+    assert exited.stopped_by is StopReason.SELF
+    assert not exited.failed
 
 
 def test_polling_after_the_exit_was_collected_reports_nothing_again() -> None:
