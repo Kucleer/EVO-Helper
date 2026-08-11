@@ -50,6 +50,7 @@ from evo_helper.tools.pirate_loop import (
     PANEL_DRAG_TO_Y,
     LoopOptions,
     PirateLoop,
+    TargetCheck,
     slow_drag,
 )
 
@@ -80,6 +81,12 @@ class BotLoop(PirateLoop):
     #: 一发都没派出去过的。
     ATTACK_BUTTON: tuple[int, int] = pirate_ui.BOT_ATTACK_BUTTON
 
+    #: bot 这边**两种认不出都自愈**（父类只对 `MISMATCH` 自愈）。理由和海盗那边
+    #: 正好相反：目标是扫描库里已经记过的 bot，站上去读不出 bot 本身就是异常，
+    #: 而不是常态；而且一轮只有几个目标，多复位一次的代价远小于漏派一发。
+    #: 这也保住了这条路径实机验证过的行为——原先失败就重试，不分是哪一种。
+    RETRY_CHECKS: frozenset[TargetCheck] = frozenset({TargetCheck.MISMATCH, TargetCheck.ABSENT})
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
         super().__init__(
@@ -90,49 +97,17 @@ class BotLoop(PirateLoop):
             ),
         )
         self._bot = options
-        self._coord_dumps = 0
 
     # -- 识别 ---------------------------------------------------------------
 
-    #: 坐标核对失败时最多存这么多张现场图。实机踩过一次「连续 44 个目标全部核对
-    #: 不过」，不设上限会写出上百张几乎一样的图；前几张就够定位了。
-    MAX_COORD_DUMPS: int = 3
-
-    def _goto_confirmed(self, coordinate: Coordinate) -> bool:
-        """导航过去并核对面板；核对不过就复位画面再试一次。
-
-        实机（2026-08-11 00:55–01:08）：第一个目标走到派遣面板时预设条读成空，
-        之后**连续 44 个目标**每一次坐标核对都不过，读数一律多出个 `:9` 前缀——
-        画面从某一刻起整体偏了。而每个目标只试一次、失败就跳下一个，于是这 13
-        分钟一发都没派出去，日志里也只有一行文字、连张图都没留。
-
-        判据本身没有放松的余地：那一轮里有一次读到的是**上一个目标的星系**
-        （请求 2:321:5，面板显示 2:320:5），放松判据就等于打错星球。能改的只是
-        失败之后怎么办——把浮层关掉、重新导航、再读一次。
-        """
-        self._navigator.goto(coordinate)
-        if self.is_bot_target(coordinate):
-            return True
-        say("  复位画面后重试一次")
-        # 先看会话还在不在。掉线时这一屏是 START 登录页，面板**永远**读不出来，
-        # 复位和重新导航都是白费——实机（2026-08-11 02:11）就这么对着登录页把
-        # 目标一个个试下去，每个 ~35 秒，日志里全是「面板读作 ''」。
-        reconnected = self._ensure_session(force=True)
-        self._reset_to_known_screen()
-        if reconnected and not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError("重连后切不到恒星系视图；安全停止")
-        # 清缓存是这条重试的**全部意义**。导航器认为某个字段已经对了就不去重设，
-        # 所以只要它的记忆和导航栏实际值分了岔，不清缓存的重试会一字不差地重演
-        # 上一次的失败——实机验证过：重试读回来的还是那个 `[9:137:12]`。
-        self._navigator.invalidate()
-        self._navigator.goto(coordinate)
-        return self.is_bot_target(coordinate)
-
-    def is_bot_target(self, coordinate: Coordinate) -> bool:
-        """行星面板上是不是这个 bot。
+    def check_target(self, coordinate: Coordinate) -> TargetCheck:
+        """行星面板上是不是这个 bot。自愈由父类的 `_goto_checked` 统一管。
 
         名字与坐标都要核，判据与坐标扫描器共用一套（`vision.scan_reading`）：
         导航栏偶尔会停在别的位号上，那时面板是真的、只是不是请求的那一位。
+
+        判据本身没有放松的余地：实机那一轮里有一次读到的是**上一个目标的星系**
+        （请求 2:321:5，面板显示 2:320:5），放松判据就等于打错星球。
         """
         from evo_helper.game.system_navigator import crop_reader
         from evo_helper.vision.scan_reading import read_panel_confirming
@@ -141,16 +116,12 @@ class BotLoop(PirateLoop):
         panel = read_panel_confirming(crop_reader(self._driver.capture(), self._ocr), requested)
         if not panel.confirms(requested):
             say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
-            # 只有一行文字复盘不了「画面到底成了什么样」——实机那 13 分钟就是这么
-            # 白丢的。存图，但要封顶，否则一轮能写出上百张几乎一样的现场。
-            if self._coord_dumps < self.MAX_COORD_DUMPS:
-                self._coord_dumps += 1
-                self._dump_frame("bot-coord-mismatch")
-            return False
+            self._dump_coord_mismatch("bot-coord-mismatch")
+            return TargetCheck.MISMATCH
         if not panel.is_bot:
             say(f"  {coordinate} 不是 bot（面板名 {panel.display_name!r}）")
-            return False
-        return True
+            return TargetCheck.ABSENT
+        return TargetCheck.CONFIRMED
 
     # -- 判定 ---------------------------------------------------------------
 
@@ -248,7 +219,7 @@ class BotLoop(PirateLoop):
 
     def _probe(self, coordinate: Coordinate) -> None:
         """派一发探路。走的是攻击链路，所以简报上写的是「攻击」。"""
-        if not self._goto_confirmed(coordinate):
+        if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             return
         self._outcome.pirates.append(coordinate)
         if not self._bot.probe:
@@ -272,7 +243,7 @@ class BotLoop(PirateLoop):
             self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
             self._mark_skipped(coordinate)
             return
-        if not self._goto_confirmed(coordinate):
+        if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return
         self.attack(coordinate, preset=preset)

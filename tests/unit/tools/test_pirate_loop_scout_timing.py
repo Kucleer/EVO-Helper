@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop
+from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, TargetCheck
 
 
 class _Navigator:
@@ -37,7 +37,11 @@ def _loop(events: list[str], *, scout: bool, pirates_at: set[int]) -> PirateLoop
     loop._options = LoopOptions(systems=((2, 137),), scout=scout, attack=True)  # type: ignore[attr-defined]
     loop._outcome = Outcome()  # type: ignore[attr-defined]
     loop._navigator = _Navigator(events)  # type: ignore[attr-defined]
-    loop.is_pirate = lambda c: c.position in pirates_at  # type: ignore[assignment, method-assign]
+
+    def _check(coordinate: Coordinate) -> TargetCheck:
+        return TargetCheck.CONFIRMED if coordinate.position in pirates_at else TargetCheck.ABSENT
+
+    loop.check_target = _check  # type: ignore[assignment, method-assign]
 
     def _scout(coordinate: Coordinate) -> bool:
         events.append(f"scout {coordinate.position}")

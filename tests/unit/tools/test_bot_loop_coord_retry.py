@@ -17,6 +17,11 @@
 的是 `2:321:5`。那一次核对拦对了；放松成「位次对上就行」就是往错误的星球扔舰队。
 
 所以这里钉两件事：失败之后会复位画面重试一次；以及存现场，但有封顶。
+
+⚠️ bot 这条链路**两种认不出都自愈**（`BotLoop.RETRY_CHECKS`），和海盗那边只对
+`MISMATCH` 自愈不同：这边的目标是扫描库里已经记过的 bot，站上去读不出 bot 本身
+就是异常。这是实机验证过的行为，`TargetCheck` 三值化不许把它改掉——
+`test_an_absent_bot_also_retries` 钉的就是这一条。
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from typing import Any
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop
+from evo_helper.tools.pirate_loop import TargetCheck
 
 TARGET = Coordinate(2, 321, 5)
 
@@ -40,13 +46,13 @@ class _Navigator:
         self._events.append("清缓存")
 
 
-def _loop(events: list[str], verdicts: list[bool]) -> Any:
+def _loop(events: list[str], verdicts: list[TargetCheck]) -> Any:
     loop = BotLoop.__new__(BotLoop)
     loop._navigator = _Navigator(events)  # type: ignore[attr-defined]
 
-    def _confirm(_coordinate: Coordinate) -> bool:
+    def _confirm(_coordinate: Coordinate) -> TargetCheck:
         verdict = verdicts.pop(0)
-        events.append(f"核对 {'过' if verdict else '不过'}")
+        events.append(f"核对 {verdict.value}")
         return verdict
 
     def _reset() -> None:
@@ -56,7 +62,7 @@ def _loop(events: list[str], verdicts: list[bool]) -> Any:
         events.append("查会话")
         return False
 
-    loop.is_bot_target = _confirm  # type: ignore[assignment, method-assign]
+    loop.check_target = _confirm  # type: ignore[assignment, method-assign]
     loop._reset_to_known_screen = _reset  # type: ignore[assignment, method-assign]
     loop._ensure_session = _session  # type: ignore[assignment, method-assign]
     return loop
@@ -65,10 +71,20 @@ def _loop(events: list[str], verdicts: list[bool]) -> Any:
 def test_a_clean_read_costs_nothing_extra() -> None:
     """第一次就过的话不许多走一趟——稳态是绝大多数情况。"""
     events: list[str] = []
-    loop = _loop(events, [True])
+    loop = _loop(events, [TargetCheck.CONFIRMED])
 
-    assert loop._goto_confirmed(TARGET) is True
-    assert events == ["goto 321", "核对 过"]
+    assert loop._goto_checked(TARGET) is TargetCheck.CONFIRMED
+    assert events == ["goto 321", "核对 认出目标"]
+
+
+def test_an_absent_bot_also_retries() -> None:
+    """bot 认不出（不是坐标问题）同样要自愈——这条链路原本就是这么跑的。"""
+    events: list[str] = []
+    loop = _loop(events, [TargetCheck.ABSENT, TargetCheck.CONFIRMED])
+
+    assert loop._goto_checked(TARGET) is TargetCheck.CONFIRMED
+    assert events.count("复位画面") == 1
+    assert events.count("清缓存") == 1
 
 
 def test_a_failed_read_resets_the_screen_and_retries() -> None:
@@ -80,26 +96,26 @@ def test_a_failed_read_resets_the_screen_and_retries() -> None:
     实机验证过：重试读回来的还是同一个 `[9:137:12]`。
     """
     events: list[str] = []
-    loop = _loop(events, [False, True])
+    loop = _loop(events, [TargetCheck.MISMATCH, TargetCheck.CONFIRMED])
 
-    assert loop._goto_confirmed(TARGET) is True
+    assert loop._goto_checked(TARGET) is TargetCheck.CONFIRMED
     assert events == [
         "goto 321",
-        "核对 不过",
+        "核对 坐标核对不过",
         "查会话",
         "复位画面",
         "清缓存",
         "goto 321",
-        "核对 过",
+        "核对 认出目标",
     ]
 
 
 def test_it_gives_up_after_one_retry() -> None:
     """重试一次就够。无限重试会把整轮卡死在一个目标上，比跳过还糟。"""
     events: list[str] = []
-    loop = _loop(events, [False, False])
+    loop = _loop(events, [TargetCheck.MISMATCH, TargetCheck.MISMATCH])
 
-    assert loop._goto_confirmed(TARGET) is False
+    assert loop._goto_checked(TARGET) is TargetCheck.MISMATCH
     assert events.count("复位画面") == 1
     assert events.count("goto 321") == 2
 
@@ -115,7 +131,7 @@ class _Driver:
 
 
 def _confirming_loop(monkeypatch: Any, *, confirms: bool) -> tuple[Any, list[str]]:
-    """一个 `is_bot_target` 走真实实现、但读数与截屏都被替掉的循环。"""
+    """一个 `check_target` 走真实实现、但读数与截屏都被替掉的循环。"""
     dumped: list[str] = []
 
     class _Panel:
@@ -149,7 +165,7 @@ def test_a_mismatch_leaves_a_frame_behind(monkeypatch: Any) -> None:
     """一行文字复盘不了画面。核对不过就要有图。"""
     loop, dumped = _confirming_loop(monkeypatch, confirms=False)
 
-    assert loop.is_bot_target(TARGET) is False
+    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
     assert dumped == ["bot-coord-mismatch"]
 
 
@@ -158,7 +174,7 @@ def test_dumps_are_capped(monkeypatch: Any) -> None:
     loop, dumped = _confirming_loop(monkeypatch, confirms=False)
 
     for _ in range(10):
-        loop.is_bot_target(TARGET)
+        loop.check_target(TARGET)
 
     assert len(dumped) == BotLoop.MAX_COORD_DUMPS
 
@@ -166,5 +182,5 @@ def test_dumps_are_capped(monkeypatch: Any) -> None:
 def test_a_passing_read_dumps_nothing(monkeypatch: Any) -> None:
     loop, dumped = _confirming_loop(monkeypatch, confirms=True)
 
-    assert loop.is_bot_target(TARGET) is True
+    assert loop.check_target(TARGET) is TargetCheck.CONFIRMED
     assert dumped == []
