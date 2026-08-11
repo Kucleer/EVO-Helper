@@ -16,6 +16,21 @@ MISSION_LABELS: dict[str, str] = {
 }
 
 
+#: 任务参数在界面上的名字。
+#:
+#: 键是 `mission_tasks.params_json` 里的字段名，也就是 `domain.missions` 那几个
+#: 换算函数的形参名。配置固化记录要把「改了什么」念给人听，而
+#: `first_system 100 → 120` 里那个英文字段名，页面上从来没出现过——参数框旁边
+#: 写的是「起始系号」。认不出来的键回落到原样显示：宁可露出一个英文字段名，
+#: 也不要把一条真的发生过的改动从记录里吞掉。
+PARAM_LABELS: dict[str, str] = {
+    "radius": "半径",
+    "galaxy": "星系",
+    "first_system": "起始系号",
+    "last_system": "结束系号",
+}
+
+
 #: 八档状态各自的 chip 色调与字形。
 #:
 #: 键是 `TaskStatus` 的**每一个**成员，一个都不许缺——调度台按状态上色，

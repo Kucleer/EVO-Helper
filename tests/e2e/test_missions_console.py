@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from evo_helper.application.mission_freeze import MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.domain.scheduler import MissionKind, TaskStatus
@@ -58,7 +59,11 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         factory,
         local_token=TOKEN,
         mission_scheduler=MissionScheduler(
-            SqlAlchemyRepository(factory), supervisor, clock=lambda: NOW
+            SqlAlchemyRepository(factory),
+            supervisor,
+            clock=lambda: NOW,
+            # 临时目录：测试不许往仓库里落文件。
+            freeze_log=MissionFreezeLog(tmp_path / "freezes.jsonl"),
         ),
         # 后台 tick 先 sleep 再 tick，推到一小时就等于「测试期间不会自己跑」。
         tick_interval_s=3600.0,
@@ -174,6 +179,62 @@ def test_the_page_lists_the_mission_run_history(client: TestClient) -> None:
     assert "运行历史" in html
     assert "结束方式" in html
     assert "退出码" in html
+
+
+def test_the_page_disables_every_edit_control_while_running(client: TestClient) -> None:
+    """运行中把输入框、复选框、拖拽把手一并置灰。
+
+    后端已经 409 拒了（`tests/integration/api/test_scheduler_api.py`），但只拒不
+    置灰的话，用户要改完、按下回车、看见一条红字才知道白改了。页面这一侧是同一
+    条规则的**提前显形**，不是第二份判据——灰不灰由接口下发的 `config_locked`
+    决定，页面不自己判断调度器在不在跑。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "config_locked" in body
+    for control in (".mission-param", ".mission-enabled"):
+        assert control in body, control
+    # 拖拽认的是 `draggable` 属性，所以锁上必须真的去改它，不能只把把手画灰。
+    assert "setAttribute('draggable'" in body
+    assert "disabled = locked" in body
+
+
+def test_the_page_says_why_the_controls_are_grey(client: TestClient) -> None:
+    """只置灰不解释，用户只会得出「这页坏了」。"""
+    body = _page_body(client.get("/missions").text)
+
+    assert "运行中" in body
+    assert "结束" in body
+    # 「恢复」那条口子也得说出口：它是运行中唯一还能按的按钮。
+    assert "恢复" in body
+
+
+def test_the_revive_button_survives_the_lock(client: TestClient) -> None:
+    """一条链路可能在调度器跑着的时候被自动停用，那时用户最需要恢复它。
+
+    显隐只看 `status === '已停用'`，**不看锁**——跟着锁一起藏起来的话，运行中
+    被自动停用的链路在页面上就再没有恢复的办法。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    lines = [line for line in body.splitlines() if ".mission-revive" in line]
+    assert lines, "页面上没有恢复按钮了"
+    assert any("已停用" in line for line in lines), "恢复按钮的显隐不再看「已停用」"
+    for line in lines:
+        assert "locked" not in line, line
+        assert "disabled" not in line, line
+
+
+def test_the_page_shows_the_frozen_configuration_record(client: TestClient) -> None:
+    """「记录任务内容」得有个看得见的入口，否则记了也等于没记。"""
+    html = client.get("/missions").text
+
+    assert "配置固化记录" in html
+    assert "与上一次相比" in html
+    # 记录落在磁盘上的位置写出来：控制台没开也要查得到。这里是夹具注入的那个
+    # 临时文件名；生产默认走 `DEFAULT_FREEZE_LOG`，由
+    # `test_the_console_writes_its_freezes_under_var` 钉住。
+    assert "freezes.jsonl" in html
 
 
 def test_the_page_does_not_recompute_the_scheduling_criteria(client: TestClient) -> None:

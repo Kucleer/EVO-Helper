@@ -308,6 +308,35 @@ class MissionRunView:
 
 
 @dataclass(frozen=True)
+class FrozenTaskView:
+    """配置固化记录里的一行。
+
+    刻意**不带 status / detail**：那两样是「现在怎么样」，而这条记录说的是
+    「当时填的是什么」。混在一起，一份两天前的记录会摆出今天的状态。
+    """
+
+    kind: str
+    label: str
+    enabled: bool
+    priority: int
+    params: dict[str, int]
+    #: 参数的人话回显，**只从固化的那份参数算**，不查库：
+    #: 「半径 8」「2:100 – 2:200」。查库算出来的是今天的库，不是当时的。
+    summary: str
+
+
+@dataclass(frozen=True)
+class ConfigFreezeView:
+    """一次「开始」固化下来的配置，翻成页面能直接摆出来的样子。"""
+
+    frozen_at_utc: datetime
+    tasks: tuple[FrozenTaskView, ...]
+    #: 与**上一次「开始」**相比改了什么，每条一句人话。空元组表示没改过；
+    #: 头一条记录是 `("首次记录",)`——「没改过」和「没得比」不是一回事。
+    changes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SchedulerView:
     running: bool
     #: 点「开始」的时刻，供页面上那块秒表。停着时为 None。
@@ -316,6 +345,11 @@ class SchedulerView:
     #: 上次没走正常关闭路径留下的进程号。**只显示给人看**，不据此杀进程。
     orphan_pid: int | None
     tasks: tuple[MissionTaskView, ...]
+    #: 任务配置现在改不改得动。页面据此把输入框、复选框、拖拽把手置灰——
+    #: 让用户改完才发现没生效，比一开始就不给改糟得多。
+    config_locked: bool = False
+    #: 本轮开始那一刻固化的配置。停着时为 None。
+    frozen_config: ConfigFreezeView | None = None
 
 
 class ApplicationService(Protocol):

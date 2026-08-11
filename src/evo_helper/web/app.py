@@ -19,6 +19,7 @@ from pydantic import BeforeValidator
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import Lifespan
 
+from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
@@ -34,6 +35,7 @@ from .display import LIST_SHIP_COLUMNS, MISSION_LABELS, STATUS_GLYPHS, STATUS_TO
 from .persistent_service import MissionConsoleService, PersistentApplicationService
 from .schemas import (
     BotTargetOut,
+    ConfigFreezeOut,
     CoordinateModel,
     CoordinateScanOut,
     CurrentMissionOut,
@@ -42,6 +44,7 @@ from .schemas import (
     FleetDiffOut,
     FleetEntryOut,
     FleetSnapshotOut,
+    FrozenTaskOut,
     MissionTaskOut,
     MissionTaskPatch,
     RevisitIn,
@@ -63,11 +66,13 @@ from .service import (
     SHANGHAI,
     ApplicationService,
     BotTargetView,
+    ConfigFreezeView,
     FakeApplicationService,
     FleetChangeView,
     FleetDiffView,
     FleetEntryView,
     FleetSnapshotView,
+    FrozenTaskView,
     MissionTaskView,
     NotFoundError,
     PlanPatchView,
@@ -592,6 +597,13 @@ def create_app(
                 "status_tones": STATUS_TONES,
                 "status_glyphs": STATUS_GLYPHS,
                 "runs": [] if console is None else console.recent_runs(limit=50),
+                # 历次「开始」固化下来的配置。**本轮**那一份不在这里，它由
+                # /api/scheduler 随状态一起下发——刚点完「开始」就要看得见，
+                # 而这一段只有刷新整页才会变。
+                "freezes": [] if console is None else console.recent_config_freezes(limit=20),
+                # 那份记录落在磁盘上的什么地方。写出来是为了让「能查」不依赖
+                # 控制台还开着——出事的时候用记事本也打得开。
+                "freeze_log_path": None if console is None else console.freeze_log_path(),
             },
         )
 
@@ -837,6 +849,25 @@ def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
     )
 
 
+def _frozen_task_out(task: FrozenTaskView) -> FrozenTaskOut:
+    return FrozenTaskOut(
+        kind=task.kind,
+        label=task.label,
+        enabled=task.enabled,
+        priority=task.priority,
+        params=task.params,
+        summary=task.summary,
+    )
+
+
+def _config_freeze_out(freeze: ConfigFreezeView) -> ConfigFreezeOut:
+    return ConfigFreezeOut(
+        frozen_at_utc=freeze.frozen_at_utc,
+        tasks=[_frozen_task_out(task) for task in freeze.tasks],
+        changes=list(freeze.changes),
+    )
+
+
 def _scheduler_out(view: SchedulerView) -> SchedulerOut:
     return SchedulerOut(
         running=view.running,
@@ -853,6 +884,10 @@ def _scheduler_out(view: SchedulerView) -> SchedulerOut:
         ),
         orphan_pid=view.orphan_pid,
         tasks=[_mission_task_out(task) for task in view.tasks],
+        config_locked=view.config_locked,
+        frozen_config=(
+            None if view.frozen_config is None else _config_freeze_out(view.frozen_config)
+        ),
     )
 
 
@@ -957,6 +992,10 @@ def create_persistent_app(
         SqlAlchemyRepository(session_factory),
         MissionSupervisor(),
         origin=resolved.origin_coordinate,
+        # 只有这里给固化记录一个真的文件。默认（`MissionScheduler` 自己建的
+        # 那个）只留在内存里——往仓库里写文件必须是组装点明确决定的事，
+        # 否则每一次跑测试都会在工作区里落下一个文件。
+        freeze_log=MissionFreezeLog(DEFAULT_FREEZE_LOG),
     )
 
     @asynccontextmanager
