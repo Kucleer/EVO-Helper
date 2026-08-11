@@ -17,6 +17,7 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop, BotOptions
+from evo_helper.tools.pirate_loop import TargetCheck
 
 A = Coordinate(2, 149, 17)
 B = Coordinate(2, 149, 18)
@@ -292,7 +293,9 @@ def test_the_tier_uses_the_stored_total_without_a_second_mailbox_trip() -> None:
     loop._ensure_run = lambda: (_StoredUnits(5360), None)
     loop.read_defender_units = lambda coordinate: pytest.fail("库里有数就不该再进信箱")
     attacked: list[tuple[Coordinate, str]] = []
-    loop._goto_confirmed = lambda coordinate: True
+    # 合流后 `_tier_and_attack` 走父类的 `_goto_checked`（两条链路共用的自愈）。
+    # 这两条测试钉的是「分档的数从哪来」，导航不在范围内，桩掉即可。
+    loop._goto_checked = lambda coordinate: TargetCheck.CONFIRMED
     loop.attack = lambda coordinate, *, preset: attacked.append((coordinate, preset))
 
     loop._tier_and_attack(A)
@@ -308,7 +311,9 @@ def test_the_tier_falls_back_to_the_mailbox_when_the_row_has_no_total() -> None:
     loop._ensure_run = lambda: (_StoredUnits(None), None)
     loop.read_defender_units = lambda coordinate: 9000
     attacked: list[tuple[Coordinate, str]] = []
-    loop._goto_confirmed = lambda coordinate: True
+    # 合流后 `_tier_and_attack` 走父类的 `_goto_checked`（两条链路共用的自愈）。
+    # 这两条测试钉的是「分档的数从哪来」，导航不在范围内，桩掉即可。
+    loop._goto_checked = lambda coordinate: TargetCheck.CONFIRMED
     loop.attack = lambda coordinate, *, preset: attacked.append((coordinate, preset))
 
     loop._tier_and_attack(A)
