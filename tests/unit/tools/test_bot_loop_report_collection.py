@@ -1,4 +1,9 @@
-"""进信箱收探路战报这一趟：怎么进、翻多少、开哪几封、怎么认、怎么入库。
+"""进信箱收战报这一趟：怎么进、翻多少、开哪几封、怎么认、怎么入库。
+
+**探路发与攻击发共用这一趟**，这里的每一条对两种发都成立：两种发打的是同一个坐标、
+走的是同一条攻击链路、报告主题同为「攻击报告」，认归属靠的都是 VS 块里的目标坐标。
+这条路径上从头到尾没有一处读得到「这一份是哪个预设打的」——也不需要读。
+「哪些目标交进来收」在 `test_bot_loop.py`（分态路由）那一侧。
 
 翻信箱的动作两条链路共用（`PirateLoop._scan_mail_rows`），这里守的是 bot 这一侧：
 
@@ -256,7 +261,7 @@ def _ingesting_loop(repository: _Repository, bottom: Any = None) -> Any:
 def test_a_readable_report_is_stored() -> None:
     repository = _Repository()
 
-    assert _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A)) is True
+    assert _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A)) is True
     assert len(repository.appended) == 1
 
 
@@ -268,7 +273,7 @@ def test_a_report_pointing_elsewhere_is_refused() -> None:
     """
     repository = _Repository()
 
-    assert _ingesting_loop(repository)._ingest_probe_report(B, _DetailScreens(A)) is False
+    assert _ingesting_loop(repository)._ingest_battle_report(B, _DetailScreens(A)) is False
     assert repository.appended == []
 
 
@@ -277,7 +282,7 @@ def test_an_already_stored_report_is_not_appended_again() -> None:
     于是下一趟又读同一封——没有这道去重，它会每趟复制一行。"""
     repository = _Repository(already_stored=True)
 
-    assert _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A)) is False
+    assert _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A)) is False
     assert repository.appended == []
 
 
@@ -292,9 +297,9 @@ def test_an_unreadable_report_is_skipped_and_dumped() -> None:
     dumped: list[str] = []
     loop._dump_frame = lambda name, roi=None: dumped.append(name)
 
-    assert loop._ingest_probe_report(A, _DetailScreens(A, header="装饰文字")) is False
+    assert loop._ingest_battle_report(A, _DetailScreens(A, header="装饰文字")) is False
     assert repository.appended == []
-    assert dumped == ["probe-report-unreadable"]
+    assert dumped == ["battle-report-unreadable"]
 
 
 class _DetailScreens:
@@ -362,7 +367,7 @@ def test_the_computed_outcome_reaches_the_stored_report() -> None:
     repository = _Repository()
     bottom = _DetailScreens(A, units=("1", "319"), losses=("1", "0"))
 
-    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
 
     assert repository.appended[0].outcome == "FAIL"
     assert (repository.appended[0].attacker_losses, repository.appended[0].defender_losses) == (
@@ -375,7 +380,7 @@ def test_a_wiped_out_defender_is_a_victory() -> None:
     repository = _Repository()
     bottom = _DetailScreens(A, units=("100", "783"), losses=("0", "783"))
 
-    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
 
     assert repository.appended[0].outcome == "VICTORY"
 
@@ -385,7 +390,7 @@ def test_both_sides_surviving_is_a_draw() -> None:
     repository = _Repository()
     bottom = _DetailScreens(A, units=("100", "783"), losses=("30", "200"))
 
-    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
 
     assert repository.appended[0].outcome == "DRAW"
 
@@ -399,7 +404,7 @@ def test_an_uncomputable_outcome_stores_nothing_rather_than_a_defeat() -> None:
     """
     repository = _Repository()
 
-    _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A, banner="FAIL"))
+    _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A, banner="FAIL"))
 
     assert repository.appended[0].outcome is None
 
@@ -413,7 +418,7 @@ def test_the_units_come_from_the_scrolled_screen_when_the_first_one_has_none() -
     repository = _Repository()
     bottom = _DetailScreens(A, units=("1", "319"))
 
-    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
 
     assert repository.appended[0].defender_units == 319
 
@@ -428,7 +433,7 @@ def test_the_unscrolled_screen_wins_when_it_already_has_the_units() -> None:
     repository = _Repository()
     bottom = _DetailScreens(A, units=("9", "9"))
 
-    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A))
 
     assert repository.appended[0].defender_units == 5360
 
@@ -439,7 +444,7 @@ def test_units_that_neither_screen_shows_stay_empty() -> None:
     """
     repository = _Repository()
 
-    _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
 
     assert repository.appended[0].defender_units is None
 
@@ -466,7 +471,7 @@ def test_a_report_that_is_not_due_yet_says_so_instead_of_blaming_the_window() ->
     original = module.say
     module.say = said.append
     try:
-        loop.collect_probe_reports((A,))
+        loop.collect_battle_reports((A,))
     finally:
         module.say = original
 
@@ -491,7 +496,7 @@ def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> Non
     original = module.say
     module.say = said.append
     try:
-        loop.collect_probe_reports((A,))
+        loop.collect_battle_reports((A,))
     finally:
         module.say = original
 
@@ -521,7 +526,7 @@ def test_the_mail_trip_floor_is_the_dispatch_time_not_the_expected_report_time()
     original = module.say
     module.say = lambda _line: None
     try:
-        loop.collect_probe_reports((A,))
+        loop.collect_battle_reports((A,))
     finally:
         module.say = original
 

@@ -150,6 +150,46 @@ def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repositor
     )
 
 
+def test_the_attack_report_is_what_finishes_the_target(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**分档打出去的那一发，它的战报才是这个目标的终点。**
+
+    探路那一发闭合只把目标推到 `NEEDS_ATTACK`；真打那一发派出去之后，目标进
+    `AWAITING_ATTACK_REPORT`，而**只有把它的战报入库**才到得了 `DONE`。
+    调度器数「还有几个没走完」用的就是这条（`mission_scheduler._bot_remaining`），
+    所以没人去收攻击战报时，这一轮在调度器眼里永远没跑完，攻击日志上那一行也
+    永远停在「战果 待战报」（实机 2026-08-11，AAA 那一发）。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+    attack_at = ROUND_START + timedelta(minutes=20)
+    _intent(repository, run_id, preset="AAA", created_at=attack_at)
+
+    waiting = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
+    assert phase_of(waiting) is BotPhase.AWAITING_ATTACK_REPORT
+
+    _close_dispatch_at(repository, attack_at)
+
+    assert (
+        phase_of(repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW))
+        is BotPhase.DONE
+    )
+
+
+def test_the_mail_floor_follows_the_attack_dispatch(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """等攻击战报时，翻信箱的时间下界是**攻击那一发的派出时刻**。
+
+    收攻击战报走的是同一个 `bot_report_due_at`（`BotLoop.collect_battle_reports`
+    对两种发一视同仁）。探路那一发已经闭合，就不该再把下界拖回它派出的时刻——
+    拖回去只是每趟多翻几屏旧邮件，而那几屏顶头就是它自己那份已入库的探路战报。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+    attack_at = ROUND_START + timedelta(minutes=20)
+    _intent(repository, run_id, preset="AAA", created_at=attack_at)
+
+    due = repository.bot_report_due_at([TARGET], since=ROUND_START)
+
+    assert due[TARGET][0] == attack_at
+
+
 # -- 翻信箱要的两个时刻 ------------------------------------------------------
 
 
@@ -389,6 +429,22 @@ def _intent(  # type: ignore[no-untyped-def]
     if has_report:
         _attach_report(repository, dispatch_id, created_at)
     return intent_id
+
+
+def _close_dispatch_at(repository, dispatched_at: datetime) -> None:  # type: ignore[no-untyped-def]
+    """给这个时刻派出的那一发挂上战报。用于「后来那一发的战报回来了」。"""
+    from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    with repository._session_factory() as session:  # noqa: SLF001
+        dispatch_id = session.scalar(
+            select(orm.AttackDispatchRow.id).where(
+                orm.AttackDispatchRow.dispatched_at_utc == dispatched_at
+            )
+        )
+    assert dispatch_id is not None
+    _attach_report(repository, dispatch_id, dispatched_at)
 
 
 def _attach_report(repository, dispatch_id, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
