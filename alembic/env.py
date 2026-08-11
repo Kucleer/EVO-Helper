@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from alembic import context
 from evo_helper.storage import models  # noqa: F401  # register tables on Base.metadata
 from evo_helper.storage.database import Base
 

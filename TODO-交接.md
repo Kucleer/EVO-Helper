@@ -11,10 +11,14 @@ python -m mypy src
 
 `1026 passed` / 三条 `All checks passed!` / `no issues found in 90 source files`。
 
-> ⚠️ 别用 `ruff check .` / `mypy`（不带参数）当基线。前者会把
-> `.claude/worktrees/` 下的旧 worktree 一起扫进来（文件数 188 → 280，报的全是
-> 旧分支里的问题）；后者会去 site-packages 找包，撞上 `py.typed` 缺失。
-> 两个都不是真回归，CI 一个都不会报。
+> `ruff check .` / `ruff format --check .`（仓库根口径）现在也是干净的，可以拿来
+> 当额外一道关。之前那条「会把 `.claude/worktrees/` 下的旧 worktree 扫进来」的说法
+> **是错的**：`/.claude/` 在 `.gitignore` 里，ruff 默认 `respect-gitignore`，实测在
+> 主检出上跑（旁边挂着好几个活 worktree）报的仍然只有本仓自己的问题。
+>
+> ⚠️ 但 `mypy`（不带参数）仍然不能当基线：`[tool.mypy] packages = ["evo_helper"]`
+> 会让它去 site-packages 找包，撞上 `py.typed` 缺失而整个跳过。CI 和这份文档一律用
+> `mypy src`（90 个文件全查），那条路没这个问题。
 
 ## 这一轮修了什么
 
@@ -128,9 +132,14 @@ workflow / web schema 与 API / 每页都显示的「🔒 演习模式 已锁定
 - 海盗那轮读信箱时报过「切不到自己星球地表」。当时是掉线，现在有重连兜着了，
   但 `_goto_planet_surface` 本身没有重试，还需要观察。
 - #60 里的锚点校验（±5px 警告 / ±20px 拒绝）仍未实现。
-- 仓库根口径的 `ruff check .` 有 4 处、`ruff format --check .` 有 3 处既有告警
+- ~~仓库根口径的 `ruff check .` 有 4 处、`ruff format --check .` 有 3 处既有告警
   （`alembic/env.py` 与三个旧迁移的 import 排序、三份文档里的代码块）。CI 不检查
-  它们，本轮没顺手改，免得把功能提交搅浑。
+  它们，本轮没顺手改，免得把功能提交搅浑。~~ 已做：import 排序按 ruff 自己的判定
+  修好（`alembic` 在本仓被判为 first-party，`src/evo_helper/web/runtime.py` 和另外
+  11 个迁移本来就是这个写法，跟着它走），迁移文件只动 import 行；`HANDOFF.md` 与
+  `SUBAGENT_IMPLEMENTATION.md` 的代码块补了空行。`docs/superpowers/` 整个排除出
+  ruff——那份计划文档里的 ```python 块是故意的片段，格式化会把方法体拉平、把
+  `target_kind=X,` 改写成 `target_kind = (X,)`，等于把文档改错。
 
 ---
 

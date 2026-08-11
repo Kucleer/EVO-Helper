@@ -31,6 +31,7 @@
 
 ```python
 import ctypes
+
 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
 ```
 

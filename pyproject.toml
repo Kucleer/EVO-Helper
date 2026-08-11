@@ -62,6 +62,12 @@ pythonpath = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+# 归档的计划/规格文档：里面的 ```python 块是**故意的片段**——保留原文件里的缩进
+# 用来指明「加在 BotLoop 里」，有的甚至只截了一行调用参数。ruff 0.16 起会格式化
+# Markdown 里的代码块，套在这些片段上会把方法体拉平成模块级函数、把
+# `target_kind=X,` 改写成 `target_kind = (X,)`，直接把文档改错。
+# 这些计划已经执行完、属于历史记录，排除掉比改坏它们划算。
+extend-exclude = ["docs/superpowers/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
