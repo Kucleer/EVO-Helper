@@ -13,6 +13,11 @@
 - **掉线分两种，善后完全不同。** 「连接已断开」点掉弹窗还能接回去；
   「连接已断开，**无法重新连接**」是页面自己宣告没救了，点掉弹窗照样回不去，
   只能关掉窗口重开 Chrome。后者有次数上限，理由见 `MAX_WINDOW_RESTARTS`。
+- **「关窗重开」不只服务于掉线。** 画面上一个「掉线」字样都没有、但视图就是切不
+  回来的时候，调用方原本只能就地抛异常停摆（实机 2026-08-11：读完邮件切不回恒星
+  系视图，整轮退出码 1）。`restart_and_reenter` 就是给这些调用方的同一个出口——
+  用户口径是「切不回就重启，这是兜底策略」。它和掉线那条**共用同一份重开配额**，
+  否则服务端维护时两条路各开各的，配额就拦不住无限重启。
 """
 
 from __future__ import annotations
@@ -190,17 +195,53 @@ class SessionKeeper:
         restarted = False
         if state is ScreenState.DEAD_SESSION:
             # 页面自己写着「无法重新连接」：入口序列救不了它，只能关窗重开。
-            refusal = self._restart_now()
+            refusal = self._restart_now("读到「无法重新连接」：会话已死，点掉弹窗也回不去")
             if refusal is not None:
                 return refusal
             restarted = True
-            # 新窗口停在入口页，不是游戏内——必须重走一遍入口序列，所以这里
-            # 只等到入口序列的某一屏，剩下的交给下面原有的分支。
-            state = self._wait_for(
-                {ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME},
-                RESTART_ENTRY_TIMEOUT_S,
-            )
+            state = self._wait_after_restart()
 
+        return self._walk_entry_sequence(state, restarted=restarted)
+
+    def restart_and_reenter(self, reason: str) -> ReconnectOutcome:
+        """不是掉线，但画面已经没救了——关窗重开，再走一遍入口序列。
+
+        `reconnect` 只在读到「无法重新连接」时才重开，可实机上还有另一类死法：
+        画面上一个「掉线」字样都没有，`classify_screen` 甚至给出 IN_GAME，但视图
+        就是切不回去。调用方原本只能就地抛异常，整轮停摆（2026-08-11：读完邮件
+        切不回恒星系视图，退出码 1）。用户口径是「切不回就重启，这是兜底策略」。
+
+        **配额和日志与掉线那条完全共用**（`_restart_now`）。服务端维护时两条路
+        都会撞上，各记各的账就等于把上限翻倍，正是 `MAX_WINDOW_RESTARTS` 要防的。
+
+        `reason` 是给日志和结局用的人话，说明「是什么把它逼到要重开」。
+
+        ⚠️ 重开之后**不假定**自己已经在游戏内：新窗口停在入口页，照样得走一遍
+        判据驱动的入口序列，认不出就停。「认不出的画面绝不点击」在这条路上一样成立。
+        """
+        refusal = self._restart_now(reason, refusal_state=ScreenState.UNKNOWN)
+        if refusal is not None:
+            return refusal
+        return self._walk_entry_sequence(self._wait_after_restart(), restarted=True)
+
+    def _wait_after_restart(self) -> ScreenState:
+        """等新窗口把画面画出来。
+
+        新窗口停在入口页，不是游戏内——必须重走一遍入口序列，所以这里只等到入口
+        序列的某一屏，剩下的交给 `_walk_entry_sequence`。
+        """
+        return self._wait_for(
+            {ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME},
+            RESTART_ENTRY_TIMEOUT_S,
+        )
+
+    def _walk_entry_sequence(self, state: ScreenState, *, restarted: bool) -> ReconnectOutcome:
+        """从当前这一屏走完入口序列：关弹窗 →「进入」→ START → 游戏内。
+
+        掉线重连和关窗重开的收尾是**同一段**，所以只有这一份。这里面有几条来之
+        不易的细节（固定等待不够、要轮询到出现 START），复制一份就等于把它们
+        留在一份里、丢在另一份里。
+        """
         if state is ScreenState.DISCONNECTED:
             if self._dismiss_disconnect is None:
                 # 没给关闭动作就停在这里，而不是把掉线当成「认不出」——
@@ -240,18 +281,27 @@ class SessionKeeper:
             state, reconnected=False, detail="entry sequence did not reach the game"
         )
 
-    def _restart_now(self) -> ReconnectOutcome | None:
+    def _restart_now(
+        self,
+        reason: str,
+        *,
+        refusal_state: ScreenState = ScreenState.DEAD_SESSION,
+    ) -> ReconnectOutcome | None:
         """关窗重开一次。成功发起返回 None，拒绝或失败则返回要上报的结局。
 
         **重开是有代价的动作，所以每一步都要说话。** 静默重启看起来就是
         「窗口莫名其妙自己关了又开」，事后从日志里根本看不出发生过什么。
+
+        **这是唯一一处重开入口，两条路（死会话 / 视图恢复不了）都从这里走。**
+        配额、日志、失败处理因此天然共用；另开一份计数就等于把上限翻倍。
+        `reason` 由调用方给，好让日志说清是哪一条路把它逼到要重开。
         """
         if self._restart_window is None:
             # 没给重开动作就停在这里，而不是退回去点弹窗——那条路已经证明没用。
             return ReconnectOutcome(
-                ScreenState.DEAD_SESSION,
+                refusal_state,
                 reconnected=False,
-                detail="dead session with no way to restart the game window",
+                detail="no way to restart the game window",
             )
 
         now = self._clock()
@@ -259,12 +309,12 @@ class SessionKeeper:
         minutes = self._restart_budget_window_s / 60
         if len(self._restarts) >= self._max_restarts:
             self._log(
-                f"读到「无法重新连接」，但 {minutes:.0f} 分钟内已经重开过 "
+                f"{reason}，但 {minutes:.0f} 分钟内已经重开过 "
                 f"{len(self._restarts)} 次（上限 {self._max_restarts}）；"
                 "多半是服务端在维护，不再重开，安全停止"
             )
             return ReconnectOutcome(
-                ScreenState.DEAD_SESSION,
+                refusal_state,
                 reconnected=False,
                 detail=(
                     f"restart budget exhausted: {len(self._restarts)}/{self._max_restarts} "
@@ -274,7 +324,7 @@ class SessionKeeper:
 
         self._restarts.append(now)
         self._log(
-            "读到「无法重新连接」：会话已死，点掉弹窗也回不去。"
+            f"{reason}。"
             f"关掉游戏窗口并重开 Chrome（{minutes:.0f} 分钟内第 "
             f"{len(self._restarts)}/{self._max_restarts} 次）"
         )
@@ -285,7 +335,7 @@ class SessionKeeper:
             # 会被无限重试，正是这里要防的那种循环。
             self._log(f"关窗重开失败：{failure}；停止而不是接着重试")
             return ReconnectOutcome(
-                ScreenState.DEAD_SESSION,
+                refusal_state,
                 reconnected=False,
                 detail=f"restarting the game window failed: {failure}",
             )

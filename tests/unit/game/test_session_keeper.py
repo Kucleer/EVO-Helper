@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from evo_helper.game.session_keeper import (
     HEALTH_CHECK_INTERVAL_S,
     MAX_WINDOW_RESTARTS,
@@ -438,6 +440,157 @@ class TestRestartIsLoud:
         keeper(recorder, restart_window=_Restarter(), log=said.append).reconnect()
 
         assert said == []
+
+
+class TestRestartAndReenter:
+    """画面恢复不了时的兜底入口：不是掉线，但就是回不去，那就关窗重开。
+
+    用户口径（2026-08-11）：「切不回就重启，这是兜底策略。」实机上倒在
+    「读完邮件切不回恒星系视图」——画面上一个「掉线」字样都没有，于是
+    `reconnect` 那条重连路（判据是「连接已断开」/「无法重新连接」）压根不会
+    被触发，整轮就地停摆、退出码 1。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_real_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """⚠️ **本类的每一条测试都不许碰真窗口。**
+
+        照 `test_game_window.TestRestartGameWindow._no_real_windows` 的做法办：
+        那个 fixture 是整改验证时真把用户的游戏窗口从 1920x917 拽成 1894x556
+        之后才加的。`SessionKeeper` 的重开动作是注入进来的（这里注入 `_Restarter`），
+        真实现在 `game_window` 里；一旦有人把真调用接回来，这里立刻炸，而且什么都没动。
+        """
+        from evo_helper.game import game_window
+
+        def explode(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("测试绝不许碰真窗口：重开动作必须是注入进来的假货")
+
+        for name in ("ensure_game_window", "restart_game_window", "resize_to_viewport"):
+            monkeypatch.setattr(game_window, name, explode)
+
+    def test_it_restarts_and_walks_the_entry_sequence_again(self) -> None:
+        """重开之后新窗口停在入口页，「进入」和 START 都得重点一遍。"""
+        recorder = Recorder([ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME])
+        restart = _Restarter()
+
+        outcome = keeper(recorder, restart_window=restart).restart_and_reenter("切不回恒星系视图")
+
+        assert restart.calls == 1
+        assert outcome.ready and outcome.reconnected
+        assert (recorder.entry_clicks, recorder.start_clicks) == (1, 1)
+
+    def test_it_reuses_the_entry_sequence_rather_than_a_copy_of_it(self) -> None:
+        """入口序列只有一份：慢过渡要轮询、不许固定等待——那几条来之不易。
+
+        复制一份的话，这条会绿在 `reconnect` 上、红在这里。
+        """
+        recorder = Recorder(
+            [
+                ScreenState.ENTRY,
+                ScreenState.ENTRY,  # 点完还没切过去
+                ScreenState.UNKNOWN,  # 过渡中读不清
+                ScreenState.START,
+                ScreenState.LOADING,
+                ScreenState.IN_GAME,
+            ]
+        )
+
+        outcome = keeper(recorder, restart_window=_Restarter()).restart_and_reenter("切不回视图")
+
+        assert outcome.ready
+        assert recorder.entry_clicks == 1, "慢过渡要轮询，不能重点一次「进入」"
+
+    def test_a_restart_that_lands_nowhere_is_reported_not_clicked_through(self) -> None:
+        """⚠️ 重开之后**不许**因为「刚重开过」就假定自己在游戏内。"""
+        recorder = Recorder([ScreenState.UNKNOWN] * 400)
+
+        outcome = keeper(recorder, restart_window=_Restarter()).restart_and_reenter("切不回视图")
+
+        assert not outcome.ready
+        assert (recorder.entry_clicks, recorder.start_clicks) == (0, 0)
+
+    def test_the_reason_is_what_gets_logged(self) -> None:
+        """重开是有代价的动作：日志得说清是什么把它逼到这一步。"""
+        recorder = Recorder([ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME])
+        said: list[str] = []
+
+        keeper(recorder, restart_window=_Restarter(), log=said.append).restart_and_reenter(
+            "读完邮件切不回恒星系视图"
+        )
+
+        assert any("读完邮件切不回恒星系视图" in line for line in said)
+
+    def test_it_still_needs_a_restart_action(self) -> None:
+        recorder = Recorder([ScreenState.IN_GAME])
+
+        outcome = keeper(recorder).restart_and_reenter("切不回视图")
+
+        assert not outcome.ready
+        assert "restart" in outcome.detail
+
+    def test_a_refusal_is_not_dressed_up_as_a_dead_session(self) -> None:
+        """这条路上画面并没有写着「无法重新连接」，结局不该那么说。"""
+        recorder = Recorder([ScreenState.IN_GAME])
+
+        outcome = keeper(recorder).restart_and_reenter("切不回视图")
+
+        assert outcome.state is not ScreenState.DEAD_SESSION
+
+    def test_a_restart_that_blows_up_is_reported_not_raised(self) -> None:
+        recorder = Recorder([ScreenState.IN_GAME])
+
+        outcome = keeper(recorder, restart_window=_Restarter(fails=True)).restart_and_reenter("x")
+
+        assert not outcome.ready
+        assert "Chrome 拉不起来" in outcome.detail
+
+
+class TestTheRestartBudgetIsShared:
+    """⚠️ **两条路必须共用同一份配额。**
+
+    服务端维护时「无法重新连接」和「视图切不回来」都会撞上。各记各的账就等于
+    把上限翻倍，`MAX_WINDOW_RESTARTS` 那道拦无限重启的闸门就形同虚设。
+    """
+
+    def test_a_view_failure_is_refused_once_dead_sessions_spent_the_budget(self) -> None:
+        recorder = Recorder([ScreenState.DEAD_SESSION])
+        restart = _Restarter()
+        guard = keeper(recorder, restart_window=restart, max_restarts=1)
+
+        guard.reconnect()  # 死会话用掉唯一的名额
+        recorder.states = [ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME]
+        outcome = guard.restart_and_reenter("切不回恒星系视图")
+
+        assert restart.calls == 1, "配额已被死会话那条用光，这一次不该再重开"
+        assert not outcome.ready
+        assert "budget" in outcome.detail
+
+    def test_a_dead_session_is_refused_once_view_failures_spent_the_budget(self) -> None:
+        """反方向同样成立，否则只是把翻倍挪了个方向。"""
+        recorder = Recorder([ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME])
+        restart = _Restarter()
+        guard = keeper(recorder, restart_window=restart, max_restarts=1)
+
+        guard.restart_and_reenter("切不回恒星系视图")
+        recorder.states = [ScreenState.DEAD_SESSION]
+        outcome = guard.reconnect()
+
+        assert restart.calls == 1
+        assert "budget" in outcome.detail
+
+    def test_the_two_paths_share_one_rolling_window(self) -> None:
+        """配额是滚动窗口，不是两个各自计数的桶。"""
+        recorder = Recorder([ScreenState.DEAD_SESSION])
+        restart = _Restarter()
+        guard = keeper(recorder, restart_window=restart, max_restarts=1)
+
+        guard.reconnect()
+        recorder.now += RESTART_BUDGET_WINDOW_S + 1
+        recorder.states = [ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME]
+        outcome = guard.restart_and_reenter("切不回恒星系视图")
+
+        assert restart.calls == 2, "老得看不见的那次重开不该再占配额"
+        assert outcome.ready
 
 
 class TestInGameMarkersSurviveOcr:

@@ -1291,8 +1291,7 @@ class PirateLoop:
         """
         self._driver.click(*MAIL_BACK, label="关闭面板")
         self._driver.wait(2.2)
-        if not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError("派出之后切不回恒星系视图；安全停止")
+        self._require_system_view("派出之后切不回恒星系视图")
         self._navigator.invalidate()
 
     def _close_mail(self) -> None:
@@ -1303,8 +1302,7 @@ class PirateLoop:
             # 还在列表上说明刚才那一下退的是详情页，再退一层才关掉信箱。
             self._driver.click(*MAIL_BACK, label="关闭信箱")
             self._driver.wait(2.0)
-        if not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError("读完邮件切不回恒星系视图；安全停止")
+        self._require_system_view("读完邮件切不回恒星系视图")
         self._navigator.invalidate()
 
     # -- 持久化 -------------------------------------------------------------
@@ -1423,6 +1421,34 @@ class PirateLoop:
             return True
         return False
 
+    def _require_system_view(self, what_failed: str) -> None:
+        """必须停在恒星系视图，否则关窗重开一次再试；仍然不行才抛。
+
+        **用户口径（2026-08-11）：「切不回就重启，这是兜底策略。」**
+
+        原来这三处（开工、派出之后、读完邮件之后）都是就地 `raise`，整轮停摆、
+        退出码 1——而画面上一个「掉线」字样都没有，`SessionKeeper.reconnect` 那条
+        重连路根本不会被触发：它的判据是读到「连接已断开」/「无法重新连接」。
+        实机 2026-08-11 就是这么倒在「读完邮件切不回恒星系视图」上的。
+
+        - **只重开一次。** 重开完再切不回来就老实抛出去。做成循环的话，服务端
+          维护期间会变成「关一次 Chrome、开一次、再关」一直折腾到有人来看。
+        - **配额与死会话那条共用**（`SessionKeeper._restart_now` 里的滚动窗口）。
+          配额用完时 `restart_and_reenter` 直接返回拒绝结局，这里照样抛。
+        - **重开之后不假定自己在游戏内**：`restart_and_reenter` 仍然走判据驱动的
+          入口序列，`ensure_system_view` 也照旧读导航栏标签。认不出就停，不乱点。
+        """
+        if self._navigator.ensure_system_view(self._nav_labels):
+            return
+        say(f"  {what_failed}；关窗重开一次再试（兜底策略）")
+        outcome = self._keeper().restart_and_reenter(what_failed)
+        if not outcome.ready:
+            raise RuntimeError(f"{what_failed}；重开也没能回到游戏内（{outcome.detail}）；安全停止")
+        # 重开之后画面整个换过一遍，导航器那份记忆记的是重开前的坐标。
+        self._navigator.invalidate()
+        if not self._navigator.ensure_system_view(self._nav_labels):
+            raise RuntimeError(f"{what_failed}；重开之后仍然切不回来；安全停止")
+
     # -- 主循环 -------------------------------------------------------------
 
     def run(self) -> Outcome:
@@ -1433,8 +1459,7 @@ class PirateLoop:
         ensure_game_window()
         self._ensure_session(force=True)
         self._reset_to_known_screen()
-        if not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError("切不到恒星系视图；停止而不是往固定坐标乱点")
+        self._require_system_view("开工时切不到恒星系视图")
 
         try:
             self.reconcile_today()
