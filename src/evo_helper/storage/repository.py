@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -76,6 +77,48 @@ REVISIT_STATUS_DONE = "DONE"
 
 class StorageConflictError(ValueError):
     """Raised when an append would violate a uniqueness or close-once rule."""
+
+
+@dataclass(frozen=True)
+class DueDispatch:
+    """一发**理论上已经该有战报**的攻击派遣。
+
+    开工那一趟信箱是**由库驱动**的（用户口径 2026-08-11：「先读数据库中理论上
+    已经到达的报告，然后更新数据再开始后面的任务」）：先从库里算出这张单子，
+    再带着它去信箱找，而不是「翻到什么算什么」。判据见 `due_attack_dispatches`。
+    """
+
+    dispatch_id: UUID
+    target: Coordinate
+    dispatched_at_utc: datetime
+    #: 预计战报时刻；飞行时间没读到时为 None（那一档当作「现在就该有了」）。
+    expected_report_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class DailyAttackStatus:
+    """某条链路某个 UTC 日的攻击状态，**一行读回**，不必再翻信箱。
+
+    用户口径（2026-08-11）：「每天的海盗次数（状态）也可以存库，这样也可以
+    快速回读。」重启之后「今天打了几发、还剩几发、还有几发在等战报」要立刻答得上。
+    """
+
+    day_utc: str
+    target_kind: str
+    #: 信箱里数到的本链路战报份数（观测下界）。
+    observed_reports: int
+    #: 上面那个数是不是全天（有没有一直翻到昨天的报告）。
+    complete: bool
+    #: 库里当天已被游戏接受的攻击派遣数（助手自己派出去的那一侧）。
+    dispatched_count: int
+    #: 当天**已用配额** = 两个下界取大，且按 UTC 日只增不减。判据与
+    #: `count_dispatches_since` 完全一致，这一列只是把它固化下来供回读。
+    attacks_used: int
+    #: 写这一刻还有几发已派出、还没有战报、且还没被判放弃。
+    #: **这是瞬时状态，不是计数**，所以它可增可减——把它也做成只增不减，
+    #: 舰队全回来之后那个数会永远停在最高水位，回读出来的「还在等」全是假的。
+    awaiting_reports: int
+    reconciled_at_utc: datetime
 
 
 class SqlAlchemyRepository:
@@ -297,21 +340,65 @@ class SqlAlchemyRepository:
                         uncertain=entry.uncertain,
                     )
                 )
-            close = [
-                dispatch
-                for dispatch in _unmatched_dispatch_candidates(session, record)
-                if _close_in_time(dispatch.dispatched_at_utc, record.reported_at_utc)
-            ]
-            if len(close) == 1:
-                report_row.dispatch_id = close[0].id
-                report_row.match_status = "MATCHED"
-                report_row.match_confidence = 1.0
-                target = _bot_target_for(session, record.defender_target)
-                if target is not None:
-                    target.last_report_at_utc = record.reported_at_utc
-            elif len(close) > 1:
-                report_row.match_status = "AMBIGUOUS"
+            _link_dispatch(
+                session,
+                report_row,
+                origin=record.attacker_origin,
+                target=record.defender_target,
+                reported_at=record.reported_at_utc,
+            )
             session.commit()
+
+    def rematch_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
+        """把库里那份**还没认领上派遣**的战报再认领一次。认上了返回 True。
+
+        ## 为什么非有这条路不可
+
+        `append_report` 只在**写入的那一刻**认领一次，认不上就把 `dispatch_id`
+        留空、`match_status` 记 `AMBIGUOUS`，此后再没有任何代码回头看它一眼。
+        于是「认领判据修好了」并不能让已经在库里的那些行自己接上——而
+        `has_report_at` 那道去重又保证了它们**永远不会被重新读一遍**：
+        下一趟翻信箱看到同一封，只会说一句「库里已有」然后早停。
+
+        实机（生产库，2026-08-11）四发 AAA 全卡在这个组合里：战报确实读进来了、
+        `dispatch_id` 全空、攻击日志的战果列全空、四个目标全停在「待战报」。
+
+        所以由库驱动的那一趟（见 `due_attack_dispatches`）撞见一封「库里已有」时，
+        要在这里再认一次——不重开邮件、不重读像素，只是拿现在的判据把旧行重算。
+
+        ⚠️ **只碰 `dispatch_id` 为空的行。** 已经认领上的不重算：那会把一次判据
+        变动变成一次静默的改档，而 `dispatch_id` 上有唯一约束，重算过程中一旦
+        算错，原本对的那一发也一起丢了。
+
+        ⚠️ **一行都不新建。** 这里只更新已有的战报行，绝不补 `attack_dispatches`。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        matched = False
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BattleReportRow).where(
+                    orm.BattleReportRow.defender_target_galaxy == target.galaxy,
+                    orm.BattleReportRow.defender_target_system == target.system,
+                    orm.BattleReportRow.defender_target_position == target.position,
+                    orm.BattleReportRow.reported_at_utc == reported_at_utc,
+                    orm.BattleReportRow.dispatch_id.is_(None),
+                )
+            ).all()
+            for row in rows:
+                origin = Coordinate(
+                    row.attacker_origin_galaxy,
+                    row.attacker_origin_system,
+                    row.attacker_origin_position,
+                )
+                matched |= _link_dispatch(
+                    session,
+                    row,
+                    origin=origin,
+                    target=target,
+                    reported_at=row.reported_at_utc,
+                )
+            session.commit()
+        return matched
 
     # -- 侦察报告 -------------------------------------------------------------
 
@@ -752,6 +839,94 @@ class SqlAlchemyRepository:
                 )
             )
 
+    def due_attack_dispatches(
+        self, target_kind: str, *, now_utc: datetime, max_age: timedelta
+    ) -> list[DueDispatch]:
+        """**这张单子**：已派出、理论上战报早该到了、库里却还没有的那些攻击发。
+
+        开工翻信箱由它驱动（用户口径 2026-08-11：「先读数据库中理论上已经到达的
+        报告，然后更新数据再开始后面的任务」）。原先那一趟是「翻到什么算什么，
+        读到库里已有的就早停」——而早停假定「库里已有 ⇒ 往下都读过了」，
+        这个假定在**报告已入库、却没接到该接的那一发上**时是假的
+        （见 `rematch_report_at`），于是那几发永远补不回来。
+
+        单子上还有条目时，早停就不能只凭「撞见一封已入库的」收工；单子空了
+        才收工。取舍与落点写在 `tools.pirate_loop.PirateLoop._ingest_report_row`。
+
+        判据四条，每一条都与兄弟方法同源：
+
+        1. `target_kind` + `accepted` + `mission_kind == ATTACK`——只有攻击发会有
+           战报（口径同 `pending_reports_for_kind` / `oldest_open_attack_at`）。
+        2. 还没有战报认领它。
+        3. **理论上已经该有了**：`expected_report_at_utc` 已过；那一列为 NULL 的
+           （飞行时间没读到）当作「现在就该有」，与 `ReportWaitPlanner.plan` 里
+           「未知即立即收取」同一个降级方向。
+        4. **还没被判放弃**：派出超过 `max_age` 的不算。少了这一条，一发战报真的
+           丢了的派遣会让单子**永远非空**，早停就此彻底失效——每一趟都要把开封
+           预算烧满，而那是每封八秒。
+        """
+        now = _require_utc(now_utc, "now_utc")
+        expected = orm.AttackDispatchRow.expected_report_at_utc
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackDispatchRow.id,
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    expected,
+                )
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == target_kind,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.BattleReportRow.id.is_(None),
+                    orm.AttackDispatchRow.dispatched_at_utc > now - max_age,
+                    or_(expected.is_(None), expected <= now),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            ).all()
+        return [
+            DueDispatch(
+                dispatch_id=dispatch_id,
+                target=Coordinate(galaxy, system, position),
+                dispatched_at_utc=dispatched,
+                expected_report_at_utc=expected_at,
+            )
+            for dispatch_id, galaxy, system, position, dispatched, expected_at in rows
+        ]
+
+    def daily_attack_status(
+        self, target_kind: str, *, day_utc: datetime
+    ) -> DailyAttackStatus | None:
+        """把某个 UTC 日的攻击状态**一行读回来**；那天还没对过账就 None。
+
+        用户口径（2026-08-11）：「每天的海盗次数（状态）也可以存库，这样也可以
+        快速回读。」重启之后「今天打了几发、还剩几发、还有几发在等战报」要立刻
+        答得上，而不是再进一趟信箱（一趟约 20 秒导航，还要抢会话）。
+
+        写入在 `record_daily_reconciliation`，语义见 `DailyAttackStatus`。
+        """
+        day = _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d")
+        with self._session_factory() as session:
+            row = session.scalar(
+                select(orm.DailyReconciliationRow).where(
+                    orm.DailyReconciliationRow.target_kind == target_kind,
+                    orm.DailyReconciliationRow.day_utc == day,
+                )
+            )
+            if row is None:
+                return None
+            return _daily_status(row)
+
     def record_daily_reconciliation(
         self,
         target_kind: str,
@@ -760,7 +935,7 @@ class SqlAlchemyRepository:
         observed_reports: int,
         complete: bool,
         reconciled_at_utc: datetime,
-    ) -> None:
+    ) -> DailyAttackStatus:
         """记下「今天信箱里数到 N 份本链路的战报」。一天一条，**只增不减**。
 
         ⚠️ **绝不因此往 `attack_dispatches` 里补行。** 那张表的每一行都意味着
@@ -782,8 +957,31 @@ class SqlAlchemyRepository:
         `complete` 跟着胜出的那个数走：它说的是「那个数是不是全天」，
         接在一个已经被丢掉的数上没有意义。数一样大时取或——两趟里只要有一趟
         真的翻见了昨天，这个数就是全天的。
+
+        ## 顺手把当天的状态固化下来
+
+        用户口径（2026-08-11）：「每天的海盗次数（状态）也可以存库，这样也可以
+        快速回读。」这张表原先**只有信箱那一侧的观测数**，答不上「今天一共算打了
+        几发」——那个数要现去跑 `count_dispatches_since`；也答不上「还有几发在等
+        战报」——那个数库里压根没有。于是重启之后想知道「今日 X/32、几发在飞」，
+        除了再翻一趟信箱没有别的办法。
+
+        三个数在这里一并算出来写下（判据与各自的权威查询完全一致，**不另立口径**）：
+
+        - `dispatched_count`：当天库内已被接受的攻击派遣数（**只数攻击发**，
+          口径同 `count_dispatches_since`：侦察占航线不占配额）。这是当前事实，
+          照实写。
+        - `attacks_used`：两个下界取大，且**按 UTC 日只增不减**。多一层只增不减
+          是因为库可能被换过/清过：那时 `dispatched_count` 会掉下来，而当天在
+          游戏里已经用掉的额度不会跟着退回去。偏大只让助手提前收手，偏小才白飞舰队。
+        - `awaiting_reports`：`due_attack_dispatches` 的条数，**瞬时状态、可增可减**
+          （理由见 `DailyAttackStatus`）。
+
+        ⚠️ 这三个数一个都不许反过来写进 `attack_dispatches`。同上：库里多一条不
+        存在的派遣，调度器就会以为一条航线被占着、等一份永远不来的战报。
         """
         day = _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d")
+        moment = _require_utc(reconciled_at_utc, "reconciled_at_utc")
         if observed_reports < 0:
             raise ValueError("observed_reports must not be negative")
         with self._session_factory() as session:
@@ -803,8 +1001,14 @@ class SqlAlchemyRepository:
                 row.complete = complete
             elif observed_reports == row.observed_reports:
                 row.complete = row.complete or complete
-            row.reconciled_at_utc = _require_utc(reconciled_at_utc, "reconciled_at_utc")
+            row.reconciled_at_utc = moment
+            row.dispatched_count = _accepted_attacks_on(session, target_kind, day=day)
+            row.attacks_used = max(row.attacks_used, row.dispatched_count, row.observed_reports)
+            row.awaiting_reports = _awaiting_attack_reports(
+                session, target_kind, now=moment, max_age=MAX_REPORT_AGE
+            )
             session.commit()
+            return _daily_status(row)
 
     def count_inflight(self, *, now_utc: datetime) -> int:
         """还占着航线的舰队有几支。**跨 kind**——航线是全局资源。
@@ -1590,20 +1794,126 @@ def _bot_target_for(session: Session, coordinate: Coordinate) -> orm.BotTargetRo
     )
 
 
+def _daily_status(row: orm.DailyReconciliationRow) -> DailyAttackStatus:
+    return DailyAttackStatus(
+        day_utc=row.day_utc,
+        target_kind=row.target_kind,
+        observed_reports=row.observed_reports,
+        complete=row.complete,
+        dispatched_count=row.dispatched_count,
+        attacks_used=row.attacks_used,
+        awaiting_reports=row.awaiting_reports,
+        reconciled_at_utc=row.reconciled_at_utc,
+    )
+
+
+def _accepted_attacks_on(session: Session, target_kind: str, *, day: str) -> int:
+    """这条链路在这个 UTC 日**真打出去**了几发（库内一侧）。
+
+    口径与 `count_dispatches_since` 里那半段逐字一致：`accepted` + 只数
+    `MISSION_KIND_ATTACK`。侦察也是打向海盗的，不排掉的话一轮 4 发侦察就吃掉
+    4 次攻击额度，当天 32 次以 4 倍速度静默消失。
+    """
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(orm.AttackDispatchRow)
+            .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
+            .where(
+                orm.AttackIntentRow.target_kind == target_kind,
+                orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                orm.AttackDispatchRow.accepted.is_(True),
+                func.date(orm.AttackDispatchRow.dispatched_at_utc) == day,
+            )
+        )
+        or 0
+    )
+
+
+def _awaiting_attack_reports(
+    session: Session, target_kind: str, *, now: datetime, max_age: timedelta
+) -> int:
+    """还有几发已派出、没战报、且还没被判放弃。`due_attack_dispatches` 的计数版。
+
+    **不加「已经到点了」那道条件**：回读的人问的是「还有几支舰队在外面没交代」，
+    还在飞的那几发也算在内。到点没到点是调度那一侧的事。
+    """
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(orm.AttackDispatchRow)
+            .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
+            .outerjoin(
+                orm.BattleReportRow,
+                orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+            )
+            .where(
+                orm.AttackIntentRow.target_kind == target_kind,
+                orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                orm.AttackDispatchRow.accepted.is_(True),
+                orm.BattleReportRow.id.is_(None),
+                orm.AttackDispatchRow.dispatched_at_utc > now - max_age,
+            )
+        )
+        or 0
+    )
+
+
+def _link_dispatch(
+    session: Session,
+    report_row: orm.BattleReportRow,
+    *,
+    origin: Coordinate,
+    target: Coordinate,
+    reported_at: datetime,
+) -> bool:
+    """给一行战报认领一发派遣，写回 `dispatch_id` / `match_status`。认上了返回 True。
+
+    入库（`append_report`）与回头重认（`rematch_report_at`）共用这一段，
+    **不能各写一份**：判据一分家，重认那条路就会用一套跟入库不同的规则去改
+    历史行，而两套规则的差别只会在实机上以「战果列有时空着」的形式露出来。
+
+    ⚠️ **不猜**：候选恰好一个才认领；多于一个记 `AMBIGUOUS`，一个都没有记
+    `UNMATCHED`。写死这三档而不是「认不上就不动」，是为了让重认能把一行从
+    `AMBIGUOUS` 改回 `UNMATCHED`——候选已经全部过期时，那才是真话。
+    """
+    close = [
+        dispatch
+        for dispatch in _unmatched_dispatch_candidates(
+            session, origin=origin, target=target, reported_at=reported_at
+        )
+        if _close_in_time(dispatch.dispatched_at_utc, reported_at)
+    ]
+    if len(close) == 1:
+        report_row.dispatch_id = close[0].id
+        report_row.match_status = "MATCHED"
+        report_row.match_confidence = 1.0
+        bot_target = _bot_target_for(session, target)
+        if bot_target is not None:
+            bot_target.last_report_at_utc = reported_at
+        return True
+    report_row.match_status = "AMBIGUOUS" if len(close) > 1 else "UNMATCHED"
+    return False
+
+
 def _unmatched_dispatch_candidates(
     session: Session,
-    report: BattleReport,
+    *,
+    origin: Coordinate,
+    target: Coordinate,
+    reported_at: datetime,
 ) -> list[orm.AttackDispatchRow]:
     """这份战报**可能**属于哪几发派遣。
 
-    除了出发点、目标、`accepted` 与「还没被别的战报认领」，还要排掉两类：
+    除了出发点、目标、`accepted` 与「还没被别的战报认领」，还要排掉三类：
 
     1. **派在这份战报之后的**。战报不可能早于产生它的那一发。
     2. **早到已经被判定「战报永远不会来」的**（派出超过 `MAX_REPORT_AGE`）。
+    3. **侦察发**（`mission_kind != ATTACK`）。
 
-    第 2 条是这次实机故障的正解，而且补的是一处**两地不一致**：
-    `bot_dispatch_facts()` 早就按 `MAX_REPORT_AGE` 把过期派遣整条剔掉、让目标退回
-    重新探路；可认领这一侧不认这条规则，仍把它当候选。于是——
+    第 2 条补的是一处**两地不一致**：`bot_dispatch_facts()` 早就按 `MAX_REPORT_AGE`
+    把过期派遣整条剔掉、让目标退回重新探路；可认领这一侧不认这条规则，仍把它当候选。
+    于是——
 
         战报 2:323:10  01:35:18
         候选 A  派于 08-10 18:28（预计战报 18:53，已过期 6 小时 42 分）
@@ -1611,10 +1921,30 @@ def _unmatched_dispatch_candidates(
 
     两个候选都在 12 小时容差内，`len(close) > 1` → `AMBIGUOUS` → `dispatch_id`
     留空 → `has_report` 永远为假 → 目标永远停在等战报，攻击日志也永远显示不出战果。
-    **而 A 早就被另一半代码写掉了。** 两处用同一个常量之后，这里只剩一个候选，
-    不需要任何猜测。
+    **而 A 早就被另一半代码写掉了。**
 
-    ⚠️ 仍然**不猜**：排掉之后还多于一个候选时照旧记 `AMBIGUOUS`。这条改的是
+    ## 第 3 条：侦察发根本产生不了攻击战报
+
+    **侦察发不产生 `battle_reports`**——侦察报告是信箱里另一种主题，走
+    `scout_reports` 那张表。所以「一个目标同一天两发」里只有攻击发有资格被认领，
+    这一点是**结构上成立的**，不需要拿「时间就近」去猜哪一发更像。
+
+    这个过滤此前只有这里没有：`count_dispatches_since`、`oldest_open_attack_at`、
+    `pending_reports_for_kind`、`bot_dispatch_facts`、`bot_report_due_at` 五处
+    早就写着 `mission_kind == MISSION_KIND_ATTACK`，唯独可认领这一侧漏了。
+    而海盗链路的常态恰恰是「先侦察、判定值得打、再攻击」——同一个出发点、
+    同一个目标、相隔几分钟。实机（生产库 2026-08-11）那天四发 AAA 攻击的战报
+    **无一例外**都撞上了自己那一发侦察：
+
+        战报 2:138:2  13:06:28   VICTORY
+        候选 A  12:45:07  SCOUT   ← 探测器，永远不会有战报
+        候选 B  12:51:11  ATTACK  ← 就是它
+
+    两个候选 → `AMBIGUOUS` → 四个目标全停在「待战报」，而战报明明已经在库里。
+    2:137:1 / 2:137:3 / 2:136:3 / 2:138:2 四行一模一样。加上这一条之后
+    每一份都只剩一个候选，同样不需要任何猜测。
+
+    ⚠️ 仍然**不猜**：排掉之后还多于一个候选时照旧记 `AMBIGUOUS`。这三条改的都是
     「谁有资格当候选」，不是「多个候选时挑一个」。
     """
     from evo_helper.domain.report_wait import MAX_REPORT_AGE
@@ -1626,16 +1956,17 @@ def _unmatched_dispatch_candidates(
         select(orm.AttackDispatchRow)
         .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
         .where(
-            orm.AttackIntentRow.origin_galaxy == report.attacker_origin.galaxy,
-            orm.AttackIntentRow.origin_system == report.attacker_origin.system,
-            orm.AttackIntentRow.origin_position == report.attacker_origin.position,
-            orm.AttackIntentRow.target_galaxy == report.defender_target.galaxy,
-            orm.AttackIntentRow.target_system == report.defender_target.system,
-            orm.AttackIntentRow.target_position == report.defender_target.position,
+            orm.AttackIntentRow.origin_galaxy == origin.galaxy,
+            orm.AttackIntentRow.origin_system == origin.system,
+            orm.AttackIntentRow.origin_position == origin.position,
+            orm.AttackIntentRow.target_galaxy == target.galaxy,
+            orm.AttackIntentRow.target_system == target.system,
+            orm.AttackIntentRow.target_position == target.position,
             orm.AttackDispatchRow.accepted.is_(True),
+            orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
             orm.AttackDispatchRow.id.not_in(linked),
-            orm.AttackDispatchRow.dispatched_at_utc <= report.reported_at_utc,
-            orm.AttackDispatchRow.dispatched_at_utc >= report.reported_at_utc - MAX_REPORT_AGE,
+            orm.AttackDispatchRow.dispatched_at_utc <= reported_at,
+            orm.AttackDispatchRow.dispatched_at_utc >= reported_at - MAX_REPORT_AGE,
         )
         .order_by(orm.AttackDispatchRow.dispatched_at_utc)
     ).all()

@@ -20,11 +20,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop
 from evo_helper.tools.pirate_loop import (
     MAIL_MAX_OPENS,
@@ -67,8 +70,12 @@ def _row(index: int, kind: ReportKind, at: datetime) -> MailRow:
 
 
 class _Repository:
-    def __init__(self, *, oldest_open: datetime | None = None) -> None:
+    def __init__(
+        self, *, oldest_open: datetime | None = None, due: Sequence[Coordinate] = ()
+    ) -> None:
         self.oldest_open = oldest_open
+        #: 单子：已派出、理论上该有战报、库里还没有的那些攻击发的目标。
+        self.due = list(due)
         self.records: list[dict[str, Any]] = []
 
     def oldest_open_attack_at(
@@ -76,8 +83,12 @@ class _Repository:
     ) -> datetime | None:
         return self.oldest_open
 
-    def record_daily_reconciliation(self, target_kind: str, **fields: Any) -> None:
+    def due_attack_dispatches(self, target_kind: str, **_fields: Any) -> list[Any]:
+        return [SimpleNamespace(target=target) for target in self.due]
+
+    def record_daily_reconciliation(self, target_kind: str, **fields: Any) -> Any:
         self.records.append({"target_kind": target_kind, **fields})
+        return None
 
 
 def _loop(
@@ -293,6 +304,50 @@ def test_a_report_already_in_the_database_stops_the_opening(
     _reconcile(loop, monkeypatch)
 
     assert opened == [0], "第一封就是库里已有的，后面几封不该再开"
+
+
+def test_a_pending_dispatch_keeps_the_opening_going_past_a_known_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **本次修复的落点。** 由库驱动：单子上还有没找到的，就不能因为撞见
+    一份已入库的战报就收工。
+
+    早停假定「库里已有 ⇒ 往下都读过了」。实机（2026-08-11）推翻了它：那四发 AAA
+    的战报确实在库里，只是没接到该接的那一发派遣上（成因见
+    `repository._unmatched_dispatch_candidates`：同一目标当天先侦察后攻击，
+    而侦察发本不该当候选）。于是每一趟都在第一封就收工，要找的那几封就躺在
+    它下面，那几个目标永远停在「待战报」。
+
+    ⚠️ 早停本身**不删**（用户明确要的）——它只是要先问过那张单子。
+    """
+    loop, _repository, opened = _loop(
+        [
+            [_row(index, ReportKind.PIRATE, NOON) for index in range(4)],
+            [_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))],
+        ],
+        repository=_Repository(due=[Coordinate(2, 138, 2)]),
+        ingest=ReportIngest.KNOWN,
+    )
+
+    _reconcile(loop, monkeypatch)
+
+    assert opened == [0, 1, 2, 3], "单子上还有一发没找到，不该在第一封「已有」就收工"
+
+
+def test_an_empty_worklist_restores_the_early_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """单子空了，早停照旧生效——它省的是每封八秒的开封，不能因为修盲点就丢掉。"""
+    loop, _repository, opened = _loop(
+        [
+            [_row(index, ReportKind.PIRATE, NOON) for index in range(4)],
+            [_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))],
+        ],
+        repository=_Repository(due=[]),
+        ingest=ReportIngest.KNOWN,
+    )
+
+    _reconcile(loop, monkeypatch)
+
+    assert opened == [0]
 
 
 def test_the_count_keeps_going_after_the_opening_stops(monkeypatch: pytest.MonkeyPatch) -> None:

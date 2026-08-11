@@ -80,7 +80,13 @@ from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
-from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop, ReportIngest, TargetCheck
+from evo_helper.tools.pirate_loop import (
+    LoopOptions,
+    PirateLoop,
+    ReportIngest,
+    TargetCheck,
+    rematch_note,
+)
 
 # `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
 # `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
@@ -281,7 +287,9 @@ class BotLoop(PirateLoop):
             return ReportIngest.UNREADABLE
         repository, _run_id = self._ensure_run()
         if repository.has_report_at(target, live.reported_at_utc):
-            say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库")
+            # 已在库里的那一行未必认领上了派遣，顺手重认一次（理由见 `rematch_note`）。
+            note = rematch_note(repository, target, live.reported_at_utc)
+            say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库{note}")
             return ReportIngest.KNOWN
         repository.append_report(to_battle_report(live, report_id=uuid4()))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有

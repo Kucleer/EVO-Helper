@@ -235,12 +235,18 @@ class _Repository:
     def __init__(self, *, already_stored: bool = False) -> None:
         self.already_stored = already_stored
         self.appended: list[Any] = []
+        self.rematched: list[tuple[Coordinate, datetime]] = []
 
     def has_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
         return self.already_stored
 
     def append_report(self, report: Any) -> None:
         self.appended.append(report)
+
+    def rematch_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
+        """已在库里的那一行未必认领上了派遣，收报告那一趟顺手重认一次。"""
+        self.rematched.append((target, reported_at_utc))
+        return False
 
 
 def _ingesting_loop(repository: _Repository, bottom: Any = None) -> Any:

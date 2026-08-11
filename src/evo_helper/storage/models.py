@@ -455,4 +455,16 @@ class DailyReconciliationRow(Base):
     #: **它不是过滤条件。** 下界照样参与配额取大——扔掉它就等于回到只按库算，
     #: 也就是回到会超额的那一侧。这一列只作诊断：日志要说清那个数是不是全天。
     complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: 那天库内已被游戏接受的**攻击**派遣数（侦察发不数，口径同
+    #: `repository.count_dispatches_since`）。当前事实，照实写。
+    dispatched_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: 那天**已用配额** = `dispatched_count` 与 `observed_reports` 取大，
+    #: 且按 UTC 日**只增不减**。多一层只增不减是因为库可能被换过/清过：那时
+    #: `dispatched_count` 会掉下来，而游戏里已经用掉的额度不会跟着退回去。
+    #: 偏大只让助手提前收手，偏小才会白飞舰队。
+    attacks_used: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: 写这一刻还有几发已派出、还没有战报、且还没被判放弃。
+    #: ⚠️ **这是瞬时状态，不是计数**，所以它可增可减——做成只增不减的话，
+    #: 舰队全回来之后那个数会永远停在最高水位，回读出来的「还在等」全是假的。
+    awaiting_reports: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     reconciled_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
