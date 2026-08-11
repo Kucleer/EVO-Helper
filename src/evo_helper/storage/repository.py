@@ -533,11 +533,39 @@ class SqlAlchemyRepository:
         **只数攻击发。** 侦察也是打向海盗的，只按 `target_kind` 过滤的话，
         一轮 4 发侦察会各吃掉一次攻击额度——当天 32 次以 4 倍速度消失，
         而且完全静默、不报任何错。侦察占的是航线，不是配额，见 `count_inflight`。
+
+        ## 库内计数与开工对账，按 UTC 日**取大**
+
+        这张表只知道助手自己派出去过什么。库外发生过的事它一概不知道：用户手动
+        打的、上一次进程崩在写库之前的、换过库之后游戏里仍然算数的那些。数少了
+        就会超额。开工对账（`tools.pirate_loop.PirateLoop.reconcile_today`）从信箱
+        里数当天的战报，把观测值写进 `daily_reconciliations`，这里把它折进来。
+
+        两边都只是下界，而且证据互相独立：
+
+        - 库内计数知道**刚派出、战报还没到**的那几发，信箱不知道。
+        - 信箱知道**库外发生过**的那几发，库不知道。
+
+        所以谁也不能单独当答案，按 UTC 日取两者的大者。取大是能被证据支持的最紧
+        的下界，只会让助手提前收手；取小或相加都会错——相加会把同一发数两遍。
+
+        **没翻到底的那次对账照样算数。** `complete=False` 只说明「今天至少这么多」，
+        而它仍然是一个真实存在的下界，而且往往比库内计数更紧。把它扔掉等于回到
+        「只按库算」，也就是回到会超额的那一侧。`complete` 只作诊断用（日志里要说清
+        那个数是不是全天），不作过滤条件。
+
+        方向一律往「打得更少」倒：这个数偏大只会让助手提前收手，偏小才会白飞舰队。
+
+        部分覆盖的那一天照样整天折进来（例如 `since` 落在当天中午）：对账的粒度
+        就是 UTC 日，而配额窗口本来也是整个 UTC 日；宁可把额度算紧一点。
         """
+        floor = _require_utc(since, "since")
         with self._session_factory() as session:
-            return int(
-                session.scalar(
-                    select(func.count())
+            dispatched = func.date(orm.AttackDispatchRow.dispatched_at_utc)
+            per_day = {
+                str(day): int(count)
+                for day, count in session.execute(
+                    select(dispatched, func.count())
                     .select_from(orm.AttackDispatchRow)
                     .join(
                         orm.AttackIntentRow,
@@ -547,11 +575,82 @@ class SqlAlchemyRepository:
                         orm.AttackIntentRow.target_kind == target_kind,
                         orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                         orm.AttackDispatchRow.accepted.is_(True),
-                        orm.AttackDispatchRow.dispatched_at_utc >= _require_utc(since, "since"),
+                        orm.AttackDispatchRow.dispatched_at_utc >= floor,
+                    )
+                    .group_by(dispatched)
+                ).all()
+            }
+            observed = {
+                str(day): int(count)
+                for day, count in session.execute(
+                    select(
+                        orm.DailyReconciliationRow.day_utc,
+                        orm.DailyReconciliationRow.observed_reports,
+                    ).where(
+                        orm.DailyReconciliationRow.target_kind == target_kind,
+                        orm.DailyReconciliationRow.day_utc >= floor.strftime("%Y-%m-%d"),
+                    )
+                ).all()
+            }
+        return sum(
+            max(per_day.get(day, 0), observed.get(day, 0))
+            for day in per_day.keys() | observed.keys()
+        )
+
+    def reconciled_on(self, target_kind: str, *, day_utc: datetime) -> bool:
+        """这条链路今天（UTC+0）已经对过账了吗。
+
+        去重键是 **UTC 日**而不是「这个进程启动过没有」：配额的日界本来就是
+        UTC 00:00（`domain.scheduler.quota_day_start_utc`），而控制台一天可能重启
+        好几次——按进程去重的话，每重启一次就要多翻一趟信箱。
+        """
+        with self._session_factory() as session:
+            return (
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.DailyReconciliationRow)
+                    .where(
+                        orm.DailyReconciliationRow.target_kind == target_kind,
+                        orm.DailyReconciliationRow.day_utc
+                        == _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d"),
                     )
                 )
                 or 0
+            ) > 0
+
+    def record_daily_reconciliation(
+        self,
+        target_kind: str,
+        *,
+        day_utc: datetime,
+        observed_reports: int,
+        complete: bool,
+        reconciled_at_utc: datetime,
+    ) -> None:
+        """记下「今天信箱里数到 N 份本链路的战报」。一天一条，重跑就覆盖。
+
+        ⚠️ **绝不因此往 `attack_dispatches` 里补行。** 那张表的每一行都意味着
+        「一支舰队正在外面」，凭空多一条，调度器就会以为一条航线被占着、并等一份
+        永远不会来的战报，要到 `MAX_REPORT_AGE`（6 小时）才被判缺失清掉。
+        这里只更新计数所依赖的那个事实，见 `count_dispatches_since`。
+        """
+        day = _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d")
+        if observed_reports < 0:
+            raise ValueError("observed_reports must not be negative")
+        with self._session_factory() as session:
+            row = session.scalar(
+                select(orm.DailyReconciliationRow).where(
+                    orm.DailyReconciliationRow.target_kind == target_kind,
+                    orm.DailyReconciliationRow.day_utc == day,
+                )
             )
+            if row is None:
+                row = orm.DailyReconciliationRow(day_utc=day, target_kind=target_kind)
+                session.add(row)
+            row.observed_reports = observed_reports
+            row.complete = complete
+            row.reconciled_at_utc = _require_utc(reconciled_at_utc, "reconciled_at_utc")
+            session.commit()
 
     def count_inflight(self, *, now_utc: datetime) -> int:
         """还占着航线的舰队有几支。**跨 kind**——航线是全局资源。
@@ -778,6 +877,63 @@ class SqlAlchemyRepository:
                 )
                 for preset_name, report_id in session.execute(statement).all()
             ]
+
+    def bot_report_due_at(
+        self, coordinates: Sequence[Coordinate], *, since: datetime | None
+    ) -> dict[Coordinate, tuple[datetime, datetime | None]]:
+        """这些 bot 本轮**还没收到战报**的那一发：`(派出时刻, 预计战报时刻)`。
+
+        两个时刻的用途完全不同，所以一起交出去而不是各查一次：
+
+        - **派出时刻**是硬事实（本地在游戏接受「出发！」的那一刻记下的），
+          用作翻信箱时的时间下界：列表按时间倒序，比它还早的报告不可能是这一发的。
+        - **预计战报时刻**来自简报上的一次 OCR，只用来把日志上那句话说准
+          （「还没到点」vs「到点了却没翻到」），**不当闸门**。实机上同一天同距离的
+          六发读出 8 秒到 25 分钟不等——拿这么个读数去决定收不收战报，一次抖动
+          就能让一个目标停摆到 `MAX_REPORT_AGE`。飞行时间是闹钟不是闸门，
+          `tools.pirate_loop._read_flight_time` 的注释记着同一条。
+
+        同一个坐标有多发未闭合时取**最早**那一发：翻信箱要的是覆盖全部候选的下界。
+        """
+        moments: dict[Coordinate, tuple[datetime, datetime | None]] = {}
+        if not coordinates:
+            return moments
+        wanted = {(item.galaxy, item.system, item.position): item for item in coordinates}
+        with self._session_factory() as session:
+            statement = (
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackDispatchRow.expected_report_at_utc,
+                )
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.BattleReportRow.id.is_(None),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            )
+            if since is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+                )
+            for galaxy, system, position, dispatched, expected in session.execute(statement).all():
+                coordinate = wanted.get((galaxy, system, position))
+                if coordinate is None or coordinate in moments:
+                    continue
+                moments[coordinate] = (dispatched, expected)
+        return moments
 
     def has_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
         """这个目标这个**报告时刻**的战报是不是已经在库里了。

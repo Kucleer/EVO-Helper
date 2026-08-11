@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.tools.pirate_loop import PirateLoop
+from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop
 
 WANTED = (Coordinate(2, 136, 1),)
 
@@ -30,6 +31,8 @@ WANTED = (Coordinate(2, 136, 1),)
 def _loop(*, reachable: bool) -> tuple[Any, list[str]]:
     events: list[str] = []
     loop = PirateLoop.__new__(PirateLoop)
+    loop._options = LoopOptions(systems=(), scout=True, attack=True)  # type: ignore[attr-defined]
+    loop._started_at = datetime(2026, 8, 11, tzinfo=UTC)  # type: ignore[attr-defined]
     loop._reset_to_known_screen = lambda: events.append("关浮层")  # type: ignore[assignment, method-assign]
     loop._goto_planet_surface = lambda: (  # type: ignore[assignment, method-assign]
         events.append("切地表"),

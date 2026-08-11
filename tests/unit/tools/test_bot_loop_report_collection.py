@@ -1,11 +1,13 @@
-"""进信箱收探路战报这一趟：怎么进、怎么认、怎么入库。
+"""进信箱收探路战报这一趟：怎么进、翻多少、开哪几封、怎么认、怎么入库。
 
-真正驱动鼠标的部分和海盗那条链路共用（`pirate_loop`），这里守的是三件事：
+翻信箱的动作两条链路共用（`PirateLoop._scan_mail_rows`），这里守的是 bot 这一侧：
 
-1. **进信箱前必须先关浮层**，切不过去要留下现场。这是刚在
-   `collect_scout_reports` 里修过的同一个缺陷，`read_defender_units` 那边漏了。
+1. **进信箱前必须先关浮层**，切不过去要留下现场。
 2. **认报告靠 VS 块里的目标坐标，不靠行号。** 行序随新邮件变。
 3. **入库前后各有一道闸门**：复核 VS 坐标、按报告时间去重。
+
+窗口那一侧（先读主题再决定开不开、翻屏、按时间早停）钉在
+`test_mail_scan_window.py`——那是两条链路共用的部分。
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop, BotOptions
-from evo_helper.tools.pirate_loop import TargetCheck
+from evo_helper.tools.pirate_loop import LoopOptions, MailRow, TargetCheck
+from evo_helper.vision.parsers import ReportKind
 
 A = Coordinate(2, 149, 17)
 B = Coordinate(2, 149, 18)
@@ -57,12 +60,29 @@ class _Page:
         return ("100", self.units)
 
 
+def _attack_rows(count: int) -> list[MailRow]:
+    """列表页上 `count` 行「攻击报告」，主题都读得干干净净。"""
+    return [
+        MailRow(
+            index=index,
+            subject="攻击报告",
+            raw_time_text=f"06/08/2026 11:45:0{index}",
+            reported_at_utc=REPORTED_AT,
+            kind=ReportKind.ATTACK,
+        )
+        for index in range(count)
+    ]
+
+
 def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]]:
     """一个只装了「翻信箱」所需零件的 `BotLoop`。"""
     events: list[str] = []
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(targets=(), probe=True, attack=True)
+    loop._options = LoopOptions(systems=(), scout=True, attack=True)
+    loop._started_at = datetime(2026, 8, 6, tzinfo=UTC)
     loop._driver = _Driver()
+    loop._mail_dumps = 0
     loop._reset_to_known_screen = lambda: events.append("关浮层")
     loop._goto_planet_surface = lambda: (events.append("切地表"), reachable)[1]
     loop._dump_frame = lambda name, roi=None: events.append(f"存图:{name}")
@@ -70,6 +90,8 @@ def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]
     loop._close_mail = lambda: events.append("关信箱")
     loop._settle = lambda predicate, **_kwargs: True
     loop._on_mail_list = lambda: True
+    loop._on_mail_detail = lambda: True
+    loop._mail_list_rows = lambda: _attack_rows(len(pages) or 1)
     remaining = list(pages)
     loop._report_screens = lambda: remaining.pop(0) if remaining else _Page(None)
     return loop, events
@@ -78,9 +100,9 @@ def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]
 @pytest.fixture(autouse=True)
 def _no_dragging(monkeypatch: pytest.MonkeyPatch) -> None:
     """慢拖要真的按住鼠标分步移动，这批测试一律桩掉。"""
-    from evo_helper.tools import bot_loop
+    from evo_helper.tools import pirate_loop
 
-    monkeypatch.setattr(bot_loop, "slow_drag", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pirate_loop, "slow_drag", lambda *args, **kwargs: None)
 
 
 # -- 进信箱的姿势 ------------------------------------------------------------
@@ -92,9 +114,6 @@ def test_overlays_are_closed_before_the_surface_check() -> None:
     `_on_planet_surface()` 的正面凭据是右上角那个未读数，而浮层会盖住它；
     `_goto_planet_surface()` 自己不关浮层，只会反复点视图菜单——而那个坐标
     此刻正压在浮层底下。顺序反了等于没修。
-
-    这一步紧跟在派遣与等待之后，正是舰队返航之类的通知最容易冒出来的时刻：
-    海盗那条链路实机三次都倒在这里，每次都已经先派出 4 发侦察。
     """
     loop, events = _loop([_Page(None)])
     loop._open_mail = lambda: (_ for _ in ()).throw(RuntimeError("到此为止"))
@@ -106,11 +125,7 @@ def test_overlays_are_closed_before_the_surface_check() -> None:
 
 
 def test_an_unreachable_surface_leaves_a_frame_behind() -> None:
-    """切不过去就存一帧：不知道当时画面长什么样是最贵的失败。
-
-    原先 `read_defender_units` 这一处只抛异常、一张图都不留——而它偏偏是
-    整条链路唯一会去信箱的地方。
-    """
+    """切不过去就存一帧：不知道当时画面长什么样是最贵的失败。"""
     loop, events = _loop([], reachable=False)
 
     with pytest.raises(RuntimeError, match="切不到自己星球地表"):
@@ -169,6 +184,28 @@ def test_an_unrendered_panel_is_skipped_rather_than_guessed() -> None:
     assert missing == {A}
 
 
+def test_a_detail_page_that_never_renders_is_not_read_at_all() -> None:
+    """**点开之后要等详情页真的铺开，铺不开就一个字都不读。**
+
+    面板是滑进来的（`_settle` 的注释记着「等 2.4 秒判一次判不到，而失败时存下的
+    那一帧读得清清楚楚」）。没铺开的那一屏读出来是一堆读不通的字，和「这封是别人
+    的报告」在下游长得一模一样——于是一份本来在信箱里的战报被静默丢掉，
+    而日志上只有一句「还没翻到」。
+
+    这里让 `_on_mail_detail` 恒为假：即使那一屏其实是 A 的战报，也一封都不读，
+    并且留下现场图。
+    """
+    loop, events = _loop([_Page(A)])
+    loop._settle = lambda predicate, **_kwargs: predicate is not loop._on_mail_detail
+    seen: list[Coordinate] = []
+
+    missing = loop._scan_mail((A,), lambda target, page: seen.append(target))
+
+    assert seen == []
+    assert missing == {A}
+    assert "存图:mail-detail-unrendered" in events
+
+
 def test_the_mailbox_is_closed_even_when_nothing_matched() -> None:
     """不关信箱，下一个目标的 `goto` 会在浮层上朝导航栏坐标盲点。"""
     loop, events = _loop([_Page(B)])
@@ -176,6 +213,14 @@ def test_the_mailbox_is_closed_even_when_nothing_matched() -> None:
     loop._scan_mail((A,), lambda target, page: None)
 
     assert events[-1] == "关信箱"
+
+
+def test_nothing_wanted_means_no_mailbox_trip_at_all() -> None:
+    """没有要收的目标就别进信箱——一趟十几秒，白跑还占着鼠标。"""
+    loop, events = _loop([])
+
+    assert loop._scan_mail((), lambda target, page: None) == set()
+    assert events == []
 
 
 # -- 入库前后的两道闸门 ------------------------------------------------------
@@ -277,6 +322,100 @@ class _DetailScreens:
 
     def unit_totals(self) -> tuple[str, str]:
         return ("100", "5.36K")
+
+
+# -- 收不到时那句话要说准 ----------------------------------------------------
+
+
+def test_a_report_that_is_not_due_yet_says_so_instead_of_blaming_the_window() -> None:
+    """「还没到点」和「到点了却没翻到」的处置完全相反，日志必须分开说。
+
+    实机上六个目标一视同仁地报「还没出现在信箱最上面几行」，连续四趟同一句——
+    而其中三发确实还没到点、另三发是**窗口不够大**。那句话把后者说成了前者，
+    于是「窗口太小」这个正因被盖了整整一天。
+    """
+    now = datetime.now(UTC)
+    loop, _events = _loop([])
+    said: list[str] = []
+    loop._ensure_run = lambda: (_DueRepository({A: (now, now.replace(year=now.year + 1))}), None)
+    loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
+    loop._scan_mail = lambda wanted, visit, not_before=None: set(wanted)
+
+    from evo_helper.tools import bot_loop as module
+
+    original = module.say
+    module.say = said.append
+    try:
+        loop.collect_probe_reports((A,))
+    finally:
+        module.say = original
+
+    assert any("才产生；接着等" in line for line in said)
+    assert not any("到点了却没翻到" in line for line in said)
+
+
+def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> None:
+    """到点了还翻不到，那就是这一趟没翻到——说准了才修得动。"""
+    now = datetime.now(UTC)
+    loop, _events = _loop([])
+    said: list[str] = []
+    loop._ensure_run = lambda: (
+        _DueRepository({A: (now.replace(year=now.year - 1), now.replace(year=now.year - 1))}),
+        None,
+    )
+    loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
+    loop._scan_mail = lambda wanted, visit, not_before=None: set(wanted)
+
+    from evo_helper.tools import bot_loop as module
+
+    original = module.say
+    module.say = said.append
+    try:
+        loop.collect_probe_reports((A,))
+    finally:
+        module.say = original
+
+    assert any("到点了却没翻到" in line for line in said)
+
+
+def test_the_mail_trip_floor_is_the_dispatch_time_not_the_expected_report_time() -> None:
+    """翻信箱的时间下界取**派出时刻**，不取预计战报时刻。
+
+    预计时刻来自简报上的一次 OCR，实机上同一天同距离的六发读出 8 秒到 25 分钟
+    不等；拿它当下界，一次读大就能把真报告挡在窗口外，而且完全静默。
+    派出时刻是本地在游戏接受「出发！」那一刻记的，是硬事实。
+    """
+    dispatched = datetime(2026, 8, 11, 1, 7, tzinfo=UTC)
+    expected = datetime(2026, 8, 11, 1, 33, tzinfo=UTC)
+    floors: list[datetime | None] = []
+    loop, _events = _loop([])
+    loop._ensure_run = lambda: (_DueRepository({A: (dispatched, expected)}), None)
+    loop._round_start = lambda: datetime(2026, 8, 11, tzinfo=UTC)
+    loop._scan_mail = lambda wanted, visit, not_before=None: (
+        floors.append(not_before),
+        set(wanted),
+    )[1]
+
+    from evo_helper.tools import bot_loop as module
+
+    original = module.say
+    module.say = lambda _line: None
+    try:
+        loop.collect_probe_reports((A,))
+    finally:
+        module.say = original
+
+    assert floors == [dispatched]
+
+
+class _DueRepository:
+    def __init__(self, due: dict[Coordinate, tuple[datetime, datetime | None]]) -> None:
+        self._due = due
+
+    def bot_report_due_at(
+        self, coordinates: Any, *, since: datetime | None
+    ) -> dict[Coordinate, tuple[datetime, datetime | None]]:
+        return dict(self._due)
 
 
 # -- 分档取数 ----------------------------------------------------------------

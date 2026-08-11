@@ -98,6 +98,8 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
     # `run()` 现在归父类管（开工前置 + `RoundExhausted` 收尾），会话巡检要真截屏，
     # 这条测试只关心分态路由，桩掉即可。
     loop._ensure_session = lambda **_k: False
+    # 开工对账要开库、翻信箱，同样不在分态路由的范围内。
+    loop.reconcile_today = lambda: None
     loop._nav_labels = lambda: ""
     loop._phase_of = lambda coordinate: phase
     loop._probe = lambda coordinate: calls.append("probe")
@@ -223,6 +225,7 @@ def test_running_out_of_lines_ends_the_round_cleanly(monkeypatch: pytest.MonkeyP
     loop._navigator = _FakeNavigator()
     loop._reset_to_known_screen = lambda: None
     loop._ensure_session = lambda **_k: False
+    loop.reconcile_today = lambda: None
     loop._nav_labels = lambda: ""
     loop._phase_of = lambda _c: BotPhase.NEEDS_PROBE
     loop._probe = lambda _c: (_ for _ in ()).throw(RoundExhausted("同时派遣的舰队数量已达上限"))

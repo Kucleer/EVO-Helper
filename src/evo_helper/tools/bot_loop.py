@@ -29,6 +29,12 @@
 而唯一读战报的代码只挂在 `NEEDS_ATTACK` 分支上——读战报的代码只在读过战报
 之后才会被执行。
 
+补上之后它仍然一份都收不到，原因换成了**信箱窗口太小**：两条链路的报告混在同一个
+收件箱里按时间倒序排，海盗链路整夜产出攻击报告，而收取只盲开最上面 6 行。实机
+2026-08-11 四趟（09:14 / 09:19 / 09:24 / 09:30）全部报「翻不到」，六个目标同一句话。
+现在翻信箱的窗口与筛选归 `pirate_loop.PirateLoop._scan_mail_rows` 统一管：
+先在列表页读主题、只开主题对得上的、翻得到第四屏、翻到旧报告就停。
+
 ## 只读详情页那一屏
 
 分档防的是**量级错**，不是末位误差（见 `domain.fleet_tier` 模块头）。「单位」总数是
@@ -56,24 +62,12 @@ from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
-from evo_helper.tools.pirate_loop import (
-    MAIL_BADGE_ROI,
-    MAIL_FIRST_ROW_Y,
-    MAIL_ROW_PITCH,
-    MAIL_ROW_X,
-    MAIL_SCAN_ROWS,
-    MAIL_SCROLL_TO_TOP_DRAGS,
-    PANEL_DRAG_FROM_Y,
-    PANEL_DRAG_TO_Y,
-    LoopOptions,
-    PirateLoop,
-    TargetCheck,
-    slow_drag,
-)
+from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop, TargetCheck
 
 # `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
 # `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, say
+from evo_helper.vision.parsers import ReportKind
 
 #: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
 PROBE_PRESET = DEFAULT_PRESET.name
@@ -103,6 +97,9 @@ class BotLoop(PirateLoop):
     #: 而不是常态；而且一轮只有几个目标，多复位一次的代价远小于漏派一发。
     #: 这也保住了这条路径实机验证过的行为——原先失败就重试，不分是哪一种。
     RETRY_CHECKS: frozenset[TargetCheck] = frozenset({TargetCheck.MISMATCH, TargetCheck.ABSENT})
+
+    #: 打 bot 的战报主题是「攻击报告」；海盗战是「海盗攻击报告」，走父类那一档。
+    RECONCILE_KIND: ReportKind = ReportKind.ATTACK
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
@@ -142,72 +139,50 @@ class BotLoop(PirateLoop):
 
     # -- 判定 ---------------------------------------------------------------
 
-    def _report_screens(self) -> Any:
-        """当前这一屏的 `ReportScreens`。**每次重新建**——同一个实例读两屏会
-        把上一屏的像素当成这一屏（`ingest_pirate_report` 里记着同一条）。"""
-        from evo_helper.vision.optional.report_screens import ImageReportScreens
-        from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
-
-        image = crop_to_viewport(self._driver.capture())
-        return ImageReportScreens(
-            image,
-            layout_for_viewport(image.width, image.height),
-            tesseract_cmd=_tesseract(),
-        )
-
     def _scan_mail(
-        self, wanted: Sequence[Coordinate], visit: Callable[[Coordinate, Any], None]
+        self,
+        wanted: Sequence[Coordinate],
+        visit: Callable[[Coordinate, Any], None],
+        *,
+        not_before: datetime | None = None,
     ) -> set[Coordinate]:
-        """**一趟信箱**：翻最上面几行，认得出的那几份交给 `visit`。返回没找到的目标。
+        """**一趟信箱**：把认得出的那几份战报交给 `visit`。返回没找到的目标。
 
         为什么一趟读完而不是「一个目标进一次」：进出信箱要切视图、开面板、翻标签，
         每次还要慢拖三下，一趟十几秒；而这些报告本来就并排躺在同一页上。
-        `collect_scout_reports` 是同一个理由、同一套写法。
 
         找报告靠 **VS 块里的目标坐标**核对，不靠行号：行序随新邮件变，
         而报告自己写着打的是谁。
 
-        ⚠️ **先关浮层再切地表。** `_on_planet_surface()` 的正面凭据是右上角那个
-        未读数，而浮层会盖住它；`_goto_planet_surface()` 自己不关浮层，只会反复点
-        视图菜单（而那个坐标此刻正压在浮层底下）。同一个缺陷在
-        `pirate_loop.collect_scout_reports` 里刚修过——那边实机三次都倒在这一步，
-        每次都已经先派出 4 发侦察，报告读不到那几发就白飞。
+        翻信箱的姿势（关浮层、先读主题再决定开不开、翻屏、按时间早停）由父类的
+        `_scan_mail_rows` 统一管——两条链路共用一份，见那边的模块级说明。
+        这里只提供「这一封是不是我要的」和「拿到之后干什么」。
         """
         from evo_helper.vision.parsers import parse_versus_block
 
-        self._reset_to_known_screen()
-        if not self._goto_planet_surface():
-            # 判据失败时最贵的事是「不知道当时画面长什么样」。存一帧只要一次写盘。
-            self._dump_frame("planet-surface-unreachable", MAIL_BADGE_ROI)
-            raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
-        self._open_mail()
-        # 列表会记住上次滚到哪。不拖回顶部，第 0 行可能是一封只露半截的邮件——
-        # 读出来是空主题，而画面看着完全正常。
-        for _ in range(MAIL_SCROLL_TO_TOP_DRAGS):
-            slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
         remaining = set(wanted)
-        for row in range(MAIL_SCAN_ROWS):
-            if not remaining:
-                break
-            # ⚠️ **每翻一行都要先确认「还在邮件列表上」。** 上一次返回没退到列表时，
-            # 照列表的行坐标点下去就是点在地表 UI 上——实机踩过「取消任务」确认框。
-            if not self._settle(self._on_mail_list):
-                say(f"  第 {row} 行之前已经不在邮件列表上了；停止翻行")
-                break
-            self._driver.click(
-                MAIL_ROW_X, MAIL_FIRST_ROW_Y + row * MAIL_ROW_PITCH, label="打开邮件"
-            )
-            self._driver.wait(2.4)
-            page = self._report_screens()
+
+        def visit_row(row: Any, page: Any) -> bool:
             versus = parse_versus_block(page.versus_block(), "ocr")
-            target = versus.defender.coordinate.value if versus is not None else None
-            if target is not None and target in remaining:
-                remaining.discard(target)
-                say(f"  第 {row} 行是 {target} 的战报")
-                visit(target, page)
-            self._driver.click(*_mail_back(), label="返回")
-            self._driver.wait(2.0)
-        self._close_mail()
+            if versus is None:
+                # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，接着按它的
+                # 舰队量去挑攻击组合。
+                say(f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报")
+                return False
+            target = versus.defender.coordinate.value
+            if target not in remaining:
+                say(f"  第 {row.index} 行是 {target} 的战报，不在这一趟要收的目标里")
+                return False
+            remaining.discard(target)
+            say(f"  第 {row.index} 行是 {target} 的战报")
+            visit(target, page)
+            return not remaining
+
+        if not remaining:
+            return remaining
+        self._scan_mail_rows(
+            wanted=ReportKind.ATTACK, label="攻击战报", visit=visit_row, not_before=not_before
+        )
         return remaining
 
     def collect_probe_reports(self, wanted: Sequence[Coordinate]) -> tuple[Coordinate, ...]:
@@ -223,6 +198,12 @@ class BotLoop(PirateLoop):
 
         入库走 `append_report`，它会按「出发坐标 + 目标坐标 + 时间就近」自己认领
         那一发派遣（置 `dispatch_id` 与 `match_status='MATCHED'`），这里不另做匹配。
+
+        ⚠️ **收不到时那句话要说准。** 原先统一说「还没出现在信箱最上面几行」，
+        把「窗口不够大」说成了「报告还没到」——而实机上正因就是前者：海盗链路
+        整夜产出攻击报告，6 行窗口被别人的报告占满，六个目标一视同仁地报「翻不到」，
+        连续四趟都是同一句。两者的处置完全相反（一个要把窗口开大、一个要接着等），
+        所以现在按「这一发到点了没有」分开说。
         """
         stored: list[Coordinate] = []
 
@@ -230,10 +211,23 @@ class BotLoop(PirateLoop):
             if self._ingest_probe_report(target, page):
                 stored.append(target)
 
-        missing = self._scan_mail(wanted, visit)
+        repository, _run_id = self._ensure_run()
+        due = dict(repository.bot_report_due_at(wanted, since=self._round_start()))
+        # 列表按时间倒序：比**最早那一发的派出时刻**还早的报告，不可能是这几发的。
+        # 取派出时刻而不是预计抵达时刻，是因为预计时刻来自简报上的一次 OCR，
+        # 而那个读数实机上并不可靠（同一天同距离的六发读出 8 秒到 25 分钟不等）。
+        # 派出时刻是本地记的，是硬事实；用它当下界只会多翻几行，不会漏掉报告。
+        not_before = min((moment for moment, _ in due.values()), default=None)
+        missing = self._scan_mail(wanted, visit, not_before=not_before)
+        now = datetime.now(UTC)
         for coordinate in wanted:
-            if coordinate in missing:
-                say(f"  {coordinate} 的探路战报还没出现在信箱最上面几行；这一趟不动它")
+            if coordinate not in missing:
+                continue
+            expected = due.get(coordinate, (None, None))[1]
+            if expected is not None and expected > now:
+                say(f"  {coordinate} 的探路战报预计 {expected:%H:%M:%S} UTC 才产生；接着等")
+            else:
+                say(f"  {coordinate} 的探路战报到点了却没翻到；下一趟再来")
         return tuple(stored)
 
     def _ingest_probe_report(self, target: Coordinate, page: Any) -> bool:
@@ -418,18 +412,6 @@ def _count(text: str) -> int | None:
     from evo_helper.domain.fleet_tier import parse_fleet_count
 
     return parse_fleet_count(text) if text else None
-
-
-def _mail_back() -> tuple[int, int]:
-    from evo_helper.tools.pirate_loop import MAIL_BACK
-
-    return MAIL_BACK
-
-
-def _tesseract() -> str:
-    from evo_helper.tools.scan_coordinates import tesseract_path
-
-    return str(tesseract_path())
 
 
 def parse_round_start(text: str) -> datetime:
