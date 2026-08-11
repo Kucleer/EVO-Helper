@@ -150,6 +150,77 @@ def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repositor
     )
 
 
+# -- 翻信箱要的两个时刻 ------------------------------------------------------
+
+
+def test_the_open_dispatch_hands_out_both_clocks(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """`bot_report_due_at` 一次交出**派出时刻**和**预计战报时刻**。
+
+    两者用途完全不同：前者是翻信箱的时间下界（列表按时间倒序，比它还早的报告
+    不可能是这一发的），后者只用来把日志上那句话说准。分两次查就会有人只查一个，
+    然后拿预计时刻去当下界——那是个 OCR 读数，实机上同距离的六发读出 8 秒到
+    25 分钟不等，读大一次就能把真报告永久挡在窗口外，而且完全静默。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START)
+    _set_expected_report(repository, ROUND_START + timedelta(minutes=25))
+
+    due = repository.bot_report_due_at([TARGET], since=ROUND_START)
+
+    assert due == {TARGET: (ROUND_START, ROUND_START + timedelta(minutes=25))}
+
+
+def test_a_dispatch_whose_report_is_back_is_not_waiting_any_more(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """战报已经收到的那一发不再交出来——它没有什么可等的了。
+
+    留着它只会把时间下界压到更早，于是每一趟都往回多翻几屏旧邮件。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
+
+    assert repository.bot_report_due_at([TARGET], since=ROUND_START) == {}
+
+
+def test_a_refused_dispatch_is_not_waiting_either(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """被游戏拒掉的那一发没有舰队飞出去，也就永远不会有战报。
+
+    和 `bot_dispatch_facts` / `count_dispatches_since` 同一条口径：算进来就是
+    一个永远等不到的下界。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, accepted=False)
+
+    assert repository.bot_report_due_at([TARGET], since=ROUND_START) == {}
+
+
+def test_the_earliest_open_dispatch_wins(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """同一个坐标有多发未闭合时取**最早**那一发。
+
+    翻信箱要的是覆盖全部候选的下界；取最晚那一发会把更早那一发的报告挡在外面。
+    """
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START)
+    _intent(repository, run_id, preset=PROBE, created_at=ROUND_START + timedelta(minutes=10))
+
+    due = repository.bot_report_due_at([TARGET], since=ROUND_START)
+
+    assert due[TARGET][0] == ROUND_START
+
+
+def test_last_rounds_dispatch_does_not_drag_the_floor_back(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """上一轮的派遣不参与本轮：`since` 之前的那些不该把下界拖到昨天去。"""
+    _intent(repository, run_id, preset=PROBE, created_at=LAST_ROUND)
+
+    assert repository.bot_report_due_at([TARGET], since=ROUND_START) == {}
+
+
+def _set_expected_report(repository, expected: datetime) -> None:  # type: ignore[no-untyped-def]
+    from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    with repository._session_factory() as session:  # noqa: SLF001
+        for row in session.scalars(select(orm.AttackDispatchRow)):
+            row.expected_report_at_utc = expected
+        session.commit()
+
+
 # -- 「不值得打」的标记 ------------------------------------------------------
 
 

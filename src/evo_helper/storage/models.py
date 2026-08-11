@@ -360,3 +360,33 @@ class SchedulerConfigRow(Base):
     #: 同一条链路两次启动之间的最小间隔。堵的是「战报还没到就反复进信箱扑空」
     #: 的空转——每轮几十秒的导航全白费，还一直占着鼠标不让扫描进来。
     restart_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)
+
+
+class DailyReconciliationRow(Base):
+    """开工对账的结果：某个 UTC 日、某条链路，信箱里数到了几份攻击战报。
+
+    ⚠️ **这张表不是派遣台账，一行也不代表一发派遣。** 它只记「观测到 N 份战报」
+    这一个数，供 `repository.count_dispatches_since` 与库内计数取大。
+    对账绝不往 `attack_dispatches` 里补行：多一条不存在的派遣，调度器就会以为
+    一条航线被占着、等一份永远不会来的战报，要到 6 小时后才被判缺失清掉。
+    """
+
+    __tablename__ = "daily_reconciliations"
+    __table_args__ = (
+        UniqueConstraint("day_utc", "target_kind", name="uq_reconciliation_day_kind"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    #: `YYYY-MM-DD`，**UTC+0 的那一天**——配额的日界就是 UTC 00:00。
+    #: 存成字符串是为了能和 SQLite 的 `date(dispatched_at_utc)` 直接比。
+    day_utc: Mapped[str] = mapped_column(String(10), index=True)
+    #: `pirate` / `bot`，与 `attack_intents.target_kind` 同一套词。
+    target_kind: Mapped[str] = mapped_column(String(16))
+    #: 那天信箱里数到的本链路战报份数。
+    observed_reports: Mapped[int] = mapped_column(Integer, default=0)
+    #: 有没有一直翻到「昨天的报告」。为假时上面那个数只是「今天至少这么多」。
+    #:
+    #: **它不是过滤条件。** 下界照样参与配额取大——扔掉它就等于回到只按库算，
+    #: 也就是回到会超额的那一侧。这一列只作诊断：日志要说清那个数是不是全天。
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    reconciled_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)

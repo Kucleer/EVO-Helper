@@ -43,14 +43,19 @@ class TestTesseractPath:
     def test_the_two_runners_borrow_the_same_resolver(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """三条链路各写一遍 = 改一处漏两处，而漏掉的那两条照常启动。"""
+        """三条链路各写一遍 = 改一处漏两处，而漏掉的那两条照常启动。
+
+        bot 那条**不再自己解析**：取 `ReportScreens` 的代码合并进了
+        `PirateLoop._report_screens`，路径只在那一处取。这里顺带钉住「没有第二份」
+        ——重新长出一个 `bot_loop._tesseract()` 就是把这个坑重新挖开。
+        """
         from evo_helper.tools import bot_loop, pirate_loop, scan_coordinates
 
         monkeypatch.setenv("EVO_HELPER_TESSERACT_PATH", r"D:\ocr\tesseract.exe")
 
         assert pirate_loop._tesseract_path() == Path(r"D:\ocr\tesseract.exe")
-        assert bot_loop._tesseract() == r"D:\ocr\tesseract.exe"
         assert scan_coordinates.tesseract_path() == Path(r"D:\ocr\tesseract.exe")
+        assert not hasattr(bot_loop, "_tesseract")
 
     @pytest.mark.parametrize(
         "module_name",
