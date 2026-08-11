@@ -562,7 +562,15 @@
     root.append(makeGroup('AND', 0));
     try { shipNames = await EVOHelper.get('/api/intel/ships'); } catch (_) { shipNames = []; }
     renderHead();
-    activeGroup().querySelector('[data-children]').append(makeCondition());
+    // 打开时**不预置任何舰队条件**。
+    //
+    // 原来这里默认塞一条「舰队总数 > 0」，于是页面一打开就悄悄筛掉了所有
+    // 「有战报、但没读到舰队数」的目标——而那恰恰是刚打完一轮最想看的那些：
+    // 战报刚入库、单位数还没读出来的记录舰队总数是空的。实机上用户连着两次
+    // 报「看不到新的战报」，数据一直在库里、排序也对，是被这条默认条件挡住了。
+    //
+    // 空条件 = 不筛。要按舰队筛，点「+ 条件」一下就有。默认应当是「都给我看」，
+    // 而不是「先替你藏掉一部分」。
     await loadFilters();
     refreshCondCount();
     runSearch(0);
