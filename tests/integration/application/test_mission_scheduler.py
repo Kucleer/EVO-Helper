@@ -16,6 +16,8 @@ from evo_helper.application.mission_scheduler import MAX_CONSECUTIVE_FAILURES, M
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
+    MISSION_KIND_ATTACK,
+    MISSION_KIND_SCOUT,
     TARGET_KIND_BOT,
     TARGET_KIND_PIRATE,
     AttackDispatch,
@@ -74,7 +76,15 @@ def dispatch(  # type: ignore[no-untyped-def]
     target: Coordinate,
     dispatched_at: datetime,
     preset_name: str = "AAA",
+    flight: timedelta | None = None,
+    mission_kind: str = MISSION_KIND_ATTACK,
 ):
+    """记一发被游戏接受的派遣。
+
+    `flight` 不传就留空航线钟，那一档按 `UNKNOWN_LINE_HOLD`（6 小时）算**仍然
+    占着航线**——测试若只想验别的事，就得把飞行时间给上，否则这一发会一直压着
+    航线让链路起不来。
+    """
     intent_id, dispatch_id = uuid4(), uuid4()
     repository.save_attack_intent(
         AttackIntent(
@@ -94,8 +104,11 @@ def dispatch(  # type: ignore[no-untyped-def]
             intent_id=intent_id,
             dispatched_at_utc=dispatched_at,
             accepted=True,
+            mission_kind=mission_kind,
         )
     )
+    if flight is not None:
+        repository.record_flight_time(dispatch_id, flight, dispatched_at)
     return dispatch_id
 
 
@@ -473,6 +486,92 @@ def test_the_chain_comes_back_once_the_cooldown_expires(  # type: ignore[no-unty
     assert launcher.kinds == [MissionKind.PIRATE, MissionKind.PIRATE]
 
 
+# -- 航线占满之后不要再一轮轮地起 ----------------------------------------------
+
+
+def _scout_still_out(repository, run_id, *, dispatched_at, flight):  # type: ignore[no-untyped-def]
+    """派一发还在外面没回来的侦察，好让「下一条航线什么时候空」有个真实答案。
+
+    **用侦察而不是攻击**：侦察不产生 `battle_reports`，也就不会顺带把
+    `pirate_reports_due` 点亮。用攻击发的话，等航线那一档刚解除，战报判据也
+    到期了，测出来分不清链路到底是为哪一边起来的。侦察一样占航线（这正是这里
+    要的），只是不进配额、不进战报。
+    """
+    return dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        target=Coordinate(2, 137, 1),
+        dispatched_at=dispatched_at,
+        preset_name="侦察",
+        mission_kind=MISSION_KIND_SCOUT,
+        flight=flight,
+    )
+
+
+def test_a_round_that_dispatched_nothing_does_not_restart_while_a_fleet_is_out(  # type: ignore[no-untyped-def]
+    repository, launcher, clock, run_id, session_factory
+) -> None:
+    """**用户口径：「航路上限到达后，不应继续海盗任务。」**
+
+    实机 2026-08-11 01:12–01:34 UTC（本地 09:12–09:34）：估算的空闲航线一路报 3，
+    游戏那边 6 条全满，海盗与 bot 交替起了九轮，每轮几十秒导航之后撞上
+    「同时派遣的舰队数量已达上限。」退出、冷却五分钟、再来。
+
+    这里守的是接线：库里读出来的「上一轮空手而归」+「还有舰队在外面」必须真的
+    落到「这一轮不起」。**注意空闲航线是 5**——只看 `free_lines` 的话它一定会起，
+    所以这条断言是有牙的。
+    """
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    set_config(session_factory, fleet_line_limit=6)
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    _scout_still_out(
+        repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
+    )
+    scheduler.start()
+
+    # 第一轮照常起：这条链路还没有「上一轮」可言。
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.PIRATE]
+
+    # 它跑完了、退出码 0（撞上航线上限也是这个码），但一发都没派出去。
+    launcher.latest.exit_code = 0
+    clock.now = NOW + RESTART_COOLDOWN + timedelta(seconds=1)
+
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.PIRATE]
+
+
+def test_the_chain_restarts_once_a_line_actually_frees_up(  # type: ignore[no-untyped-def]
+    repository, launcher, clock, run_id, session_factory
+) -> None:
+    """**不许做成永久不起。** 那发侦察一回来，链路就该照常开工。
+
+    等到的是库里查得出来的那个时刻（出发 + 飞行时长 × 2），不是又一段拍脑袋的
+    固定间隔。
+    """
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    set_config(session_factory, fleet_line_limit=6)
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    _scout_still_out(
+        repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
+    )
+    scheduler.start()
+    scheduler.tick()
+    launcher.latest.exit_code = 0
+
+    # 出发后 10 分钟派出，飞 25 分钟、往返 50 分钟 → 航线在 NOW + 40 分钟空出来。
+    clock.now = NOW + timedelta(minutes=41)
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.PIRATE, MissionKind.PIRATE]
+
+
 # -- 连续失败自停 --------------------------------------------------------------
 
 
@@ -592,6 +691,9 @@ def test_a_target_that_only_got_a_probe_report_still_counts_as_remaining(  # typ
         target=target,
         dispatched_at=NOW - timedelta(hours=1),
         preset_name=DEFAULT_PRESET.name,
+        # 这一发早该回来了。飞行时间不给的话航线钟留空，那一档算「还占着」，
+        # 唯一那条航线被压住，验的就不再是「目标还剩几个」了。
+        flight=timedelta(minutes=20),
     )
     attach_report(session_factory, dispatch_id, target, NOW - timedelta(minutes=30))
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)

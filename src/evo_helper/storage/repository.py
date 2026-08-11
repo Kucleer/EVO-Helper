@@ -6,8 +6,9 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
@@ -26,7 +27,12 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
-from evo_helper.domain.report_wait import MAX_REPORT_AGE, PendingReport, line_free_at
+from evo_helper.domain.report_wait import (
+    MAX_REPORT_AGE,
+    UNKNOWN_LINE_HOLD,
+    PendingReport,
+    line_free_at,
+)
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.state_machine import require_transition
 
@@ -569,9 +575,11 @@ class SqlAlchemyRepository:
 
         **侦察发照数**：它一样占航线。它不进的是配额，见 `count_dispatches_since`。
 
-        飞行时间为 NULL 的不计入：读不到就当它不占位，宁可估高空闲航线。
-        估高了 runner 起来空跑一轮，估低了则是航线空着不派——前者有闸门兜底，
-        后者没有。
+        **飞行时间为 NULL 的照数**，占到派出时刻 + `UNKNOWN_LINE_HOLD` 为止。
+        NULL 的语义是「不知道它什么时候回来」，不是「它没占航线」——被游戏接受的
+        那一发舰队一定占着一条位子。此前这一档按不占记，每一发读不出飞行时间的
+        派遣就凭空多出一条空闲航线，而这个错估没有任何回写路径：调度器每隔一个
+        `RESTART_COOLDOWN` 就照着它再起一轮，导航几十秒、撞上限、退出、再来。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
@@ -581,11 +589,55 @@ class SqlAlchemyRepository:
                     .select_from(orm.AttackDispatchRow)
                     .where(
                         orm.AttackDispatchRow.accepted.is_(True),
-                        orm.AttackDispatchRow.line_free_at_utc > now_utc,
+                        _still_holding_a_line(now_utc),
                     )
                 )
                 or 0
             )
+
+    def next_line_free_at(self, *, now_utc: datetime) -> datetime | None:
+        """已知最早会空出来的那条航线，什么时候空。算不出来时返回 None。
+
+        供调度器把「等航线」锚在一个**真会发生的事件**上，而不是又一段拍脑袋的
+        固定间隔。
+
+        **只看有航线钟的那些。** 飞行时间读不到的那一档虽然照样算占位（见
+        `count_inflight`），但它的 `UNKNOWN_LINE_HOLD` 是「等到这里就放弃」的
+        上界，不是对返航时刻的预测；拿它当闹钟会让链路一睡 6 小时。全场只剩这种
+        派遣时宁可返回 None，让调用方走自己那条有界退避。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            moment: datetime | None = session.scalar(
+                select(func.min(orm.AttackDispatchRow.line_free_at_utc)).where(
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.line_free_at_utc > now_utc,
+                )
+            )
+        return moment
+
+    def last_dispatch_at(self, target_kind: str) -> datetime | None:
+        """这种目标最近一次**真的派出去**是什么时候。一次都没有则为 None。
+
+        供调度器判「上一轮是不是空手而归」：这个时刻早于该链路上一次启动，就说明
+        那一轮从头跑到尾一发都没派出去。
+
+        **侦察发照数、被拒的那发不数**，和 `count_inflight` 同口径：侦察一样占
+        航线，一轮只派了侦察不算空手；被游戏拒掉的那一发根本没飞出去，算进来就
+        等于把「撞上航线上限」误读成「派成功了」——那正是要认出来的那件事。
+        """
+        with self._session_factory() as session:
+            moment: datetime | None = session.scalar(
+                select(func.max(orm.AttackDispatchRow.dispatched_at_utc))
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == target_kind,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                )
+            )
+        return moment
 
     def pending_reports_for_kind(
         self,
@@ -1134,6 +1186,23 @@ def _tier_negligible(session: Session, coordinate: Coordinate, *, since: datetim
     if since is not None:
         statement = statement.where(orm.TargetRevisitRow.requested_at_utc >= since)
     return bool(session.scalar(statement) or 0)
+
+
+def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:
+    """这一发是不是还占着一条航线。抽成具名谓词是为了让两档合在一处看得见。
+
+    - 航线钟读到了：到点就放手。
+    - 航线钟为 NULL：**照样占着**，直到派出时刻 + `UNKNOWN_LINE_HOLD`。
+      NULL 的意思是「不知道它什么时候回来」，不是「它没占位」。
+    """
+    row = orm.AttackDispatchRow
+    return or_(
+        row.line_free_at_utc > now_utc,
+        and_(
+            row.line_free_at_utc.is_(None),
+            row.dispatched_at_utc > now_utc - UNKNOWN_LINE_HOLD,
+        ),
+    )
 
 
 def _require_utc(value: datetime, label: str) -> datetime:
