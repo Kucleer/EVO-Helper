@@ -97,6 +97,16 @@ class ReportLayout:
     mail_row_pitch: int
     mail_visible_rows: int
     report_header: Region
+    #: 页眉右上角那行时间的**窄单行 ROI**，与坐标同一套路子（见下面那组注释）。
+    #:
+    #: `report_header` 是一块两行、带中文、按列读的宽 ROI，主题行读得很干净，
+    #: 而右上角那行时间在同一次读里被糊成 `'wi'`——`REPORT_TIME_RE` 自然搜不到，
+    #: 整份报告卡在「report header has no readable time」上入不了库。
+    #: 实机（2026-08-11）五份 bot 探路战报连着栽在这里。
+    #:
+    #: 单独裁出来、psm 7、纯数字白名单，五张现场图全部读对；顺带在两份更早的
+    #: 海盗战报截图（另一个 ui_version）上也读对了。
+    report_time: Region
     detail_versus: Region
     replay_versus: Region
     #: Tight single-line ROIs for the coordinates, read separately at psm 7.
@@ -132,6 +142,7 @@ LIVE_LAYOUT = ReportLayout(
     mail_row_pitch=86,
     mail_visible_rows=6,
     report_header=Region(720, 125, 1200, 195),
+    report_time=Region(1010, 126, 1205, 162),
     detail_versus=Region(720, 370, 1200, 460),
     replay_versus=Region(720, 150, 1200, 240),
     detail_attacker_coordinate=Region(760, 428, 900, 452),

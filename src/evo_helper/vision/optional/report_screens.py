@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 from evo_helper.vision.fleet_counts import COUNT_RECIPES
+from evo_helper.vision.parsers import REPORT_TIME_RE, normalise_report_time
 from evo_helper.vision.report_layout import (
     OCR_PSM_COLUMN,
     OCR_PSM_LINE,
@@ -42,6 +43,14 @@ NUMBER_COLUMN_MIN_WIDTH = 10
 
 #: 「单位」数值的字符集。大舰队显示成 `5.36K`，所以要收 `.` 和 `K`。
 UNIT_WHITELIST = "0123456789.K"
+
+#: 页眉时间那一行只可能出现这些字符。空格留着——白名单里给了它，tesseract
+#: 仍然常常吞掉，所以还要 `normalise_report_time` 把分隔补回去。
+REPORT_TIME_WHITELIST = "0123456789/: "
+
+#: 页眉时间依次试这几档放大。**3× 打头而不是布局默认的 2×**：实测五张现场图，
+#: 2× 有三张把日期首位削掉（`11/08/…` → `1/08/…`），3× 与 4× 五张全对。
+REPORT_TIME_UPSCALES: tuple[int, ...] = (3, 4, 2)
 
 #: 名称列相对列左沿的裁剪范围与放大倍数。
 FLEET_NAME_INSET = 15
@@ -123,7 +132,45 @@ class ImageReportScreens:
         ]
 
     def report_header(self) -> str:
-        return self._read(self._layout.report_header, OCR_PSM_COLUMN)
+        """页眉文本。时间那一行读不到时，用窄 ROI 单独补一次。
+
+        宽 ROI 按列读能把「主题: 攻击报告」读得很干净，却会把右上角那行时间糊成
+        `'wi'`——于是 `REPORT_TIME_RE` 搜不到，整份报告卡在
+        「report header has no readable time」上入不了库。实机（2026-08-11）
+        五份 bot 探路战报连着栽在这里，而那行时间在图上清清楚楚。
+
+        同一个坑仓库里已经踩过一次并留了办法：VS 块的坐标也是「宽裁剪里读不准、
+        各自开一个窄单行 ROI」（见 `versus_block` 的注释）。这里照搬。
+
+        补读只在宽读没拿到时间时才发生，稳态一次 OCR 都没多花。
+        """
+        wide = self._read(self._layout.report_header, OCR_PSM_COLUMN)
+        if REPORT_TIME_RE.search(wide):
+            return wide
+        stamp = self._report_time()
+        return f"{stamp}\n{wide}" if stamp is not None else wide
+
+    def _report_time(self) -> str | None:
+        """窄 ROI 读页眉时间：单行、纯英文、只认数字与分隔符。
+
+        ⚠️ **必须用自己的放大倍数，不能跟布局默认的 2×。** 实测五张现场图：
+        2× 有三张把日期首位削掉（`11/08/…` 读成 `1/08/…`，规范化随即判定失败），
+        3× 与 4× 五张全对。逐档试、第一个读通的就采信——和坐标行的
+        `COORD_RECIPES` 同一个路子。
+        """
+        for scale in REPORT_TIME_UPSCALES:
+            stamp = normalise_report_time(
+                self._read(
+                    self._layout.report_time,
+                    OCR_PSM_LINE,
+                    language="eng",
+                    whitelist=REPORT_TIME_WHITELIST,
+                    scale=scale,
+                )
+            )
+            if stamp is not None:
+                return stamp
+        return None
 
     def versus_block(self) -> str:
         """Rebuild the VS block as two aligned columns.
