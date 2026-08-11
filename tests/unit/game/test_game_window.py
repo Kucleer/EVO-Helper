@@ -433,6 +433,150 @@ class _FakeWindowDriver:
         return (self._size[0] - self._border[0], self._size[1] - self._border[1])
 
 
+class _FakeLifecycle:
+    """假的窗口生命周期。**测试里绝不许真的开关窗口。**
+
+    `closes` 之后再问 `find`，窗口就不见了——真窗口是异步消失的，所以这里
+    还能配一个「消失前还会被看见几次」的延迟。
+    """
+
+    def __init__(self, *, present: bool = True, linger: int = 0) -> None:
+        self.closes: list[int] = []
+        self.ensured = 0
+        self._present = present
+        self._linger = linger
+
+    def find(self) -> object | None:
+        if not self._present:
+            return None
+        if self.closes and self._linger <= 0:
+            return None
+        if self.closes:
+            self._linger -= 1
+        return _window("EVO")
+
+    def request_close(self, window: object) -> None:
+        self.closes.append(getattr(window, "handle", 0))
+
+    def ensure(self) -> object:
+        self.ensured += 1
+        return _window("EVO")
+
+
+class TestRestartGameWindow:
+    """「无法重新连接」那一屏的善后：关掉这一个窗口，再让它自己开回来。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """⚠️ **本类的每一条测试都不许碰真窗口。**
+
+        这个 fixture 不是「顺手加的保险」，是整改验证时**真的踩到了**才加的：
+        把 `hardware.ensure()` 改回直接调 `ensure_game_window()`（正是这里要防的
+        那种回退），下面第一条测试就沿着真实现走了下去，把用户的游戏窗口从
+        1920x917 拽成了 1894x556——测试确实变红了，但**红之前已经动了系统**。
+
+        所以光有「注入假的就不碰真的」那一条断言不够：它只保护自己那一条。
+        整类一起 monkeypatch，边界一旦被绕过就立刻炸在这里，而且什么都没动。
+        """
+        from evo_helper.game import game_window
+
+        def explode(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("测试绝不许碰真窗口：动系统的调用必须留在 _Win32Lifecycle 后面")
+
+        for name in (
+            "find_game_window",
+            "find_loading_game_window",
+            "launch_game",
+            "ensure_game_window",
+            "resize_to_viewport",
+        ):
+            monkeypatch.setattr(game_window, name, explode)
+
+    def test_it_closes_then_brings_the_window_back(self) -> None:
+        from evo_helper.game import game_window
+
+        lifecycle = _FakeLifecycle()
+        game_window.restart_game_window(lifecycle=lifecycle, pause=lambda _s: None)  # type: ignore[arg-type]
+
+        assert lifecycle.closes == [1]
+        assert lifecycle.ensured == 1
+
+    def test_it_waits_for_the_window_to_actually_disappear(self) -> None:
+        """`PostMessageW` 是异步的：投完消息窗口还在。
+
+        不等它消失就去拉新窗口，屏幕上会同时留下两个游戏窗口，而
+        `find_game_window` 见到两个就彻底罢工——链路从此起不来。
+        """
+        from evo_helper.game import game_window
+
+        lifecycle = _FakeLifecycle(linger=3)
+        slept: list[float] = []
+        game_window.restart_game_window(lifecycle=lifecycle, pause=slept.append)  # type: ignore[arg-type]
+
+        assert slept, "窗口还在的时候必须等，不能直接往下走"
+        assert lifecycle.ensured == 1
+
+    def test_a_window_that_refuses_to_close_is_reported_not_duplicated(self) -> None:
+        from evo_helper.game import game_window
+
+        class _Stuck(_FakeLifecycle):
+            def find(self) -> object | None:
+                return _window("EVO")
+
+        lifecycle = _Stuck()
+        with pytest.raises(game_window.GameWindowError, match="WM_CLOSE"):
+            game_window.restart_game_window(
+                lifecycle=lifecycle,  # type: ignore[arg-type]
+                pause=lambda _s: None,
+                clock=iter(range(0, 10_000, 5)).__next__,
+            )
+        assert lifecycle.ensured == 0, "关不掉就绝不能再拉一个"
+
+    def test_a_missing_window_is_simply_relaunched(self) -> None:
+        """窗口早就没了（用户自己关的、或崩了）也要能走通，不能卡在关窗上。"""
+        from evo_helper.game import game_window
+
+        lifecycle = _FakeLifecycle(present=False)
+        game_window.restart_game_window(lifecycle=lifecycle, pause=lambda _s: None)  # type: ignore[arg-type]
+
+        assert lifecycle.closes == []
+        assert lifecycle.ensured == 1
+
+    def test_it_closes_one_window_rather_than_killing_chrome(self) -> None:
+        """用户多半同时开着自己的 Chrome。
+
+        按进程名杀会把用户的标签页一起带走。`WM_CLOSE` 投到具体句柄上，
+        效果等同于用户点了那个窗口的右上角 ×。
+        """
+        from evo_helper.game import game_window
+
+        assert game_window.WM_CLOSE == 0x0010
+
+    def test_every_system_touching_call_stays_behind_the_lifecycle(self) -> None:
+        """**这条钉的是测试纪律，不是产品行为。**
+
+        已经出过事：有改动在单元测试里直接调 `ensure_game_window()`，把用户真实
+        的游戏窗口连拽了三次尺寸。所有会动系统的调用都必须待在 `_Win32Lifecycle`
+        后面；一旦有人把它们搬回 `restart_game_window` 的函数体，`_no_real_windows`
+        会让这条（和本类其余每一条）立刻变红——而且什么都没动。
+        """
+        from evo_helper.game import game_window
+
+        lifecycle = _FakeLifecycle(linger=2)
+        game_window.restart_game_window(lifecycle=lifecycle, pause=lambda _s: None)  # type: ignore[arg-type]
+
+        assert (lifecycle.closes, lifecycle.ensured) == ([1], 1)
+
+    def test_the_real_lifecycle_does_nothing_until_it_is_asked(self) -> None:
+        """构造真实现本身不许有副作用，否则注入假的也拦不住它。
+
+        （`_no_real_windows` 已经把真调用换成会炸的桩，所以这一句真去动系统就红。）
+        """
+        from evo_helper.game import game_window
+
+        game_window._Win32Lifecycle()
+
+
 class TestSelfCalibratingResize:
     """边框宽度跟系统 DPI 走，换台机器就变。所以不能假定，只能量。"""
 

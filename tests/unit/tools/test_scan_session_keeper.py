@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from evo_helper.game.session_keeper import ScreenState
 from evo_helper.tools.scan_coordinates import (
+    DISCONNECT_BUTTON,
+    DISCONNECT_TEXT_ROI,
     ENTRY_BUTTON_ROI,
     ENTRY_TITLE_ROI,
     NAV_TEXT_ROI,
@@ -39,8 +43,15 @@ def fake_ocr(crop: Any, *, digits: bool, upscale: int, threshold: int | None = N
     return texts.get(box, "")
 
 
-def keeper_for(texts: dict[tuple[int, int, int, int], str]):
-    """假时钟每问一次就跳 10 秒，等待循环立刻超时——测试不该真的睡两分钟。"""
+def keeper_for(
+    texts: dict[tuple[int, int, int, int], str],
+    *,
+    restart_window: Any = None,
+):
+    """假时钟每问一次就跳 10 秒，等待循环立刻超时——测试不该真的睡两分钟。
+
+    ``restart_window`` 一律传假的：**测试绝不许真的开关窗口。**
+    """
     driver = FakeDriver(texts)
     ticks = iter(range(0, 100_000, 10))
     keeper = make_session_keeper(
@@ -48,6 +59,7 @@ def keeper_for(texts: dict[tuple[int, int, int, int], str]):
         fake_ocr,
         clock=lambda: float(next(ticks)),
         sleep=lambda _s: None,
+        restart_window=restart_window or (lambda: None),
     )
     return driver, keeper
 
@@ -89,6 +101,56 @@ def test_an_unrecognised_screen_is_never_clicked() -> None:
     outcome = keeper.reconnect()
     assert outcome.state is ScreenState.UNKNOWN
     assert not outcome.reconnected
+    assert driver.clicks == []
+
+
+#: 两种掉线弹窗共用同一块 ROI、同一行正文，只在文字上分。
+RECOVERABLE_DISCONNECT = {DISCONNECT_TEXT_ROI: "连接已断开", NAV_TEXT_ROI: "商店 联盟"}
+DEAD_SESSION = {DISCONNECT_TEXT_ROI: "连接已断开，无法重新连接。", NAV_TEXT_ROI: "商店 联盟"}
+
+
+def test_the_popup_is_read_before_the_nav_bar_behind_it() -> None:
+    """弹窗是浮层，底下的导航条还画在画面上，「商店/联盟」照样读得出来。
+
+    先判导航条就会把死会话认成在线，之后每一步点击都石沉大海，全程不报错。
+    """
+    _driver, keeper = keeper_for(DEAD_SESSION)
+    assert keeper._observe() is ScreenState.DEAD_SESSION
+
+
+def test_a_recoverable_disconnect_is_dismissed_not_restarted() -> None:
+    restarts: list[bool] = []
+    driver, keeper = keeper_for(
+        RECOVERABLE_DISCONNECT, restart_window=lambda: restarts.append(True)
+    )
+
+    keeper.reconnect()
+
+    assert restarts == [], "点一下就能回去的时候不该关窗口"
+    assert driver.clicks[0][:2] == DISCONNECT_BUTTON
+
+
+def test_a_dead_session_restarts_the_window_and_never_clicks_the_dialog() -> None:
+    """「无法重新连接」= 点掉弹窗也回不去。别在死页面上多留一次点击。"""
+    restarts: list[bool] = []
+    driver, keeper = keeper_for(DEAD_SESSION, restart_window=lambda: restarts.append(True))
+
+    keeper.reconnect()
+
+    assert restarts == [True]
+    assert driver.clicks == []
+
+
+def test_the_dismiss_action_itself_refuses_a_dead_session() -> None:
+    """第二道防线：就算有人绕过守护直接调这个动作，也不许点在死页面上。
+
+    守护本身已经把 DEAD_SESSION 引去关窗重开、根本走不到这里，所以这条判据
+    只在「被绕过」时才起作用——而那正是它存在的理由。
+    """
+    driver, keeper = keeper_for(DEAD_SESSION)
+
+    with pytest.raises(RuntimeError, match="读不到那行字"):
+        keeper._dismiss_disconnect()
     assert driver.clicks == []
 
 
