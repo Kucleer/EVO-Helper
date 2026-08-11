@@ -1083,7 +1083,7 @@ class SqlAlchemyRepository:
         """本轮这个目标最新那份战报里守方的「单位」总数；没有就 None。
 
         分档要的就是这个数，而它在收报告那一趟已经读过一次了（见
-        `tools.bot_loop.collect_probe_reports`）。从库里取而不是再进一趟信箱，
+        `tools.bot_loop.collect_battle_reports`）。从库里取而不是再进一趟信箱，
         省的不只是十几秒 OCR：信箱里那几行**没有时间闸门**，翻到的可能是
         上一轮甚至上一天的报告，照它分档就是拿旧情报去挑舰队组合。
         `since` 把范围钉在本轮上。
