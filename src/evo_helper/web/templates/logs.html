@@ -10,13 +10,25 @@
   <h2 id="log-filter" class="visually-hidden">筛选</h2>
   <div class="filter-bar">
     <span class="inline-label">事件类型</span>
-    <a class="btn small {{ 'primary' if kind == 'all' else '' }}" href="/logs?kind=all">全部</a>
+    <a class="btn small {{ 'primary' if kind == 'all' else '' }}" href="{{ kind_url('all') }}">全部</a>
     {% for value, label in kind_labels.items() %}
-      <a class="btn small {{ 'primary' if kind == value else '' }}" href="/logs?kind={{ value }}">{{ label }}</a>
+      <a class="btn small {{ 'primary' if kind == value else '' }}" href="{{ kind_url(value) }}">{{ label }}</a>
     {% endfor %}
     <span class="spacer"></span>
     <span class="muted">最多显示最近 {{ limit }} 条</span>
   </div>
+  {# 日期按游戏时间 UTC+0 的自然日切，和表格第一列同口径；清空即不筛。 #}
+  <form class="filter-bar" method="get" action="/logs">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <label class="inline-label" for="log-date">日期（游戏 UTC+0）</label>
+    <input type="date" id="log-date" name="date" value="{{ day_value }}">
+    <button class="btn small primary" type="submit">筛选</button>
+    <a class="btn small" href="{{ clear_date_url }}">全部日期</a>
+    <span class="spacer"></span>
+    <span class="muted">
+      {% if day_value %}只看 {{ day_value }} 这一个游戏日（UTC+0 00:00–24:00）{% else %}未按日期筛选{% endif %}
+    </span>
+  </form>
 </section>
 
 <section class="panel" aria-labelledby="log-table">
@@ -33,7 +45,7 @@
           <th scope="col">预设</th>
           <th scope="col">结果</th>
           <th scope="col">战果</th>
-          <th scope="col">预计战报（游戏 UTC+0）</th>
+          <th scope="col">预计战报（现实 UTC+8）</th>
         </tr>
       </thead>
       <tbody>
@@ -77,7 +89,8 @@
               </div>
             {% endif %}
           </td>
-          <td class="muted">{{ game_time(entry.expected_report_at_utc) }}</td>
+          {# 预计战报按现实时间显示：这一格的用途是「我几点回来收战报」，而人是按墙上时钟等的。 #}
+          <td class="muted">{{ local_time(entry.expected_report_at_utc) }}</td>
         </tr>
       {% else %}
         <tr><td colspan="9" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>

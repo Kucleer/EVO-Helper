@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, cast
@@ -362,6 +362,13 @@ def _blank_to_none(value: Any) -> Any:
 
 #: 允许空串的整数查询参数。空串→None，由处理函数各自决定落回什么默认值。
 BlankableInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
+
+#: 允许空串的日期查询参数（`YYYY-MM-DD`）。空串→None，也就是「不按日期筛」。
+#:
+#: 和 `BlankableInt` 同一个坑：攻击日志页的日期框清空之后，浏览器照样提交
+#: `date=`，声明成 `date | None` 会当场 422。日期框天生就有「清空」这个动作，
+#: 不像下拉框还能塞一个 `value=""` 的选项绕开，所以这一条是必须的。
+BlankableDate = Annotated[date | None, BeforeValidator(_blank_to_none)]
 
 
 # ---- application factory --------------------------------------------------
@@ -754,15 +761,32 @@ def create_app(
         return _revisit_out(service.request_revisit(payload.scope, payload.reason, target))
 
     @app.get("/logs", response_class=HTMLResponse)
-    async def attack_log_page(request: Request, kind: str = "all") -> HTMLResponse:
+    async def attack_log_page(
+        request: Request, kind: str = "all", date: BlankableDate = None
+    ) -> HTMLResponse:
         """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
 
-        筛选走查询参数，所以「只看海盗」有自己可分享的链接。
+        筛选走查询参数，所以「只看海盗」「只看 8 月 9 日」都有自己可分享的链接。
+
+        `date` 按**游戏时间 UTC+0** 的自然日切，和表格第一列同一口径。拿现实时间
+        UTC+8 的日期去切会把每天最早的八小时划到前一天——而那八小时正好压着
+        海盗每日 32 次配额的边界，切错就等于把配额记到别的日子上。
+
+        默认不按日期筛。默认「今天」在这一页是反的：UTC+0 的今天要到现实时间
+        08:00 才开始，早上打开日志会看见一页空白，而空白读起来就是「昨晚一发没打」。
         """
         service = get_service(request)
-        entries = service.list_attack_log(ATTACK_LOG_LIMIT)
+        entries = service.list_attack_log(ATTACK_LOG_LIMIT, day_utc=date)
         if kind in TARGET_KIND_LABELS:
             entries = [entry for entry in entries if entry.target_kind == kind]
+
+        def kind_url(value: str) -> str:
+            """切换事件类型时把日期带上——否则筛完日期再点「海盗」就跳回全部日期。"""
+            params = {"kind": value}
+            if date is not None:
+                params["date"] = date.isoformat()
+            return "/logs?" + urlencode(params)
+
         return templates.TemplateResponse(
             request=request,
             name="logs.html",
@@ -772,6 +796,9 @@ def create_app(
                 "kind": kind,
                 "kind_labels": TARGET_KIND_LABELS,
                 "limit": ATTACK_LOG_LIMIT,
+                "day_value": date.isoformat() if date is not None else "",
+                "kind_url": kind_url,
+                "clear_date_url": "/logs?" + urlencode({"kind": kind}),
             },
         )
 
