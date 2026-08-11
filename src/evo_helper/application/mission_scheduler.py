@@ -17,9 +17,16 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from evo_helper.application.mission_freeze import (
+    FrozenTask,
+    MissionConfigFreeze,
+    MissionFreezeLog,
+    freeze_now,
+)
 from evo_helper.application.mission_supervisor import (
     MissionExit,
     MissionSupervisor,
@@ -89,6 +96,12 @@ class SchedulerSnapshot:
     tasks: tuple[orm.MissionTaskRow, ...]
     config: orm.SchedulerConfigRow
     facts: SchedulerFacts
+    #: 任务配置现在改不改得动。见 `MissionScheduler.config_locked`。
+    config_locked: bool = False
+    #: **本轮**开始那一刻固化下来的配置。停着时为 None——停着的时候「本轮」
+    #: 不存在，把上一轮那份继续挂在页面上会被读成「现在跑的就是这套」。
+    #: 历史那几份走 `MissionScheduler.config_freezes()`。
+    frozen_config: MissionConfigFreeze | None = None
 
 
 class MissionScheduler:
@@ -106,10 +119,15 @@ class MissionScheduler:
         clock: Callable[[], datetime] = _utc_now,
         planner: ReportWaitPlanner | None = None,
         origin: Coordinate = ORIGIN,
+        freeze_log: MissionFreezeLog | None = None,
     ) -> None:
         self._repository = repository
         self._supervisor = supervisor
         self._clock = clock
+        #: 每按一次「开始」记一条当时的配置。默认是只留在内存里的那种——
+        #: 往仓库里写文件必须是组装点（`web.app.create_persistent_app`）明确
+        #: 决定的事，不能由一个默认值替测试和假服务做主。
+        self._freezes = freeze_log or MissionFreezeLog()
         #: 主星。默认值来自 `domain.missions`，真正的取值由建这个对象的那一层
         #: （`web.app`）从 Settings 解析后注入——`domain` 不许 import `config`，
         #: 否则纯领域层就绑死在配置上。
@@ -163,6 +181,36 @@ class MissionScheduler:
     def current(self) -> RunningChild | None:
         return self._supervisor.running
 
+    @property
+    def config_locked(self) -> bool:
+        """任务配置现在改不改得动。开着 = 锁着。
+
+        **为什么锁**：`_step()` 每秒重新去库里读一遍配置，所以运行中改参数会
+        立刻生效到下一轮，而上一轮正拿着旧参数在飞。一轮之内两套口径，事后
+        从台账里分不出当时用的是哪一套。用户口径就是「开始后无法修改，只有
+        结束状态才可以修改」。
+
+        **为什么第二个条件**：`stop()` 是同步的（`terminate()` 之后
+        `wait(TERMINATE_TIMEOUT_S)`），返回时 `supervisor.running` 已经是
+        None，所以正常路径上这一条恒为假、不会多锁哪怕一毫秒。留着它是因为
+        「结束之后子进程还在收尾」这个问题的答案不该藏在别的模块的实现细节
+        里：哪天 `stop()` 改成异步收尾，锁会自己跟着延到子进程真的走完，而
+        不是静默地在收尾途中放行一次改参数。
+
+        `disabled_reason` 那一路不受这里约束——它不是配置，见
+        `web.persistent_service.MissionConsoleService.patch_mission`。
+        """
+        return self._enabled or self._supervisor.running is not None
+
+    def config_freezes(self) -> tuple[MissionConfigFreeze, ...]:
+        """历次「开始」固化下来的配置，旧的在前。页面上那张历史表读它。"""
+        return self._freezes.records()
+
+    @property
+    def freeze_log_path(self) -> Path | None:
+        """固化记录落在磁盘上的什么地方。只留在内存里时为 None。"""
+        return self._freezes.path
+
     def prepare(self) -> int:
         """开机：补齐三行任务与单行配置，标出孤儿，返回孤儿条数。
 
@@ -181,12 +229,41 @@ class MissionScheduler:
             return self._repository.mark_orphan_mission_runs(ended_at_utc=now)
 
     def start(self) -> None:
+        """用户点「开始」。顺手把这一刻的三条链路配置固化成一条记录。
+
+        **查库在锁外**（同 `snapshot()`）：`mission_tasks()` 只有三行、比
+        `_facts()` 轻得多，但把任何一次查库压进这把锁都是在给「结束」排队，
+        而那正是上一轮修复刚拆开的东西。锁里只剩几个字段的赋值。
+
+        固化只发生在**停 → 开**这一次跃迁上。连点两下「开始」不该记两条——
+        第二下什么都没变，记下来只会让历史表里多一条「与上一次相同」，把真正
+        改过的那几条淹掉；秒表同理，不按回零。
+        """
+        # 抄配置和按下秒表用的是同一个时刻：两次取「现在」的话，记录上的固化
+        # 时刻会和页面上那块秒表的起点差一点，而事后翻账正是拿这两个对时间线。
+        tasks = self._repository.mission_tasks()
+        now = self._clock()
         with self._lock:
-            # 已经在跑就不要把秒表按回零：连点两下「开始」不该让页面显示成
-            # 刚刚才启动。
-            if not self._enabled:
-                self._started_at_utc = self._clock()
+            if self._enabled:
+                return
+            self._started_at_utc = now
             self._enabled = True
+            freeze = freeze_now(
+                [
+                    FrozenTask(
+                        kind=MissionKind(row.kind),
+                        enabled=row.enabled,
+                        priority=row.priority,
+                        params_json=row.params_json,
+                    )
+                    for row in tasks
+                    if _known(row.kind)
+                ],
+                frozen_at_utc=now,
+            )
+        # 落账在锁外：写文件的耗时没有上界（磁盘、杀毒软件），而它对
+        # 「任何时刻最多一个子进程」这条不变量毫无影响。
+        self._freezes.append(freeze)
 
     def stop(self) -> None:
         """用户点「结束」。立刻杀，不等它跑完手上这一个。"""
@@ -239,6 +316,8 @@ class MissionScheduler:
                 tasks=tuple(tasks),
                 config=config,
                 facts=facts,
+                config_locked=self.config_locked,
+                frozen_config=self._freezes.latest() if self._enabled else None,
             )
 
     def begin_bot_round(self) -> None:

@@ -11,6 +11,7 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from evo_helper.application.mission_freeze import FrozenTask, MissionConfigFreeze
 from evo_helper.application.mission_scheduler import (
     MissionScheduler,
     SchedulerSnapshot,
@@ -33,11 +34,12 @@ from evo_helper.domain.state_machine import require_transition
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
-from .display import MISSION_LABELS
+from .display import MISSION_LABELS, PARAM_LABELS
 from .service import (
     SHANGHAI,
     AttackLogView,
     BotTargetView,
+    ConfigFreezeView,
     ConflictError,
     CoordinateScanView,
     CurrentMissionView,
@@ -46,6 +48,7 @@ from .service import (
     FleetDiffView,
     FleetEntryView,
     FleetSnapshotView,
+    FrozenTaskView,
     MissionRunView,
     MissionTaskView,
     NotFoundError,
@@ -762,8 +765,13 @@ class MissionConsoleService:
         priority: int | None = None,
         params: dict[str, int] | None = None,
     ) -> MissionTaskView:
-        """改开关 / 参数 / 优先级。三样各自独立，`None` 表示这次不动它。"""
+        """改开关 / 参数 / 优先级。三样各自独立，`None` 表示这次不动它。
+
+        **调度器运行中一律拒绝**（`_refuse_while_running`），只留「恢复」一个口子。
+        """
         kind = self._kind(kind_text)
+        row = self._row(kind)
+        self._refuse_while_running(row, enabled=enabled, priority=priority, params=params)
         if kind is MissionKind.SCAN and priority is not None:
             # 领域层的排序键已经把扫描结构性地钉在最后一位，所以收下这个值也
             # 不会真的改变次序——正因为如此才必须拒绝：默默收下一个不起作用的
@@ -774,7 +782,6 @@ class MissionConsoleService:
         if kind is MissionKind.SCAN and params:
             raise ServiceError("扫描不吃参数：它自己维护扫描计划与游标")
 
-        row = self._row(kind)
         params_json = None if params is None else json.dumps(params, ensure_ascii=False)
         # 校验的时机有两个：动了参数，或者这一下是在**启用**它。
         # 后者不能省——先存一个空范围、再单独勾复选框，就绕过去了。
@@ -797,6 +804,92 @@ class MissionConsoleService:
         return self._task_view_for(MissionKind.BOT)
 
     # -- 内部 ------------------------------------------------------------------
+
+    def _refuse_while_running(
+        self,
+        row: orm.MissionTaskRow,
+        *,
+        enabled: bool | None,
+        priority: int | None,
+        params: dict[str, int] | None,
+    ) -> None:
+        """调度器跑着的时候不许改配置。**「恢复」是唯一的例外。**
+
+        为什么要拒而不是收下：调度器每秒重新读一遍库，改动会立刻生效到下一轮，
+        而上一轮正拿着旧参数在飞。一轮之内两套口径，事后从日志里分不出当时用的
+        是哪一套。用户口径就是「开始后无法修改，只有结束状态才可以修改」。
+
+        为什么给「恢复」开口子：一条链路完全可能在调度器跑着的时候被自动停用
+        （连崩三次，多半是「窗口抢不到前台」这类环境原因），而那正是用户最需要
+        把它恢复回来的时刻——一刀切禁掉 PATCH，页面上那个「恢复」按钮就废了，
+        用户只剩「点结束、恢复、再点开始」这一条路，代价是把另外两条正常的链路
+        一起停掉。开这个口子不破坏固化：`enabled` 在自动停用时**本来就还是
+        True**，`disabled_reason` 与失败计数是调度器自己的状态、不是用户填的
+        配置，所以这一下不动固化记录里的任何一个字段。
+
+        因此口子开得很窄：**只认「这一行确实处在已停用状态」且这次 PATCH 除了
+        `enabled: true` 之外什么都没带**。带上 params 或 priority 就不是恢复，
+        是趁着恢复顺手改一笔。
+        """
+        if not self._scheduler.config_locked:
+            return
+        is_revive = (
+            enabled is True
+            and priority is None
+            and params is None
+            and row.disabled_reason is not None
+        )
+        if is_revive:
+            return
+        raise ConflictError(
+            "调度器运行中，任务配置已固化，不能修改；点「结束」后可改"
+            "（被自动停用的链路仍可点「恢复」）"
+        )
+
+    def freeze_log_path(self) -> str | None:
+        """固化记录落在磁盘上的什么地方，没有落盘时为 None。页面把它写出来。"""
+        path = self._scheduler.freeze_log_path
+        return None if path is None else str(path)
+
+    def recent_config_freezes(self, *, limit: int = 20) -> list[ConfigFreezeView]:
+        """历次「开始」固化下来的配置，**新的在前**。页面上那张记录表读它。
+
+        「与上一次相比改了什么」要拿相邻两条比，所以先把整串按时间顺序算完再
+        截断——先截断再比的话，最老那一条会拿不到它真正的上一条，于是每次翻页
+        都多出一句凭空的「首次记录」。
+        """
+        records = self._scheduler.config_freezes()
+        views = [
+            self._freeze_view(record, records[index - 1] if index else None)
+            for index, record in enumerate(records)
+        ]
+        views.reverse()
+        return views[:limit]
+
+    def _freeze_view(
+        self, record: MissionConfigFreeze, previous: MissionConfigFreeze | None
+    ) -> ConfigFreezeView:
+        return ConfigFreezeView(
+            frozen_at_utc=record.frozen_at_utc,
+            tasks=tuple(
+                _frozen_task_view(task)
+                for task in record.tasks
+                if task.kind.value in MISSION_LABELS
+            ),
+            changes=_describe_changes(previous, record),
+        )
+
+    def _current_freeze_view(self, record: MissionConfigFreeze) -> ConfigFreezeView:
+        """本轮那一份，连同「与上一次开始相比改了什么」。
+
+        上一条按**身份**去队尾找，不是无脑取倒数第二条：`records[-1]` 就是
+        `record` 这件事由 `snapshot()` 保证，但那是另一个模块的实现细节，
+        照着它写等于把两处绑死。
+        """
+        records = self._scheduler.config_freezes()
+        index = next((position for position, item in enumerate(records) if item is record), None)
+        previous = records[index - 1] if index else None
+        return self._freeze_view(record, previous)
 
     def _validate(self, kind: MissionKind, params_json: str) -> None:
         """用调度器自己那把尺子量一遍，量不过就 400。
@@ -830,6 +923,12 @@ class MissionConsoleService:
             ),
             orphan_pid=snapshot.orphan_pid,
             tasks=tuple(self._task_view(row, snapshot) for row in tasks),
+            config_locked=snapshot.config_locked,
+            frozen_config=(
+                None
+                if snapshot.frozen_config is None
+                else self._current_freeze_view(snapshot.frozen_config)
+            ),
         )
 
     def _task_view(self, row: orm.MissionTaskRow, snapshot: SchedulerSnapshot) -> MissionTaskView:
@@ -959,6 +1058,103 @@ class MissionConsoleService:
             return MissionKind(kind_text.upper())
         except ValueError as exc:
             raise NotFoundError(f"没有 {kind_text} 这条任务链路") from exc
+
+
+def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
+    params = _int_params(task.params_json)
+    kind = task.kind
+    return FrozenTaskView(
+        kind=kind.value,
+        label=MISSION_LABELS[kind.value],
+        enabled=task.enabled,
+        priority=task.priority,
+        params=params,
+        summary=_frozen_summary(kind, params),
+    )
+
+
+def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
+    """固化的那份参数念成人话。
+
+    **只用记录里的数字，不查库。** `MissionConsoleService._summary` 会去问
+    「这个范围里现在有几个 bot」——那是今天的库，而这条记录说的是上周五那一轮。
+    把今天的数字贴在旧记录上，正是这份记录要防的那种走样。
+    """
+    if kind is MissionKind.PIRATE:
+        radius = params.get("radius")
+        return "未设置半径" if radius is None else f"半径 {radius}"
+    if kind is MissionKind.BOT:
+        galaxy = params.get("galaxy")
+        first = params.get("first_system")
+        last = params.get("last_system")
+        if galaxy is None or first is None or last is None:
+            return "未设置系号区间"
+        return f"{galaxy}:{first} – {galaxy}:{last}"
+    return "不吃参数"
+
+
+def _describe_changes(
+    before: MissionConfigFreeze | None, after: MissionConfigFreeze
+) -> tuple[str, ...]:
+    """两次「开始」之间，用户到底改了什么。
+
+    用户口径里的「记录任务内容」有两半：这一轮用的是哪一套（`tasks`），
+    以及**改了什么、什么时候改的**——后者就是这一串。一张只有参数、没有差异的
+    表，翻账时要拿眼睛去逐格对，而两条记录之间往往只差一个数字。
+
+    没有上一条时说「首次记录」而不是空：**「没改过」和「没得比」不是一回事**，
+    都显示成空白的话，第一条记录看起来就像是「跟上次一样」。
+    """
+    if before is None:
+        return ("首次记录",)
+    changes: list[str] = []
+    for task in after.tasks:
+        label = MISSION_LABELS.get(task.kind.value, task.kind.value)
+        old = before.task(task.kind)
+        if old is None:
+            changes.append(f"{label}：首次出现")
+            continue
+        if old.enabled != task.enabled:
+            changes.append(f"{label}：参与调度 {_yes(old.enabled)} → {_yes(task.enabled)}")
+        if old.priority != task.priority:
+            changes.append(f"{label}：优先级 {old.priority} → {task.priority}")
+        changes.extend(_param_changes(label, old.params_json, task.params_json))
+    return tuple(changes)
+
+
+def _param_changes(label: str, before_json: str, after_json: str) -> list[str]:
+    """参数逐项对比。
+
+    键的次序以**新的那份**为准，旧的那份里多出来的接在后面：改动多半是「这一项
+    换了个数」，按新的次序读下来和页面上那排输入框的顺序一致。
+
+    末尾那条兜底是给手改过库的情况：`_int_params` 只认整数，所以
+    `{"radius": "8"}` 这种在两边都会被丢成空字典，逐项对比说不出改了哪一项。
+    说一句「参数有改动」也比装作没改好——那种参数调度器起不来，用户迟早要来
+    翻这份记录找原因。
+    """
+    before = _int_params(before_json)
+    after = _int_params(after_json)
+    changes: list[str] = []
+    for key in dict.fromkeys([*after, *before]):
+        old = before.get(key)
+        new = after.get(key)
+        if old == new:
+            continue
+        name = PARAM_LABELS.get(key, key)
+        changes.append(f"{label}：{name} {_or_dash(old)} → {_or_dash(new)}")
+    if not changes and before_json != after_json:
+        changes.append(f"{label}：参数有改动（无法逐项对比）")
+    return changes
+
+
+def _yes(value: bool) -> str:
+    return "是" if value else "否"
+
+
+def _or_dash(value: int | None) -> str:
+    """没有这一项时显示破折号。`0` 是个合法取值，不能和「没填」显示成一样。"""
+    return "—" if value is None else str(value)
 
 
 def _int_params(raw: str) -> dict[str, int]:
