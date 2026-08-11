@@ -20,17 +20,32 @@
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
 
-## 为什么读「单位」总数而不是逐舰种明细
+## 一趟推一态，战报由这条链路自己收
+
+五个态见 `domain.bot_round.phase_of`。`AWAITING_PROBE_REPORT` 的出路是
+`collect_probe_reports()`：进一趟信箱、把探路战报读出来写进 `battle_reports`，
+`phase_of` 下一趟才看得到 `has_report`，目标才进得了 `NEEDS_ATTACK`。
+这一步以前**没有人做**，于是每个目标都永久停在等战报（实机一整夜 152 次），
+而唯一读战报的代码只挂在 `NEEDS_ATTACK` 分支上——读战报的代码只在读过战报
+之后才会被执行。
+
+## 只读详情页那一屏
 
 分档防的是**量级错**，不是末位误差（见 `domain.fleet_tier` 模块头）。「单位」总数是
-详情页上独立给出的一个数，一个 ROI 就读到；逐舰种明细要进回放页、读两列、
-还要反复重拍到合计对上，一份报告多花两三秒，而它对分档没有增量价值。
+详情页上独立给出的一个数，一个 ROI 就读到。
+
+逐舰种明细则**整整差一屏**：参战战舰那两列在**回放页**上（`ReportLayout.
+participating_rows` 是对着回放页量的，`tools.ingest_report` 也是从 replay 那一屏取的），
+要拿到它得点开「查看战斗回放」——而那个按钮至今没有标定过的点击坐标，一份报告
+还要多花两三秒 OCR。所以这条链路只读详情页，`fleet_snapshots` 一行不写。
+先例是海盗战报：刻意只记胜负与战损总数（用户口径 2026-08-09，为省性能）。
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -42,10 +57,12 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
 from evo_helper.tools.pirate_loop import (
+    MAIL_BADGE_ROI,
     MAIL_FIRST_ROW_Y,
     MAIL_ROW_PITCH,
     MAIL_ROW_X,
     MAIL_SCAN_ROWS,
+    MAIL_SCROLL_TO_TOP_DRAGS,
     PANEL_DRAG_FROM_Y,
     PANEL_DRAG_TO_Y,
     LoopOptions,
@@ -154,31 +171,55 @@ class BotLoop(PirateLoop):
 
     # -- 判定 ---------------------------------------------------------------
 
-    def read_defender_units(self, coordinate: Coordinate) -> int | None:
-        """去信箱把这个目标最近那份攻击报告的守方「单位」总数读回来。
-
-        只读详情页的一个 ROI。找报告靠**VS 块里的目标坐标**核对，不靠行号：
-        行序随新邮件变，而报告自己写着打的是谁。
-        """
+    def _report_screens(self) -> Any:
+        """当前这一屏的 `ReportScreens`。**每次重新建**——同一个实例读两屏会
+        把上一屏的像素当成这一屏（`ingest_pirate_report` 里记着同一条）。"""
         from evo_helper.vision.optional.report_screens import ImageReportScreens
-        from evo_helper.vision.parsers import parse_versus_block
         from evo_helper.vision.report_layout import crop_to_viewport, layout_for_viewport
 
-        def screens() -> Any:
-            image = crop_to_viewport(self._driver.capture())
-            return ImageReportScreens(
-                image,
-                layout_for_viewport(image.width, image.height),
-                tesseract_cmd=_tesseract(),
-            )
+        image = crop_to_viewport(self._driver.capture())
+        return ImageReportScreens(
+            image,
+            layout_for_viewport(image.width, image.height),
+            tesseract_cmd=_tesseract(),
+        )
 
+    def _scan_mail(
+        self, wanted: Sequence[Coordinate], visit: Callable[[Coordinate, Any], None]
+    ) -> set[Coordinate]:
+        """**一趟信箱**：翻最上面几行，认得出的那几份交给 `visit`。返回没找到的目标。
+
+        为什么一趟读完而不是「一个目标进一次」：进出信箱要切视图、开面板、翻标签，
+        每次还要慢拖三下，一趟十几秒；而这些报告本来就并排躺在同一页上。
+        `collect_scout_reports` 是同一个理由、同一套写法。
+
+        找报告靠 **VS 块里的目标坐标**核对，不靠行号：行序随新邮件变，
+        而报告自己写着打的是谁。
+
+        ⚠️ **先关浮层再切地表。** `_on_planet_surface()` 的正面凭据是右上角那个
+        未读数，而浮层会盖住它；`_goto_planet_surface()` 自己不关浮层，只会反复点
+        视图菜单（而那个坐标此刻正压在浮层底下）。同一个缺陷在
+        `pirate_loop.collect_scout_reports` 里刚修过——那边实机三次都倒在这一步，
+        每次都已经先派出 4 发侦察，报告读不到那几发就白飞。
+        """
+        from evo_helper.vision.parsers import parse_versus_block
+
+        self._reset_to_known_screen()
         if not self._goto_planet_surface():
+            # 判据失败时最贵的事是「不知道当时画面长什么样」。存一帧只要一次写盘。
+            self._dump_frame("planet-surface-unreachable", MAIL_BADGE_ROI)
             raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
         self._open_mail()
-        for _ in range(3):
+        # 列表会记住上次滚到哪。不拖回顶部，第 0 行可能是一封只露半截的邮件——
+        # 读出来是空主题，而画面看着完全正常。
+        for _ in range(MAIL_SCROLL_TO_TOP_DRAGS):
             slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
-        found: int | None = None
+        remaining = set(wanted)
         for row in range(MAIL_SCAN_ROWS):
+            if not remaining:
+                break
+            # ⚠️ **每翻一行都要先确认「还在邮件列表上」。** 上一次返回没退到列表时，
+            # 照列表的行坐标点下去就是点在地表 UI 上——实机踩过「取消任务」确认框。
             if not self._settle(self._on_mail_list):
                 say(f"  第 {row} 行之前已经不在邮件列表上了；停止翻行")
                 break
@@ -186,17 +227,91 @@ class BotLoop(PirateLoop):
                 MAIL_ROW_X, MAIL_FIRST_ROW_Y + row * MAIL_ROW_PITCH, label="打开邮件"
             )
             self._driver.wait(2.4)
-            page = screens()
+            page = self._report_screens()
             versus = parse_versus_block(page.versus_block(), "ocr")
-            if versus is not None and versus.defender.coordinate.value == coordinate:
-                units = page.unit_totals()[1]
-                found = _count(units)
-                say(f"  第 {row} 行是 {coordinate} 的战报：守方单位 {units!r} → {found}")
+            target = versus.defender.coordinate.value if versus is not None else None
+            if target is not None and target in remaining:
+                remaining.discard(target)
+                say(f"  第 {row} 行是 {target} 的战报")
+                visit(target, page)
             self._driver.click(*_mail_back(), label="返回")
             self._driver.wait(2.0)
-            if found is not None:
-                break
         self._close_mail()
+        return remaining
+
+    def collect_probe_reports(self, wanted: Sequence[Coordinate]) -> tuple[Coordinate, ...]:
+        """把这些目标的探路战报读回来，**写进 `battle_reports`**。返回入库了哪几个。
+
+        这一步以前**根本不存在**，而它是整条链路的死结：`phase_of` 要看到
+        `DispatchFact.has_report` 才放目标进 `NEEDS_ATTACK`，那个字段来自
+        `battle_reports` 里有没有一行指着这发派遣；而全仓没有任何代码为 bot 探路
+        写过那张表。于是每个目标都永久停在 `AWAITING_PROBE_REPORT`——实机跑一整夜，
+        那一态出现 152 次，`NEEDS_ATTACK` 出现 0 次。唯一读战报的
+        `read_defender_units()` 又只挂在 `NEEDS_ATTACK` 分支上：**读战报的代码只在
+        读过战报之后才会被执行**。连带后果就是网页「情报中心」一行数据都没多。
+
+        入库走 `append_report`，它会按「出发坐标 + 目标坐标 + 时间就近」自己认领
+        那一发派遣（置 `dispatch_id` 与 `match_status='MATCHED'`），这里不另做匹配。
+        """
+        stored: list[Coordinate] = []
+
+        def visit(target: Coordinate, page: Any) -> None:
+            if self._ingest_probe_report(target, page):
+                stored.append(target)
+
+        missing = self._scan_mail(wanted, visit)
+        for coordinate in wanted:
+            if coordinate in missing:
+                say(f"  {coordinate} 的探路战报还没出现在信箱最上面几行；这一趟不动它")
+        return tuple(stored)
+
+    def _ingest_probe_report(self, target: Coordinate, page: Any) -> bool:
+        """把详情页上这一份读成 `BattleReport` 并入库。读不出来就放过，不存半份。"""
+        from uuid import uuid4
+
+        from evo_helper.application.report_ingest import to_battle_report
+        from evo_helper.vision.live_reports import DETAIL_UI_VERSION, LiveReportReader
+        from evo_helper.vision.models import PageObservation
+        from evo_helper.vision.parsers import UnknownUiVersionError
+
+        try:
+            live = LiveReportReader(page).read_detail_only(
+                PageObservation(screen="mail_detail", ui_version=DETAIL_UI_VERSION, confidence=1.0)
+            )
+        except (UnknownUiVersionError, ValueError) as error:
+            # 读不出来不是「没有战报」。这一份就放着，等 `MAX_REPORT_AGE` 到点把
+            # 那发派遣判掉、允许重新探路（见 `repository.bot_dispatch_facts`）。
+            say(f"  {target} 的战报读不出来：{error}")
+            self._dump_frame("probe-report-unreadable")
+            return False
+        # VS 块读了两遍（翻行时一遍、这里一遍），两遍必须指向同一个目标。
+        # 不核的话，一次 OCR 抖动就能把这份战报挂到别人头上。
+        if live.defender.coordinate.value != target:
+            say(f"  {target} 的战报复核不过：这一份写的是 {live.defender.coordinate.value}")
+            return False
+        repository, _run_id = self._ensure_run()
+        if repository.has_report_at(target, live.reported_at_utc):
+            say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库")
+            return False
+        repository.append_report(to_battle_report(live, report_id=uuid4()))
+        say(f"  {target} 探路战报入库：{live.raw_time_text}，守方单位 {live.defender_units}")
+        return True
+
+    def read_defender_units(self, coordinate: Coordinate) -> int | None:
+        """去信箱把这个目标最近那份攻击报告的守方「单位」总数读回来。
+
+        只读详情页的一个 ROI。**这是兜底路径**：正常情况下这个数在收报告那一趟
+        已经读过并入库了，`_tier_and_attack` 先问库（`latest_defender_units`）。
+        """
+        found: int | None = None
+
+        def visit(target: Coordinate, page: Any) -> None:
+            nonlocal found
+            units = page.unit_totals()[1]
+            found = _count(units)
+            say(f"  {target} 的战报：守方单位 {units!r} → {found}")
+
+        self._scan_mail((coordinate,), visit)
         return found
 
     # -- 主循环 -------------------------------------------------------------
@@ -220,15 +335,32 @@ class BotLoop(PirateLoop):
           不走父类的 `run()`。
 
         覆盖 `_sweep` 之后这两件事都由父类统一管，不会再各写一份。
+
+        ⚠️ **收战报排在最前面，而且整轮只进一趟信箱。** 等战报的目标可能有几十个，
+        一个一个进信箱要切视图、开面板、慢拖三下再翻六行，一趟十几秒；而它们的
+        报告本来就并排躺在同一页上。派遣要排在收取之后：`_close_mail` 收尾时会切回
+        恒星系视图，正好是 `_probe` / `_tier_and_attack` 需要的姿势。
+
+        态在开头一次算完。收进来的战报**不在本趟继续推进**——「一趟只推进一态」
+        这条不因为它排在最前面而破例。
         """
+        phases = {coordinate: self._phase_of(coordinate) for coordinate in self._bot.targets}
+        awaiting = tuple(
+            coordinate
+            for coordinate, phase in phases.items()
+            if phase is BotPhase.AWAITING_PROBE_REPORT
+        )
+        if awaiting:
+            say(f"等探路战报的目标 {len(awaiting)} 个；进一趟信箱去收")
+            self.collect_probe_reports(awaiting)
         for coordinate in self._bot.targets:
-            phase = self._phase_of(coordinate)
+            phase = phases[coordinate]
             say(f"目标 {coordinate}（{phase.value}）")
             if phase is BotPhase.NEEDS_PROBE:
                 self._probe(coordinate)
             elif phase is BotPhase.NEEDS_ATTACK:
                 self._tier_and_attack(coordinate)
-            # 其余三态这一趟没事可做：等战报，或已走完。
+            # 其余三态这一趟没事可做：等攻击战报，或已走完。
 
     def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。
@@ -257,10 +389,17 @@ class BotLoop(PirateLoop):
             self._outcome.scouted.append(coordinate)
 
     def _tier_and_attack(self, coordinate: Coordinate) -> None:
-        """探路战报已回：读守方单位数、分档、按档位真打。"""
+        """探路战报已回：取守方单位数、分档、按档位真打。
+
+        **先问库。** 走到这一态的前提就是「本轮的探路战报已经入库」，那个数在
+        `collect_probe_reports` 那一趟已经读过了；再进一趟信箱既多花十几秒，翻到的
+        还可能是上一轮的报告（信箱那条路没有时间闸门）。库里没有才现场读一次。
+        """
         if not self._bot.attack:
             return
-        units = self.read_defender_units(coordinate)
+        units = self._stored_defender_units(coordinate)
+        if units is None:
+            units = self.read_defender_units(coordinate)
         if units is None:
             say(f"  {coordinate} 读不到战报里的守方单位数；不打")
             self._outcome.refused.append((coordinate, "读不到守方单位数"))
@@ -276,6 +415,11 @@ class BotLoop(PirateLoop):
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return
         self.attack(coordinate, preset=preset)
+
+    def _stored_defender_units(self, coordinate: Coordinate) -> int | None:
+        """本轮已入库的守方「单位」总数；没有就 None（调用方现场再读一次）。"""
+        repository, _run_id = self._ensure_run()
+        return repository.latest_defender_units(coordinate, since=self._round_start())
 
     def _mark_skipped(self, coordinate: Coordinate) -> None:
         """把「分档说不值得打」记进库，否则下一趟又会重新分一次档。"""

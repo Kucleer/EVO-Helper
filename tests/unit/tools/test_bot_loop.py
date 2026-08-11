@@ -102,6 +102,7 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
     loop._phase_of = lambda coordinate: phase
     loop._probe = lambda coordinate: calls.append("probe")
     loop._tier_and_attack = lambda coordinate: calls.append("tier_and_attack")
+    loop.collect_probe_reports = lambda wanted: calls.append("collect_probe_reports") or ()
 
     loop.run()
     return calls
@@ -112,7 +113,7 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
     [
         (BotPhase.NEEDS_PROBE, ["probe"]),
         (BotPhase.NEEDS_ATTACK, ["tier_and_attack"]),
-        (BotPhase.AWAITING_PROBE_REPORT, []),
+        (BotPhase.AWAITING_PROBE_REPORT, ["collect_probe_reports"]),
         (BotPhase.AWAITING_ATTACK_REPORT, []),
         (BotPhase.DONE, []),
     ],
@@ -120,11 +121,17 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
 def test_each_phase_routes_to_exactly_one_action(
     monkeypatch: pytest.MonkeyPatch, phase: BotPhase, expected: list[str]
 ) -> None:
-    """五种态各自该做什么，以及**等待中的三种什么都不做**。
+    """五种态各自该做什么。
 
     分流一旦失效（比如无条件走探路），每个目标每趟都会重新派一发探路——
-    一趟烧一条航线和一次配额，而画面上看不出异常。等战报的那三态尤其要守：
-    它们的正确行为就是「这一趟不碰它」。
+    一趟烧一条航线和一次配额，而画面上看不出异常。
+
+    `AWAITING_PROBE_REPORT` 的动作是**去收战报**。它以前是空的，而那正是死锁：
+    没人收，`has_report` 永远为假，目标永远进不了 `NEEDS_ATTACK`，
+    于是唯一读战报的那段代码永远不会被执行。
+
+    `AWAITING_ATTACK_REPORT` 与 `DONE` 仍然什么都不做——攻击发的战报由
+    调度器那条等待链路收（`domain.report_wait`），不在这里。
     """
     assert _run_with_phase(monkeypatch, phase) == expected
 

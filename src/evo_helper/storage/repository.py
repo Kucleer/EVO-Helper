@@ -26,7 +26,7 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
-from evo_helper.domain.report_wait import PendingReport, line_free_at
+from evo_helper.domain.report_wait import MAX_REPORT_AGE, PendingReport, line_free_at
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.state_machine import require_transition
 
@@ -651,12 +651,27 @@ class SqlAlchemyRepository:
             ]
 
     def bot_dispatch_facts(
-        self, coordinate: Coordinate, *, since: datetime | None
+        self, coordinate: Coordinate, *, since: datetime | None, now_utc: datetime | None = None
     ) -> list[DispatchFact]:
         """本轮针对这个 bot 已经**真的派出去**了哪些发、战报回来了没有。
 
         供 `domain.bot_round.phase_of` 判态。`since` 为空表示不限本轮
-        （手工跑命令行时用）。
+        （手工跑命令行时用）。`now_utc` 只用来判「这一发的战报还等不等得到」，
+        不传就取此刻——两个调用方（调度器与 runner）都问的是「现在」。
+
+        **这里就是 `phase_of` 那条前置条件的落实处。** 那个纯函数的 docstring
+        写着「调用方必须先把已判定战报永远不会来的派遣剔除掉」，否则目标会
+        静默卡死在等待态。剔除规则和兄弟方法 `pending_reports_for_kind` 同源，
+        也是「现算」而不是「别处先写好的标记」：**派出超过 `MAX_REPORT_AGE`
+        （6 小时）还没有战报的，就当它永远不会来了**，整条剔掉。
+
+        为什么按 `dispatched_at_utc` 而不是 `expected_report_at_utc` 算：这条
+        链路打的是同系目标，飞行按分钟计，而 `MAX_CREDIBLE_FLIGHT` 已经把简报上
+        读出来的时长封在 6 小时内——比派出时刻晚 6 小时还没到的战报，只可能是丢了。
+
+        剔干净之后这个目标会退回 `NEEDS_PROBE`（或 `NEEDS_ATTACK`），也就是
+        **允许重新探路**。代价有界：每个目标每 6 小时最多重来一次；而不剔的
+        代价是它这一整轮再也不动，且画面上只是「在等」。
 
         `accepted` 这个过滤不能省，与兄弟方法 `count_dispatches_since` /
         `pending_reports_for_kind` 同口径：被游戏拒掉的那一发没有舰队飞出去，
@@ -672,6 +687,7 @@ class SqlAlchemyRepository:
         「分档说这个目标不值得打」是对**这一轮的这个坐标**下的判定，复查表里
         也没有指回某一条意图的列。`phase_of` 只用 `any(...)`，粒度对得上。
         """
+        give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
         with self._session_factory() as session:
             statement = (
                 select(orm.AttackIntentRow.preset_name, orm.BattleReportRow.id)
@@ -690,6 +706,11 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_system == coordinate.system,
                     orm.AttackIntentRow.target_position == coordinate.position,
                     orm.AttackDispatchRow.accepted.is_(True),
+                    # 战报回来了的一律留着；没回来的只留还等得到的那些。
+                    or_(
+                        orm.BattleReportRow.id.is_not(None),
+                        orm.AttackDispatchRow.dispatched_at_utc > give_up_before,
+                    ),
                 )
             )
             if since is not None:
@@ -705,6 +726,59 @@ class SqlAlchemyRepository:
                 )
                 for preset_name, report_id in session.execute(statement).all()
             ]
+
+    def has_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
+        """这个目标这个**报告时刻**的战报是不是已经在库里了。
+
+        活链路每一趟都会去信箱翻同样那几行，而 `append_report` 认领不到派遣时
+        （坐标 OCR 偏了、或者同一目标同一时段有两发分不开）只会把行写下来、
+        `dispatch_id` 留空——判态那一侧仍然看不到战报，于是下一趟又读同一封。
+        没有这道去重，一份读不上号的战报会每趟复制一行，越堆越多。
+
+        判据取**报告时间**，与探索报告采集器同源（那边也是「以报告时间去重」）：
+        它是游戏自己写在报告上的字，不受本地时钟与重跑影响。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            return (
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.BattleReportRow)
+                    .where(
+                        orm.BattleReportRow.defender_target_galaxy == target.galaxy,
+                        orm.BattleReportRow.defender_target_system == target.system,
+                        orm.BattleReportRow.defender_target_position == target.position,
+                        orm.BattleReportRow.reported_at_utc == reported_at_utc,
+                    )
+                )
+                or 0
+            ) > 0
+
+    def latest_defender_units(self, target: Coordinate, *, since: datetime) -> int | None:
+        """本轮这个目标最新那份战报里守方的「单位」总数；没有就 None。
+
+        分档要的就是这个数，而它在收报告那一趟已经读过一次了（见
+        `tools.bot_loop.collect_probe_reports`）。从库里取而不是再进一趟信箱，
+        省的不只是十几秒 OCR：信箱里那几行**没有时间闸门**，翻到的可能是
+        上一轮甚至上一天的报告，照它分档就是拿旧情报去挑舰队组合。
+        `since` 把范围钉在本轮上。
+
+        「本轮没有战报」与「有战报但没读出这个数」都返回 None——调用方两种
+        情况都得退回现场读一次，分开也没有不同的处置。
+        """
+        _require_utc(since, "since")
+        with self._session_factory() as session:
+            return session.scalar(
+                select(orm.BattleReportRow.defender_units)
+                .where(
+                    orm.BattleReportRow.defender_target_galaxy == target.galaxy,
+                    orm.BattleReportRow.defender_target_system == target.system,
+                    orm.BattleReportRow.defender_target_position == target.position,
+                    orm.BattleReportRow.reported_at_utc >= since,
+                )
+                .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id.desc())
+                .limit(1)
+            )
 
     def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime) -> None:
         """把「分档说不值得打」记成本轮的一条 `target_revisits`。
