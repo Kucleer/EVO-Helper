@@ -238,10 +238,18 @@ class _Repository:
         self.appended.append(report)
 
 
-def _ingesting_loop(repository: _Repository) -> Any:
+def _ingesting_loop(repository: _Repository, bottom: Any = None) -> Any:
+    """一个只装了「入库」所需零件的 `BotLoop`。
+
+    `_bottom_screens` 在生产上要真的按住鼠标把面板拖到底再拍一屏，这里桩掉；
+    默认交出一屏读不出「单位」的画面，也就是**拖到底也没读到**那种情况。
+    """
     loop = BotLoop.__new__(BotLoop)
     loop._ensure_run = lambda: (repository, None)
     loop._dump_frame = lambda name, roi=None: None
+    loop._bottom_screens = lambda: (
+        bottom if bottom is not None else _DetailScreens(A, units=("", ""))
+    )
     return loop
 
 
@@ -292,8 +300,19 @@ def test_an_unreadable_report_is_skipped_and_dumped() -> None:
 class _DetailScreens:
     """够 `LiveReportReader.read_detail_only` 读一遍的详情页取字面。"""
 
-    def __init__(self, target: Coordinate, *, header: str | None = None) -> None:
+    def __init__(
+        self,
+        target: Coordinate,
+        *,
+        header: str | None = None,
+        units: tuple[str, str] = ("100", "5.36K"),
+        losses: tuple[str, str] = ("", ""),
+        banner: str = "FAIL",
+    ) -> None:
         self._target = target
+        self._units = units
+        self._losses = losses
+        self._banner = banner
         self._header = (
             header
             if header is not None
@@ -321,7 +340,108 @@ class _DetailScreens:
         return []
 
     def unit_totals(self) -> tuple[str, str]:
-        return ("100", "5.36K")
+        return self._units
+
+    def loss_totals(self) -> tuple[str, str]:
+        """默认空着——「损失单位」那一行**只有拖到底那一屏**才读得到。"""
+        return self._losses
+
+    def outcome_banner(self) -> str:
+        return self._banner
+
+
+# -- 胜负是算出来的，「单位」与「损失单位」是它的输入 ------------------------
+
+
+def test_the_computed_outcome_reaches_the_stored_report() -> None:
+    """攻击日志的战果列就取这一个字段（`web.service.AttackLogView.outcome`）。
+
+    这里第二屏给出「我方 1 艘全损、对方 319 一艘没掉」——我方剩余 0 → `FAIL`，
+    正是那五张探路战报的实际形状。
+    """
+    repository = _Repository()
+    bottom = _DetailScreens(A, units=("1", "319"), losses=("1", "0"))
+
+    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+
+    assert repository.appended[0].outcome == "FAIL"
+    assert (repository.appended[0].attacker_losses, repository.appended[0].defender_losses) == (
+        1,
+        0,
+    )
+
+
+def test_a_wiped_out_defender_is_a_victory() -> None:
+    repository = _Repository()
+    bottom = _DetailScreens(A, units=("100", "783"), losses=("0", "783"))
+
+    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+
+    assert repository.appended[0].outcome == "VICTORY"
+
+
+def test_both_sides_surviving_is_a_draw() -> None:
+    """**平局这一档不需要样本**——没人见过平局的横幅，但它算得出来。"""
+    repository = _Repository()
+    bottom = _DetailScreens(A, units=("100", "783"), losses=("30", "200"))
+
+    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+
+    assert repository.appended[0].outcome == "DRAW"
+
+
+def test_an_uncomputable_outcome_stores_nothing_rather_than_a_defeat() -> None:
+    """⚠️ 本文件最要紧的一条：**「没算出胜负」不能长成「打输了」。**
+
+    没拖到底就没有战损，没有战损就算不出胜负——这是常态。而画面上那行 `FAIL`
+    大字**不许**在这时顶上来（用户口径 2026-08-11：不看游戏内的提示）：
+    真顶上去，攻击日志就会出现一场根本没核过的败仗，和真败仗在页面上一模一样。
+    """
+    repository = _Repository()
+
+    _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A, banner="FAIL"))
+
+    assert repository.appended[0].outcome is None
+
+
+def test_the_units_come_from_the_scrolled_screen_when_the_first_one_has_none() -> None:
+    """bot 战报多一行「生成卫星概率」，「单位」那一行整个落在可视区之外。
+
+    2026-08-11 的五张实拍里四张如此——不是锚点找错，是那一行没画出来。
+    出路只有一条：把详情页拖到底再拍一屏。
+    """
+    repository = _Repository()
+    bottom = _DetailScreens(A, units=("1", "319"))
+
+    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+
+    assert repository.appended[0].defender_units == 319
+
+
+def test_the_unscrolled_screen_wins_when_it_already_has_the_units() -> None:
+    """看得见就别再问拖到底那一屏。
+
+    两屏的「单位」是同一行字，但拖过之后的那一屏是**另一次截图**；
+    没理由为一个已经读到的数再赌一次 OCR。第五张实拍就属于这一种
+    （没有「生成卫星概率」那一行，「单位」直接就在屏上）。
+    """
+    repository = _Repository()
+    bottom = _DetailScreens(A, units=("9", "9"))
+
+    _ingesting_loop(repository, bottom)._ingest_probe_report(A, _DetailScreens(A))
+
+    assert repository.appended[0].defender_units == 5360
+
+
+def test_units_that_neither_screen_shows_stay_empty() -> None:
+    """拖到底也没读到就留空。**不能拿 0 顶替**：0 会落进「不值得打」那一档，
+    于是一个真有舰队的 bot 被静默跳过（`_tier_and_attack` 那两条测试守着同一件事）。
+    """
+    repository = _Repository()
+
+    _ingesting_loop(repository)._ingest_probe_report(A, _DetailScreens(A, units=("", "")))
+
+    assert repository.appended[0].defender_units is None
 
 
 # -- 收不到时那句话要说准 ----------------------------------------------------
@@ -416,6 +536,30 @@ class _DueRepository:
         self, coordinates: Any, *, since: datetime | None
     ) -> dict[Coordinate, tuple[datetime, datetime | None]]:
         return dict(self._due)
+
+
+# -- 兜底路径也要拖 ----------------------------------------------------------
+
+
+def test_the_fallback_read_also_scrolls_when_the_first_screen_has_no_units() -> None:
+    """`read_defender_units` 是**兜底路径**，同样得拖到底。
+
+    只修入库那一条不够：兜底这条读不出来就返回 None，而 None 会让
+    `_tier_and_attack` 整个跳过这个目标——一个真有舰队的 bot 被静默放走，
+    和「库里没数」长得一模一样。
+    """
+    loop, _events = _loop([_Page(A, units="")])
+    loop._bottom_screens = lambda: _Page(A, units="319")
+
+    assert loop.read_defender_units(A) == 319
+
+
+def test_the_fallback_read_does_not_scroll_when_it_already_has_the_number() -> None:
+    """看得见就别拖——拖一次要真的按住鼠标分步走两趟，而那个数已经在手上了。"""
+    loop, _events = _loop([_Page(A, units="5.36K")])
+    loop._bottom_screens = lambda: pytest.fail("第一屏读到了就不该再拖")
+
+    assert loop.read_defender_units(A) == 5360
 
 
 # -- 分档取数 ----------------------------------------------------------------

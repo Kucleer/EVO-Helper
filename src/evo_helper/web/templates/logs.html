@@ -78,10 +78,16 @@
             {% if entry.outcome is none %}
               <span class="muted">待战报</span>
             {% else %}
+              {# 按读到的原文分档。**不能拿「不是 VICTORY 就是负」兜底**：
+                 库里存的是画面原文，将来多一档（平局）会被静默显示成败仗。 #}
               {% if entry.outcome == 'VICTORY' %}
                 <span class="chip ok"><span class="glyph" aria-hidden="true">★</span>胜</span>
-              {% else %}
+              {% elif entry.outcome == 'FAIL' %}
                 <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>负</span>
+              {% elif entry.outcome == 'DRAW' %}
+                <span class="chip"><span class="glyph" aria-hidden="true">＝</span>平</span>
+              {% else %}
+                <span class="chip">{{ entry.outcome }}</span>
               {% endif %}
               <div class="muted" style="font-size:11px">
                 战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}

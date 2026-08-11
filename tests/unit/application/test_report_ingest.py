@@ -66,6 +66,43 @@ class TestToBattleReport:
         assert report.raw_time_text == "06/08/2026 11:45:03"
         assert report.reported_at_utc == REPORTED_AT
 
+    def test_carries_the_outcome_through_unchanged(self) -> None:
+        """攻击日志的战果列就取这一个字段。判定在 `domain.battle_outcome`，
+        这里只负责别把它弄丢。"""
+        report = to_battle_report(live_report(outcome="FAIL"), report_id=uuid4())
+
+        assert report.outcome == "FAIL"
+
+    def test_an_uncomputed_outcome_stays_empty(self) -> None:
+        """**不能填 `FAIL` 顶替。** 「没算出胜负」和「打输了」在页面上必须分得开：
+        前者显示「待战报」，后者显示一场败仗，而后者会被当成真的战果去看。"""
+        report = to_battle_report(live_report(), report_id=uuid4())
+
+        assert report.outcome is None
+
+    def test_the_losses_are_stored_too(self) -> None:
+        """战损既是页面上「战损 我 X · 敌 Y」的来源，也是**算出那个战果的输入**。
+
+        不落库的话，事后没有任何办法回头核「当初凭什么判成这个结果」——
+        而这条判据是算术，能核才有意义。
+        """
+        report = to_battle_report(
+            live_report(attacker_losses=1, defender_losses=0), report_id=uuid4()
+        )
+
+        assert (report.attacker_losses, report.defender_losses) == (1, 0)
+
+    def test_unread_losses_stay_empty_rather_than_zero(self) -> None:
+        """⚠️ **0 和「没读到」在这一列上是两个结论**：前者是「一艘没损失」。
+
+        而 0 恰好还会让 `outcome` 算成胜仗（对方剩余 = 单位 − 0 ≠ 0，
+        我方剩余 = 单位 − 0 ≠ 0 …… 一路都是假的）。
+        """
+        report = to_battle_report(live_report(), report_id=uuid4())
+
+        assert report.attacker_losses is None
+        assert report.defender_losses is None
+
     def test_participating_fleet_has_no_round(self) -> None:
         report = to_battle_report(live_report(), report_id=uuid4())
         participating = [entry for entry in report.fleet if entry.round_no is None]

@@ -52,6 +52,17 @@ REPORT_TIME_WHITELIST = "0123456789/: "
 #: 2× 有三张把日期首位削掉（`11/08/…` → `1/08/…`），3× 与 4× 五张全对。
 REPORT_TIME_UPSCALES: tuple[int, ...] = (3, 4, 2)
 
+#: 胜负横幅的「算不算横幅墨迹」门槛，量在 **R−B 通道差**上（见 `outcome_banner`）。
+#:
+#: 实测七张详情页：横幅墨迹的峰值 155（红 `FAIL`）与 192（金 `VICTORY`），
+#: 而幽灵文字与面板背景不超过 10。40 / 60 / 80 三档读出来一模一样，
+#: 取中间那档——门槛落在一个数量级的空档里，不是调出来的参数。
+OUTCOME_INK_THRESHOLD = 60
+
+#: 剥完通道之后的放大倍数。2 / 3 / 4 三档在七张上输出**逐字节相同**，
+#: 取最小的那档（`OCR_UPSCALE` 那张表同样的取舍：一样准就取快的）。
+OUTCOME_UPSCALE = 2
+
 #: 名称列相对列左沿的裁剪范围与放大倍数。
 FLEET_NAME_INSET = 15
 FLEET_NAME_WIDTH = 115
@@ -447,14 +458,43 @@ class ImageReportScreens:
         return self._totals_row(1)
 
     def outcome_banner(self) -> str:
-        """详情页上那行 `VICTORY` / `FAIL`。海盗战报的胜负就取自这里。
+        """详情页上那行 `VICTORY` / `FAIL`。这是战报里「打赢没有」的唯一来源。
+
+        **按颜色剥，不按亮度读。** 原先是「灰度 + psm 7」，海盗那份金色
+        `VICTORY` 读得出来，bot 战报的红色 `FAIL` 却五张全废——2026-08-11 的
+        五张实拍读出来是 `'- a'`、`'- a'`、`'- a'`、`''`、`''`。
+        成因不是几何（横幅墨迹的外接框七张逐像素一致，都落在 `OUTCOME_ROI` 里），
+        而是横幅背后压着一层「`-TOTAL CREW` / `-17003` / `-COMMAND OFFICERS`」的
+        幽灵文字：它和暗红色的 `FAIL` 灰度接近，`--psm 7` 只肯交出一行，
+        于是交出的是那层幽灵。
+
+        判据用 **R−B 通道差**：横幅是红（`FAIL`，实测 `(184,52,44)`）或金
+        （`VICTORY`），两者的 R 都远高于 B；幽灵文字与面板背景是蓝灰的，R≈B。
+        实测七张（5 张 `FAIL` + 2 张 `VICTORY`）横幅墨迹的 R−B 峰值 155/192，
+        而背景不超过 10——中间隔着一个数量级，门槛落在哪都一样。
+
+        剥完再二值化。这不违反模块头「不要二值化」那条：那条说的是**舰队明细列**，
+        灰度切一刀会打断 tesseract 自己的自适应阈值、把数字读坏；这里切的是
+        通道差，切完只剩横幅那几个字母，没有别的东西可坏。
 
         只跑 `eng`：这一行没有中文，多加载一个中文模型白花约 0.4 秒。
         不限字符集——白名单会让 tesseract 失去切分依据，实测大字反而读不出来。
         """
+        # PIL 在 `__init__` 里已经确认装得上（`_load_backends`），这里直接用。
+        from PIL import ImageChops
+
         from evo_helper.vision.pirate_reports import OUTCOME_ROI
 
-        return self._read(OUTCOME_ROI, OCR_PSM_LINE, language="eng")
+        crop = self._image.crop(OUTCOME_ROI.as_box()).convert("RGB")
+        red, _green, blue = crop.split()
+        ink = ImageChops.subtract(red, blue)
+        # 黑字白底：tesseract 对这个方向最稳，而且和别处的灰度裁剪一致。
+        mask = ink.point(lambda value: 0 if value >= OUTCOME_INK_THRESHOLD else 255)
+        mask = mask.resize(
+            (mask.width * OUTCOME_UPSCALE, mask.height * OUTCOME_UPSCALE),
+            self._image_module.Resampling.LANCZOS,
+        )
+        return str(self._ocr.image_to_string(mask, lang="eng", config=f"--psm {OCR_PSM_LINE}"))
 
     def _totals_row(self, row_index: int) -> tuple[str, str]:
         """「战斗详情」横幅之下第 `row_index` 行的双方数值。"""
