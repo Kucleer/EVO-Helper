@@ -203,6 +203,25 @@ class CurrentMissionOut(BaseModel):
     log_path: str
 
 
+class FrozenTaskOut(BaseModel):
+    """配置固化记录里的一行：**当时填的是什么**，不含当时的状态。"""
+
+    kind: str
+    label: str
+    enabled: bool
+    priority: int
+    params: dict[str, int]
+    #: 只从固化的那份参数算出来的人话回显：`半径 8`、`2:100 – 2:200`。
+    summary: str
+
+
+class ConfigFreezeOut(BaseModel):
+    frozen_at_utc: datetime
+    tasks: list[FrozenTaskOut]
+    #: 与上一次「开始」相比改了什么。空表示没改；`["首次记录"]` 表示没得比。
+    changes: list[str]
+
+
 class SchedulerOut(BaseModel):
     running: bool
     #: 点「开始」的时刻，供页面与悬浮窗上那块秒表。停着时为 None。
@@ -212,6 +231,11 @@ class SchedulerOut(BaseModel):
     #: pid 会被系统回收复用。
     orphan_pid: int | None = None
     tasks: list[MissionTaskOut]
+    #: 任务配置现在改不改得动。运行中为真，页面据此把输入框、复选框、拖拽
+    #: 把手一并置灰——让用户改完才发现 409，比一开始就不给改糟得多。
+    config_locked: bool = False
+    #: 本轮开始那一刻固化下来的配置。停着时为 None。
+    frozen_config: ConfigFreezeOut | None = None
 
 
 class DashboardOut(BaseModel):
@@ -223,6 +247,7 @@ class DashboardOut(BaseModel):
 
 __all__ = [
     "BotTargetOut",
+    "ConfigFreezeOut",
     "CoordinateModel",
     "CurrentMissionOut",
     "DashboardOut",
@@ -230,6 +255,7 @@ __all__ = [
     "FleetDiffOut",
     "FleetEntryOut",
     "FleetSnapshotOut",
+    "FrozenTaskOut",
     "MissionTaskOut",
     "MissionTaskPatch",
     "RevisitIn",

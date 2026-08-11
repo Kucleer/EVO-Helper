@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.domain.models import Coordinate
@@ -72,6 +74,8 @@ class Console:
     scheduler: MissionScheduler
     launcher: FakeLauncher
     clock: MovableClock
+    #: 配置固化记录落盘的地方。**临时目录**，测试不许往仓库里写文件。
+    freeze_log: Path
 
     def get(self) -> dict[str, object]:
         response = self.client.get("/api/scheduler")
@@ -118,7 +122,10 @@ def console(tmp_path: Path) -> Iterator[Console]:
     clock = MovableClock(NOW)
     launcher = FakeLauncher()
     supervisor = MissionSupervisor(launch=launcher, clock=clock, log_dir=tmp_path / "logs")
-    scheduler = MissionScheduler(repository, supervisor, clock=clock)
+    freeze_log = tmp_path / "freezes.jsonl"
+    scheduler = MissionScheduler(
+        repository, supervisor, clock=clock, freeze_log=MissionFreezeLog(freeze_log)
+    )
     app = create_persistent_app(
         factory,
         local_token=TOKEN,
@@ -127,7 +134,7 @@ def console(tmp_path: Path) -> Iterator[Console]:
         tick_interval_s=3600.0,
     )
     with TestClient(app, headers={"X-Evo-Helper-Token": TOKEN}) as client:
-        yield Console(client, repository, scheduler, launcher, clock)
+        yield Console(client, repository, scheduler, launcher, clock, freeze_log)
 
 
 # -- 读 -------------------------------------------------------------------------
@@ -340,6 +347,218 @@ def test_an_unknown_kind_is_a_404(console: Console) -> None:
     assert console.client.patch("/api/missions/DRAGON", json={"enabled": True}).status_code == 404
 
 
+# -- 运行中不许改 ---------------------------------------------------------------
+#
+# 用户口径（2026-08-11）：「任务开始后，调度台固化任务数据，记录任务内容。
+# 并且开始后，无法修改任务，只有结束状态才可以修改」。
+#
+# 为什么必须拒而不是收下：`_step()` 每秒重新去库里读一遍配置，收下的改动会
+# **立刻**生效到下一轮，而上一轮正拿着旧参数在飞。一轮之内两套口径，事后从
+# `mission_runs` 里只看得到一行命令行，分不出当时用的是哪一套。
+
+
+def _start(console: Console) -> None:
+    assert console.client.post("/api/scheduler/start").status_code == 200
+
+
+def test_params_cannot_be_changed_while_the_scheduler_runs(console: Console) -> None:
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    _start(console)
+
+    response = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 30}})
+
+    assert response.status_code == 409, response.text
+    assert "运行中" in response.json()["detail"]
+    # 拒了就得真的没改。收下一个 409 却把值写进去，比静默忽略更糟。
+    assert console.task("PIRATE")["params"] == {"radius": 5}
+
+
+def test_priority_cannot_be_reordered_while_the_scheduler_runs(console: Console) -> None:
+    """拖拽也走这个 PATCH，所以这一条同时守住了那个拖拽把手。"""
+    _start(console)
+
+    response = console.client.patch("/api/missions/BOT", json={"priority": -1})
+
+    assert response.status_code == 409
+    tasks = console.get()["tasks"]
+    assert isinstance(tasks, list)
+    assert tasks[0]["kind"] != "BOT"
+
+
+def test_a_chain_cannot_be_switched_off_while_the_scheduler_runs(console: Console) -> None:
+    """复选框也是任务配置的一部分：中途摘掉一条链路同样是「一轮之内两套口径」。"""
+    _start(console)
+
+    response = console.client.patch("/api/missions/SCAN", json={"enabled": False})
+
+    assert response.status_code == 409
+    assert console.task("SCAN")["enabled"] is True
+
+
+def test_a_disabled_chain_can_still_be_revived_while_the_scheduler_runs(
+    console: Console,
+) -> None:
+    """**「恢复」是运行中唯一的口子。**
+
+    一条链路完全可能在调度器跑着的时候被自动停用（连崩三次，多半是「窗口抢不到
+    前台」这类环境原因），而那正是用户最需要把它恢复回来的时刻。一刀切禁掉 PATCH
+    的话，页面上那个「恢复」按钮就废了，用户只剩「点结束、恢复、再点开始」这一条
+    路——代价是把另外两条正常的链路一起停掉。
+
+    开这个口子不破坏固化：自动停用时 `enabled` **本来就还是 True**，
+    `disabled_reason` 与失败计数是调度器自己的状态、不是用户填的配置，所以这一下
+    不动固化记录里的任何一个字段。
+    """
+    _start(console)
+    console.repository.record_mission_failure(MissionKind.SCAN, exit_code=1, limit=1)
+    assert console.task("SCAN")["disabled_reason"] is not None
+
+    response = console.client.patch("/api/missions/SCAN", json={"enabled": True})
+
+    assert response.status_code == 200, response.text
+    assert console.task("SCAN")["disabled_reason"] is None
+
+
+def test_reviving_while_running_may_not_smuggle_in_a_param_change(console: Console) -> None:
+    """口子只给「清停用状态」，不给「趁着恢复顺手改一笔」。"""
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    _start(console)
+    console.repository.disable_mission_task(MissionKind.PIRATE, "连续 3 次异常退出")
+
+    response = console.client.patch(
+        "/api/missions/PIRATE", json={"enabled": True, "params": {"radius": 30}}
+    )
+
+    assert response.status_code == 409
+    assert console.task("PIRATE")["params"] == {"radius": 5}
+    assert console.task("PIRATE")["disabled_reason"] is not None
+
+
+def test_enabling_a_chain_that_is_not_disabled_is_still_refused(console: Console) -> None:
+    """没被停用的行收到 `enabled: true` 不是「恢复」，是在勾一条没参与的链路。"""
+    _start(console)
+
+    response = console.client.patch("/api/missions/BOT", json={"enabled": True})
+
+    assert response.status_code == 409
+
+
+def test_the_configuration_is_editable_again_after_stopping(console: Console) -> None:
+    """「只有结束状态才可以修改」的另一半：结束之后必须真的能改回来。"""
+    _start(console)
+    assert console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 9}}) is not None
+    console.client.post("/api/scheduler/stop")
+
+    response = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 9}})
+
+    assert response.status_code == 200, response.text
+    assert console.task("PIRATE")["params"] == {"radius": 9}
+
+
+def test_a_child_that_is_still_running_keeps_the_configuration_locked(console: Console) -> None:
+    """「结束之后 runner 还在收尾」算不算停止状态：**只要手上还有子进程就不算。**
+
+    正常路径上 `stop()` 是同步的（`terminate()` 之后 `wait()`），所以这一条永远
+    不会拦住用户。这里直接把调度器的开关关掉、把子进程留在手上，钉住的是那个
+    将来才会出现的窗口：哪天收尾改成异步的，锁必须自己跟着延长，而不是在收尾
+    途中静默放行一次改参数。
+    """
+    _start(console)
+    console.scheduler.tick()
+    assert console.get()["current"] is not None
+
+    console.scheduler._enabled = False  # noqa: SLF001 - 造出「关了但子进程还在」
+
+    assert console.get()["config_locked"] is True
+    refused = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 7}})
+    assert refused.status_code == 409
+
+
+def test_a_new_bot_round_is_still_allowed_while_running(console: Console) -> None:
+    """「重开一轮」不写任何一个配置字段，所以它不在这道锁里。
+
+    它只把 `round_started_at_utc` 推到当前，也就是「按同一套配置再跑一遍」——
+    固化记录里的每个字段都还是原样。挡掉它的话，用户要开新一轮就得先把整台
+    调度器停下来。
+    """
+    _start(console)
+
+    assert console.client.post("/api/missions/BOT/new-round").status_code == 200
+
+
+# -- 配置固化 -------------------------------------------------------------------
+
+
+def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> None:
+    """「开始」那一下抄一份，页面据此回答「这一轮到底按什么跑的」。"""
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 6}})
+    _start(console)
+
+    frozen = console.get()["frozen_config"]
+    assert isinstance(frozen, dict)
+    assert frozen["frozen_at_utc"].startswith("2026-08-09T12:00")
+    pirate = next(task for task in frozen["tasks"] if task["kind"] == "PIRATE")
+    assert pirate["params"] == {"radius": 6}
+    assert pirate["summary"] == "半径 6"
+    assert frozen["changes"] == ["首次记录"]
+
+
+def test_a_stopped_scheduler_shows_no_frozen_configuration(console: Console) -> None:
+    """停着的时候「本轮」不存在。把上一轮那份继续挂着会被读成「现在跑的就是这套」。"""
+    _start(console)
+    assert console.get()["frozen_config"] is not None
+
+    console.client.post("/api/scheduler/stop")
+
+    assert console.get()["frozen_config"] is None
+    assert console.get()["config_locked"] is False
+
+
+def test_the_second_start_records_what_changed_in_between(console: Console) -> None:
+    """用户口径里的「记录任务内容」有两半，这是「改了什么、什么时候改的」那半。"""
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    _start(console)
+    console.client.post("/api/scheduler/stop")
+    console.clock.now = NOW + timedelta(hours=1)
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 12}})
+    console.client.patch("/api/missions/BOT", json={"priority": -1})
+    _start(console)
+
+    frozen = console.get()["frozen_config"]
+    assert isinstance(frozen, dict)
+    # 次序按链路（`MissionKind` 的声明顺序）走，不按改动发生的先后：两份记录
+    # 逐条对比时，同一条链路必须落在同一格。
+    assert frozen["changes"] == [
+        "侦查+攻击海盗：半径 5 → 12",
+        "扫描+攻击 bot：优先级 1 → -1",
+    ]
+
+
+def test_pressing_start_twice_does_not_record_a_second_freeze(console: Console) -> None:
+    """第二下什么都没变，记下来只会把真正改过的那几条淹掉。"""
+    _start(console)
+    _start(console)
+
+    assert len(console.scheduler.config_freezes()) == 1
+
+
+def test_the_freeze_is_written_where_a_restarted_console_can_read_it(console: Console) -> None:
+    """控制台重启后内存里的一切都没了，而用户多半是重启之后才来翻这份记录。"""
+    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 4}})
+    _start(console)
+
+    lines = console.freeze_log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    # 拿读回来的那一份断言，而不是在这行 JSON 上找子串：这条记录的用途就是
+    # **被下一个进程读回来**，只断言「文件里有 radius 这几个字母」的话，一个
+    # 存得下、读不回的格式照样能满足。
+    reloaded = MissionFreezeLog(console.freeze_log).latest()
+    assert reloaded is not None
+    pirate = reloaded.task(MissionKind.PIRATE)
+    assert pirate is not None
+    assert json.loads(pirate.params_json) == {"radius": 4}
+
+
 # -- 重开一轮 -------------------------------------------------------------------
 
 
@@ -383,6 +602,22 @@ def test_an_orphan_run_is_surfaced_with_its_pid(tmp_path: Path) -> None:
         body = client.get("/api/scheduler").json()
         assert body["orphan_pid"] is None
         assert body["running"] is False
+
+
+def test_the_console_writes_its_freezes_under_var(tmp_path: Path) -> None:
+    """默认的固化记录落在 `var/` 里，和子进程日志同一个地方。
+
+    只建 app、不点「开始」，所以这条不会真的写出文件——`MissionFreezeLog` 是
+    读构造、写追加的。钉住的是**接线**：控制台自己建调度器时必须给它一个带
+    路径的账本，忘了给就只留在内存里，重启一次全没了，而那种丢失是静默的。
+    """
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'wiring.db'}")
+    Base.metadata.create_all(engine)
+    app = create_persistent_app(
+        create_session_factory(engine), local_token=TOKEN, tick_interval_s=3600.0
+    )
+
+    assert app.state.mission_scheduler.freeze_log_path == DEFAULT_FREEZE_LOG
 
 
 def test_force_kill_stops_the_child_we_do_know_about(console: Console) -> None:

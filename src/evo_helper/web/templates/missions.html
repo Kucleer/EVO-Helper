@@ -139,11 +139,67 @@
       </tbody>
     </table>
   </div>
-  {# 400 一律显示在这里。静默失败等于把后端那句中文说明扔了。 #}
+  {# 400 / 409 一律显示在这里。静默失败等于把后端那句中文说明扔了。 #}
   <p class="chip danger" id="mission-error" role="status" style="margin:10px 0 0" hidden></p>
-  <p class="muted" style="margin:8px 0 0;font-size:12px">
+  {#
+    运行中这句话要换。控件已经置灰了，但「为什么灰的、怎么才能改」必须写出来
+    ——只置灰不解释，用户只会得出「这页坏了」。
+  #}
+  <p class="muted" id="mission-hint" style="margin:8px 0 0;font-size:12px">
     改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。
   </p>
+</section>
+
+{#
+  配置固化记录。调度器一「开始」就把三条链路当时的配置抄一份，运行中不许改，
+  所以这份记录就是「那一轮到底按什么跑的」的唯一答案——`mission_runs` 里只有
+  一行命令行，看不出页面上填的是哪一套。
+#}
+<section class="panel" aria-labelledby="freeze-head">
+  <h2 id="freeze-head">配置固化记录</h2>
+  <div id="freeze-current" class="filter-bar">
+    <span class="muted">读取中…</span>
+  </div>
+  <div class="table-wrap" style="margin-top:10px">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">开始时刻（现实 UTC+8）</th>
+          <th scope="col">当时的配置</th>
+          <th scope="col">与上一次相比</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for freeze in freezes %}
+        <tr>
+          <td class="coord">{{ local_time(freeze.frozen_at_utc) }}</td>
+          <td>
+            {% for task in freeze.tasks %}
+              <div class="muted" style="font-size:11px">
+                {{ task.label }} · {{ '参与' if task.enabled else '未参与' }} · {{ task.summary }}
+              </div>
+            {% endfor %}
+          </td>
+          <td>
+            {% for change in freeze.changes %}
+              <div class="muted" style="font-size:11px">{{ change }}</div>
+            {% else %}
+              <span class="muted">与上一次相同</span>
+            {% endfor %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="muted">还没有记录。点一次「开始」就会把当时的三条链路配置抄下来。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if freeze_log_path %}
+    <p class="muted" style="margin:8px 0 0;font-size:12px">
+      完整记录一次一行写在 <span class="coord">{{ freeze_log_path }}</span>，
+      控制台没开也查得到。
+    </p>
+  {% endif %}
 </section>
 
 <section class="panel" aria-labelledby="runs-head">
@@ -192,8 +248,17 @@
   const STATUS_TONES = {{ status_tones | tojson }};
   const STATUS_GLYPHS = {{ status_glyphs | tojson }};
 
+  // 运行中改配置一律被后端 409 拒掉（`_refuse_while_running`）。页面这一侧
+  // 只做同一件事的**提前显形**：控件置灰 + 说明为什么。两边都要有——只置灰
+  // 挡不住直接打接口的，只拒不置灰则要用户改完才发现。
+  const LOCKED_HINT = '调度器运行中，任务配置已固化，不可修改；点「结束」后可改。'
+    + '被自动停用的链路仍可点「恢复」。';
+  const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。';
+
   const rows = document.getElementById('mission-rows');
   const errorBox = document.getElementById('mission-error');
+  const hint = document.getElementById('mission-hint');
+  const freezeCurrent = document.getElementById('freeze-current');
   const orphanBanner = document.getElementById('orphan-banner');
   const orphanPid = document.getElementById('orphan-pid');
   const schedChip = document.getElementById('sched-chip');
@@ -271,6 +336,10 @@
       }
     }
 
+    const locked = state.config_locked === true;
+    hint.textContent = locked ? LOCKED_HINT : EDITABLE_HINT;
+    renderFreeze(state.frozen_config, locked);
+
     for (const task of state.tasks) {
       const row = rowFor(task.kind);
       if (!row) continue;
@@ -278,7 +347,15 @@
       // 复选框**无条件**跟库走，哪怕它此刻还带着焦点：勾了却被 400 拒掉
       // （范围内零个 bot、半径填错）时，它必须自己弹回去。留在勾上，页面就在
       // 说一句谎——用户会以为这条链路已经参与调度了。
-      row.querySelector('.mission-enabled').checked = task.enabled;
+      const checkbox = row.querySelector('.mission-enabled');
+      checkbox.checked = task.enabled;
+      checkbox.disabled = locked;
+      for (const input of row.querySelectorAll('.mission-param')) input.disabled = locked;
+      // 扫描那一行本来就不能拖，锁上之后另外两行也不能。`dragstart` 认的就是
+      // 这个属性，所以改它就等于真的拖不动，不是只把把手画灰。
+      row.setAttribute('draggable', locked || task.kind === 'SCAN' ? 'false' : 'true');
+      const handle = row.querySelector('.drag-handle');
+      if (handle) handle.style.opacity = locked ? '0.35' : '';
 
       const chip = row.querySelector('.mission-status');
       const tone = STATUS_TONES[task.status] || '';
@@ -297,7 +374,10 @@
       // 这条恢复路径在页面上本来看不见——这个按钮就是把它显式化。
       row.querySelector('.mission-revive').hidden = task.status !== '已停用';
 
-      if (!paramsPrimed) {
+      // 参数框平时只填一次（每轮都写回去会把用户正在输入的值顶掉），但锁着的
+      // 时候没人能输入，那就每轮都跟库走——否则「结束」之后框里留着的可能是
+      // 上一次输入到一半的值，而它看起来和已保存的值一模一样。
+      if (!paramsPrimed || locked) {
         for (const input of row.querySelectorAll('.mission-param')) {
           const value = task.params[input.dataset.param];
           input.value = value === undefined ? '' : value;
@@ -306,6 +386,44 @@
     }
     paramsPrimed = true;
     tickClock();
+  }
+
+  function renderFreeze(freeze, locked) {
+    freezeCurrent.textContent = '';
+    if (!freeze) {
+      const idle = document.createElement('span');
+      idle.className = 'muted';
+      idle.textContent = locked
+        ? '本轮的固化记录还没读到。'
+        : '调度器已停止：任务配置现在可以修改，下一次点「开始」会把它固化下来。';
+      freezeCurrent.append(idle);
+      return;
+    }
+    const chip = document.createElement('span');
+    chip.className = 'chip ok';
+    // 时区后缀缺失时按 UTC 读（同 `elapsed`）：少了它，浏览器会按本地时区解释，
+    // 显示出来的固化时刻会凭空差 8 小时。
+    const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(freeze.frozen_at_utc)
+      ? freeze.frozen_at_utc
+      : `${freeze.frozen_at_utc}Z`;
+    chip.textContent = `本轮已固化 · ${new Date(stamped).toLocaleString()}`;
+    const lines = document.createElement('div');
+    for (const task of freeze.tasks) {
+      const line = document.createElement('div');
+      line.className = 'muted';
+      line.style.fontSize = '11px';
+      line.textContent =
+        `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`;
+      lines.append(line);
+    }
+    const changed = document.createElement('div');
+    changed.className = 'muted';
+    changed.style.fontSize = '11px';
+    changed.textContent = freeze.changes.length
+      ? `与上一次相比：${freeze.changes.join('；')}`
+      : '与上一次相同';
+    lines.append(changed);
+    freezeCurrent.append(chip, lines);
   }
 
   function tickClock() {
