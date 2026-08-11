@@ -43,6 +43,25 @@ ISO_TIME_RE = re.compile(
 #: ``DD/MM/YYYY HH:MM:SS`` as rendered by the live mail list and report header.
 REPORT_TIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})")
 
+#: 同一个时间戳，但**日期与时刻之间允许没有空白**。
+#:
+#: 窄 ROI 加纯数字白名单读那一行时，tesseract 稳定地把中间那个空格吞掉：
+#: `11/08/2026 01:32:37` 读成 `11/08/202601:32:37`。数字一个不差，只是分隔没了，
+#: 而 `REPORT_TIME_RE` 要求 `\s+`，于是明明读对了却匹配不上。
+#: **不要为此放松 `REPORT_TIME_RE`**——它还要在整段页眉文本里搜时间，
+#: 放松之后会在一长串数字中间凑出一个假时间。
+_SQUASHED_REPORT_TIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})\s*(\d{2}):(\d{2}):(\d{2})")
+
+
+def normalise_report_time(text: str | None) -> str | None:
+    """把窄 ROI 读出来的时间补回标准写法；认不出返回 None。"""
+    match = _SQUASHED_REPORT_TIME_RE.search(text or "")
+    if match is None:
+        return None
+    day, month, year, hour, minute, second = match.groups()
+    return f"{day}/{month}/{year} {hour}:{minute}:{second}"
+
+
 #: The game renders every in-game time in UTC+0 (confirmed 2026-08-07).
 #:
 #: This is not the schedule timezone. The user's run window (for example

@@ -242,3 +242,100 @@ class TestSavedFilters:
         loaded = repo.get_filter(saved.filter_id)
         assert loaded is not None
         assert loaded.span is None
+
+
+def _row_for(session_factory, coordinate: Coordinate):  # type: ignore[no-untyped-def]
+    """只取这一个坐标那一行。
+
+    不能借用上面的 `search()`：它带着「示例查询」的 span 与筛选条件
+    （total > 2000、钛能守卫者 > 5），而这几条测试要看的恰恰是**没有逐舰种数据**
+    的行——照那套条件筛，它们一条都留不下来。
+    """
+    page = SqlAlchemyIntelRepository(session_factory).search(
+        IntelSearchQuery(span=parse_coordinate_span("2:1", "2:400"))
+    )
+    return next(row for row in page.rows if row.coordinate == coordinate)
+
+
+class TestDetailOnlyReports:
+    """探路战报只读详情页，没有逐舰种行——情报中心不能因此显示成「总计 0」。
+
+    bot 探路战报只读详情页（逐舰种明细在回放页，而那个入口按钮全仓没有标定坐标，
+    见 `BotLoop.collect_probe_reports` 的取舍）。于是 `fleet_snapshots` 一行都没有，
+    而 `total` 原先是「逐舰种求和」——空 dict 求和得 0。
+
+    结果是页面显示「有舰队数据，总计 0」，而报告里明明写着守方单位 319。
+    0 和「没读到」在页面上长得一样，但含义相反：前者是「对方没船，随便打」。
+    """
+
+    def test_the_unit_total_stands_in_for_missing_per_ship_rows(
+        self,
+        session_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        coordinate = Coordinate(2, 320, 11)
+        add_target(session_factory, coordinate, "bot_2_320_11")
+        SqlAlchemyRepository(session_factory).append_report(
+            BattleReport(
+                report_id=uuid4(),
+                reported_at_utc=datetime(2026, 8, 11, 1, 32, 37, tzinfo=UTC),
+                attacker_origin=Coordinate(2, 137, 18),
+                defender_target=coordinate,
+                fleet=(),
+                defender_units=319,
+            )
+        )
+
+        row = _row_for(session_factory, coordinate)
+
+        assert row.total == 319
+        assert row.counts == {}
+        assert row.has_fleet_data is True
+
+    def test_per_ship_rows_still_win_when_they_exist(
+        self,
+        session_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        """逐舰种和「单位」总数是两个独立来源，不是同一个数的两种写法。
+
+        大舰队的逐行数量四舍五入显示，相加凑不出精确总数（见 `BattleReport`
+        的注释）。有逐行时优先用它——它带着构成信息。
+        """
+        coordinate = Coordinate(2, 321, 5)
+        add_target(session_factory, coordinate, "bot_2_321_5")
+        SqlAlchemyRepository(session_factory).append_report(
+            BattleReport(
+                report_id=uuid4(),
+                reported_at_utc=datetime(2026, 8, 11, 1, 33, 30, tzinfo=UTC),
+                attacker_origin=Coordinate(2, 137, 18),
+                defender_target=coordinate,
+                fleet=(FleetSnapshotEntry(side="defender", ship_type="巡洋舰", count=7),),
+                defender_units=999,
+            )
+        )
+
+        row = _row_for(session_factory, coordinate)
+
+        assert row.total == 7
+        assert row.counts == {"巡洋舰": 7}
+
+    def test_a_report_with_no_figures_at_all_is_not_claimed_as_fleet_data(
+        self,
+        session_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        """两个来源都没有时要老实说没有，而不是显示 0。"""
+        coordinate = Coordinate(2, 322, 16)
+        add_target(session_factory, coordinate, "bot_2_322_16")
+        SqlAlchemyRepository(session_factory).append_report(
+            BattleReport(
+                report_id=uuid4(),
+                reported_at_utc=datetime(2026, 8, 11, 1, 34, 23, tzinfo=UTC),
+                attacker_origin=Coordinate(2, 137, 18),
+                defender_target=coordinate,
+                fleet=(),
+            )
+        )
+
+        row = _row_for(session_factory, coordinate)
+
+        assert row.total is None
+        assert row.has_fleet_data is False

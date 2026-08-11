@@ -74,7 +74,17 @@ class IntelRow:
 
     @property
     def has_fleet_data(self) -> bool:
-        return self.snapshot_at is not None
+        """有没有**舰队数字**，不是「有没有战报」。
+
+        原先判的是 `snapshot_at is not None`，也就是「这个目标有战报」。bot 探路
+        战报只读详情页、不写逐舰种行（打开逐舰种要进回放页，而那个入口按钮全仓
+        没有标定坐标），于是 `counts` 为空、`total` 从「逐舰种求和」得到 0——
+        页面上就成了「有舰队数据，总计 0」，而报告里明明写着守方单位 319。
+
+        判 `total` 而不判 `snapshot_at`：读到了数才算有数。0 是合法的（对方真没船），
+        所以比的是 `is not None` 而不是真值。
+        """
+        return self.total is not None
 
 
 @dataclass(frozen=True)
@@ -159,7 +169,11 @@ class SqlAlchemyIntelRepository:
             player=target.latest_owner_name,
             last_scan_at=target.last_scanned_at_utc,
             snapshot_at=report.reported_at_utc,
-            total=sum(counts.values()),
+            # 逐舰种有行就按行求和；一行都没有时退回战报详情页上的守方「单位」总数。
+            # 这两个是**两个独立来源**，不是同一个数的两种写法：大舰队的逐行数量是
+            # 四舍五入显示的，相加凑不出精确总数（见 `records.BattleReport` 的注释）。
+            # 所以优先用逐行和——它带着构成信息；没有逐行时用总数，总比显示 0 强。
+            total=sum(counts.values()) if counts else report.defender_units,
             counts=counts,
             matched_summary="",
             match_confidence=report.match_confidence,
