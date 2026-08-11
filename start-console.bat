@@ -23,20 +23,20 @@ echo   EVO-Helper 控制台
 echo   目录: %CD%
 echo.
 
-rem ---- 网页服务：端口被占就停下 ----------------------------------
-rem 曾经出现过两个陈旧服务各占一个端口、浏览器连着旧的那个，于是
-rem 「代码明明改好了页面却还是坏的」查了很久。
-set OCCUPIED_PID=
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":8770 .*LISTENING" 2^>nul') do set OCCUPIED_PID=%%p
-
-if defined OCCUPIED_PID (
-    echo   [停止] 8770 端口已被进程 %OCCUPIED_PID% 占用。
+rem ---- 网页服务：先腾空 8770，再起新的 ------------------------
+rem 原来是「发现端口被占就停下、让人手动 kill」，实机上没挡住：同一天两次
+rem 出现两代服务并存，旧的占着 8770 跑几小时前的代码，浏览器连的一直是它，
+rem 表现成「代码明明合并了页面还是旧的」。
+rem
+rem 腾空的逻辑放在 tools 目录下的 free-port.ps1 里，那里写清了两件事：
+rem 为什么必须按端口反查而不是按命令行匹配（uvicorn 的子进程会接管端口），
+rem 以及为什么不能把多行 PowerShell 用 ^ 续行写在 bat 里（会被 cmd 拼坏）。
+echo   Cleaning up any service holding port 8770 ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools/free-port.ps1" -Port 8770
+if errorlevel 1 (
     echo.
-    echo   多半是上一次没关干净。要停掉它，在另一个窗口执行：
-    echo       taskkill /PID %OCCUPIED_PID% /F
-    echo.
-    echo   不要在旧服务还开着的时候再起一个：浏览器连到哪个说不准，
-    echo   而旧进程跑的是旧代码，你会看到早就修好的 bug。
+    echo   [STOP] Port 8770 is still in use and could not be freed.
+    echo   Check who owns it:  netstat -ano ^| findstr :8770
     echo.
     pause
     exit /b 1
