@@ -514,6 +514,14 @@ DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
 
+#: 判定当前是哪一屏时最多取几帧。入口页在做明暗动画，实测约一半的帧什么都读不出
+#: （见 `observe` 的注释）。4 帧足够：实测空帧与好帧大致交替，连着 4 帧全空的概率
+#: 可以忽略，而代价只有认不出时才付。
+OBSERVE_FRAMES = 4
+
+#: 两帧之间隔多久。取 0.9s 是为了不和动画同频——固定短间隔有可能每次都踩在同一相位上。
+OBSERVE_FRAME_GAP_S = 0.9
+
 #: 各种浮层左上角的关闭键。信箱、消息详情、飞行中列表、派遣面板共用这一个位置，
 #: 所以关浮层这件事不需要先认出是哪一种浮层（`pirate_loop.MAIL_BACK` 是同一个点）。
 OVERLAY_CLOSE_BUTTON = (750, 71)
@@ -569,6 +577,33 @@ def make_session_keeper(
         return classify_screen(text) is ScreenState.DISCONNECTED
 
     def observe() -> ScreenState:
+        """多取几帧再下结论。**单帧在会动的页面上是抛硬币。**
+
+        实机（2026-08-11 07:16）：入口页在做明暗动画，连读 6 帧的结果是
+
+            第0帧 title='ETERNAL VOID' 进入='进入'   nav=''
+            第1帧 title=''             进入=''      nav='>  =.  _'
+            第2帧 title='ETERNAL VOID' 进入='进入'   nav=''
+            第3帧 title=''             进入=''      nav='>  =.  _'
+
+        一半的帧什么都读不出来。落在空帧上就判 UNKNOWN → 守护报「认不出的画面」
+        → runner 拒绝开工 → 连撞三次，bot 和扫描两条链路双双被自动停用。而画面
+        其实好好的，人手按同样的判据、多取几帧就走回游戏里了。
+
+        只对 UNKNOWN 重取，**没有放松「认不出的画面一律停止」**：每一帧都读不出
+        才返回 UNKNOWN。这也顺带压住了另一个坑——入口页底下透着一层淡淡的
+        START，空帧上 `entry` 认不出时会退去读它，偶尔真能读成 START，于是在
+        入口页上去点 START。等到一帧读得清再判，这个歧义就不存在了。
+        """
+        for attempt in range(OBSERVE_FRAMES):
+            state = observe_once()
+            if state is not ScreenState.UNKNOWN:
+                return state
+            if attempt + 1 < OBSERVE_FRAMES:
+                sleep(OBSERVE_FRAME_GAP_S)
+        return ScreenState.UNKNOWN
+
+    def observe_once() -> ScreenState:
         image = driver.capture()
         # **掉线要排在导航条之前判。** 弹窗是浮层，底下的导航条还在画面上，
         # 「商店/联盟」照样读得出来——先判导航条就会把死会话认成在线，
