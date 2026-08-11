@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 from evo_helper.domain.bot_round import PROBE_PRESET_NAME
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_SCOUT
-from evo_helper.domain.report_wait import line_free_at
+from evo_helper.domain.report_wait import MAX_REPORT_AGE, UNKNOWN_LINE_HOLD, line_free_at
 
 DISPATCHED = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 FLIGHT = timedelta(minutes=30)
@@ -70,9 +70,32 @@ def test_a_scout_is_never_mistaken_for_a_probe() -> None:
 def test_an_unknown_flight_time_leaves_the_clock_unset() -> None:
     """读不到飞行时长就没有钟可言。
 
-    NULL 不计入在飞数——宁可估高空闲航线：估高了 runner 起来空跑一轮，
-    有 `LineCapacityGate` 兜底；估低则是航线空着不派，没人兜。
+    **None 不表示「它没占航线」**：被游戏接受的那一发舰队一定占着一条位子。
+    那一档改按 `UNKNOWN_LINE_HOLD` 从派出时刻起算（见
+    `repository._still_holding_a_line`），这里只是说「算不出确切时刻」。
     """
     assert (
         line_free_at(DISPATCHED, None, mission_kind=MISSION_KIND_ATTACK, preset_name="AAA") is None
     )
+
+
+def test_the_unknown_hold_is_not_the_report_age_ceiling() -> None:
+    """**这两个常量必须分开，同值就是一次读不到换一次停摆。**
+
+    `MAX_REPORT_AGE`（6 小时）是「等一封战报等到什么时候死心」的上界，和
+    `pirate_loop.MAX_CREDIBLE_FLIGHT` 一样是**离谱值的天花板**；而这里问的是
+    「一支不知道何时回来的舰队该占多久航线」，那是个往返时长。这两条链路打的
+    是同系目标：生产库 236 条有航线钟的派遣，实际占用中位数 48 秒、最长 62.6
+    分钟。
+
+    实机 2026-08-11：08:48–10:07 之间 6 发 bot 攻击都没读到飞行时间，正好等于
+    `fleet_line_limit`，于是 `free_lines` 从 10:07 起恒为 0，直到第一发满 6 小时
+    （14:48）才松一格——而那 6 支舰队 11:10 前就全回来了。中间三个多小时里两条
+    攻击链路一齐显示「等航线」，调度器「空转中」。
+
+    上界断言是有牙的那一半：把它调回 6 小时（或任何 ≥2 小时的值），下面这条
+    就会红。
+    """
+    assert UNKNOWN_LINE_HOLD < MAX_REPORT_AGE
+    # 覆盖得住实测最长往返（62.6 分钟），又短到一次读不到不至于压死一条航线半天。
+    assert timedelta(minutes=63) < UNKNOWN_LINE_HOLD <= timedelta(hours=2)

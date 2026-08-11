@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from evo_helper.domain.scheduler import MissionKind
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, MissionKind
 
 #: 子进程日志的落脚处。与 `tools/scan_console.py` 同一个目录。
 LOG_DIR = Path("var/logs")
@@ -83,7 +83,8 @@ class MissionExit:
 
     kind: MissionKind
     command: tuple[str, ...]
-    #: 退出码是唯一的进程间协议：0 = 这一轮正常跑完，非 0 = 异常。
+    #: 退出码是唯一的进程间协议：0 = 这一轮正常跑完，
+    #: `EXIT_ENVIRONMENT_BUSY` = 这会儿轮不到我（不算故障），其余非 0 = 异常。
     #: 收不到（杀不掉、等超时）则为 None。
     exit_code: int | None
     stopped_by: StopReason
@@ -94,10 +95,22 @@ class MissionExit:
     def failed(self) -> bool:
         """算不算一次「异常退出」，供连续失败自停计数。
 
-        抢占和用户点停不算失败——那是我们自己动的手，任务本身没毛病。
-        把它们算进去，一个被频繁抢占的扫描三次就会被自动停用。
+        两档豁免，成因不同但形状一样——**都不是这条链路的毛病**：
+
+        - **不是它自己退的**（抢占、用户点停、控制台关闭）：那是我们自己动的手。
+          算进去的话，一个被频繁抢占的扫描三次就会被自动停用，而扫描的定位恰恰是
+          「始终填空隙」，也就是最容易被抢占的那一条。实机 2026-08-11 01:16–01:32
+          扫描被抢占了 7 次。
+        - **`EXIT_ENVIRONMENT_BUSY`**：runner 明说「这会儿轮不到我」（目前只有
+          「游戏窗口抢不到前台」这一种，意思是用户正在用别的窗口）。它和真正的
+          故障必须分得开，而进程间唯一的协议就是退出码。
+
+        ⚠️ 豁免只认这**一个**退出码，不是「非 0 都不算」也不是「1 都不算」：
+        真坏了必须还能数到三，否则调度循环会在一个坏掉的任务上满速空转。
         """
         if self.stopped_by is not StopReason.SELF:
+            return False
+        if self.exit_code == EXIT_ENVIRONMENT_BUSY:
             return False
         return self.exit_code != 0
 

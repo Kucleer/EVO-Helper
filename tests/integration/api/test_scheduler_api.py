@@ -316,6 +316,26 @@ def test_patching_clears_an_automatic_disable(console: Console) -> None:
     assert console.task("PIRATE")["disabled_reason"] is None
 
 
+def test_a_disabled_scan_is_revived_by_enabling_it_again(console: Console) -> None:
+    """**页面上那个「恢复」按钮走的就是这一条。**
+
+    扫描不吃参数、也不许改优先级，所以它只有 `enabled` 这一条改得动的路；
+    而自动停用时 `enabled` 本来就还是 True——不认这一下的话，一条被
+    「连续 3 次异常退出」停掉的扫描在页面上永远没有恢复的办法，用户只能去改库。
+    计数也必须一起清零，否则下一次崩溃立刻又满三次。
+    """
+    console.repository.record_mission_failure(MissionKind.SCAN, exit_code=1, limit=1)
+    assert console.task("SCAN")["disabled_reason"] is not None
+
+    response = console.client.patch("/api/missions/SCAN", json={"enabled": True})
+
+    assert response.status_code == 200, response.text
+    assert console.task("SCAN")["disabled_reason"] is None
+    assert console.task("SCAN")["status"] != "已停用"
+    row = next(row for row in console.repository.mission_tasks() if row.kind == "SCAN")
+    assert row.consecutive_failures == 0
+
+
 def test_an_unknown_kind_is_a_404(console: Console) -> None:
     assert console.client.patch("/api/missions/DRAGON", json={"enabled": True}).status_code == 404
 
@@ -412,3 +432,14 @@ def test_the_old_missions_page_still_renders(console: Console) -> None:
     """页面重做是下一个任务。这一步只加接口，不许把 `/missions` 弄崩。"""
     assert console.client.get("/missions").status_code == 200
     assert console.client.get("/logs").status_code == 200
+
+
+def test_every_row_carries_a_revive_button(console: Console) -> None:
+    """三条链路都可能被自动停用，恢复的入口就不能只长在其中一行上。
+
+    显隐由 `status === '已停用'` 决定（脚本里），这里只钉住「按钮在每一行」——
+    渲染在 `{% for %}` 外面写漏一次，页面上就再没有恢复的办法。
+    """
+    page = console.client.get("/missions").text
+
+    assert page.count('class="btn small mission-revive"') == 3

@@ -299,9 +299,9 @@ def test_a_cooling_chain_yields_its_turn_to_the_next_one() -> None:
     assert decision == Decision(Action.START, MissionKind.SCAN)
 
 
-def test_scan_is_never_held_back_by_the_cooldown() -> None:
-    """**扫描跳过冷却。** 刚被抢占、冷却期远未过，而攻击任务已经没活干了——
-    这一刻应当立刻回到扫描，不是空转等满五分钟。
+def test_scan_is_not_held_back_after_a_clean_round() -> None:
+    """**扫描没崩就跳过冷却。** 刚被抢占、冷却期远未过，而攻击任务已经没活干了
+    ——这一刻应当立刻回到扫描，不是空转等满五分钟。
 
     冷却堵的 churn 是收战报特有的（NULL expected → 恒判「该去收」→ 进信箱扑空
     → 再来）。扫描没有这种循环，游标持久化、随起随停没有代价。套上去只会制造
@@ -322,6 +322,56 @@ def test_scan_is_never_held_back_by_the_cooldown() -> None:
         min_dwell=DWELL,
         restart_cooldown=RESTART_COOLDOWN,
     ) == Decision(Action.START, MissionKind.SCAN)
+
+
+def test_scan_does_cool_down_after_it_crashed() -> None:
+    """**崩掉的那一档不一样。**
+
+    实机 2026-08-11 08:40:30 / 08:40:45 / 08:40:59：同一个「游戏窗口抢不到前台」
+    把扫描连崩三次，每次 14 秒——不冷却的话，`MAX_CONSECUTIVE_FAILURES` 只需要
+    **43 秒**就把这条链路自动停用，而另外两条有冷却的链路要撞满 10 分钟才落到
+    同一个下场。于是最该一直有活干的那条，最容易被一阵前台争抢误判成坏掉。
+    """
+    just_crashed = facts(
+        free_lines=0,
+        last_started_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=15)},
+        last_failure_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=14)},
+    )
+
+    assert not has_work(MissionKind.SCAN, just_crashed, restart_cooldown=RESTART_COOLDOWN)
+    assert decide(
+        tasks(MissionKind.PIRATE, MissionKind.BOT, MissionKind.SCAN),
+        just_crashed,
+        running=None,
+        min_dwell=DWELL,
+        restart_cooldown=RESTART_COOLDOWN,
+    ) == Decision(Action.IDLE, None)
+
+
+def test_scan_comes_back_once_the_crash_cooldown_expires() -> None:
+    """**不许做成崩一次就再也不起。** 冷却是节流，不是墓碑。"""
+    cooled = facts(
+        free_lines=0,
+        last_failure_at_utc={MissionKind.SCAN: NOW - RESTART_COOLDOWN - timedelta(seconds=1)},
+    )
+
+    assert has_work(MissionKind.SCAN, cooled, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_a_scan_in_its_crash_cooldown_is_never_called_waiting_for_a_line() -> None:
+    """扫描压根不派遣，航线满不满与它无关。
+
+    `came_back_empty` 对它恒为真（它永远不会出现在 `last_dispatch_at_utc` 里），
+    不挡一道的话，一条只是在崩溃冷却里的扫描会被 `status_of` 说成「等航线」
+    ——一句用户照着去调航线数、调完也不会有任何变化的假话。
+    """
+    stuck = facts(
+        free_lines=0,
+        last_started_at_utc={MissionKind.SCAN: NOW - timedelta(seconds=15)},
+        next_line_free_at_utc=NOW + timedelta(minutes=20),
+    )
+
+    assert not waiting_for_a_line(MissionKind.SCAN, stuck)
 
 
 def test_a_cooling_chain_does_not_preempt_the_running_scan() -> None:

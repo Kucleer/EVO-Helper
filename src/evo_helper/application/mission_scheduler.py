@@ -41,6 +41,7 @@ from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
 from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
 from evo_helper.domain.scheduler import (
     Action,
+    Decision,
     MissionKind,
     RunningProcess,
     SchedulerFacts,
@@ -126,10 +127,24 @@ class MissionScheduler:
         #: 就清掉——那一下的含义是「我知道了，别再提醒我」。
         self._orphan_pid: int | None = None
         self._run_id: UUID | None = None
+        #: 每条链路上一次异常退出的时刻，喂给 `domain.scheduler.cooling_down`。
+        #: **只记在内存里**：它的用途是压住本次运行里的重启 churn，控制台重启就
+        #: 该忘掉；真正跨进程的那份记忆是 `mission_tasks.consecutive_failures`。
+        self._last_failure_at: dict[MissionKind, datetime] = {}
         #: tick 跑在后台线程里，而页面的「开始 / 结束」来自请求线程。没有这把锁，
         #: 一次「结束」可能正好落在 tick 的「起进程」中间——supervisor 停掉的是
         #: 上一个，紧接着 tick 又起了一个新的，于是控制台以为已经停了，实际还有
         #: 一个 runner 在点鼠标。这直接违反「任何时刻最多一个子进程」。
+        #:
+        #: ⚠️ **它只护「起停」这几行，绝不能护到查库上去。** 查库要多久没有上界：
+        #: 一次 `_facts()` 会按 bot 目标逐个问库，生产库里那个范围有 4237 个目标，
+        #: 实测一次 0.32 秒；而 tick 每秒一次、页面每 2 秒问一次状态、桌面悬浮窗
+        #: 还有一次。这些活儿一旦压在同一把锁上，用户点「结束」就得排在它们后面
+        #: ——`RLock` 没有公平性，排在一群反复重取的线程后面可以饿任意久；而且
+        #: FastAPI 的同步接口跑在容量 40 的线程池里，轮询全卡在锁上之后，那个
+        #: POST 连线程都分不到，于是页面上「点了结束毫无反应、秒表照走」。
+        #: 实机 2026-08-11 就是这样：调度器显示已运行 2:29:08，点「结束」没反应。
+        #:
         #: 可重入锁：`stop()` 与 `tick()` 内部都会再调 `_finish()`。
         self._lock = threading.RLock()
 
@@ -207,10 +222,15 @@ class MissionScheduler:
 
         走的是和 `tick()` 同一套 `_facts`，所以页面上看到的判据依据与调度器
         下一步据以行动的是同一份事实。
+
+        **查库在锁外。** 每 2 秒一次的状态轮询没有任何理由把用户的「结束」堵在
+        后面——一次 `_facts()` 要按 bot 目标逐个问库（实测 0.32 秒），两个客户端
+        一起轮询就够把那把锁占满。锁里只剩几个字段的读取。
         """
+        tasks = self._repository.mission_tasks()
+        config = self._repository.scheduler_config()
+        facts = self._facts(tasks, config, self._clock())
         with self._lock:
-            tasks = self._repository.mission_tasks()
-            config = self._repository.scheduler_config()
             return SchedulerSnapshot(
                 enabled=self._enabled,
                 started_at_utc=self._started_at_utc,
@@ -218,7 +238,7 @@ class MissionScheduler:
                 orphan_pid=self._orphan_pid,
                 tasks=tuple(tasks),
                 config=config,
-                facts=self._facts(tasks, config, self._clock()),
+                facts=facts,
             )
 
     def begin_bot_round(self) -> None:
@@ -247,16 +267,19 @@ class MissionScheduler:
 
         收退出码不能只在页面轮询时做——没人开着页面时，那条记录会一直挂在
         「运行中」，而连续失败也就永远数不到三。
+
+        **读事实那一段在锁外**（见 `_lock` 上的注释）：它没有上界，而「结束」
+        必须能立刻插进来。
         """
         with self._lock:
             self._finish(self._supervisor.poll())
-            if not self._enabled:
+        if not self._enabled:
+            return
+        # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
+        # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
+        for _ in range(len(MissionKind)):
+            if not self._step():
                 return
-            # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
-            # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
-            for _ in range(len(MissionKind)):
-                if not self._step():
-                    return
 
     # -- 一次决策 --------------------------------------------------------------
 
@@ -280,13 +303,43 @@ class MissionScheduler:
         )
         if decision.action is Action.IDLE or decision.kind is None:
             return False
-        if decision.action is Action.PREEMPT:
-            # 只有扫描会被抢占（判据保证），它的游标持久化，随时可断。
-            self._finish(self._supervisor.stop(StopReason.PREEMPTED))
-        return not self._launch(decision.kind, tasks)
+        return self._act(decision, tasks)
+
+    def _act(self, decision: Decision, tasks: Sequence[orm.MissionTaskRow]) -> bool:
+        """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
+
+        上面那段读事实是在锁外跑的，因此进锁之后必须重新问两个问题——它们正是
+        「任何时刻最多一个子进程」这条不变量的守卫：
+
+        - **用户在这期间点了「结束」吗？** 点了就作废这一轮。少了这一句，
+          `stop()` 杀掉的是上一个，紧接着这里又起一个新的，控制台以为已经停了，
+          实际还有一个 runner 在点鼠标。
+        - **在跑的那个还是决策时看到的那个吗？** 不是就作废，等下一 tick 拿新
+          事实重算——照着过期的决策抢占或启动，等于凭一份旧快照动真鼠标。
+
+        作废一律返回「不必再算」：再算一遍读的还是同一份库，只是白付一次
+        `_facts()` 的钱。只有「刚把某条链路就地停用」才值得重算，那时次序真的
+        变了，顺位该立刻让给下一条。
+        """
+        if decision.kind is None:
+            return False
+        with self._lock:
+            if not self._enabled:
+                return False
+            running = self._supervisor.running
+            if decision.action is Action.PREEMPT:
+                if running is None or running.kind is not MissionKind.SCAN:
+                    return False
+                # 只有扫描会被抢占（判据保证），它的游标持久化，随时可断。
+                self._finish(self._supervisor.stop(StopReason.PREEMPTED))
+            elif running is not None:
+                return False
+            return not self._launch(decision.kind, tasks)
 
     def _launch(self, kind: MissionKind, tasks: Sequence[orm.MissionTaskRow]) -> bool:
         """组命令行、起进程、记账。参数不合格则停用该任务并返回 False。
+
+        调用方必须已经持有 `_lock`：这里会真的拉起一个去点鼠标的子进程。
 
         `MissionParamError` 必须在这里被接住：让它冒出去就是整个调度循环停摆，
         而它表达的只是「这条链路的配置填错了」——另外两条没有理由跟着停。
@@ -319,14 +372,22 @@ class MissionScheduler:
                 exit_code=exited.exit_code,
                 stopped_by=exited.stopped_by.value,
             )
+        if exited.stopped_by is not StopReason.SELF:
+            # 抢占、用户点停、控制台关闭：我们自己动的手，两个计数都不动。
+            return
+        if exited.exit_code == 0:
+            # 跑完一轮。「连续」是连续，成功过一次就重新数。
+            self._last_failure_at.pop(exited.kind, None)
+            self._repository.clear_mission_failures(exited.kind)
+            return
+        # 自己退且退出码非 0。**冷却与「算不算故障」是两件事，分开记。**
+        # 冷却按「起来就没好好跑完」算，`EXIT_ENVIRONMENT_BUSY` 那一档也要吃：
+        # 用户正在用别的窗口，14 秒后再起一次同样抢不到前台，纯 churn。
+        self._last_failure_at[exited.kind] = exited.ended_at_utc
         if exited.failed:
             self._repository.record_mission_failure(
                 exited.kind, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
             )
-        elif exited.stopped_by is StopReason.SELF:
-            # 跑完一轮且退出码为 0。抢占和用户点停不动这个计数——那是我们
-            # 自己动的手，任务本身没毛病。
-            self._repository.clear_mission_failures(exited.kind)
 
     # -- 事实 ------------------------------------------------------------------
 
@@ -336,10 +397,13 @@ class MissionScheduler:
         config: orm.SchedulerConfigRow,
         now: datetime,
     ) -> SchedulerFacts:
-        """一次调度所需的全部事实，全部来自数据库。
+        """一次调度所需的全部事实：一条来自内存，其余全部来自数据库。
 
         没在参与调度的链路一律不去查：bot 的完成判据要按目标逐个问库，
         而 tick 每秒一次。查了也只是丢掉。
+
+        **这段没有上界，所以它必须在 `_lock` 外面跑**——生产库里 bot 范围有
+        4237 个目标，实测一次 0.32 秒，把它压在锁上，用户点「结束」就得排队。
         """
         active = {
             MissionKind(row.kind)
@@ -378,6 +442,7 @@ class MissionScheduler:
             last_started_at_utc=self._repository.last_mission_starts(),
             last_dispatch_at_utc=self._last_dispatches(active),
             next_line_free_at_utc=self._repository.next_line_free_at(now_utc=now),
+            last_failure_at_utc=dict(self._last_failure_at),
         )
 
     def _last_dispatches(self, active: set[MissionKind]) -> dict[MissionKind, datetime]:
