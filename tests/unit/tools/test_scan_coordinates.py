@@ -76,13 +76,25 @@ def test_repeated_failures_stop_after_the_attempt_budget() -> None:
     assert driver.captures == 3
 
 
-def test_a_retry_resets_every_field() -> None:
-    # 读不出可能是因为根本没跳过去，所以重来时不能靠「记得刚才在哪」省字段。
+def test_a_failed_read_leaves_no_memory_behind() -> None:
+    """读不出可能是因为根本没跳过去，所以重来时不能靠「记得刚才在哪」省字段。
+
+    导航器的缓存里只放**回读确认过**的坐标（见 `SystemNavigator` 的类注释），
+    而这一趟一次都没核对通过——所以走完之后它必须是空的，下一个坐标三个字段全重设。
+    """
     driver = RecordingDriver([{FREE_COORD_ROI: "[9:9:9]"}])
     navigator = SystemNavigator(driver)
     navigator.current = Coordinate(2, 2, 10)
     scan_one(navigator, ocr, Coordinate(2, 2, 11), debug_dir=None, attempts=2)
-    assert navigator.current == Coordinate(2, 2, 11)
+    assert navigator.current is None
+
+
+def test_a_confirmed_read_is_remembered_so_the_next_hop_is_cheap() -> None:
+    """核对通过 = 导航栏的回读证据。不记下来，同一恒星系里每一位都要重设三个字段。"""
+    driver = RecordingDriver([{FREE_COORD_ROI: "[2:2:12]", FREE_NAME_ROI: "荒芜行星"}])
+    navigator = SystemNavigator(driver)
+    scan_one(navigator, ocr, Coordinate(2, 2, 12), debug_dir=None)
+    assert navigator.current == Coordinate(2, 2, 12)
 
 
 def patch_db(monkeypatch, *, scanned, bots) -> None:

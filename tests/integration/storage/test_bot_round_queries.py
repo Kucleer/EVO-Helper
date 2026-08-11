@@ -177,7 +177,7 @@ def test_the_attack_report_is_what_finishes_the_target(repository, run_id) -> No
 def test_the_mail_floor_follows_the_attack_dispatch(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """等攻击战报时，翻信箱的时间下界是**攻击那一发的派出时刻**。
 
-    收攻击战报走的是同一个 `bot_report_due_at`（`BotLoop.collect_battle_reports`
+    收攻击战报走的是同一个 `bot_report_due_at`（`BotLoop._say_still_waiting`
     对两种发一视同仁）。探路那一发已经闭合，就不该再把下界拖回它派出的时刻——
     拖回去只是每趟多翻几屏旧邮件，而那几屏顶头就是它自己那份已入库的探路战报。
     """

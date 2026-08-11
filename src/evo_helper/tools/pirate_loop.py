@@ -25,6 +25,18 @@
 
 侦察报告里 `深空吞噬者 / 噬能截击者 / 钛能守卫者 / 收割者` 任一 > 1 就打。
 判定结论是三值的（见 `vision.scout_reports`）：读不出来时**不打**也不当成空位。
+
+## 开工第一件事：读战报，再更新「今天打了几发」
+
+用户口径（2026-08-11）：「任务启动先去读战报……读完后，需要更新海盗攻击/bot 攻击
+的数量，因为我可能暂停任务重启启动。」`reconcile_today()` 是那一趟——一次进信箱
+办两件事：把还没入库的攻击战报读进 `battle_reports`（战果按
+`domain.battle_outcome` 那条算式算，不看画面上那行大字），同时数今天（UTC+0）
+信箱里已经有多少份本链路的战报。两条链路共用这一趟，只有「一封战报怎么读」不同。
+
+海盗战报以前**一份都没读过**：`vision.pirate_reports.read_pirate_report` 只挂在
+离线入口 `tools.ingest_pirate_report`（要人手工喂两张截图）上，活链路从来不调它，
+于是攻击日志的战果列永远是空的。bot 那边的同一个死结在此之前刚修过。
 """
 
 from __future__ import annotations
@@ -50,6 +62,7 @@ from evo_helper.domain.records import (
 )
 from evo_helper.domain.report_wait import parse_game_duration
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
+from evo_helper.domain.scheduler import quota_day_start_utc
 from evo_helper.game import pirate_ui
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
@@ -219,6 +232,10 @@ MAIL_BACK = (750, 71)
 PANEL_DRAG_FROM_Y = 700
 PANEL_DRAG_TO_Y = 300
 
+#: 读「单位」/「损失单位」那两行之前，详情页要往下拖几次（见 `PirateLoop._bottom_screens`）。
+#: 到底会夹住，多拖一次无害；少拖一次就是静默留空。
+DETAIL_SCROLL_TO_BOTTOM_DRAGS = 2
+
 
 #: 借 `scan_coordinates` 那一份，不再各写一遍。它是编码安全的——
 #: 实机上 `print` 一个 OCR 读出来的 `™` 就把整个 runner 弄崩过，见那边的注释。
@@ -261,6 +278,23 @@ class TargetCheck(Enum):
     ABSENT = "不是目标"
     #: 面板是真的，但显示的不是请求的那一位。
     MISMATCH = "坐标核对不过"
+
+
+class ReportIngest(Enum):
+    """开工那一趟信箱里，一封战报的三种下场。
+
+    ⚠️ **`KNOWN` 与 `UNREADABLE` 必须分开**，虽然两者都「没往库里加行」：
+
+    - `KNOWN`（库里已有）是**早停的凭据**。信箱从新往旧排、入库也从新往旧写，
+      所以碰到第一份已有的，往下每一份都必然已经在库里了，不必再开封。
+    - `UNREADABLE`（这一封读不出来）**不能早停**。它下面还可能躺着没入库的战报，
+      当成早停就是把「这一封读坏了」变成「今天剩下的都不读了」——一次 OCR 抖动
+      能让一整趟收取哑掉。
+    """
+
+    STORED = "已入库"
+    KNOWN = "库里已有"
+    UNREADABLE = "读不出来"
 
 
 @dataclass(frozen=True)
@@ -343,6 +377,33 @@ def mail_row_from_text(index: int, text: str) -> MailRow:
 
 
 @dataclass
+class DailyTally:
+    """数今天（UTC+0）信箱里有多少份本链路的战报。`_scan_mail_rows` 逐行喂给它。
+
+    **不开封**：判据只有列表行上的主题与时间。一屏六行是一次截图加六次窄 ROI OCR，
+    而开一封约八秒——正因为便宜，它才敢一直数到「翻见昨天的那一行」为止，
+    不必受开封预算牵制。
+
+    `complete` 只在**真的看见一行昨天的报告**时才为真。拖不动了、到上限了都不算：
+    那时 `observed` 只是「今天至少这么多」。这个数照样参与配额取大（下界也是证据），
+    但日志与库里要说得清它是不是全天——否则日后没人分得出「今天只打了 3 发」
+    和「只数到 3 发」，而这两件事对「还能不能接着打」的含义完全相反。
+    """
+
+    kind: ReportKind
+    day_start: datetime
+    observed: int = 0
+    complete: bool = False
+
+    def __call__(self, row: MailRow) -> None:
+        if row.is_older_than(self.day_start):
+            self.complete = True
+            return
+        if row.kind is self.kind:
+            self.observed += 1
+
+
+@dataclass
 class LoopOptions:
     systems: tuple[tuple[int, int], ...]
     scout: bool
@@ -395,6 +456,9 @@ class PirateLoop:
     #: 今天的行为）；bot 那边数多了，只会让它提前收手。`count_dispatches_since`
     #: 取大的规则保证了这一点——观测值只能把计数往上抬，不能往下压。
     RECONCILE_KIND: ReportKind = ReportKind.PIRATE
+
+    #: 上面那一档在日志里怎么念。只影响措辞，不影响判据。
+    REPORT_LABEL: str = "海盗攻击报告"
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
@@ -484,23 +548,60 @@ class PirateLoop:
         """行星面板上是不是「敌对海盗」，而且坐标对得上。
 
         **先认面板、再核坐标**，顺序不能反：坐标行（`PIRATE_COORD_ROI`）属于
-        海盗面板那套布局，空位上那块像素是什么并没有证据。先核坐标的话，每个
-        空位都会因为读不到坐标而判成 `MISMATCH`，于是整轮都在复位重试——
-        而「这一位没有海盗」本来就是最常见的正常结果。
+        海盗面板那套布局。先核坐标的话，一次读不出就把「这一位没有海盗」判成
+        `MISMATCH`，于是整轮都在复位重试——而那本来就是最常见的正常结果。
 
         坐标要核：导航栏偶尔会停在别的位号上（实机踩过），这时面板是真的、
         只是不是请求的那一位——照着它打就打错了目标。
+
+        认出海盗并核过坐标，就等于回读证明了导航栏停在这一位，于是
+        `navigator.confirm()`：导航器只信有证据的记忆（见 `SystemNavigator`）。
+        没有海盗的那些位走 `_confirm_from_panel`，理由见那边。
         """
         title = self._read(pirate_ui.PIRATE_TITLE_ROI)
         if pirate_ui.PIRATE_TITLE_TEXT not in title:
-            return TargetCheck.ABSENT
+            return self._confirm_from_panel(coordinate)
         wanted = f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
         shown = self._read(pirate_ui.PIRATE_COORD_ROI, digits=True)
         if wanted not in shown:
             say(f"  坐标核对不过：面板显示 {shown!r}，请求的是 {wanted}")
             self._dump_coord_mismatch("pirate-coord-mismatch")
             return TargetCheck.MISMATCH
+        self._navigator.confirm(coordinate)
         return TargetCheck.CONFIRMED
+
+    def _confirm_from_panel(self, coordinate: Coordinate) -> TargetCheck:
+        """面板上没有海盗时，仍旧把坐标行回读一遍。返回 `ABSENT` 或 `MISMATCH`。
+
+        为什么非读不可：海盗链路 1–4 位里绝大多数是空位，如果空位不留下任何证据，
+        导航器的缓存就永远建立不起来（`goto()` 之后 `current` 是 None），每一位都要
+        重设三个字段——每位白花约 6 秒。这一次读是**用一次窄 ROI 的 OCR 换掉两次
+        字段输入**，量级差一个数。
+
+        读的是坐标行而不是「有没有海盗」，用的是全仓那份唯一的判据
+        （`read_panel_confirming`，坐标扫描器每一位都在用它，无主行星照样读得出
+        「荒芜行星 + 坐标」）。三种结果各有各的善后：
+
+        - **读通且就是请求的那一位** → 确认缓存，照常报「这一位没有海盗」。
+        - **读通但是别的坐标** → 导航漂了，判 `MISMATCH` 交给 `_goto_checked` 自愈。
+          这一档补的是实机上最贵的那种静默故障：缓存和导航栏分岔之后，44 个目标
+          一路报「不是海盗」把整轮走完，日志上和「今天这几位真没海盗」一模一样。
+        - **读不出坐标**（面板没铺开、被浮层压着） → **既不确认也不指控**：
+          不确认，下一趟自然把三个字段都重设；不指控，免得一次 OCR 抖动就换来
+          一次复位重试。
+        """
+        from evo_helper.vision.scan_reading import COORDINATE_RE, read_panel_confirming
+
+        requested = f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
+        panel = read_panel_confirming(crop_reader(self._driver.capture(), self._ocr), requested)
+        if panel.confirms(requested):
+            self._navigator.confirm(coordinate)
+            return TargetCheck.ABSENT
+        if COORDINATE_RE.search(panel.coordinate_text):
+            say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
+            self._dump_coord_mismatch("pirate-coord-drift")
+            return TargetCheck.MISMATCH
+        return TargetCheck.ABSENT
 
     def _dump_coord_mismatch(self, name: str) -> None:
         """坐标核对不过就留一帧现场，但要封顶。
@@ -818,12 +919,25 @@ class PirateLoop:
         not_before: datetime | None = None,
         max_pages: int = MAIL_SCAN_PAGES,
         max_opens: int = MAIL_MAX_OPENS,
+        observe: Callable[[MailRow], None] | None = None,
     ) -> None:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
         `visit(row, page)` 返回 True 表示「要的都收齐了」，这一趟就此收工。
         `not_before` 是「要找的报告最早可能是什么时候」：列表按时间倒序，翻到比它
         更早的那一行，往下就全是旧报告，可以立刻收工。
+
+        `observe(row)` 是**看每一行（不开封）**的旁路，开工对账用它数今天已经有
+        多少份战报（见 `reconcile_today`）。它和开封是两笔独立的预算，这一点是
+        判据的一部分而不是实现细节：
+
+        - 开封受 `max_opens` 和「收齐了」两道限制，因为开一封 ≈8 秒；
+        - **数数不受它们限制**，只受 `max_pages` 与 `not_before` 限制。
+          反过来写（开封停了就整趟停）会让计数在换过库、当天战报一份都没入库时
+          只数到最前面那八行，把「今天打了 20 发」记成「今天打了 8 发」——
+          而计数偏小正是会超额的那一侧。
+        - 没有 `observe` 的那些调用（收侦察报告、补录）行为一个字不变：
+          收齐了就收工，没有任何再翻下去的理由。
 
         `max_pages` / `max_opens` 默认就是活链路那两个上限，它们是按「一轮在等
         6–8 份报告」定的，**不要为了补录去调大默认值**：活链路每一轮都要付这个
@@ -857,9 +971,11 @@ class PirateLoop:
         self._enter_mailbox()
         seen: set[tuple[str, str]] = set()
         opened = 0
+        collected = False
+        budget_noted = False
         done = False
         for page in range(max_pages):
-            if done or opened >= max_opens:
+            if done:
                 break
             # ⚠️ **每次点行之前都要先确认「还在邮件列表上」。** 实机踩过两次同一个错：
             # 上一次返回没退到列表（或把整个信箱关掉了），接着照列表的行坐标点下去，
@@ -873,6 +989,8 @@ class PirateLoop:
                 break
             seen.update(row.identity for row in fresh)
             for row in fresh:
+                if observe is not None:
+                    observe(row)
                 if row.is_older_than(not_before):
                     say(
                         f"  第 {row.index} 行是 {row.raw_time_text} 的报告，比要找的那几发还早；"
@@ -880,16 +998,23 @@ class PirateLoop:
                     )
                     done = True
                     break
+                if collected:
+                    continue
                 if opened >= max_opens:
-                    say(f"  这一趟已经开了 {opened} 封，到上限；剩下的留给下一趟")
-                    break
+                    if not budget_noted:
+                        budget_noted = True
+                        say(f"  这一趟已经开了 {opened} 封，到上限；剩下的留给下一趟")
+                    continue
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
                     continue
                 opened += 1
                 if self._open_mail_row(row, visit):
-                    done = True
-                    break
+                    collected = True
+            # 不再开封之后还翻不翻，取决于**有没有人在数数**：
+            # 数数要的是「今天一共几份」，那个数不能被开封预算截断。
+            if collected and observe is None:
+                done = True
             if not done and page + 1 < max_pages:
                 slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
         self._close_mail()
@@ -1082,12 +1207,119 @@ class PirateLoop:
         )
         return read, written
 
-    # -- 开工对账 -----------------------------------------------------------
+    # -- 开工：先读战报，再更新计数 ------------------------------------------
+
+    def _ingest_report(self, row: MailRow, page: Any) -> ReportIngest:
+        """把详情页上这一封读成一条战报并入库。**子类按自己的战报格式覆盖。**
+
+        海盗这一份走 `vision.pirate_reports.read_pirate_report`，与离线入口
+        `tools.ingest_pirate_report` 共用同一段读法与同一条胜负算式
+        （`domain.battle_outcome`：剩余 = 单位 − 损失；本方剩余 0 判负、对方全歼
+        判胜、两边都有船判平）。**不读横幅**——用户 2026-08-11 明确说了不看画面上
+        那行大字，横幅在读法内部只作交叉校验。
+
+        要两屏：`page` 是没拖过的那一屏（主题、时间、VS 块、「单位」），
+        `_bottom_screens()` 是拖到底那一屏（「损失单位」）。缺一个数就算不出胜负，
+        那时整份拒收——半份记录没人会回头核。
+
+        入库走 `append_report`，它按「出发坐标 + 目标坐标 + 时间就近」自己认领那一发
+        派遣（置 `dispatch_id`），攻击日志的战果列与「这一发打完了没有」都接在那上面。
+        这里**不另做匹配，更不补派遣行**。
+        """
+        from evo_helper.application.report_ingest import to_pirate_battle_report
+        from evo_helper.vision.pirate_reports import PirateReportUnreadable, read_pirate_report
+
+        bottom = self._bottom_screens()
+        try:
+            reading = read_pirate_report(page, bottom)
+        except PirateReportUnreadable as error:
+            # 读不出来就**不存**，不存半份，不猜。下一趟这一封还在信箱里。
+            say(f"  第 {row.index} 行读不出海盗战报：{error}")
+            return ReportIngest.UNREADABLE
+        repository, _run_id = self._ensure_run()
+        if repository.has_report_at(reading.defender_target, reading.reported_at_utc):
+            say(f"  第 {row.index} 行 → {reading.defender_target} {reading.outcome}（库里已有）")
+            return ReportIngest.KNOWN
+        repository.append_report(to_pirate_battle_report(reading, report_id=uuid4()))
+        say(
+            f"  第 {row.index} 行 → {reading.defender_target} {reading.outcome}"
+            f"（战损 我 {reading.attacker_losses} · 敌 {reading.defender_losses}；已入库）"
+        )
+        return ReportIngest.STORED
+
+    def _ingest_report_row(self, row: MailRow, page: Any) -> bool:
+        """开工那一趟里开的每一封都走这里。返回「不必再开封了」。
+
+        **读到库里已有的那一份就不再开封**（用户口径 2026-08-11）。信箱按时间
+        从新往旧排，入库也是从新往旧写的，所以碰到第一份「已有」时，它往下的每一份
+        都必然更旧、也必然已经在库里——再开下去只是一封封确认「已有」，每封约 8 秒。
+        这条对「同一天多次启动」尤其要紧：每次重启都要重新翻一遍信箱。
+
+        ⚠️ **只停开封，不停这一趟。** 数数还要接着往下翻（见 `_scan_mail_rows` 的
+        `observe`）：库里已有多少份和信箱里今天有多少份是两件事，而配额要的是后者。
+        """
+        if self._ingest_report(row, page) is not ReportIngest.KNOWN:
+            return False
+        say("  往下都是更旧的报告，不再开封")
+        return True
+
+    def _bottom_screens(self) -> Any:
+        """把详情页拖到底再拍一屏：「单位」与「损失单位」两行都在那里。
+
+        为什么非拖不可：「损失单位」在没拖的那一屏上正好被面板下沿切掉，
+        七张实拍**没有一张**读得到。bot 战报还比海盗战报多一行「生成卫星概率」，
+        「战斗详情」横幅因此下移约 30px，连「单位」整行都落到可视区之外
+        （2026-08-11 的五张实拍里四张如此）。所以这不是锚点找错了——那些行
+        **根本没画出来**，只能拖。
+
+        ⚠️ 这一步是**判据的输入**，不只是补一个展示字段：胜负按
+        「剩余 = 单位 − 损失单位」算（`domain.battle_outcome`），不拖就没有战损，
+        没有战损就算不出胜负，攻击日志的战果列会一直空着。
+
+        ⚠️ **拖之前那一屏必须先读完。** 拖到底之后 VS 块与胜负横幅都滚出可视区
+        （实测拖到底的那一屏横幅读作 `'Z ?'`）。调用方拿到的 `page` 持有的是
+        拖之前那一次截图的像素，所以顺序上先拿 `page`、再拖、再拍这一屏，
+        两屏各读各的。
+
+        拖两次而不是一次：面板到底会夹住（`pirate_reports` 模块头记着实测拖 280px
+        与 520px 落点完全一致），多拖一次无害；而少拖一次读不到就是静默留空。
+        """
+        for _ in range(DETAIL_SCROLL_TO_BOTTOM_DRAGS):
+            slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+        return self._report_screens()
 
     def reconcile_today(self) -> None:
-        """开工先对账：数一遍今天（UTC+0）信箱里已经有多少份本链路的攻击战报。
+        """开工第一件事：**把今天的战报读进库**，读完再把「今天已经打了几发」更新掉。
 
-        ## 为什么要对账
+        用户口径（2026-08-11）：「任务启动先去读战报……读完后，需要更新海盗攻击 /
+        bot 攻击的数量，因为我可能暂停任务重启启动。」
+
+        ## 一趟信箱办两件事
+
+        进出信箱要复位画面、切地表、开面板、切「报告」标签、慢拖回顶，一趟约 20 秒；
+        而读战报和数战报看的是同一批行、同一个倒序列表。分两趟就要把这 20 秒付两遍，
+        所以这里只有一次 `_scan_mail_rows`：`visit` 开封入库，`observe` 数数。
+
+        **两笔预算互不牵连**，判据写在 `_scan_mail_rows` 里：开封受 `MAIL_MAX_OPENS`
+        与「读到库里已有的那一份」限制，数数只受 `RECONCILE_MAX_PAGES` 与「翻到昨天」
+        限制。反过来写（开封停了整趟就停）会在换过库的那天把「今天打了 20 发」
+        记成 8 发，而计数偏小正是会超额的那一侧。
+
+        **数的是列表行，不是入库结果**：一封读不出来的战报仍然证明「这一发打出去过」。
+        两件事分开，才不会让一次 OCR 失手同时丢掉战果和配额。
+
+        ## 每次开工都做，不再是一天一次
+
+        原先靠 `daily_reconciliations` 里那条按 UTC 日去重的记录，一天只对一次账。
+        用户会暂停任务再重启，而重启之后「今日 X/32」必须接得上——一天一次意味着
+        早上那次对账之后，库外发生的事（手动打的、进程崩在写库之前的）当天再也不会
+        被数进来。现在每次开工都数一遍；而这一趟本来就要跑（战报得有人读），
+        多出来的成本只是那几行窄 ROI 的 OCR。
+
+        重复对账不会把数越描越小：`record_daily_reconciliation` 按 UTC 日**取大**，
+        「今天至少有几份」这件事在一天之内只会往上走。
+
+        ## 哪一侧是权威
 
         「今天已经打了几发」现在只按库里的 `attack_dispatches` 数
         （`repository.count_dispatches_since`）。库外发生过的事它一概不知道：
@@ -1115,82 +1347,68 @@ class PirateLoop:
         让计数那一侧（`count_dispatches_since`）把它折进去——也就是用户说的
         「更新计数所依赖的那个事实，而不是伪造 N 条派遣」。
 
-        ## 一天只做一次，而且做在链路开工处
+        ## 做在链路开工处
 
         对账要看屏，而控制台自己不驱动游戏（它只跑网页与调度）。放在链路开工处，
-        游戏窗口、会话、信箱导航全都是现成的；靠库里那条按 **UTC 日**去重的记录
-        保证一天只做一次——按 UTC 日而不是按进程启动去重，是因为配额的日界本来
-        就是 UTC 00:00（见 `domain.scheduler.quota_day_start_utc`），而控制台一天
-        可能重启好几次。
+        游戏窗口、会话、信箱导航全都是现成的。日界一律 **UTC 00:00**
+        （`domain.scheduler.quota_day_start_utc`），因为游戏的每日配额就是这么切的。
         """
-        from evo_helper.domain.scheduler import quota_day_start_utc
-
         repository, _run_id = self._ensure_run()
         now = datetime.now(UTC)
         day_start = quota_day_start_utc(now)
-        if repository.reconciled_on(self.TARGET_KIND, day_utc=day_start):
-            return
-        say(f"开工对账：数一遍 UTC {day_start:%Y-%m-%d} 信箱里的{self.TARGET_KIND}战报")
+        say(f"开工：读回{self.REPORT_LABEL}，并数一遍 UTC {day_start:%Y-%m-%d} 打了几发")
+        tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
         try:
-            observed, complete = self._count_reports_since(day_start)
+            self._scan_mail_rows(
+                wanted=self.RECONCILE_KIND,
+                label=self.REPORT_LABEL,
+                visit=self._ingest_report_row,
+                not_before=self._report_floor(day_start, now=now),
+                max_pages=RECONCILE_MAX_PAGES,
+                observe=tally,
+            )
         except RoundExhausted:
             raise
         except RuntimeError as error:
-            # 对账翻不了信箱**不该把这一轮判死**。它只是让配额判据退回按库计数，
+            # 翻不了信箱**不该把这一轮判死**。它只是让配额判据退回按库计数，
             # 也就是今天没修正的那个状态——和不做对账一样，不比它更糟。
             # 不写记录，下一轮再试。
-            say(f"  对账翻不了信箱（{error}）；这一轮先按库内计数走")
+            say(f"  开工翻不了信箱（{error}）；这一轮先按库内计数走")
             return
         repository.record_daily_reconciliation(
             self.TARGET_KIND,
             day_utc=day_start,
-            observed_reports=observed,
-            complete=complete,
+            observed_reports=tally.observed,
+            complete=tally.complete,
             reconciled_at_utc=now,
         )
-        note = "翻到底了" if complete else "没翻到底，这是「至少」"
-        say(f"  今天已有 {observed} 份（{note}）")
+        note = "翻到底了" if tally.complete else "没翻到底，这是「至少」"
+        say(f"  今天已有 {tally.observed} 份（{note}）")
 
-    def _count_reports_since(self, day_start: datetime) -> tuple[int, bool]:
-        """数今天的战报，**一封都不打开**。返回 (份数, 有没有翻到今天之外)。
+    def _report_floor(self, day_start: datetime, *, now: datetime) -> datetime:
+        """这一趟最早翻到哪一行为止。默认就是今天的 UTC 日界。
 
-        只读列表页的主题与时间：一屏一次截图加六次窄 ROI OCR，而开一封要八秒。
-        正常的停止条件是「翻到了 `day_start` 之前的那一行」——列表按时间倒序，
-        再往下都是昨天的。`RECONCILE_MAX_PAGES` 只是时间读不出来时的兜底。
+        日界之外还要多翻一段的情况只有一种：**跨过 UTC 午夜还在等的那一发**。
+        它的战报写着昨天的时间，翻到日界就停的话永远读不到，那一发要一直挂到
+        `MAX_REPORT_AGE`（6 小时）才被判缺失——bot 那边还要连带把目标退回去重打一遍。
 
-        没翻到底时返回的份数是「今天至少这么多」。它**照样算数**（配额那一侧
-        仍然拿它去和库内计数取大），但这件事要一起记下来：日志和库里都要说得清
-        那个数是不是全天，否则日后没人分得出「今天只打了 3 发」和「只数到 3 发」。
+        所以下界取「今天的日界」与「最早那发还在等战报的攻击派于何时」的更早者。
+        问库而不是无条件往回翻 6 小时：没有在等的派遣时（绝大多数时候）下界就是
+        日界，一行都不多翻；真有在等的才多付那几屏。
         """
-        self._enter_mailbox()
-        seen: set[tuple[str, str]] = set()
-        observed = 0
-        complete = False
-        for page in range(RECONCILE_MAX_PAGES):
-            if not self._settle(self._on_mail_list):
-                say("  已经不在邮件列表上了；对账到此为止")
-                break
-            fresh = [row for row in self._mail_list_rows() if row.identity not in seen]
-            if not fresh:
-                # 拖不动了：到底了，或者面板夹住了。两种都不能算「翻完了今天」——
-                # 只有真的看见一行昨天的报告才算。
-                say(f"  第 {page + 1} 屏没有没见过的邮件；对账到此为止")
-                break
-            seen.update(row.identity for row in fresh)
-            older = [row for row in fresh if row.is_older_than(day_start)]
-            if older:
-                complete = True
-            observed += sum(
-                1
-                for row in fresh
-                if row.kind is self.RECONCILE_KIND and not row.is_older_than(day_start)
-            )
-            if complete:
-                break
-            if page + 1 < RECONCILE_MAX_PAGES:
-                slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
-        self._close_mail()
-        return observed, complete
+        oldest = self._oldest_open_attack(now)
+        if oldest is None or oldest >= day_start:
+            return day_start
+        say(f"  还有 {oldest:%m-%d %H:%M} UTC 派出的一发在等战报；往回多翻到那里")
+        return oldest
+
+    def _oldest_open_attack(self, now: datetime) -> datetime | None:
+        from evo_helper.domain.report_wait import MAX_REPORT_AGE
+
+        repository, _run_id = self._ensure_run()
+        return repository.oldest_open_attack_at(
+            self.TARGET_KIND, now_utc=now, max_age=MAX_REPORT_AGE
+        )
 
     def _panel_title(self) -> str:
         return self._read(PANEL_TITLE_ROI)
@@ -1288,14 +1506,28 @@ class PirateLoop:
 
         少了这一步，下一个目标的 `goto` 会在列表页上朝导航栏坐标盲点——
         实机上就是这样点到了「取消」。
+
+        ⚠️ **这里不再清导航缓存**（用户 2026-08-11：「海盗侦查不用每次都修改 3 个
+        坐标，降低效率」）。原先每派出一发就清一次，于是同一恒星系里每颗星球都要
+        重设三个字段——一次字段输入约 3 秒，每颗星球白花 6 秒。
+
+        不清的依据是**缓存里只放回读确认过的坐标**（见 `SystemNavigator` 的类注释）：
+        那份记忆来自派遣之前面板坐标行的一次核对，而关掉一层浮层并不改导航栏的值。
+        真改了值的动作仍旧照清：`_require_system_view` 一旦需要切视图，
+        `ensure_system_view` 自己就 `invalidate()` 了。
+        万一记忆终究不作数，下一个目标的回读会当场核不过，走 `_goto_checked` 自愈。
         """
         self._driver.click(*MAIL_BACK, label="关闭面板")
         self._driver.wait(2.2)
         self._require_system_view("派出之后切不回恒星系视图")
-        self._navigator.invalidate()
 
     def _close_mail(self) -> None:
-        """回到恒星系视图。信箱是浮层，关掉之后还在自己星球的地表视图上。"""
+        """回到恒星系视图。信箱是浮层，关掉之后还在自己星球的地表视图上。
+
+        ⚠️ 这里同样不再显式清导航缓存：进信箱要先切到地表视图，而
+        `_goto_planet_surface` 与回来时的 `ensure_system_view` **换过视图就已经清了**。
+        再补一次是空动作，理由见 `_leave_dispatch_list`。
+        """
         self._driver.click(*MAIL_BACK, label="关闭信箱")
         self._driver.wait(2.0)
         if self._on_mail_list():
@@ -1303,7 +1535,6 @@ class PirateLoop:
             self._driver.click(*MAIL_BACK, label="关闭信箱")
             self._driver.wait(2.0)
         self._require_system_view("读完邮件切不回恒星系视图")
-        self._navigator.invalidate()
 
     # -- 持久化 -------------------------------------------------------------
 

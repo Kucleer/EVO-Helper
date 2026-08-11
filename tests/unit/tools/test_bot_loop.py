@@ -84,15 +84,14 @@ class _FakeNavigator:
 
 def _run_with_phases(
     monkeypatch: pytest.MonkeyPatch, phases: dict[Coordinate, BotPhase]
-) -> tuple[list[str], list[tuple[Coordinate, ...]]]:
-    """跑一趟 `run()`，返回这一趟调了哪些动作、以及每趟信箱收的是哪几个目标。"""
+) -> list[str]:
+    """跑一趟 `run()`，返回这一趟按顺序调了哪些动作。"""
     from evo_helper.game import game_window
     from evo_helper.tools.pirate_loop import Outcome
 
     monkeypatch.setattr(game_window, "ensure_game_window", lambda: None)
 
     calls: list[str] = []
-    trips: list[tuple[Coordinate, ...]] = []
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(targets=tuple(phases), probe=True, attack=True)
     loop._outcome = Outcome()
@@ -101,26 +100,20 @@ def _run_with_phases(
     # `run()` 现在归父类管（开工前置 + `RoundExhausted` 收尾），会话巡检要真截屏，
     # 这条测试只关心分态路由，桩掉即可。
     loop._ensure_session = lambda **_k: False
-    # 开工对账要开库、翻信箱，同样不在分态路由的范围内。
-    loop.reconcile_today = lambda: None
+    # 开工那一趟信箱（读战报 + 数今天打了几发）要开库、要看屏，这里只记它跑过。
+    loop.reconcile_today = lambda: calls.append("开工那一趟信箱")
     loop._nav_labels = lambda: ""
     loop._phase_of = lambda coordinate: phases[coordinate]
     loop._probe = lambda coordinate: calls.append("probe")
     loop._tier_and_attack = lambda coordinate: calls.append("tier_and_attack")
-
-    def _collect(wanted: Any) -> tuple[Coordinate, ...]:
-        calls.append("collect_battle_reports")
-        trips.append(tuple(wanted))
-        return ()
-
-    loop.collect_battle_reports = _collect
+    loop._say_still_waiting = lambda coordinate: calls.append("说还在等战报")
 
     loop.run()
-    return calls, trips
+    return calls
 
 
 def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[str]:
-    return _run_with_phases(monkeypatch, {TARGET: phase})[0]
+    return _run_with_phases(monkeypatch, {TARGET: phase})
 
 
 @pytest.mark.parametrize(
@@ -128,8 +121,8 @@ def _run_with_phase(monkeypatch: pytest.MonkeyPatch, phase: BotPhase) -> list[st
     [
         (BotPhase.NEEDS_PROBE, ["probe"]),
         (BotPhase.NEEDS_ATTACK, ["tier_and_attack"]),
-        (BotPhase.AWAITING_PROBE_REPORT, ["collect_battle_reports"]),
-        (BotPhase.AWAITING_ATTACK_REPORT, ["collect_battle_reports"]),
+        (BotPhase.AWAITING_PROBE_REPORT, ["说还在等战报"]),
+        (BotPhase.AWAITING_ATTACK_REPORT, ["说还在等战报"]),
         (BotPhase.DONE, []),
     ],
 )
@@ -141,43 +134,41 @@ def test_each_phase_routes_to_exactly_one_action(
     分流一旦失效（比如无条件走探路），每个目标每趟都会重新派一发探路——
     一趟烧一条航线和一次配额，而画面上看不出异常。
 
-    **两个等待态的动作都是「去收战报」。** 它们先后各空过一次，两次都是同一个死锁：
-    没人收 → `has_report` 永远为假 → 目标永远推不到下一态。`AWAITING_ATTACK_REPORT`
-    那次尤其难看出来，因为它长得像「有人在别处收」——注释当时写的是「攻击发的战报由
-    调度器那条等待链路收」，而调度器到点只是把这条链路整个重新起一遍，起来还是走这里。
-    实机 2026-08-11：分档打出去的那一发在攻击日志上停在「战果 待战报」，
-    同一页上探路那三发的战果与战损却都读出来了。
+    **两个等待态在这里不再进信箱**：战报由开工那一趟统一收（见下一条）。
+    它们在这里只剩下一句话，而那句话要说准是「还没到点」还是「到点了却没翻到」。
 
     只有 `DONE` 什么都不做。
     """
-    assert _run_with_phase(monkeypatch, phase) == expected
+    assert _run_with_phase(monkeypatch, phase) == ["开工那一趟信箱", *expected]
 
 
-def test_both_waiting_phases_are_collected_in_the_same_single_mail_trip(
+def test_reports_are_read_before_the_phases_are_decided(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """等探路战报的和等攻击战报的**并进同一趟信箱**，而不是各进一趟。
+    """**本文件的重点。** 开工那一趟信箱排在分态之前，而且整轮只有那一趟。
 
-    两种发的报告混在同一页上按时间倒序排。分两趟收就要把「关浮层 → 切地表 →
-    开信箱 → 翻四屏」这套开销付两遍（实机一趟 83 秒），还要让两趟互相抢那 8 封的
-    开封预算。
+    用户口径（2026-08-11）：「任务启动先去读战报。」顺序不能反——反了的话，
+    这一趟刚读回来的探路战报要等下一轮才作数，每一份报告白等一个调度周期。
 
-    这条同时钉住了「攻击发真的在收取名单里」：只看动作列表的话，一个仍旧只收探路
-    的实现会因为名单里恰好还有个探路目标，而照样调到 `collect_battle_reports`。
+    整轮只进一趟信箱，是因为开工那一趟为了数「今天已经打了几发」**本来就要把
+    信箱最上面那几屏翻一遍**，顺手把认得出的战报都开了、都入了库。另起一趟收取
+    要把「关浮层 → 切地表 → 开信箱 → 慢拖回顶 → 翻页 → 关面板」整套再付一遍
+    （实机约 20 秒），还要和它抢那 8 封的开封预算。
+
+    这条也堵住了 `AWAITING_ATTACK_REPORT` 那个死结的复发形状：收取不再按「本轮在
+    等哪几个目标」的名单走，名单也就漏不了态。归属只认报告自己写的目标坐标。
     """
     other = Coordinate(2, 137, 15)
-    done = Coordinate(2, 137, 16)
-    calls, trips = _run_with_phases(
+    calls = _run_with_phases(
         monkeypatch,
         {
             TARGET: BotPhase.AWAITING_PROBE_REPORT,
-            other: BotPhase.AWAITING_ATTACK_REPORT,
-            done: BotPhase.DONE,
+            other: BotPhase.NEEDS_ATTACK,
         },
     )
 
-    assert calls == ["collect_battle_reports"]
-    assert trips == [(TARGET, other)]
+    assert calls == ["开工那一趟信箱", "说还在等战报", "tier_and_attack"]
+    assert calls.count("开工那一趟信箱") == 1
 
 
 def test_the_look_only_mode_never_touches_the_database() -> None:

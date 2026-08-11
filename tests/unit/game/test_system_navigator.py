@@ -66,6 +66,7 @@ def test_next_position_in_the_same_system_only_sets_the_position() -> None:
     driver = FakeDriver()
     navigator = SystemNavigator(driver)
     navigator.goto(Coordinate(2, 121, 5))
+    navigator.confirm(Coordinate(2, 121, 5))
     driver.actions.clear()
     navigator.goto(Coordinate(2, 121, 6))
     assert fields_touched(driver) == [POSITION_FIELD]
@@ -75,9 +76,27 @@ def test_crossing_a_system_keeps_the_galaxy() -> None:
     driver = FakeDriver()
     navigator = SystemNavigator(driver)
     navigator.goto(Coordinate(2, 121, 20))
+    navigator.confirm(Coordinate(2, 121, 20))
     driver.actions.clear()
     navigator.goto(Coordinate(2, 122, 5))
     assert fields_touched(driver) == [SYSTEM_FIELD, POSITION_FIELD]
+
+
+def test_typing_alone_is_not_evidence_of_where_the_nav_bar_is() -> None:
+    """**本文件的重点。** 打完字不算数：省字段只能靠回读确认过的那份记忆。
+
+    实机 2026-08-11：一次「设恒星系」的点击落到了银河系框上，游戏把 136 截断成
+    最大值 9。按「我刚才打了什么」记，缓存当场就是错的，而判「一样」用的就是
+    那份错记忆——银河系字段再没被重设，连续 44 个目标坐标核对全不过。
+    按「面板回读到什么」记，错的记不进来：拿不准就把三个字段全重设一遍。
+    """
+    driver = FakeDriver()
+    navigator = SystemNavigator(driver)
+    navigator.goto(Coordinate(2, 121, 5))
+    assert navigator.current is None
+    driver.actions.clear()
+    navigator.goto(Coordinate(2, 121, 6))
+    assert fields_touched(driver) == [GALAXY_FIELD, SYSTEM_FIELD, POSITION_FIELD]
 
 
 def test_invalidate_forces_all_three_fields_again() -> None:
@@ -85,6 +104,7 @@ def test_invalidate_forces_all_three_fields_again() -> None:
     driver = FakeDriver()
     navigator = SystemNavigator(driver)
     navigator.goto(Coordinate(2, 121, 5))
+    navigator.confirm(Coordinate(2, 121, 5))
     navigator.invalidate()
     driver.actions.clear()
     navigator.goto(Coordinate(2, 121, 6))
@@ -103,10 +123,11 @@ def test_ensure_system_view_does_nothing_when_already_there() -> None:
     driver = FakeDriver()
     navigator = SystemNavigator(driver)
     navigator.goto(Coordinate(2, 1, 5))
+    navigator.confirm(Coordinate(2, 1, 5))
     driver.actions.clear()
     assert navigator.ensure_system_view(lambda: "银河系 恒星系 行星")
     assert driver.actions == []
-    # 没换视图，记住的坐标还作数。
+    # 没换视图，回读确认过的那份记忆还作数。
     assert navigator.current == Coordinate(2, 1, 5)
 
 

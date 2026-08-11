@@ -714,26 +714,43 @@ class SqlAlchemyRepository:
             for day in per_day.keys() | observed.keys()
         )
 
-    def reconciled_on(self, target_kind: str, *, day_utc: datetime) -> bool:
-        """这条链路今天（UTC+0）已经对过账了吗。
+    def oldest_open_attack_at(
+        self, target_kind: str, *, now_utc: datetime, max_age: timedelta
+    ) -> datetime | None:
+        """这种目标下，**最早那一发还在等战报**的攻击派于何时；没有就 None。
 
-        去重键是 **UTC 日**而不是「这个进程启动过没有」：配额的日界本来就是
-        UTC 00:00（`domain.scheduler.quota_day_start_utc`），而控制台一天可能重启
-        好几次——按进程去重的话，每重启一次就要多翻一趟信箱。
+        供开工翻信箱时定下界（`tools.pirate_loop.PirateLoop._report_floor`）：
+        战报不可能早于产生它的那一发，所以再往下翻就没有意义了。
+
+        **只看攻击发。** 侦察发不产生 `battle_reports`（侦察报告走信箱里另一条路），
+        算进来就是一条永远不闭合的记录，会让下界永远停在那一发上、每趟都往回
+        多翻几屏。这条排除与 `pending_reports_for_kind` / `count_dispatches_since`
+        同一个口径。
+
+        **超过 `max_age` 的不算。** 那些已经被判「战报永远不会来」了
+        （`_unmatched_dispatch_candidates` 与 `bot_dispatch_facts` 用的是同一个常量），
+        把下界钉在一发已经放弃的派遣上，只会让每一趟都白翻到底。
         """
+        floor = _require_utc(now_utc, "now_utc") - max_age
         with self._session_factory() as session:
-            return (
-                session.scalar(
-                    select(func.count())
-                    .select_from(orm.DailyReconciliationRow)
-                    .where(
-                        orm.DailyReconciliationRow.target_kind == target_kind,
-                        orm.DailyReconciliationRow.day_utc
-                        == _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d"),
-                    )
+            return session.scalar(
+                select(func.min(orm.AttackDispatchRow.dispatched_at_utc))
+                .select_from(orm.AttackDispatchRow)
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
                 )
-                or 0
-            ) > 0
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == target_kind,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.BattleReportRow.id.is_(None),
+                    orm.AttackDispatchRow.dispatched_at_utc > floor,
+                )
+            )
 
     def record_daily_reconciliation(
         self,
@@ -744,12 +761,27 @@ class SqlAlchemyRepository:
         complete: bool,
         reconciled_at_utc: datetime,
     ) -> None:
-        """记下「今天信箱里数到 N 份本链路的战报」。一天一条，重跑就覆盖。
+        """记下「今天信箱里数到 N 份本链路的战报」。一天一条，**只增不减**。
 
         ⚠️ **绝不因此往 `attack_dispatches` 里补行。** 那张表的每一行都意味着
         「一支舰队正在外面」，凭空多一条，调度器就会以为一条航线被占着、并等一份
         永远不会来的战报，要到 `MAX_REPORT_AGE`（6 小时）才被判缺失清掉。
         这里只更新计数所依赖的那个事实，见 `count_dispatches_since`。
+
+        ## 为什么是取大而不是覆盖
+
+        这个数的含义是「今天信箱里**至少**有这么多份」，而一天之内战报只会变多，
+        所以同一个 UTC 日里它只该往上走。
+
+        取大是有了具体成因才改的：开工对账现在**每次开工都跑**（用户会暂停任务
+        再重启，「今日 X/32」必须接得上），而每一趟能翻到多远并不一样——翻到底的
+        那趟数到 20，下一趟因为面板夹住只数到 6。照覆盖写，第二趟就把配额判据
+        从 20 松回 6，于是助手以为还剩 26 发可打。**计数偏小正是会超额的那一侧**，
+        而超额的代价是游戏把攻击强制返回、白飞一趟舰队。
+
+        `complete` 跟着胜出的那个数走：它说的是「那个数是不是全天」，
+        接在一个已经被丢掉的数上没有意义。数一样大时取或——两趟里只要有一趟
+        真的翻见了昨天，这个数就是全天的。
         """
         day = _require_utc(day_utc, "day_utc").strftime("%Y-%m-%d")
         if observed_reports < 0:
@@ -764,8 +796,13 @@ class SqlAlchemyRepository:
             if row is None:
                 row = orm.DailyReconciliationRow(day_utc=day, target_kind=target_kind)
                 session.add(row)
-            row.observed_reports = observed_reports
-            row.complete = complete
+                row.observed_reports = observed_reports
+                row.complete = complete
+            elif observed_reports > row.observed_reports:
+                row.observed_reports = observed_reports
+                row.complete = complete
+            elif observed_reports == row.observed_reports:
+                row.complete = row.complete or complete
             row.reconciled_at_utc = _require_utc(reconciled_at_utc, "reconciled_at_utc")
             session.commit()
 
@@ -1083,7 +1120,7 @@ class SqlAlchemyRepository:
         """本轮这个目标最新那份战报里守方的「单位」总数；没有就 None。
 
         分档要的就是这个数，而它在收报告那一趟已经读过一次了（见
-        `tools.bot_loop.collect_battle_reports`）。从库里取而不是再进一趟信箱，
+        `tools.bot_loop.BotLoop._ingest_report`）。从库里取而不是再进一趟信箱，
         省的不只是十几秒 OCR：信箱里那几行**没有时间闸门**，翻到的可能是
         上一轮甚至上一天的报告，照它分档就是拿旧情报去挑舰队组合。
         `since` 把范围钉在本轮上。

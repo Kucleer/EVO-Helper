@@ -79,10 +79,30 @@ class SystemNavigator:
 
     银河系和恒星系只在变化时才重设——一次字段输入是三个动作约 3 秒，
     同一恒星系内连扫 16 个位时省下的时间占了大头。
+
+    ## 缓存里只放**回读确认过**的坐标
+
+    `current` 不是「我刚才往框里打了什么」，而是「面板回读证明导航栏就是这个坐标」。
+    打完字不算数，要调用方拿到证据之后调 `confirm()` 才算——`goto()` 结束时先把
+    `current` 清空。
+
+    这个区分是有代价才换来的。实机 2026-08-11：一次「设恒星系」落到了银河系框上，
+    游戏把 136 截断成最大值 9，此后导航栏是 `[9:137:x]` 而缓存说 `2:137`；判「一样」
+    用的就是那份错记忆，于是银河系再也不会被重设，连续 44 个目标坐标核对全不过。
+    按「打了什么」记，那份记忆本身就可能是错的；按「读回来什么」记，错的记不进来。
+
+    于是省字段这件事从「假定」变成了「有证据」：
+    调用方每次导航之后都回读面板坐标行（`vision.scan_reading.read_panel_confirming`
+    是那份唯一的判据），读通了就 `confirm()`，读不通就什么都不记——下一趟自然会把
+    三个字段都重设一遍。**方向永远是「拿不准就多设」**，绝不会因为省事而少设。
+
+    反过来，正因为缓存有证据撑着，关掉浮层（派遣面板、信箱）之后不必再无条件
+    `invalidate()`：那些浮层压根不改导航栏的值，而真改了值的那些动作（切视图、
+    重连、关窗重开）仍然照旧清缓存，见 `invalidate()` 的调用点。
     """
 
     driver: ScanDriver
-    #: 当前导航栏里的坐标。None 表示不确定，下一次会把三个字段都设一遍。
+    #: **回读确认过**的坐标。None 表示不确定，下一次会把三个字段都设一遍。
     current: Coordinate | None = None
 
     def goto(self, coordinate: Coordinate) -> None:
@@ -93,10 +113,27 @@ class SystemNavigator:
         if at is None or at.system != coordinate.system:
             self._set(SYSTEM_FIELD, coordinate.system, "恒星系")
         self._set(POSITION_FIELD, coordinate.position, "行星")
+        # ⚠️ **打完字不等于跳过去了。** 这里必须清空而不是记下 `coordinate`：
+        # 数字可能进错框（实机上 136 就这么被截成 9）、可能压根没进去。
+        # 记忆要等 `confirm()`，也就是等面板回读给出证据。
+        self.current = None
+
+    def confirm(self, coordinate: Coordinate) -> None:
+        """回读确认：面板读回来的就是这个坐标，导航栏可以据此省字段了。
+
+        **只由拿到证据的那一方调用。** 证据是行星详情面板上的坐标行——
+        `vision.scan_reading.read_panel_confirming` 逐套配方读到核对通过为止，
+        那是全仓唯一一份「面板读出来的算不算数」的判据。
+        """
         self.current = coordinate
 
     def invalidate(self) -> None:
-        """画面被别的东西改过（重连、弹窗）之后调用，下一次重设全部字段。"""
+        """画面被别的东西改过（切视图、重连、关窗重开）之后调用，下一次重设全部字段。
+
+        ⚠️ 只用在**导航栏本身可能变了**的地方。单纯关掉一层浮层不属于这一类：
+        浮层不改导航栏的值，而清掉一份回读确认过的记忆，代价是下一个目标白设
+        两个字段（约 6 秒）——海盗那条链路每颗星球都要付一次。
+        """
         self.current = None
 
     def ensure_system_view(self, read_nav_labels: Callable[[], str], *, attempts: int = 3) -> bool:
