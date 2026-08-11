@@ -1059,10 +1059,18 @@ class PirateLoop:
             if self._store_scout_reading(reading):
                 written += 1
                 say(f"  第 {row.index} 行 → {reading.target} {reading.verdict}（已入库）")
-            else:
-                say(f"  第 {row.index} 行 → {reading.target} {reading.verdict}（库里已有）")
-            # 永远不收工：补录要把预算内的每一封都看一遍。
-            return False
+                return False
+            # **读到库里已有的那一份就收工。**（用户口径 2026-08-11）
+            #
+            # 信箱是按时间**从新往旧**排的，而入库也是从新往旧写的。所以碰到第一份
+            # 「库里已有」时，它往下的每一份都必然更旧、也必然已经在库里了——再翻
+            # 下去只是一封封开、一封封确认「已有」，每封约 8 秒。
+            #
+            # 这条对「同一天多次启动」尤其重要：每次重启都要重新翻一遍信箱，没有
+            # 这个早停，第二次、第三次启动都要把当天所有报告重开一遍。
+            say(f"  第 {row.index} 行 → {reading.target} {reading.verdict}（库里已有）")
+            say("  往下都是更旧的报告，收工")
+            return True
 
         self._scan_mail_rows(
             wanted=ReportKind.SCOUT,
