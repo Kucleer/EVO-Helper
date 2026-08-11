@@ -126,6 +126,23 @@ def test_a_chain_inside_its_restart_cooldown_says_cooling_down() -> None:
     assert status(MissionKind.PIRATE, last_started_at_utc=recent) is TaskStatus.COOLING_DOWN
 
 
+def test_a_chain_waiting_for_a_line_says_so_rather_than_cooling_down() -> None:
+    """两者同时成立时说「等航线」——那是更长、也更该让用户看到的原因。
+
+    反过来显示成「冷却中」，用户会以为再等五分钟就动，然后眼看着它到点也不动
+    （航线还没空出来）。页面上那句话必须能预测调度器接下来干什么。
+    """
+    empty_round = status(
+        MissionKind.PIRATE,
+        free_lines=3,
+        next_line_free_at_utc=NOW + timedelta(minutes=20),
+        last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=1)},
+        last_dispatch_at_utc={MissionKind.PIRATE: NOW - timedelta(hours=2)},
+    )
+
+    assert empty_round is TaskStatus.WAITING_LINES
+
+
 def test_scanning_is_never_cooled_down() -> None:
     """冷却只管攻击链路。套在扫描上就是纯空转——填空隙正是它存在的理由。"""
     recent = {MissionKind.SCAN: NOW - timedelta(seconds=1)}
