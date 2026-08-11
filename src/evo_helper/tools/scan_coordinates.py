@@ -510,6 +510,9 @@ START_THRESHOLD = 180
 #: 弹窗只有一个按钮，所以按钮位置写死；但**是否要点它由那行字决定**——
 #: 读到「连接已断开」才点，读不到就停。绿色像素只用来量位置，不作判据：
 #: 派遣界面上的绿色 ✓ 长得一模一样，靠颜色认会在派遣页上点出一发舰队。
+#:
+#: 同一块 ROI 也用来认「无法重新连接」那一种（会话已死，只能关窗重开）。
+#: 两种弹窗长得一样、正文在同一行，所以只读一次、由 `classify_screen` 分流。
 DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
@@ -542,11 +545,16 @@ def make_session_keeper(
     *,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    restart_window: Callable[[], None] | None = None,
 ) -> Any:
     """巡检用的会话守护。
 
     **只在真的读到 START 时才点 START**：判据来自这一屏本身，而不是「不在游戏里就多半是它」。
     认不出的画面一律停止——可能是维护公告或弹窗，乱点会误触派遣、删信或领奖。
+
+    ``restart_window`` 是「会话已死时关窗重开」这个动作。它是**唯一**会真的
+    关窗口、真的拉起 Chrome 的入口，做成参数就是为了让测试注入一个假的——
+    单元测试绝不许真的开关窗口。默认接真实现。
     """
     from evo_helper.game.session_keeper import ScreenState, SessionKeeper, classify_screen
 
@@ -571,10 +579,17 @@ def make_session_keeper(
         left, top, right, bottom = ENTRY_BUTTON_ROI
         return ((left + right) // 2, (top + bottom) // 2)
 
-    def disconnected(image: Any) -> bool:
-        """掉线弹窗在不在。"""
+    def disconnect_screen(image: Any) -> ScreenState | None:
+        """掉线弹窗在不在，以及是哪一种；都不是就返回 None。
+
+        两种弹窗（可恢复的「连接已断开」、不可恢复的「无法重新连接」）长得一样、
+        正文在同一行，只读一次、由 `classify_screen` 按文字分流。
+        """
         text = ocr(image.crop(DISCONNECT_TEXT_ROI), digits=False, upscale=DISCONNECT_UPSCALE)
-        return classify_screen(text) is ScreenState.DISCONNECTED
+        state = classify_screen(text)
+        if state in (ScreenState.DISCONNECTED, ScreenState.DEAD_SESSION):
+            return state
+        return None
 
     def observe() -> ScreenState:
         """多取几帧再下结论。**单帧在会动的页面上是抛硬币。**
@@ -608,8 +623,9 @@ def make_session_keeper(
         # **掉线要排在导航条之前判。** 弹窗是浮层，底下的导航条还在画面上，
         # 「商店/联盟」照样读得出来——先判导航条就会把死会话认成在线，
         # 之后每一步点击都石沉大海，而且全程不报错。实机上确认过这一屏。
-        if disconnected(image):
-            return ScreenState.DISCONNECTED
+        popup = disconnect_screen(image)
+        if popup is not None:
+            return popup
         state = classify_screen(
             ocr(image.crop(NAV_TEXT_ROI), digits=False, upscale=NAV_TEXT_UPSCALE)
         )
@@ -637,15 +653,24 @@ def make_session_keeper(
         driver.click(*spot, label=ENTRY_BUTTON_TEXT)
 
     def dismiss_disconnect() -> None:
-        if not disconnected(driver.capture()):
+        # **只在读到可恢复那一种时才点。** 会话已死的那一屏走的是关窗重开，
+        # 不是点这个 ✓——点了也回不去，白白在一个死页面上留下一次点击。
+        if disconnect_screen(driver.capture()) is not ScreenState.DISCONNECTED:
             raise RuntimeError("要关掉线弹窗时却读不到那行字；停止而不是往固定坐标乱点")
         driver.click(*DISCONNECT_BUTTON, label="确认掉线弹窗")
+
+    def restart_game_window_now() -> None:
+        from evo_helper.game.game_window import restart_game_window
+
+        restart_game_window()
 
     return SessionKeeper(
         observe=observe,
         click_entry=click_entry,
         click_start=click_start,
         dismiss_disconnect=dismiss_disconnect,
+        restart_window=restart_window or restart_game_window_now,
+        log=say,
         clock=clock,
         sleep=sleep,
     )
