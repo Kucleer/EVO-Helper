@@ -35,6 +35,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -170,6 +171,36 @@ class RoundExhausted(RuntimeError):
     """
 
 
+class TargetCheck(Enum):
+    """站到一个坐标上、面板铺开之后，看到的是三种情况之一。
+
+    ⚠️ **三值不是为了好看。** `ABSENT` 与 `MISMATCH` 都让调用方「这一位不打」，
+    但成因相反，善后也必须相反：
+
+    - `ABSENT`：面板是请求的那一位，只是上面没有要找的东西。海盗链路上这是
+      **最常见的正常结果**（1–4 位里没有海盗是家常便饭）。当成异常去复位重试，
+      每个空位都要多付一次复位+重导航，整轮慢一倍。
+    - `MISMATCH`：面板是真的，但它显示的不是请求的那一位——导航漂了。
+      `SystemNavigator` 只重设它**认为变了**的字段，一旦那份记忆和导航栏实际值
+      分了岔，它再也不会自己纠回来（判「一样」用的就是那份错记忆）。实机
+      2026-08-11：一次「设恒星系」落到银河系框上，136 被截断成 9，此后导航栏是
+      `[9:137:12]` 而缓存说 `2:137`，连续 44 个目标坐标核对全不过。
+      这一类必须走 `_goto_checked` 的自愈（清缓存后重来），否则只会一路
+      静默地报「不是海盗」把整轮走完，而且从日志上看不出异常。
+
+    ⚠️ **判据本身一个字都不许放松。** 那一轮里有一次面板读到的是上一个目标的
+    星系（请求 2:321:5，面板 2:320:5），核对拦对了；放松成「位次对上就行」
+    就是往错误的星球扔舰队。能改的只是核对不过之后怎么办。
+    """
+
+    #: 面板显示的就是请求的那一位，而且是要找的目标。
+    CONFIRMED = "认出目标"
+    #: 面板显示的就是请求的那一位，只是上面没有要找的目标。
+    ABSENT = "不是目标"
+    #: 面板是真的，但显示的不是请求的那一位。
+    MISMATCH = "坐标核对不过"
+
+
 @dataclass
 class LoopOptions:
     systems: tuple[tuple[int, int], ...]
@@ -198,6 +229,16 @@ class PirateLoop:
     #: `pirate_ui.BOT_ATTACK_BUTTON` 的注释。
     ATTACK_BUTTON: tuple[int, int] = pirate_ui.ATTACK_BUTTON
 
+    #: 哪些判定值得「复位画面 → 清缓存 → 重新导航」自愈一次（见 `_goto_checked`）。
+    #:
+    #: 海盗这边**只对 `MISMATCH` 自愈**：`ABSENT`（这一位没有海盗）是最常见的
+    #: 正常结果，把它也算进来等于每个空位都多付一次复位+重导航，整轮慢一倍。
+    #: `BotLoop` 覆盖了它——那边的目标是扫描库里已知的 bot，认不出本身就是异常。
+    RETRY_CHECKS: frozenset[TargetCheck] = frozenset({TargetCheck.MISMATCH})
+
+    #: 坐标核对失败时最多存这么多张现场图（见 `_dump_coord_mismatch`）。
+    MAX_COORD_DUMPS: int = 3
+
     def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
         self._driver = driver
         self._ocr = ocr
@@ -207,6 +248,7 @@ class PirateLoop:
         self._repository: SqlAlchemyRepository | None = None
         self._run_id: UUID | None = None
         self._session_keeper: Any = None
+        self._coord_dumps = 0
 
     # -- 读屏 ---------------------------------------------------------------
 
@@ -277,21 +319,73 @@ class PirateLoop:
 
     # -- 识别 ---------------------------------------------------------------
 
-    def is_pirate(self, coordinate: Coordinate) -> bool:
+    def check_target(self, coordinate: Coordinate) -> TargetCheck:
         """行星面板上是不是「敌对海盗」，而且坐标对得上。
+
+        **先认面板、再核坐标**，顺序不能反：坐标行（`PIRATE_COORD_ROI`）属于
+        海盗面板那套布局，空位上那块像素是什么并没有证据。先核坐标的话，每个
+        空位都会因为读不到坐标而判成 `MISMATCH`，于是整轮都在复位重试——
+        而「这一位没有海盗」本来就是最常见的正常结果。
 
         坐标要核：导航栏偶尔会停在别的位号上（实机踩过），这时面板是真的、
         只是不是请求的那一位——照着它打就打错了目标。
         """
         title = self._read(pirate_ui.PIRATE_TITLE_ROI)
         if pirate_ui.PIRATE_TITLE_TEXT not in title:
-            return False
+            return TargetCheck.ABSENT
         wanted = f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
         shown = self._read(pirate_ui.PIRATE_COORD_ROI, digits=True)
         if wanted not in shown:
             say(f"  坐标核对不过：面板显示 {shown!r}，请求的是 {wanted}")
-            return False
-        return True
+            self._dump_coord_mismatch("pirate-coord-mismatch")
+            return TargetCheck.MISMATCH
+        return TargetCheck.CONFIRMED
+
+    def _dump_coord_mismatch(self, name: str) -> None:
+        """坐标核对不过就留一帧现场，但要封顶。
+
+        只有一行文字复盘不了「画面到底成了什么样」——实机那 13 分钟就是这么白丢
+        的。反过来不封顶的话，连续 44 个目标全失败会写出上百张几乎一样的图，
+        前几张就够定位了。
+        """
+        if self._coord_dumps >= self.MAX_COORD_DUMPS:
+            return
+        self._coord_dumps += 1
+        self._dump_frame(name)
+
+    def _goto_checked(self, coordinate: Coordinate) -> TargetCheck:
+        """导航过去并核对面板；判定落在 `RETRY_CHECKS` 里就复位画面再试一次。
+
+        实机（2026-08-11 00:55–01:08）：第一个目标走到派遣面板时预设条读成空，
+        之后**连续 44 个目标**每一次坐标核对都不过，读数一律多出个 `:9` 前缀——
+        画面从某一刻起整体偏了。而每个目标只试一次、失败就跳下一个，于是这 13
+        分钟一发都没派出去，日志里也只有一行文字、连张图都没留。
+
+        动作顺序（两条链路共用这一份，别再各写一遍）：
+        查会话 → 复位画面 →（重连过就切回恒星系视图）→ **清缓存** → 重新导航 → 再读一次。
+
+        - 查会话排在最前：掉线时这一屏是 START 登录页，面板**永远**读不出来，
+          复位和重新导航都是白费——实机（2026-08-11 02:11）就这么对着登录页把
+          目标一个个试下去，每个 ~35 秒，日志里全是「面板读作 ''」。
+        - 清缓存是这条重试的**全部意义**。导航器认为某个字段已经对了就不去重设
+          （`SystemNavigator.goto` 里那三个 `if`），所以只要它的记忆和导航栏实际
+          值分了岔，不清缓存的重试会一字不差地重演上一次失败——实机验证过：
+          重试读回来的还是那个 `[9:137:12]`。
+
+        **只重试一次。** 无限重试会把整轮卡死在一个目标上，比跳过还糟。
+        """
+        self._navigator.goto(coordinate)
+        check = self.check_target(coordinate)
+        if check not in self.RETRY_CHECKS:
+            return check
+        say("  复位画面后重试一次")
+        reconnected = self._ensure_session(force=True)
+        self._reset_to_known_screen()
+        if reconnected and not self._navigator.ensure_system_view(self._nav_labels):
+            raise RuntimeError("重连后切不到恒星系视图；安全停止")
+        self._navigator.invalidate()
+        self._navigator.goto(coordinate)
+        return self.check_target(coordinate)
 
     # -- 派遣 ---------------------------------------------------------------
 
@@ -883,13 +977,22 @@ class PirateLoop:
 
         认出海盗的那一刻，面板已经开着、侦察按钮就在眼前，没有任何理由先走开再
         回来。融合之后首发提前到 ~25 秒，链路本身一行没改。
+
+        ⚠️ **「认不出」分两种，这里必须分开对待**（见 `TargetCheck`）：没有海盗
+        就照常走下一位；坐标核对不过是导航漂了，`_goto_checked` 会自愈一次，
+        自愈完还不过就**记一笔 refused**——不记的话它长得和「这一位没有海盗」
+        一模一样，而后者是最常见的正常结果，整轮一发没派也看不出异常。
         """
         pirates: list[Coordinate] = []
         scouted = 0
         for position in PIRATE_POSITIONS:
             coordinate = Coordinate(galaxy, system, position)
-            self._navigator.goto(coordinate)
-            if not self.is_pirate(coordinate):
+            check = self._goto_checked(coordinate)
+            if check is TargetCheck.MISMATCH:
+                say(f"  {coordinate} 复位重试后坐标仍核对不过；跳过这一位")
+                self._outcome.refused.append((coordinate, "坐标核对不过"))
+                continue
+            if check is not TargetCheck.CONFIRMED:
                 say(f"  {coordinate} 不是海盗")
                 continue
             say(f"  {coordinate} 敌对海盗")
@@ -917,8 +1020,7 @@ class PirateLoop:
         say(f"  {coordinate} 判定 {reading.verdict}：{reading.trigger_ships}")
         if reading.verdict != VERDICT_ATTACK:
             return
-        self._navigator.goto(coordinate)
-        if not self.is_pirate(coordinate):
+        if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return
         self.attack(coordinate)
