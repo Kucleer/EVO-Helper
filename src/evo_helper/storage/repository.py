@@ -1419,6 +1419,31 @@ def _unmatched_dispatch_candidates(
     session: Session,
     report: BattleReport,
 ) -> list[orm.AttackDispatchRow]:
+    """这份战报**可能**属于哪几发派遣。
+
+    除了出发点、目标、`accepted` 与「还没被别的战报认领」，还要排掉两类：
+
+    1. **派在这份战报之后的**。战报不可能早于产生它的那一发。
+    2. **早到已经被判定「战报永远不会来」的**（派出超过 `MAX_REPORT_AGE`）。
+
+    第 2 条是这次实机故障的正解，而且补的是一处**两地不一致**：
+    `bot_dispatch_facts()` 早就按 `MAX_REPORT_AGE` 把过期派遣整条剔掉、让目标退回
+    重新探路；可认领这一侧不认这条规则，仍把它当候选。于是——
+
+        战报 2:323:10  01:35:18
+        候选 A  派于 08-10 18:28（预计战报 18:53，已过期 6 小时 42 分）
+        候选 B  派于 08-11 01:10（预计战报 01:35:10，差 8 秒）
+
+    两个候选都在 12 小时容差内，`len(close) > 1` → `AMBIGUOUS` → `dispatch_id`
+    留空 → `has_report` 永远为假 → 目标永远停在等战报，攻击日志也永远显示不出战果。
+    **而 A 早就被另一半代码写掉了。** 两处用同一个常量之后，这里只剩一个候选，
+    不需要任何猜测。
+
+    ⚠️ 仍然**不猜**：排掉之后还多于一个候选时照旧记 `AMBIGUOUS`。这条改的是
+    「谁有资格当候选」，不是「多个候选时挑一个」。
+    """
+    from evo_helper.domain.report_wait import MAX_REPORT_AGE
+
     linked = select(orm.BattleReportRow.dispatch_id).where(
         orm.BattleReportRow.dispatch_id.is_not(None)
     )
@@ -1434,6 +1459,8 @@ def _unmatched_dispatch_candidates(
             orm.AttackIntentRow.target_position == report.defender_target.position,
             orm.AttackDispatchRow.accepted.is_(True),
             orm.AttackDispatchRow.id.not_in(linked),
+            orm.AttackDispatchRow.dispatched_at_utc <= report.reported_at_utc,
+            orm.AttackDispatchRow.dispatched_at_utc >= report.reported_at_utc - MAX_REPORT_AGE,
         )
         .order_by(orm.AttackDispatchRow.dispatched_at_utc)
     ).all()
