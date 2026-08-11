@@ -279,7 +279,7 @@ class TestDetailOnlyReports:
     """探路战报只读详情页，没有逐舰种行——情报中心不能因此显示成「总计 0」。
 
     bot 探路战报只读详情页（逐舰种明细在回放页，而那个入口按钮全仓没有标定坐标，
-    见 `BotLoop.collect_probe_reports` 的取舍）。于是 `fleet_snapshots` 一行都没有，
+    见 `BotLoop.collect_battle_reports` 的取舍）。于是 `fleet_snapshots` 一行都没有，
     而 `total` 原先是「逐舰种求和」——空 dict 求和得 0。
 
     结果是页面显示「有舰队数据，总计 0」，而报告里明明写着守方单位 319。
