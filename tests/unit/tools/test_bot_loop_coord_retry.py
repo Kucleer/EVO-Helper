@@ -130,9 +130,10 @@ class _Driver:
         return object()
 
 
-def _confirming_loop(monkeypatch: Any, *, confirms: bool) -> tuple[Any, list[str]]:
+def _confirming_loop(monkeypatch: Any, *, confirms: bool) -> tuple[Any, list[str], list[str]]:
     """一个 `check_target` 走真实实现、但读数与截屏都被替掉的循环。"""
     dumped: list[str] = []
+    confirmed: list[str] = []
 
     class _Panel:
         coordinate_text = ":9:320:5"
@@ -153,25 +154,31 @@ def _confirming_loop(monkeypatch: Any, *, confirms: bool) -> tuple[Any, list[str
         "evo_helper.vision.scan_reading.read_panel_confirming", lambda _reader, _req: _Panel()
     )
 
+    class _Navigator:
+        def confirm(self, coordinate: Any) -> None:
+            confirmed.append(str(coordinate))
+
     loop = BotLoop.__new__(BotLoop)
     loop._driver = _Driver()  # type: ignore[attr-defined]
     loop._ocr = None  # type: ignore[attr-defined]
     loop._coord_dumps = 0  # type: ignore[attr-defined]
+    loop._navigator = _Navigator()  # type: ignore[attr-defined]
     loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[assignment, method-assign]
-    return loop, dumped
+    return loop, dumped, confirmed
 
 
 def test_a_mismatch_leaves_a_frame_behind(monkeypatch: Any) -> None:
     """一行文字复盘不了画面。核对不过就要有图。"""
-    loop, dumped = _confirming_loop(monkeypatch, confirms=False)
+    loop, dumped, confirmed = _confirming_loop(monkeypatch, confirms=False)
 
     assert loop.check_target(TARGET) is TargetCheck.MISMATCH
     assert dumped == ["bot-coord-mismatch"]
+    assert confirmed == [], "核对不过的读数绝不能拿去确认导航缓存"
 
 
 def test_dumps_are_capped(monkeypatch: Any) -> None:
     """连续 44 个目标全失败时不能写出 44 张几乎一样的现场图。"""
-    loop, dumped = _confirming_loop(monkeypatch, confirms=False)
+    loop, dumped, _confirmed = _confirming_loop(monkeypatch, confirms=False)
 
     for _ in range(10):
         loop.check_target(TARGET)
@@ -180,7 +187,9 @@ def test_dumps_are_capped(monkeypatch: Any) -> None:
 
 
 def test_a_passing_read_dumps_nothing(monkeypatch: Any) -> None:
-    loop, dumped = _confirming_loop(monkeypatch, confirms=True)
+    loop, dumped, confirmed = _confirming_loop(monkeypatch, confirms=True)
 
     assert loop.check_target(TARGET) is TargetCheck.CONFIRMED
     assert dumped == []
+    # 核对通过 = 导航栏的回读证据，缓存据此才敢省字段。
+    assert confirmed == [str(TARGET)]

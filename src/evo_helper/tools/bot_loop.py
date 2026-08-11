@@ -20,29 +20,24 @@
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
 
-## 一趟推一态，战报由这条链路自己收
+## 一趟推一态，战报在开工那一趟信箱里收
 
 五个态见 `domain.bot_round.phase_of`。两个等待态（`AWAITING_PROBE_REPORT` 与
-`AWAITING_ATTACK_REPORT`）的出路是同一个 `collect_battle_reports()`：进一趟信箱、
-把战报读出来写进 `battle_reports`，`phase_of` 下一趟才看得到 `has_report`。
+`AWAITING_ATTACK_REPORT`）的出路是**开工那一趟信箱**（父类 `reconcile_today`）：
+把认得出的攻击报告读出来写进 `battle_reports`，`phase_of` 才看得到 `has_report`。
+
 这一步以前**没有人做**，于是每个目标都永久停在等战报（实机一整夜 152 次），
 而唯一读战报的代码只挂在 `NEEDS_ATTACK` 分支上——读战报的代码只在读过战报
-之后才会被执行。
+之后才会被执行。补上之后它仍然一份都收不到，原因换成了**信箱窗口太小**：
+两条链路的报告混在同一个收件箱里按时间倒序排，海盗链路整夜产出攻击报告，
+而收取只盲开最上面 6 行。实机 2026-08-11 四趟全部报「翻不到」。
 
-补上之后它仍然一份都收不到，原因换成了**信箱窗口太小**：两条链路的报告混在同一个
-收件箱里按时间倒序排，海盗链路整夜产出攻击报告，而收取只盲开最上面 6 行。实机
-2026-08-11 四趟（09:14 / 09:19 / 09:24 / 09:30）全部报「翻不到」，六个目标同一句话。
-现在翻信箱的窗口与筛选归 `pirate_loop.PirateLoop._scan_mail_rows` 统一管：
-先在列表页读主题、只开主题对得上的、翻得到第四屏、翻到旧报告就停。
+**而这两修都只修了探路那一半。** 收取当时只挑 `AWAITING_PROBE_REPORT` 的目标进
+信箱，攻击发的战报没人读；后来两个等待态一起交进来，仍旧是一张**会漏项的名单**。
+现在干脆不按名单收：这条路径认归属本来就只靠 VS 块里的目标坐标，翻信箱只靠
+「攻击报告」这个主题，两种发的战报长得一模一样——读到就存，名单也就漏不了态。
 
-**而这两修都只修了探路那一半。** 收取只挑 `AWAITING_PROBE_REPORT` 的目标进信箱，
-攻击发的战报**全仓没有任何代码去读**：调度器不读（`mission_scheduler` 到点只是把
-这条链路整个重新起一遍），`_sweep` 也不读（注释写着「等攻击战报……这一趟没事可做」）。
-实机 2026-08-11 的攻击日志一页之内就并排摆着两种结局：探路那三发读出了战果与战损，
-AAA 那一发停在「战果 待战报」——它的战报就躺在同一个信箱里，只是没有人去开。
-而收取这条路径本来就与预设无关（认归属靠 VS 块里的目标坐标，翻信箱靠「攻击报告」
-这个主题，两种发的战报长得一模一样），所以修法是**把攻击发也放进同一趟信箱**，
-而不是另写一条读法。
+收取与「数今天已经打了几发」共用同一趟信箱，理由见 `PirateLoop.reconcile_today`。
 
 ## 只读详情页，但那是**两屏**
 
@@ -85,7 +80,7 @@ from evo_helper.domain.fleet_tier import FleetTier, tier_for
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
-from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop, TargetCheck
+from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop, ReportIngest, TargetCheck
 
 # `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
 # `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
@@ -94,10 +89,6 @@ from evo_helper.vision.parsers import ReportKind
 
 #: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
 PROBE_PRESET = DEFAULT_PRESET.name
-
-#: 读「单位」那一行之前，详情页要往下拖几次（见 `BotLoop._bottom_screens`）。
-#: 到底会夹住，多拖一次无害；少拖一次就是静默留空。
-DETAIL_SCROLL_TO_BOTTOM_DRAGS = 2
 
 #: 「这个目标在等一份战报」的那几个态。**两个都要在这里。**
 #:
@@ -135,6 +126,7 @@ class BotLoop(PirateLoop):
 
     #: 打 bot 的战报主题是「攻击报告」；海盗战是「海盗攻击报告」，走父类那一档。
     RECONCILE_KIND: ReportKind = ReportKind.ATTACK
+    REPORT_LABEL: str = "攻击战报"
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
@@ -157,6 +149,10 @@ class BotLoop(PirateLoop):
 
         判据本身没有放松的余地：实机那一轮里有一次读到的是**上一个目标的星系**
         （请求 2:321:5，面板显示 2:320:5），放松判据就等于打错星球。
+
+        核对通过就 `navigator.confirm()`——那次核对本身就是导航栏的回读证据，
+        导航器只信这种有证据的记忆（见 `SystemNavigator` 的类注释）。**不是 bot
+        也照样确认**：确认的是「导航栏停在这一位」，与那一位上住着谁无关。
         """
         from evo_helper.game.system_navigator import crop_reader
         from evo_helper.vision.scan_reading import read_panel_confirming
@@ -167,6 +163,7 @@ class BotLoop(PirateLoop):
             say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
             self._dump_coord_mismatch("bot-coord-mismatch")
             return TargetCheck.MISMATCH
+        self._navigator.confirm(coordinate)
         if not panel.is_bot:
             say(f"  {coordinate} 不是 bot（面板名 {panel.display_name!r}）")
             return TargetCheck.ABSENT
@@ -220,8 +217,8 @@ class BotLoop(PirateLoop):
         )
         return remaining
 
-    def collect_battle_reports(self, wanted: Sequence[Coordinate]) -> tuple[Coordinate, ...]:
-        """把这些目标的战报读回来，**写进 `battle_reports`**。返回入库了哪几个。
+    def _ingest_report(self, row: Any, page: Any) -> ReportIngest:
+        """开工那一趟里读到的一封「攻击报告」：认出打的是谁，读通就入库。
 
         **探路发与攻击发共用这一条路径，而且必须共用。** 两种发打的是同一个坐标、
         走的是同一条攻击链路、产出的报告主题同为「攻击报告」，认归属靠的又都是 VS
@@ -232,79 +229,33 @@ class BotLoop(PirateLoop):
         `DispatchFact.has_report` 才放目标往下走，那个字段来自 `battle_reports`
         里有没有一行指着这发派遣；而全仓没有任何代码为 bot 写过那张表。于是每个
         目标都永久停在 `AWAITING_PROBE_REPORT`——实机跑一整夜，那一态出现 152 次，
-        `NEEDS_ATTACK` 出现 0 次。唯一读战报的 `read_defender_units()` 又只挂在
-        `NEEDS_ATTACK` 分支上：**读战报的代码只在读过战报之后才会被执行**。
-        连带后果就是网页「情报中心」一行数据都没多。
+        `NEEDS_ATTACK` 出现 0 次。
 
-        补上之后**攻击发那一半仍然是死结**：调用方只把 `AWAITING_PROBE_REPORT`
-        的目标交进来。实机 2026-08-11 的攻击日志上，同一页里探路那三发全都读出了
-        战果与战损，而 AAA 那一发停在「战果 待战报」——它的战报就躺在同一个信箱里，
-        只是没有人去开。现在两个等待态一起交进来（见 `_sweep`）。
+        ⚠️ **不按「是不是本轮在等的那个目标」筛。** 读到就存。原先只把
+        `AWAITING_PROBE_REPORT` 那几个目标交进来，攻击发的战报于是没人读；
+        后来两个等待态一起交，仍旧是一张会漏项的名单。名单越窄，漏的越多，
+        而这条路径认归属本来就只靠报告自己写的目标坐标——按名单筛纯属多余。
+        先例是侦察报告那条链路（`PirateLoop.collect_scout_reports` 里那段注释）。
 
         入库走 `append_report`，它会按「出发坐标 + 目标坐标 + 时间就近」自己认领
         那一发派遣（置 `dispatch_id` 与 `match_status='MATCHED'`），这里不另做匹配。
-
-        ⚠️ **收不到时那句话要说准。** 原先统一说「还没出现在信箱最上面几行」，
-        把「窗口不够大」说成了「报告还没到」——而实机上正因就是前者：海盗链路
-        整夜产出攻击报告，6 行窗口被别人的报告占满，六个目标一视同仁地报「翻不到」，
-        连续四趟都是同一句。两者的处置完全相反（一个要把窗口开大、一个要接着等），
-        所以现在按「这一发到点了没有」分开说。
         """
-        stored: list[Coordinate] = []
+        from evo_helper.vision.parsers import parse_versus_block
 
-        def visit(target: Coordinate, page: Any) -> None:
-            if self._ingest_battle_report(target, page):
-                stored.append(target)
+        versus = parse_versus_block(page.versus_block(), "ocr")
+        if versus is None:
+            # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，接着按它的
+            # 舰队量去挑攻击组合。
+            say(f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报")
+            return ReportIngest.UNREADABLE
+        return self._ingest_battle_report(versus.defender.coordinate.value, page)
 
-        repository, _run_id = self._ensure_run()
-        due = dict(repository.bot_report_due_at(wanted, since=self._round_start()))
-        # 列表按时间倒序：比**最早那一发的派出时刻**还早的报告，不可能是这几发的。
-        # 取派出时刻而不是预计抵达时刻，是因为预计时刻来自简报上的一次 OCR，
-        # 而那个读数实机上并不可靠（同一天同距离的六发读出 8 秒到 25 分钟不等）。
-        # 派出时刻是本地记的，是硬事实；用它当下界只会多翻几行，不会漏掉报告。
-        not_before = min((moment for moment, _ in due.values()), default=None)
-        missing = self._scan_mail(wanted, visit, not_before=not_before)
-        now = datetime.now(UTC)
-        for coordinate in wanted:
-            if coordinate not in missing:
-                continue
-            expected = due.get(coordinate, (None, None))[1]
-            if expected is not None and expected > now:
-                say(f"  {coordinate} 的战报预计 {expected:%H:%M:%S} UTC 才产生；接着等")
-            else:
-                say(f"  {coordinate} 的战报到点了却没翻到；下一趟再来")
-        return tuple(stored)
+    def _ingest_battle_report(self, target: Coordinate, page: Any) -> ReportIngest:
+        """把详情页上这一份读成 `BattleReport` 并入库。读不出来就放过，不存半份。
 
-    def _bottom_screens(self) -> Any:
-        """把详情页拖到底再拍一屏：「单位」与「损失单位」两行都在那里。
-
-        为什么非拖不可：bot 战报比海盗战报**多一行**「生成卫星概率」，「战斗详情」
-        横幅因此下移约 30px，「单位」整行落到面板可视区之外。2026-08-11 的五张
-        实拍里四张如此，第五张恰好没有那一行、「单位」就在屏上（读作 `1` / `319`）。
-        所以这不是锚点找错了——那一行**根本没画出来**，只能拖。
-        「损失单位」在它下面一行，七张实拍**没有一张**在没拖的那屏上读得到。
-
-        ⚠️ 这一步现在是**判据的输入**，不再只是补一个展示字段：胜负按
-        「剩余 = 单位 − 损失单位」算（`domain.battle_outcome`），不拖就没有战损，
-        没有战损就算不出胜负，攻击日志的战果列会一直空着。
-
-        ⚠️ **拖之前那一屏必须先读完。** 拖到底之后 VS 块与胜负横幅都滚出可视区
-        （实测拖到底的那一屏横幅读作 `'Z ?'`）。调用方拿到的 `page` 持有的是
-        拖之前那一次截图的像素，所以顺序上先拿 `page`、再拖、再拍这一屏，
-        两屏各读各的。
-
-        拖两次而不是一次：面板到底会夹住（`pirate_reports` 模块头记着实测拖 280px
-        与 520px 落点完全一致），多拖一次无害；而少拖一次读不到就是静默留空。
-        同样的姿势侦察报告那条链路已经在实机上跑了很久（`collect_scout_reports`）。
+        三值而不是布尔：「库里已有」是开工那一趟的早停凭据，「读不出来」不是——
+        理由见 `ReportIngest`。
         """
-        from evo_helper.tools.pirate_loop import PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y, slow_drag
-
-        for _ in range(DETAIL_SCROLL_TO_BOTTOM_DRAGS):
-            slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
-        return self._report_screens()
-
-    def _ingest_battle_report(self, target: Coordinate, page: Any) -> bool:
-        """把详情页上这一份读成 `BattleReport` 并入库。读不出来就放过，不存半份。"""
         from uuid import uuid4
 
         from evo_helper.application.report_ingest import to_battle_report
@@ -322,16 +273,16 @@ class BotLoop(PirateLoop):
             # 那发派遣判掉、允许重新探路（见 `repository.bot_dispatch_facts`）。
             say(f"  {target} 的战报读不出来：{error}")
             self._dump_frame("battle-report-unreadable")
-            return False
+            return ReportIngest.UNREADABLE
         # VS 块读了两遍（翻行时一遍、这里一遍），两遍必须指向同一个目标。
         # 不核的话，一次 OCR 抖动就能把这份战报挂到别人头上。
         if live.defender.coordinate.value != target:
             say(f"  {target} 的战报复核不过：这一份写的是 {live.defender.coordinate.value}")
-            return False
+            return ReportIngest.UNREADABLE
         repository, _run_id = self._ensure_run()
         if repository.has_report_at(target, live.reported_at_utc):
             say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库")
-            return False
+            return ReportIngest.KNOWN
         repository.append_report(to_battle_report(live, report_id=uuid4()))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
         # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
@@ -342,7 +293,7 @@ class BotLoop(PirateLoop):
             f"（我 {live.attacker_units}−{live.attacker_losses}，"
             f"敌 {live.defender_units}−{live.defender_losses}）"
         )
-        return True
+        return ReportIngest.STORED
 
     def read_defender_units(self, coordinate: Coordinate) -> int | None:
         """去信箱把这个目标最近那份攻击报告的守方「单位」总数读回来。
@@ -390,41 +341,48 @@ class BotLoop(PirateLoop):
 
         覆盖 `_sweep` 之后这两件事都由父类统一管，不会再各写一份。
 
-        ⚠️ **收战报排在最前面，而且整轮只进一趟信箱。** 等战报的目标可能有几十个，
-        一个一个进信箱要切视图、开面板、慢拖三下再翻六行，一趟十几秒；而它们的
-        报告本来就并排躺在同一页上。派遣要排在收取之后：`_close_mail` 收尾时会切回
-        恒星系视图，正好是 `_probe` / `_tier_and_attack` 需要的姿势。
+        ⚠️ **战报已经在开工那一趟信箱里收过了**（父类 `reconcile_today`），
+        这里不再进第二趟。等战报的目标可能有几十个，而它们的报告本来就并排躺在
+        同一页上；开工那一趟为了数今天的战报数**本来就要把那一页翻一遍**，
+        顺手把认得出的都开了、都入了库，比另起一趟省下整套「切视图 → 开面板 →
+        慢拖回顶 → 翻页 → 关面板」（约 20 秒）。
 
-        ⚠️ **两个等待态一起收，一趟。** 原先只收 `AWAITING_PROBE_REPORT`，
-        `AWAITING_ATTACK_REPORT` 落在这句注释里：「等攻击战报……这一趟没事可做」。
-        那句话预设了别处有人收，而**别处没有人**：调度器到点只是把这条链路整个
-        重新起一遍（`mission_scheduler._command_for`），起来之后走的还是这里。
-        于是分档之后真打出去的那一发永远停在「待战报」——攻击日志的战果列空着、
-        `phase_of` 到不了 `DONE`、调度器眼里这一轮永远没跑完，直到 6 小时后
-        `bot_dispatch_facts` 按 `MAX_REPORT_AGE` 把那发整条判掉、目标退回去重打一遍。
-        和当初 `AWAITING_PROBE_REPORT` 那个死结是同一个形状。
+        收取那一步认归属只靠报告自己写的目标坐标，不认名单——所以两个等待态
+        （`AWAITING_PROBE_REPORT` / `AWAITING_ATTACK_REPORT`）不需要在这里列出来，
+        也就不会再出现「名单漏了一个态，那一档目标永远收不到战报」这种事。
+        `AWAITING_ATTACK_REPORT` 当初就是这么被漏掉的：注释写着「等攻击战报……
+        这一趟没事可做」，而那句话预设了别处有人收，别处却没有人。
 
-        分两趟收也不行：两种发的报告混在同一页上按时间倒序排，分两趟就要把
-        「进信箱 → 翻四屏」这套开销付两遍，还会互相抢那 8 封的开封预算。
-
-        态在开头一次算完。收进来的战报**不在本趟继续推进**——「一趟只推进一态」
-        这条不因为它排在最前面而破例。
+        态在开头一次算完，收进来的战报本轮就作数：`reconcile_today` 排在
+        `_sweep` 之前，所以刚回来的探路战报这一趟就能拿去分档。**仍旧一趟只推进
+        一态**——每个目标在这个循环里只走一个分支。
         """
-        phases = {coordinate: self._phase_of(coordinate) for coordinate in self._bot.targets}
-        awaiting = tuple(
-            coordinate for coordinate, phase in phases.items() if phase in _AWAITING_REPORT
-        )
-        if awaiting:
-            say(f"等战报的目标 {len(awaiting)} 个；进一趟信箱去收")
-            self.collect_battle_reports(awaiting)
         for coordinate in self._bot.targets:
-            phase = phases[coordinate]
+            phase = self._phase_of(coordinate)
             say(f"目标 {coordinate}（{phase.value}）")
             if phase is BotPhase.NEEDS_PROBE:
                 self._probe(coordinate)
             elif phase is BotPhase.NEEDS_ATTACK:
                 self._tier_and_attack(coordinate)
-            # 剩下的两个等待态已经在上面那一趟信箱里收过了；`DONE` 无事可做。
+            elif phase in _AWAITING_REPORT:
+                self._say_still_waiting(coordinate)
+            # `DONE` 无事可做。
+
+    def _say_still_waiting(self, coordinate: Coordinate) -> None:
+        """还在等战报的目标，日志上要分清「还没到点」和「到点了却没翻到」。
+
+        ⚠️ **这句话要说准。** 原先统一说「还没出现在信箱最上面几行」，把
+        「窗口不够大」说成了「报告还没到」——而实机上正因就是前者：海盗链路整夜
+        产出攻击报告，6 行窗口被别人的报告占满，六个目标一视同仁地报「翻不到」，
+        连续四趟都是同一句。两者的处置完全相反（一个要把窗口开大、一个要接着等）。
+        """
+        repository, _run_id = self._ensure_run()
+        due = dict(repository.bot_report_due_at((coordinate,), since=self._round_start()))
+        expected = due.get(coordinate, (None, None))[1]
+        if expected is not None and expected > datetime.now(UTC):
+            say(f"  战报预计 {expected:%H:%M:%S} UTC 才产生；接着等")
+        else:
+            say("  战报到点了却没翻到；下一趟再来")
 
     def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。
@@ -456,7 +414,7 @@ class BotLoop(PirateLoop):
         """探路战报已回：取守方单位数、分档、按档位真打。
 
         **先问库。** 走到这一态的前提就是「本轮的探路战报已经入库」，那个数在
-        `collect_battle_reports` 那一趟已经读过了；再进一趟信箱既多花十几秒，翻到的
+        开工那一趟信箱已经读过了；再进一趟信箱既多花十几秒，翻到的
         还可能是上一轮的报告（信箱那条路没有时间闸门）。库里没有才现场读一次。
         """
         if not self._bot.attack:

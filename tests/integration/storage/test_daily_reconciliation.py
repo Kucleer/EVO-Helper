@@ -34,6 +34,18 @@ NOON = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 MIDNIGHT = datetime(2026, 8, 11, 0, 0, tzinfo=UTC)
 
 
+def _reconciliation_rows(repository) -> int:  # type: ignore[no-untyped-def]
+    with repository._session_factory() as session:  # noqa: SLF001 - 直接数行，绕开被测方法
+        return int(
+            session.scalar(select(func.count()).select_from(orm.DailyReconciliationRow)) or 0
+        )
+
+
+def _reconciliation_complete(repository) -> bool:  # type: ignore[no-untyped-def]
+    with repository._session_factory() as session:  # noqa: SLF001 - 直接读列，绕开被测方法
+        return bool(session.scalar(select(orm.DailyReconciliationRow.complete)))
+
+
 def _dispatch(repository, run_id, *, at, kind=TARGET_KIND_PIRATE, target=None) -> None:  # type: ignore[no-untyped-def]
     intent_id = uuid4()
     repository.save_attack_intent(
@@ -188,12 +200,12 @@ def test_reconciling_never_invents_a_dispatch_row(  # type: ignore[no-untyped-de
         assert session.scalar(select(func.count()).select_from(orm.AttackIntentRow)) == 0
 
 
-def test_a_day_is_reconciled_once_and_rerunning_overwrites_it(repository) -> None:  # type: ignore[no-untyped-def]
-    """去重键是 **UTC 日**，不是「这个进程启动过没有」——控制台一天可能重启好几次，
-    按进程去重的话每重启一次就要多翻一趟信箱。重跑就覆盖，不堆行。
-    """
-    assert repository.reconciled_on(TARGET_KIND_PIRATE, day_utc=MIDNIGHT) is False
+def test_a_day_keeps_one_row_and_a_later_bigger_count_wins(repository) -> None:  # type: ignore[no-untyped-def]
+    """一天一行，键是 **UTC 日**；同一天再对一次就更新那一行，不堆行。
 
+    对账现在**每次开工都跑**（用户会暂停任务再重启，「今日 X/32」必须接得上），
+    所以同一个 UTC 日会写好几次。
+    """
     repository.record_daily_reconciliation(
         TARGET_KIND_PIRATE,
         day_utc=MIDNIGHT,
@@ -201,8 +213,6 @@ def test_a_day_is_reconciled_once_and_rerunning_overwrites_it(repository) -> Non
         complete=True,
         reconciled_at_utc=NOON,
     )
-    assert repository.reconciled_on(TARGET_KIND_PIRATE, day_utc=MIDNIGHT) is True
-    # 同一天再对一次：覆盖那一行，而不是多写一行。
     repository.record_daily_reconciliation(
         TARGET_KIND_PIRATE,
         day_utc=MIDNIGHT,
@@ -212,6 +222,54 @@ def test_a_day_is_reconciled_once_and_rerunning_overwrites_it(repository) -> Non
     )
 
     assert repository.count_dispatches_since(TARGET_KIND_PIRATE, since=MIDNIGHT) == 8
-    assert (
-        repository.reconciled_on(TARGET_KIND_PIRATE, day_utc=MIDNIGHT - timedelta(days=1)) is False
+    assert _reconciliation_rows(repository) == 1
+
+
+def test_a_later_smaller_count_never_lowers_the_day(repository) -> None:  # type: ignore[no-untyped-def]
+    """**本文件里与「取大」并列的另一条：同一个 UTC 日里这个数只增不减。**
+
+    每趟能翻到多远并不一样：翻到底的那趟数到 20，下一趟面板夹住只数到 6。
+    照覆盖写，第二趟就把配额判据从 20 松回 6，助手于是以为还剩 26 发可打——
+    **计数偏小正是会超额的那一侧**，代价是游戏把攻击强制返回、白飞一趟舰队。
+    而战报只会变多，所以「今天至少有几份」本来就只该往上走。
+    """
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=MIDNIGHT,
+        observed_reports=20,
+        complete=True,
+        reconciled_at_utc=NOON,
     )
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=MIDNIGHT,
+        observed_reports=6,
+        complete=False,
+        reconciled_at_utc=NOON + timedelta(hours=1),
+    )
+
+    assert repository.count_dispatches_since(TARGET_KIND_PIRATE, since=MIDNIGHT) == 20
+    # `complete` 跟着胜出的那个数走：它说的是「那个数是不是全天」。
+    assert _reconciliation_complete(repository) is True
+
+
+def test_the_next_day_starts_from_zero_again(repository) -> None:  # type: ignore[no-untyped-def]
+    """只增不减是**一天之内**的规则。日界一到，新的一天从头数。"""
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=MIDNIGHT,
+        observed_reports=20,
+        complete=True,
+        reconciled_at_utc=NOON,
+    )
+    tomorrow = MIDNIGHT + timedelta(days=1)
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=tomorrow,
+        observed_reports=1,
+        complete=True,
+        reconciled_at_utc=tomorrow,
+    )
+
+    assert repository.count_dispatches_since(TARGET_KIND_PIRATE, since=tomorrow) == 1
+    assert _reconciliation_rows(repository) == 2

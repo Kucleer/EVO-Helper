@@ -467,6 +467,10 @@ def scan_one(
     实测 `2:2:11` 被读成 `[2:2:1]`——相邻的两个 1 粘在一起少读一位。核对是对的
     （读回来的不是请求的那个就不能入库），但**只读一次就放弃会留下静默缺口**：
     这个坐标既没入库，游标也会被后面成功的坐标带过去，再也不会回来。
+
+    核对通过时要 `navigator.confirm()`：那次核对本身就是导航栏的回读证据，
+    导航器只信这种有证据的记忆（见 `SystemNavigator` 的类注释）。不调的话，
+    同一恒星系内连扫 16 个位每一位都要重设三个字段——每位白花约 6 秒。
     """
     started = time.perf_counter()
     outcome: ScanOutcome | None = None
@@ -483,6 +487,7 @@ def scan_one(
             coordinate, panel, panel.confirms(requested), round(time.perf_counter() - started, 2)
         )
         if outcome.confirmed:
+            navigator.confirm(coordinate)
             return outcome
         if debug_dir is not None:
             debug_dir.mkdir(parents=True, exist_ok=True)

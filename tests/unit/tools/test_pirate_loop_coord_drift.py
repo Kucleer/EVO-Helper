@@ -28,73 +28,6 @@ from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, Targe
 TARGET = Coordinate(2, 137, 3)
 
 
-# -- 三值判定本身 --------------------------------------------------------------
-
-
-def _reading_loop(*, title: str, coordinate_text: str) -> tuple[Any, list[str]]:
-    """一个 `check_target` 走真实实现、但读屏被替掉的循环。"""
-    dumped: list[str] = []
-
-    def _read(roi: tuple[int, int, int, int], **_recipe: Any) -> str:
-        return coordinate_text if roi == pirate_ui.PIRATE_COORD_ROI else title
-
-    loop = PirateLoop.__new__(PirateLoop)
-    loop._coord_dumps = 0  # type: ignore[attr-defined]
-    loop._read = _read  # type: ignore[assignment, method-assign]
-    loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[assignment, method-assign]
-    return loop, dumped
-
-
-def test_an_empty_position_reads_as_absent() -> None:
-    """没有海盗就是 `ABSENT`——正常结果，不是异常。"""
-    loop, dumped = _reading_loop(title="", coordinate_text="")
-
-    assert loop.check_target(TARGET) is TargetCheck.ABSENT
-    # 空位不留现场：那会把最常见的正常结果写成一地图。
-    assert dumped == []
-
-
-def test_a_pirate_panel_showing_another_planet_reads_as_mismatch() -> None:
-    """面板是真的海盗面板，坐标却是别人——导航漂了。"""
-    loop, dumped = _reading_loop(title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="2:136:3")
-
-    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
-    assert dumped == ["pirate-coord-mismatch"]
-
-
-def test_the_coordinate_criterion_is_not_relaxed() -> None:
-    """位次对上、星系不对，仍然是 `MISMATCH`。
-
-    实机上真读到过上一个目标的星系（请求 2:321:5，面板 2:320:5）。放松成
-    「位次对上就行」就是往错误的星球扔舰队。
-    """
-    loop, _dumped = _reading_loop(title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="9:137:3")
-
-    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
-
-
-def test_a_matching_pirate_panel_is_confirmed() -> None:
-    loop, dumped = _reading_loop(
-        title=f"[{pirate_ui.PIRATE_TITLE_TEXT}]", coordinate_text="2:137:3"
-    )
-
-    assert loop.check_target(TARGET) is TargetCheck.CONFIRMED
-    assert dumped == []
-
-
-def test_mismatch_dumps_are_capped() -> None:
-    """一整轮漂下去也不能写出上百张几乎一样的现场图。"""
-    loop, dumped = _reading_loop(title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="9:137:3")
-
-    for _ in range(10):
-        loop.check_target(TARGET)
-
-    assert len(dumped) == PirateLoop.MAX_COORD_DUMPS
-
-
-# -- 自愈 ---------------------------------------------------------------------
-
-
 class _Navigator:
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -104,6 +37,135 @@ class _Navigator:
 
     def invalidate(self) -> None:
         self._events.append("清缓存")
+
+    def confirm(self, coordinate: Coordinate) -> None:
+        self._events.append(f"确认 {coordinate.position}")
+
+
+# -- 三值判定本身 --------------------------------------------------------------
+
+
+class _Image:
+    """`crop_reader` 只要一个 `crop(box)`；把 box 原样传给假的 OCR。"""
+
+    def crop(self, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return box
+
+
+def _reading_loop(
+    *, title: str, coordinate_text: str, panel_text: str | None = None
+) -> tuple[Any, list[str], list[str]]:
+    """一个 `check_target` 走真实实现、但读屏被替掉的循环。
+
+    `coordinate_text` 是海盗面板那条坐标行（`PIRATE_COORD_ROI`）；
+    `panel_text` 是**没有海盗时**回读到的坐标行，默认与前者相同。
+    """
+    dumped: list[str] = []
+    events: list[str] = []
+    shown = coordinate_text if panel_text is None else panel_text
+
+    def _read(roi: tuple[int, int, int, int], **_recipe: Any) -> str:
+        return coordinate_text if roi == pirate_ui.PIRATE_COORD_ROI else title
+
+    def _ocr(box: tuple[int, int, int, int], **_recipe: Any) -> str:
+        from evo_helper.vision.scan_reading import FREE_COORD_ROI, OWNED_COORD_ROI
+
+        return shown if box in (OWNED_COORD_ROI, FREE_COORD_ROI) else ""
+
+    loop = PirateLoop.__new__(PirateLoop)
+    loop._coord_dumps = 0  # type: ignore[attr-defined]
+    loop._navigator = _Navigator(events)  # type: ignore[attr-defined]
+    loop._ocr = _ocr  # type: ignore[attr-defined]
+    loop._driver = type("_D", (), {"capture": lambda self: _Image()})()  # type: ignore[attr-defined]
+    loop._read = _read  # type: ignore[assignment, method-assign]
+    loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[assignment, method-assign]
+    return loop, dumped, events
+
+
+def test_an_empty_position_reads_as_absent() -> None:
+    """没有海盗就是 `ABSENT`——正常结果，不是异常。"""
+    loop, dumped, events = _reading_loop(title="", coordinate_text="", panel_text="[2:137:3]")
+
+    assert loop.check_target(TARGET) is TargetCheck.ABSENT
+    # 空位不留现场：那会把最常见的正常结果写成一地图。
+    assert dumped == []
+    # 坐标行回读通过 → 这就是导航栏停在这一位的证据，缓存据此才敢省字段。
+    assert events == ["确认 3"]
+
+
+def test_an_empty_position_showing_another_planet_reads_as_mismatch() -> None:
+    """**本文件新增的重点。** 空位上读到的是别的坐标 → 导航漂了，不是「没有海盗」。
+
+    实机上最贵的那次故障正是这个形状：缓存和导航栏分岔之后，连续 44 个目标一路
+    报「不是海盗」把整轮走完，日志上与「今天这几位真没海盗」一模一样。
+    空位不回读坐标，这种漂移就永远是静默的。
+    """
+    loop, dumped, events = _reading_loop(title="", coordinate_text="", panel_text="[2:136:3]")
+
+    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
+    assert dumped == ["pirate-coord-drift"]
+    assert events == [], "读到的是别人的坐标，绝不能拿去确认缓存"
+
+
+def test_an_unreadable_empty_position_neither_confirms_nor_accuses() -> None:
+    """坐标行整个读不出来（面板没铺开、被浮层压着）：既不确认缓存，也不判漂移。
+
+    不确认，下一趟自然把三个字段都重设一遍——方向永远是「拿不准就多设」。
+    不指控，免得一次 OCR 抖动换来一次复位重试（约 35 秒）。
+    """
+    loop, dumped, events = _reading_loop(title="", coordinate_text="", panel_text="")
+
+    assert loop.check_target(TARGET) is TargetCheck.ABSENT
+    assert (dumped, events) == ([], [])
+
+
+def test_a_pirate_panel_showing_another_planet_reads_as_mismatch() -> None:
+    """面板是真的海盗面板，坐标却是别人——导航漂了。"""
+    loop, dumped, events = _reading_loop(
+        title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="2:136:3"
+    )
+
+    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
+    assert dumped == ["pirate-coord-mismatch"]
+    assert events == []
+
+
+def test_the_coordinate_criterion_is_not_relaxed() -> None:
+    """位次对上、星系不对，仍然是 `MISMATCH`。
+
+    实机上真读到过上一个目标的星系（请求 2:321:5，面板 2:320:5）。放松成
+    「位次对上就行」就是往错误的星球扔舰队。
+    """
+    loop, _dumped, _events = _reading_loop(
+        title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="9:137:3"
+    )
+
+    assert loop.check_target(TARGET) is TargetCheck.MISMATCH
+
+
+def test_a_matching_pirate_panel_is_confirmed() -> None:
+    loop, dumped, events = _reading_loop(
+        title=f"[{pirate_ui.PIRATE_TITLE_TEXT}]", coordinate_text="2:137:3"
+    )
+
+    assert loop.check_target(TARGET) is TargetCheck.CONFIRMED
+    assert dumped == []
+    assert events == ["确认 3"], "核对通过就是导航栏的回读证据，必须记进缓存"
+
+
+def test_mismatch_dumps_are_capped() -> None:
+    """一整轮漂下去也不能写出上百张几乎一样的现场图。"""
+    loop, dumped, _events = _reading_loop(
+        title=pirate_ui.PIRATE_TITLE_TEXT, coordinate_text="9:137:3"
+    )
+
+    for _ in range(10):
+        loop.check_target(TARGET)
+
+    assert len(dumped) == PirateLoop.MAX_COORD_DUMPS
+
+
+# -- 自愈 ---------------------------------------------------------------------
 
 
 def _loop(events: list[str], checks: list[TargetCheck]) -> Any:

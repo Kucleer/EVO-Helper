@@ -24,7 +24,7 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop, BotOptions
-from evo_helper.tools.pirate_loop import LoopOptions, MailRow, TargetCheck
+from evo_helper.tools.pirate_loop import LoopOptions, MailRow, ReportIngest, TargetCheck
 from evo_helper.vision.parsers import ReportKind
 
 A = Coordinate(2, 149, 17)
@@ -261,7 +261,8 @@ def _ingesting_loop(repository: _Repository, bottom: Any = None) -> Any:
 def test_a_readable_report_is_stored() -> None:
     repository = _Repository()
 
-    assert _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A)) is True
+    ingest = _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A))
+    assert ingest is ReportIngest.STORED
     assert len(repository.appended) == 1
 
 
@@ -273,16 +274,23 @@ def test_a_report_pointing_elsewhere_is_refused() -> None:
     """
     repository = _Repository()
 
-    assert _ingesting_loop(repository)._ingest_battle_report(B, _DetailScreens(A)) is False
+    ingest = _ingesting_loop(repository)._ingest_battle_report(B, _DetailScreens(A))
+    assert ingest is ReportIngest.UNREADABLE
     assert repository.appended == []
 
 
 def test_an_already_stored_report_is_not_appended_again() -> None:
     """信箱里那几行每趟都在。认领不上号的战报尤其危险：`has_report` 永远为假，
-    于是下一趟又读同一封——没有这道去重，它会每趟复制一行。"""
+    于是下一趟又读同一封——没有这道去重，它会每趟复制一行。
+
+    结论是 `KNOWN` 而不是「没入库」：开工那一趟拿它当早停凭据（信箱从新往旧排，
+    第一份库里已有的往下都已经在库里了），而这一档必须与「读不出来」分开——
+    见 `ReportIngest`。
+    """
     repository = _Repository(already_stored=True)
 
-    assert _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A)) is False
+    ingest = _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A))
+    assert ingest is ReportIngest.KNOWN
     assert repository.appended == []
 
 
@@ -297,7 +305,8 @@ def test_an_unreadable_report_is_skipped_and_dumped() -> None:
     dumped: list[str] = []
     loop._dump_frame = lambda name, roi=None: dumped.append(name)
 
-    assert loop._ingest_battle_report(A, _DetailScreens(A, header="装饰文字")) is False
+    ingest = loop._ingest_battle_report(A, _DetailScreens(A, header="装饰文字"))
+    assert ingest is ReportIngest.UNREADABLE
     assert repository.appended == []
     assert dumped == ["battle-report-unreadable"]
 
@@ -452,6 +461,19 @@ def test_units_that_neither_screen_shows_stay_empty() -> None:
 # -- 收不到时那句话要说准 ----------------------------------------------------
 
 
+def _waiting_lines(loop: Any, target: Coordinate) -> list[str]:
+    from evo_helper.tools import bot_loop as module
+
+    said: list[str] = []
+    original = module.say
+    module.say = said.append
+    try:
+        loop._say_still_waiting(target)
+    finally:
+        module.say = original
+    return said
+
+
 def test_a_report_that_is_not_due_yet_says_so_instead_of_blaming_the_window() -> None:
     """「还没到点」和「到点了却没翻到」的处置完全相反，日志必须分开说。
 
@@ -461,19 +483,10 @@ def test_a_report_that_is_not_due_yet_says_so_instead_of_blaming_the_window() ->
     """
     now = datetime.now(UTC)
     loop, _events = _loop([])
-    said: list[str] = []
     loop._ensure_run = lambda: (_DueRepository({A: (now, now.replace(year=now.year + 1))}), None)
     loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
-    loop._scan_mail = lambda wanted, visit, not_before=None: set(wanted)
 
-    from evo_helper.tools import bot_loop as module
-
-    original = module.say
-    module.say = said.append
-    try:
-        loop.collect_battle_reports((A,))
-    finally:
-        module.say = original
+    said = _waiting_lines(loop, A)
 
     assert any("才产生；接着等" in line for line in said)
     assert not any("到点了却没翻到" in line for line in said)
@@ -483,54 +496,31 @@ def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> Non
     """到点了还翻不到，那就是这一趟没翻到——说准了才修得动。"""
     now = datetime.now(UTC)
     loop, _events = _loop([])
-    said: list[str] = []
     loop._ensure_run = lambda: (
         _DueRepository({A: (now.replace(year=now.year - 1), now.replace(year=now.year - 1))}),
         None,
     )
     loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
-    loop._scan_mail = lambda wanted, visit, not_before=None: set(wanted)
 
-    from evo_helper.tools import bot_loop as module
-
-    original = module.say
-    module.say = said.append
-    try:
-        loop.collect_battle_reports((A,))
-    finally:
-        module.say = original
+    said = _waiting_lines(loop, A)
 
     assert any("到点了却没翻到" in line for line in said)
 
 
-def test_the_mail_trip_floor_is_the_dispatch_time_not_the_expected_report_time() -> None:
-    """翻信箱的时间下界取**派出时刻**，不取预计战报时刻。
+def test_saying_it_is_still_waiting_never_opens_the_mailbox() -> None:
+    """这句话是**纯日志**：战报已经在开工那一趟收过了。
 
-    预计时刻来自简报上的一次 OCR，实机上同一天同距离的六发读出 8 秒到 25 分钟
-    不等；拿它当下界，一次读大就能把真报告挡在窗口外，而且完全静默。
-    派出时刻是本地在游戏接受「出发！」那一刻记的，是硬事实。
+    再进一趟信箱要把「关浮层 → 切地表 → 开信箱 → 慢拖回顶 → 翻页 → 关面板」
+    整套再付一遍（实机约 20 秒），而那几行报告刚刚才被同一个流程翻过。
     """
-    dispatched = datetime(2026, 8, 11, 1, 7, tzinfo=UTC)
-    expected = datetime(2026, 8, 11, 1, 33, tzinfo=UTC)
-    floors: list[datetime | None] = []
-    loop, _events = _loop([])
-    loop._ensure_run = lambda: (_DueRepository({A: (dispatched, expected)}), None)
-    loop._round_start = lambda: datetime(2026, 8, 11, tzinfo=UTC)
-    loop._scan_mail = lambda wanted, visit, not_before=None: (
-        floors.append(not_before),
-        set(wanted),
-    )[1]
+    loop, events = _loop([])
+    loop._ensure_run = lambda: (_DueRepository({}), None)
+    loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
 
-    from evo_helper.tools import bot_loop as module
+    _waiting_lines(loop, A)
 
-    original = module.say
-    module.say = lambda _line: None
-    try:
-        loop.collect_battle_reports((A,))
-    finally:
-        module.say = original
-
-    assert floors == [dispatched]
+    assert events == []
+    assert loop._driver.clicks == []
 
 
 class _DueRepository:
