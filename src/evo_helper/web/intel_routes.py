@@ -65,6 +65,11 @@ class IntelRowOut(BaseModel):
 class SearchOut(BaseModel):
     rows: list[IntelRowOut]
     next_cursor: str | None
+    # 翻页要的三个数：命中总数、这一页的起点、每页行数。页码是它们算出来的，
+    # 不由服务端定义——同一批结果换个每页行数，页码就该跟着变。
+    total: int
+    offset: int
+    limit: int
 
 
 class FilterIn(BaseModel):
@@ -139,6 +144,9 @@ def register_intel_routes(app: FastAPI, session_factory: sessionmaker[Session]) 
                 for row in page.rows
             ],
             next_cursor=page.next_cursor,
+            total=page.total,
+            offset=page.offset,
+            limit=payload.limit,
         )
 
     @router.get("/filters", response_model=list[FilterOut])

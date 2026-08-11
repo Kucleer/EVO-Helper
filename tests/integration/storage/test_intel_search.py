@@ -183,6 +183,24 @@ class TestPagination:
         page = search(populated, conditions=None, limit=50)
         assert page.next_cursor is None
 
+    def test_total_counts_every_hit_not_just_this_page(self, populated) -> None:  # type: ignore[no-untyped-def]
+        """页码要靠总数算，而「这一页有几行」算不出总页数。"""
+        page = search(populated, conditions=None, limit=2)
+        assert len(page.rows) == 2
+        assert page.total == 3
+
+    def test_offset_says_where_the_page_starts(self, populated) -> None:  # type: ignore[no-untyped-def]
+        page = search(populated, conditions=None, limit=2, cursor="2")
+        assert page.offset == 2
+        assert page.total == 3
+
+    def test_a_cursor_past_the_end_yields_an_empty_page(self, populated) -> None:  # type: ignore[no-untyped-def]
+        """结果变少时前端要能发现「这一页越界了」，好退回最后一页。"""
+        page = search(populated, conditions=None, limit=2, cursor="99")
+        assert page.rows == ()
+        assert page.total == 3
+        assert page.offset == 99
+
 
 class TestSorting:
     def test_default_order_is_by_coordinate(self, populated) -> None:  # type: ignore[no-untyped-def]
