@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 from evo_helper.storage.database import UTCDateTime
-
 
 revision: str = "8c41b9d201ff"
 down_revision: str | None = "28376b48e201"

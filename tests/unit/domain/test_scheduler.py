@@ -18,9 +18,11 @@ from evo_helper.domain.scheduler import (
     RunningProcess,
     SchedulerFacts,
     TaskSnapshot,
+    came_back_empty,
     decide,
     has_work,
     quota_day_start_utc,
+    waiting_for_a_line,
 )
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
@@ -339,6 +341,134 @@ def test_a_cooling_chain_does_not_preempt_the_running_scan() -> None:
     )
 
     assert decision == Decision(Action.IDLE, None)
+
+
+# -- 航线占满之后不要再一轮轮地起 ----------------------------------------------
+#
+# 实机 2026-08-11 01:12–01:34 UTC（本地 09:12–09:34）：`free_lines` 一路报 3，
+# 游戏那边 6 条航线全满，海盗与 bot 交替起了九轮，每轮几十秒导航之后撞上
+# 「同时派遣的舰队数量已达上限。」退出，冷却五分钟，再来。
+#
+# 成因不是判据写错，是 `free_lines` 这个估算错了而且**没有回写路径**：runner
+# 在屏上看到了真相，可它撞上限之后的退出码（0）和跑完一轮正常收尾一模一样。
+
+#: 上一轮启动之后再没派出去过任何一发——「空手而归」的最小事实组合。
+_EMPTY_ROUND = {
+    "last_started_at_utc": {MissionKind.PIRATE: NOW - RESTART_COOLDOWN - timedelta(seconds=1)},
+    "last_dispatch_at_utc": {MissionKind.PIRATE: NOW - timedelta(hours=2)},
+}
+
+
+def test_a_round_that_dispatched_nothing_is_recognised_as_empty() -> None:
+    """判据就是两个时刻比大小：上一次启动之后再没有过一条被接受的派遣记录。"""
+    assert came_back_empty(MissionKind.PIRATE, facts(**_EMPTY_ROUND))
+
+
+def test_a_round_that_actually_dispatched_is_not_empty() -> None:
+    """派出去了就不算空手而归——这一刻没有任何理由怀疑航线估算。"""
+    productive = facts(
+        last_started_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=10)},
+        last_dispatch_at_utc={MissionKind.PIRATE: NOW - timedelta(minutes=9)},
+    )
+
+    assert not came_back_empty(MissionKind.PIRATE, productive)
+
+
+def test_a_chain_that_never_ran_is_not_treated_as_empty() -> None:
+    """没跑过就没有「上一轮」。开机第一轮不该被自己的空白历史压住。"""
+    assert not came_back_empty(MissionKind.PIRATE, facts(last_dispatch_at_utc={}))
+
+
+def test_an_empty_round_stops_the_chain_while_a_fleet_is_still_out() -> None:
+    """**这就是用户说的「航路上限到达后，不应继续海盗任务」。**
+
+    估算说还有一条空闲航线，可上一轮从头跑到尾一发都没派出去，而且还有舰队在
+    外面没回来——照着同一个估算再起一轮，只会把上一轮原样重演一遍。
+    """
+    blocked = facts(
+        free_lines=3,
+        next_line_free_at_utc=NOW + timedelta(minutes=3),
+        **_EMPTY_ROUND,
+    )
+
+    assert waiting_for_a_line(MissionKind.PIRATE, blocked)
+    assert not has_work(MissionKind.PIRATE, blocked, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_the_chain_comes_back_once_a_line_actually_frees_up() -> None:
+    """**不许做成永久不起。** 压到的那个时刻是库里查出来的，到点自动解除。"""
+    freed = facts(
+        free_lines=3,
+        next_line_free_at_utc=NOW - timedelta(seconds=1),
+        **_EMPTY_ROUND,
+    )
+
+    assert not waiting_for_a_line(MissionKind.PIRATE, freed)
+    assert has_work(MissionKind.PIRATE, freed, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_an_empty_round_with_nothing_in_flight_is_not_blocked() -> None:
+    """一支在飞的都没有时，这一层对「航线满不满」没有任何证据，那就不猜。
+
+    空手而归还有别的成因（这一圈没有海盗、目标都在保护期里）。单凭它就压着
+    链路，等于把一条与航线无关的规则塞进航线判据，而且没有任何时刻可以解除。
+    这一档照旧交给 `RESTART_COOLDOWN` 节流。
+    """
+    no_anchor = facts(free_lines=3, next_line_free_at_utc=None, **_EMPTY_ROUND)
+
+    assert not waiting_for_a_line(MissionKind.PIRATE, no_anchor)
+    assert has_work(MissionKind.PIRATE, no_anchor, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_waiting_for_a_line_never_holds_back_report_collection() -> None:
+    """只挡「去派」那半边判据。收报告不占航线，压着它只会让战报烂在信箱里。"""
+    blocked = facts(
+        free_lines=3,
+        next_line_free_at_utc=NOW + timedelta(minutes=3),
+        pirate_reports_due=True,
+        **_EMPTY_ROUND,
+    )
+
+    assert waiting_for_a_line(MissionKind.PIRATE, blocked)
+    assert has_work(MissionKind.PIRATE, blocked, restart_cooldown=RESTART_COOLDOWN)
+
+
+def test_an_empty_pirate_round_does_not_hold_back_the_bot_chain() -> None:
+    """空手而归按 kind 分。海盗那轮什么都没派出去，不该连累 bot。"""
+    mixed = facts(free_lines=3, next_line_free_at_utc=NOW + timedelta(minutes=3), **_EMPTY_ROUND)
+
+    assert waiting_for_a_line(MissionKind.PIRATE, mixed)
+    assert not waiting_for_a_line(MissionKind.BOT, mixed)
+
+
+def test_scanning_fills_the_gap_while_the_attack_chains_wait_for_a_line() -> None:
+    """两条攻击链路都在等航线时，扫描顶上——那正是它存在的理由。
+
+    这一条盯的是整轮里最贵的那件事：实机上那九轮不只是白跑，它们一直占着鼠标，
+    扫描一次都挤不进来。
+    """
+    stuck = facts(
+        free_lines=3,
+        next_line_free_at_utc=NOW + timedelta(minutes=3),
+        last_started_at_utc={
+            MissionKind.PIRATE: NOW - RESTART_COOLDOWN - timedelta(seconds=1),
+            MissionKind.BOT: NOW - RESTART_COOLDOWN - timedelta(seconds=1),
+        },
+        last_dispatch_at_utc={
+            MissionKind.PIRATE: NOW - timedelta(hours=2),
+            MissionKind.BOT: NOW - timedelta(hours=2),
+        },
+    )
+
+    decision = decide(
+        tasks(MissionKind.PIRATE, MissionKind.BOT, MissionKind.SCAN),
+        stuck,
+        running=None,
+        min_dwell=DWELL,
+        restart_cooldown=RESTART_COOLDOWN,
+    )
+
+    assert decision == Decision(Action.START, MissionKind.SCAN)
 
 
 # -- 配额的起算时刻 ------------------------------------------------------------

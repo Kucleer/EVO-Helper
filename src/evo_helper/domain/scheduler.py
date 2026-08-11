@@ -57,7 +57,8 @@ class TaskStatus(Enum):
     RUNNING = "运行中"
     #: 有活干，只是还没轮到它（或者调度器整个停着）。
     READY = "待命"
-    #: 估算的空闲航线为 0，且没有到期未收的战报。
+    #: 没有到期未收的战报，而且现在不值得为「去派」起一轮：估算的空闲航线为 0，
+    #: 或者上一轮空手而归、正等着一条航线真的空出来（见 `waiting_for_a_line`）。
     WAITING_LINES = "等航线"
     #: 在重启冷却里。和「等航线」分开说，是因为用户能做的事不一样：
     #: 冷却只要等，等航线得看是不是航线数配小了。
@@ -92,8 +93,11 @@ class SchedulerFacts:
     """一次调度所需的全部事实，全部来自数据库。
 
     `free_lines` 是**乐观估算**，不含用户自己派出去的舰队。权威的航线闸门
-    在 runner 的 `game.capacity.LineCapacityGate` 里——它看屏。这里估高了，
-    最坏结果是 runner 起来发现没位子、空跑一轮就退，不会误派。
+    在 runner 的 `game.capacity.LineCapacityGate` 里——它看屏。估高了不会误派，
+    但**也不是没有代价**：runner 空跑那一轮要几十秒导航，还一直占着鼠标，而且
+    错估没有回写路径，同一轮会每隔一个 `RESTART_COOLDOWN` 原样再来。兜这一层的
+    是 `waiting_for_a_line`——它用 `last_dispatch_at_utc` 与 `next_line_free_at_utc`
+    把「上一轮空手而归」变成「等到有航线真的空出来再试」。
     """
 
     now_utc: datetime
@@ -119,6 +123,15 @@ class SchedulerFacts:
     #: 事实来自 `mission_runs` 里各 kind 的最大 `started_at_utc`，
     #: 这一层不去查库。
     last_started_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
+    #: 每条链路最近一次**真的把舰队派出去**的时刻。和上一条比大小，就知道上一轮
+    #: 是不是从头跑到尾一发都没派出去，见 `came_back_empty`。
+    #: 来自 `repository.last_dispatch_at`，这一层不去查库。
+    last_dispatch_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
+    #: 已知最早会空出来的那条航线在什么时刻空。一条在飞记录都没有（或全是航线钟
+    #: 读不到的那种）时为 None。`free_lines` 说的是「现在有几条」，这一条说的是
+    #: 「下一条什么时候来」——`free_lines` 被现场推翻之后，只有后者能给出一个
+    #: 值得再试的时刻。
+    next_line_free_at_utc: datetime | None = None
 
 
 def quota_day_start_utc(now: datetime) -> datetime:
@@ -179,6 +192,52 @@ def pirate_quota_exhausted(facts: SchedulerFacts) -> bool:
     return facts.pirate_dispatches_today >= facts.pirate_quota
 
 
+def came_back_empty(kind: MissionKind, facts: SchedulerFacts) -> bool:
+    """这条链路上一轮跑完，一发都没派出去。
+
+    判据就是两个时刻比大小：上一次启动之后再没有过一条被接受的派遣记录。
+    没跑过的链路不算（没有「上一轮」可言）。
+
+    **它不声称自己认出了「航线满了」。** 认那件事的是 runner，它看屏，而它撞上
+    「同时派遣的舰队数量已达上限。」之后走的是正常收尾、退出码 0——和「这一圈
+    没有海盗」在进程间协议上一模一样，调度器这一侧分不出来，也不该去猜。
+    这里只陈述一个能查证的事实：那一轮空手而归。
+    """
+    started = facts.last_started_at_utc.get(kind)
+    if started is None:
+        return False
+    dispatched = facts.last_dispatch_at_utc.get(kind)
+    return dispatched is None or dispatched < started
+
+
+def waiting_for_a_line(kind: MissionKind, facts: SchedulerFacts) -> bool:
+    """要不要压着这条链路，等到有一条航线真的空出来再让它去派。
+
+    两个条件同时成立才压：**上一轮空手而归**，而且**还有一条在飞的舰队没回来**。
+
+    **为什么空手而归就要疑心航线。** `free_lines` 是只按自家派遣记录算出来的
+    估算，数不到用户自己派出去的舰队，也数不到航线钟被读错的那些。估错了没有
+    任何回写路径——runner 在屏上看到了真相，可它撞上限之后的退出码和跑完一轮
+    正常收尾一模一样，于是同一个错估每隔一个 `RESTART_COOLDOWN` 就原样再来一次。
+    实机 2026-08-11 01:12–01:34（本地 09:12–09:34）：`free_lines` 一路报 3，游戏
+    那边 6 条航线全满，海盗与 bot 交替起了九轮，每轮几十秒导航之后撞上限退出。
+
+    **为什么还要有第二个条件。** 空手而归有别的成因（这一圈没有海盗、目标都在
+    保护期里），单凭它就压着链路，等于把一条与航线无关的规则塞进航线判据。
+    `next_line_free_at_utc` 就是把话说死的那个锚点：只有真有舰队在外面没回来，
+    「等它回来再试」才成立；一条在飞记录都没有的时候，航线满不满这件事这一层
+    没有任何证据，那就不猜——照旧交给 `RESTART_COOLDOWN` 节流。
+
+    **因此它不可能变成永久不起**：压到的那个时刻是库里查出来的，到点自动解除。
+    而且它只挡「去派」这半边判据，「回去收战报」那半边一个字都不动——收报告不占
+    航线，压着它只会让战报烂在信箱里。
+    """
+    if not came_back_empty(kind, facts):
+        return False
+    next_free = facts.next_line_free_at_utc
+    return next_free is not None and next_free > facts.now_utc
+
+
 def bot_round_complete(facts: SchedulerFacts) -> bool:
     """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。"""
     return facts.bot_targets_remaining <= 0
@@ -196,6 +255,10 @@ def has_work(
     它是判据的一部分而不是启动前的一道额外闸门，这样抢占那一路（`decide` 里靠
     `wanted` 判断值不值得打断扫描）自动跟着生效：一条正在冷却的链路不该把扫描
     打断成谁都不在跑。
+
+    两条攻击链路的判据都是「**有航线可派** 或 **有战报该收**」。左半边多一道
+    `waiting_for_a_line`：`free_lines` 只是估算，被现场推翻过就不能再照着它起轮。
+    右半边不加任何闸门——收报告不占航线。
     """
     if cooling_down(kind, facts, restart_cooldown=restart_cooldown):
         return False
@@ -204,15 +267,17 @@ def has_work(
         # 扫描不派遣，因此不受航线约束，也没有完成态。它正是用来填空隙的。
         return True
 
+    can_dispatch = facts.free_lines > 0 and not waiting_for_a_line(kind, facts)
+
     if kind is MissionKind.PIRATE:
         if pirate_quota_exhausted(facts):
             return False
-        return facts.free_lines > 0 or facts.pirate_reports_due
+        return can_dispatch or facts.pirate_reports_due
 
     if kind is MissionKind.BOT:
         if bot_round_complete(facts):
             return False
-        return facts.free_lines > 0 or facts.bot_reports_due
+        return can_dispatch or facts.bot_reports_due
 
     # 穷举到这里说明 MissionKind 加了新成员却没人补上面的分支——宁可让
     # strict mypy 在这里报错，也不要让新种类静默套用 BOT 的判据跑起来。
@@ -263,6 +328,11 @@ def status_of(
         return TaskStatus.QUOTA_EXHAUSTED
     if task.kind is MissionKind.BOT and bot_round_complete(facts):
         return TaskStatus.DONE
+    # 「等航线」排在「冷却中」前面：两者同时成立时，等航线是那个更长、也更该让
+    # 用户看到的原因。反过来显示成「冷却中」，用户会以为再等五分钟就动，
+    # 然后眼看着它到点也不动。
+    if waiting_for_a_line(task.kind, facts):
+        return TaskStatus.WAITING_LINES
     if cooling_down(task.kind, facts, restart_cooldown=restart_cooldown):
         return TaskStatus.COOLING_DOWN
     return TaskStatus.WAITING_LINES

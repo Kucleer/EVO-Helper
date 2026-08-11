@@ -376,14 +376,37 @@ class MissionScheduler:
                 else 0
             ),
             last_started_at_utc=self._repository.last_mission_starts(),
+            last_dispatch_at_utc=self._last_dispatches(active),
+            next_line_free_at_utc=self._repository.next_line_free_at(now_utc=now),
         )
+
+    def _last_dispatches(self, active: set[MissionKind]) -> dict[MissionKind, datetime]:
+        """每条派遣链路最近一次真的把舰队派出去是什么时候。
+
+        供 `domain.scheduler.came_back_empty` 和上一次启动时刻比大小。派遣按
+        `target_kind` 存（打谁），调度器按 `MissionKind` 想（哪条链路），所以这里
+        走 `_TARGET_KIND` 那张映射，而不是让两套词汇硬凑成一套。
+
+        `SCAN` 不在映射里，也不该在：它压根不派遣。
+        """
+        moments: dict[MissionKind, datetime] = {}
+        for kind, target_kind in _TARGET_KIND.items():
+            if kind not in active:
+                continue
+            moment = self._repository.last_dispatch_at(target_kind)
+            if moment is not None:
+                moments[kind] = moment
+        return moments
 
     def _free_lines(self, config: orm.SchedulerConfigRow, now: datetime) -> int:
         """空闲航线的**乐观估算**——不含用户自己派出去的舰队。
 
-        权威闸门仍在 runner 的 `game.capacity.LineCapacityGate`（它看屏）。
-        这里估高了，最坏结果是 runner 起来发现没位子、空跑一轮就退，不会误派；
-        `reserved_lines` 正是为这段误差留的缓冲。**不要把看屏搬进调度器。**
+        权威闸门仍在 runner 的 `game.capacity.LineCapacityGate`（它看屏），
+        `reserved_lines` 是为这段误差留的缓冲。**不要把看屏搬进调度器。**
+
+        估高了不会误派，但空跑一轮要几十秒导航、还占着鼠标，而且这个错估自己
+        不会好——纠偏在 `domain.scheduler.waiting_for_a_line`：上一轮空手而归就
+        等到有航线真的空出来再试，而不是照旧五分钟一轮。
         """
         usable = max(config.fleet_line_limit - config.reserved_lines, 0)
         return max(usable - self._repository.count_inflight(now_utc=now), 0)

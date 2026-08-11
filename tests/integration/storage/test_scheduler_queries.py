@@ -20,7 +20,7 @@ from evo_helper.domain.records import (
     AttackIntent,
     FleetPresetRef,
 )
-from evo_helper.domain.report_wait import MAX_REPORT_AGE
+from evo_helper.domain.report_wait import MAX_REPORT_AGE, UNKNOWN_LINE_HOLD
 
 #: 宽限期取 `scheduler_config.report_grace_minutes` 的默认值。
 GRACE = timedelta(minutes=30)
@@ -406,11 +406,15 @@ def test_refused_dispatches_do_not_occupy_a_line(repository, run_id) -> None:  #
     assert repository.count_inflight(now_utc=now) == 0
 
 
-def test_a_dispatch_with_no_flight_time_is_not_counted_as_inflight(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """飞行时间读不到的，估算里当作不占航线——**这是一个自觉的乐观口径**。
+def test_a_dispatch_with_no_flight_time_still_holds_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """飞行时间读不到照样占航线。
 
-    估高了空闲航线，最坏结果是 runner 起来发现没位子、空跑一轮就退；
-    估低了则是航线空着不派。权威闸门在 runner 里看屏复核，兜得住前者。
+    NULL 的意思是「不知道它什么时候回来」，不是「它没占位」——被游戏接受的那一发
+    舰队一定占着一条位子，简报上读没读到那一行和这件事毫无关系。
+
+    此前这一档按「不占」记，理由是「估高了最坏也只是 runner 空跑一轮就退」。
+    实机推翻了那个「最坏」：错估没有回写路径，同一轮会每隔一个 `RESTART_COOLDOWN`
+    原样再来，每次都要几十秒导航并一直占着鼠标。
     """
     now = datetime.now(UTC)
     _dispatch(
@@ -421,7 +425,112 @@ def test_a_dispatch_with_no_flight_time_is_not_counted_as_inflight(repository, r
         dispatched_at=now - timedelta(minutes=5),
     )
 
+    assert repository.count_inflight(now_utc=now) == 1
+
+
+def test_a_dispatch_with_no_flight_time_lets_go_after_the_hold_expires(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """NULL 那一档占航线要封顶，否则一发读不出飞行时间的派遣就永久吃掉一条航线。
+
+    封顶取 `UNKNOWN_LINE_HOLD`，与放弃等它战报的阈值同一个时刻：过了这个点，
+    两边一起放手。
+    """
+    now = datetime.now(UTC)
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=27,
+        dispatched_at=now - UNKNOWN_LINE_HOLD - timedelta(minutes=1),
+    )
+
     assert repository.count_inflight(now_utc=now) == 0
+
+
+def test_the_next_free_line_ignores_dispatches_with_no_flight_time(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """航线钟为 NULL 的那些不给「下一条航线什么时候空」当闹钟。
+
+    它们的 `UNKNOWN_LINE_HOLD` 是「等到这里就放弃」的上界，不是对返航时刻的预测。
+    拿它当闹钟，调度器会一睡 6 小时。全场只剩这种派遣时宁可答不上来（None），
+    让调用方走自己那条退避。
+    """
+    now = datetime.now(UTC)
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=28,
+        dispatched_at=now - timedelta(minutes=5),
+    )
+
+    assert repository.count_inflight(now_utc=now) == 1
+    assert repository.next_line_free_at(now_utc=now) is None
+
+
+def test_the_next_free_line_is_the_earliest_one_still_out(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """有几支在飞就取最早回来的那个时刻——那是「局面会变」的最近一个锚点。"""
+    now = datetime.now(UTC)
+    for position, flight in ((21, timedelta(hours=2)), (22, timedelta(minutes=40))):
+        dispatch_id = _dispatch(
+            repository, run_id, TARGET_KIND_PIRATE, position=position, dispatched_at=now
+        )
+        repository.record_flight_time(dispatch_id, flight, now)
+
+    # 攻击发按 2× 算（打完还要飞回来），所以最早的是 40 分钟那发的 80 分钟。
+    assert repository.next_line_free_at(now_utc=now) == now + timedelta(minutes=80)
+
+
+def test_the_next_free_line_is_none_when_nothing_is_out(repository) -> None:  # type: ignore[no-untyped-def]
+    """一支在飞的都没有：这一层对「航线满不满」没有任何证据，不许瞎猜一个时刻。"""
+    assert repository.next_line_free_at(now_utc=datetime.now(UTC)) is None
+
+
+def test_the_last_dispatch_time_is_per_target_kind(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """调度器拿它和「上一次启动」比大小，判上一轮是不是空手而归。
+
+    按目标分开：bot 那轮派出去了，不该让海盗看起来也派出去了。
+    """
+    now = datetime.now(UTC)
+    _dispatch(repository, run_id, TARGET_KIND_BOT, position=11, dispatched_at=now)
+
+    assert repository.last_dispatch_at(TARGET_KIND_BOT) == now
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) is None
+
+
+def test_the_last_dispatch_time_counts_scouts_too(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """一轮只派了侦察不算空手而归——侦察一样占航线。
+
+    漏掉它的话，「侦察派满、攻击没派」的那一轮会被读成空手而归，链路白等一趟。
+    """
+    now = datetime.now(UTC)
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=12,
+        dispatched_at=now,
+        preset_name="侦察",
+        mission_kind=MISSION_KIND_SCOUT,
+    )
+
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) == now
+
+
+def test_a_refused_dispatch_is_not_a_dispatch(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """被游戏拒掉的那一发根本没飞出去。
+
+    算进来就是把「撞上航线上限」读成「派成功了」——而那恰恰是要认出来的那件事，
+    认错了调度器就照旧一轮轮地起。
+    """
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_PIRATE,
+        position=13,
+        dispatched_at=datetime.now(UTC),
+        accepted=False,
+    )
+
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) is None
 
 
 def _attach_report(session_factory, dispatch_id, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
