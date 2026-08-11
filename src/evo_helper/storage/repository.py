@@ -23,6 +23,8 @@ from evo_helper.domain.records import (
     CoordinateScan,
     FleetDiff,
     ReportHistoryEntry,
+    ScoutReport,
+    ScoutTriggerShip,
     ShipTypeDiff,
     StateEvent,
     TargetRevisit,
@@ -310,6 +312,121 @@ class SqlAlchemyRepository:
             elif len(close) > 1:
                 report_row.match_status = "AMBIGUOUS"
             session.commit()
+
+    # -- 侦察报告 -------------------------------------------------------------
+
+    def has_scout_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
+        """这个目标这个**报告时刻**的侦察报告是不是已经在库里了。
+
+        口径与 `has_report_at` 完全一致（目标 + 报告时间），理由也一样：活链路
+        每一轮都会去信箱翻同样那几行，而报告时间是游戏自己写在报告上的字，
+        不受本地时钟与重跑影响。没有这道去重，一份读到过的侦察报告会每趟复制一行。
+
+        补录入口（`tools.backfill_scout_reports`）与活链路用的是同一条判据，
+        所以两者可以随便交叉跑，谁先跑到都不会写重。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            return _scout_report_exists(session, target, reported_at_utc)
+
+    def append_scout_report(self, report: object) -> bool:
+        """写一份侦察报告；同一份（目标 + 报告时间）已经在库里就不写，返回 False。
+
+        ⚠️ **每一格原样存。** `ScoutTriggerShip.count is None` 表示这一格没读出来，
+        写进去仍是 `NULL`——不许在这里补成 0。把读空补成 0 就等于把「没看清」
+        记成「这里是空的」，而三值判定整个建立在这个区分上
+        （见 `domain.records.ScoutTriggerShip`）。
+
+        去重在同一个 session 里预检，是为了让正常路径不必靠 `IntegrityError` 收场；
+        真正的保证是表上的 `uq_scout_reports_target_time`。
+        """
+        record = _require_type(report, ScoutReport, "scout report")
+        _require_utc(record.reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            if _scout_report_exists(session, record.target, record.reported_at_utc):
+                return False
+            session.add(
+                orm.ScoutReportRow(
+                    id=record.report_id,
+                    reported_at_utc=record.reported_at_utc,
+                    raw_time_text=record.raw_time_text,
+                    origin_galaxy=record.origin.galaxy,
+                    origin_system=record.origin.system,
+                    origin_position=record.origin.position,
+                    target_galaxy=record.target.galaxy,
+                    target_system=record.target.system,
+                    target_position=record.target.position,
+                )
+            )
+            for ordinal, entry in enumerate(record.trigger_ships):
+                session.add(
+                    orm.ScoutTriggerShipRow(
+                        report_id=record.report_id,
+                        ordinal=ordinal,
+                        ship_type=entry.ship_type,
+                        # `None` 原样落成 NULL。**不要 `or 0`。**
+                        count=entry.count,
+                    )
+                )
+            session.commit()
+        return True
+
+    def list_scout_reports(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        target: Coordinate | None = None,
+    ) -> list[ScoutReport]:
+        """按报告时间升序取出侦察报告，每一格原样带回来。
+
+        `since` / `until` 是**报告时间**上的左闭右开区间（同样是 UTC）——
+        「UTC+0 的 8/11 那一天」就是 `[08-11T00:00Z, 08-12T00:00Z)`。
+        """
+        if since is not None:
+            _require_utc(since, "since")
+        if until is not None:
+            _require_utc(until, "until")
+        with self._session_factory() as session:
+            statement = select(orm.ScoutReportRow).order_by(
+                orm.ScoutReportRow.reported_at_utc, orm.ScoutReportRow.id
+            )
+            if since is not None:
+                statement = statement.where(orm.ScoutReportRow.reported_at_utc >= since)
+            if until is not None:
+                statement = statement.where(orm.ScoutReportRow.reported_at_utc < until)
+            if target is not None:
+                statement = statement.where(
+                    orm.ScoutReportRow.target_galaxy == target.galaxy,
+                    orm.ScoutReportRow.target_system == target.system,
+                    orm.ScoutReportRow.target_position == target.position,
+                )
+            rows = list(session.scalars(statement).all())
+            ships: dict[UUID, list[orm.ScoutTriggerShipRow]] = {}
+            if rows:
+                found = session.scalars(
+                    select(orm.ScoutTriggerShipRow)
+                    .where(orm.ScoutTriggerShipRow.report_id.in_([row.id for row in rows]))
+                    .order_by(orm.ScoutTriggerShipRow.ordinal, orm.ScoutTriggerShipRow.id)
+                ).all()
+                for entry in found:
+                    ships.setdefault(entry.report_id, []).append(entry)
+            return [
+                ScoutReport(
+                    report_id=row.id,
+                    reported_at_utc=row.reported_at_utc,
+                    raw_time_text=row.raw_time_text,
+                    origin=Coordinate(row.origin_galaxy, row.origin_system, row.origin_position),
+                    target=Coordinate(row.target_galaxy, row.target_system, row.target_position),
+                    trigger_ships=tuple(
+                        # `NULL` 原样带回成 `None`。**不要 `or 0`**：读回来时把它
+                        # 补成 0，和存的时候补成 0 一样是把「没看清」记成「空的」。
+                        ScoutTriggerShip(ship_type=entry.ship_type, count=entry.count)
+                        for entry in ships.get(row.id, ())
+                    ),
+                )
+                for row in rows
+            ]
 
     # -- query helpers ---------------------------------------------------------
 
@@ -1299,6 +1416,27 @@ def _require_type[T](value: object, expected: type[T], label: str) -> T:
     if not isinstance(value, expected):
         raise TypeError(f"{label} must be {expected.__name__}, got {type(value).__name__}")
     return value
+
+
+def _scout_report_exists(session: Session, target: Coordinate, reported_at_utc: datetime) -> bool:
+    """侦察报告的去重判据只有这一份：**目标 + 报告时间**。
+
+    写侧（`append_scout_report`）与问侧（`has_scout_report_at`）共用它，
+    免得哪天有人只改了一处，于是「问过不重复」和「写的时候不重复」用上两套口径。
+    """
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(orm.ScoutReportRow)
+            .where(
+                orm.ScoutReportRow.target_galaxy == target.galaxy,
+                orm.ScoutReportRow.target_system == target.system,
+                orm.ScoutReportRow.target_position == target.position,
+                orm.ScoutReportRow.reported_at_utc == reported_at_utc,
+            )
+        )
+        or 0
+    ) > 0
 
 
 def _latest_bot_intent_at(

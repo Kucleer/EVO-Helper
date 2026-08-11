@@ -172,6 +172,17 @@ MAIL_SCAN_PAGES = 4
 #: 报告（海盗一系 4 发侦察、bot 一轮 6 发探路）。
 MAIL_MAX_OPENS = 8
 
+#: 补录侦察报告（`backfill_scout_reports`）时的两个上限。
+#:
+#: 与活链路那两个（`MAIL_SCAN_PAGES` / `MAIL_MAX_OPENS`）分开写死，不是复用后调参：
+#: 活链路每一轮都要付这段时间，上限是按「一轮在等 6–8 份报告」定的；补录是人手动
+#: 跑的一次性动作，要把**一整天**的报告翻出来——2026-08-11 那天光重复侦察就 25 发。
+#:
+#: 12 屏 ≈ 72 行，覆盖得住一天的信箱；60 封 × ≈15 秒（开封 8 秒 + 两次慢拖）
+#: 最坏约 15 分钟，是「人盯着跑一次」能接受的量级，同时保证它一定会停。
+BACKFILL_SCAN_PAGES = 12
+BACKFILL_MAX_OPENS = 60
+
 #: 开工对账时最多往下翻几屏。**一封都不打开。**
 #:
 #: 正常的停止条件不是这个上限，而是「翻到了今天 UTC 00:00 之前的那一行」——
@@ -805,12 +816,19 @@ class PirateLoop:
         label: str,
         visit: Callable[[MailRow, Any], bool],
         not_before: datetime | None = None,
+        max_pages: int = MAIL_SCAN_PAGES,
+        max_opens: int = MAIL_MAX_OPENS,
     ) -> None:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
         `visit(row, page)` 返回 True 表示「要的都收齐了」，这一趟就此收工。
         `not_before` 是「要找的报告最早可能是什么时候」：列表按时间倒序，翻到比它
         更早的那一行，往下就全是旧报告，可以立刻收工。
+
+        `max_pages` / `max_opens` 默认就是活链路那两个上限，它们是按「一轮在等
+        6–8 份报告」定的，**不要为了补录去调大默认值**：活链路每一轮都要付这个
+        时间，而补录是人手动跑的一次性动作。补录入口自己传大值
+        （见 `backfill_scout_reports`）。
 
         两条链路共用这一份（侦察报告 / 攻击战报只差 `wanted` 与 `visit`）。
         原先各写一份，于是每修一次只修好一半：关浮层那条修在海盗那边、
@@ -840,8 +858,8 @@ class PirateLoop:
         seen: set[tuple[str, str]] = set()
         opened = 0
         done = False
-        for page in range(MAIL_SCAN_PAGES):
-            if done or opened >= MAIL_MAX_OPENS:
+        for page in range(max_pages):
+            if done or opened >= max_opens:
                 break
             # ⚠️ **每次点行之前都要先确认「还在邮件列表上」。** 实机踩过两次同一个错：
             # 上一次返回没退到列表（或把整个信箱关掉了），接着照列表的行坐标点下去，
@@ -862,7 +880,7 @@ class PirateLoop:
                     )
                     done = True
                     break
-                if opened >= MAIL_MAX_OPENS:
+                if opened >= max_opens:
                     say(f"  这一趟已经开了 {opened} 封，到上限；剩下的留给下一趟")
                     break
                 if not row.may_be(wanted):
@@ -872,7 +890,7 @@ class PirateLoop:
                 if self._open_mail_row(row, visit):
                     done = True
                     break
-            if not done and page + 1 < MAIL_SCAN_PAGES:
+            if not done and page + 1 < max_pages:
                 slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
         self._close_mail()
 
@@ -912,6 +930,10 @@ class PirateLoop:
 
         按**报告自己写的目标**归档，不按行号猜：行序会随新邮件变，
         而报告开头那行写着「已对 [x:y:z] 完成侦察」，那是它自己的凭据。
+
+        **读到的每一份都落库**（`_store_scout_reading`），包括「不在本轮目标里」
+        的那些。入库是加出来的一步，返回值仍旧只是本轮要的那几份——
+        `_decide_and_attack` 的入参一个字没变。
         """
         from evo_helper.vision.scout_reports import ScoutReportUnreadable, read_pirate_scout
 
@@ -928,6 +950,11 @@ class PirateLoop:
             except ScoutReportUnreadable as error:
                 say(f"  第 {row.index} 行读不出侦察报告：{error}")
                 return False
+            # ⚠️ **落库要排在归档之前，而且不管它在不在本轮目标里。** 这条链路
+            # 每一轮都当作没侦察过，于是同样四颗星球被来回重侦（2026-08-11 当天
+            # 31 发派遣里 25 发是重复侦察）。要看得出这件事，恰恰要靠「这一份不是
+            # 我这轮要的」那些行——它们正是上几轮侦察留下的证据。
+            self._store_scout_reading(reading)
             if reading.target in remaining:
                 found[reading.target] = reading
                 remaining.discard(reading.target)
@@ -950,6 +977,102 @@ class PirateLoop:
         for coordinate in sorted(remaining, key=_coordinate_order):
             say(f"  {coordinate} 的侦察报告这一趟没翻到")
         return found
+
+    def _store_scout_reading(self, reading: Any) -> bool:
+        """把一份读通了的侦察报告落进 `scout_reports`。已经有了就不写，返回 False。
+
+        写侧与 `bot_loop` 收战报那一段同形：先按「目标 + 报告时间」问一句，
+        再写。活链路每一轮都会翻信箱里同样那几行，没有这道去重，一份报告
+        会每趟复制一行。
+
+        ⚠️ **读不通的不进这里**（`read_pirate_scout` 已经抛掉了），而读通了的
+        **原样存**：哪几格没读出来就存成 `NULL`，不补 0。判定留给读的人现算，
+        库里只放证据（见 `domain.records.ScoutTriggerShip`）。
+        """
+        from evo_helper.application.report_ingest import to_scout_report
+
+        repository, _run_id = self._ensure_run()
+        if repository.has_scout_report_at(reading.target, reading.reported_at_utc):
+            return False
+        repository.append_scout_report(to_scout_report(reading, report_id=uuid4()))
+        return True
+
+    def prepare_for_mailbox(self) -> None:
+        """开工前的两步：校几何、查会话。与 `run()` 开头同序、同理由。
+
+        - 几何先校：窗口会在运行中自己缩回去，缩了之后所有 ROI 读的都是别处的像素，
+          而且一声不响。
+        - 再查会话：掉线时画面停在登录页，面板永远读不出来，翻信箱纯属白费。
+
+        ⚠️ **这两件事都会伸手动操作系统**（`ensure_game_window` 改真实窗口尺寸），
+        所以单独成一个方法、只由实机入口调用，而不是塞进
+        `backfill_scout_reports` 那样要写单元测试的方法里。
+        """
+        from evo_helper.game.game_window import ensure_game_window
+
+        ensure_game_window()
+        self._ensure_session(force=True)
+
+    def backfill_scout_reports(
+        self,
+        *,
+        not_before: datetime | None = None,
+        max_pages: int = BACKFILL_SCAN_PAGES,
+        max_opens: int = BACKFILL_MAX_OPENS,
+    ) -> tuple[int, int]:
+        """把**信箱里已经躺着的**侦察报告补进库。返回 (读通几份, 新写了几份)。
+
+        补录与活链路读的是同一条路径、同一套判据、同一份去重口径，区别只有两处：
+
+        - **一发都不派。** 这里只翻信箱、只读、只写库；调用方给的 `LiveDriver`
+          虽然必须允许点击（开信箱、开邮件、返回都要点），但这条路径上不存在
+          任何派遣动作。
+        - **预算大得多。** 活链路那两个上限（4 屏 / 8 封）是按「一轮在等 6–8 份
+          报告」定的；补录要把一整天的报告翻出来，一天可能有几十份。
+
+        ⚠️ **信箱里只切「报告」标签**，别的筛选一个都不碰——这条走的仍是
+        `_scan_mail_rows`，白名单由 `tests/unit/tools/test_mailbox_clicks.py` 钉着。
+
+        ⚠️ **校几何与查会话不在这里做**，由调用方先调 `prepare_for_mailbox()`。
+        这不是风格问题：`ensure_game_window()` 会去找并**改真实窗口的尺寸**，
+        混在这个方法里，任何一条忘了打桩的单元测试都会伸手去动用户的窗口——
+        写这条测试时就真的这么干了一次（连试三次改 1539×874 那个窗口）。
+        会动操作系统的调用要留在只有实机才走的那一层。
+        """
+        from evo_helper.vision.scout_reports import ScoutReportUnreadable, read_pirate_scout
+
+        read = 0
+        written = 0
+
+        def visit(row: MailRow, header: Any) -> bool:
+            nonlocal read, written
+            slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+            slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+            ships = self._report_screens()
+            try:
+                reading = read_pirate_scout(header, ships)
+            except ScoutReportUnreadable as error:
+                # 读不出来就**不存**，不存半份，不猜。留一句话就够——补录是人盯着跑的。
+                say(f"  第 {row.index} 行读不出侦察报告：{error}")
+                return False
+            read += 1
+            if self._store_scout_reading(reading):
+                written += 1
+                say(f"  第 {row.index} 行 → {reading.target} {reading.verdict}（已入库）")
+            else:
+                say(f"  第 {row.index} 行 → {reading.target} {reading.verdict}（库里已有）")
+            # 永远不收工：补录要把预算内的每一封都看一遍。
+            return False
+
+        self._scan_mail_rows(
+            wanted=ReportKind.SCOUT,
+            label="侦察报告",
+            visit=visit,
+            not_before=not_before,
+            max_pages=max_pages,
+            max_opens=max_opens,
+        )
+        return read, written
 
     # -- 开工对账 -----------------------------------------------------------
 

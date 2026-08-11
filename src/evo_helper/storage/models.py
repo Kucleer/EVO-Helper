@@ -230,6 +230,72 @@ class FleetSnapshotRow(Base):
     uncertain: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ScoutReportRow(Base):
+    """一份海盗侦察报告。**独立于 `battle_reports`，两者不可互相借用。**
+
+    `battle_reports` 是攻击战报表：`dispatch_id` 认领一发派遣、`match_status`
+    记认领结果、`outcome` / `attacker_units` / `*_losses` 全是打完之后才有的东西。
+    侦察报告一样都没有，塞进去只会凭空多出一行「没认领上的战报」，让判态那一侧
+    以为还有一发攻击在等回音。
+
+    去重口径与 `repository.has_report_at` 一致：**目标 + 报告时间**。报告时间是
+    游戏自己写在报告上的字，不受本地时钟与重跑影响；同一趟信箱被翻两次
+    （活链路每一轮都会翻同样那几行）不会写出第二行。唯一约束是硬保证，
+    `repository.append_scout_report` 里的预检只是让正常路径不必靠异常收场。
+    """
+
+    __tablename__ = "scout_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_galaxy",
+            "target_system",
+            "target_position",
+            "reported_at_utc",
+            name="uq_scout_reports_target_time",
+        ),
+        Index("ix_scout_reports_reported_at_utc", "reported_at_utc"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    reported_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: 报告头上那串原文（`DD/MM/YYYY HH:MM:SS`），供事后核对时区换算。
+    raw_time_text: Mapped[str] = mapped_column(String(64))
+    origin_galaxy: Mapped[int] = mapped_column(Integer)
+    origin_system: Mapped[int] = mapped_column(Integer)
+    origin_position: Mapped[int] = mapped_column(Integer)
+    target_galaxy: Mapped[int] = mapped_column(Integer)
+    target_system: Mapped[int] = mapped_column(Integer)
+    target_position: Mapped[int] = mapped_column(Integer)
+
+
+class ScoutTriggerShipRow(Base):
+    """侦察报告里某一个判定舰种那一格。
+
+    ⚠️ **`count` 可空，而 `NULL` 的含义是「这一格没读出来」，不是 0。**
+    这不是可有可无的洁癖：数量为 0 的格子在画面上只是一个孤零零的 `0`，
+    实测最容易读空（见 `vision.scout_reports.PirateScoutReading.missing`）。
+    把读空补成 0 存进来，就等于把「没看清」记成「这里是空的」，
+    而三值判定（ATTACK / SKIP / UNREADABLE）整个建立在这个区分上——
+    下一轮据此判「不值得打」，一支实打实的舰队就此被放过。
+
+    ⚠️ **这不是舰队快照，别拿它当 `fleet_snapshots` 用。** 这里只有
+    `PIRATE_TRIGGER_SHIPS` 那四个舰种，不是对方的全部舰队。
+    """
+
+    __tablename__ = "scout_trigger_ships"
+    __table_args__ = (
+        UniqueConstraint("report_id", "ship_type", name="uq_scout_trigger_report_ship"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    report_id: Mapped[UUID] = mapped_column(ForeignKey("scout_reports.id"), index=True)
+    #: 读到的先后次序。`PirateScoutReading.missing` 是有序元组，读回来要一模一样。
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    ship_type: Mapped[str] = mapped_column(String(64))
+    #: 读到的数量；**`NULL` = 没读出来**，与 0 是两回事。
+    count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class TargetRevisitRow(Base):
     __tablename__ = "target_revisits"
 

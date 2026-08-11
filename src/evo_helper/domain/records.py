@@ -112,6 +112,60 @@ class BattleReport:
 
 
 @dataclass(frozen=True)
+class ScoutTriggerShip:
+    """侦察报告里某一个判定舰种那一格。
+
+    ⚠️ **`count is None` 与 `count == 0` 是两件事，任何一层都不许把它们合并。**
+
+    - `0`：这一格读出来了，写着 0——对方这个舰种确实一艘没有。
+    - `None`：这一格**没读出来**。
+
+    `vision.scout_reports.PirateScoutReading` 的注释写着为什么这个区分要命：
+    数量为 0 的格子在画面上只是一个孤零零的 `0`，实测最容易读空，而读空当成 0
+    就把「没看清」记成了「这里是空的」，判定据此说「不值得打」，一支实打实的
+    舰队就此被放过。三值的 `verdict`（ATTACK / SKIP / UNREADABLE）整个建立在
+    这个区分上，所以库里也必须原样分得开——用可空整数，不用 0 兜底。
+    """
+
+    ship_type: str
+    #: 读到的数量；`None` 表示这一格没读出来，**绝不等于 0**。
+    count: int | None = None
+
+
+@dataclass(frozen=True)
+class ScoutReport:
+    """一份海盗侦察报告，原样落库。
+
+    ⚠️ **它不是 `BattleReport`，也不能塞进 `battle_reports`。** 那张表是攻击战报：
+    `dispatch_id` 要去认领一发派遣、`match_status` 记认领结果、`attacker_units`
+    与胜负战损全是攻击报告才有的东西。侦察报告一样都没有——它认领不了任何派遣
+    （侦察发不产生战报），却会凭空占住一行「未认领的战报」，让判态那一侧
+    以为有一发攻击还没收到回音。
+
+    ⚠️ **`trigger_ships` 也不是舰队快照，不许写 `fleet_snapshots`。**
+    `PirateScoutReading` 的注释说得很直白：那只有 `PIRATE_TRIGGER_SHIPS` 四个舰种，
+    「不是对方的全部舰队」。当成快照存，情报中心就会把一份只读了四行的报告
+    显示成对方的全部家当。
+
+    **本记录不存 `verdict`。** 打不打是一条会变的规则（见
+    `game.pirate_ui.triggers_attack` 与 `PirateScoutReading.verdict`），把当时算出来的
+    结论钉进库里，规则一改，库里那一列就成了没人知道是按哪版规则算的死数。
+    存证据（每一格读到什么、哪几格没读出来），判定留给读的人现算。
+    """
+
+    report_id: UUID
+    reported_at_utc: datetime
+    #: 报告头上那串原文（`DD/MM/YYYY HH:MM:SS`）。留着是为了事后能核对
+    #: `reported_at_utc` 的换算，与 `BattleReport.raw_time_text` 同一个用意。
+    raw_time_text: str
+    origin: Coordinate
+    target: Coordinate
+    #: 四个判定舰种各一项，**顺序即读到的顺序**（读出来的在前、没读出来的在后）。
+    #: 顺序要留住：`PirateScoutReading.missing` 是个有序元组，读回来要能一模一样。
+    trigger_ships: tuple[ScoutTriggerShip, ...] = ()
+
+
+@dataclass(frozen=True)
 class StateEvent:
     aggregate_type: str
     aggregate_id: UUID

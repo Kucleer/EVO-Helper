@@ -5,10 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from evo_helper.domain.records import BattleReport, FleetSnapshotEntry, UiObservation
+from evo_helper.domain.records import (
+    BattleReport,
+    FleetSnapshotEntry,
+    ScoutReport,
+    ScoutTriggerShip,
+    UiObservation,
+)
 from evo_helper.vision.live_reports import LiveBattleReport
 from evo_helper.vision.models import FleetLine
 from evo_helper.vision.pirate_reports import PirateReportReading
+from evo_helper.vision.scout_reports import PirateScoutReading
 
 # The repository and Web service filter snapshots on these exact strings.
 ATTACKER = "attacker"
@@ -77,6 +84,57 @@ def to_pirate_battle_report(reading: PirateReportReading, *, report_id: UUID) ->
         outcome=reading.outcome,
         attacker_losses=reading.attacker_losses,
         defender_losses=reading.defender_losses,
+    )
+
+
+def to_scout_report(reading: PirateScoutReading, *, report_id: UUID) -> ScoutReport:
+    """把一份侦察报告的读数落成 `ScoutReport`。**一个字段都不许丢。**
+
+    尤其是 `missing`：它记的是「这四个触发舰种里，哪几格没读出来」，在库里落成
+    `count IS NULL`。**不要把它折叠成 0**——读空当成 0 就是把「没看清」记成
+    「这里是空的」，下一轮据此判「不值得打」，一支实打实的舰队就此被放过
+    （`PirateScoutReading.missing` 与 `verdict` 的注释写着完整的来龙去脉）。
+
+    条目顺序是「读出来的在前、没读出来的在后」，与 `to_scout_reading` 成对——
+    这样 `missing` 那个有序元组读回来能一模一样。这里**不引用
+    `PIRATE_TRIGGER_SHIPS`**：读数里有什么就存什么，规则表以后增删舰种，
+    已经存下来的报告仍然是当时读到的那份。
+    """
+    if reading.reported_at_utc.tzinfo is None:
+        raise ValueError("reported_at_utc must be timezone-aware")
+    entries = [
+        ScoutTriggerShip(ship_type=name, count=count)
+        for name, count in reading.trigger_ships.items()
+    ]
+    entries.extend(ScoutTriggerShip(ship_type=name, count=None) for name in reading.missing)
+    return ScoutReport(
+        report_id=report_id,
+        reported_at_utc=reading.reported_at_utc,
+        raw_time_text=reading.raw_time_text,
+        origin=reading.origin,
+        target=reading.target,
+        trigger_ships=tuple(entries),
+    )
+
+
+def to_scout_reading(record: ScoutReport) -> PirateScoutReading:
+    """把库里那份读回成 `PirateScoutReading`，好让 `verdict` 现算。
+
+    库里**不存 verdict**（见 `ScoutReport` 的注释：那是一条会变的规则）。
+    要问「当时那份报告算下来是打还是不打」，就把证据读回来、按现行规则算一遍——
+    这样库里的行与活链路当场的判定永远出自同一段代码。
+    """
+    return PirateScoutReading(
+        raw_time_text=record.raw_time_text,
+        reported_at_utc=record.reported_at_utc,
+        origin=record.origin,
+        target=record.target,
+        trigger_ships={
+            entry.ship_type: entry.count
+            for entry in record.trigger_ships
+            if entry.count is not None
+        },
+        missing=tuple(entry.ship_type for entry in record.trigger_ships if entry.count is None),
     )
 
 
