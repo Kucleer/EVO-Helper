@@ -431,3 +431,93 @@ def ensure_game_window(
     if found is None:  # pragma: no cover - 竞态
         raise GameWindowError("窗口在校验尺寸后消失了")
     return found
+
+
+# -- 会话已死时的重开 -----------------------------------------------------------
+#
+# 页面自己写着「无法重新连接」的那一屏：点掉弹窗也回不去，只有整个页面重开一次
+# 才可能恢复。见 `session_keeper.ScreenState.DEAD_SESSION`。
+
+#: `PostMessageW` 的关窗消息号。
+#:
+#: **只关这一个窗口，绝不 `taskkill /im chrome.exe`。** 用户多半同时开着自己的
+#: Chrome，而同一个可执行文件的所有窗口共享进程名——按进程名杀会把用户的标签页
+#: 一起带走。`WM_CLOSE` 投到具体句柄上，效果等同于用户点了那个窗口的右上角 ×，
+#: 别的 Chrome 窗口不受影响。
+WM_CLOSE = 0x0010
+
+#: 送出 `WM_CLOSE` 之后等窗口真的消失的上限与轮询间隔。
+#:
+#: **这一等不能省。** `PostMessageW` 只是把消息投进队列就返回，此刻窗口还在。
+#: 不等它消失就去拉新窗口，屏幕上会同时留下两个游戏窗口，而 `find_game_window`
+#: 见到两个就彻底罢工——整条链路从此起不来，还得人工关窗口。
+WINDOW_CLOSE_TIMEOUT_S = 20.0
+WINDOW_CLOSE_POLL_S = 0.5
+
+
+class GameWindowLifecycle(Protocol):
+    """`restart_game_window` 会去动系统的三件事，抽出来是为了测得了。
+
+    ⚠️ **测试里绝不许真的开关窗口或改窗口尺寸。** 这层边界就是为此存在的：
+    真实现只在 `_Win32Lifecycle` 里，测试注入假的。已经出过事——有改动在单元
+    测试里直接调 `ensure_game_window()`，把用户真实的游戏窗口连拽了三次尺寸。
+    新增任何「动系统」的步骤，都要先在这里开一个方法，不要在函数体里直接调。
+    """
+
+    def find(self) -> WindowInfo | None: ...
+
+    def request_close(self, window: WindowInfo) -> None: ...
+
+    def ensure(self) -> WindowInfo: ...
+
+
+class _Win32Lifecycle:
+    """真窗口。唯一会真的关窗、真的拉起 Chrome 的地方。"""
+
+    def find(self) -> WindowInfo | None:
+        return find_game_window()
+
+    def request_close(self, window: WindowInfo) -> None:
+        import ctypes
+
+        # ctypes.windll 只在 Windows 上存在；动态取属性好让 Linux 上的 mypy 也能过。
+        getattr(ctypes, "windll").user32.PostMessageW(window.handle, WM_CLOSE, 0, 0)
+
+    def ensure(self) -> WindowInfo:
+        return ensure_game_window()
+
+
+def restart_game_window(
+    *,
+    lifecycle: GameWindowLifecycle | None = None,
+    pause: Callable[[float], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> WindowInfo:
+    """关掉游戏窗口再开一个，返回尺寸正确的新窗口。
+
+    只给「会话已死」用：页面写着「无法重新连接」时，点掉弹窗回不去，
+    页面本身已经没救了，唯一的出路是整个重开。这是**有代价的动作**
+    （用户会看到窗口消失又出现，重开后还得重走入口序列），所以调用方必须
+    真的读到那行字才来这里，并且有次数上限——见 `session_keeper`。
+
+    中间**不插一次 `launch_game`**，拉起整个交给 `ensure_game_window` 自己做。
+    手工恢复时是「关 → `launch_game` → `ensure_game_window`」三步，照抄进代码
+    却有个竞态：`launch_game` 之后 Chrome 还没画出窗口，紧接着的
+    `ensure_game_window` 既找不到 `EVO` 也找不到「正在加载」，于是**再拉一个**
+    ——两个游戏窗口，`find_game_window` 罢工。`ensure_game_window` 本来就管
+    「没窗口就拉起来」，让它一个人管这件事，这个竞态就不存在。
+    """
+    hardware = lifecycle or _Win32Lifecycle()
+    wait = pause or time.sleep
+    window = hardware.find()
+    if window is not None:
+        hardware.request_close(window)
+        deadline = clock() + WINDOW_CLOSE_TIMEOUT_S
+        while hardware.find() is not None:
+            if clock() >= deadline:
+                raise GameWindowError(
+                    f"送出 WM_CLOSE 后 {WINDOW_CLOSE_TIMEOUT_S:.0f}s 内游戏窗口没有消失；"
+                    "没有再拉一个（会留下两个窗口把链路彻底卡死），请人工确认那个窗口"
+                )
+            wait(WINDOW_CLOSE_POLL_S)
+    return hardware.ensure()

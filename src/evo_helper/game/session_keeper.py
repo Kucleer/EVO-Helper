@@ -10,6 +10,9 @@
 - **重连只走已知的入口序列**（语言页 → 进入 → START），任何认不出的画面一律停止
   并保留证据，绝不乱点。乱点可能误触派遣、删信或领奖。
 - **不与用户抢登录**。重连失败按 `SessionBackoff` 退避，退避耗尽就安全暂停。
+- **掉线分两种，善后完全不同。** 「连接已断开」点掉弹窗还能接回去；
+  「连接已断开，**无法重新连接**」是页面自己宣告没救了，点掉弹窗照样回不去，
+  只能关掉窗口重开 Chrome。后者有次数上限，理由见 `MAX_WINDOW_RESTARTS`。
 """
 
 from __future__ import annotations
@@ -35,13 +38,39 @@ START_POLL_S = 3.0
 #: 结果在线的会话被判成「认不出」。
 IN_GAME_MARKERS: tuple[str, ...] = ("商店", "联盟", "银河系", "恒星系")
 
-#: 掉线弹窗上的字。实测原文：「连接已断开，无法重新连接。」
+#: 掉线弹窗上的字，**还能接回去的那一种**。
 #:
 #: ⚠️ **这一屏最危险的地方是它看起来像在线。** 弹窗是浮层，底下的导航条
 #: 还完整地画在画面上，`IN_GAME_MARKERS` 里的「商店」「联盟」照样读得出来——
 #: 于是会话判定给出 IN_GAME，而实际上任何点击都没有效果。
 #: 所以判掉线**必须排在判 IN_GAME 之前**，和「先判入口页再判 START」同一类陷阱。
-DISCONNECT_MARKERS: tuple[str, ...] = ("连接已断开", "无法重新连接")
+DISCONNECT_MARKERS: tuple[str, ...] = ("连接已断开",)
+
+#: 同一个蓝色弹窗，但页面自己宣告**接不回去了**。实测原文（2026-08-11，
+#: 截图存在 `var/logs/now-check.png`）：「连接已断开，无法重新连接。」
+#:
+#: 善后跟上面那种**完全不同**：那一种点掉绿色 ✓ 就能回到入口序列；这一种
+#: 页面已经死了，点掉弹窗照样回不去。实机表现就是反复走「点弹窗 → 等入口页」
+#: 这条恢复序列却始终回不到游戏内，最后报「会话不可用」。唯一的出路是关掉
+#: 窗口重开 Chrome——见 `SessionKeeper._restart_now`。
+DEAD_SESSION_MARKERS: tuple[str, ...] = ("无法重新连接",)
+
+#: 关窗重开的次数上限，以及配额的滚动周期。
+#:
+#: **上限跟重开本身一样重要。** 服务端维护时每次巡检都会撞到这一屏，没有上限
+#: 就成了「每 10 分钟关一次 Chrome 再开一次」，一直折腾到有人来看——那比不重开
+#: 更糟：不重开只是停下来，无限重开会一直抢用户的桌面和前台。
+#:
+#: 取 3 次 / 1 小时：巡检间隔是 10 分钟，一小时最多撞 6 次，3 次意味着
+#: 「连着两次重开都没救回来就不是偶发，别再试了」，同时给真正的偶发（一次重开
+#: 就好）留足余量。用**滚动窗口**而不是整点清零：整点清零会在小时交界处放出
+#: 双倍配额（59 分连开 3 次，01 分又是 3 次）。
+MAX_WINDOW_RESTARTS = 3
+RESTART_BUDGET_WINDOW_S = 3600.0
+
+#: 重开之后等新窗口把入口页画出来的上限。冷启动要开 Chrome、下载资源、初始化
+#: WebGL，比「点掉弹窗回到入口页」慢一个量级，所以不共用 `ENTRY_TIMEOUT_S`。
+RESTART_ENTRY_TIMEOUT_S = 120.0
 
 
 class ScreenState(Enum):
@@ -55,6 +84,8 @@ class ScreenState(Enum):
     IN_GAME = "in_game"
     #: 掉线弹窗，只有一个绿色 ✓。点掉它才能回到入口序列。
     DISCONNECTED = "disconnected"
+    #: 同一个弹窗，但写着「无法重新连接」——点掉也回不去，只能关窗重开。
+    DEAD_SESSION = "dead_session"
     #: 加载转圈。
     LOADING = "loading"
     #: 认不出——必须停止并保留证据。
@@ -64,13 +95,19 @@ class ScreenState(Enum):
 def classify_screen(text: str) -> ScreenState:
     """按画面上的文字判断当前处于哪一屏。
 
-    顺序有讲究，两处都是实机踩出来的：
+    顺序有讲究，三处都是实机踩出来的：
 
-    - **先判掉线**：掉线弹窗底下的导航条仍在画面里，后判会读出「商店/联盟」
+    - **先判「无法重新连接」，再判「连接已断开」**：可恢复那条的文案
+      （「连接已断开」）是不可恢复那条（「连接已断开，无法重新连接。」）的
+      **前缀**，反过来判就永远走不到重开那一支——现象是助手一遍遍点掉弹窗、
+      一遍遍等不到入口页，最后报「会话不可用」，而它其实只需要重开一次窗口。
+    - **再判掉线**：掉线弹窗底下的导航条仍在画面里，后判会读出「商店/联盟」
       并给出 IN_GAME，于是助手在一个死会话上一路点下去，全程不报错。
-    - **再判 START**：START 页的背景里也印着淡淡的 ETERNAL VOID。
+    - **然后判 START**：START 页的背景里也印着淡淡的 ETERNAL VOID。
     """
     haystack = text or ""
+    if any(marker in haystack for marker in DEAD_SESSION_MARKERS):
+        return ScreenState.DEAD_SESSION
     if any(marker in haystack for marker in DISCONNECT_MARKERS):
         return ScreenState.DISCONNECTED
     if "START" in haystack.upper():
@@ -103,6 +140,10 @@ class SessionKeeper:
         click_entry: Callable[[], None],
         click_start: Callable[[], None],
         dismiss_disconnect: Callable[[], None] | None = None,
+        restart_window: Callable[[], None] | None = None,
+        max_restarts: int = MAX_WINDOW_RESTARTS,
+        restart_budget_window_s: float = RESTART_BUDGET_WINDOW_S,
+        log: Callable[[str], None] | None = None,
         interval_s: float = HEALTH_CHECK_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -111,10 +152,18 @@ class SessionKeeper:
         self._click_entry = click_entry
         self._click_start = click_start
         self._dismiss_disconnect = dismiss_disconnect
+        # 关窗重开真的会动系统，所以它是**注入进来的**：测试注入假的，
+        # 于是单元测试永远碰不到真窗口。默认 None = 不会重开，只会停下来报告。
+        self._restart_window = restart_window
+        self._max_restarts = max_restarts
+        self._restart_budget_window_s = restart_budget_window_s
+        self._log = log or (lambda _message: None)
         self._interval = interval_s
         self._clock = clock
         self._sleep = sleep
         self._last_check: float | None = None
+        #: 最近若干次重开的时刻，用来算滚动配额。
+        self._restarts: list[float] = []
 
     def due(self) -> bool:
         """距上次巡检是否已满一个间隔。首次调用必定为真。"""
@@ -137,6 +186,20 @@ class SessionKeeper:
         if state is ScreenState.UNKNOWN:
             # 认不出的画面不乱点：可能是弹窗、维护公告或改版。
             return ReconnectOutcome(state, reconnected=False, detail="unrecognised screen")
+
+        restarted = False
+        if state is ScreenState.DEAD_SESSION:
+            # 页面自己写着「无法重新连接」：入口序列救不了它，只能关窗重开。
+            refusal = self._restart_now()
+            if refusal is not None:
+                return refusal
+            restarted = True
+            # 新窗口停在入口页，不是游戏内——必须重走一遍入口序列，所以这里
+            # 只等到入口序列的某一屏，剩下的交给下面原有的分支。
+            state = self._wait_for(
+                {ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME},
+                RESTART_ENTRY_TIMEOUT_S,
+            )
 
         if state is ScreenState.DISCONNECTED:
             if self._dismiss_disconnect is None:
@@ -163,10 +226,71 @@ class SessionKeeper:
             state = self._wait_for_game()
 
         if state is ScreenState.IN_GAME:
-            return ReconnectOutcome(state, reconnected=True, detail="re-entered the session")
+            detail = (
+                "restarted the game window and re-entered the session"
+                if restarted
+                else "re-entered the session"
+            )
+            if restarted:
+                self._log("重开之后已经重新进到游戏内")
+            return ReconnectOutcome(state, reconnected=True, detail=detail)
+        if restarted:
+            self._log("重开之后仍然没能走完入口序列；停止并保留现场")
         return ReconnectOutcome(
             state, reconnected=False, detail="entry sequence did not reach the game"
         )
+
+    def _restart_now(self) -> ReconnectOutcome | None:
+        """关窗重开一次。成功发起返回 None，拒绝或失败则返回要上报的结局。
+
+        **重开是有代价的动作，所以每一步都要说话。** 静默重启看起来就是
+        「窗口莫名其妙自己关了又开」，事后从日志里根本看不出发生过什么。
+        """
+        if self._restart_window is None:
+            # 没给重开动作就停在这里，而不是退回去点弹窗——那条路已经证明没用。
+            return ReconnectOutcome(
+                ScreenState.DEAD_SESSION,
+                reconnected=False,
+                detail="dead session with no way to restart the game window",
+            )
+
+        now = self._clock()
+        self._restarts = [at for at in self._restarts if now - at < self._restart_budget_window_s]
+        minutes = self._restart_budget_window_s / 60
+        if len(self._restarts) >= self._max_restarts:
+            self._log(
+                f"读到「无法重新连接」，但 {minutes:.0f} 分钟内已经重开过 "
+                f"{len(self._restarts)} 次（上限 {self._max_restarts}）；"
+                "多半是服务端在维护，不再重开，安全停止"
+            )
+            return ReconnectOutcome(
+                ScreenState.DEAD_SESSION,
+                reconnected=False,
+                detail=(
+                    f"restart budget exhausted: {len(self._restarts)}/{self._max_restarts} "
+                    f"restarts within {self._restart_budget_window_s:.0f}s"
+                ),
+            )
+
+        self._restarts.append(now)
+        self._log(
+            "读到「无法重新连接」：会话已死，点掉弹窗也回不去。"
+            f"关掉游戏窗口并重开 Chrome（{minutes:.0f} 分钟内第 "
+            f"{len(self._restarts)}/{self._max_restarts} 次）"
+        )
+        try:
+            self._restart_window()
+        except Exception as failure:  # noqa: BLE001 - 重开失败要上报，不能把调用方拖崩
+            # 配额已经记上了：重开失败也算用掉一次，否则一个必然失败的重开
+            # 会被无限重试，正是这里要防的那种循环。
+            self._log(f"关窗重开失败：{failure}；停止而不是接着重试")
+            return ReconnectOutcome(
+                ScreenState.DEAD_SESSION,
+                reconnected=False,
+                detail=f"restarting the game window failed: {failure}",
+            )
+        self._log("窗口已重开；新窗口停在入口页，重新走「进入」→ START")
+        return None
 
     def _wait_for_game(self) -> ScreenState:
         return self._wait_for({ScreenState.IN_GAME}, START_LOAD_TIMEOUT_S)
