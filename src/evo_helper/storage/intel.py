@@ -91,6 +91,11 @@ class IntelRow:
 class IntelSearchPage:
     rows: tuple[IntelRow, ...]
     next_cursor: str | None
+    #: 当前条件下的**命中总数**，不是这一页的行数。翻页界面要说得出「共几条、
+    #: 第几页」，光有 `next_cursor` 只能说出「还有没有下一页」。
+    total: int = 0
+    #: 这一页第一行在整个结果里的下标，页码由它和 limit 算出来。
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -391,6 +396,8 @@ def _paginate(rows: list[IntelRow], *, cursor: str | None, limit: int) -> IntelS
     return IntelSearchPage(
         rows=tuple(page),
         next_cursor=str(next_index) if next_index < len(rows) else None,
+        total=len(rows),
+        offset=start,
     )
 
 

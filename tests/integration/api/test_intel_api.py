@@ -105,6 +105,30 @@ class TestSearch:
         )
         assert {row["coordinate"] for row in response.json()["rows"]} == {"1:150:4", "1:160:7"}
 
+    def test_response_carries_what_the_pager_needs(self, client: TestClient) -> None:
+        """总数、页起点、每页行数——页码在浏览器里由这三个数算出来。"""
+        response = client.post(
+            "/api/intel/search",
+            json={"span": {"start": "1:100", "end": "1:200"}, "limit": 1},
+        )
+        page = response.json()
+
+        assert len(page["rows"]) == 1
+        assert page["total"] == 2
+        assert page["offset"] == 0
+        assert page["limit"] == 1
+
+    def test_a_later_page_reports_its_own_offset(self, client: TestClient) -> None:
+        response = client.post(
+            "/api/intel/search",
+            json={"span": {"start": "1:100", "end": "1:200"}, "limit": 1, "cursor": "1"},
+        )
+        page = response.json()
+
+        assert page["offset"] == 1
+        assert page["total"] == 2
+        assert page["next_cursor"] is None
+
 
 class TestValidationErrors:
     def test_unknown_ship_is_a_readable_error(self, client: TestClient) -> None:

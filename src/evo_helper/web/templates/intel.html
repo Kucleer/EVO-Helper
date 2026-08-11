@@ -20,11 +20,22 @@
 
     <span class="sep" role="separator"></span>
 
+    {#
+      默认按**战报时间倒序**，不按坐标。
+
+      按坐标排时这一页打开就是 2:1:9、2:2:13……而全宇宙有 4000 多个 bot、
+      每页只取前 50 行；今天刚打过的那几个（比如 2:320–2:325）排在几百行开外，
+      于是「刚跑完一轮，来看看打了谁」这件事**根本看不到**——实机上就是这样，
+      用户报「情报中心看不到」，而数据一直在库里，只是排在够不着的地方。
+
+      时间倒序把「最近有战报的」顶到最前，没有战报的自然沉底（`snapshot_at`
+      为空时排序键取 -inf）。要按坐标查仍然一下拉就能切回去。
+    #}
     <select id="sort" aria-label="排序">
+      <option value="snapshot_desc" selected>战报时间 ↓</option>
       <option value="coordinate">坐标</option>
       <option value="total_desc">总数 ↓</option>
       <option value="total_asc">总数 ↑</option>
-      <option value="snapshot_desc">时间 ↓</option>
     </select>
 
     <button class="btn primary small" id="run-search" type="button">检索</button>
@@ -58,8 +69,35 @@
     </table>
   </div>
   <div id="result-empty" class="empty" hidden>还没有检索结果。设置条件后点击「检索」。</div>
-  <div class="field-row" style="margin-top:10px">
-    <button class="btn small" id="load-more" type="button" hidden>加载更多</button>
+
+  {#
+    分页，不是「加载更多」。
+
+    「加载更多」只能往前堆，翻到第 8 屏想回第 2 屏就只能滚回去，也说不出
+    「一共命中多少」——用户看到的永远是「已经加载的这些」。分页把总数、当前
+    页码、总页数都摆在明面上，往回翻也是一次点击。
+  #}
+  <div class="filter-bar" id="pager" style="margin-top:10px" hidden>
+    <span class="inline-label">每页</span>
+    <select id="page-size" aria-label="每页行数">
+      <option value="25">25</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+      <option value="200">200</option>
+    </select>
+
+    <span class="sep" role="separator"></span>
+
+    <button class="btn small" id="first-page" type="button" aria-label="第一页">« 首页</button>
+    <button class="btn small" id="prev-page" type="button">← 上一页</button>
+    <span class="inline-label">第</span>
+    <input id="page-input" type="number" min="1" size="4" style="width:56px" aria-label="页码">
+    <span class="inline-label" id="page-total">/ 1 页</span>
+    <button class="btn small" id="next-page" type="button">下一页 →</button>
+    <button class="btn small" id="last-page" type="button" aria-label="最后一页">末页 »</button>
+
+    <span class="spacer"></span>
+    <span class="muted" id="page-range" style="font-size:12px"></span>
   </div>
 </section>
 
@@ -81,7 +119,10 @@
   // detail dialog. A column per recorded type overflowed a laptop screen.
   const LIST_SHIPS = {{ list_ship_columns | tojson }};
   let shipNames = [];
-  let cursor = null;
+  // 分页状态。offset 是「这一页第一行在整份结果里的下标」，服务端的 cursor 就是
+  // 这个下标的字符串形式，所以页码可以直接算，不必攒着一串 cursor 往回找。
+  let offset = 0;
+  let total = 0;
   let lastQuery = null;
 
   const el = (id) => document.getElementById(id);
@@ -221,9 +262,9 @@
     }
   }
 
-  function renderRows(rows, append) {
+  function renderRows(rows) {
     const body = el('result-rows');
-    if (!append) body.replaceChildren();
+    body.replaceChildren();
     for (const row of rows) {
       const counts = Object.fromEntries(row.ships.map((s) => [s.ship_type, s.count]));
       const tr = document.createElement('tr');
@@ -254,10 +295,11 @@
 
       body.append(tr);
     }
-    const total = body.children.length;
+    // 标题上的数字说的是**命中总数**，不是这一页的行数——第 3 页写「(50)」
+    // 会让人以为一共就 50 条。
     el('result-count').textContent = total ? `(${total})` : '';
-    el('result-empty').hidden = total > 0;
-    if (!total) el('result-empty').textContent = '没有目标满足当前条件。';
+    el('result-empty').hidden = body.children.length > 0;
+    if (!body.children.length) el('result-empty').textContent = '没有目标满足当前条件。';
   }
 
   function cell(text, className) {
@@ -395,19 +437,59 @@
     box.hidden = !message;
   }
 
-  async function runSearch(append = false) {
-    const query = append && lastQuery ? { ...lastQuery, cursor } : buildQuery();
+  const pageSize = () => Number(el('page-size').value);
+  const pageCount = () => Math.max(1, Math.ceil(total / pageSize()));
+
+  /**
+   * 翻页时沿用上一次的检索条件（`keep`），不重读输入框：条件改了但还没点
+   * 「检索」时去点「下一页」，翻的应该还是眼前这份结果，而不是半路换一份。
+   */
+  async function runSearch(nextOffset = 0, keep = false) {
+    const query = keep && lastQuery ? { ...lastQuery } : buildQuery();
     lastQuery = { ...query };
-    delete lastQuery.cursor;
+    offset = Math.max(0, nextOffset);
     showError('');
     try {
-      const page = await EVOHelper.post('/api/intel/search', query);
-      renderRows(page.rows, append);
-      cursor = page.next_cursor;
-      el('load-more').hidden = !cursor;
+      const page = await EVOHelper.post('/api/intel/search', {
+        ...query,
+        cursor: offset ? String(offset) : null,
+        limit: pageSize(),
+      });
+      total = page.total;
+      offset = page.offset;
+      // 结果变少（换了条件、或数据被清过）时停在空白的第 9 页没有意义，
+      // 退到还有行的最后一页重来一次。
+      if (!page.rows.length && total > 0 && offset >= total) {
+        await runSearch((pageCount() - 1) * pageSize(), true);
+        return;
+      }
+      renderRows(page.rows);
+      renderPager();
     } catch (error) {
       showError(error.detail || error.message);
     }
+  }
+
+  function renderPager() {
+    const size = pageSize();
+    const pages = pageCount();
+    const current = Math.floor(offset / size) + 1;
+    el('pager').hidden = total === 0;
+    el('page-input').value = String(current);
+    el('page-input').max = String(pages);
+    el('page-total').textContent = `/ ${pages} 页`;
+    el('page-range').textContent = total
+      ? `共 ${total.toLocaleString()} 条，正在看第 ${(offset + 1).toLocaleString()}–${Math.min(offset + size, total).toLocaleString()} 条`
+      : '';
+    el('first-page').disabled = current <= 1;
+    el('prev-page').disabled = current <= 1;
+    el('next-page').disabled = current >= pages;
+    el('last-page').disabled = current >= pages;
+  }
+
+  function goToPage(number) {
+    const page = Math.min(Math.max(1, Number(number) || 1), pageCount());
+    runSearch((page - 1) * pageSize(), true);
   }
 
   // ---- saved filters ----------------------------------------------------
@@ -431,7 +513,7 @@
     el('span-end').value = filter.span ? filter.span.end : '';
     hydrate(activeGroup(), filter.conditions);
     refreshCondCount();
-    runSearch();
+    runSearch(0);
   };
 
   el('delete-saved').onclick = async () => {
@@ -460,10 +542,21 @@
 
   el('add-condition').onclick = () => { activeGroup().querySelector('[data-children]').append(makeCondition()); refreshCondCount(); };
   el('add-group').onclick = () => activeGroup().querySelector('[data-children]').append(makeGroup('OR', 1));
-  el('run-search').onclick = () => { cursor = null; runSearch(false); };
-  el('load-more').onclick = () => runSearch(true);
-  el('sort').onchange = () => { cursor = null; runSearch(false); };
+  el('run-search').onclick = () => runSearch(0);
+  el('sort').onchange = () => runSearch(0);
   el('close-history').onclick = () => el('history-dialog').close();
+
+  // 改每页行数后回第一页：留在「第 7 页」上，换成每页 200 就成了第 1400 条起，
+  // 早已越过原来看的那一段。
+  el('page-size').onchange = () => runSearch(0, true);
+  el('first-page').onclick = () => goToPage(1);
+  el('prev-page').onclick = () => goToPage(Math.floor(offset / pageSize()));
+  el('next-page').onclick = () => goToPage(Math.floor(offset / pageSize()) + 2);
+  el('last-page').onclick = () => goToPage(pageCount());
+  el('page-input').onchange = () => goToPage(el('page-input').value);
+  el('page-input').onkeydown = (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); goToPage(el('page-input').value); }
+  };
 
   (async () => {
     root.append(makeGroup('AND', 0));
@@ -472,7 +565,7 @@
     activeGroup().querySelector('[data-children]').append(makeCondition());
     await loadFilters();
     refreshCondCount();
-    runSearch(false);
+    runSearch(0);
   })();
 })();
 </script>
