@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+from evo_helper.domain.battle_outcome import outcome_from_totals
 from evo_helper.vision.models import (
     FleetLine,
     PageObservation,
@@ -116,6 +117,18 @@ class LiveBattleReport:
     #: 读不到时为 None，绝不用明细之和顶替。
     attacker_units: int | None = None
     defender_units: int | None = None
+    #: 详情页的「损失单位」总数，双方各一。它是 `outcome` 的**输入之一**，
+    #: 不只是展示字段：剩余 = 单位 − 损失单位。
+    #: 这一行要把详情页拖到底才读得到，所以缺席是常态。
+    attacker_losses: int | None = None
+    defender_losses: int | None = None
+    #: `VICTORY` / `FAIL` / `DRAW`，**算出来的**，不是从横幅读的：
+    #: 本方剩余 0 判负、对方被全歼判胜、两边都有船判平
+    #: （用户口径 2026-08-11，判据在 `domain.battle_outcome`）。
+    #:
+    #: ⚠️ **算不出就是 None，绝不拿别的东西顶替。** 「没算出胜负」和「打输了」
+    #: 在下游完全不同：后者会进攻击日志的战果列，显示成一场根本没读过的败仗。
+    outcome: str | None = None
     #: How long this report took to read, split by stage.
     timing: ReadTiming = field(default_factory=ReadTiming)
 
@@ -202,8 +215,10 @@ class LiveReportReader:
         )
         return report
 
-    def read_detail_only(self, detail_page: PageObservation) -> LiveBattleReport:
-        """只读**战斗详情页**那一屏：报告时间、双方、「单位」总数。
+    def read_detail_only(
+        self, detail_page: PageObservation, *, bottom: object | None = None
+    ) -> LiveBattleReport:
+        """只读**战斗详情页**：报告时间、双方、「单位」与「损失单位」，据此算胜负。
 
         与 `read_report` 的差别是 `participating_*` 与 `rounds` 一律为空——
         因为那些东西**不在详情页上**：参战战舰那两列的行界（`ReportLayout.
@@ -217,16 +232,57 @@ class LiveReportReader:
 
         ⚠️ **空就是空，不拿别的东西顶替。** 「没读逐舰种明细」和「对方一艘船都
         没有」在下游长得一模一样，而后者会直接进情报中心。这条与
-        `attacker_units` 那条注释是同一个规矩：读不到就留空。
+        `attacker_units`、`outcome` 那两条注释是同一个规矩：读不到就留空。
 
         其余判据一条不放松：主题必须是可匹配派遣的攻击报告、时间必须读得出、
         VS 块必须两边都全——单边战报会被挂到错的目标上。
+
+        ## 胜负是**算**出来的
+
+        剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、两边都有船判平
+        （用户口径 2026-08-11，判据在 `domain.battle_outcome`）。画面上那行
+        `VICTORY` / `FAIL` 大字只做交叉校验，两边都算得出而结论不一致时留一条
+        warning——用户明确说了不看游戏内的提示，横幅没有推翻算式的资格。
+
+        代价说在前面：**四个数缺一个就判不出**，而「损失单位」那一行恰恰要拖到底
+        才读得到（见下）。所以没有第二屏时 `outcome` 多半是 None，这是诚实的空，
+        不是故障。
+
+        ## `bottom`：拖到底之后的那一屏
+
+        bot 战报比海盗战报**多一行**「生成卫星概率」，「战斗详情」横幅因此下移约
+        30px，「单位」那一行整个落到面板可视区之外。2026-08-11 的五张实拍里
+        四张如此（第五张恰好没有那一行，「单位」就读得出来，读数 `1` / `319`），
+        所以这不是定位错、是那一行**根本没画出来**——只能拖。
+        「损失单位」在它下面一行，更是**只有**拖到底才读得到。
+
+        这一步因此从「补一个展示字段」变成了**判据的输入**：不拖就没有战损，
+        没有战损就算不出胜负。
+
+        ⚠️ **时间与 VS 块必须仍旧从没拖过的那一屏读**——拖到底之后它们都滚出了
+        可视区。所以两屏各有各的用处，不能互相顶替：
+        「单位」先问第一屏、读不到再问第二屏；「损失单位」只在第二屏上。
         """
         timer = _StageTimer(self._clock)
         self._require_version(detail_page, SUPPORTED_DETAIL_VERSIONS, "battle detail")
         kind, raw_time, reported_at = self._header_facts(timer)
         versus = self._versus(timer)
-        attacker_units, defender_units = self._unit_totals()
+        attacker_units, defender_units = self._unit_totals(self._screens)
+        if bottom is not None and attacker_units is None and defender_units is None:
+            attacker_units, defender_units = self._unit_totals(bottom)
+        # 「损失单位」只在拖到底那一屏上（没拖时被面板下沿切掉，读出来是半行字）。
+        # 没给第二屏就问第一屏——多半读不到，那就诚实地留空。
+        attacker_losses, defender_losses = self._loss_totals(
+            bottom if bottom is not None else self._screens
+        )
+        outcome = outcome_from_totals(
+            attacker_units=attacker_units,
+            attacker_losses=attacker_losses,
+            defender_units=defender_units,
+            defender_losses=defender_losses,
+        )
+        self._cross_check_banner(outcome, raw_time)
+        timer.stage("outcome")
         return LiveBattleReport(
             kind=kind,
             raw_time_text=raw_time,
@@ -241,6 +297,9 @@ class LiveReportReader:
             ui_versions={"battle_detail_ui_version": str(detail_page.ui_version)},
             attacker_units=attacker_units,
             defender_units=defender_units,
+            attacker_losses=attacker_losses,
+            defender_losses=defender_losses,
+            outcome=outcome,
             timing=timer.finish(),
         )
 
@@ -272,7 +331,7 @@ class LiveReportReader:
             raise UnknownUiVersionError("versus block is incomplete; refusing a one-sided report")
         return versus
 
-    def _unit_totals(self) -> tuple[int | None, int | None]:
+    def _unit_totals(self, screens: object) -> tuple[int | None, int | None]:
         """「单位」总数是独立来源，读不到就留空——**绝不用明细之和顶替**。
 
         大舰队的逐行数量是四舍五入显示（`5.36K`），相加得出的「总数」是假的。
@@ -280,9 +339,42 @@ class LiveReportReader:
         用 getattr 取而不是写进协议：写进去会打断所有既有的 ReportScreens 实现，
         而总数是增强项——提供不了的实现照样能读出一份完整报告。
         """
-        reader = getattr(self._screens, "unit_totals", None)
+        reader = getattr(screens, "unit_totals", None)
         totals = reader() if reader is not None else ("", "")
         return (_unit_count(totals[0]), _unit_count(totals[1]))
+
+    def _loss_totals(self, screens: object) -> tuple[int | None, int | None]:
+        """「损失单位」总数，双方各一。读不到就留空——它是胜负的输入，不能猜。
+
+        与 `_unit_totals` 同一个 getattr 路子，理由也一样：写进协议会打断所有
+        既有的 `ReportScreens` 实现。
+        """
+        reader = getattr(screens, "loss_totals", None)
+        totals = reader() if reader is not None else ("", "")
+        return (_unit_count(totals[0]), _unit_count(totals[1]))
+
+    def _cross_check_banner(self, computed: str | None, where: str) -> None:
+        """算出来的胜负与画面横幅对不上就留一条 warning。**只记不改。**
+
+        用户明确说了不看游戏内的提示，所以横幅没有推翻算式的资格；但两者都读得出
+        还不一致，说明其中一条链路坏了——那正是值得有人看一眼的事。
+
+        **算不出胜负时连读都不读**：横幅那一次 OCR 只为校验，而这时没有东西可校，
+        白花约 0.3 秒。bot 战报缺战损是常态，省下的正是常态那一路。
+
+        **不在这里抛。** 海盗那条链路算不出胜负就整份拒收，因为那份记录**只有**
+        胜负与战损；bot 这条链路的主业是「战报回来了没有」与守方单位数，
+        为一个算不出的战果丢掉整份战报，会让目标重新卡回 `AWAITING_PROBE_REPORT`
+        ——那正是这条链路上一次的死结。
+        """
+        if computed is None:
+            return
+        from evo_helper.vision.pirate_reports import cross_check_banner
+
+        reader = getattr(self._screens, "outcome_banner", None)
+        if reader is None:
+            return
+        cross_check_banner(computed, reader(), where=f"攻击战报 {where}")
 
     def _read_report(
         self,
@@ -308,7 +400,15 @@ class LiveReportReader:
         rounds = parse_replay_rounds(self._screens.round_columns(), self._source)
         timer.stage("rounds")
 
-        attacker_units, defender_units = self._unit_totals()
+        attacker_units, defender_units = self._unit_totals(self._screens)
+        attacker_losses, defender_losses = self._loss_totals(self._screens)
+        outcome = outcome_from_totals(
+            attacker_units=attacker_units,
+            attacker_losses=attacker_losses,
+            defender_units=defender_units,
+            defender_losses=defender_losses,
+        )
+        self._cross_check_banner(outcome, raw_time)
 
         return LiveBattleReport(
             kind=kind,
@@ -325,6 +425,9 @@ class LiveReportReader:
             },
             attacker_units=attacker_units,
             defender_units=defender_units,
+            attacker_losses=attacker_losses,
+            defender_losses=defender_losses,
+            outcome=outcome,
             timing=timer.finish(),
         )
 

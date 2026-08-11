@@ -76,6 +76,16 @@ class _CapturedScreens:
         # 「单位」总数在**详情页**，不在回放页。
         return self._detail.unit_totals()
 
+    def loss_totals(self) -> tuple[str, str]:
+        # 「损失单位」同样在详情页。⚠️ 只有那张截图是**拖到底**之后拍的才读得到；
+        # 没拖过的详情页上这一行被面板下沿切掉，读回来是半行字 → 留空 → 算不出胜负。
+        return self._detail.loss_totals()
+
+    def outcome_banner(self) -> str:
+        # 胜负横幅同样只在详情页上；回放页那一屏顶部是 VS 块。
+        # 现在只做交叉校验，判据是 `domain.battle_outcome` 那条算式。
+        return self._detail.outcome_banner()
+
 
 def read_report(detail: Path, replay: Path, tesseract_cmd: str) -> LiveBattleReport:
     reader = LiveReportReader(_CapturedScreens(detail, replay, tesseract_cmd))
@@ -120,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"reported (UTC): {live.reported_at_utc.isoformat()}")
     print(f"attacker      : {live.attacker.player} {live.attacker.coordinate.value}")
     print(f"defender      : {live.defender.player} {live.defender.coordinate.value}")
+    print(f"outcome       : {live.outcome or '(not computable)'}")
+    print(
+        f"units / losses: 我 {live.attacker_units}/{live.attacker_losses}, "
+        f"敌 {live.defender_units}/{live.defender_losses}"
+    )
     print(f"fleet rows    : {len(report.fleet)}")
     print(f"read time     : {live.timing.summary()}")
     print(f"slowest stage : {live.timing.slowest[0]}")

@@ -24,7 +24,7 @@ from evo_helper.domain.records import (
 )
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.vision.pirate_reports import OUTCOME_VICTORY
+from evo_helper.vision.pirate_reports import OUTCOME_DRAW, OUTCOME_FAIL, OUTCOME_VICTORY
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
@@ -36,7 +36,7 @@ DISPATCHED = datetime(2026, 8, 9, 3, 55, tzinfo=UTC)
 PRESET = FleetPresetRef(name="AAA", signature="深空吞噬者:70")
 
 
-def _client(tmp_path: Path, *, with_report: bool) -> TestClient:
+def _client(tmp_path: Path, *, with_report: bool, outcome: str = OUTCOME_VICTORY) -> TestClient:
     engine = create_database_engine(f"sqlite:///{tmp_path / 'logs.db'}")
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
@@ -79,7 +79,7 @@ def _client(tmp_path: Path, *, with_report: bool) -> TestClient:
                 attacker_origin=ORIGIN,
                 defender_target=TARGET,
                 raw_time_text="09/08/2026 04:38:46",
-                outcome=OUTCOME_VICTORY,
+                outcome=outcome,
                 attacker_losses=0,
                 defender_losses=783,
             )
@@ -96,6 +96,27 @@ def test_the_log_page_shows_the_battle_result(tmp_path: Path) -> None:
     assert "胜" in body
     assert "战损 我 0" in body
     assert "敌 783" in body
+
+
+def test_a_lost_battle_shows_as_a_defeat(tmp_path: Path) -> None:
+    """bot 探路战报现在也会带着战果进来，而它们基本全是 `FAIL`——
+    探路本来就是拿一艘船去换一个守方数量，赢不了。"""
+    body = _client(tmp_path, with_report=True, outcome=OUTCOME_FAIL).get("/logs").text
+
+    assert "负" in body
+    assert "胜" not in body
+
+
+def test_a_draw_is_not_rendered_as_a_defeat(tmp_path: Path) -> None:
+    """⚠️ 原先这一格是「不是 VICTORY 就画成负」。
+
+    库里存的是**画面上的原文**，多一档就会被静默画成败仗——而页面上败仗和平局
+    是两个结论。这一条钉的是「兜底分支不许再回来」。
+    """
+    body = _client(tmp_path, with_report=True, outcome=OUTCOME_DRAW).get("/logs").text
+
+    assert "平" in body
+    assert "负" not in body
 
 
 def test_an_attack_without_a_report_yet_shows_pending(tmp_path: Path) -> None:

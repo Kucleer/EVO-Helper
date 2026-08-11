@@ -11,9 +11,11 @@ from datetime import UTC, datetime
 import pytest
 
 from evo_helper.vision.pirate_reports import (
+    OUTCOME_DRAW,
     OUTCOME_FAIL,
     OUTCOME_VICTORY,
     PirateReportUnreadable,
+    cross_check_banner,
     parse_outcome,
     read_pirate_report,
 )
@@ -75,10 +77,32 @@ def test_per_ship_detail_is_not_recorded() -> None:
     assert not hasattr(reading, "fleet")
 
 
-def test_a_lost_battle_reads_as_fail() -> None:
-    reading = read_pirate_report(_Screens(banner="FAIL"), _Screens())
+def test_a_lost_battle_is_computed_from_the_survivors_not_the_banner() -> None:
+    """⚠️ 判据是**剩余舰艇数**，不是画面上那行大字（用户口径 2026-08-11）。
+
+    这里故意让两者打架：横幅写着 `VICTORY`，而我方 100 全损、对方 783 一艘没掉。
+    按算式我方剩余 0 → `FAIL`。横幅没有推翻算式的资格，只会留一条 warning。
+    """
+    reading = read_pirate_report(
+        _Screens(banner="VICTORY", units=("100", "783"), losses=("100", "0")),
+        _Screens(losses=("100", "0")),
+    )
 
     assert reading.outcome == OUTCOME_FAIL
+
+
+def test_a_draw_needs_no_screenshot_of_a_draw() -> None:
+    """平局这一档是**算出来的**，不必先认出一张没人见过的横幅。
+
+    仓库里 7 张详情页只有 `VICTORY` 与 `FAIL` 两种大字；换成按剩余数算之后，
+    「两边都还有船」自然就落到 `DRAW`。
+    """
+    reading = read_pirate_report(
+        _Screens(units=("100", "783"), losses=("30", "200")),
+        _Screens(losses=("30", "200")),
+    )
+
+    assert reading.outcome == OUTCOME_DRAW
 
 
 def test_a_banner_missing_a_letter_still_snaps() -> None:
@@ -88,13 +112,66 @@ def test_a_banner_missing_a_letter_still_snaps() -> None:
     assert parse_outcome("FAlL") == OUTCOME_FAIL
 
 
-def test_an_unreadable_banner_rejects_the_whole_report() -> None:
-    """胜负与战损是这条记录**唯一**的内容，读不出胜负就没有存的价值。"""
-    assert parse_outcome("") is None
-    assert parse_outcome("TOTAL CREW") is None
+def test_an_unreadable_banner_no_longer_rejects_anything() -> None:
+    """横幅降级成交叉校验之后，它读不出来**不再影响**这份记录能不能存。
 
-    with pytest.raises(PirateReportUnreadable, match="胜负"):
-        read_pirate_report(_Screens(banner=""), _Screens())
+    胜负来自四个数，横幅没有一票否决权——那五张 bot 实拍上的横幅一度全读成
+    `'- a'`，而它们的四个数（拖到底之后）是齐的。
+    """
+    reading = read_pirate_report(_Screens(banner=""), _Screens())
+
+    assert reading.outcome == OUTCOME_VICTORY
+
+
+def test_a_report_whose_outcome_cannot_be_computed_is_refused() -> None:
+    """胜负与战损是这条记录**唯一**的内容，算不出胜负就没有存的价值。
+
+    判据换了（从「横幅读不出」变成「四个数缺一个」），拒收这条规矩没换。
+    """
+    with pytest.raises(PirateReportUnreadable, match="算不出胜负"):
+        read_pirate_report(_Screens(units=("", "")), _Screens())
+
+
+class TestTheBannerIsOnlyACrossCheck:
+    """横幅**只记不改**：它没有推翻算式的资格，但对不上时要有人看得见。"""
+
+    def test_a_disagreement_leaves_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING"):
+            cross_check_banner(OUTCOME_FAIL, "VICTORY", where="测试")
+
+        assert "以算出来的为准" in caplog.text
+
+    def test_agreement_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING"):
+            cross_check_banner(OUTCOME_VICTORY, "VICTORY", where="测试")
+
+        assert caplog.text == ""
+
+    def test_an_unreadable_banner_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """bot 战报缺战损是常态，横幅读不出来也是常态。
+
+        为常态刷 warning 等于把这条校验变成噪声，用不了几次就没人再看它了。
+        """
+        with caplog.at_level("WARNING"):
+            cross_check_banner(OUTCOME_FAIL, "- a", where="测试")
+            cross_check_banner(None, "VICTORY", where="测试")
+
+        assert caplog.text == ""
+
+
+def test_the_third_label_does_not_swallow_the_other_two() -> None:
+    """`DRAW` 这一档**手上没有样本**（仓库里 7 张详情页只有 `VICTORY` / `FAIL`）。
+
+    列进词表的前提是它不能把另外两档吸走：三档两两距离都远大于容差 2，
+    而 `snap_to_vocabulary` 遇到并列命中还会判歧义返回 None。
+    这条钉的就是「多一档没有代价」，而不是「平局读得出来」——后者无从验证。
+    """
+    assert parse_outcome("DRAW") == OUTCOME_DRAW
+    assert parse_outcome("FAIL") == OUTCOME_FAIL
+    assert parse_outcome("VICTORY") == OUTCOME_VICTORY
+    # 2026-08-11 实拍上真的读出来过的噪声，一段都不许贴上。
+    for noise in ("- a", "Z ?", "ee eoooooOomy", "@- b= ie", ") Ai tt Fl:", "re", "-17003"):
+        assert parse_outcome(noise) is None, noise
 
 
 def test_unreadable_losses_reject_the_whole_report() -> None:
@@ -102,12 +179,14 @@ def test_unreadable_losses_reject_the_whole_report() -> None:
         read_pirate_report(_Screens(), _Screens(losses=("0", "")))
 
 
-def test_missing_unit_totals_are_tolerated() -> None:
-    """单位总数是附带信息；这条记录的正文是胜负与战损。"""
-    reading = read_pirate_report(_Screens(units=("", "")), _Screens())
+def test_unit_totals_are_no_longer_optional() -> None:
+    """「单位」从附带信息变成了**判据的输入**：剩余 = 单位 − 损失单位。
 
-    assert reading.attacker_units is None
-    assert reading.outcome == OUTCOME_VICTORY
+    以前它读不出来只是少一个展示字段，现在少了就判不出胜负，而胜负是这条记录的
+    正文——所以整份拒收。这是换判据带来的、有意的收紧。
+    """
+    with pytest.raises(PirateReportUnreadable, match="算不出胜负"):
+        read_pirate_report(_Screens(units=("", "")), _Screens())
 
 
 def test_a_non_pirate_report_is_refused() -> None:

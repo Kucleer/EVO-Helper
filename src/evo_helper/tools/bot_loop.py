@@ -35,10 +35,24 @@
 现在翻信箱的窗口与筛选归 `pirate_loop.PirateLoop._scan_mail_rows` 统一管：
 先在列表页读主题、只开主题对得上的、翻得到第四屏、翻到旧报告就停。
 
-## 只读详情页那一屏
+## 只读详情页，但那是**两屏**
 
 分档防的是**量级错**，不是末位误差（见 `domain.fleet_tier` 模块头）。「单位」总数是
-详情页上独立给出的一个数，一个 ROI 就读到。
+详情页上独立给出的一个数，一个 ROI 就读到——**前提是它画出来了**。
+
+bot 战报比海盗战报多一行「生成卫星概率」，「战斗详情」横幅因此下移约 30px，
+「单位」整行落到面板可视区之外。2026-08-11 的五张实拍里四张如此（第五张恰好
+没有那一行，「单位」就读得出来）。所以详情页要拖到底再拍一屏，只为这一行。
+
+而 VS 块与那行 `VICTORY` / `FAIL` 大字**只在没拖过的那一屏上**——拖到底之后
+它们都滚出了可视区。两屏各读各的，见 `BotLoop._bottom_screens` 与
+`LiveReportReader.read_detail_only`。
+
+## 胜负是算出来的，不看那行大字
+
+用户口径（2026-08-11）：剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、
+两边都有船判平（`domain.battle_outcome`）。于是拖那一屏从「补一个展示字段」变成了
+**判据的输入**——「损失单位」只有拖到底才读得到，不拖就永远算不出战果。
 
 逐舰种明细则**整整差一屏**：参战战舰那两列在**回放页**上（`ReportLayout.
 participating_rows` 是对着回放页量的，`tools.ingest_report` 也是从 replay 那一屏取的），
@@ -71,6 +85,10 @@ from evo_helper.vision.parsers import ReportKind
 
 #: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
 PROBE_PRESET = DEFAULT_PRESET.name
+
+#: 读「单位」那一行之前，详情页要往下拖几次（见 `BotLoop._bottom_screens`）。
+#: 到底会夹住，多拖一次无害；少拖一次就是静默留空。
+DETAIL_SCROLL_TO_BOTTOM_DRAGS = 2
 
 
 @dataclass
@@ -230,6 +248,34 @@ class BotLoop(PirateLoop):
                 say(f"  {coordinate} 的探路战报到点了却没翻到；下一趟再来")
         return tuple(stored)
 
+    def _bottom_screens(self) -> Any:
+        """把详情页拖到底再拍一屏：「单位」与「损失单位」两行都在那里。
+
+        为什么非拖不可：bot 战报比海盗战报**多一行**「生成卫星概率」，「战斗详情」
+        横幅因此下移约 30px，「单位」整行落到面板可视区之外。2026-08-11 的五张
+        实拍里四张如此，第五张恰好没有那一行、「单位」就在屏上（读作 `1` / `319`）。
+        所以这不是锚点找错了——那一行**根本没画出来**，只能拖。
+        「损失单位」在它下面一行，七张实拍**没有一张**在没拖的那屏上读得到。
+
+        ⚠️ 这一步现在是**判据的输入**，不再只是补一个展示字段：胜负按
+        「剩余 = 单位 − 损失单位」算（`domain.battle_outcome`），不拖就没有战损，
+        没有战损就算不出胜负，攻击日志的战果列会一直空着。
+
+        ⚠️ **拖之前那一屏必须先读完。** 拖到底之后 VS 块与胜负横幅都滚出可视区
+        （实测拖到底的那一屏横幅读作 `'Z ?'`）。调用方拿到的 `page` 持有的是
+        拖之前那一次截图的像素，所以顺序上先拿 `page`、再拖、再拍这一屏，
+        两屏各读各的。
+
+        拖两次而不是一次：面板到底会夹住（`pirate_reports` 模块头记着实测拖 280px
+        与 520px 落点完全一致），多拖一次无害；而少拖一次读不到就是静默留空。
+        同样的姿势侦察报告那条链路已经在实机上跑了很久（`collect_scout_reports`）。
+        """
+        from evo_helper.tools.pirate_loop import PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y, slow_drag
+
+        for _ in range(DETAIL_SCROLL_TO_BOTTOM_DRAGS):
+            slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+        return self._report_screens()
+
     def _ingest_probe_report(self, target: Coordinate, page: Any) -> bool:
         """把详情页上这一份读成 `BattleReport` 并入库。读不出来就放过，不存半份。"""
         from uuid import uuid4
@@ -241,7 +287,8 @@ class BotLoop(PirateLoop):
 
         try:
             live = LiveReportReader(page).read_detail_only(
-                PageObservation(screen="mail_detail", ui_version=DETAIL_UI_VERSION, confidence=1.0)
+                PageObservation(screen="mail_detail", ui_version=DETAIL_UI_VERSION, confidence=1.0),
+                bottom=self._bottom_screens(),
             )
         except (UnknownUiVersionError, ValueError) as error:
             # 读不出来不是「没有战报」。这一份就放着，等 `MAX_REPORT_AGE` 到点把
@@ -259,7 +306,15 @@ class BotLoop(PirateLoop):
             say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库")
             return False
         repository.append_report(to_battle_report(live, report_id=uuid4()))
-        say(f"  {target} 探路战报入库：{live.raw_time_text}，守方单位 {live.defender_units}")
+        # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
+        # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
+        # （没拖到底 / 那一屏的行位置偏了）。
+        say(
+            f"  {target} 探路战报入库：{live.raw_time_text}，"
+            f"战果 {live.outcome or '算不出'}"
+            f"（我 {live.attacker_units}−{live.attacker_losses}，"
+            f"敌 {live.defender_units}−{live.defender_losses}）"
+        )
         return True
 
     def read_defender_units(self, coordinate: Coordinate) -> int | None:
@@ -267,12 +322,19 @@ class BotLoop(PirateLoop):
 
         只读详情页的一个 ROI。**这是兜底路径**：正常情况下这个数在收报告那一趟
         已经读过并入库了，`_tier_and_attack` 先问库（`latest_defender_units`）。
+
+        没拖过的那一屏上读不到时要拖到底再读一次，理由与 `_bottom_screens` 同——
+        bot 战报的「单位」那一行多半压根不在可视区里。这里不能只修入库那一条路：
+        兜底路径读不出来就返回 None，而 None 会让 `_tier_and_attack` 整个跳过。
         """
         found: int | None = None
 
         def visit(target: Coordinate, page: Any) -> None:
             nonlocal found
             units = page.unit_totals()[1]
+            # 判据是「读不出来」，不是「读出来是 0」——0 是一条真读数。
+            if _count(units) is None:
+                units = self._bottom_screens().unit_totals()[1]
             found = _count(units)
             say(f"  {target} 的战报：守方单位 {units!r} → {found}")
 
