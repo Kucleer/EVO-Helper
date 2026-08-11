@@ -562,3 +562,94 @@ def test_idempotency_key_is_unique(session_factory) -> None:
     _plan_id, _run_id = _seed_run(session_factory)
     with pytest.raises(IntegrityError):
         _seed_run(session_factory, plan_name="plan-b")
+
+
+def _accepted_dispatch(repository, run_id: UUID, *, at: datetime) -> UUID:
+    # 每发各用各的 cycle_start：同 run+目标+周期只允许一条意图（见
+    # `save_attack_intent` 的 StorageConflictError），而这里要的正是同一个目标
+    # 上的两发。
+    intent = _intent(run_id, cycle_start_utc=at)
+    repository.save_attack_intent(intent)
+    dispatch_id = uuid4()
+    repository.save_dispatch(
+        AttackDispatch(
+            dispatch_id=dispatch_id,
+            intent_id=intent.intent_id,
+            dispatched_at_utc=at,
+            accepted=True,
+        )
+    )
+    return dispatch_id
+
+
+def test_a_written_off_dispatch_no_longer_blocks_the_match(
+    session_factory,
+    repository,
+) -> None:
+    """过期到「战报永远不会来」的那一发，不该再挡住新战报认领。
+
+    实机（2026-08-11）：目标 2:323:10 有两发未认领的派遣——
+
+        战报         01:35:18
+        候选 A 派于 08-10 18:28（预计战报 18:53，已过期 6 小时 42 分）
+        候选 B 派于 08-11 01:10（预计战报 01:35:10，差 8 秒）
+
+    两个都在 12 小时容差内 → `AMBIGUOUS` → `dispatch_id` 留空 → `has_report`
+    永远为假 → 目标永远停在等战报，攻击日志上那一行也永远显示不出战果。
+
+    **而 A 早就被另一半代码写掉了**：`bot_dispatch_facts()` 按 `MAX_REPORT_AGE`
+    把它整条剔掉、让目标退回重新探路。两处对「这一发什么时候算写掉」的判断不一致，
+    才是这次的根。用同一个常量之后，这里只剩一个候选，不需要任何猜测。
+    """
+    _plan_id, run_id = _seed_run(session_factory)
+    reported_at = datetime(2026, 8, 11, 1, 35, 18, tzinfo=UTC)
+    _accepted_dispatch(repository, run_id, at=reported_at - timedelta(hours=7))
+    fresh = _accepted_dispatch(repository, run_id, at=reported_at - timedelta(minutes=25))
+
+    repository.append_report(_report(reported_at=reported_at))
+
+    with session_factory() as session:
+        report = session.scalar(select(BattleReportRow))
+    assert report is not None
+    assert report.match_status == "MATCHED"
+    assert report.dispatch_id == fresh
+
+
+def test_two_live_dispatches_are_still_refused(
+    session_factory,
+    repository,
+) -> None:
+    """这条改的是「谁有资格当候选」，**不是**「多个候选时挑一个」。
+
+    两发都还在报告窗口内时照旧记 `AMBIGUOUS`——认错了就是把战果挂到别的派遣上。
+    """
+    _plan_id, run_id = _seed_run(session_factory)
+    reported_at = datetime(2026, 8, 11, 1, 35, 18, tzinfo=UTC)
+    _accepted_dispatch(repository, run_id, at=reported_at - timedelta(hours=2))
+    _accepted_dispatch(repository, run_id, at=reported_at - timedelta(minutes=25))
+
+    repository.append_report(_report(reported_at=reported_at))
+
+    with session_factory() as session:
+        report = session.scalar(select(BattleReportRow))
+    assert report is not None
+    assert report.match_status == "AMBIGUOUS"
+    assert report.dispatch_id is None
+
+
+def test_a_dispatch_made_after_the_report_is_never_a_candidate(
+    session_factory,
+    repository,
+) -> None:
+    """战报不可能早于产生它的那一发。"""
+    _plan_id, run_id = _seed_run(session_factory)
+    reported_at = datetime(2026, 8, 11, 1, 35, 18, tzinfo=UTC)
+    _accepted_dispatch(repository, run_id, at=reported_at + timedelta(minutes=5))
+
+    repository.append_report(_report(reported_at=reported_at))
+
+    with session_factory() as session:
+        report = session.scalar(select(BattleReportRow))
+    assert report is not None
+    assert report.match_status == "UNMATCHED"
+    assert report.dispatch_id is None
