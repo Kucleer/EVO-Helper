@@ -34,6 +34,12 @@ PROBE = DEFAULT_PRESET.name
 ROUND_START = datetime(2026, 8, 9, tzinfo=UTC)
 LAST_ROUND = ROUND_START - timedelta(days=1)
 
+#: 「现在」。**必须显式给**，不能让查询取真实时钟：`bot_dispatch_facts` 会把
+#: 派出超过 `MAX_REPORT_AGE` 还没战报的那些剔掉（`phase_of` 的前置条件），
+#: 而这些用例的时间戳是写死的历史时刻——用真实时钟跑，每一条派遣事实都会被
+#: 当成「战报永远不会来了」而消失，测试当天能过、第二天就红。
+NOW = ROUND_START + timedelta(hours=1)
+
 
 # -- 派遣事实：哪些行算「真的派出去了」 --------------------------------------
 
@@ -46,7 +52,7 @@ def test_dispatch_facts_are_typed_domain_records(repository, run_id) -> None:  #
     """
     _intent(repository, run_id, preset=PROBE, created_at=ROUND_START)
 
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
     assert [type(fact) for fact in facts] == [DispatchFact]
 
@@ -61,7 +67,7 @@ def test_a_refused_dispatch_does_not_leave_the_target_awaiting_a_report(reposito
     """
     _intent(repository, run_id, preset="AAA", created_at=ROUND_START, accepted=False)
 
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
     assert facts == []
     assert phase_of(facts) is BotPhase.NEEDS_PROBE
@@ -82,15 +88,22 @@ def test_an_intent_with_no_dispatch_at_all_is_not_a_fact(repository, run_id) -> 
         )
     )
 
-    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START) == []
+    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW) == []
 
 
 def test_facts_from_an_earlier_round_are_excluded(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """上一轮打过不代表本轮打过——不按轮切开，重开一轮会立刻显示「已完成」。"""
     _intent(repository, run_id, preset="AAA", created_at=LAST_ROUND, has_report=True)
 
-    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START) == []
-    assert len(repository.bot_dispatch_facts(TARGET, since=LAST_ROUND)) == 1
+    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW) == []
+    assert (
+        len(
+            repository.bot_dispatch_facts(
+                TARGET, since=LAST_ROUND, now_utc=LAST_ROUND + timedelta(hours=1)
+            )
+        )
+        == 1
+    )
 
 
 def test_a_pirate_intent_on_the_same_coordinate_is_not_a_bot_fact(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -103,7 +116,7 @@ def test_a_pirate_intent_on_the_same_coordinate_is_not_a_bot_fact(repository, ru
         target_kind=TARGET_KIND_PIRATE,
     )
 
-    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START) == []
+    assert repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW) == []
 
 
 def test_a_scout_dispatch_is_not_a_bot_round_fact(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -121,7 +134,7 @@ def test_a_scout_dispatch_is_not_a_bot_round_fact(repository, run_id) -> None:  
         mission_kind=MISSION_KIND_SCOUT,
     )
 
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
     assert facts == []
     assert phase_of(facts) is BotPhase.NEEDS_PROBE
@@ -132,7 +145,8 @@ def test_a_probe_with_its_report_back_moves_the_target_to_needs_attack(repositor
     _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
 
     assert (
-        phase_of(repository.bot_dispatch_facts(TARGET, since=ROUND_START)) is BotPhase.NEEDS_ATTACK
+        phase_of(repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW))
+        is BotPhase.NEEDS_ATTACK
     )
 
 
@@ -144,7 +158,7 @@ def test_a_skipped_target_counts_as_done(repository, run_id) -> None:  # type: i
     _intent(repository, run_id, preset=PROBE, created_at=ROUND_START, has_report=True)
     repository.mark_bot_target_skipped(TARGET, since=ROUND_START)
 
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START)
+    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
     assert [fact.skipped for fact in facts] == [True]
     assert phase_of(facts) is BotPhase.DONE

@@ -19,7 +19,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
-from evo_helper.vision.models import FleetLine, PageObservation, ReplayRound, VersusSide
+from evo_helper.vision.models import (
+    FleetLine,
+    PageObservation,
+    ReplayRound,
+    VersusBlock,
+    VersusSide,
+)
 from evo_helper.vision.parsers import (
     GAME_DISPLAY_ZONE,
     ReportKind,
@@ -34,7 +40,11 @@ from evo_helper.vision.parsers import (
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_DETAIL_VERSIONS = frozenset({"battle-detail-v2"})
+#: 战斗详情页的界面版本标签。单拎成常量是因为**取图那一侧也要用它**：
+#: 活链路自己造 `PageObservation` 时得填这个字，抄一份字面量迟早两边分家。
+DETAIL_UI_VERSION = "battle-detail-v2"
+
+SUPPORTED_DETAIL_VERSIONS = frozenset({DETAIL_UI_VERSION})
 SUPPORTED_REPLAY_VERSIONS = frozenset({"battle-replay-v2"})
 
 
@@ -192,15 +202,50 @@ class LiveReportReader:
         )
         return report
 
-    def _read_report(
-        self,
-        detail_page: PageObservation,
-        replay_page: PageObservation,
-        timer: _StageTimer,
-    ) -> LiveBattleReport:
-        self._require_version(detail_page, SUPPORTED_DETAIL_VERSIONS, "battle detail")
-        self._require_version(replay_page, SUPPORTED_REPLAY_VERSIONS, "battle replay")
+    def read_detail_only(self, detail_page: PageObservation) -> LiveBattleReport:
+        """只读**战斗详情页**那一屏：报告时间、双方、「单位」总数。
 
+        与 `read_report` 的差别是 `participating_*` 与 `rounds` 一律为空——
+        因为那些东西**不在详情页上**：参战战舰那两列的行界（`ReportLayout.
+        participating_rows`）是对着**回放页**量的，`tools.ingest_report` 也是从
+        replay 那一屏取的。详情页上同一段 y 坐标正压着 VS 块。
+
+        所以「只读详情页」换掉的不是几次 OCR，是**整整一屏**：要拿到逐舰种明细
+        就得点开「查看战斗回放」，而那个按钮至今没有标定过的点击坐标，一份报告
+        还要多花两三秒。取舍的先例就在仓库里——海盗战报刻意只记胜负与战损总数
+        （用户口径 2026-08-09，为省性能，见 `vision.pirate_reports` 模块头）。
+
+        ⚠️ **空就是空，不拿别的东西顶替。** 「没读逐舰种明细」和「对方一艘船都
+        没有」在下游长得一模一样，而后者会直接进情报中心。这条与
+        `attacker_units` 那条注释是同一个规矩：读不到就留空。
+
+        其余判据一条不放松：主题必须是可匹配派遣的攻击报告、时间必须读得出、
+        VS 块必须两边都全——单边战报会被挂到错的目标上。
+        """
+        timer = _StageTimer(self._clock)
+        self._require_version(detail_page, SUPPORTED_DETAIL_VERSIONS, "battle detail")
+        kind, raw_time, reported_at = self._header_facts(timer)
+        versus = self._versus(timer)
+        attacker_units, defender_units = self._unit_totals()
+        return LiveBattleReport(
+            kind=kind,
+            raw_time_text=raw_time,
+            reported_at_utc=reported_at,
+            attacker=versus.attacker,
+            defender=versus.defender,
+            participating_attacker=(),
+            participating_defender=(),
+            rounds=(),
+            # 只有详情页这一屏的版本。**不填回放页的**：版本标签是「这一屏长什么
+            # 样」的凭据，而这条链路根本没看过那一屏。
+            ui_versions={"battle_detail_ui_version": str(detail_page.ui_version)},
+            attacker_units=attacker_units,
+            defender_units=defender_units,
+            timing=timer.finish(),
+        )
+
+    def _header_facts(self, timer: _StageTimer) -> tuple[ReportKind, str, datetime]:
+        """报告头上的三件事：类型、时间原文、UTC 时间。任一读不出就抛。"""
         header = self._screens.report_header()
         timer.stage("header")
         subject = _subject_from_header(header)
@@ -218,11 +263,38 @@ class LiveReportReader:
         )
         if raw_time is None or reported_at is None:
             raise UnknownUiVersionError("report header has no readable time")
+        return kind, raw_time, reported_at
 
+    def _versus(self, timer: _StageTimer) -> VersusBlock:
         versus = parse_versus_block(self._screens.versus_block(), self._source)
         timer.stage("versus")
         if versus is None:
             raise UnknownUiVersionError("versus block is incomplete; refusing a one-sided report")
+        return versus
+
+    def _unit_totals(self) -> tuple[int | None, int | None]:
+        """「单位」总数是独立来源，读不到就留空——**绝不用明细之和顶替**。
+
+        大舰队的逐行数量是四舍五入显示（`5.36K`），相加得出的「总数」是假的。
+
+        用 getattr 取而不是写进协议：写进去会打断所有既有的 ReportScreens 实现，
+        而总数是增强项——提供不了的实现照样能读出一份完整报告。
+        """
+        reader = getattr(self._screens, "unit_totals", None)
+        totals = reader() if reader is not None else ("", "")
+        return (_unit_count(totals[0]), _unit_count(totals[1]))
+
+    def _read_report(
+        self,
+        detail_page: PageObservation,
+        replay_page: PageObservation,
+        timer: _StageTimer,
+    ) -> LiveBattleReport:
+        self._require_version(detail_page, SUPPORTED_DETAIL_VERSIONS, "battle detail")
+        self._require_version(replay_page, SUPPORTED_REPLAY_VERSIONS, "battle replay")
+
+        kind, raw_time, reported_at = self._header_facts(timer)
+        versus = self._versus(timer)
 
         attacker_text, defender_text = self._screens.participating_columns()
         timer.stage("fleet")
@@ -236,15 +308,7 @@ class LiveReportReader:
         rounds = parse_replay_rounds(self._screens.round_columns(), self._source)
         timer.stage("rounds")
 
-        # 「单位」总数是独立来源，读不到就留空——**绝不用明细之和顶替**。
-        # 大舰队的逐行数量是四舍五入显示，相加得出的「总数」是假的。
-        #
-        # 用 getattr 取而不是写进协议：写进去会打断所有既有的 ReportScreens 实现，
-        # 而总数是增强项——提供不了的实现照样能读出一份完整报告。
-        reader = getattr(self._screens, "unit_totals", None)
-        totals = reader() if reader is not None else ("", "")
-        attacker_units = _unit_count(totals[0])
-        defender_units = _unit_count(totals[1])
+        attacker_units, defender_units = self._unit_totals()
 
         return LiveBattleReport(
             kind=kind,
