@@ -373,7 +373,7 @@ class PersistentApplicationService:
                 for row in reversed(rows)
             ]
 
-    def list_attack_log(self, limit: int) -> list[AttackLogView]:
+    def list_attack_log(self, limit: int, *, day_utc: date | None = None) -> list[AttackLogView]:
         """攻击日志：每条意图一行，派出去的带上派遣事实。
 
         用 `outerjoin` 而不是 `join`：**被闸门拦下、或者读简报没通过的意图
@@ -385,9 +385,15 @@ class PersistentApplicationService:
         战报也是 `outerjoin` 接上来的：刚派出去的那一发还没有战报，而它必须照样在列。
         战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
         在这里按坐标重新配一次，等于把同一条判据写第二份。
+
+        `day_utc` 给定时只留那一个 **UTC+0 自然日**（也就是游戏内的一天）的记录。
+        筛选下推到 SQL，而不是在取回 `limit` 条之后再按日期挑：日志页只取最近
+        若干条，在内存里筛日期等于「先砍掉历史再问历史」——查三天前那天会得到
+        空页，而空页读起来和「那天一发没打」一模一样。海盗每日 32 次配额是按
+        游戏日算的，一天的记录必须能整天取全。
         """
         with self._session_factory() as session:
-            rows = session.execute(
+            statement = (
                 select(orm.AttackIntentRow, orm.AttackDispatchRow, orm.BattleReportRow)
                 .outerjoin(
                     orm.AttackDispatchRow,
@@ -397,11 +403,24 @@ class PersistentApplicationService:
                     orm.BattleReportRow,
                     orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
                 )
-                .order_by(
+            )
+            if day_utc is not None:
+                # 按页面第一列显示的那个瞬时切：派出去的按派遣时刻，没派出去的
+                # 按意图创建时刻。半开区间 [当日 00:00, 次日 00:00)，别用
+                # `date()` 之类的 SQL 函数——那是 SQLite 方言，且用不上索引。
+                moment = func.coalesce(
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackIntentRow.created_at_utc,
+                )
+                day_start = datetime.combine(day_utc, time(), tzinfo=UTC)
+                statement = statement.where(
+                    moment >= day_start, moment < day_start + timedelta(days=1)
+                )
+            rows = session.execute(
+                statement.order_by(
                     orm.AttackIntentRow.created_at_utc.desc(),
                     orm.AttackIntentRow.id.desc(),
-                )
-                .limit(limit)
+                ).limit(limit)
             ).all()
             return [
                 AttackLogView(
