@@ -30,7 +30,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from evo_helper.storage.database import UTCDateTime
 
 revision: str = "d7a1c95e2f60"
 down_revision: str | None = "c9e5a2b70d18"
@@ -42,7 +41,7 @@ def upgrade() -> None:
     op.create_table(
         "scout_reports",
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("reported_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("reported_at_utc", sa.DateTime(), nullable=False),
         sa.Column("raw_time_text", sa.String(length=64), nullable=False),
         sa.Column("origin_galaxy", sa.Integer(), nullable=False),
         sa.Column("origin_system", sa.Integer(), nullable=False),

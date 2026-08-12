@@ -24,7 +24,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from evo_helper.storage.database import UTCDateTime
 
 revision: str = "e29d06f8489f"
 down_revision: str | None = "a91c6d4e8b07"
@@ -39,8 +38,8 @@ def upgrade() -> None:
         sa.Column("kind", sa.String(length=16), nullable=False),
         sa.Column("command", sa.Text(), nullable=False),
         sa.Column("pid", sa.Integer(), nullable=True),
-        sa.Column("started_at_utc", UTCDateTime(), nullable=False),
-        sa.Column("ended_at_utc", UTCDateTime(), nullable=True),
+        sa.Column("started_at_utc", sa.DateTime(), nullable=False),
+        sa.Column("ended_at_utc", sa.DateTime(), nullable=True),
         sa.Column("exit_code", sa.Integer(), nullable=True),
         sa.Column("stopped_by", sa.String(length=16), nullable=True),
         sa.Column("log_path", sa.String(length=255), nullable=False),
@@ -54,12 +53,12 @@ def upgrade() -> None:
         sa.Column("enabled", sa.Boolean(), nullable=False),
         sa.Column("priority", sa.Integer(), nullable=False),
         sa.Column("params_json", sa.Text(), nullable=False),
-        sa.Column("round_started_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("quota_exhausted_until_utc", UTCDateTime(), nullable=True),
+        sa.Column("round_started_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("quota_exhausted_until_utc", sa.DateTime(), nullable=True),
         sa.Column("consecutive_failures", sa.Integer(), nullable=False),
         sa.Column("disabled_reason", sa.String(length=255), nullable=True),
-        sa.Column("created_at_utc", UTCDateTime(), nullable=False),
-        sa.Column("updated_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("created_at_utc", sa.DateTime(), nullable=False),
+        sa.Column("updated_at_utc", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("kind"),
     )
