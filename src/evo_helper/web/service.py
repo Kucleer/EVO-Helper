@@ -13,7 +13,6 @@ from typing import Protocol
 from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
-from evo_helper.domain.state_machine import require_transition
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -240,6 +239,35 @@ class AttackLogView:
     defender_losses: int | None = None
 
 
+#: 攻击日志「结果」那一档的三个取值。键同 `storage.intel.DISPATCH_*`，
+#: 中文标签与 chip 样式复用 `display.DISPATCH_STATE_*`。
+#:
+#: **没有 `NEVER`。** 情报中心筛的是「目标星球」，一颗从没被派遣过的星球才叫
+#: 「从未派遣」；而攻击日志一行就是一次派遣意图，「从未」在这里不存在，摆出来
+#: 只会是一档永远筛出空页的选项——而空页读起来就是「这类记录没有」。
+ATTACK_LOG_RESULTS: tuple[str, ...] = ("SENT", "BLOCKED", "REJECTED")
+
+
+@dataclass(frozen=True)
+class AttackLogOptions:
+    """攻击日志上两档快速筛选的候选值，**从库里现有的记录取**。
+
+    预设是用户自己在游戏里维护的，写死字面量就会漏掉他新建的那一个；战果同理，
+    库里存的是战斗详情页上的画面原文（`BattleReportRow.outcome`），将来多一档
+    也得能筛。
+
+    「结果」不在这里：它不是存下来的字段，而是由「有没有派遣行 + accepted」
+    三选一算出来的，取值集合由表结构定死（`ATTACK_LOG_RESULTS`）。
+
+    候选值**不跟着当前筛选走**：按预设筛完之后再看战果那一档，若候选也跟着
+    收窄，用户就再也切不回别的档去了——筛选器得一直是完整的那张地图。
+    """
+
+    presets: tuple[str, ...]
+    #: 含 `AWAITING`（还没收到战报的那些行），当且仅当库里真有这样一行。
+    outcomes: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class RevisitView:
     revisit_id: UUID
@@ -368,12 +396,10 @@ class ApplicationService(Protocol):
     ) -> ScanPlanView: ...
     def update_plan(self, plan_id: UUID, patch: PlanPatchView) -> ScanPlanView: ...
     def delete_plan(self, plan_id: UUID) -> None: ...
+    # 运行实例只剩「建一条 + 查一条」这两件事。列表与暂停/恢复/紧急停止随
+    # 「运行详情」那一页一起删了——那三个动作只有那一页上的按钮调用过。
     def start_run(self, plan_id: UUID, idempotency_key: str) -> RunStatusView: ...
     def get_run(self, run_id: UUID) -> RunStatusView | None: ...
-    def list_runs(self) -> list[RunStatusView]: ...
-    def pause_run(self, run_id: UUID) -> RunStatusView: ...
-    def resume_run(self, run_id: UUID) -> RunStatusView: ...
-    def emergency_stop_run(self, run_id: UUID) -> RunStatusView: ...
     def list_targets(self) -> list[BotTargetView]: ...
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
     def count_scans(self) -> int: ...
@@ -394,7 +420,11 @@ class ApplicationService(Protocol):
         day_utc: date | None = None,
         kind: str | None = None,
         target_span: CoordinateRange | None = None,
+        preset: str | None = None,
+        result: str | None = None,
+        outcome: str | None = None,
     ) -> list[AttackLogView]: ...
+    def attack_log_options(self) -> AttackLogOptions: ...
     def dashboard(self) -> DashboardView: ...
 
 
@@ -561,42 +591,6 @@ class FakeApplicationService:
     def get_run(self, run_id: UUID) -> RunStatusView | None:
         with self._lock:
             return self._runs.get(run_id)
-
-    def list_runs(self) -> list[RunStatusView]:
-        with self._lock:
-            return sorted(self._runs.values(), key=lambda run: run.created_at)
-
-    def pause_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.PAUSED, "paused")
-
-    def resume_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.ARMED, "resumed")
-
-    def emergency_stop_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.EMERGENCY_STOPPED, "emergency_stopped")
-
-    def _transition(self, run_id: UUID, target: RunState, event: str) -> RunStatusView:
-        with self._lock:
-            run = self._runs.get(run_id)
-            if run is None:
-                raise NotFoundError(f"run {run_id} not found")
-            try:
-                require_transition(run.state, target)
-            except ValueError as exc:
-                raise ConflictError(str(exc)) from exc
-            updated = RunStatusView(
-                run_id=run.run_id,
-                plan_id=run.plan_id,
-                state=target,
-                idempotency_key=run.idempotency_key,
-                target_date=run.target_date,
-                created_at=run.created_at,
-                started_at=run.started_at,
-                finished_at=self._now() if target is RunState.EMERGENCY_STOPPED else None,
-            )
-            self._runs[run_id] = updated
-            self._append_event(run_id, "run", event, run.state.value, target.value)
-            return updated
 
     def _schedule_state(self, plan: ScanPlanView, now: datetime) -> tuple[RunState, date]:
         shanghai_now = now.astimezone(SHANGHAI)
@@ -810,6 +804,9 @@ class FakeApplicationService:
         day_utc: date | None = None,
         kind: str | None = None,
         target_span: CoordinateRange | None = None,
+        preset: str | None = None,
+        result: str | None = None,
+        outcome: str | None = None,
     ) -> list[AttackLogView]:
         """Fake 服务不模拟派遣，所以攻击日志恒为空。
 
@@ -817,6 +814,13 @@ class FakeApplicationService:
         并且要显示「还没有攻击记录」而不是 500。
         """
         return []
+
+    def attack_log_options(self) -> AttackLogOptions:
+        """同上：没有派遣记录，也就没有预设与战果可供筛选。
+
+        两个空元组让筛选器只剩「全部」一项，而不是摆出一串筛不出东西的档位。
+        """
+        return AttackLogOptions(presets=(), outcomes=())
 
     def dashboard(self) -> DashboardView:
         with self._lock:
@@ -841,7 +845,9 @@ class FakeApplicationService:
 
 
 __all__ = [
+    "ATTACK_LOG_RESULTS",
     "ApplicationService",
+    "AttackLogOptions",
     "BotTargetView",
     "ConflictError",
     "CurrentMissionView",

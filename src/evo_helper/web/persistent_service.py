@@ -30,13 +30,19 @@ from evo_helper.domain.scheduler import (
     scheduling_order,
     status_of,
 )
-from evo_helper.domain.state_machine import require_transition
 from evo_helper.storage import models as orm
+from evo_helper.storage.intel import (
+    DISPATCH_BLOCKED,
+    DISPATCH_REJECTED,
+    DISPATCH_SENT,
+    RESULT_AWAITING,
+)
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import MISSION_LABELS, PARAM_LABELS
 from .service import (
     SHANGHAI,
+    AttackLogOptions,
     AttackLogView,
     BotTargetView,
     ConfigFreezeView,
@@ -190,22 +196,6 @@ class PersistentApplicationService:
         with self._session_factory() as session:
             row = session.get(orm.RunInstance, run_id)
             return self._run_view(session, row) if row else None
-
-    def list_runs(self) -> list[RunStatusView]:
-        with self._session_factory() as session:
-            rows = session.scalars(
-                select(orm.RunInstance).order_by(orm.RunInstance.created_at_utc)
-            ).all()
-            return [self._run_view(session, row) for row in rows]
-
-    def pause_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.PAUSED, "paused")
-
-    def resume_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.ARMED, "resumed")
-
-    def emergency_stop_run(self, run_id: UUID) -> RunStatusView:
-        return self._transition(run_id, RunState.EMERGENCY_STOPPED, "emergency_stopped")
 
     def list_targets(self) -> list[BotTargetView]:
         with self._session_factory() as session:
@@ -383,6 +373,9 @@ class PersistentApplicationService:
         day_utc: date | None = None,
         kind: str | None = None,
         target_span: CoordinateRange | None = None,
+        preset: str | None = None,
+        result: str | None = None,
+        outcome: str | None = None,
     ) -> list[AttackLogView]:
         """攻击日志：每条意图一行，派出去的带上派遣事实。
 
@@ -396,7 +389,7 @@ class PersistentApplicationService:
         战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
         在这里按坐标重新配一次，等于把同一条判据写第二份。
 
-        **三个筛选全部下推到 SQL**，不许在取回 `limit` 条之后再挑：日志页只取最近
+        **六个筛选全部下推到 SQL**，不许在取回 `limit` 条之后再挑：日志页只取最近
         若干条，在内存里筛等于「先砍掉历史再问历史」——查三天前那天、或者查某个
         坐标，会得到空页，而空页读起来和「那天/那里一发没打」一模一样。海盗每日
         32 次配额是按游戏日算的，一天的记录必须能整天取全。
@@ -404,6 +397,18 @@ class PersistentApplicationService:
         - `day_utc`：只留那一个 **UTC+0 自然日**（也就是游戏内的一天）。
         - `kind`：`bot` / `pirate`（`domain.records.TARGET_KIND_*`）。
         - `target_span`：目标坐标区间，闭区间，两端都含。
+        - `preset`：舰队预设名，精确匹配 `attack_intents.preset_name`。
+        - `result`：`SENT` / `BLOCKED` / `REJECTED`（`service.ATTACK_LOG_RESULTS`）。
+          这一档**不是存下来的字段**，而是由「有没有派遣行 + accepted」算出来的，
+          所以三个分支各自写成 SQL 条件，和页面上那一格的判据是同一套。
+        - `outcome`：战报里的胜负原文；`AWAITING` 表示「还没有战果」。
+          外连接下没有战报行时 `BattleReportRow.outcome` 就是 NULL，所以
+          `IS NULL` 一条同时覆盖「没战报」和「战报没读出胜负」——页面上这两种
+          也都显示「待战报」，两边必须是同一条判据。
+
+        **这一行就是一次派遣，所以三个新筛选一律按这一行自己的值判**，不套情报
+        中心那套「按最近一次派遣判目标星球」的口径——那一页筛的是星球，这一页
+        筛的是派遣，混用会让「今天被拦下的那几发」按星球的最新状态被筛掉。
         """
         with self._session_factory() as session:
             statement = (
@@ -444,6 +449,16 @@ class PersistentApplicationService:
                 statement = statement.where(
                     moment >= day_start, moment < day_start + timedelta(days=1)
                 )
+            if preset is not None:
+                statement = statement.where(orm.AttackIntentRow.preset_name == preset)
+            if result is not None:
+                statement = statement.where(_dispatch_result_clause(result))
+            if outcome is not None:
+                statement = statement.where(
+                    orm.BattleReportRow.outcome.is_(None)
+                    if outcome == RESULT_AWAITING
+                    else orm.BattleReportRow.outcome == outcome
+                )
             rows = session.execute(
                 statement.order_by(
                     orm.AttackIntentRow.created_at_utc.desc(),
@@ -473,6 +488,56 @@ class PersistentApplicationService:
                 )
                 for intent, dispatch, report in rows
             ]
+
+    def attack_log_options(self) -> AttackLogOptions:
+        """攻击日志上「预设」「战果」两档的候选值，从库里现有的记录取。
+
+        写死字面量会漏掉用户新建的预设——预设是他自己在游戏里维护的，助手这边
+        只是读到什么记什么。战果同理：库里存的是战斗详情页上的画面原文。
+
+        **不带任何当前筛选条件**（见 `AttackLogOptions` 的说明）：候选跟着结果
+        收窄的话，筛完一档就再也切不回别的档。
+
+        战报按 `dispatch_id is not null` 取：没配上派遣的战报根本不会出现在
+        这一页上，把它的胜负摆进筛选器等于给出一个筛不出行的选项。
+        """
+        with self._session_factory() as session:
+            presets = tuple(
+                session.scalars(
+                    select(orm.AttackIntentRow.preset_name)
+                    .distinct()
+                    .order_by(orm.AttackIntentRow.preset_name)
+                ).all()
+            )
+            outcomes = [
+                value
+                for value in session.scalars(
+                    select(orm.BattleReportRow.outcome)
+                    .where(orm.BattleReportRow.dispatch_id.is_not(None))
+                    .distinct()
+                    .order_by(orm.BattleReportRow.outcome)
+                ).all()
+                if value is not None
+            ]
+            # 「待战报」只在真有这样一行时才摆出来。判据与页面上那一格、与
+            # `list_attack_log(outcome=AWAITING)` 完全一致：外连接之后
+            # `outcome IS NULL`——既覆盖「还没战报」，也覆盖「战报没读出胜负」。
+            awaiting = session.execute(
+                select(orm.AttackIntentRow.id)
+                .outerjoin(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(orm.BattleReportRow.outcome.is_(None))
+                .limit(1)
+            ).first()
+            if awaiting is not None:
+                outcomes.append(RESULT_AWAITING)
+        return AttackLogOptions(presets=presets, outcomes=tuple(outcomes))
 
     def request_revisit(
         self, scope: str, reason: str, target_coordinate: Coordinate | None
@@ -534,24 +599,6 @@ class PersistentApplicationService:
                 )
                 or 0,
             )
-
-    def _transition(self, run_id: UUID, target: RunState, event: str) -> RunStatusView:
-        with self._session_factory() as session:
-            row = session.get(orm.RunInstance, run_id)
-            if row is None:
-                raise NotFoundError(f"run {run_id} not found")
-            current = RunState(row.state)
-            try:
-                require_transition(current, target)
-            except ValueError as exc:
-                raise ConflictError(str(exc)) from exc
-            now = self._now()
-            row.state = target.value
-            if target is RunState.EMERGENCY_STOPPED:
-                row.finished_at_utc = now
-            self._event(session, row.id, event, current.value, target.value, now)
-            session.commit()
-            return self._run_view(session, row)
 
     def _required_plan(self, session: Session, public_id: UUID) -> orm.ScanPlan:
         row = self._plan_row(session, public_id)
@@ -1233,3 +1280,23 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
 def _pack(coordinate: Coordinate) -> int:
     """坐标打包成一个可比大小的整数。与 `storage.intel._pack` 同一套算法。"""
     return (coordinate.galaxy * 1000 + coordinate.system) * 1000 + coordinate.position
+
+
+def _dispatch_result_clause(result: str):  # type: ignore[no-untyped-def]
+    """把攻击日志「结果」那一格的判据翻成 SQL 过滤条件。
+
+    页面上那一格是这么读的：没有派遣行 → 未派出；有且 accepted → 已派出；
+    有但没 accepted → 被拒。这里必须逐条对上，否则筛出来的行和它自己显示的
+    结果会对不上——那种错读起来像是数据坏了。
+
+    外连接下 `accepted` 在「没有派遣行」时是 NULL，`IS TRUE` / `IS FALSE`
+    都不成立，所以两个分支各自天然排除了未派出的行。
+    """
+    if result == DISPATCH_SENT:
+        return orm.AttackDispatchRow.accepted.is_(True)
+    if result == DISPATCH_REJECTED:
+        return orm.AttackDispatchRow.accepted.is_(False)
+    if result == DISPATCH_BLOCKED:
+        return orm.AttackDispatchRow.id.is_(None)
+    # 认不出来的档不该走到这里：`attack_log_page` 只放行 `ATTACK_LOG_RESULTS`。
+    raise ServiceError(f"unknown attack-log result filter: {result!r}")

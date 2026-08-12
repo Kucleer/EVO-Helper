@@ -64,7 +64,13 @@ def test_plan_crud_flow() -> None:
     assert client.get(f"/api/plans/{plan_id}").status_code == 404
 
 
-def test_run_lifecycle_and_idempotency() -> None:
+def test_starting_a_run_is_idempotent() -> None:
+    """幂等键仍然是运行实例的去重依据——扫描链路也是靠它续上同一条运行的。
+
+    「暂停 / 恢复 / 紧急停止」三段原先也在这条用例里，随 `run.html` 上那三个
+    按钮一起删了：那三个接口只有那一页调用过，而真正在跑的链路从来不从那里
+    改状态（它走 `SqlAlchemyRepository.set_run_state`）。
+    """
     client, _ = _make_client()
     plan_id = _create_plan(client)
 
@@ -84,17 +90,7 @@ def test_run_lifecycle_and_idempotency() -> None:
     )
     assert duplicate.status_code == 409
 
-    paused = client.post(f"/api/runs/{run_id}/pause", headers=_headers())
-    assert paused.json()["state"] == "PAUSED"
-
-    resumed = client.post(f"/api/runs/{run_id}/resume", headers=_headers())
-    assert resumed.json()["state"] == "ARMED"
-
-    stopped = client.post(f"/api/runs/{run_id}/emergency-stop", headers=_headers())
-    assert stopped.json()["state"] == "EMERGENCY_STOPPED"
-
-    invalid = client.post(f"/api/runs/{run_id}/pause", headers=_headers())
-    assert invalid.status_code == 409
+    assert client.get(f"/api/runs/{run_id}").json()["run_id"] == run_id
 
 
 def test_targets_history_and_diff() -> None:
@@ -154,7 +150,7 @@ def test_pages_render() -> None:
     client, _ = _make_client()
     _create_plan(client)
 
-    for path in ("/", "/plans", "/runs", "/diagnostics"):
+    for path in ("/", "/plans", "/diagnostics"):
         response = client.get(path)
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
@@ -304,7 +300,14 @@ def test_legacy_pages_redirect_into_the_console() -> None:
     """Nav collapsed to two entries; the old paths must not become dead ends."""
     client, _ = _make_client()
 
-    for path, destination in (("/", "/missions"), ("/plans", "/missions"), ("/targets", "/intel")):
+    for path, destination in (
+        ("/", "/missions"),
+        ("/plans", "/missions"),
+        ("/targets", "/intel"),
+        # 「运行详情」关掉之后同样留 307：旧书签不该变成 404。
+        ("/runs", "/missions"),
+        ("/runs/2ba6d1b8-6f1e-4a2b-9a3f-0d1c2e3f4a5b", "/missions"),
+    ):
         response = client.get(path, follow_redirects=False)
         assert response.status_code == 307, (path, response.status_code)
         assert response.headers["location"] == destination
@@ -320,7 +323,7 @@ def test_legacy_paths_land_on_a_rendered_page() -> None:
 def test_auxiliary_pages_render_in_the_console_shell() -> None:
     client, _ = _make_client()
 
-    for path, marker in (("/runs", "运行详情"), ("/diagnostics", "诊断")):
+    for path, marker in (("/diagnostics", "诊断"),):
         body = client.get(path).text
         assert response_ok(client, path), path
         assert marker in body
@@ -328,21 +331,22 @@ def test_auxiliary_pages_render_in_the_console_shell() -> None:
         assert "/static/console.css" in body
 
 
+def test_the_run_detail_page_is_gone_and_leaves_no_dead_link() -> None:
+    """「运行详情」这一页已关闭（用户口径 2026-08-11：「实际已经没有作用」）。
+
+    两件事一起钉：导航里不再有入口，且**没有任何一页还指向 /runs**——
+    留一条指向 307 的链接，点下去会莫名其妙地跳到任务中心。
+    """
+    client, _ = _make_client()
+
+    for path in ("/missions", "/intel", "/planets", "/logs", "/diagnostics"):
+        body = client.get(path).text
+        assert "运行详情" not in body, path
+        assert 'href="/runs' not in body, path
+
+
 def response_ok(client: TestClient, path: str) -> bool:
     return client.get(path).status_code == 200
-
-
-def test_run_state_chips_pair_colour_with_a_glyph() -> None:
-    """Colour must never be the only signal for a state."""
-    from evo_helper.web.app import run_state_glyph, run_state_tone
-
-    for state in ("SCANNING", "PAUSED", "FAILED", "EMERGENCY_STOPPED", "COMPLETED"):
-        assert run_state_tone(state) != "", state
-        assert run_state_glyph(state) != "•", state
-
-    # An unknown state still renders something rather than blowing up.
-    assert run_state_tone("SOMETHING_NEW") == ""
-    assert run_state_glyph("SOMETHING_NEW") == "•"
 
 
 def test_plan_carries_fleet_line_configuration() -> None:
@@ -419,17 +423,6 @@ def test_reserving_every_line_is_rejected() -> None:
     assert "never dispatch" in response.json()["detail"]
 
 
-def test_run_states_render_in_chinese() -> None:
-    """英文状态常量对用户有歧义；界面只显示中文。"""
-    from evo_helper.web.app import run_state_label
-
-    assert run_state_label("ARMED") == "待命"
-    assert run_state_label("DRAINING") == "收取战报"
-    assert run_state_label("EMERGENCY_STOPPED") == "已紧急停止"
-    # 未知状态回落到原值，宁可显示英文也不要显示空白。
-    assert run_state_label("SOMETHING_NEW") == "SOMETHING_NEW"
-
-
 def test_console_never_mentions_a_rehearsal_mode() -> None:
     """演习模式这个概念已经整体删掉了，界面上不许再冒出来。
 
@@ -438,21 +431,10 @@ def test_console_never_mentions_a_rehearsal_mode() -> None:
     """
     client, _ = _make_client()
 
-    for path in ("/missions", "/runs", "/diagnostics", "/logs"):
+    for path in ("/missions", "/intel", "/diagnostics", "/logs"):
         body = client.get(path).text
         for wording in ("演习", "dry run", "dry_run"):
             assert wording not in body, (path, wording)
-
-
-def test_the_new_waiting_states_have_chinese_labels() -> None:
-    """派出后松手等待的两个状态也要能在界面上读懂。"""
-    from evo_helper.web.app import run_state_glyph, run_state_label, run_state_tone
-
-    assert run_state_label("AWAITING_REPORT") == "等待战报"
-    assert run_state_label("WAITING_SESSION") == "等待登录"
-    for state in ("AWAITING_REPORT", "WAITING_SESSION"):
-        assert run_state_tone(state) != ""
-        assert run_state_glyph(state) != "•"
 
 
 def _seed_planets(service: FakeApplicationService, specs) -> None:

@@ -48,7 +48,8 @@
     <a href="/intel" {% if active == 'intel' %}aria-current="page"{% endif %}>情报中心</a>
     <a href="/planets" {% if active == 'planets' %}aria-current="page"{% endif %}>星球列表</a>
     <div class="group-label">辅助</div>
-    <a href="/runs" {% if active == 'runs' %}aria-current="page"{% endif %}>运行详情</a>
+    {# 「运行详情」已关闭：它操作的是更早的 run_instances/scan_plans 那条路径，
+       起停与记账都由任务中心（常驻调度器 + mission_runs）接手了。 #}
     <a href="/logs" {% if active == 'logs' %}aria-current="page"{% endif %}>攻击日志</a>
     <a href="/diagnostics" {% if active == 'diagnostics' %}aria-current="page"{% endif %}>诊断</a>
   </nav>
