@@ -8,20 +8,77 @@
 
 <section class="panel compact" aria-labelledby="log-filter">
   <h2 id="log-filter" class="visually-hidden">筛选</h2>
+  {#
+    事件类型这一排是**链接**，选中态由 `.btn.primary`（强调色）表示。
+    所以这里刻意**不给它们上 bot / 海盗那两种色**：那两种色本身也在强调色附近，
+    上了之后「这一档被选中了」和「这一档是 bot」会用同一种色说两件事，选中态
+    就废了。改为只带上和表格里同一个字形（▣ / ☠）——筛选和结果对得上，
+    而且不跟选中态抢信号。
+  #}
   <div class="filter-bar">
     <span class="inline-label">事件类型</span>
     <a class="btn small {{ 'primary' if kind == 'all' else '' }}" href="{{ kind_url('all') }}">全部</a>
     {% for value, label in kind_labels.items() %}
-      <a class="btn small {{ 'primary' if kind == value else '' }}" href="{{ kind_url(value) }}">{{ label }}</a>
+      <a class="btn small {{ 'primary' if kind == value else '' }}" href="{{ kind_url(value) }}">
+        <span class="glyph" aria-hidden="true">{{ kind_glyphs.get(value, '•') }}</span> {{ label }}</a>
     {% endfor %}
     <span class="spacer"></span>
     <span class="muted">最多显示最近 {{ limit }} 条</span>
   </div>
+
+  {#
+    快速筛选：预设 / 结果 / 战果，就是表头上那三列。
+
+    **一行就是一次派遣，所以按这一行自己的值筛**——不套情报中心那套「按最近
+    一次派遣判目标星球」的口径，那一页筛的是星球。
+
+    三个下拉框的「全部」那一项 value 是空串，也就是「不筛」。筛选一律下推到
+    SQL（见 `attack_log_page` 的注释）：这一页只取最近若干条，在内存里筛某个
+    预设会得到空页，而空页读起来就是「那个预设没打过」。
+  #}
+  <form class="filter-bar" method="get" action="/logs">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="date" value="{{ day_value }}">
+    <input type="hidden" name="target_start" value="{{ target_start_value }}">
+    <input type="hidden" name="target_end" value="{{ target_end_value }}">
+    <label class="inline-label" for="log-preset">预设</label>
+    <select id="log-preset" name="preset">
+      {# 候选值从库里现有的取：预设是用户自己在游戏里维护的，写死就会漏掉新建的。 #}
+      <option value="">全部</option>
+      {% for name in preset_options %}
+        <option value="{{ name }}" {% if name == preset_value %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+    <label class="inline-label" for="log-result">结果</label>
+    <select id="log-result" name="result">
+      <option value="">全部</option>
+      {% for value in result_options %}
+        <option value="{{ value }}" {% if value == result_value %}selected{% endif %}>{{ dispatch_labels.get(value, value) }}</option>
+      {% endfor %}
+    </select>
+    <label class="inline-label" for="log-outcome">战果</label>
+    <select id="log-outcome" name="outcome">
+      <option value="">全部</option>
+      {% for value in outcome_options %}
+        <option value="{{ value }}" {% if value == outcome_value %}selected{% endif %}>{{ result_labels.get(value, value) }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn small primary" type="submit">筛选</button>
+    <a class="btn small" href="{{ clear_quick_url }}">全部</a>
+    <span class="spacer"></span>
+    <span class="muted">
+      {% if quick_label %}只看 {{ quick_label }}{% else %}未按预设 / 结果 / 战果筛选{% endif %}
+    </span>
+  </form>
+
   {# 日期按游戏时间 UTC+0 的自然日切，和表格第一列同口径；清空即不筛。 #}
   <form class="filter-bar" method="get" action="/logs">
     <input type="hidden" name="kind" value="{{ kind }}">
     <input type="hidden" name="target_start" value="{{ target_start_value }}">
     <input type="hidden" name="target_end" value="{{ target_end_value }}">
+    <input type="hidden" name="preset" value="{{ preset_value }}">
+    <input type="hidden" name="result" value="{{ result_value }}">
+    <input type="hidden" name="outcome" value="{{ outcome_value }}">
     <label class="inline-label" for="log-date">日期（游戏 UTC+0）</label>
     <input type="date" id="log-date" name="date" value="{{ day_value }}">
     <button class="btn small primary" type="submit">筛选</button>
@@ -43,6 +100,9 @@
   <form class="filter-bar" method="get" action="/logs">
     <input type="hidden" name="kind" value="{{ kind }}">
     <input type="hidden" name="date" value="{{ day_value }}">
+    <input type="hidden" name="preset" value="{{ preset_value }}">
+    <input type="hidden" name="result" value="{{ result_value }}">
+    <input type="hidden" name="outcome" value="{{ outcome_value }}">
     <label class="inline-label" for="log-target-start">目标坐标</label>
     <input id="log-target-start" name="target_start" value="{{ target_start_value }}"
            placeholder="2:130" size="10" aria-label="目标坐标范围起点">
@@ -91,7 +151,11 @@
           <td>{{ game_time(moment) }}{% if not entry.dispatched_at_utc %} <span class="muted">（仅意图）</span>{% endif %}</td>
           <td>{{ local_time(moment) }}</td>
           <td>
-            <span class="chip">{{ kind_labels.get(entry.target_kind, entry.target_kind) }}</span>
+            {# bot 与海盗共用情报中心那一套 chip 样式（`display.TARGET_KIND_*`）：
+               同一个概念在两页上配两种色，比两页都不上色更糟。
+               色永远配一个字形和一个词——控制台要在灰度下、对色盲用户也读得懂。 #}
+            <span class="chip {{ kind_tones.get(entry.target_kind, '') }}">
+              <span class="glyph" aria-hidden="true">{{ kind_glyphs.get(entry.target_kind, '•') }}</span>{{ kind_labels.get(entry.target_kind, entry.target_kind) }}</span>
           </td>
           <td><a href="/targets/{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}?back=%2Flogs">{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}</a></td>
           <td class="muted">{{ entry.origin.galaxy }}:{{ entry.origin.system }}:{{ entry.origin.position }}</td>
@@ -100,30 +164,28 @@
             <div class="muted" style="font-size:11px">{{ entry.preset_signature }}</div>
           </td>
           <td>
-            {% if entry.dispatched_at_utc is none %}
-              <span class="chip"><span class="glyph" aria-hidden="true">◷</span>未派出 · {{ entry.guard_status }}</span>
-            {% elif entry.accepted %}
-              <span class="chip ok"><span class="glyph" aria-hidden="true">▶</span>已派出</span>
-            {% else %}
-              <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>被拒</span>
-            {% endif %}
+            {#
+              这一格的判据和「结果」那个下拉框、和 `_dispatch_result_clause` 的
+              SQL 必须是同一套：没有派遣行 → 未派出，有且 accepted → 已派出，
+              有但没 accepted → 被拒。标签/色调/字形一律取自
+              `display.DISPATCH_STATE_*`，页面上不再另写一份中文。
+            #}
+            {% set state = 'BLOCKED' if entry.dispatched_at_utc is none else ('SENT' if entry.accepted else 'REJECTED') %}
+            <span class="chip {{ dispatch_tones.get(state, '') }}">
+              <span class="glyph" aria-hidden="true">{{ dispatch_glyphs.get(state, '•') }}</span>{{ dispatch_labels.get(state, state) }}{% if state == 'BLOCKED' %} · {{ entry.guard_status }}{% endif %}</span>
           </td>
           <td>
             {# 海盗战报只记胜负与战损总数，所以这一格就是战果的全部。 #}
             {% if entry.outcome is none %}
-              <span class="muted">待战报</span>
+              {# 还没战报是常态，不是一种要上色的状态——每行都挂个黄 chip 只会
+                 让真正读到胜负的那几行不显眼。下拉框里它叫「待战报」，同一个词。 #}
+              <span class="muted">{{ result_labels.get('AWAITING', '待战报') }}</span>
             {% else %}
               {# 按读到的原文分档。**不能拿「不是 VICTORY 就是负」兜底**：
-                 库里存的是画面原文，将来多一档（平局）会被静默显示成败仗。 #}
-              {% if entry.outcome == 'VICTORY' %}
-                <span class="chip ok"><span class="glyph" aria-hidden="true">★</span>胜</span>
-              {% elif entry.outcome == 'FAIL' %}
-                <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>负</span>
-              {% elif entry.outcome == 'DRAW' %}
-                <span class="chip"><span class="glyph" aria-hidden="true">＝</span>平</span>
-              {% else %}
-                <span class="chip">{{ entry.outcome }}</span>
-              {% endif %}
+                 库里存的是画面原文，将来多一档（平局）会被静默显示成败仗。
+                 认不出来的取值照样原样显示，只是没有色也没有字形。 #}
+              <span class="chip {{ result_tones.get(entry.outcome, '') }}">
+                <span class="glyph" aria-hidden="true">{{ result_glyphs.get(entry.outcome, '') }}</span>{{ result_labels.get(entry.outcome, entry.outcome) }}</span>
               <div class="muted" style="font-size:11px">
                 战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}
                 · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}

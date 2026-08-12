@@ -75,6 +75,7 @@ from .schemas import (
 )
 from .security import LocalSecurityMiddleware, default_local_token
 from .service import (
+    ATTACK_LOG_RESULTS,
     DEFAULT_PLANET_KIND,
     PLANET_KINDS,
     SHANGHAI,
@@ -264,51 +265,6 @@ def _revisit_out(revisit: RevisitView) -> RevisitOut:
     )
 
 
-#: Run states grouped by tone for the status chips. Every chip also renders a
-#: glyph and the state name, so colour is never the only signal.
-_RUN_STATE_TONE = {
-    "SCANNING": "ok",
-    "DRAINING": "ok",
-    "AWAITING_REPORT": "warn",
-    "WAITING_SESSION": "warn",
-    "COMPLETED": "ok",
-    "ARMED": "warn",
-    "WAITING_CAPACITY": "warn",
-    "PAUSED": "warn",
-    "FAILED": "danger",
-    "EMERGENCY_STOPPED": "danger",
-}
-
-_RUN_STATE_GLYPH = {
-    "SCANNING": "▶",
-    "DRAINING": "▼",
-    "AWAITING_REPORT": "🕗",
-    "WAITING_SESSION": "🔑",
-    "COMPLETED": "✓",
-    "ARMED": "◷",
-    "WAITING_CAPACITY": "⏸",
-    "PAUSED": "⏸",
-    "FAILED": "✕",
-    "EMERGENCY_STOPPED": "■",
-}
-
-
-#: 运行状态的中文标签。界面只显示中文；英文常量仍是接口与数据库里的值。
-_RUN_STATE_LABEL = {
-    "DRAFT": "草稿",
-    "ARMED": "待命",
-    "SCANNING": "扫描中",
-    "WAITING_CAPACITY": "等待航线",
-    "DRAINING": "收取战报",
-    "AWAITING_REPORT": "等待战报",
-    "WAITING_SESSION": "等待登录",
-    "COMPLETED": "已完成",
-    "PAUSED": "已暂停",
-    "FAILED": "已失败",
-    "EMERGENCY_STOPPED": "已紧急停止",
-}
-
-
 #: 攻击日志一页显示多少条。日志是给人翻的，不是给人滚的。
 ATTACK_LOG_LIMIT = 300
 
@@ -344,19 +300,6 @@ def _safe_back_url(back: str | None, default: str = "/planets") -> str:
     if not back.startswith("/") or back.startswith("//"):
         return default
     return back
-
-
-def run_state_label(state: str) -> str:
-    """未知状态回落到原值，宁可显示英文也不要显示空白。"""
-    return _RUN_STATE_LABEL.get(state, state)
-
-
-def run_state_tone(state: str) -> str:
-    return _RUN_STATE_TONE.get(state, "")
-
-
-def run_state_glyph(state: str) -> str:
-    return _RUN_STATE_GLYPH.get(state, "•")
 
 
 def _blank_to_none(value: Any) -> Any:
@@ -412,6 +355,17 @@ def _target_span(start: str | None, end: str | None) -> CoordinateRange | None:
     return parse_coordinate_span(first, last)
 
 
+def _ordered_outcomes(values: tuple[str, ...]) -> list[str]:
+    """战果候选值排成人看得懂的顺序：胜、负、平、待战报，其余按原文排在后面。
+
+    库里的 `DISTINCT` 只能给出字母序（`AWAITING` 会排到 `VICTORY` 前面），而
+    这几档在用户心里是有固定次序的。认不出来的取值**照样列出来**，不丢：
+    库里存的是画面原文，将来多一档的话，能不能筛得到比排得好看重要。
+    """
+    known = [value for value in BATTLE_RESULT_LABELS if value in values]
+    return known + sorted(value for value in values if value not in BATTLE_RESULT_LABELS)
+
+
 def _span_label(span: CoordinateRange | None) -> str:
     """把补位之后的区间写全给用户看。
 
@@ -452,9 +406,6 @@ def create_app(
     # `<` `>` `&` `'`，放进 `<script>` 依然是安全的。
     templates.env.policies["json.dumps_kwargs"] = {"sort_keys": True, "ensure_ascii": False}
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-    templates.env.globals["run_state_tone"] = run_state_tone
-    templates.env.globals["run_state_glyph"] = run_state_glyph
-    templates.env.globals["run_state_label"] = run_state_label
     templates.env.globals["game_time"] = game_time
     templates.env.globals["local_time"] = local_time
 
@@ -555,17 +506,26 @@ def create_app(
 
     # ---- runs ------------------------------------------------------------
 
-    @app.get("/runs", response_class=HTMLResponse)
-    async def runs_page(request: Request) -> HTMLResponse:
-        service = get_service(request)
-        return templates.TemplateResponse(
-            request=request,
-            name="runs.html",
-            context={
-                "plans": [_plan_out(plan) for plan in service.list_plans()],
-                "runs": [_run_out(run) for run in service.list_runs()],
-            },
-        )
+    @app.get("/runs", include_in_schema=False)
+    async def runs_page() -> RedirectResponse:
+        """「运行详情」这一页已经关掉，起停与记账都在任务中心。
+
+        它操作的是更早的 `run_instances` / `scan_plans` 那条路径：页面上「启动
+        运行」建出来的运行实例没有任何人推进，三条 2026-08-07/09 的记录就一直
+        卡在「扫描中」。真正在跑的是常驻调度器——起停走 `/api/scheduler`，
+        每一轮记在 `mission_runs`，都在任务中心那一页上。
+
+        留 307 而不是直接删路由：同 `/targets → /intel` 的先例，旧链接与书签
+        不该变成 404。**`run_instances` / `scan_plans` 两张表照旧**——扫描链路
+        （`tools/scan_coordinates.py`、`tools/pirate_loop.py` 的 `PLAN_NAME` /
+        `RUN_KEY`）还在往里写，这次关掉的只是这一页。
+        """
+        return RedirectResponse("/missions", status_code=307)
+
+    @app.get("/runs/{run_id}", include_in_schema=False)
+    async def run_page(run_id: UUID) -> RedirectResponse:
+        """运行实例的详情页只从上面那张表点进来，跟着一起关掉。"""
+        return RedirectResponse("/missions", status_code=307)
 
     @app.post("/api/runs/start", response_model=RunStatusOut, status_code=201)
     async def start_run(
@@ -584,38 +544,10 @@ def create_app(
             raise NotFoundError(f"run {run_id} not found")
         return _run_out(run)
 
-    @app.get("/runs/{run_id}", response_class=HTMLResponse)
-    async def run_page(request: Request, run_id: UUID) -> HTMLResponse:
-        service = get_service(request)
-        run = service.get_run(run_id)
-        if run is None:
-            raise NotFoundError(f"run {run_id} not found")
-        return templates.TemplateResponse(
-            request=request,
-            name="run.html",
-            context={"run": _run_out(run)},
-        )
-
-    @app.post("/api/runs/{run_id}/pause", response_model=RunStatusOut)
-    async def pause_run(
-        run_id: UUID,
-        service: ApplicationService = Depends(get_service),
-    ) -> RunStatusOut:
-        return _run_out(service.pause_run(run_id))
-
-    @app.post("/api/runs/{run_id}/resume", response_model=RunStatusOut)
-    async def resume_run(
-        run_id: UUID,
-        service: ApplicationService = Depends(get_service),
-    ) -> RunStatusOut:
-        return _run_out(service.resume_run(run_id))
-
-    @app.post("/api/runs/{run_id}/emergency-stop", response_model=RunStatusOut)
-    async def emergency_stop_run(
-        run_id: UUID,
-        service: ApplicationService = Depends(get_service),
-    ) -> RunStatusOut:
-        return _run_out(service.emergency_stop_run(run_id))
+    # 「暂停 / 恢复 / 紧急停止」三个接口跟着 `run.html` 上那三个按钮一起删了：
+    # 它们只有那一个调用方，而真正在跑的那条链路根本不从这里改状态——
+    # 扫描/海盗 runner 走 `SqlAlchemyRepository.set_run_state`，起停走
+    # `/api/scheduler/stop` 与任务中心的「强制结束」。
 
     # ---- targets / history ----------------------------------------------
 
@@ -835,6 +767,9 @@ def create_app(
         date: BlankableDate = None,
         target_start: BlankableStr = None,
         target_end: BlankableStr = None,
+        preset: BlankableStr = None,
+        result: BlankableStr = None,
+        outcome: BlankableStr = None,
     ) -> HTMLResponse:
         """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
 
@@ -848,14 +783,22 @@ def create_app(
         默认不按日期筛。默认「今天」在这一页是反的：UTC+0 的今天要到现实时间
         08:00 才开始，早上打开日志会看见一页空白，而空白读起来就是「昨晚一发没打」。
 
-        **三个筛选一律下推到 SQL**（`list_attack_log` 的参数），不在取回
+        **六个筛选一律下推到 SQL**（`list_attack_log` 的参数），不在取回
         `ATTACK_LOG_LIMIT` 条之后再挑：那样等于先砍掉历史再问历史，查一个旧坐标
         必得空页，而空页读起来就是「那个坐标没打过」。事件类型原先正是在内存里
         筛的，一并搬下去。
 
+        顶上那三档快速筛选（预设 / 结果 / 战果）**按每一行自己的值判**。
+        情报中心那三个同名的档不是一回事：那一页一行是一颗目标星球，所以才有
+        「按最近一次派遣判」那套口径；这一页一行就是一次派遣，行里就写着答案。
+
         坐标解析失败**不返回 422**：这是一张 HTML 页，一页 JSON 报错读起来就是
         「控制台坏了」。改为照常渲染、在顶上挂一条红字说明「这一页没有按坐标筛」——
         默默地不筛才是最坏的一种，用户会以为下面那些行就是筛出来的结果。
+
+        `preset` / `result` / `outcome` 的**空串一律当「不筛」**（`BlankableStr`）：
+        三个下拉框的「全部」那一项 value 就是空串，浏览器提交表单必然带上
+        `preset=&result=&outcome=`，声明成会解析的类型就是当场 422（PR #74）。
         """
         service = get_service(request)
         span: CoordinateRange | None = None
@@ -864,15 +807,24 @@ def create_app(
             span = _target_span(target_start, target_end)
         except InvalidQueryError as exc:
             span_error = str(exc)
+        # 认不出来的档当成没筛（同 `kind` 那一条）：这三个参数只有手改链接才
+        # 可能写错，而报 422 会把一整页记录换成一页 JSON。当前生效的筛选写在
+        # 筛选栏右侧那句话里，所以「没按它筛」不会是悄悄发生的。
+        if result not in ATTACK_LOG_RESULTS:
+            result = None
+        options = service.attack_log_options()
         entries = service.list_attack_log(
             ATTACK_LOG_LIMIT,
             day_utc=date,
             kind=kind if kind in TARGET_KIND_LABELS else None,
             target_span=span,
+            preset=preset,
+            result=result,
+            outcome=outcome,
         )
 
         def keep(**overrides: str) -> str:
-            """带着当前的其余筛选拼链接——切换事件类型不该把日期和坐标甩掉。"""
+            """带着当前的其余筛选拼链接——切换任何一档都不该把别的甩掉。"""
             params: dict[str, str] = {"kind": kind}
             if date is not None:
                 params["date"] = date.isoformat()
@@ -880,8 +832,22 @@ def create_app(
                 params["target_start"] = target_start
             if target_end:
                 params["target_end"] = target_end
+            if preset:
+                params["preset"] = preset
+            if result:
+                params["result"] = result
+            if outcome:
+                params["outcome"] = outcome
             params.update(overrides)
             return "/logs?" + urlencode({k: v for k, v in params.items() if v})
+
+        chosen: list[str] = []
+        if preset:
+            chosen.append(f"预设 {preset}")
+        if result:
+            chosen.append(f"结果 {DISPATCH_STATE_LABELS.get(result, result)}")
+        if outcome:
+            chosen.append(f"战果 {BATTLE_RESULT_LABELS.get(outcome, outcome)}")
 
         return templates.TemplateResponse(
             request=request,
@@ -891,15 +857,35 @@ def create_app(
                 "entries": entries,
                 "kind": kind,
                 "kind_labels": TARGET_KIND_LABELS,
+                # bot 与海盗的 chip 样式**复用情报中心那一套**（PR #96）：
+                # 同一个概念在两页上用两种色，比不上色更糟。
+                "kind_tones": TARGET_KIND_TONES,
+                "kind_glyphs": TARGET_KIND_GLYPHS,
                 "limit": ATTACK_LOG_LIMIT,
                 "day_value": date.isoformat() if date is not None else "",
                 "target_start_value": target_start or "",
                 "target_end_value": target_end or "",
                 "span_label": _span_label(span),
                 "span_error": span_error,
+                "preset_value": preset or "",
+                "result_value": result or "",
+                "outcome_value": outcome or "",
+                "preset_options": options.presets,
+                "result_options": ATTACK_LOG_RESULTS,
+                "outcome_options": _ordered_outcomes(options.outcomes),
+                "quick_label": " · ".join(chosen),
+                # 「结果」「战果」两列与两个下拉框共用同一套标签、色调、字形，
+                # 页面上不再各写一份中文。
+                "dispatch_labels": DISPATCH_STATE_LABELS,
+                "dispatch_tones": DISPATCH_STATE_TONES,
+                "dispatch_glyphs": DISPATCH_STATE_GLYPHS,
+                "result_labels": BATTLE_RESULT_LABELS,
+                "result_tones": BATTLE_RESULT_TONES,
+                "result_glyphs": BATTLE_RESULT_GLYPHS,
                 "kind_url": lambda value: keep(kind=value),
                 "clear_date_url": keep(date=""),
                 "clear_target_url": keep(target_start="", target_end=""),
+                "clear_quick_url": keep(preset="", result="", outcome=""),
             },
         )
 

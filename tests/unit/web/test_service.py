@@ -75,15 +75,11 @@ def test_idempotency_key_is_rejected_on_reuse() -> None:
         clock.start_run(plan.id, "same-key")
 
 
-def test_invalid_state_transition_is_conflict() -> None:
-    clock = _fixed_clock("2026-08-06T01:00:00+00:00")
-    plan = _plan_payload(clock)
-    run = clock.start_run(plan.id, "transition-key")
-
-    clock.emergency_stop_run(run.run_id)
-
-    with pytest.raises(ConflictError):
-        clock.pause_run(run.run_id)
+# `test_invalid_state_transition_is_conflict` 随「运行详情」页一起删了：
+# 它守的是 `pause_run` / `emergency_stop_run` 那条状态机路径，而那两个方法
+# 只有 `run.html` 上的按钮调用过。运行状态在真实链路里由
+# `SqlAlchemyRepository.set_run_state` 推进，`domain.state_machine` 的转移
+# 规则本身仍有 `tests/unit/domain` 与 `test_report_wait_persistence` 守着。
 
 
 def test_update_plan_preserves_created_at() -> None:
