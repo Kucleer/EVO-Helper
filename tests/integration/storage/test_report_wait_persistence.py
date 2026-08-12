@@ -17,6 +17,7 @@ from evo_helper.storage.database import Base, create_database_engine, create_ses
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 DISPATCHED = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 FLIGHT = timedelta(hours=3, minutes=20)
@@ -45,8 +46,18 @@ def _plan_and_run(tmp_path: Path, name: str):  # type: ignore[no-untyped-def]
             ),
         ),
     )
-    run = service.start_run(plan.id, f"idem-{name}")
-    return engine, factory, run
+    # 起手是 ARMED，和这个计划原本的排期一致：窗口 08:00–10:00，而 `DISPATCHED`
+    # 是现实时间 UTC+8 的 20:00，早过了窗口。下面 `test_waiting_states_are_persisted`
+    # 正是从 ARMED 一路推到 WAITING_SESSION 的——种成 SCANNING 会让它开头那一步
+    # 变成 SCANNING → SCANNING，被状态机当场拒掉。
+    run_id = seed_run_instance(
+        factory,
+        plan_id=plan.id,
+        idempotency_key=f"idem-{name}",
+        state=RunState.ARMED,
+        created_at_utc=DISPATCHED,
+    )
+    return engine, factory, run_id
 
 
 def _real_dispatch(repo: SqlAlchemyRepository, run_id, target: Coordinate):  # type: ignore[no-untyped-def]
@@ -75,9 +86,9 @@ def _real_dispatch(repo: SqlAlchemyRepository, run_id, target: Coordinate):  # t
 
 
 def test_the_wake_up_time_survives_a_restart(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "restart.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "restart.db")
     repo = SqlAlchemyRepository(factory)
-    dispatch_id = _real_dispatch(repo, run.run_id, Coordinate(1, 149, 17))
+    dispatch_id = _real_dispatch(repo, run_id, Coordinate(1, 149, 17))
     repo.record_flight_time(dispatch_id, FLIGHT, DISPATCHED)
     engine.dispose()
 
@@ -85,21 +96,21 @@ def test_the_wake_up_time_survives_a_restart(tmp_path: Path) -> None:
     reopened = create_database_engine(f"sqlite:///{tmp_path / 'restart.db'}")
     repo2 = SqlAlchemyRepository(create_session_factory(reopened))
 
-    pending = repo2.pending_reports(run.run_id)
+    pending = repo2.pending_reports(run_id)
     assert len(pending) == 1
     assert pending[0].expected_report_at_utc == DISPATCHED + FLIGHT
     assert not pending[0].closed
 
 
 def test_a_fleet_still_in_flight_makes_the_run_wait(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "inflight.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "inflight.db")
     repo = SqlAlchemyRepository(factory)
     repo.record_flight_time(
-        _real_dispatch(repo, run.run_id, Coordinate(1, 149, 17)), FLIGHT, DISPATCHED
+        _real_dispatch(repo, run_id, Coordinate(1, 149, 17)), FLIGHT, DISPATCHED
     )
 
     plan = ReportWaitPlanner().plan(
-        repo.pending_reports(run.run_id), now_utc=DISPATCHED + timedelta(hours=1)
+        repo.pending_reports(run_id), now_utc=DISPATCHED + timedelta(hours=1)
     )
 
     assert plan.action is WaitAction.WAIT
@@ -108,14 +119,14 @@ def test_a_fleet_still_in_flight_makes_the_run_wait(tmp_path: Path) -> None:
 
 
 def test_an_arrived_fleet_makes_the_run_collect(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "arrived.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "arrived.db")
     repo = SqlAlchemyRepository(factory)
     repo.record_flight_time(
-        _real_dispatch(repo, run.run_id, Coordinate(1, 149, 17)), FLIGHT, DISPATCHED
+        _real_dispatch(repo, run_id, Coordinate(1, 149, 17)), FLIGHT, DISPATCHED
     )
 
     plan = ReportWaitPlanner().plan(
-        repo.pending_reports(run.run_id), now_utc=DISPATCHED + FLIGHT + timedelta(minutes=5)
+        repo.pending_reports(run_id), now_utc=DISPATCHED + FLIGHT + timedelta(minutes=5)
     )
 
     assert plan.action is WaitAction.COLLECT
@@ -124,13 +135,13 @@ def test_an_arrived_fleet_makes_the_run_collect(tmp_path: Path) -> None:
 
 def test_a_rejected_dispatch_never_holds_the_run_open(tmp_path: Path) -> None:
     """被游戏拒掉的那一发没有舰队飞出去，也就不会有战报；算进来运行就永远等不完。"""
-    engine, factory, run = _plan_and_run(tmp_path, "rejected.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "rejected.db")
     repo = SqlAlchemyRepository(factory)
     intent_id, dispatch_id = uuid4(), uuid4()
     repo.save_attack_intent(
         AttackIntent(
             intent_id=intent_id,
-            run_id=run.run_id,
+            run_id=run_id,
             origin=Coordinate(2, 137, 18),
             target=Coordinate(1, 149, 17),
             preset=FleetPresetRef(name="探路", signature="轻型战斗机:1"),
@@ -148,22 +159,20 @@ def test_a_rejected_dispatch_never_holds_the_run_open(tmp_path: Path) -> None:
         )
     )
 
-    assert repo.pending_reports(run.run_id) == []
+    assert repo.pending_reports(run_id) == []
     assert (
-        ReportWaitPlanner().plan(repo.pending_reports(run.run_id), now_utc=DISPATCHED).action
+        ReportWaitPlanner().plan(repo.pending_reports(run_id), now_utc=DISPATCHED).action
         is WaitAction.COMPLETE
     )
     engine.dispose()
 
 
 def test_unknown_flight_time_is_stored_as_unknown(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "unknown.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "unknown.db")
     repo = SqlAlchemyRepository(factory)
-    repo.record_flight_time(
-        _real_dispatch(repo, run.run_id, Coordinate(1, 149, 17)), None, DISPATCHED
-    )
+    repo.record_flight_time(_real_dispatch(repo, run_id, Coordinate(1, 149, 17)), None, DISPATCHED)
 
-    pending = repo.pending_reports(run.run_id)
+    pending = repo.pending_reports(run_id)
     assert pending[0].expected_report_at_utc is None
     # 未知不能变成无限等待。
     assert ReportWaitPlanner().plan(pending, now_utc=DISPATCHED).action is WaitAction.COLLECT
@@ -171,30 +180,30 @@ def test_unknown_flight_time_is_stored_as_unknown(tmp_path: Path) -> None:
 
 
 def test_resume_time_and_session_attempts_round_trip(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "resume.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "resume.db")
     repo = SqlAlchemyRepository(factory)
     wake = DISPATCHED + FLIGHT
 
-    repo.set_resume_at(run.run_id, wake)
-    assert repo.note_session_attempt(run.run_id, succeeded=False) == 1
-    assert repo.note_session_attempt(run.run_id, succeeded=False) == 2
+    repo.set_resume_at(run_id, wake)
+    assert repo.note_session_attempt(run_id, succeeded=False) == 1
+    assert repo.note_session_attempt(run_id, succeeded=False) == 2
     # 拿到会话后归零，下一次中断重新从短退避开始。
-    assert repo.note_session_attempt(run.run_id, succeeded=True) == 0
+    assert repo.note_session_attempt(run_id, succeeded=True) == 0
     engine.dispose()
 
 
 def test_waiting_states_are_persisted(tmp_path: Path) -> None:
-    engine, factory, run = _plan_and_run(tmp_path, "states.db")
+    engine, factory, run_id = _plan_and_run(tmp_path, "states.db")
     repo = SqlAlchemyRepository(factory)
 
-    repo.set_run_state(run.run_id, RunState.SCANNING)
-    repo.set_run_state(run.run_id, RunState.DRAINING)
-    repo.set_run_state(run.run_id, RunState.AWAITING_REPORT)
-    assert repo.run_state(run.run_id) is RunState.AWAITING_REPORT
+    repo.set_run_state(run_id, RunState.SCANNING)
+    repo.set_run_state(run_id, RunState.DRAINING)
+    repo.set_run_state(run_id, RunState.AWAITING_REPORT)
+    assert repo.run_state(run_id) is RunState.AWAITING_REPORT
 
-    repo.set_run_state(run.run_id, RunState.WAITING_SESSION)
-    assert repo.run_state(run.run_id) is RunState.WAITING_SESSION
+    repo.set_run_state(run_id, RunState.WAITING_SESSION)
+    assert repo.run_state(run_id) is RunState.WAITING_SESSION
 
-    repo.set_run_state(run.run_id, RunState.DRAINING)
-    assert repo.run_state(run.run_id) is RunState.DRAINING
+    repo.set_run_state(run_id, RunState.DRAINING)
+    assert repo.run_state(run_id) is RunState.DRAINING
     engine.dispose()

@@ -28,6 +28,7 @@ from evo_helper.vision.pirate_reports import OUTCOME_DRAW, OUTCOME_FAIL, OUTCOME
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 TARGET = Coordinate(2, 137, 4)
@@ -50,11 +51,13 @@ def _client(tmp_path: Path, *, with_report: bool, outcome: str = OUTCOME_VICTORY
             ScanRangeView(Coordinate(2, 137, 1), TARGET, ORIGIN, PRESET.name, PRESET.signature, 0),
         ),
     )
-    run = service.start_run(plan.id, "log-page-0001")
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="log-page-0001", created_at_utc=DISPATCHED
+    )
     repository = SqlAlchemyRepository(factory)
     intent = AttackIntent(
         intent_id=uuid4(),
-        run_id=run.run_id,
+        run_id=run_id,
         origin=ORIGIN,
         target=TARGET,
         preset=PRESET,

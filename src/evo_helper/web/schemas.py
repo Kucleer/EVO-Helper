@@ -75,24 +75,6 @@ class ScanPlanOut(BaseModel):
     updated_at: datetime
 
 
-class RunStartIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    plan_id: UUID
-    idempotency_key: str = Field(min_length=8, max_length=128)
-
-
-class RunStatusOut(BaseModel):
-    run_id: UUID
-    plan_id: UUID
-    state: str
-    idempotency_key: str
-    target_date: str
-    created_at: datetime
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-
-
 class RevisitIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -260,8 +242,6 @@ __all__ = [
     "MissionTaskPatch",
     "RevisitIn",
     "RevisitOut",
-    "RunStartIn",
-    "RunStatusOut",
     "ScanPlanIn",
     "ScanPlanOut",
     "ScanPlanPatch",

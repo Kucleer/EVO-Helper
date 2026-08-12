@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
+from evo_helper.domain.models import Coordinate, CoordinateRange
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -80,18 +80,6 @@ class PlanPatchView:
     window_start: time | None = None
     window_end: time | None = None
     ranges: tuple[ScanRangeView, ...] | None = None
-
-
-@dataclass(frozen=True)
-class RunStatusView:
-    run_id: UUID
-    plan_id: UUID
-    state: RunState
-    idempotency_key: str
-    target_date: date
-    created_at: datetime
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
 
 
 #: 星球列表的筛选类型。`all` 不是一种星球，是「不过滤」。
@@ -396,10 +384,10 @@ class ApplicationService(Protocol):
     ) -> ScanPlanView: ...
     def update_plan(self, plan_id: UUID, patch: PlanPatchView) -> ScanPlanView: ...
     def delete_plan(self, plan_id: UUID) -> None: ...
-    # 运行实例只剩「建一条 + 查一条」这两件事。列表与暂停/恢复/紧急停止随
-    # 「运行详情」那一页一起删了——那三个动作只有那一页上的按钮调用过。
-    def start_run(self, plan_id: UUID, idempotency_key: str) -> RunStatusView: ...
-    def get_run(self, run_id: UUID) -> RunStatusView | None: ...
+    # 运行实例这一层已经整个不在服务协议里了：`start_run` / `get_run` 是
+    # `POST /api/runs/start` 与 `GET /api/runs/{run_id}` 仅有的调用点，两个接口
+    # 都随「运行详情」页的关闭一起删了。库里的 `run_instances` 照旧——建与推进
+    # 都在 `tools/` 的扫描与海盗链路里，读状态走 `SqlAlchemyRepository.run_state`。
     def list_targets(self) -> list[BotTargetView]: ...
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
     def count_scans(self) -> int: ...
@@ -457,8 +445,6 @@ class FakeApplicationService:
         self._now = now_utc or (lambda: datetime.now(UTC))
         self._lock = Lock()
         self._plans: dict[UUID, ScanPlanView] = {}
-        self._runs: dict[UUID, RunStatusView] = {}
-        self._runs_by_key: dict[str, UUID] = {}
         self._targets: dict[Coordinate, BotTargetView] = {}
         self._snapshots: dict[Coordinate, list[FleetSnapshotView]] = {}
         self._events: list[StateEventView] = []
@@ -559,68 +545,6 @@ class FakeApplicationService:
         # The origin is deliberately not required to fall inside the range. It
         # is the player's own planet, which normally sits well outside the
         # coordinates being scanned.
-
-    # ---- runs ------------------------------------------------------------
-
-    def start_run(self, plan_id: UUID, idempotency_key: str) -> RunStatusView:
-        with self._lock:
-            if idempotency_key in self._runs_by_key:
-                existing_id = self._runs_by_key[idempotency_key]
-                existing = self._runs[existing_id]
-                raise ConflictError(f"idempotency_key already used by run {existing.run_id}")
-            plan = self._plans.get(plan_id)
-            if plan is None:
-                raise NotFoundError(f"plan {plan_id} not found")
-            if not plan.enabled:
-                raise ServiceError(f"plan {plan.name} is disabled")
-            now = self._now()
-            state, target_date = self._schedule_state(plan, now)
-            run = RunStatusView(
-                run_id=uuid4(),
-                plan_id=plan.id,
-                state=state,
-                idempotency_key=idempotency_key,
-                target_date=target_date,
-                created_at=now,
-            )
-            self._runs[run.run_id] = run
-            self._runs_by_key[idempotency_key] = run.run_id
-            self._append_event(run.run_id, "run", "started", None, state.value)
-            return run
-
-    def get_run(self, run_id: UUID) -> RunStatusView | None:
-        with self._lock:
-            return self._runs.get(run_id)
-
-    def _schedule_state(self, plan: ScanPlanView, now: datetime) -> tuple[RunState, date]:
-        shanghai_now = now.astimezone(SHANGHAI)
-        today = shanghai_now.date()
-        current = shanghai_now.time()
-        if current < plan.window_start:
-            return RunState.ARMED, today
-        if current <= plan.window_end:
-            return RunState.SCANNING, today
-        return RunState.ARMED, today + timedelta(days=1)
-
-    def _append_event(
-        self,
-        aggregate_id: UUID,
-        aggregate: str,
-        event: str,
-        from_state: str | None,
-        to_state: str | None,
-    ) -> None:
-        self._events.append(
-            StateEventView(
-                event_id=uuid4(),
-                occurred_at_utc=self._now(),
-                aggregate=aggregate,
-                aggregate_id=aggregate_id,
-                event=event,
-                from_state=from_state,
-                to_state=to_state,
-            )
-        )
 
     # ---- targets / history ----------------------------------------------
 
@@ -823,22 +747,19 @@ class FakeApplicationService:
         return AttackLogOptions(presets=(), outcomes=())
 
     def dashboard(self) -> DashboardView:
+        """Fake 服务里「进行中的运行」恒为 0。
+
+        它原先数的是 `start_run` 建出来的内存运行实例，而 `start_run` 随
+        `POST /api/runs/start` 一起删了——这个 Fake 现在没有任何造运行实例的入口。
+        返回 0 而不是留一个永远空的字典，同 `list_attack_log` 恒空：演示服务照样
+        打得开，只是没有可数的东西。真实数字由 `PersistentApplicationService`
+        直接查 `run_instances` 得出。
+        """
         with self._lock:
-            active = sum(
-                1
-                for run in self._runs.values()
-                if run.state
-                in {
-                    RunState.ARMED,
-                    RunState.SCANNING,
-                    RunState.WAITING_CAPACITY,
-                    RunState.DRAINING,
-                }
-            )
             pending = sum(1 for revisit in self._revisits if revisit.status == "pending")
             return DashboardView(
                 plan_count=len(self._plans),
-                active_run_count=active,
+                active_run_count=0,
                 target_count=len(self._targets),
                 pending_revisit_count=pending,
             )
@@ -862,7 +783,6 @@ __all__ = [
     "NotFoundError",
     "PlanPatchView",
     "RevisitView",
-    "RunStatusView",
     "ScanPlanView",
     "SchedulerView",
     "ScanRangeView",

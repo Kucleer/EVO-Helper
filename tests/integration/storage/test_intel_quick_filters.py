@@ -49,6 +49,7 @@ from evo_helper.storage.intel import (
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.scout_reports import PirateScoutReading
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 BASE_TIME = datetime(2026, 8, 11, 3, 0, 0, tzinfo=UTC)
@@ -173,18 +174,12 @@ class _Seed:
 
 def _make_run(factory: sessionmaker[Session]) -> UUID:
     """派遣意图有一条指向 run_instances 的外键，先得有一次运行。"""
-    from evo_helper.web.persistent_service import PersistentApplicationService
-    from evo_helper.web.service import ScanRangeView
-
-    service = PersistentApplicationService(factory, now_utc=lambda: BASE_TIME)
-    plan = service.create_plan(
-        name="quick-filters",
-        enabled=True,
-        window_start=datetime(2026, 1, 1, 8).time(),
-        window_end=datetime(2026, 1, 1, 20).time(),
-        ranges=(ScanRangeView(Coordinate(2, 1, 1), Coordinate(2, 999, 20), ORIGIN, "AAA", "x", 0),),
+    return seed_run_instance(
+        factory,
+        plan_name="quick-filters",
+        idempotency_key="quick-filters-0001",
+        created_at_utc=BASE_TIME,
     )
-    return service.start_run(plan.id, "quick-filters-0001").run_id
 
 
 # -- 海盗行 -------------------------------------------------------------------

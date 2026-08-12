@@ -64,12 +64,23 @@ def test_plan_crud_flow() -> None:
     assert client.get(f"/api/plans/{plan_id}").status_code == 404
 
 
-def test_starting_a_run_is_idempotent() -> None:
-    """幂等键仍然是运行实例的去重依据——扫描链路也是靠它续上同一条运行的。
+# `test_starting_a_run_is_idempotent` 随 `POST /api/runs/start` 与
+# `GET /api/runs/{run_id}` 一起删了：它守的是这两个接口本身（201 + 409 + 回读），
+# 接口不在了，这条用例也就没有对应的行为可守。
+#
+# 它顺带守着的那条不变量——**同一个幂等键只许有一条运行实例**——落在库上，由
+# `tests/integration/storage/test_repository.py::test_idempotency_key_is_unique`
+# 守着（`run_instances.idempotency_key` 的唯一约束）。那也正是生产链路真正依赖的
+# 那一层：`tools/scan_coordinates.py` 与 `tools/pirate_loop.py` 用固定的 `RUN_KEY`
+# 续上同一条运行，从来不经过 HTTP。
 
-    「暂停 / 恢复 / 紧急停止」三段原先也在这条用例里，随 `run.html` 上那三个
-    按钮一起删了：那三个接口只有那一页调用过，而真正在跑的链路从来不从那里
-    改状态（它走 `SqlAlchemyRepository.set_run_state`）。
+
+def test_the_runs_api_is_gone() -> None:
+    """`/api/runs` 底下不许再剩任何一个接口。
+
+    301/307 只留给页面路径（旧书签），接口没有书签这回事：留一个没人调的写接口
+    在那里，下一个人只会以为「运行实例是从这里建的」，而真正建它的是
+    `tools/` 里的扫描与海盗链路。
     """
     client, _ = _make_client()
     plan_id = _create_plan(client)
@@ -79,18 +90,10 @@ def test_starting_a_run_is_idempotent() -> None:
         headers=_headers(),
         json={"plan_id": plan_id, "idempotency_key": "run-key-0001"},
     )
-    assert started.status_code == 201
-    assert started.json()["state"] == "SCANNING"
-    run_id = started.json()["run_id"]
+    assert started.status_code == 404, started.status_code
 
-    duplicate = client.post(
-        "/api/runs/start",
-        headers=_headers(),
-        json={"plan_id": plan_id, "idempotency_key": "run-key-0001"},
-    )
-    assert duplicate.status_code == 409
-
-    assert client.get(f"/api/runs/{run_id}").json()["run_id"] == run_id
+    read_back = client.get("/api/runs/2ba6d1b8-6f1e-4a2b-9a3f-0d1c2e3f4a5b")
+    assert read_back.status_code == 404, read_back.status_code
 
 
 def test_targets_history_and_diff() -> None:

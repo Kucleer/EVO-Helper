@@ -33,6 +33,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 CYCLE = datetime(2026, 8, 3, tzinfo=UTC)
@@ -67,7 +68,9 @@ def _seed(tmp_path: Path) -> tuple[PersistentApplicationService, TestClient]:
         window_end=time(20),
         ranges=(ScanRangeView(Coordinate(2, 1, 1), Coordinate(2, 999, 20), ORIGIN, "AAA", "x", 0),),
     )
-    run = service.start_run(plan.id, "log-target-0001")
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="log-target-0001", created_at_utc=NOW
+    )
     repository = SqlAlchemyRepository(factory)
 
     # 越靠后创建的越新；日志按创建时刻倒序，所以 ORDER 就是页面上的顺序。
@@ -75,7 +78,7 @@ def _seed(tmp_path: Path) -> tuple[PersistentApplicationService, TestClient]:
         moment = datetime(2026, 8, 9, tzinfo=UTC) + timedelta(minutes=index)
         intent = AttackIntent(
             intent_id=uuid4(),
-            run_id=run.run_id,
+            run_id=run_id,
             origin=ORIGIN,
             target=target,
             preset=PRESET,
