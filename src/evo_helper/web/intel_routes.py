@@ -4,6 +4,9 @@ Filtering runs on the server: the request carries a coordinate span and a
 condition tree, and the response carries one row per matching target with its
 latest defender snapshot summary. The browser never receives fleet history it
 would have to filter itself.
+
+预设 / 结果 / 战果三个快速过滤按**最近一次派遣**判，口径写在
+`storage.intel` 的模块注释里，页面上也照写一遍——用户不该从筛选结果里反推语义。
 """
 
 from __future__ import annotations
@@ -42,6 +45,12 @@ class SearchIn(BaseModel):
     cursor: str | None = None
     limit: int = DEFAULT_LIMIT
     sort: str = SORT_COORDINATE
+    #: 三个快速过滤。**空串等同于不筛**——下拉框里「不限」那一项的 value 就是
+    #: 空串，而 `preset=""` 要是被当成「预设名叫空字符串」，这一页的默认选项
+    #: 点下去就永远是 0 条。同 `web.app._blank_to_none` 那条教训。
+    preset: str | None = None
+    dispatch_state: str | None = None
+    battle_result: str | None = None
 
 
 class ShipCountOut(BaseModel):
@@ -49,17 +58,30 @@ class ShipCountOut(BaseModel):
     count: int
 
 
+class ScoutShipOut(BaseModel):
+    ship_type: str
+    #: ⚠️ **可以是 null，而 null 不是 0**：那一格没读出来。页面必须把两者显示成
+    #: 不同的东西（`0` 与 `—`），不许在任何一层 `or 0`。
+    count: int | None
+
+
 class IntelRowOut(BaseModel):
     coordinate: str
+    kind: str
     player: str | None
     last_scan_at: datetime | None
     snapshot_at: datetime | None
+    scout_at: datetime | None
     total: int | None
     has_fleet_data: bool
     matched_summary: str
     match_confidence: float | None
     review_status: str | None
+    preset_name: str | None
+    dispatch_state: str
+    battle_result: str
     ships: list[ShipCountOut]
+    scout_ships: list[ScoutShipOut]
 
 
 class SearchOut(BaseModel):
@@ -110,6 +132,11 @@ def register_intel_routes(app: FastAPI, session_factory: sessionmaker[Session]) 
         extra = sorted(recorded - set(UNIT_ORDER))
         return known + extra
 
+    @router.get("/presets", response_model=list[str])
+    async def list_presets() -> list[str]:
+        """派遣里出现过的预设名，供「预设」快速过滤的下拉框用。"""
+        return repository.preset_names()
+
     @router.post("/search", response_model=SearchOut)
     async def search(payload: SearchIn) -> SearchOut:
         span, conditions = _resolve(repository, payload)
@@ -122,23 +149,37 @@ def register_intel_routes(app: FastAPI, session_factory: sessionmaker[Session]) 
                 cursor=payload.cursor,
                 limit=payload.limit,
                 sort=payload.sort,
+                preset=_blank_to_none(payload.preset),
+                dispatch_state=_blank_to_none(payload.dispatch_state),
+                battle_result=_blank_to_none(payload.battle_result),
             )
         )
         return SearchOut(
             rows=[
                 IntelRowOut(
                     coordinate=str(row.coordinate),
+                    kind=row.kind,
                     player=row.player,
                     last_scan_at=row.last_scan_at,
                     snapshot_at=row.snapshot_at,
+                    scout_at=row.scout_at,
                     total=row.total,
                     has_fleet_data=row.has_fleet_data,
                     matched_summary=row.matched_summary,
                     match_confidence=row.match_confidence,
                     review_status=row.review_status,
+                    preset_name=row.preset_name,
+                    dispatch_state=row.dispatch_state,
+                    battle_result=row.battle_result,
                     ships=[
                         ShipCountOut(ship_type=name, count=count)
                         for name, count in sorted(row.counts.items())
+                    ],
+                    # 顺序原样保留：`scout_trigger_ships.ordinal` 记的是读到的次序，
+                    # 排序会把「读出来的在前、没读出来的在后」这条信息抹掉。
+                    scout_ships=[
+                        ScoutShipOut(ship_type=name, count=count)
+                        for name, count in row.scout_ships.items()
                     ],
                 )
                 for row in page.rows
@@ -186,6 +227,12 @@ def _resolve(
 
 def _span(span: SpanIn | None) -> CoordinateRange | None:
     return parse_coordinate_span(span.start, span.end) if span is not None else None
+
+
+def _blank_to_none(value: str | None) -> str | None:
+    """空串 = 不筛。下拉框里「不限」那一项提交的就是空串。"""
+    cleaned = (value or "").strip()
+    return cleaned or None
 
 
 def _filter_out(saved: Any) -> FilterOut:

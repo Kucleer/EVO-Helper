@@ -22,7 +22,7 @@ from evo_helper.domain.missions import (
     bot_targets_in_range,
     pirate_systems,
 )
-from evo_helper.domain.models import Coordinate, RunState
+from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
 from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
@@ -376,7 +376,14 @@ class PersistentApplicationService:
                 for row in reversed(rows)
             ]
 
-    def list_attack_log(self, limit: int, *, day_utc: date | None = None) -> list[AttackLogView]:
+    def list_attack_log(
+        self,
+        limit: int,
+        *,
+        day_utc: date | None = None,
+        kind: str | None = None,
+        target_span: CoordinateRange | None = None,
+    ) -> list[AttackLogView]:
         """攻击日志：每条意图一行，派出去的带上派遣事实。
 
         用 `outerjoin` 而不是 `join`：**被闸门拦下、或者读简报没通过的意图
@@ -389,11 +396,14 @@ class PersistentApplicationService:
         战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
         在这里按坐标重新配一次，等于把同一条判据写第二份。
 
-        `day_utc` 给定时只留那一个 **UTC+0 自然日**（也就是游戏内的一天）的记录。
-        筛选下推到 SQL，而不是在取回 `limit` 条之后再按日期挑：日志页只取最近
-        若干条，在内存里筛日期等于「先砍掉历史再问历史」——查三天前那天会得到
-        空页，而空页读起来和「那天一发没打」一模一样。海盗每日 32 次配额是按
-        游戏日算的，一天的记录必须能整天取全。
+        **三个筛选全部下推到 SQL**，不许在取回 `limit` 条之后再挑：日志页只取最近
+        若干条，在内存里筛等于「先砍掉历史再问历史」——查三天前那天、或者查某个
+        坐标，会得到空页，而空页读起来和「那天/那里一发没打」一模一样。海盗每日
+        32 次配额是按游戏日算的，一天的记录必须能整天取全。
+
+        - `day_utc`：只留那一个 **UTC+0 自然日**（也就是游戏内的一天）。
+        - `kind`：`bot` / `pirate`（`domain.records.TARGET_KIND_*`）。
+        - `target_span`：目标坐标区间，闭区间，两端都含。
         """
         with self._session_factory() as session:
             statement = (
@@ -407,6 +417,21 @@ class PersistentApplicationService:
                     orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
                 )
             )
+            if kind is not None:
+                statement = statement.where(orm.AttackIntentRow.target_kind == kind)
+            if target_span is not None:
+                # 打包成一个整数再比区间。逐分量比较（galaxy>= 且 system>= 且
+                # position>=）会把 2:130:14 排除在 2:130:1 – 2:140:20 之外——
+                # 14 > 20 不成立，那一路就走不通了。情报中心的坐标区间踩过同一个坑
+                # （`storage.intel._within`）。
+                packed = (
+                    orm.AttackIntentRow.target_galaxy * 1_000_000
+                    + orm.AttackIntentRow.target_system * 1000
+                    + orm.AttackIntentRow.target_position
+                )
+                statement = statement.where(
+                    packed.between(_pack(target_span.start), _pack(target_span.end))
+                )
             if day_utc is not None:
                 # 按页面第一列显示的那个瞬时切：派出去的按派遣时刻，没派出去的
                 # 按意图创建时刻。半开区间 [当日 00:00, 次日 00:00)，别用
@@ -1203,3 +1228,8 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
     if kind == "free":
         return orm.BotTargetRow.latest_owner_name.is_(None)
     return None
+
+
+def _pack(coordinate: Coordinate) -> int:
+    """坐标打包成一个可比大小的整数。与 `storage.intel._pack` 同一套算法。"""
+    return (coordinate.galaxy * 1000 + coordinate.system) * 1000 + coordinate.position

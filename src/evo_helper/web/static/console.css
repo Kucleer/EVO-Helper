@@ -27,6 +27,10 @@
   --warn: #e0b341;
   --danger: #e5675f;
 
+  /* 海盗行的色。不复用 ok/warn/danger：那三个说的是「好 / 要留意 / 出事了」，
+     而「这是个海盗」不是一种状态。 */
+  --pirate: #c887e8;
+
   --radius: 6px;
   --gap: 16px;
   --nav-w: 208px;
@@ -160,6 +164,13 @@ body {
 .chip.warn { color: var(--warn); border-color: #524220; }
 .chip.danger { color: var(--danger); border-color: #562b2a; }
 
+/* bot 与海盗：两条完全不同的链路，情报中心把它们列在同一张表里，得一眼分得开。
+   刻意避开 ok/warn/danger 三色——那三个说的是「好 / 要留意 / 出事了」，
+   而 bot 和海盗之间没有好坏之分，借用状态色会让人以为海盗行出了问题。
+   同 `.chip.ok` 一样，色永远配一个字形和一个词。 */
+.chip.kind-bot { color: var(--accent-strong); border-color: #1f5462; }
+.chip.kind-pirate { color: var(--pirate); border-color: #4c2f5e; }
+
 /* ---- stat tiles ----------------------------------------------------- */
 
 .tile { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
@@ -289,6 +300,13 @@ tbody tr[aria-selected="true"] { background: var(--accent-dim); }
 td.num, th.num { text-align: center; }
 td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
 td.coord { font-family: var(--mono); color: var(--accent-strong); }
+
+/* 情报中心：整行也带上类型色，一条左边框而不是整行底色——底色会盖掉
+   hover 与选中态，而那两个是能点的信号。类型那一格里写着「bot」「海盗」，
+   所以这条边框只是加速，不是唯一的信号。 */
+tbody tr.kind-bot td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr.kind-pirate td:first-child { box-shadow: inset 3px 0 0 var(--pirate); }
+tbody tr.kind-pirate td.coord { color: var(--pirate); }
 
 /* ---- 调度台的任务行 --------------------------------------------------- */
 

@@ -23,12 +23,26 @@ from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFre
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
-from evo_helper.domain.models import Coordinate
+from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_span
+from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.storage.repository import SqlAlchemyRepository
 
-from .display import LIST_SHIP_COLUMNS, MISSION_LABELS, STATUS_GLYPHS, STATUS_TONES
+from .display import (
+    BATTLE_RESULT_GLYPHS,
+    BATTLE_RESULT_LABELS,
+    BATTLE_RESULT_TONES,
+    DISPATCH_STATE_GLYPHS,
+    DISPATCH_STATE_LABELS,
+    DISPATCH_STATE_TONES,
+    LIST_SHIP_COLUMNS,
+    MISSION_LABELS,
+    STATUS_GLYPHS,
+    STATUS_TONES,
+    TARGET_KIND_GLYPHS,
+    TARGET_KIND_TONES,
+)
 
 # 模块级导入（而不是留在 `create_persistent_app` 里）：`register_mission_routes`
 # 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
@@ -375,6 +389,37 @@ BlankableInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
 #: 不像下拉框还能塞一个 `value=""` 的选项绕开，所以这一条是必须的。
 BlankableDate = Annotated[date | None, BeforeValidator(_blank_to_none)]
 
+#: 允许空串的文本查询参数。空串→None，也就是「这一格没填」。
+#:
+#: `str | None` 本身不会 422，但空串会一路走到解析函数那里变成一条错误提示，
+#: 而用户看到的只是「我没填这一格」。攻击日志的坐标框是两个 `<input>`，
+#: 提交表单必然带上 `target_start=&target_end=`。
+BlankableStr = Annotated[str | None, BeforeValidator(_blank_to_none)]
+
+
+def _target_span(start: str | None, end: str | None) -> CoordinateRange | None:
+    """把攻击日志上那两个坐标框读成一个闭区间。
+
+    只填一端时另一端跟着它走：填 `2:130` 就是「只看 2:130 这个星系」，而不是
+    「从 2:130 到宇宙尽头」——一个人只填了起点，想的是那一个位置，不是半个宇宙。
+    简写补位由 `parse_coordinate_span` 负责：起点补 1，终点补最后一位，所以
+    `2:130` – `2:140` 覆盖 2:130:1 到 2:140:999，两端都含。
+    """
+    first = start or end
+    last = end or start
+    if first is None or last is None:
+        return None
+    return parse_coordinate_span(first, last)
+
+
+def _span_label(span: CoordinateRange | None) -> str:
+    """把补位之后的区间写全给用户看。
+
+    输入 `2:130` 补成 `2:130:1`，页面上必须显示补完的那一对——否则「为什么
+    2:130:14 也在里面」这件事，用户只能从结果里反推。
+    """
+    return "" if span is None else f"{span.start} – {span.end}"
+
 
 # ---- application factory --------------------------------------------------
 
@@ -622,6 +667,17 @@ def create_app(
                 "planet_total": service.count_scans(),
                 "active": "intel",
                 "list_ship_columns": list(LIST_SHIP_COLUMNS),
+                # 标签与 chip 样式由服务端下发，页面脚本不再自己写一份中文——
+                # 抄一份就会有一天页面上的档位和库里的取值对不上。
+                "kind_labels": TARGET_KIND_LABELS,
+                "kind_tones": TARGET_KIND_TONES,
+                "kind_glyphs": TARGET_KIND_GLYPHS,
+                "dispatch_labels": DISPATCH_STATE_LABELS,
+                "dispatch_tones": DISPATCH_STATE_TONES,
+                "dispatch_glyphs": DISPATCH_STATE_GLYPHS,
+                "result_labels": BATTLE_RESULT_LABELS,
+                "result_tones": BATTLE_RESULT_TONES,
+                "result_glyphs": BATTLE_RESULT_GLYPHS,
             },
         )
 
@@ -774,11 +830,16 @@ def create_app(
 
     @app.get("/logs", response_class=HTMLResponse)
     async def attack_log_page(
-        request: Request, kind: str = "all", date: BlankableDate = None
+        request: Request,
+        kind: str = "all",
+        date: BlankableDate = None,
+        target_start: BlankableStr = None,
+        target_end: BlankableStr = None,
     ) -> HTMLResponse:
         """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
 
-        筛选走查询参数，所以「只看海盗」「只看 8 月 9 日」都有自己可分享的链接。
+        筛选走查询参数，所以「只看海盗」「只看 8 月 9 日」「只看 2:130–2:140」
+        都有自己可分享的链接。
 
         `date` 按**游戏时间 UTC+0** 的自然日切，和表格第一列同一口径。拿现实时间
         UTC+8 的日期去切会把每天最早的八小时划到前一天——而那八小时正好压着
@@ -786,18 +847,41 @@ def create_app(
 
         默认不按日期筛。默认「今天」在这一页是反的：UTC+0 的今天要到现实时间
         08:00 才开始，早上打开日志会看见一页空白，而空白读起来就是「昨晚一发没打」。
+
+        **三个筛选一律下推到 SQL**（`list_attack_log` 的参数），不在取回
+        `ATTACK_LOG_LIMIT` 条之后再挑：那样等于先砍掉历史再问历史，查一个旧坐标
+        必得空页，而空页读起来就是「那个坐标没打过」。事件类型原先正是在内存里
+        筛的，一并搬下去。
+
+        坐标解析失败**不返回 422**：这是一张 HTML 页，一页 JSON 报错读起来就是
+        「控制台坏了」。改为照常渲染、在顶上挂一条红字说明「这一页没有按坐标筛」——
+        默默地不筛才是最坏的一种，用户会以为下面那些行就是筛出来的结果。
         """
         service = get_service(request)
-        entries = service.list_attack_log(ATTACK_LOG_LIMIT, day_utc=date)
-        if kind in TARGET_KIND_LABELS:
-            entries = [entry for entry in entries if entry.target_kind == kind]
+        span: CoordinateRange | None = None
+        span_error: str | None = None
+        try:
+            span = _target_span(target_start, target_end)
+        except InvalidQueryError as exc:
+            span_error = str(exc)
+        entries = service.list_attack_log(
+            ATTACK_LOG_LIMIT,
+            day_utc=date,
+            kind=kind if kind in TARGET_KIND_LABELS else None,
+            target_span=span,
+        )
 
-        def kind_url(value: str) -> str:
-            """切换事件类型时把日期带上——否则筛完日期再点「海盗」就跳回全部日期。"""
-            params = {"kind": value}
+        def keep(**overrides: str) -> str:
+            """带着当前的其余筛选拼链接——切换事件类型不该把日期和坐标甩掉。"""
+            params: dict[str, str] = {"kind": kind}
             if date is not None:
                 params["date"] = date.isoformat()
-            return "/logs?" + urlencode(params)
+            if target_start:
+                params["target_start"] = target_start
+            if target_end:
+                params["target_end"] = target_end
+            params.update(overrides)
+            return "/logs?" + urlencode({k: v for k, v in params.items() if v})
 
         return templates.TemplateResponse(
             request=request,
@@ -809,8 +893,13 @@ def create_app(
                 "kind_labels": TARGET_KIND_LABELS,
                 "limit": ATTACK_LOG_LIMIT,
                 "day_value": date.isoformat() if date is not None else "",
-                "kind_url": kind_url,
-                "clear_date_url": "/logs?" + urlencode({"kind": kind}),
+                "target_start_value": target_start or "",
+                "target_end_value": target_end or "",
+                "span_label": _span_label(span),
+                "span_error": span_error,
+                "kind_url": lambda value: keep(kind=value),
+                "clear_date_url": keep(date=""),
+                "clear_target_url": keep(target_start="", target_end=""),
             },
         )
 
