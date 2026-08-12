@@ -27,7 +27,13 @@ from typing import Protocol
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scan_bounds import MAX_POSITION, SYSTEMS_PER_GALAXY, TOTAL_GALAXIES
-from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS, triggers_attack
+from evo_helper.domain.scout_verdict import (
+    VERDICT_ATTACK,
+    VERDICT_SKIP,
+    VERDICT_UNREADABLE,
+    verdict_for,
+)
+from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS
 from evo_helper.vision.parsers import (
     COORDINATE_RE,
     GAME_DISPLAY_ZONE,
@@ -74,13 +80,6 @@ class ScoutReportUnreadable(RuntimeError):
     猜错的方向不是「白打一发」，而是「把舰队送去挨打」。"""
 
 
-#: 判定结论。三值，不是布尔——「读不出来」必须和「读出来了，不值得打」分开：
-#: 前者要重读或跳过，后者是已经问出答案了。合成一个布尔就分不出这两种。
-VERDICT_ATTACK = "ATTACK"
-VERDICT_SKIP = "SKIP"
-VERDICT_UNREADABLE = "UNREADABLE"
-
-
 @dataclass(frozen=True)
 class PirateScoutReading:
     """一份海盗侦察报告里，判定用得上的那部分。"""
@@ -98,19 +97,14 @@ class PirateScoutReading:
 
     @property
     def verdict(self) -> str:
-        """打、不打、还是不下结论。
+        """打、不打、还是不下结论。判据见 `domain.scout_verdict.verdict_for`。
 
-        判据的不对称性是有意的：
-
-        - 读到任何一个 > 1 就打。这个方向的证据是**正面**的——那个数确实读出来了，
-          缺的几格再怎么样也只会让舰队更强，不会让结论反过来。
-        - 读到的都 ≤ 1、却还有没读出来的格子：**不下结论**。缺的那格可能正是
-          一支实打实的舰队，当成 0 就会把「没看清」记成「这里是空的」。
-        - 四格都读出来且都 ≤ 1：这才叫「不值得打」。
+        规则住在 domain，是因为它还有第二个消费者：仓储要按库里那份侦察报告
+        回答「这个海盗走到哪一步了」（`domain.pirate_round`），而 storage
+        不能 import vision。两边各写一份，就会出现「界面上说不值得打、
+        而链路当时判的是没看清」这种谁也说不清的分叉。
         """
-        if triggers_attack(self.trigger_ships):
-            return VERDICT_ATTACK
-        return VERDICT_UNREADABLE if self.missing else VERDICT_SKIP
+        return verdict_for(self.trigger_ships, unread=self.missing)
 
     @property
     def worth_attacking(self) -> bool:

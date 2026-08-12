@@ -24,6 +24,11 @@
 
 from __future__ import annotations
 
+from evo_helper.domain.scout_verdict import (
+    PIRATE_TRIGGER_MIN_COUNT,
+    PIRATE_TRIGGER_SHIPS,
+    triggers_attack,
+)
 from evo_helper.domain.text import snap_to_vocabulary
 
 #: 行星面板上「敌对海盗」的标题与坐标行。两者都读到才算认出是海盗位。
@@ -183,16 +188,6 @@ NAV_PLANET = (840, 862)
 NAV_FLEET = (920, 862)
 NAV_SCROLL_RIGHT = (1204, 862)
 
-#: 判定门槛：侦察报告里这几种舰船任一数量超过这个值，就用攻击预设打。
-#: 门槛低是用户明确确认过的——几乎每个有舰队的海盗都会命中。
-PIRATE_TRIGGER_SHIPS = (
-    "深空吞噬者",
-    "噬能截击者",
-    "钛能守卫者",
-    "收割者",
-)
-PIRATE_TRIGGER_MIN_COUNT = 1
-
 #: 攻击用的游戏内预设（实机核对 2026-08-09，预设槽 4/10）。
 ATTACK_PRESET_NAME = "AAA"
 ATTACK_PRESET_COUNTS = {"深空吞噬者": 70, "钛能守卫者": 30}
@@ -219,15 +214,6 @@ def briefing_says_attack(raw: str) -> bool:
     return snap_mission(raw) == "攻击"
 
 
-def triggers_attack(ships: dict[str, int]) -> bool:
-    """侦察到的舰队是否够格挨一发。
-
-    「任一 > 1」是用户确认过的字面规则。注意这**不是**强弱判断——
-    它只问「这个海盗有没有实打实的舰队」，不问打不打得过。
-    """
-    return any(ships.get(name, 0) > PIRATE_TRIGGER_MIN_COUNT for name in PIRATE_TRIGGER_SHIPS)
-
-
 __all__ = [
     "ATTACK_BUTTON",
     "ATTACK_PRESET_COUNTS",
@@ -236,6 +222,9 @@ __all__ = [
     "BRIEFING_LAUNCH_BUTTON",
     "BRIEFING_MISSION_ROI",
     "DISPATCH_CONFIRM",
+    # 判定规则住在 `domain.scout_verdict`（仓储也要用，而 storage 不能 import
+    # vision/game）。这里原样 re-export，老的 import 路径一个都不用改。
+    "PIRATE_TRIGGER_MIN_COUNT",
     "PIRATE_TRIGGER_SHIPS",
     "PRESET_TOGGLE",
     "SCOUT_BUTTON",

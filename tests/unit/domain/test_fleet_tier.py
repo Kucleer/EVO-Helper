@@ -35,6 +35,25 @@ class TestParsing:
         for junk in ("", "K", "abc", "5..3K", "1,090"):
             assert parse_fleet_count(junk) is None
 
+    def test_the_m_suffix_is_refused_on_purpose(self) -> None:
+        """`M` 不认。识别侧的白名单本来也只放行 `0123456789.K`
+        （`vision.optional.report_screens.UNIT_WHITELIST`），`M` 根本进不来；
+        在这里认了它，就等于凭一个从未在实机上见过的后缀把舰队送出去。
+        「没读到」在调用方那边的处置是不打，这是安全的那一侧。
+        """
+        for text in ("1.5M", "2M", "8m"):
+            assert parse_fleet_count(text) is None
+
+    def test_the_k_suffix_needs_its_decimal_point(self) -> None:
+        """实机 2026-08-11 的量级错**不是**在这里发生的。
+
+        2:48:12 的守方单位实为 `1.22K`，这个函数给出 1220（2K 以下，不该打）；
+        入库的 122000 来自 `122K`——小数点在 OCR 那一层就掉了，修在
+        `vision.fleet_counts.pick_count`。
+        """
+        assert parse_fleet_count("1.22K") == 1220
+        assert parse_fleet_count("122K") == 122000
+
 
 class TestTiers:
     def test_each_bucket_maps_to_its_preset(self) -> None:

@@ -188,23 +188,47 @@ def _plurality(votes: dict[int, int]) -> int:
 
 
 def pick_count(votes: Mapping[str, int]) -> str:
-    """从多次读数里选一个值。**后缀让位于更长的候选。**
+    """从多次读数里选一个值。**掉了字的让位于更全的候选。**
 
-    这个字体的失败模式是恒定的：**丢首位，从不凭空多字**。
+    这个字体的失败模式是恒定的：**只会漏掉笔画，从不凭空多字**。
     实测 `74` 读成 `4` 21 次、读对 15 次；`210` 与 `10` 各 15 次打平。
-    单纯多数票会稳定选错短的那个——而短的恰恰是被截断的那个。
+    单纯多数票会稳定选错短的那个——而短的恰恰是被漏掉字的那个。
 
-    所以先把「是别人后缀」的票并给更长的那个，再取多数。
+    所以先把「能由某个更长候选漏掉字得来」的票并给那个更长的，再取多数。
     这条推理与坐标核对同源：错误只会漏读，不会凭空多读。
+
+    漏掉的字有两种，都要认：
+
+    1. **前面的字掉了** → 短的是长的**后缀**（`74` → `4`、`5.73K` → `73K`）。
+    2. **小数点掉了** → 同一串数字，差整整 100 倍（`1.22K` → `122K`）。
+
+    第 2 条是 2026-08-11 实机上一次真实事故：2:48:12 的守方「单位」实为
+    `1.22K`（1220 艘，2K 以下，按规则**本来就不该打**），入库成了 122000，
+    分档判成 `8K+` 并去挑最重的那套攻击组合。那个小圆点只有几个像素，
+    背后还压着水印，是这一行上最容易丢的一笔——而分档的三条边界
+    （2K/5K/8K）全落在 `1.22K` 与 `122K` 之间，丢一个点就跨过全部三条。
+
+    两条都是**单向**的：带点的候选吸收去掉点之后与它相同的候选，反过来不成立。
+    方向来自同一个前提——字体不会凭空多出一个点，正如它不会凭空多出一位数字。
     """
     if not votes:
         return ""
     folded: dict[str, int] = {}
     for text, count in votes.items():
-        longer = [other for other in votes if other != text and other.endswith(text)]
+        longer = [other for other in votes if other != text and _may_have_dropped_to(other, text)]
         target = max(longer, key=len) if longer else text
         folded[target] = folded.get(target, 0) + count
     return max(sorted(folded), key=lambda value: folded[value])
+
+
+def _may_have_dropped_to(full: str, short: str) -> bool:
+    """`short` 是不是 `full` 漏掉字之后的样子。判据见 `pick_count`。
+
+    **不放宽成「`short` 是 `full` 的子序列」。** 那条会把 `11` 并进 `1.17K`
+    （1、1 确实按顺序出现在里面），把一个 11 艘的读数说成 1170 艘。
+    只认实测见过的两种漏法。
+    """
+    return full.endswith(short) or full.replace(".", "") == short
 
 
 def row_grid(first_top: int, pitch: int, rows: int) -> list[int]:

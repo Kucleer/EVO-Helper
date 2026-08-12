@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from evo_helper.domain.fleet_tier import parse_fleet_count as parse_count
 from evo_helper.vision.fleet_counts import (
     COUNT_RECIPES,
     FleetCountsUnresolved,
@@ -185,7 +186,7 @@ def test_a_tie_is_broken_deterministically() -> None:
 
 
 class TestPickCount:
-    """选票规则：后缀让位于更长的候选。"""
+    """选票规则：掉了字的让位于更全的候选。"""
 
     def test_a_truncated_reading_loses_to_the_full_one_even_with_more_votes(self) -> None:
         # 实测：`74` 读成 `4` 21 次、读对 15 次。多数票会选错。
@@ -204,6 +205,31 @@ class TestPickCount:
 
     def test_no_votes_reads_as_empty(self) -> None:
         assert pick_count({}) == ""
+
+    def test_a_dropped_decimal_point_loses_to_the_dotted_reading(self) -> None:
+        """实机 2026-08-11：2:48:12 的守方「单位」实为 `1.22K`（1220 艘）。
+
+        小数点丢了就成了 `122K` = 122000，差整整 100 倍，而分档的三条边界
+        （2K/5K/8K）全落在这两个读数之间——那一发因此从「2K 以下，不该打」
+        变成了「8K+，用最重的组合打」。
+        """
+        assert pick_count({"122K": 5, "1.22K": 1}) == "1.22K"
+
+    def test_the_dot_only_travels_one_way(self) -> None:
+        """这个字体只会漏笔画，不会凭空多出一个点——所以只有带点的能吸收去点的。
+
+        反过来允许的话，一个真的 `122` 会被一票 `1.22` 拽成 1220。
+        """
+        assert parse_count(pick_count({"122K": 5, "1.22K": 1})) == 1220
+        assert parse_count(pick_count({"1.22K": 5, "122K": 1})) == 1220
+
+    def test_the_dot_rule_does_not_swallow_unrelated_readings(self) -> None:
+        """判据只认「同一串数字、只差一个点」，不是「子序列」。
+
+        放宽成子序列的话 `11` 会被并进 `1.17K`（1、1 确实按顺序出现在里面），
+        一个 11 艘的读数就成了 1170。
+        """
+        assert pick_count({"11": 5, "1.17K": 2}) == "11"
 
 
 class TestRowGrid:

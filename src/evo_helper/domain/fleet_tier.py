@@ -63,6 +63,18 @@ def parse_fleet_count(text: str) -> int | None:
 
     `K` 是游戏自己的四舍五入显示，`5.36K` 的真实值在 5355–5364 之间。
     这里取 5360——档位判断用不着更准。
+
+    ⚠️ **`M` 是故意不认的，不是漏了。** 读到 `1.5M` 返回 None，调用方那边
+    「没读到」的处置是**不打**（`tools.bot_loop._tier_and_attack`），
+    而认了它就等于凭一个从未在实机上见过的后缀把舰队送出去。
+    识别侧的白名单本来也只放行 `0123456789.K`
+    （`vision.optional.report_screens.UNIT_WHITELIST`），`M` 根本进不来；
+    真有一天游戏开始显示 `M`，要改的是那条白名单和这里，两处一起改一次。
+
+    ⚠️ 这个函数**不是** 2026-08-11 那次量级错的成因。2:48:12 的守方单位
+    实为 `1.22K`，`parse_fleet_count("1.22K")` 给出 1220（正确）；入库的
+    122000 来自 `parse_fleet_count("122K")`——小数点在 OCR 那一层就掉了。
+    修在选票那一层（`vision.fleet_counts.pick_count`），不在这里。
     """
     match = _COUNT_RE.match(text.strip())
     if match is None:
