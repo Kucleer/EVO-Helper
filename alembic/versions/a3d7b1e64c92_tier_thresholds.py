@@ -1,7 +1,7 @@
 """bot 分档的三道边界落库
 
 Revision ID: a3d7b1e64c92
-Revises: f4c2e91a7b63
+Revises: b6e0a4f21c98
 Create Date: 2026-08-12
 
 `scheduler_config` 补三列：`tier_alpha_from` / `tier_beta_from` /
@@ -32,7 +32,10 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a3d7b1e64c92"
-down_revision: str | None = "f4c2e91a7b63"
+#: 排在 `b6e0a4f21c98`（时刻列带时区）之后。这条迁移原先也写着 `f4c2e91a7b63`，
+#: 那两条就成了 alembic 的两个 head，而 `web.runtime._upgrade_database` 升到
+#: `"head"` 会直接抛 "Multiple head revisions are present"——控制台连启动都启动不了。
+down_revision: str | None = "b6e0a4f21c98"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
