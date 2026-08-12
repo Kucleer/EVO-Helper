@@ -202,6 +202,45 @@ class ConfigFreezeOut(BaseModel):
     tasks: list[FrozenTaskOut]
     #: 与上一次「开始」相比改了什么。空表示没改；`["首次记录"]` 表示没得比。
     changes: list[str]
+    #: 那一轮的分档阈值，`2000 / 4000 / 8000`。这个字段是后加的，历史记录里
+    #: 没有——那时为 None，页面写「未记录」，**不回填一个默认值**。
+    tier_thresholds: str | None = None
+
+
+class TierBandOut(BaseModel):
+    """一档一行：这个区间的守方，用哪套预设。"""
+
+    #: `AAA` / `BBB` / `CCC`，最低那一档是 `（不派）`。
+    preset: str
+    #: `2K 以下` / `2K–4K` / `8K+`。
+    span: str
+
+
+class TierThresholdsOut(BaseModel):
+    """分档阈值页的全部内容。"""
+
+    alpha_from: int
+    beta_from: int
+    gamma_from: int
+    #: 四行区间回显，从低到高。服务端算好送出去，页面不自己拼——
+    #: 两边各拼一次就会对同一套阈值说出两种区间。
+    bands: list[TierBandOut]
+    #: 调度器运行中为真。页面据此把三个框和「保存」置灰。
+    locked: bool = False
+
+
+class TierThresholdsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: 三个数一次全给。**不做成各自可选**：阈值的合法性是三个数之间的关系
+    #: （严格递增），单独改一个必须拿另外两个一起量，那还不如让调用方把三个
+    #: 都摆出来——页面上本来就是三个框一起保存。
+    #:
+    #: `ge=1` 只挡住负数和零这种一眼看得出的；严格递增由
+    #: `domain.fleet_tier.TierThresholds` 判，错误信息要说清哪一档会变成死区。
+    alpha_from: int = Field(ge=1)
+    beta_from: int = Field(ge=1)
+    gamma_from: int = Field(ge=1)
 
 
 class SchedulerOut(BaseModel):
@@ -249,4 +288,7 @@ __all__ = [
     "ScanRangeOut",
     "SchedulerOut",
     "StateEventOut",
+    "TierBandOut",
+    "TierThresholdsOut",
+    "TierThresholdsPatch",
 ]

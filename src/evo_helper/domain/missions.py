@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from evo_helper.domain.fleet_tier import TierThresholds
 from evo_helper.domain.models import Coordinate
 
 # 故意不从 scan_priority 导入：那边只是转手 import，没有再导出，
@@ -81,17 +82,24 @@ def pirate_command(systems: Sequence[tuple[int, int]]) -> list[str]:
     )
 
 
-def bot_command(targets: Sequence[Coordinate]) -> list[str]:
+def bot_command(targets: Sequence[Coordinate], thresholds: TierThresholds) -> list[str]:
     """bot 攻击命令行。
 
     同 `pirate_command`：`--probe --attack` 是会真的派遣舰队的开关，
     必须原样出现在生成的 argv 里，不能被当作可省略的默认值。
+
+    分档阈值也写进 argv 而不是让 runner 自己去查库，理由是这条命令行会原样存进
+    `mission_runs.command`——事后翻账时「那一轮到底打了谁」全靠它，加上这三个数
+    之后它还能回答「按哪三个数分的档」。而且这样一来，运行中就算有人改了库里的
+    阈值，已经起来的那个子进程用的仍然是启动那一刻的取值。
     """
     if not targets:
         raise MissionParamError("该范围内没有已记录的 bot；先跑扫描")
     listed = [f"{item.galaxy}:{item.system}:{item.position}" for item in targets]
+    edges = [str(edge) for edge in thresholds.edges]
     return _checked(
         [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed]
+        + ["--tier-thresholds", *edges]
         + ["--probe", "--attack"]
     )
 

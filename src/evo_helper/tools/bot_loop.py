@@ -14,8 +14,9 @@
 - 海盗看侦察报告里几个特定舰种的数量（`vision.scout_reports`），
   因为海盗要么有舰队要么没有，不需要分档。
 - bot 看**攻击侦查打回来的战报**里守方的「单位」总数，按 `domain.fleet_tier`
-  分成 2K–5K / 5K–8K / 8K+ 三档，各档一个预设（AAA / BBB / CCC）。
-  2K 以下不派——用户明确说过那个量级不值得为它挑组合。
+  分成三档，各档一个预设（AAA / BBB / CCC），最低那一档不派——用户明确说过
+  那个量级不值得为它挑组合。三道边界（默认 2K / 4K / 8K）由用户在控制台的
+  「分档阈值」页上配，经 `--tier-thresholds` 传进来；档位数量与预设名不可配。
 
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
@@ -76,7 +77,13 @@ from typing import Any
 
 from evo_helper.domain.bot_round import BotPhase, DispatchFact, phase_of
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
-from evo_helper.domain.fleet_tier import FleetTier, tier_for
+from evo_helper.domain.fleet_tier import (
+    DEFAULT_TIER_THRESHOLDS,
+    FleetTier,
+    TierThresholdError,
+    TierThresholds,
+    tier_for,
+)
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
@@ -112,6 +119,11 @@ class BotOptions:
     attack: bool
     #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态。
     round_started_at: datetime | None = None
+    #: 本轮分档用的三道边界。调度器从 `scheduler_config` 读出来写进 argv
+    #: （`domain.missions.bot_command`），手工跑时由 `main()` 现查一次库。
+    #: 这里给默认值只是让 `BotOptions(targets=..., probe=..., attack=...)`
+    #: 这种最小构造在测试里还写得出来；两条真实入口都会明确传值。
+    tier_thresholds: TierThresholds = DEFAULT_TIER_THRESHOLDS
 
 
 class BotLoop(PirateLoop):
@@ -434,11 +446,13 @@ class BotLoop(PirateLoop):
             say(f"  {coordinate} 读不到战报里的守方单位数；不打")
             self._outcome.refused.append((coordinate, "读不到守方单位数"))
             return
-        tier = tier_for(units)
+        thresholds = self._bot.tier_thresholds
+        tier = tier_for(units, thresholds)
         preset = tier.preset
-        say(f"  {coordinate} 守方 {units} → {tier.value}；预设 {preset or '（不派）'}")
+        label = thresholds.label(tier)
+        say(f"  {coordinate} 守方 {units} → {label}；预设 {preset or '（不派）'}")
         if preset is None:
-            self._outcome.refused.append((coordinate, f"{tier.value}，不值得打"))
+            self._outcome.refused.append((coordinate, f"{label}，不值得打"))
             self._mark_skipped(coordinate)
             return
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
@@ -498,6 +512,36 @@ def parse_round_start(text: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def configured_thresholds() -> TierThresholds:
+    """库里当前生效的三道边界。手工跑（不带 `--tier-thresholds`）时用它。
+
+    **不回落到 `DEFAULT_TIER_THRESHOLDS`。** 手工跑一趟和控制台起一轮打的是同一
+    批目标、派的是同一批舰队，用两套不同的阈值分档没有任何道理，而且那种分歧
+    在日志里看不出来——两边都只会打印自己用的那三个数。
+
+    库里还没有配置行时 `SqlAlchemyRepository.tier_thresholds()` 自己会给默认值，
+    那是「新库」而不是「忽略配置」。
+    """
+    from evo_helper.config import Settings
+    from evo_helper.storage.database import create_database_engine, create_session_factory
+    from evo_helper.storage.repository import SqlAlchemyRepository
+
+    factory = create_session_factory(create_database_engine(Settings().database_url))
+    return SqlAlchemyRepository(factory).tier_thresholds()
+
+
+def parse_thresholds(values: Sequence[int]) -> TierThresholds:
+    """`--tier-thresholds A B C` → 三道边界。不递增就当场拒收。
+
+    在入口就拒，而不是让一套不成立的阈值一路走到分档那一步：中间那一档变成
+    死区之后，日志里看到的只是「这一轮一发 BBB 都没派」，看不出是阈值的问题。
+    """
+    try:
+        return TierThresholds(*values)
+    except TierThresholdError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def parse_target(text: str) -> Coordinate:
     parts = text.split(":")
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
@@ -519,10 +563,26 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="本轮起始时刻（ISO 8601，必须带时区）。调度器会传；手工跑不给则按当日 UTC 00:00 算",
     )
+    parser.add_argument(
+        "--tier-thresholds",
+        nargs=3,
+        type=int,
+        metavar=("AAA", "BBB", "CCC"),
+        default=None,
+        help="三档的下界（艘），必须严格递增。调度器会传；手工跑不给则读库里的配置",
+    )
     args = parser.parse_args(argv)
 
     if args.attack and not args.probe:
         parser.error("--attack 需要 --probe：没有攻击侦查打回来的战报就没有分档依据")
+
+    if args.tier_thresholds is None:
+        thresholds = configured_thresholds()
+    else:
+        try:
+            thresholds = parse_thresholds(args.tier_thresholds)
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
 
     import ctypes
 
@@ -533,10 +593,17 @@ def main(argv: list[str] | None = None) -> int:
         probe=args.probe,
         attack=args.attack,
         round_started_at=args.round_started_at,
+        tier_thresholds=thresholds,
     )
     mode = "只认目标" if not args.probe else ("侦查+攻击" if args.attack else "只侦查")
     listed = ", ".join(str(target) for target in options.targets)
     say(f"模式：{mode}；目标 {listed}")
+    # 阈值要打印出来。这一轮派了哪套预设全由它决定，而日志是事后唯一能回答
+    # 「当时按哪三个数分的档」的东西（`mission_runs.command` 记的是调度器那条路）。
+    say(
+        f"分档阈值：AAA {thresholds.alpha_from} / BBB {thresholds.beta_from}"
+        f" / CCC {thresholds.gamma_from}"
+    )
 
     driver = LiveDriver(allow_actions=args.probe or args.attack)
     driver.window()
@@ -550,7 +617,14 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["BotLoop", "BotOptions", "FleetTier", "main"]
+__all__ = [
+    "BotLoop",
+    "BotOptions",
+    "FleetTier",
+    "configured_thresholds",
+    "main",
+    "parse_thresholds",
+]
 
 
 if __name__ == "__main__":  # pragma: no cover
