@@ -6,11 +6,37 @@
 
 预设条是**连续横向滚动**的，一屏只看得见约两个预设，而且**打开时的滚动位置不固定**：
 实机上 AAA 在最左端，面板却是从「探路 / BBB」那一段打开的。所以流程是
-「先拖到左端夹住 → 再按名字找」，不能假设第一屏就有想要的那个。
+「先拖到左端夹住 → 再一屏一屏往右找」，不能假设第一屏就有想要的那个。
+
+⚠️ **只在左端那一屏找是不够的。** 曾经如此，代价是：左端那一屏是 `AAA / 探路`，
+BBB 和 CCC 在更右边，于是它俩**永远进不了候选**——5K 以上和 8K 以上两档
+（`domain.fleet_tier`：甲=AAA、乙=BBB、丙=CCC）一发也派不出去，而报出来的是
+「预设条上找不到 'CCC'」，看上去像游戏里没有这个预设。它有，只是没拖到。
+
+## 往右拖，同时保证点不到「+ 保存当前舰队」
 
 ⚠️ **预设条最右端是「+ 保存当前舰队」**，点到它会覆盖用户的预设——这是整条链路上
-唯一会改坏用户配置的控件。所以这里**只往左拖**（`PRESET_DRAG_TO_X → FROM_X`，
-内容右移、露出左侧），从不往右拖：往左拖永远离那个按钮更远。
+唯一会改坏用户配置的控件。原先的做法是「一步也不往右拖」，简单但把右边的预设一并
+关在了门外。现在往右拖，安全由三条各自独立的闸挡着：
+
+1. **按下的手指不进边距**：往右拖的起点 `PRESET_DRAG_RIGHT_FROM_X` 在
+   `PRESET_SAFE_CLICK_MAX_X` 左边。（左拖是按在 800、松手到 1150；松手落在按钮上
+   不触发它，所以左拖坐标原样不动。）
+2. **点不进边距**：命中的中心 x 落在 `PRESET_SAFE_CLICK_MAX_X` 右边一律不点，
+   当作这一屏没找到、继续拖。往右拖会把它带进安全区，下一屏再点。
+3. **按名字也不点**：读出来含 `PRESET_SAVE_BUTTON_KEYWORD` 的一律不当候选。
+
+## 位置只能来自当前这一屏
+
+用户口径（2026-08-11）：「这里你需要识别文本进行定位，而不是直接定位」。
+
+所以点击用的 x **必须是这一次在当前截图上 OCR 出来的中心 x**：拖一次 → 重读这一屏
+→ 目标在不在这一屏读出来的名字里？在就点它当屏的位置，不在就继续拖。
+不缓存、不累加、不把别的屏上的 x 换算过来——预设条是连续滚动的，拖动步距从来没标定
+过、还带惯性，外推出来的坐标站不住，而点偏的代价是选错预设、送错舰队。
+
+顺带的好处：合并（见 `merged_names`）永远只在**一屏之内**发生，跨屏两个词被 x
+凑到一起误合成一个名字这件事根本不会出现。
 """
 
 from __future__ import annotations
@@ -21,10 +47,14 @@ from typing import Any, Protocol
 
 from evo_helper.game.pirate_ui import (
     PRESET_DRAG_FROM_X,
+    PRESET_DRAG_RIGHT_FROM_X,
+    PRESET_DRAG_RIGHT_TO_X,
     PRESET_DRAG_TO_X,
     PRESET_DRAG_Y,
     PRESET_MAX_DRAGS,
     PRESET_NAME_ROW_Y,
+    PRESET_SAFE_CLICK_MAX_X,
+    PRESET_SAVE_BUTTON_KEYWORD,
     PRESET_TOGGLE,
 )
 
@@ -68,7 +98,7 @@ class PresetDriver(Protocol):
 
 
 class PresetNotFound(RuntimeError):
-    """拖到左端也没在预设条上找到这个名字。
+    """从左端一路拖到右端，每一屏都没读到这个名字。
 
     **不许退而求其次点一个别的**：预设决定送出去多少舰队，选错的代价是真实的舰队。
     """
@@ -90,6 +120,8 @@ class PresetPicker:
 
         判据是「这一屏读到的名字不再变化」，不是拖固定次数：拖多少次能到左端
         取决于打开时停在哪。实测从「探路 / BBB」那一段出发，两次就夹住了。
+
+        两处用它：找之前定起点，以及**放弃之前把条还原成左端**（见 `pick`）。
         """
         seen = list(self.read_names())
         for _attempt in range(max_drags):
@@ -107,24 +139,58 @@ class PresetPicker:
             seen = current
         return seen
 
+    def scroll_right_once(self) -> Sequence[tuple[int, str]]:
+        """往右拖一格（内容左移、露出右侧），返回**拖完之后**这一屏的预设名。
+
+        起点在 `PRESET_SAFE_CLICK_MAX_X` 左边：按下的手指绝不落进
+        「+ 保存当前舰队」那条边距里。
+        """
+        self.driver.drag(
+            PRESET_DRAG_RIGHT_FROM_X,
+            PRESET_DRAG_Y,
+            PRESET_DRAG_RIGHT_TO_X,
+            PRESET_DRAG_Y,
+            label="预设条右移",
+        )
+        self.driver.wait(PRESET_DRAG_WAIT_S)
+        return list(self.read_names())
+
     def pick(self, name: str) -> int:
-        """展开、拖到左端、点中名叫 `name` 的那个预设，返回它的中心 x。
+        """展开、拖到左端、再一屏一屏往右找，点中名叫 `name` 的那个预设，返回其中心 x。
+
+        返回的 x 就是**点下去的那个 x**，且它一定来自命中那一屏刚读出来的词框——
+        任何一屏都只用它自己的 OCR 结果定位，见模块头「位置只能来自当前这一屏」。
 
         找不到就抛 `PresetNotFound`——由调用方决定放弃这一发，而不是凑合点一个。
         """
         self.expand()
-        entries = self.scroll_to_left_end()
-        runs = merged_names(entries)
-        hits = [x for x, text in runs if name in text]
-        if not hits:
-            raise PresetNotFound(
-                f"预设条上找不到 {name!r}；这一屏读到的是 {[text for _x, text in runs]}"
-            )
-        # 命中多个只可能是同一个名字在条上出现了两次，取最左那个即可。
-        target = min(hits)
-        self.driver.click(target, PRESET_NAME_ROW_Y, label=f"预设 {name}")
-        self.driver.wait(PRESET_DRAG_WAIT_S)
-        return target
+        entries = list(self.scroll_to_left_end())
+        screens: list[list[str]] = []
+        previous: list[str] | None = None
+        for _attempt in range(PRESET_MAX_DRAGS + 1):
+            runs = merged_names(entries)
+            screens.append([text for _x, text in runs])
+            target = _clickable_hit(runs, name)
+            if target is not None:
+                self.driver.click(target, PRESET_NAME_ROW_Y, label=f"预设 {name}")
+                self.driver.wait(PRESET_DRAG_WAIT_S)
+                return target
+            words = _names_of(entries)
+            if previous is not None and words == previous:
+                break  # 右端也夹住了，右边没有更多预设了。
+            previous = words
+            entries = list(self.scroll_right_once())
+        # 一个都没点，但条被拖到了右端——那正是「+ 保存当前舰队」露脸的位置。
+        # 下游坐标（比如 `DISPATCH_CONFIRM` (1156, 763)，落在 `PRESET_STRIP_ROI` 里）
+        # 都是在条停在左端时标定的，所以交还控制权之前先拖回左端，还原成标定时的样子。
+        #
+        # ⚠️ **点中之后不这么做**，那是刻意的不对称：选中预设之后条是什么状态未知
+        # （实机上紧接着点 `DISPATCH_CONFIRM` 就能成，说明条已经不挡着那一点了），
+        # 这时再在 `PRESET_DRAG_Y=760` 上拖一把，划过的是派遣面板的「恒星系」那一行
+        # （`DESTINATION_SYSTEM_ROI` y=746–776）——一次没人验过的操作，
+        # 换来的只是「让状态更整齐」。不划算。
+        self.scroll_to_left_end()
+        raise PresetNotFound(f"预设条上找不到 {name!r}；从左到右逐屏读到的是 {screens}")
 
 
 def name_words(image: Any, ocr: Any) -> list[tuple[int, str]]:
@@ -165,6 +231,29 @@ def merged_names(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
         else:
             runs.append([(x, text)])
     return [((run[0][0] + run[-1][0]) // 2, "".join(text for _x, text in run)) for run in runs]
+
+
+def _clickable_hit(runs: Sequence[tuple[int, str]], name: str) -> int | None:
+    """这一屏里可以放心点的那个 `name`，没有就 None。
+
+    两道拒绝都**当作「这一屏没有」**而不是报错：往右拖会把落在边距里的名字带进
+    安全区，下一屏再点就是了；真到右端还是只有边距里那一个，就走 `PresetNotFound`。
+
+    ⚠️ 边距这道闸眼下**打不着**——`PRESET_NAME_ROI` 的右界是 1000，比
+    `PRESET_SAFE_CLICK_MAX_X`（1080）还靠左，真实 OCR 给不出落在边距里的词框。
+    留着它是因为那两个数是各自量出来的、会各自变：哪天有人把名字那行的 ROI 往右
+    放宽（右边就是第二个预设的数量列，看着很像该放宽），保存按钮立刻就进了候选池，
+    而那时唯一还站着的就是这道闸。所以**不要因为「测试构造不出真实场景」删掉它**。
+    """
+    for x, text in sorted(runs):  # 命中多个只可能是同名出现两次，取最左那个。
+        if name not in text:
+            continue
+        if PRESET_SAVE_BUTTON_KEYWORD in text:
+            continue
+        if x >= PRESET_SAFE_CLICK_MAX_X:
+            continue
+        return x
+    return None
 
 
 def _lanczos(image: Any) -> Any:
