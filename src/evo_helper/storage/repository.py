@@ -14,10 +14,13 @@ from sqlalchemy.sql.elements import ColumnElement
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
+from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
+    MISSION_KIND_SCOUT,
     TARGET_KIND_BOT,
+    TARGET_KIND_PIRATE,
     AttackDispatch,
     AttackIntent,
     BattleReport,
@@ -37,6 +40,7 @@ from evo_helper.domain.report_wait import (
     line_free_at,
 )
 from evo_helper.domain.scheduler import MissionKind
+from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
@@ -119,6 +123,58 @@ class DailyAttackStatus:
     #: 舰队全回来之后那个数会永远停在最高水位，回读出来的「还在等」全是假的。
     awaiting_reports: int
     reconciled_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class PirateProgress:
+    """一个海盗目标在某段时间里走到哪一步了，供控制台一行一行显示。
+
+    用户口径（2026-08-11）：「侦查海盗战果获得战报后，有 2 个结果，需要更新状态：
+    不触发攻击 / 触发攻击 / 攻击完成（获得攻击完成战报后更新）。」
+
+    **一列判定都不落库。** `phase` 与 `verdict` 都是查询时按现行规则现算的
+    （见 `domain.scout_verdict` 与 `domain.records.ScoutReport` 的注释）：
+    门槛与舰种表会变，钉进库里的结论过两天就没人说得清是按哪版算的。
+    """
+
+    target: Coordinate
+    phase: PiratePhase
+    #: 侦察判定，`domain.scout_verdict.VERDICT_*` 之一；侦察报告还没回就是 None。
+    #: ⚠️ `UNREADABLE` **不是**「不触发攻击」，是「没看清」——两者的处置相反。
+    verdict: str | None
+    #: 拿来算 `verdict` 的那份侦察报告的报告时刻；没有报告就是 None。
+    scout_reported_at_utc: datetime | None
+    #: 本轮针对它真的派出去（且被游戏接受）的攻击发数。
+    attack_count: int
+    #: 其中已经收到战报的发数。`attack_count > 0 and attack_reports == attack_count`
+    #: 就是「攻击完成」。
+    attack_reports: int
+    #: 最近一发攻击的派出时刻；一发都没派就是 None。
+    latest_attack_at_utc: datetime | None
+
+
+def _coordinate_sort_key(coordinate: Coordinate) -> tuple[int, int, int]:
+    return (coordinate.galaxy, coordinate.system, coordinate.position)
+
+
+def _pirate_progress_for(
+    target: Coordinate,
+    *,
+    scouted: bool,
+    scout: ScoutReport | None,
+    attacks: tuple[AttackFact, ...],
+    latest_attack_at_utc: datetime | None,
+) -> PirateProgress:
+    verdict = verdict_of_record(scout) if scout is not None else None
+    return PirateProgress(
+        target=target,
+        phase=phase_for(scouted=scouted, verdict=verdict, attacks=attacks),
+        verdict=verdict,
+        scout_reported_at_utc=scout.reported_at_utc if scout is not None else None,
+        attack_count=len(attacks),
+        attack_reports=sum(1 for item in attacks if item.has_report),
+        latest_attack_at_utc=latest_attack_at_utc,
+    )
 
 
 class SqlAlchemyRepository:
@@ -1235,6 +1291,126 @@ class SqlAlchemyRepository:
                 )
                 for preset_name, report_id in session.execute(statement).all()
             ]
+
+    def pirate_progress(
+        self, *, since: datetime, until: datetime | None = None
+    ) -> list[PirateProgress]:
+        """一段时间内每个海盗目标走到哪一步了，供控制台显示。
+
+        窗口 `[since, until)` 落在**意图创建时刻**上，与 `daily_attack_status`
+        和 `count_dispatches_since` 同口径：一天就是游戏内那一天（UTC+0）。
+        `until` 省略表示不设上界。
+
+        态由 `domain.pirate_round.phase_for` 定，判定由
+        `domain.scout_verdict.verdict_of_record` **现算**——库里不存判定，
+        理由见 `domain.records.ScoutReport`。所以这个方法不引入任何新表、
+        任何新列：三态（不触发攻击 / 触发攻击 / 攻击完成）全是从已有的
+        `attack_intents` + `attack_dispatches` + `battle_reports` + `scout_reports`
+        推出来的。
+
+        ⚠️ **侦察报告不按窗口筛，按目标取最近的一份。** 侦察发派出去到报告
+        落进信箱要几分钟，跨过 UTC 零点就会出现「意图在昨天、报告在今天」；
+        按窗口筛那一发会永远显示成「待侦察报告」。取该目标**不晚于 `until`**
+        的最近一份，晚于窗口的不算——否则今天的报告会去解释昨天那一发。
+
+        ⚠️ **只认 `accepted` 的派遣。** 被游戏拒掉的那一发没有舰队飞出去，
+        也就永远不会有战报；算进来就是一个永久的「已触发攻击 · 待战报」。
+        判据与 `bot_dispatch_facts` / `pending_reports_for_kind` 同源。
+        """
+        _require_utc(since, "since")
+        if until is not None:
+            _require_utc(until, "until")
+
+        created = orm.AttackIntentRow.created_at_utc
+        in_window: ColumnElement[bool] = (
+            created >= since if until is None else and_(created >= since, created < until)
+        )
+
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackDispatchRow.mission_kind,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.BattleReportRow.id,
+                )
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_PIRATE,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    in_window,
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            ).all()
+
+            scouted: set[Coordinate] = set()
+            attacks: dict[Coordinate, list[AttackFact]] = {}
+            latest_attack: dict[Coordinate, datetime] = {}
+            for galaxy, system, position, mission_kind, dispatched_at, report_id in rows:
+                target = Coordinate(galaxy, system, position)
+                if mission_kind == MISSION_KIND_SCOUT:
+                    scouted.add(target)
+                    continue
+                attacks.setdefault(target, []).append(AttackFact(has_report=report_id is not None))
+                latest_attack[target] = dispatched_at
+
+            targets = sorted(scouted | set(attacks), key=_coordinate_sort_key)
+            return [
+                _pirate_progress_for(
+                    target,
+                    scouted=target in scouted,
+                    scout=self._latest_scout_report(session, target, until=until),
+                    attacks=tuple(attacks.get(target, ())),
+                    latest_attack_at_utc=latest_attack.get(target),
+                )
+                for target in targets
+            ]
+
+    @staticmethod
+    def _latest_scout_report(
+        session: Session, target: Coordinate, *, until: datetime | None
+    ) -> ScoutReport | None:
+        """该目标不晚于 `until` 的最近一份侦察报告；一份都没有就 None。"""
+        statement = (
+            select(orm.ScoutReportRow)
+            .where(
+                orm.ScoutReportRow.target_galaxy == target.galaxy,
+                orm.ScoutReportRow.target_system == target.system,
+                orm.ScoutReportRow.target_position == target.position,
+            )
+            .order_by(orm.ScoutReportRow.reported_at_utc.desc(), orm.ScoutReportRow.id.desc())
+            .limit(1)
+        )
+        if until is not None:
+            statement = statement.where(orm.ScoutReportRow.reported_at_utc < until)
+        row = session.scalars(statement).first()
+        if row is None:
+            return None
+        ships = session.scalars(
+            select(orm.ScoutTriggerShipRow)
+            .where(orm.ScoutTriggerShipRow.report_id == row.id)
+            .order_by(orm.ScoutTriggerShipRow.ordinal, orm.ScoutTriggerShipRow.id)
+        ).all()
+        return ScoutReport(
+            report_id=row.id,
+            reported_at_utc=row.reported_at_utc,
+            raw_time_text=row.raw_time_text,
+            origin=Coordinate(row.origin_galaxy, row.origin_system, row.origin_position),
+            target=Coordinate(row.target_galaxy, row.target_system, row.target_position),
+            # `NULL` 原样带回成 `None`。**不要 `or 0`**（见 `list_scout_reports`）。
+            trigger_ships=tuple(
+                ScoutTriggerShip(ship_type=entry.ship_type, count=entry.count) for entry in ships
+            ),
+        )
 
     def bot_report_due_at(
         self, coordinates: Sequence[Coordinate], *, since: datetime | None
