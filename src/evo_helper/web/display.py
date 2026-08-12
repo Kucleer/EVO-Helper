@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scheduler import TaskStatus
+from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS
 
 #: 三条任务链路在界面上的名字。
 #:
@@ -78,9 +80,104 @@ def missing_status_tones() -> list[str]:
 #: The list is a scanning surface, so it carries only the few types the user
 #: sorts targets by. Every other type stays in the detail dialog — a column per
 #: recorded ship type made the table wider than any laptop screen.
-LIST_SHIP_COLUMNS: tuple[str, ...] = (
-    "深空吞噬者",
-    "噬能截击者",
-    "钛能守卫者",
-    "收割者",
-)
+#:
+#: **就是海盗侦察的四个判定舰种**，所以直接引用 `PIRATE_TRIGGER_SHIPS` 而不是
+#: 再抄一份字面量：这四列存在的理由就是「侦察判定看的是这四个」，判定表哪天增删
+#: 一种，列跟着变才对。抄一份的话，改了那边而这边没改，页面会安静地少显示一列——
+#: 而少的那一列恰恰是决定打不打的那一个数。
+LIST_SHIP_COLUMNS: tuple[str, ...] = PIRATE_TRIGGER_SHIPS
+
+
+#: 情报中心列表里 bot 与海盗各自的 chip 样式。
+#:
+#: 两者要一眼分得开——它们是两条完全不同的链路（bot 走扫描+探路+分档，海盗走
+#: 侦察+判定+攻击），混在一张表里读的时候，最先要回答的就是「这行是哪种」。
+#:
+#: 色永远配一个字形和一个词（同 `STATUS_TONES` 的规矩）：控制台要在灰度下、
+#: 对色盲用户也读得懂，所以 chip 里写的是「bot」「海盗」，色只是加速。
+TARGET_KIND_TONES: dict[str, str] = {"bot": "kind-bot", "pirate": "kind-pirate"}
+TARGET_KIND_GLYPHS: dict[str, str] = {"bot": "▣", "pirate": "☠"}
+
+
+#: 「结果」（最近一次派遣有没有真的发出去）的中文标签与 chip 样式。
+#:
+#: 键是 `storage.intel.DISPATCH_*`。库里与接口里一律是英文常量，界面只显示中文。
+DISPATCH_STATE_LABELS: dict[str, str] = {
+    "SENT": "已派出",
+    "BLOCKED": "未派出",
+    "REJECTED": "被拒",
+    "NEVER": "从未派遣",
+}
+
+DISPATCH_STATE_TONES: dict[str, str] = {
+    "SENT": "ok",
+    "BLOCKED": "warn",
+    "REJECTED": "danger",
+    "NEVER": "",
+}
+
+DISPATCH_STATE_GLYPHS: dict[str, str] = {
+    "SENT": "▶",
+    "BLOCKED": "◷",
+    "REJECTED": "✕",
+    "NEVER": "○",
+}
+
+
+#: 「战果」的中文标签与 chip 样式。键是 `storage.intel.RESULT_*`。
+#:
+#: 认不出来的 outcome **原样显示**，不拿「不是胜就是负」兜底：库里存的是画面
+#: 原文，将来多一档会被静默显示成败仗（`logs.html` 上同一条取舍）。
+BATTLE_RESULT_LABELS: dict[str, str] = {
+    "VICTORY": "胜",
+    "FAIL": "负",
+    "DRAW": "平",
+    "AWAITING": "待战报",
+    "NONE": "不适用",
+}
+
+BATTLE_RESULT_TONES: dict[str, str] = {
+    "VICTORY": "ok",
+    "FAIL": "danger",
+    "DRAW": "",
+    "AWAITING": "warn",
+    "NONE": "",
+}
+
+BATTLE_RESULT_GLYPHS: dict[str, str] = {
+    "VICTORY": "★",
+    "FAIL": "✕",
+    "DRAW": "＝",
+    "AWAITING": "🕗",
+    "NONE": "—",
+}
+
+
+def missing_intel_labels() -> list[str]:
+    """三张标签表里没有位置的取值。测试拿它当断言。
+
+    与 `missing_status_tones()` 同一个用意：漏一档就意味着页面上会出现一个
+    没人翻译过的英文常量，或者更糟——两档被当成同一件事。
+    """
+    from evo_helper.storage.intel import BATTLE_RESULTS, DISPATCH_STATES
+
+    missing = [
+        f"DISPATCH_{state}"
+        for state in DISPATCH_STATES
+        if state not in DISPATCH_STATE_LABELS
+        or state not in DISPATCH_STATE_TONES
+        or state not in DISPATCH_STATE_GLYPHS
+    ]
+    missing += [
+        f"RESULT_{result}"
+        for result in BATTLE_RESULTS
+        if result not in BATTLE_RESULT_LABELS
+        or result not in BATTLE_RESULT_TONES
+        or result not in BATTLE_RESULT_GLYPHS
+    ]
+    missing += [
+        f"KIND_{kind}"
+        for kind in TARGET_KIND_LABELS
+        if kind not in TARGET_KIND_TONES or kind not in TARGET_KIND_GLYPHS
+    ]
+    return missing

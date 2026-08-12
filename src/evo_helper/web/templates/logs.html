@@ -20,6 +20,8 @@
   {# 日期按游戏时间 UTC+0 的自然日切，和表格第一列同口径；清空即不筛。 #}
   <form class="filter-bar" method="get" action="/logs">
     <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="target_start" value="{{ target_start_value }}">
+    <input type="hidden" name="target_end" value="{{ target_end_value }}">
     <label class="inline-label" for="log-date">日期（游戏 UTC+0）</label>
     <input type="date" id="log-date" name="date" value="{{ day_value }}">
     <button class="btn small primary" type="submit">筛选</button>
@@ -29,6 +31,39 @@
       {% if day_value %}只看 {{ day_value }} 这一个游戏日（UTC+0 00:00–24:00）{% else %}未按日期筛选{% endif %}
     </span>
   </form>
+
+  {#
+    目标坐标区间。两端都可以只写到星系（`2:130`）——起点补 :1、终点补 :999，
+    所以 `2:130` – `2:140` 是「这十一个星系的所有位号」。只填一端时另一端跟着它，
+    也就是「只看这一个星系」。
+
+    筛选下推到 SQL（见 `attack_log_page` 的注释）：这一页只取最近若干条，
+    在内存里筛坐标的话，查一个旧坐标必得空页，而空页读起来就是「没打过」。
+  #}
+  <form class="filter-bar" method="get" action="/logs">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="date" value="{{ day_value }}">
+    <label class="inline-label" for="log-target-start">目标坐标</label>
+    <input id="log-target-start" name="target_start" value="{{ target_start_value }}"
+           placeholder="2:130" size="10" aria-label="目标坐标范围起点">
+    <span class="dash">–</span>
+    <input id="log-target-end" name="target_end" value="{{ target_end_value }}"
+           placeholder="2:140" size="10" aria-label="目标坐标范围终点">
+    <button class="btn small primary" type="submit">筛选</button>
+    <a class="btn small" href="{{ clear_target_url }}">全部坐标</a>
+    <span class="spacer"></span>
+    <span class="muted">
+      {% if span_label %}只看 {{ span_label }}（两端都含）{% else %}未按坐标筛选{% endif %}
+    </span>
+  </form>
+
+  {% if span_error %}
+    {# 解析失败时**照常显示全部记录**，但必须说清楚这一页没有按坐标筛过——
+       默默不筛才是最坏的一种，用户会以为下面这些行就是筛出来的。 #}
+    <p class="error" role="alert">
+      坐标筛选没看懂：{{ span_error }}。下面是<strong>未按坐标筛选</strong>的记录。
+    </p>
+  {% endif %}
 </section>
 
 <section class="panel" aria-labelledby="log-table">
