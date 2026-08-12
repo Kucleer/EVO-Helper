@@ -6,10 +6,14 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from evo_helper.domain.models import Coordinate, RunState
+from evo_helper.domain.records import StateEvent
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
+from evo_helper.storage.models import RunInstance, ScanPlan
+from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 NOW = datetime(2026, 8, 6, 1, 0, tzinfo=UTC)
 
@@ -35,19 +39,35 @@ def test_web_configuration_and_run_survive_service_restart(tmp_path: Path) -> No
             ),
         ),
     )
-    run = service.start_run(plan.id, "persistent-run-0001")
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="persistent-run-0001", created_at_utc=NOW
+    )
+    SqlAlchemyRepository(factory).append_state_event(
+        StateEvent(
+            aggregate_type="run",
+            aggregate_id=run_id,
+            event="started",
+            before_state=None,
+            after_state=RunState.SCANNING.value,
+            occurred_at_utc=NOW,
+        )
+    )
     engine.dispose()
 
     restarted_engine = create_database_engine(f"sqlite:///{tmp_path / 'web.db'}")
-    restarted = PersistentApplicationService(
-        create_session_factory(restarted_engine), now_utc=lambda: NOW
-    )
+    restarted_factory = create_session_factory(restarted_engine)
+    restarted = PersistentApplicationService(restarted_factory, now_utc=lambda: NOW)
 
     assert restarted.get_plan(plan.id) == plan
-    restored_run = restarted.get_run(run.run_id)
-    assert restored_run is not None
-    assert restored_run.plan_id == plan.id
-    assert restored_run.state is RunState.SCANNING
+    # 运行实例这一侧直接读库：`get_run` 随 `GET /api/runs/{run_id}` 一起删了，
+    # 而这条用例要守的本来就是「行还在、还挂在同一个计划上」，不是那个接口。
+    with restarted_factory() as session:
+        restored_run = session.get(RunInstance, run_id)
+        assert restored_run is not None
+        assert restored_run.state == RunState.SCANNING.value
+        restored_plan = session.get(ScanPlan, restored_run.plan_id)
+        assert restored_plan is not None
+        assert restored_plan.public_id == plan.id
     assert restarted.list_events(10)[0].event == "started"
 
 

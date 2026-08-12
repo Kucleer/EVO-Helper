@@ -63,8 +63,6 @@ from .schemas import (
     MissionTaskPatch,
     RevisitIn,
     RevisitOut,
-    RunStartIn,
-    RunStatusOut,
     ScanPlanIn,
     ScanPlanOut,
     ScanPlanPatch,
@@ -92,7 +90,6 @@ from .service import (
     NotFoundError,
     PlanPatchView,
     RevisitView,
-    RunStatusView,
     ScanPlanView,
     ScanRangeView,
     SchedulerView,
@@ -170,19 +167,6 @@ def _range_view(item: ScanRangeIn) -> ScanRangeView:
         fleet_preset=item.fleet_preset,
         fleet_preset_signature=item.fleet_preset_signature,
         priority=item.priority,
-    )
-
-
-def _run_out(run: RunStatusView) -> RunStatusOut:
-    return RunStatusOut(
-        run_id=run.run_id,
-        plan_id=run.plan_id,
-        state=run.state.value,
-        idempotency_key=run.idempotency_key,
-        target_date=run.target_date.isoformat(),
-        created_at=run.created_at,
-        started_at=run.started_at,
-        finished_at=run.finished_at,
     )
 
 
@@ -527,27 +511,18 @@ def create_app(
         """运行实例的详情页只从上面那张表点进来，跟着一起关掉。"""
         return RedirectResponse("/missions", status_code=307)
 
-    @app.post("/api/runs/start", response_model=RunStatusOut, status_code=201)
-    async def start_run(
-        payload: RunStartIn,
-        service: ApplicationService = Depends(get_service),
-    ) -> RunStatusOut:
-        return _run_out(service.start_run(payload.plan_id, payload.idempotency_key))
-
-    @app.get("/api/runs/{run_id}", response_model=RunStatusOut)
-    async def get_run(
-        run_id: UUID,
-        service: ApplicationService = Depends(get_service),
-    ) -> RunStatusOut:
-        run = service.get_run(run_id)
-        if run is None:
-            raise NotFoundError(f"run {run_id} not found")
-        return _run_out(run)
-
-    # 「暂停 / 恢复 / 紧急停止」三个接口跟着 `run.html` 上那三个按钮一起删了：
-    # 它们只有那一个调用方，而真正在跑的那条链路根本不从这里改状态——
-    # 扫描/海盗 runner 走 `SqlAlchemyRepository.set_run_state`，起停走
-    # `/api/scheduler/stop` 与任务中心的「强制结束」。
+    # `/api/runs` 底下已经一个接口都不剩了：
+    #
+    # - 「暂停 / 恢复 / 紧急停止」跟着 `run.html` 上那三个按钮一起删了（PR #101）。
+    # - `POST /api/runs/start` 与 `GET /api/runs/{run_id}` 这次一起删。前者上一轮
+    #   留着是因为「运行实例记账」，可它在页面关掉之后就没有调用方了，只剩测试
+    #   拿它给 `attack_intents.run_id` 造外键；后者是它的读侧，`start` 一走，
+    #   HTTP 客户端连 run_id 从哪来都没有了（列表接口 PR #101 已删），等于不可达。
+    #
+    # **表和记账机制照旧**：`run_instances` / `scan_plans` 仍由扫描与海盗链路
+    # （`tools/scan_coordinates.py`、`tools/pirate_loop.py` 的 `PLAN_NAME` /
+    # `RUN_KEY` 幂等键）建与推进，运行状态走 `SqlAlchemyRepository.set_run_state`，
+    # 首页那块「进行中的运行」也照旧数 `run_instances`。这次删的只是没人调的 HTTP 口。
 
     # ---- targets / history ----------------------------------------------
 

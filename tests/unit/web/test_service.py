@@ -3,9 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from evo_helper.domain.models import Coordinate, RunState
+from evo_helper.domain.models import Coordinate
 from evo_helper.web.service import (
-    ConflictError,
     FakeApplicationService,
     FleetEntryView,
     NotFoundError,
@@ -38,42 +37,16 @@ def _plan_payload(clock: FakeApplicationService) -> ScanPlanView:
     )
 
 
-def test_schedule_before_window_is_armed() -> None:
-    clock = _fixed_clock("2026-08-05T23:59:00+00:00")  # Shanghai 07:59
-    plan = _plan_payload(clock)
-
-    run = clock.start_run(plan.id, "key-before-window")
-
-    assert run.state is RunState.ARMED
-
-
-def test_schedule_inside_window_scans_immediately() -> None:
-    clock = _fixed_clock("2026-08-06T01:00:00+00:00")  # Shanghai 09:00
-    plan = _plan_payload(clock)
-
-    run = clock.start_run(plan.id, "key-inside-window")
-
-    assert run.state is RunState.SCANNING
-
-
-def test_schedule_after_window_arms_for_next_day() -> None:
-    clock = _fixed_clock("2026-08-06T13:00:00+00:00")  # Shanghai 21:00
-    plan = _plan_payload(clock)
-
-    run = clock.start_run(plan.id, "key-after-window")
-
-    assert run.state is RunState.ARMED
-    assert run.target_date.isoformat() == "2026-08-07"
-
-
-def test_idempotency_key_is_rejected_on_reuse() -> None:
-    clock = _fixed_clock("2026-08-06T01:00:00+00:00")
-    plan = _plan_payload(clock)
-    clock.start_run(plan.id, "same-key")
-
-    with pytest.raises(ConflictError):
-        clock.start_run(plan.id, "same-key")
-
+# 三条排期用例（窗口前 ARMED / 窗口内 SCANNING / 窗口后顺延一天）与
+# `test_idempotency_key_is_rejected_on_reuse` 随 `start_run` 一起删了：它们验的是
+# `FakeApplicationService.start_run` 与它私有的 `_schedule_state`，而 `start_run`
+# 是 `POST /api/runs/start` 唯一的实现，接口删了它也就没了调用方。
+#
+# 这两件事都**不是**生产链路上的判据：真实的运行实例由 `tools/scan_coordinates.py`
+# 与 `tools/pirate_loop.py` 按 `PLAN_NAME` / `RUN_KEY` 建，起停时间由常驻调度器
+# （`application/mission_scheduler.py`，有 `tests/unit/application` 守着）决定，
+# 幂等键的唯一性由库上的唯一约束保证
+# （`tests/integration/storage/test_repository.py::test_idempotency_key_is_unique`）。
 
 # `test_invalid_state_transition_is_conflict` 随「运行详情」页一起删了：
 # 它守的是 `pause_run` / `emergency_stop_run` 那条状态机路径，而那两个方法
@@ -93,10 +66,15 @@ def test_update_plan_preserves_created_at() -> None:
 
 
 def test_missing_plan_raises_not_found() -> None:
+    """认不出的计划 id 要走 `NotFoundError`（接口层映射成 404），不是静默当空。
+
+    原先是拿 `start_run` 验的，改用 `update_plan`：`start_run` 已删，而这条用例
+    守的从来是「查不到就报 404」这条路径本身。
+    """
     clock = _fixed_clock("2026-08-06T01:00:00+00:00")
 
     with pytest.raises(NotFoundError):
-        clock.start_run(uuid4(), "missing-plan-key")
+        clock.update_plan(uuid4(), PlanPatchView(name="missing-plan"))
 
 
 def test_fleet_diff_tracks_changes() -> None:

@@ -57,7 +57,9 @@ packages = ["src/evo_helper"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-pythonpath = ["src"]
+# `tests` 也挂上：`tests/support/` 是测试之间共用的种子工具（`seed_run_instance`
+# 要给 e2e 与 integration 两边用），不挂就得靠 conftest 收集顺序碰运气才能 import。
+pythonpath = ["src", "tests"]
 
 [tool.ruff]
 target-version = "py312"
@@ -71,6 +73,11 @@ extend-exclude = ["docs/superpowers/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+# `support` 是 `tests/support/`（测试共用的种子工具），不是装出来的第三方包。
+# 不声明的话它会被排进 fastapi / sqlalchemy 那一段，读起来像个外部依赖。
+known-first-party = ["support"]
 
 [tool.mypy]
 python_version = "3.12"

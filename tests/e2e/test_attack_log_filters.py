@@ -26,6 +26,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 CYCLE = datetime(2026, 8, 3, tzinfo=UTC)
@@ -65,13 +66,15 @@ def _seed(tmp_path: Path) -> tuple[PersistentApplicationService, TestClient]:
             ScanRangeView(Coordinate(2, 137, 1), LATE, ORIGIN, PRESET.name, PRESET.signature, 0),
         ),
     )
-    run = service.start_run(plan.id, "log-filter-0001")
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="log-filter-0001", created_at_utc=NOW
+    )
     repository = SqlAlchemyRepository(factory)
 
     def _intent(target: Coordinate, created_at_utc: datetime) -> AttackIntent:
         intent = AttackIntent(
             intent_id=uuid4(),
-            run_id=run.run_id,
+            run_id=run_id,
             origin=ORIGIN,
             target=target,
             preset=PRESET,

@@ -35,6 +35,7 @@ from evo_helper.vision.scout_reports import PirateScoutReading
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 BASE_TIME = datetime(2026, 8, 11, 3, 0, 0, tzinfo=UTC)
@@ -65,7 +66,9 @@ def _seed(factory) -> None:  # type: ignore[no-untyped-def]
         window_end=datetime(2026, 1, 1, 20).time(),
         ranges=(ScanRangeView(Coordinate(2, 1, 1), Coordinate(2, 999, 20), ORIGIN, "AAA", "x", 0),),
     )
-    run_id = service.start_run(plan.id, "quick-api-0001").run_id
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="quick-api-0001", created_at_utc=BASE_TIME
+    )
     repository = SqlAlchemyRepository(factory)
 
     repository.save_scan(

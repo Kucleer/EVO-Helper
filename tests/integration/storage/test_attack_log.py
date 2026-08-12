@@ -24,6 +24,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.pirate_reports import OUTCOME_VICTORY
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
 CYCLE = datetime(2026, 8, 3, tzinfo=UTC)
@@ -52,8 +53,10 @@ def _setup(tmp_path: Path):  # type: ignore[no-untyped-def]
             ),
         ),
     )
-    run = service.start_run(plan.id, "idem-log")
-    return SqlAlchemyRepository(factory), service, run.run_id
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="idem-log", created_at_utc=CREATED
+    )
+    return SqlAlchemyRepository(factory), service, run_id
 
 
 def _intent(run_id, target: Coordinate, kind: str, minutes: int) -> AttackIntent:  # type: ignore[no-untyped-def]

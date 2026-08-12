@@ -41,7 +41,6 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import MISSION_LABELS, PARAM_LABELS
 from .service import (
-    SHANGHAI,
     AttackLogOptions,
     AttackLogView,
     BotTargetView,
@@ -62,7 +61,6 @@ from .service import (
     PlanetRow,
     PlanPatchView,
     RevisitView,
-    RunStatusView,
     ScanPlanView,
     ScanRangeView,
     SchedulerView,
@@ -165,37 +163,11 @@ class PersistentApplicationService:
             session.delete(row)
             session.commit()
 
-    def start_run(self, plan_id: UUID, idempotency_key: str) -> RunStatusView:
-        with self._session_factory() as session:
-            if session.scalar(
-                select(orm.RunInstance).where(orm.RunInstance.idempotency_key == idempotency_key)
-            ):
-                raise ConflictError(f"idempotency_key already used: {idempotency_key}")
-            plan = self._required_plan(session, plan_id)
-            if not plan.enabled:
-                raise ServiceError(f"plan {plan.name} is disabled")
-            now = self._now()
-            plan_view = self._plan_view(session, plan)
-            state, target_date = self._schedule_state(plan_view, now)
-            run = orm.RunInstance(
-                id=uuid4(),
-                plan_id=plan.id,
-                idempotency_key=idempotency_key,
-                target_date=datetime.combine(target_date, time.min, tzinfo=UTC),
-                state=state.value,
-                created_at_utc=now,
-                started_at_utc=now if state is RunState.SCANNING else None,
-            )
-            session.add(run)
-            session.flush()
-            self._event(session, run.id, "started", None, state.value, now)
-            session.commit()
-            return self._run_view(session, run, plan.public_id)
-
-    def get_run(self, run_id: UUID) -> RunStatusView | None:
-        with self._session_factory() as session:
-            row = session.get(orm.RunInstance, run_id)
-            return self._run_view(session, row) if row else None
+    # 建运行实例（`start_run`）与查运行实例（`get_run`）都删了：它们只有
+    # `POST /api/runs/start` 与 `GET /api/runs/{run_id}` 两个调用方，而这两个接口
+    # 在「运行详情」页关掉之后已经没有任何界面用得上。往 `run_instances` 写的是
+    # `tools/scan_coordinates.py` 与 `tools/pirate_loop.py`（按 `PLAN_NAME` /
+    # `RUN_KEY` 幂等），推状态的是 `SqlAlchemyRepository.set_run_state`，都还在跑。
 
     def list_targets(self) -> list[BotTargetView]:
         with self._session_factory() as session:
@@ -639,24 +611,6 @@ class PersistentApplicationService:
             row.reserved_lines,
         )
 
-    def _run_view(
-        self, session: Session, row: orm.RunInstance, public_id: UUID | None = None
-    ) -> RunStatusView:
-        plan = session.get(orm.ScanPlan, row.plan_id)
-        if plan is None:  # pragma: no cover - database foreign key invariant
-            raise NotFoundError(f"plan {row.plan_id} for run {row.id} not found")
-        plan_id = public_id or plan.public_id
-        return RunStatusView(
-            row.id,
-            plan_id,
-            RunState(row.state),
-            row.idempotency_key,
-            row.target_date.date() if row.target_date else row.created_at_utc.date(),
-            row.created_at_utc,
-            row.started_at_utc,
-            row.finished_at_utc,
-        )
-
     @staticmethod
     def _validate_plan(start: time, end: time, ranges: tuple[ScanRangeView, ...]) -> None:
         if start > end:
@@ -690,34 +644,10 @@ class PersistentApplicationService:
                 )
             )
 
-    @staticmethod
-    def _schedule_state(plan: ScanPlanView, now: datetime) -> tuple[RunState, date]:
-        local = now.astimezone(SHANGHAI)
-        if local.time() < plan.window_start:
-            return RunState.ARMED, local.date()
-        if local.time() <= plan.window_end:
-            return RunState.SCANNING, local.date()
-        return RunState.ARMED, local.date() + timedelta(days=1)
-
-    @staticmethod
-    def _event(
-        session: Session,
-        run_id: UUID,
-        event: str,
-        before: str | None,
-        after: str | None,
-        now: datetime,
-    ) -> None:
-        session.add(
-            orm.StateEventRow(
-                aggregate_type="run",
-                aggregate_id=run_id,
-                event=event,
-                before_state=before,
-                after_state=after,
-                occurred_at_utc=now,
-            )
-        )
+    # `_schedule_state`（按计划时间窗定 ARMED / SCANNING）与 `_event`（往
+    # `state_events` 写一条 `started`）都只有 `start_run` 用过，跟着它一起删。
+    # 运行状态事件在真实链路上由 `SqlAlchemyRepository.append_state_event` 写，
+    # `list_events` 照旧读得到。
 
     @staticmethod
     def _revisit_view(row: orm.TargetRevisitRow) -> RevisitView:
