@@ -179,6 +179,14 @@
                 {{ task.label }} · {{ '参与' if task.enabled else '未参与' }} · {{ task.summary }}
               </div>
             {% endfor %}
+            {#
+              分档阈值同样是「这一轮按什么跑的」的一部分：它决定每一发用哪套
+              预设。这个字段是后加的，历史那几条里没有——那时写「未记录」，
+              **不回填一个默认值**，否则记录会变成一份看起来完整的假账。
+            #}
+            <div class="muted" style="font-size:11px">
+              分档阈值 · {{ freeze.tier_thresholds or '未记录（早于此项落库）' }}
+            </div>
           </td>
           <td>
             {% for change in freeze.changes %}
@@ -416,6 +424,12 @@
         `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`;
       lines.append(line);
     }
+    // 分档阈值也在这一份里：它决定本轮每一发用哪套预设。
+    const tiers = document.createElement('div');
+    tiers.className = 'muted';
+    tiers.style.fontSize = '11px';
+    tiers.textContent = `分档阈值 · ${freeze.tier_thresholds || '未记录（早于此项落库）'}`;
+    lines.append(tiers);
     const changed = document.createElement('div');
     changed.className = 'muted';
     changed.style.fontSize = '11px';

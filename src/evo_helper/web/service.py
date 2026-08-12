@@ -350,6 +350,41 @@ class ConfigFreezeView:
     #: 与**上一次「开始」**相比改了什么，每条一句人话。空元组表示没改过；
     #: 头一条记录是 `("首次记录",)`——「没改过」和「没得比」不是一回事。
     changes: tuple[str, ...]
+    #: 那一轮的分档阈值，念成 `2K / 4K / 8K`。这个字段是后加的，历史记录里
+    #: 没有，那时显示 None——页面写「未记录」，**不编一个默认值填进去**。
+    tier_thresholds: str | None = None
+
+
+@dataclass(frozen=True)
+class TierBandView:
+    """一档在页面上的一行：这个区间的守方，用哪套预设。
+
+    两个字段分开送，**不预先拼成一个字符串**：区间自己就带空格（`2K 以下`），
+    拼起来之后两边都得靠切字符串再拆开，而那种切法在阈值小于 1000 的时候
+    （`900 以下`）会切在别的地方。
+    """
+
+    #: `AAA` / `BBB` / `CCC`，最低那一档是 `（不派）`。
+    preset: str
+    #: `2K 以下` / `2K–4K` / `8K+`。
+    span: str
+
+
+@dataclass(frozen=True)
+class TierThresholdsView:
+    """分档阈值页要显示的全部东西。
+
+    三个数 + 四行区间回显 + 「现在改不改得动」。区间回显在服务端算好送出去，
+    页面不自己拼——两边各拼一次，日志和界面迟早对同一套阈值说出两种区间。
+    """
+
+    alpha_from: int
+    beta_from: int
+    gamma_from: int
+    #: 四行，从低到高。
+    bands: tuple[TierBandView, ...]
+    #: 调度器运行中为真。同任务参数那条口径：运行中一律不给改。
+    locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -788,6 +823,8 @@ __all__ = [
     "ScanRangeView",
     "ServiceError",
     "StateEventView",
+    "TierBandView",
+    "TierThresholdsView",
     "_parse_coordinate",
     "_parse_window",
 ]

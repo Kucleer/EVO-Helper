@@ -39,7 +39,7 @@ def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> 
     }
     # 调度器的可调项走迁移加列。漏了这条迁移，模型和真实的表就会静默分叉：
     # 本地测试用 `create_all` 建表，一路全绿，只有真实的库会在启动时炸。
-    assert "restart_cooldown_seconds" in {
+    assert {"restart_cooldown_seconds", "tier_alpha_from", "tier_beta_from", "tier_gamma_from"} <= {
         column["name"] for column in inspect(engine).get_columns("scheduler_config")
     }
     assert engine.connect().execute(text("SELECT version_num FROM alembic_version")).scalar_one()

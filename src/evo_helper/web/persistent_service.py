@@ -17,6 +17,7 @@ from evo_helper.application.mission_scheduler import (
     SchedulerSnapshot,
     task_snapshot,
 )
+from evo_helper.domain.fleet_tier import FleetTier, TierThresholdError, TierThresholds
 from evo_helper.domain.missions import (
     MissionParamError,
     bot_targets_in_range,
@@ -66,6 +67,8 @@ from .service import (
     SchedulerView,
     ServiceError,
     StateEventView,
+    TierBandView,
+    TierThresholdsView,
     planet_kind,
 )
 
@@ -796,6 +799,43 @@ class MissionConsoleService:
         )
         return self._task_view_for(kind)
 
+    def tier_thresholds(self) -> TierThresholdsView:
+        """「分档阈值」页读它。三个数 + 四行区间回显 + 现在改不改得动。"""
+        return self._thresholds_view(self._repository.tier_thresholds())
+
+    def patch_tier_thresholds(
+        self, *, alpha_from: int, beta_from: int, gamma_from: int
+    ) -> TierThresholdsView:
+        """页面上按「保存」走这里。
+
+        **调度器运行中一律拒绝**，和任务参数同一条口径（用户口径 2026-08-11：
+        「运行中我不会修改，只有在开始任务之前可以修改」）。理由也是同一个：
+        阈值决定每一发派哪套预设，一轮之内换一次口径，事后从台账里分不出当时
+        用的是哪一套。这里没有「恢复」那种例外——阈值页上没有任何一个操作是
+        「把调度器自己弄出来的状态改回去」。
+
+        不递增就 400，**不排序也不截断**：见 `domain.fleet_tier.TierThresholdError`。
+        """
+        if self._scheduler.config_locked:
+            raise ConflictError("调度器运行中，分档阈值已固化，不能修改；点「结束」后可改")
+        try:
+            thresholds = TierThresholds(
+                alpha_from=alpha_from, beta_from=beta_from, gamma_from=gamma_from
+            )
+        except TierThresholdError as error:
+            raise ServiceError(str(error)) from error
+        self._repository.update_tier_thresholds(thresholds)
+        return self._thresholds_view(thresholds)
+
+    def _thresholds_view(self, thresholds: TierThresholds) -> TierThresholdsView:
+        return TierThresholdsView(
+            alpha_from=thresholds.alpha_from,
+            beta_from=thresholds.beta_from,
+            gamma_from=thresholds.gamma_from,
+            bands=_threshold_bands(thresholds),
+            locked=self._scheduler.config_locked,
+        )
+
     def restart_bot_round(self) -> MissionTaskView:
         """「重开一轮」：把 `round_started_at_utc` 推到当前。
 
@@ -879,6 +919,7 @@ class MissionConsoleService:
                 if task.kind.value in MISSION_LABELS
             ),
             changes=_describe_changes(previous, record),
+            tier_thresholds=_threshold_summary(record.tier_thresholds),
         )
 
     def _current_freeze_view(self, record: MissionConfigFreeze) -> ConfigFreezeView:
@@ -1109,7 +1150,7 @@ def _describe_changes(
     """
     if before is None:
         return ("首次记录",)
-    changes: list[str] = []
+    changes: list[str] = _threshold_changes(before.tier_thresholds, after.tier_thresholds)
     for task in after.tasks:
         label = MISSION_LABELS.get(task.kind.value, task.kind.value)
         old = before.task(task.kind)
@@ -1148,6 +1189,49 @@ def _param_changes(label: str, before_json: str, after_json: str) -> list[str]:
     if not changes and before_json != after_json:
         changes.append(f"{label}：参数有改动（无法逐项对比）")
     return changes
+
+
+def _threshold_bands(thresholds: TierThresholds) -> tuple[TierBandView, ...]:
+    """四行区间回显，从低到高。
+
+    页面上必须把这四行摆出来：三个输入框只是三个数，「填成这样之后哪一档打哪个
+    区间」得让用户在按保存**之前**就看见。
+
+    预设名取自 `FleetTier.preset`，不在这里另写一份 `AAA/BBB/CCC`：那三个字符串
+    是**游戏内预设标题**，抄第二份就等于给「页面写着 BBB、实际去找的是别的」
+    留了一条静默的路。
+    """
+    return tuple(
+        TierBandView(preset=tier.preset or "（不派）", span=thresholds.label(tier))
+        for tier in FleetTier
+    )
+
+
+def _threshold_summary(thresholds: TierThresholds | None) -> str | None:
+    """固化记录里那一行阈值念成 `2000 / 4000 / 8000`；没记就是 None。
+
+    这里写**原始数字**而不是页面上那种 `2K`：记录是拿来逐条对比的，而 `2K` 与
+    `2.04K` 在四舍五入之后长得一样，翻账时会把一次真的改动看成没改。
+    """
+    if thresholds is None:
+        return None
+    return " / ".join(str(edge) for edge in thresholds.edges)
+
+
+def _threshold_changes(before: TierThresholds | None, after: TierThresholds | None) -> list[str]:
+    """两次「开始」之间阈值改了什么。
+
+    一边有一边没有时说「首次记录」而不是编一个旧值来对比：老的 JSONL 行里没有
+    这个字段，那几轮实际用的是当时写死在代码里的三个数，硬凑一句「2K → 2K」
+    只会让人以为那一轮真的记过。
+    """
+    if after is None:
+        return []
+    if before is None:
+        return [f"分档阈值：首次记录（{_threshold_summary(after)}）"]
+    if before.edges == after.edges:
+        return []
+    return [f"分档阈值：{_threshold_summary(before)} → {_threshold_summary(after)}"]
 
 
 def _yes(value: bool) -> str:

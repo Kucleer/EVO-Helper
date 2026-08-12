@@ -12,7 +12,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from evo_helper.storage.database import UTCDateTime
 
 revision: str = "28376b48e201"
 down_revision: str | None = None
@@ -30,7 +29,7 @@ def upgrade() -> None:
         sa.Column("media_type", sa.String(length=64), nullable=False),
         sa.Column("source", sa.String(length=64), nullable=False),
         sa.Column("retention_policy", sa.String(length=32), nullable=False),
-        sa.Column("created_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("created_at_utc", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("path"),
     )
@@ -42,10 +41,10 @@ def upgrade() -> None:
         sa.Column("position", sa.Integer(), nullable=False),
         sa.Column("is_bot", sa.Boolean(), nullable=False),
         sa.Column("latest_owner_name", sa.String(length=64), nullable=True),
-        sa.Column("last_scanned_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("last_attack_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("last_dispatch_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("last_report_at_utc", UTCDateTime(), nullable=True),
+        sa.Column("last_scanned_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("last_attack_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("last_dispatch_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("last_report_at_utc", sa.DateTime(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("galaxy", "system", "position", name="uq_bot_targets_coordinate"),
     )
@@ -58,7 +57,7 @@ def upgrade() -> None:
         sa.Column("time_window_end", sa.String(length=5), nullable=False),
         sa.Column("timezone_name", sa.String(length=64), nullable=False),
         sa.Column("dry_run", sa.Boolean(), nullable=False),
-        sa.Column("created_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("created_at_utc", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
     )
@@ -70,7 +69,7 @@ def upgrade() -> None:
         sa.Column("event", sa.String(length=64), nullable=False),
         sa.Column("before_state", sa.String(length=32), nullable=True),
         sa.Column("after_state", sa.String(length=32), nullable=True),
-        sa.Column("occurred_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("occurred_at_utc", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -87,8 +86,8 @@ def upgrade() -> None:
         sa.Column("target_galaxy", sa.Integer(), nullable=True),
         sa.Column("target_system", sa.Integer(), nullable=True),
         sa.Column("target_position", sa.Integer(), nullable=True),
-        sa.Column("requested_at_utc", UTCDateTime(), nullable=False),
-        sa.Column("executed_at_utc", UTCDateTime(), nullable=True),
+        sa.Column("requested_at_utc", sa.DateTime(), nullable=False),
+        sa.Column("executed_at_utc", sa.DateTime(), nullable=True),
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -100,7 +99,7 @@ def upgrade() -> None:
         sa.Column("detection_result", sa.String(length=255), nullable=True),
         sa.Column("confidence", sa.Float(), nullable=False),
         sa.Column("evidence_artifact_id", sa.Uuid(), nullable=True),
-        sa.Column("observed_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("observed_at_utc", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
@@ -108,15 +107,15 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("plan_id", sa.Integer(), nullable=False),
         sa.Column("idempotency_key", sa.String(length=128), nullable=False),
-        sa.Column("target_date", UTCDateTime(), nullable=True),
+        sa.Column("target_date", sa.DateTime(), nullable=True),
         sa.Column("state", sa.String(length=32), nullable=False),
         sa.Column("cursor_galaxy", sa.Integer(), nullable=True),
         sa.Column("cursor_system", sa.Integer(), nullable=True),
         sa.Column("cursor_position", sa.Integer(), nullable=True),
-        sa.Column("started_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("drained_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("finished_at_utc", UTCDateTime(), nullable=True),
-        sa.Column("created_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("started_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("drained_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("finished_at_utc", sa.DateTime(), nullable=True),
+        sa.Column("created_at_utc", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(
             ["plan_id"],
             ["scan_plans.id"],
@@ -160,10 +159,10 @@ def upgrade() -> None:
         sa.Column("target_position", sa.Integer(), nullable=False),
         sa.Column("preset_name", sa.String(length=120), nullable=False),
         sa.Column("preset_signature", sa.String(length=255), nullable=False),
-        sa.Column("cycle_start_utc", UTCDateTime(), nullable=False),
+        sa.Column("cycle_start_utc", sa.DateTime(), nullable=False),
         sa.Column("guard_status", sa.String(length=32), nullable=False),
         sa.Column("forced_revisit", sa.Boolean(), nullable=False),
-        sa.Column("created_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("created_at_utc", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(
             ["run_id"],
             ["run_instances.id"],
@@ -187,7 +186,7 @@ def upgrade() -> None:
         sa.Column("galaxy", sa.Integer(), nullable=False),
         sa.Column("system", sa.Integer(), nullable=False),
         sa.Column("position", sa.Integer(), nullable=False),
-        sa.Column("scanned_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("scanned_at_utc", sa.DateTime(), nullable=False),
         sa.Column("owner_name", sa.String(length=64), nullable=True),
         sa.Column("is_bot", sa.Boolean(), nullable=False),
         sa.Column("confidence", sa.Float(), nullable=False),
@@ -205,7 +204,7 @@ def upgrade() -> None:
         "attack_dispatches",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("intent_id", sa.Uuid(), nullable=False),
-        sa.Column("dispatched_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("dispatched_at_utc", sa.DateTime(), nullable=False),
         sa.Column("dry_run", sa.Boolean(), nullable=False),
         sa.Column("accepted", sa.Boolean(), nullable=False),
         sa.Column("evidence_artifact_id", sa.Uuid(), nullable=True),
@@ -219,7 +218,7 @@ def upgrade() -> None:
     op.create_table(
         "battle_reports",
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("reported_at_utc", UTCDateTime(), nullable=False),
+        sa.Column("reported_at_utc", sa.DateTime(), nullable=False),
         sa.Column("raw_time_text", sa.String(length=64), nullable=True),
         sa.Column("attacker_origin_galaxy", sa.Integer(), nullable=False),
         sa.Column("attacker_origin_system", sa.Integer(), nullable=False),

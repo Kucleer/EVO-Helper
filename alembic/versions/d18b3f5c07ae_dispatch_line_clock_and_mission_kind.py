@@ -31,7 +31,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from evo_helper.storage.database import UTCDateTime
 
 revision: str = "d18b3f5c07ae"
 down_revision: str | None = "c7e4a1b95d62"
@@ -41,7 +40,7 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     with op.batch_alter_table("attack_dispatches") as batch:
-        batch.add_column(sa.Column("line_free_at_utc", UTCDateTime(), nullable=True))
+        batch.add_column(sa.Column("line_free_at_utc", sa.DateTime(), nullable=True))
         batch.add_column(
             sa.Column(
                 "mission_kind",

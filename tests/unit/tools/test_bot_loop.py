@@ -1,7 +1,8 @@
 """攻击侦查 → 分档 → 攻击：判定这一层的规则。
 
 真正驱动鼠标的部分在 `pirate_loop` 里已经实机跑通，这里只守判定：
-**分档用的是游戏里真实存在的预设标题**，以及「2K 以下不派」。
+**分档用的是游戏里真实存在的预设标题**、最低那一档不派，以及分档用的三道边界
+来自这一轮传进来的配置而不是写死的常量。
 """
 
 from __future__ import annotations
@@ -14,7 +15,12 @@ import pytest
 
 from evo_helper.domain.bot_round import BotPhase
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
-from evo_helper.domain.fleet_tier import FleetTier, tier_for
+from evo_helper.domain.fleet_tier import (
+    DEFAULT_TIER_THRESHOLDS,
+    FleetTier,
+    TierThresholds,
+    tier_for,
+)
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import (
     PROBE_PRESET,
@@ -22,7 +28,11 @@ from evo_helper.tools.bot_loop import (
     BotOptions,
     parse_round_start,
     parse_target,
+    parse_thresholds,
 )
+
+#: 用户给的那一套（2K / 4K / 8K）。三道边界可配，三个预设标题不可配。
+EDGES = DEFAULT_TIER_THRESHOLDS
 
 
 def test_the_probe_uses_the_in_game_scout_preset() -> None:
@@ -31,22 +41,51 @@ def test_the_probe_uses_the_in_game_scout_preset() -> None:
 
 
 def test_each_tier_maps_to_a_real_in_game_preset_title() -> None:
-    """用户确认（2026-08-09）：甲=AAA、乙=BBB、丙=CCC。
+    """用户确认（2026-08-09）：三档分别用 AAA / BBB / CCC。
 
-    原先写的是「攻击组合甲/乙/丙」——游戏里没有这些预设，`PresetPicker`
-    照它去找一定找不到，于是每一发都在「找不到预设」上整发放弃。
+    守的是**这三个字符串必须是游戏里真实存在的预设标题**：派遣链路按标题在预设
+    条上 OCR 找（`game.preset_picker`），找不到就抛 `PresetNotFound`，整发放弃。
+    实机日志里出现过 `预设条上找不到 'CCC'；这一屏读到的是 ['AAA', '探路']`
+    ——那次的成因是选择器只往左拖、够不到右边的预设（PR #100 已修），但它说明
+    「标题对不上 = 这一发不用打了」这条后果是真会发生的。
+
+    ⚠️ 三个**标题**不可配，只有三道**边界**可配（`/tiers` 页）。所以这条断言
+    不跟着阈值走：换任何一套阈值，三档映射到的仍然是这三个标题。
     """
-    assert tier_for(3000).preset == "AAA"
-    assert tier_for(6000).preset == "BBB"
-    assert tier_for(9000).preset == "CCC"
+    assert tier_for(3000, EDGES).preset == "AAA"
+    assert tier_for(6000, EDGES).preset == "BBB"
+    assert tier_for(9000, EDGES).preset == "CCC"
 
 
 def test_a_negligible_fleet_is_not_attacked() -> None:
-    """2K 以下不派：用户明确说过那个量级不值得为它挑组合。"""
-    tier = tier_for(1500)
+    """最低那一档不派：用户明确说过那个量级不值得为它挑组合。"""
+    tier = tier_for(1500, EDGES)
 
     assert tier is FleetTier.NEGLIGIBLE
     assert tier.preset is None
+
+
+def test_the_thresholds_come_from_the_options_not_from_a_constant() -> None:
+    """`BotLoop` 分档用的是这一轮传进来的阈值，不是模块里写死的数。
+
+    调度器把它写进 argv（`domain.missions.bot_command`），手工跑时由 `main()`
+    从库里读。任何一处回落到写死的默认值，就等于用一套用户没见过的数派舰队，
+    而日志上看不出来。
+    """
+    loosened = TierThresholds(alpha_from=2000, beta_from=7000, gamma_from=8000)
+    options = BotOptions(targets=(TARGET,), probe=True, attack=True, tier_thresholds=loosened)
+
+    assert tier_for(6000, options.tier_thresholds) is FleetTier.ALPHA
+
+
+def test_a_non_increasing_command_line_is_refused_at_the_entry_point() -> None:
+    """不递增的阈值在入口就拒，不让它一路走到分档那一步。
+
+    走到那一步之后，日志里看到的只是「这一轮一发 BBB 都没派」，看不出是阈值把
+    那一档变成了死区。
+    """
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_thresholds([2000, 9000, 8000])
 
 
 def test_targets_are_parsed_as_full_coordinates() -> None:

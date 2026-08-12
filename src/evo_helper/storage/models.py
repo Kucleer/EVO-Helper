@@ -426,6 +426,19 @@ class SchedulerConfigRow(Base):
     #: 同一条链路两次启动之间的最小间隔。堵的是「战报还没到就反复进信箱扑空」
     #: 的空转——每轮几十秒的导航全白费，还一直占着鼠标不让扫描进来。
     restart_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    #: bot 分档的三道边界（单位：艘），各是那一档的**下界，闭区间**。
+    #: 语义与默认值都在 `domain.fleet_tier.TierThresholds`，这里只是它的落脚处。
+    #:
+    #: 放进这张单行表而不是 `mission_tasks.params_json`：`params_json` 回答的是
+    #: 「这条链路打哪个范围」，阈值回答的是「打得多狠」，两者一个是选目标、一个
+    #: 是选组合；而且它和航线数、日配额一样只有一份，正是这张表的用途。
+    #:
+    #: ⚠️ **严格递增由 `TierThresholds` 守，不由数据库守。** SQLite 的 CHECK
+    #: 约束加不上去（老库已有行），而且约束报出来的是英文 IntegrityError，
+    #: 页面上要的是「哪一档会变成死区」这句中文。
+    tier_alpha_from: Mapped[int] = mapped_column(Integer, default=2000, server_default="2000")
+    tier_beta_from: Mapped[int] = mapped_column(Integer, default=4000, server_default="4000")
+    tier_gamma_from: Mapped[int] = mapped_column(Integer, default=8000, server_default="8000")
 
 
 class DailyReconciliationRow(Base):
