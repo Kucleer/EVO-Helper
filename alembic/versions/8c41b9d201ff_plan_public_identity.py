@@ -12,7 +12,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from evo_helper.storage.database import UTCDateTime
 
 revision: str = "8c41b9d201ff"
 down_revision: str | None = "28376b48e201"
@@ -25,7 +24,7 @@ def upgrade() -> None:
     # backfill each existing row, then rebuild the table with the final constraints.
     with op.batch_alter_table("scan_plans") as batch:
         batch.add_column(sa.Column("public_id", sa.Uuid(), nullable=True))
-        batch.add_column(sa.Column("updated_at_utc", UTCDateTime(), nullable=True))
+        batch.add_column(sa.Column("updated_at_utc", sa.DateTime(), nullable=True))
     op.execute(
         "UPDATE scan_plans SET public_id = lower(hex(randomblob(16))), "
         "updated_at_utc = created_at_utc WHERE public_id IS NULL"
