@@ -9,18 +9,31 @@ translated into SQL. The candidate set is already bounded by the span, and
 reusing :meth:`ConditionGroup.matches` means the API and the tested domain
 semantics cannot drift apart — an AND/OR tree compiled into SQL twice is two
 implementations of the same rule.
+
+一行 = 一个**目标星球**，而预设 / 派遣结果 / 战果全都挂在**派遣**上——同一个目标
+可能被打过很多次，每次的预设与战果都不一样。这里的取值一律取**最近一次派遣**
+（按意图创建时刻排的那一次），不是「打过就算」：
+
+- 「打过就算」会让战果筛选自相矛盾——一个赢过也输过的目标同时属于「胜」和「负」，
+  于是两个筛选谁都答不上「这个目标现在什么情况」。
+- 操作台上要拿这一页去决定**下一发打谁**，而下一发看的是它现在的样子。
+
+页面上必须把这条口径写出来（`intel.html` 的快速过滤那一栏），不然用户会以为
+筛的是「历史上出现过」。
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import Select, select
+from sqlalchemy.orm import Mapped, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.functions import func
 
 from evo_helper.domain.intel_query import (
     ConditionGroup,
@@ -31,6 +44,11 @@ from evo_helper.domain.intel_query import (
     QueryField,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange
+from evo_helper.domain.records import (
+    MISSION_KIND_SCOUT,
+    TARGET_KIND_BOT,
+    TARGET_KIND_PIRATE,
+)
 from evo_helper.storage import models as orm
 
 DEFAULT_LIMIT = 50
@@ -42,6 +60,33 @@ SORT_TOTAL_ASC = "total_asc"
 SORT_SNAPSHOT_DESC = "snapshot_desc"
 SORTS = (SORT_COORDINATE, SORT_TOTAL_DESC, SORT_TOTAL_ASC, SORT_SNAPSHOT_DESC)
 
+#: 「结果」快速过滤的取值：最近一次派遣**有没有真的发出去**。
+#:
+#: 拦下与被拒是两回事，所以分成两档：`BLOCKED` 是本地闸门（读简报没通过、
+#: 配额用完……）根本没点出去，`REJECTED` 是点了、游戏那边没接受。合成一档的话，
+#: 「为什么没打」这个问题在页面上就没有答案了。
+DISPATCH_SENT = "SENT"
+DISPATCH_BLOCKED = "BLOCKED"
+DISPATCH_REJECTED = "REJECTED"
+DISPATCH_NEVER = "NEVER"
+DISPATCH_STATES = (DISPATCH_SENT, DISPATCH_BLOCKED, DISPATCH_REJECTED, DISPATCH_NEVER)
+
+#: 「战果」快速过滤的取值。
+#:
+#: `AWAITING`（待战报）只给**真的会有战报的那一发**：派出去、被接受、而且是攻击发。
+#: 侦察发不产生战报（`domain.records.MISSION_KIND_SCOUT`），把它算成「待战报」
+#: 会让页面上永远挂着一批等不到的行——PR #95 就是在认领那一侧踩的同一个坑。
+RESULT_VICTORY = "VICTORY"
+RESULT_FAIL = "FAIL"
+RESULT_DRAW = "DRAW"
+RESULT_AWAITING = "AWAITING"
+RESULT_NONE = "NONE"
+BATTLE_RESULTS = (RESULT_VICTORY, RESULT_FAIL, RESULT_DRAW, RESULT_AWAITING, RESULT_NONE)
+
+#: 坐标的三个分量在 SQL 里的样子：ORM 属性（`orm.BotTargetRow.galaxy`）与子查询
+#: 上的列（`latest.c.galaxy`）是两个类型，而打包比较对两者一视同仁。
+_IntColumn = Mapped[int] | ColumnElement[int]
+
 
 @dataclass(frozen=True)
 class IntelSearchQuery:
@@ -50,6 +95,10 @@ class IntelSearchQuery:
     cursor: str | None = None
     limit: int = DEFAULT_LIMIT
     sort: str = SORT_COORDINATE
+    #: 三个快速过滤，都按**最近一次派遣**判（见模块开头）。None = 不筛。
+    preset: str | None = None
+    dispatch_state: str | None = None
+    battle_result: str | None = None
 
     def __post_init__(self) -> None:
         if self.limit < 1 or self.limit > MAX_LIMIT:
@@ -57,6 +106,16 @@ class IntelSearchQuery:
         if self.sort not in SORTS:
             raise InvalidQueryError(
                 f"unknown sort {self.sort!r}; expected one of {', '.join(SORTS)}"
+            )
+        if self.dispatch_state is not None and self.dispatch_state not in DISPATCH_STATES:
+            raise InvalidQueryError(
+                f"unknown dispatch state {self.dispatch_state!r}; "
+                f"expected one of {', '.join(DISPATCH_STATES)}"
+            )
+        if self.battle_result is not None and self.battle_result not in BATTLE_RESULTS:
+            raise InvalidQueryError(
+                f"unknown battle result {self.battle_result!r}; "
+                f"expected one of {', '.join(BATTLE_RESULTS)}"
             )
 
 
@@ -71,6 +130,22 @@ class IntelRow:
     matched_summary: str
     match_confidence: float | None
     review_status: str | None
+    #: `bot` 还是 `pirate`（`domain.records.TARGET_KIND_*`）。列表按它上色。
+    kind: str = TARGET_KIND_BOT
+    #: 最近一次派遣的预设名 / 派遣结果 / 战果。见模块开头的口径说明。
+    preset_name: str | None = None
+    dispatch_state: str = DISPATCH_NEVER
+    battle_result: str = RESULT_NONE
+    #: 最近一份**侦察报告**的时间，以及它读到的四个判定舰种。
+    #:
+    #: ⚠️ **值可以是 `None`，而 `None` 不是 0**——那一格没读出来。整套
+    #: ATTACK/SKIP/UNREADABLE 判定就建立在这个区分上
+    #: （见 `storage.models.ScoutTriggerShipRow`），页面必须把两者显示成不同的东西。
+    #:
+    #: ⚠️ 这**不是舰队快照**，所以它不喂 `ConditionGroup`：那里只有四个判定舰种，
+    #: 当成对方全部家当去算「舰队总数」会凭空缩水一个数量级。
+    scout_at: datetime | None = None
+    scout_ships: dict[str, int | None] = field(default_factory=dict)
 
     @property
     def has_fleet_data(self) -> bool:
@@ -85,6 +160,17 @@ class IntelRow:
         所以比的是 `is not None` 而不是真值。
         """
         return self.total is not None
+
+    @property
+    def intel_at(self) -> datetime | None:
+        """这一行最近一次「知道了点什么」的时刻：战报或侦察报告，取晚的那个。
+
+        海盗目标一份战报都没有（海盗战报不写逐舰种、侦察报告更不是战报），
+        只按 `snapshot_at` 排的话它们全沉到底，而「刚侦察完的海盗」恰恰是
+        最该顶在前面的一批。
+        """
+        moments = [moment for moment in (self.snapshot_at, self.scout_at) if moment is not None]
+        return max(moments) if moments else None
 
 
 @dataclass(frozen=True)
@@ -108,6 +194,33 @@ class SavedFilter:
     updated_at_utc: datetime
 
 
+@dataclass(frozen=True)
+class _Attempt:
+    """最近一次派遣：意图 + （可能没有的）派遣 + （可能没有的）战报。"""
+
+    target_kind: str
+    preset_name: str
+    dispatched_at: datetime | None
+    accepted: bool | None
+    mission_kind: str | None
+    outcome: str | None
+
+
+@dataclass(frozen=True)
+class _Report:
+    reported_at: datetime
+    defender_units: int | None
+    match_confidence: float | None
+    review_status: str | None
+    counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _Scout:
+    reported_at: datetime
+    ships: dict[str, int | None]
+
+
 class SqlAlchemyIntelRepository:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -115,11 +228,19 @@ class SqlAlchemyIntelRepository:
     # -- search ------------------------------------------------------------
 
     def search(self, query: IntelSearchQuery) -> IntelSearchPage:
+        """一次检索 = 五条**成批**查询，不是「每个目标再查一遍」。
+
+        原先每个目标都单独查一次最新战报再查一次逐舰种，全宇宙 4000 多个 bot
+        就是 8000 多次往返。取数改成按 span 一次取全（`row_number()` 挑出每个目标
+        最新那一份），行数仍由 span 兜住。
+
+        筛选（条件树 + 三个快速过滤）在内存里做，而这与攻击日志那条「必须下推
+        SQL」的教训**不矛盾**：那边先按 limit 砍掉历史再筛，查旧账必得空页；
+        这边候选集是 span 内的全部目标、分页在筛选**之后**才切，一行都没被提前砍掉。
+        """
         with self._session_factory() as session:
-            rows = [
-                self._row_for(session, target)
-                for target in self._targets_in_span(session, query.span)
-            ]
+            rows = self._rows_in_span(session, query.span)
+        rows = [row for row in rows if _passes_quick_filters(row, query)]
         if query.conditions is not None:
             matched = []
             for row in rows:
@@ -131,59 +252,215 @@ class SqlAlchemyIntelRepository:
         rows = _sorted(rows, query.sort)
         return _paginate(rows, cursor=query.cursor, limit=query.limit)
 
-    def _targets_in_span(
-        self, session: Session, span: CoordinateRange | None
-    ) -> list[orm.BotTargetRow]:
-        statement = select(orm.BotTargetRow).where(orm.BotTargetRow.is_bot)
-        if span is not None:
-            # Compare the packed coordinate so the span is one SQL range test
-            # rather than a per-component comparison, which would wrongly
-            # exclude e.g. 1:150:4 from 1:100:1 - 1:200:999.
-            statement = statement.where(
-                _packed_column().between(_pack(span.start), _pack(span.end))
-            )
-        return list(session.scalars(statement))
+    def _rows_in_span(self, session: Session, span: CoordinateRange | None) -> list[IntelRow]:
+        """span 内的每一个**目标星球**一行——bot 与海盗都算。
 
-    def _row_for(self, session: Session, target: orm.BotTargetRow) -> IntelRow:
-        coordinate = Coordinate(target.galaxy, target.system, target.position)
-        report = session.scalars(
-            select(orm.BattleReportRow)
-            .where(
-                orm.BattleReportRow.defender_target_galaxy == coordinate.galaxy,
-                orm.BattleReportRow.defender_target_system == coordinate.system,
-                orm.BattleReportRow.defender_target_position == coordinate.position,
-            )
-            .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id.desc())
-            .limit(1)
-        ).first()
-        if report is None:
-            return IntelRow(
-                coordinate=coordinate,
-                player=target.latest_owner_name,
-                last_scan_at=target.last_scanned_at_utc,
-                snapshot_at=None,
-                total=None,
-                counts={},
-                matched_summary="",
-                match_confidence=None,
-                review_status=None,
-            )
-        counts = _defender_counts(session, report.id)
-        return IntelRow(
-            coordinate=coordinate,
-            player=target.latest_owner_name,
-            last_scan_at=target.last_scanned_at_utc,
-            snapshot_at=report.reported_at_utc,
-            # 逐舰种有行就按行求和；一行都没有时退回战报详情页上的守方「单位」总数。
-            # 这两个是**两个独立来源**，不是同一个数的两种写法：大舰队的逐行数量是
-            # 四舍五入显示的，相加凑不出精确总数（见 `records.BattleReport` 的注释）。
-            # 所以优先用逐行和——它带着构成信息；没有逐行时用总数，总比显示 0 强。
-            total=sum(counts.values()) if counts else report.defender_units,
-            counts=counts,
-            matched_summary="",
-            match_confidence=report.match_confidence,
-            review_status=report.manual_review_status,
+        海盗不在 `bot_targets` 里：那张表由坐标扫描写，而海盗是在星系视图上认出来
+        的。只列 `bot_targets` 的话，情报中心里一个海盗都没有，于是侦察报告读到的
+        四个判定舰种**永远显示不出来**——这正是用户报的那条。所以候选集是三者的并集：
+        bot 目标、有过海盗派遣的坐标、有过侦察报告的坐标。
+        """
+        targets = self._bot_targets(session, span)
+        attempts = self._latest_attempts(session, span)
+        reports = self._latest_reports(session, span)
+        scouts = self._latest_scouts(session, span)
+        coordinates = (
+            set(targets)
+            | set(scouts)
+            | {
+                coordinate
+                for coordinate, attempt in attempts.items()
+                if attempt.target_kind == TARGET_KIND_PIRATE
+            }
         )
+        return [
+            _build_row(
+                coordinate,
+                targets.get(coordinate),
+                attempts.get(coordinate),
+                reports.get(coordinate),
+                scouts.get(coordinate),
+            )
+            for coordinate in coordinates
+        ]
+
+    def _bot_targets(
+        self, session: Session, span: CoordinateRange | None
+    ) -> dict[Coordinate, orm.BotTargetRow]:
+        statement = select(orm.BotTargetRow).where(orm.BotTargetRow.is_bot)
+        statement = _within(
+            statement,
+            span,
+            orm.BotTargetRow.galaxy,
+            orm.BotTargetRow.system,
+            orm.BotTargetRow.position,
+        )
+        return {
+            Coordinate(row.galaxy, row.system, row.position): row
+            for row in session.scalars(statement)
+        }
+
+    def _latest_attempts(
+        self, session: Session, span: CoordinateRange | None
+    ) -> dict[Coordinate, _Attempt]:
+        """每个目标**最近一次**派遣，按意图创建时刻排。
+
+        战报按 `dispatch_id` 接上来，不按坐标重配：那是仓储层做过时间与坐标核对
+        之后写下的匹配结果，在这里重配一次就是把同一条判据写第二份。
+        """
+        intent = orm.AttackIntentRow
+        dispatch = orm.AttackDispatchRow
+        report = orm.BattleReportRow
+        ranked = _within(
+            select(
+                intent.target_galaxy.label("galaxy"),
+                intent.target_system.label("system"),
+                intent.target_position.label("position"),
+                intent.target_kind.label("target_kind"),
+                intent.preset_name.label("preset_name"),
+                dispatch.dispatched_at_utc.label("dispatched_at"),
+                dispatch.accepted.label("accepted"),
+                dispatch.mission_kind.label("mission_kind"),
+                report.outcome.label("outcome"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        intent.target_galaxy,
+                        intent.target_system,
+                        intent.target_position,
+                    ),
+                    order_by=(intent.created_at_utc.desc(), intent.id.desc()),
+                )
+                .label("row_no"),
+            )
+            .outerjoin(dispatch, dispatch.intent_id == intent.id)
+            .outerjoin(report, report.dispatch_id == dispatch.id),
+            span,
+            intent.target_galaxy,
+            intent.target_system,
+            intent.target_position,
+        ).subquery()
+        rows = session.execute(select(ranked).where(ranked.c.row_no == 1)).all()
+        return {
+            Coordinate(row.galaxy, row.system, row.position): _Attempt(
+                target_kind=row.target_kind,
+                preset_name=row.preset_name,
+                dispatched_at=row.dispatched_at,
+                accepted=row.accepted,
+                mission_kind=row.mission_kind,
+                outcome=row.outcome,
+            )
+            for row in rows
+        }
+
+    def _latest_reports(
+        self, session: Session, span: CoordinateRange | None
+    ) -> dict[Coordinate, _Report]:
+        report = orm.BattleReportRow
+        ranked = _within(
+            select(
+                report.id.label("report_id"),
+                report.defender_target_galaxy.label("galaxy"),
+                report.defender_target_system.label("system"),
+                report.defender_target_position.label("position"),
+                report.reported_at_utc.label("reported_at"),
+                report.defender_units.label("defender_units"),
+                report.match_confidence.label("match_confidence"),
+                report.manual_review_status.label("review_status"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        report.defender_target_galaxy,
+                        report.defender_target_system,
+                        report.defender_target_position,
+                    ),
+                    order_by=(report.reported_at_utc.desc(), report.id.desc()),
+                )
+                .label("row_no"),
+            ),
+            span,
+            report.defender_target_galaxy,
+            report.defender_target_system,
+            report.defender_target_position,
+        ).subquery()
+        latest = select(ranked).where(ranked.c.row_no == 1).subquery()
+        counts = _defender_counts(session, latest)
+        return {
+            Coordinate(row.galaxy, row.system, row.position): _Report(
+                reported_at=row.reported_at,
+                defender_units=row.defender_units,
+                match_confidence=row.match_confidence,
+                review_status=row.review_status,
+                counts=counts.get(Coordinate(row.galaxy, row.system, row.position), {}),
+            )
+            for row in session.execute(select(latest)).all()
+        }
+
+    def _latest_scouts(
+        self, session: Session, span: CoordinateRange | None
+    ) -> dict[Coordinate, _Scout]:
+        """每个目标最近一份侦察报告，连同它读到的四个判定舰种。
+
+        ⚠️ `count` 原样读回，`NULL` 保持 `None`。**不许 `or 0`**：0 是「这里没有
+        这种船」，`None` 是「这一格没读出来」，把后者记成前者就是把一支实打实的
+        舰队记成空的（见 `storage.models.ScoutTriggerShipRow`）。
+        """
+        scout = orm.ScoutReportRow
+        ranked = _within(
+            select(
+                scout.id.label("report_id"),
+                scout.target_galaxy.label("galaxy"),
+                scout.target_system.label("system"),
+                scout.target_position.label("position"),
+                scout.reported_at_utc.label("reported_at"),
+                func.row_number()
+                .over(
+                    partition_by=(scout.target_galaxy, scout.target_system, scout.target_position),
+                    order_by=(scout.reported_at_utc.desc(), scout.id.desc()),
+                )
+                .label("row_no"),
+            ),
+            span,
+            scout.target_galaxy,
+            scout.target_system,
+            scout.target_position,
+        ).subquery()
+        latest = select(ranked).where(ranked.c.row_no == 1).subquery()
+        ships: dict[Coordinate, dict[str, int | None]] = {}
+        trigger = orm.ScoutTriggerShipRow
+        for galaxy, system, position, ship_type, count in session.execute(
+            select(
+                latest.c.galaxy,
+                latest.c.system,
+                latest.c.position,
+                trigger.ship_type,
+                trigger.count,
+            )
+            .join(trigger, trigger.report_id == latest.c.report_id)
+            .order_by(trigger.ordinal)
+        ).all():
+            ships.setdefault(Coordinate(galaxy, system, position), {})[ship_type] = count
+        return {
+            Coordinate(row.galaxy, row.system, row.position): _Scout(
+                reported_at=row.reported_at,
+                ships=ships.get(Coordinate(row.galaxy, row.system, row.position), {}),
+            )
+            for row in session.execute(select(latest)).all()
+        }
+
+    def preset_names(self) -> list[str]:
+        """派遣里出现过的预设名，供「预设」快速过滤的下拉框用。
+
+        取自 `attack_intents` 而不是写死一张表：预设是用户在游戏里配的
+        （探路 / AAA / BBB / CCC / 侦察……），写死就意味着新加一个预设之后，
+        这一页会安静地筛不到它。
+        """
+        with self._session_factory() as session:
+            return sorted(
+                name
+                for name in session.scalars(select(orm.AttackIntentRow.preset_name).distinct())
+                if name
+            )
 
     # -- saved filters -----------------------------------------------------
 
@@ -322,28 +599,134 @@ def _pack(coordinate: Coordinate) -> int:
     return (coordinate.galaxy * 1000 + coordinate.system) * 1000 + coordinate.position
 
 
-def _packed_column() -> ColumnElement[int]:
-    return (
-        orm.BotTargetRow.galaxy * 1_000_000
-        + orm.BotTargetRow.system * 1000
-        + orm.BotTargetRow.position
+def _packed_column(
+    galaxy: _IntColumn, system: _IntColumn, position: _IntColumn
+) -> ColumnElement[int]:
+    return galaxy * 1_000_000 + system * 1000 + position
+
+
+def _within(
+    statement: Select[Any],
+    span: CoordinateRange | None,
+    galaxy: _IntColumn,
+    system: _IntColumn,
+    position: _IntColumn,
+) -> Select[Any]:
+    """把坐标区间下推成**一次**打包整数的范围比较。
+
+    逐分量比较（galaxy>=… AND system>=… AND position>=…）会把 1:150:4 排除在
+    1:100:1 – 1:200:999 之外，因为 4 < 1 不成立那一路走不通。打包成一个整数之后，
+    区间就是它本来的样子。
+    """
+    if span is None:
+        return statement
+    return statement.where(
+        _packed_column(galaxy, system, position).between(_pack(span.start), _pack(span.end))
     )
 
 
-def _defender_counts(session: Session, report_id: UUID) -> dict[str, int]:
+def _passes_quick_filters(row: IntelRow, query: IntelSearchQuery) -> bool:
+    """三个快速过滤，全部按**最近一次派遣**判（见模块开头）。None = 不筛。"""
+    if query.preset is not None and row.preset_name != query.preset:
+        return False
+    if query.dispatch_state is not None and row.dispatch_state != query.dispatch_state:
+        return False
+    return not (query.battle_result is not None and row.battle_result != query.battle_result)
+
+
+def _build_row(
+    coordinate: Coordinate,
+    target: orm.BotTargetRow | None,
+    attempt: _Attempt | None,
+    report: _Report | None,
+    scout: _Scout | None,
+) -> IntelRow:
+    return IntelRow(
+        coordinate=coordinate,
+        player=target.latest_owner_name if target else None,
+        last_scan_at=target.last_scanned_at_utc if target else None,
+        snapshot_at=report.reported_at if report else None,
+        # 逐舰种有行就按行求和；一行都没有时退回战报详情页上的守方「单位」总数。
+        # 这两个是**两个独立来源**，不是同一个数的两种写法：大舰队的逐行数量是
+        # 四舍五入显示的，相加凑不出精确总数（见 `records.BattleReport` 的注释）。
+        # 所以优先用逐行和——它带着构成信息；没有逐行时用总数，总比显示 0 强。
+        total=(
+            None
+            if report is None
+            else (sum(report.counts.values()) if report.counts else report.defender_units)
+        ),
+        counts=dict(report.counts) if report else {},
+        matched_summary="",
+        match_confidence=report.match_confidence if report else None,
+        review_status=report.review_status if report else None,
+        kind=_kind_of(target, attempt, scout),
+        preset_name=attempt.preset_name if attempt else None,
+        dispatch_state=_dispatch_state(attempt),
+        battle_result=_battle_result(attempt),
+        scout_at=scout.reported_at if scout else None,
+        scout_ships=dict(scout.ships) if scout else {},
+    )
+
+
+def _kind_of(
+    target: orm.BotTargetRow | None, attempt: _Attempt | None, scout: _Scout | None
+) -> str:
+    """派遣写下的 `target_kind` 最有分量：那是真打出去的那一发自己记的。
+
+    没派过就退回「有侦察报告 = 海盗」（侦察只对海盗做），再退回 bot。
+    """
+    if attempt is not None:
+        return attempt.target_kind
+    if scout is not None:
+        return TARGET_KIND_PIRATE
+    return TARGET_KIND_BOT
+
+
+def _dispatch_state(attempt: _Attempt | None) -> str:
+    if attempt is None:
+        return DISPATCH_NEVER
+    if attempt.dispatched_at is None:
+        return DISPATCH_BLOCKED
+    return DISPATCH_SENT if attempt.accepted else DISPATCH_REJECTED
+
+
+def _battle_result(attempt: _Attempt | None) -> str:
+    """战果只对「真的飞出去的攻击发」有意义。
+
+    `outcome` 原样返回，不拿「不是 VICTORY 就算负」兜底：库里存的是画面原文，
+    将来多一档会被静默显示成败仗（`logs.html` 上同一条取舍）。
+    """
+    if attempt is None or attempt.dispatched_at is None or not attempt.accepted:
+        return RESULT_NONE
+    if attempt.mission_kind == MISSION_KIND_SCOUT:
+        return RESULT_NONE
+    return attempt.outcome if attempt.outcome is not None else RESULT_AWAITING
+
+
+def _defender_counts(session: Session, latest: Any) -> dict[Coordinate, dict[str, int]]:
     """Counts from the participating fleet, which is the pre-battle holding.
 
     Per-round rows carry a ``round_no`` and describe what survived each round;
     including them would multiply-count every ship type.
+
+    ``latest`` 是「每个目标最新那一份战报」的子查询，直接 join 上去而不是先把
+    战报 id 取回来再拼一条 `IN (...)`：span 里有几千个目标时那串参数本身就是负担。
     """
-    rows = session.execute(
-        select(orm.FleetSnapshotRow.ship_type, orm.FleetSnapshotRow.count).where(
-            orm.FleetSnapshotRow.report_id == report_id,
-            orm.FleetSnapshotRow.side == "defender",
-            orm.FleetSnapshotRow.round_no.is_(None),
+    snapshot = orm.FleetSnapshotRow
+    counts: dict[Coordinate, dict[str, int]] = {}
+    for galaxy, system, position, ship_type, count in session.execute(
+        select(
+            latest.c.galaxy,
+            latest.c.system,
+            latest.c.position,
+            snapshot.ship_type,
+            snapshot.count,
         )
-    ).all()
-    return {ship_type: count for ship_type, count in rows}
+        .join(snapshot, snapshot.report_id == latest.c.report_id)
+        .where(snapshot.side == "defender", snapshot.round_no.is_(None))
+    ).all():
+        counts.setdefault(Coordinate(galaxy, system, position), {})[ship_type] = count
+    return counts
 
 
 def _to_saved_filter(row: orm.IntelFilterRow) -> SavedFilter:
@@ -373,10 +756,12 @@ def _sorted(rows: list[IntelRow], sort: str) -> list[IntelRow]:
             rows, key=lambda r: ((r.total if r.total is not None else 1 << 30), _pack(r.coordinate))
         )
     if sort == SORT_SNAPSHOT_DESC:
+        # `intel_at` 而不是 `snapshot_at`：海盗行没有战报、只有侦察报告，
+        # 按后者排会把刚侦察完的海盗全部沉到底。
         return sorted(
             rows,
             key=lambda r: (
-                -(r.snapshot_at.timestamp() if r.snapshot_at else float("-inf")),
+                -(r.intel_at.timestamp() if r.intel_at else float("-inf")),
                 _pack(r.coordinate),
             ),
         )

@@ -12,7 +12,7 @@ from threading import Lock
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from evo_helper.domain.models import Coordinate, RunState
+from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
 from evo_helper.domain.state_machine import require_transition
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -388,7 +388,12 @@ class ApplicationService(Protocol):
     ) -> RevisitView: ...
     def list_revisits(self) -> list[RevisitView]: ...
     def list_attack_log(
-        self, limit: int, *, day_utc: date | None = None
+        self,
+        limit: int,
+        *,
+        day_utc: date | None = None,
+        kind: str | None = None,
+        target_span: CoordinateRange | None = None,
     ) -> list[AttackLogView]: ...
     def dashboard(self) -> DashboardView: ...
 
@@ -798,7 +803,14 @@ class FakeApplicationService:
         with self._lock:
             return list(self._events[-limit:])
 
-    def list_attack_log(self, limit: int, *, day_utc: date | None = None) -> list[AttackLogView]:
+    def list_attack_log(
+        self,
+        limit: int,
+        *,
+        day_utc: date | None = None,
+        kind: str | None = None,
+        target_span: CoordinateRange | None = None,
+    ) -> list[AttackLogView]:
         """Fake 服务不模拟派遣，所以攻击日志恒为空。
 
         返回空列表而不是抛未实现：页面在演示服务上也要打得开，

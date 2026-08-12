@@ -21,7 +21,8 @@
     <span class="sep" role="separator"></span>
 
     {#
-      默认按**战报时间倒序**，不按坐标。
+      默认按**情报时间倒序**，不按坐标。「情报时间」= 战报时间或侦察报告时间，
+      取晚的那个：海盗一份战报都没有，只按战报时间排会把它们整批沉到底。
 
       按坐标排时这一页打开就是 2:1:9、2:2:13……而全宇宙有 4000 多个 bot、
       每页只取前 50 行；今天刚打过的那几个（比如 2:320–2:325）排在几百行开外，
@@ -32,7 +33,7 @@
       为空时排序键取 -inf）。要按坐标查仍然一下拉就能切回去。
     #}
     <select id="sort" aria-label="排序">
-      <option value="snapshot_desc" selected>战报时间 ↓</option>
+      <option value="snapshot_desc" selected>情报时间 ↓</option>
       <option value="coordinate">坐标</option>
       <option value="total_desc">总数 ↓</option>
       <option value="total_asc">总数 ↑</option>
@@ -42,6 +43,36 @@
     <span class="spacer"></span>
     <input id="save-name" placeholder="另存为…" size="10" aria-label="筛选器名称">
     <button class="btn small" id="save-filter" type="button">保存</button>
+  </div>
+
+  {#
+    快速过滤。**三个都按「最近一次派遣」判，不是「打过就算」。**
+
+    这一栏挂在派遣上，而这张表一行是一个目标星球——同一个目标可能被打过很多次，
+    每次的预设与战果都不一样。选「打过就算」的话，一个赢过也输过的目标会同时
+    落进「胜」和「负」，两个筛选谁都答不上「它现在什么情况」；而这一页存在的
+    理由就是决定下一发打谁，那看的是它现在的样子。
+
+    口径必须写在页面上（下面那行小字），不能让用户从结果里反推。
+  #}
+  <div class="filter-bar">
+    <span class="inline-label">预设</span>
+    <select id="preset-filter" aria-label="预设"><option value="">不限</option></select>
+
+    <span class="sep" role="separator"></span>
+
+    <span class="inline-label">结果</span>
+    <select id="dispatch-filter" aria-label="派遣结果"><option value="">不限</option></select>
+
+    <span class="sep" role="separator"></span>
+
+    <span class="inline-label">战果</span>
+    <select id="result-filter" aria-label="战果"><option value="">不限</option></select>
+
+    <span class="spacer"></span>
+    <span class="muted" style="font-size:12px">
+      按<strong>最近一次派遣</strong>筛，不是「历史上打过就算」
+    </span>
   </div>
 
   <details id="cond-details" open>
@@ -114,10 +145,22 @@
 (() => {
   const TOTAL_FIELD = '__total__';
   const OPERATORS = ['>', '>=', '<', '<=', '=', '!='];
-  const FIXED_COLUMNS = ['坐标', 'bot 名称', '最新战报时间', '舰队总数'];
+  // 「最新情报时间」而不是「最新战报时间」：海盗行一份战报都没有，它那一格写的是
+  // 侦察报告的时间。列名说的必须是它真正装着的东西。
+  const FIXED_COLUMNS = ['坐标', '类型', '名称', '最新情报时间', '舰队总数'];
   // Only these ship types get their own list column; the rest live in the
   // detail dialog. A column per recorded type overflowed a laptop screen.
+  // 这四个就是海盗侦察的判定舰种（`display.LIST_SHIP_COLUMNS`）。
   const LIST_SHIPS = {{ list_ship_columns | tojson }};
+  const KIND_LABELS = {{ kind_labels | tojson }};
+  const KIND_TONES = {{ kind_tones | tojson }};
+  const KIND_GLYPHS = {{ kind_glyphs | tojson }};
+  const DISPATCH_LABELS = {{ dispatch_labels | tojson }};
+  const DISPATCH_TONES = {{ dispatch_tones | tojson }};
+  const DISPATCH_GLYPHS = {{ dispatch_glyphs | tojson }};
+  const RESULT_LABELS = {{ result_labels | tojson }};
+  const RESULT_TONES = {{ result_tones | tojson }};
+  const RESULT_GLYPHS = {{ result_glyphs | tojson }};
   let shipNames = [];
   // 分页状态。offset 是「这一页第一行在整份结果里的下标」，服务端的 cursor 就是
   // 这个下标的字符串形式，所以页码可以直接算，不必攒着一串 cursor 往回找。
@@ -251,7 +294,7 @@
     const head = el('result-head');
     head.replaceChildren();
     const numeric = new Set(['舰队总数', ...LIST_SHIPS, '其他舰种']);
-    for (const label of [...FIXED_COLUMNS, ...LIST_SHIPS, '其他舰种', '操作']) {
+    for (const label of [...FIXED_COLUMNS, ...LIST_SHIPS, '其他舰种', '最近一次派遣', '操作']) {
       const th = document.createElement('th');
       th.scope = 'col';
       th.textContent = label;
@@ -262,26 +305,64 @@
     }
   }
 
+  function chip(text, tone, glyph) {
+    const span = document.createElement('span');
+    span.className = tone ? `chip ${tone}` : 'chip';
+    if (glyph) {
+      const mark = document.createElement('span');
+      mark.className = 'glyph';
+      mark.setAttribute('aria-hidden', 'true');
+      mark.textContent = glyph;
+      span.append(mark);
+    }
+    span.append(document.createTextNode(text));
+    return span;
+  }
+
+  /**
+   * 四个判定舰种那一格的取值。**「0」与「没读到」必须显示成不同的东西。**
+   *
+   * 数量为 0 的格子在游戏画面上只是一个孤零零的 `0`，实测最容易读空；读空当成 0
+   * 就是把「没看清」记成「这里是空的」，而整套 ATTACK/SKIP/UNREADABLE 判定就
+   * 建立在这个区分上。所以 `null`（没读出来）显示 `—`，真的 0 显示 `0`。
+   *
+   * 两个来源：海盗看**侦察报告**（`scout_ships`，只有这四个舰种），bot 看战报的
+   * 逐舰种行。都没有就是 `—`——bot 探路战报只读详情页、一行逐舰种都没有，
+   * 那时候写 0 同样是在编数。
+   */
+  function triggerCount(row, name) {
+    const scout = row.scout_ships.find((s) => s.ship_type === name);
+    if (row.scout_ships.length) return scout && scout.count !== null ? scout.count.toLocaleString() : '—';
+    if (!row.ships.length) return '—';
+    const found = row.ships.find((s) => s.ship_type === name);
+    return (found ? found.count : 0).toLocaleString();
+  }
+
   function renderRows(rows) {
     const body = el('result-rows');
     body.replaceChildren();
     for (const row of rows) {
-      const counts = Object.fromEntries(row.ships.map((s) => [s.ship_type, s.count]));
       const tr = document.createElement('tr');
+      // 整行也带上类型：bot 与海盗是两条完全不同的链路，混在一张表里读的时候，
+      // 最先要回答的就是「这行是哪种」。色只是加速，类型那一格里写着字。
+      tr.className = KIND_TONES[row.kind] || '';
 
       tr.append(cell(row.coordinate, 'coord'));
+      const kindCell = document.createElement('td');
+      kindCell.append(chip(KIND_LABELS[row.kind] || row.kind, KIND_TONES[row.kind], KIND_GLYPHS[row.kind]));
+      tr.append(kindCell);
       tr.append(cell(row.player || '—'));
-      tr.append(cell(row.has_fleet_data ? fmtTime(row.snapshot_at) : '暂无舰队数据'));
-      tr.append(cell(row.total === null ? '0' : row.total.toLocaleString(), 'num'));
+      tr.append(intelTimeCell(row));
+      tr.append(cell(row.total === null ? '—' : row.total.toLocaleString(), 'num'));
 
-      // A type the snapshot did not list means the bot holds none of it, so
-      // it reads as 0 rather than a blank the eye has to interpret.
       for (const name of LIST_SHIPS) {
-        tr.append(cell((counts[name] ?? 0).toLocaleString(), 'num'));
+        tr.append(cell(triggerCount(row, name), 'num'));
       }
       const others = row.ships.filter((s) => !LIST_SHIPS.includes(s.ship_type));
       const othersTotal = others.reduce((sum, s) => sum + s.count, 0);
       tr.append(cell(`${others.length} 种 / ${othersTotal.toLocaleString()}`, 'num'));
+
+      tr.append(attemptCell(row));
 
       const action = document.createElement('td');
       const button = document.createElement('button');
@@ -306,6 +387,55 @@
     const td = document.createElement('td');
     if (className) td.className = className;
     td.textContent = text;
+    return td;
+  }
+
+  /**
+   * 「最新情报时间」那一格：战报时间，或者海盗的侦察报告时间。
+   *
+   * 两者是**两种不同的东西**，所以侦察那一份要标出来——不标的话，一个只被侦察过、
+   * 从没打过的海盗看起来就像「打过、有战报」。
+   */
+  function intelTimeCell(row) {
+    const td = document.createElement('td');
+    if (row.snapshot_at) {
+      td.textContent = fmtTime(row.snapshot_at);
+      return td;
+    }
+    if (row.scout_at) {
+      td.append(document.createTextNode(fmtTime(row.scout_at) + ' '));
+      td.append(chip('侦察', KIND_TONES.pirate, '👁'));
+      return td;
+    }
+    td.textContent = '暂无情报';
+    return td;
+  }
+
+  /** 「最近一次派遣」那一格：预设名 + 结果 chip + 战果 chip。 */
+  function attemptCell(row) {
+    const td = document.createElement('td');
+    if (row.preset_name) {
+      const name = document.createElement('div');
+      name.textContent = row.preset_name;
+      td.append(name);
+    }
+    const chips = document.createElement('div');
+    chips.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap';
+    chips.append(chip(
+      DISPATCH_LABELS[row.dispatch_state] || row.dispatch_state,
+      DISPATCH_TONES[row.dispatch_state],
+      DISPATCH_GLYPHS[row.dispatch_state],
+    ));
+    // 认不出来的 outcome 原样显示，不拿「不是胜就是负」兜底：库里存的是画面原文，
+    // 将来多一档会被静默显示成败仗。
+    if (row.battle_result !== 'NONE') {
+      chips.append(chip(
+        RESULT_LABELS[row.battle_result] || row.battle_result,
+        RESULT_TONES[row.battle_result],
+        RESULT_GLYPHS[row.battle_result],
+      ));
+    }
+    td.append(chips);
     return td;
   }
 
@@ -428,7 +558,16 @@
 
   function buildQuery() {
     const group = serialise(activeGroup());
-    return { span: readSpan(), conditions: group.children.length ? group : null, sort: el('sort').value };
+    return {
+      span: readSpan(),
+      conditions: group.children.length ? group : null,
+      sort: el('sort').value,
+      // 空串 = 不筛（下拉框里「不限」那一项）。服务端也再兜一次底，
+      // 但让空串一路走到「预设名叫空字符串」是没必要的绕远路。
+      preset: el('preset-filter').value || null,
+      dispatch_state: el('dispatch-filter').value || null,
+      battle_result: el('result-filter').value || null,
+    };
   }
 
   function showError(message) {
@@ -546,6 +685,12 @@
   el('sort').onchange = () => runSearch(0);
   el('close-history').onclick = () => el('history-dialog').close();
 
+  // 三个快速过滤改一下就重查，并且回第一页：换了条件还停在第 7 页，
+  // 看到的是新结果的第 301 条起，而那多半已经越过整份结果了。
+  for (const id of ['preset-filter', 'dispatch-filter', 'result-filter']) {
+    el(id).onchange = () => runSearch(0);
+  }
+
   // 改每页行数后回第一页：留在「第 7 页」上，换成每页 200 就成了第 1400 条起，
   // 早已越过原来看的那一段。
   el('page-size').onchange = () => runSearch(0, true);
@@ -558,9 +703,26 @@
     if (event.key === 'Enter') { event.preventDefault(); goToPage(el('page-input').value); }
   };
 
+  /**
+   * 预设下拉框的选项来自库里真的出现过的预设名（`/api/intel/presets`），
+   * 不写死一张表：预设是用户在游戏里配的，写死就意味着新加一个预设之后，
+   * 这一页会安静地筛不到它。取不到时留一个「不限」，页面其余部分照常可用。
+   */
+  async function loadQuickFilters() {
+    const dispatch = el('dispatch-filter');
+    for (const [value, label] of Object.entries(DISPATCH_LABELS)) dispatch.add(new Option(label, value));
+    const result = el('result-filter');
+    for (const [value, label] of Object.entries(RESULT_LABELS)) result.add(new Option(label, value));
+    try {
+      const presets = await EVOHelper.get('/api/intel/presets');
+      for (const name of presets) el('preset-filter').add(new Option(name, name));
+    } catch (_) { /* 预设列表取不到就只剩「不限」，不挡住整页 */ }
+  }
+
   (async () => {
     root.append(makeGroup('AND', 0));
     try { shipNames = await EVOHelper.get('/api/intel/ships'); } catch (_) { shipNames = []; }
+    await loadQuickFilters();
     renderHead();
     // 打开时**不预置任何舰队条件**。
     //
