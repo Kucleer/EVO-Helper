@@ -24,41 +24,44 @@ SQLAlchemy 的 `Uuid` / `Boolean` 是**方言无关类型**——它在读写两
 
 ---
 
-## 二、⚠️ 最大的坑：33 个 `DateTime` 列没有一个是 `timezone=True`
+## 二、时区：已经做完了（PR #104），但这一节记着当初判断错的地方
 
-这是**动手之前必须先定的一件事**，不是迁移过程中的细节。
+**结论先说：这件事已经落地，迁移时不用再操心。** 保留这一节是因为我最初写的判断
+有三处是错的，而其中一处如果照着做会把库弄坏。
 
-现状：`models.py` 里 33 个 `DateTime` 列全部没写 `timezone=True`，而代码里存进去的是
-**带时区的 UTC 时刻**（`datetime.now(UTC)`）。
+### 我当初写错的三处
 
-- **SQLite 不在乎**：它把 datetime 存成字符串，tzinfo 跟着一起进去，读出来还是带时区的。
-- **Postgres 会当场丢掉**：`TIMESTAMP WITHOUT TIME ZONE` 会把 tzinfo **静默截掉**，
-  读出来变成 naive。
+| 我写的 | 实际 |
+|---|---|
+| 33 个 `DateTime` 列 | **34 个** |
+| `models.py` 里那 33 处要改 | `models.py` 里**没有一个裸 `DateTime`**——34 列全部走 `storage/database.py` 的 `UTCDateTime(TypeDecorator)`。所以「改 33 处」实际是**改一处**，`models.py` 一行没动 |
+| SQLite 把 tzinfo 一起存进去，读出来还是带时区的 | **不是**。SQLAlchemy 的 SQLite 方言 `DATETIME` 绑定格式里没有时区字段，偏移量被**丢掉且不换算**——实测 `03:04:05+08:00` 落盘成 `03:04:05`，比真实 UTC 早 8 小时 |
 
-后果不是报错，是**安静地错**。这个项目已经被时区坑过至少三次：
+由第二、三条推出一个更要紧的更正：**改之前的代码在 Postgres 上其实就是对的。**
+那个 `UTCDateTime` 一直在写入时先 `astimezone(UTC)` 再剥 tzinfo、读出时补回 `tzinfo=UTC`，
+naive 列配 naive 绑定前后自洽。我说的「读出来变成 naive」不会发生。
 
-- 战报页眉时间当成 UTC+8 解析，硬减 8 小时，把当天早上的报告算成前一天，
-  「读到前一天就收工」的判据当场误触发，一封都没开；
-- `--round-started-at` 不带时区会让上一轮的派遣被算进本轮；
-- 攻击日志的日期筛选必须按 UTC+0 切，按 UTC+8 切会让跨日那几小时归错天，
-  而海盗每天 32 次的边界正好在那里。
+### ⚠️ 真正的风险是「只做一半」
 
-naive 的 datetime 进了库，上面每一条判据都会重新变得可疑，**而且不报错**。
+如果照我最初的字面意思——无差别给列加 `timezone=True`、而**不动绑定**——naive 值会遇上
+`TIMESTAMPTZ`，Postgres 会拿**会话时区**去解释它：服务器不在 UTC 就整库偏时差，
+而且照旧不报错。PR #104 是两半一起改的，并有测试钉死。
 
-**两条路，二选一，写进决定再动手：**
+所以：**迁 Postgres 之前不要再动这块**。要动的话两半必须一起动。
 
-### 路 A（推荐）：迁移前先把列改成 `timezone=True`
+### 顺带查实的两件事
 
-- 改 `models.py` 那 33 处，加一个 alembic 迁移。
-- 在**现有 SQLite 库**上先跑通、跑测试、实机跑一轮，确认没坏。
-- 然后再做 Postgres 迁移。
+- **`daily_reconciliations.day_utc` 不是 datetime**，它是 `String(10)`——不在这 34 列里。
+  唯一名字像日期的是 `run_instances.target_date`，而它是**死列**（生产两处建 `RunInstance`
+  都不写它，全仓无人读）。
+- 原先这块是**测试盲区**：没有一个测试直接覆盖 `UTCDateTime` 的往返。现在有 9 条
+  （`tests/integration/storage/test_utc_timestamps.py`）。
 
-好处是把「换库」和「改时区语义」两件事**分开验证**。混在一起做，出了问题分不清是哪一半的锅。
+### 一条对写测试的提醒
 
-### 路 B：接受 naive-UTC
-
-全库统一存 naive UTC，读出来再补 `tzinfo=UTC`。省一次迁移，但从此每个读取点都要记得补，
-漏一处就是一个静默的时区 bug。**不推荐**——这个项目在这上面的败绩已经够多了。
+`replace(tzinfo=UTC)` 与 `astimezone(UTC)` 对 naive 值**在 UTC 主机上是同一个函数**，
+而 CI 是 UTC 的 Linux。所以「把 astimezone 换成 replace」这种变异在 CI 上**必绿**——
+不是断言写弱了，是差别在那个环境里**不可观测**。要验它必须先把进程时区掰到非 UTC。
 
 ---
 
@@ -104,6 +107,10 @@ Postgres 只监听那个虚拟网卡。这个项目的控制台默认绑 `0.0.0.
 EVO_HELPER_DATABASE_URL=... .venv/Scripts/python.exe -m alembic upgrade head
 ```
 
+⚠️ **这一步现在会挂。** 迁移 `8c41b9d201ff` 用了 `lower(hex(randomblob(16)))`，
+那是 SQLite 专有函数，Postgres 上不存在。迁库之前必须先处理它——改成方言无关的写法，
+或者给它加一个按方言分支的实现。**这是 PG 迁移眼下唯一已知的硬拦路虎**（PR #104 顺带查出来的）。
+
 ⚠️ 从**空库**跑全套迁移，不要从 SQLite 抄结构。迁移里那几处 `batch_alter_table`
 在 Postgres 上照样能跑（它是 SQLite 的补丁，在 PG 上退化成普通 `ALTER`）。
 
@@ -135,7 +142,8 @@ state_events / ui_observations / artifacts / intel_filters / target_revisits
 
 1. **逐表行数一致**
 2. **抽样核对时区**：挑几条 `attack_dispatches`，确认 `dispatched_at_utc`
-   在两边是同一个时刻（不是差 8 小时、也不是丢了 tzinfo）
+   在两边是**同一个时刻**。注意比的是时刻不是字符串——SQLite 那边落盘的是 naive UTC，
+   PG 那边是 `timestamptz`，字符串长得不一样但代表同一刻才对。差 8 小时就是错的。
 3. **`pytest tests -q` 全绿**（测试用临时库，验的是代码没被改坏）
 4. **控制台起得来**，攻击日志 / 情报中心 / 任务中心三页都能开，数据对得上
 5. **实机跑一轮**只读的（`pirate_loop --systems 2:137`，不带 `--scout --attack`），
