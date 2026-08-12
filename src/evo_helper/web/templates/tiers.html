@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}分档阈值 · EVO-Helper{% endblock %}
+{% block heading %}分档阈值{% endblock %}
+{% block content %}
+
+{#
+  这一页只管三个数：bot 打回来的探路战报里守方「单位」总数落在哪一档，决定
+  这一发用哪套游戏内预设。**档位数量和预设名（AAA / BBB / CCC）不在这里配**
+  ——预设是按标题在游戏的预设条上 OCR 找的，标题对不上整发放弃，那不是一个
+  该放在输入框里的东西。
+#}
+<section class="panel" aria-labelledby="tiers-head">
+  <h2 id="tiers-head">档位边界</h2>
+  {% if thresholds is none %}
+    <p class="muted">这台服务没有接调度器，读不到当前配置。</p>
+  {% else %}
+  <form id="tier-form" class="filter-bar">
+    <span class="inline-label">AAA 起点</span>
+    <input type="number" id="alpha-from" name="alpha_from" min="1" step="1" style="width:96px"
+           value="{{ thresholds.alpha_from }}" aria-label="AAA 档起点（艘）">
+    <span class="sep" role="separator"></span>
+    <span class="inline-label">BBB 起点</span>
+    <input type="number" id="beta-from" name="beta_from" min="1" step="1" style="width:96px"
+           value="{{ thresholds.beta_from }}" aria-label="BBB 档起点（艘）">
+    <span class="sep" role="separator"></span>
+    <span class="inline-label">CCC 起点</span>
+    <input type="number" id="gamma-from" name="gamma_from" min="1" step="1" style="width:96px"
+           value="{{ thresholds.gamma_from }}" aria-label="CCC 档起点（艘）">
+    <span class="spacer"></span>
+    <button class="btn primary small" type="submit" id="tier-save">保存</button>
+  </form>
+
+  <p class="muted" id="tier-hint" style="margin:8px 0 0;font-size:12px"></p>
+  <p class="chip danger" id="tier-error" style="margin:8px 0 0" hidden></p>
+  <p class="chip ok" id="tier-saved" style="margin:8px 0 0" hidden>已保存</p>
+
+  {#
+    三个框只是三个数，「填成这样之后哪一档打哪个区间」得在按保存之前就看得见。
+    这四行由服务端算（`_threshold_bands`），页面不自己拼——两边各拼一次，
+    界面和日志迟早对同一套阈值说出两种区间。
+  #}
+  <div class="table-wrap" style="margin-top:12px">
+    <table>
+      <thead>
+        <tr><th scope="col">守方单位</th><th scope="col">用哪套预设</th></tr>
+      </thead>
+      <tbody id="tier-bands">
+      {% for band in thresholds.bands %}
+        <tr>
+          <td class="coord">{{ band.span }}</td>
+          <td>{{ band.preset }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="muted" style="margin:12px 0 0;font-size:12px">
+    每一档的数字是它的<strong>下界，含</strong>：填 4000 表示守方 4000 艘起用 BBB，3999 艘仍是 AAA。
+    三个数必须从小到大严格递增，否则中间那一档会变成永远取不到的死区——
+    不递增会被拒绝保存，不会替你排序。
+  </p>
+  <p class="muted" style="margin:6px 0 0;font-size:12px">
+    改动只影响<strong>之后</strong>发出的攻击：分档是每次派遣现算的，历史记录里存的是当时
+    实际用掉的预设标题，不会跟着变。已经在飞的那一轮用的是它启动那一刻的阈值。
+  </p>
+  {% endif %}
+</section>
+
+{% if thresholds is not none %}
+<script>
+(() => {
+  // 运行中一律拒改（后端 409，同任务参数那条口径）。页面这一侧只做同一件事的
+  // 提前显形：控件置灰 + 说明为什么。两边都要有——只置灰挡不住直接打接口的，
+  // 只拒不置灰则要用户改完才发现。
+  const LOCKED_HINT = '调度器运行中，分档阈值已固化，不可修改；点「结束」后可改。';
+  const EDITABLE_HINT = '改完点「保存」。三个数必须严格递增，否则会被拒绝。';
+
+  const form = document.getElementById('tier-form');
+  const inputs = [
+    document.getElementById('alpha-from'),
+    document.getElementById('beta-from'),
+    document.getElementById('gamma-from'),
+  ];
+  const save = document.getElementById('tier-save');
+  const hint = document.getElementById('tier-hint');
+  const errorBox = document.getElementById('tier-error');
+  const savedBox = document.getElementById('tier-saved');
+  const bands = document.getElementById('tier-bands');
+
+  function apply(state) {
+    for (const input of inputs) input.disabled = state.locked;
+    save.disabled = state.locked;
+    hint.textContent = state.locked ? LOCKED_HINT : EDITABLE_HINT;
+    bands.textContent = '';
+    for (const band of state.bands) {
+      const row = document.createElement('tr');
+      const span = document.createElement('td');
+      span.className = 'coord';
+      span.textContent = band.span;
+      const preset = document.createElement('td');
+      preset.textContent = band.preset;
+      row.append(span, preset);
+      bands.append(row);
+    }
+  }
+
+  function fill(state) {
+    inputs[0].value = state.alpha_from;
+    inputs[1].value = state.beta_from;
+    inputs[2].value = state.gamma_from;
+    apply(state);
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    errorBox.hidden = true;
+    savedBox.hidden = true;
+    EVOHelper.request('PATCH', '/api/tier-thresholds', {
+      alpha_from: Number(inputs[0].value),
+      beta_from: Number(inputs[1].value),
+      gamma_from: Number(inputs[2].value),
+    })
+      .then((state) => {
+        fill(state);
+        savedBox.hidden = false;
+      })
+      .catch((error) => {
+        // 后端的 400 / 409 都带中文说明（哪一档会成死区、为什么运行中不给改）。
+        // 吞掉它，用户只会看到「点了没反应」。
+        errorBox.textContent = error.detail || error.message || String(error);
+        errorBox.hidden = false;
+        // 被拒之后把框恢复成库里真正的取值：留着那个没存进去的数，页面就在
+        // 说一句谎——刷新之后它会自己变回去，而用户以为已经保存了。
+        EVOHelper.get('/api/tier-thresholds').then(fill).catch(() => {});
+      });
+  });
+
+  // 「现在改不改得动」是这一页唯一会变的东西，而它由另一页上的「开始 / 结束」
+  // 决定。进页面时问一次就够——阈值本身没有别的写入方。
+  EVOHelper.get('/api/tier-thresholds').then(apply).catch(() => {});
+})();
+</script>
+{% endif %}
+{% endblock %}

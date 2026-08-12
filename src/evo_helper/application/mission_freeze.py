@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from evo_helper.domain.fleet_tier import TierThresholdError, TierThresholds
 from evo_helper.domain.scheduler import MissionKind
 
 #: 固化记录的落脚处。与 `mission_runs` 的日志同一个 `var/` 目录。
@@ -62,13 +63,22 @@ class MissionConfigFreeze:
 
     frozen_at_utc: datetime
     tasks: tuple[FrozenTask, ...]
+    #: 那一刻的 bot 分档阈值。**它决定了这一轮每一发用哪套预设**，属于「这一轮
+    #: 用的是哪一套参数」这个问题的答案，所以记在这里而不是让它只活在
+    #: `mission_runs.command` 里——后者一轮一行，回答不了「点开始时页面上填的是
+    #: 什么」。
+    #:
+    #: 可以为 None：这个字段是后加的，`var/mission-config-freezes.jsonl` 里已有的
+    #: 历史行没有它。**不给它编一个默认值**——那些轮次实际用的是当时写死在代码里
+    #: 的 2K/5K/8K，而回填一个今天的默认值会把记录变成一份看起来完整的假账。
+    tier_thresholds: TierThresholds | None = None
 
     def task(self, kind: MissionKind) -> FrozenTask | None:
         """这条链路当时的配置。库里缺行时为 None，调用方自己决定怎么说。"""
         return next((task for task in self.tasks if task.kind is kind), None)
 
     def to_json(self) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "frozen_at_utc": self.frozen_at_utc.isoformat(),
             "tasks": [
                 {
@@ -80,6 +90,8 @@ class MissionConfigFreeze:
                 for task in self.tasks
             ],
         }
+        if self.tier_thresholds is not None:
+            payload["tier_thresholds"] = list(self.tier_thresholds.edges)
         return json.dumps(payload, ensure_ascii=False)
 
     @classmethod
@@ -103,10 +115,19 @@ class MissionConfigFreeze:
         if not isinstance(raw_tasks, list):
             return None
         tasks = [task for item in raw_tasks if (task := _task(item)) is not None]
-        return cls(frozen_at_utc=moment, tasks=tuple(tasks))
+        return cls(
+            frozen_at_utc=moment,
+            tasks=tuple(tasks),
+            tier_thresholds=_thresholds(data.get("tier_thresholds")),
+        )
 
 
-def freeze_now(tasks: Sequence[FrozenTask], *, frozen_at_utc: datetime) -> MissionConfigFreeze:
+def freeze_now(
+    tasks: Sequence[FrozenTask],
+    *,
+    frozen_at_utc: datetime,
+    tier_thresholds: TierThresholds | None = None,
+) -> MissionConfigFreeze:
     """把当下这几条链路的配置封成一条记录。
 
     次序按 `MissionKind` 的声明顺序钉死，不跟着 `priority` 走：记录是拿来**逐条
@@ -120,6 +141,7 @@ def freeze_now(tasks: Sequence[FrozenTask], *, frozen_at_utc: datetime) -> Missi
     return MissionConfigFreeze(
         frozen_at_utc=frozen_at_utc,
         tasks=tuple(sorted(tasks, key=lambda task: order[task.kind])),
+        tier_thresholds=tier_thresholds,
     )
 
 
@@ -193,6 +215,23 @@ def _moment(value: Any) -> datetime | None:
     # 不带时区的时刻一律丢弃，不去猜它是哪个时区：猜错八小时，事后对时间线时
     # 会把「上一轮」和「这一轮」的配置认反。
     return moment if moment.tzinfo is not None and moment.utcoffset() is not None else None
+
+
+def _thresholds(value: Any) -> TierThresholds | None:
+    """`[2000, 4000, 8000]` → 三道边界。读不懂就 None，同 `_moment` 那条原则。
+
+    这个文件是给人看的，也就会被人编辑。手改坏的一行不该让整台控制台起不来；
+    而**读不懂时绝不回落到默认值**——一条写着 2K/4K/8K 的记录必须真的来自那一轮
+    的配置，编出来的默认值会让翻账的人对着一份假账找原因。
+    """
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+    if any(not isinstance(edge, int) or isinstance(edge, bool) for edge in value):
+        return None
+    try:
+        return TierThresholds(*value)
+    except TierThresholdError:
+        return None
 
 
 def _task(item: Any) -> FrozenTask | None:

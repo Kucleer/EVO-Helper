@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from evo_helper.domain.fleet_tier import DEFAULT_TIER_THRESHOLDS
 from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
@@ -71,7 +72,7 @@ def test_a_reversed_system_range_is_rejected() -> None:
 def test_an_empty_target_set_is_rejected_before_a_process_is_started() -> None:
     """范围内一个已记录 bot 都没有时，拉起一个必然空转的 runner 没有意义。"""
     with pytest.raises(MissionParamError):
-        bot_command(())
+        bot_command((), DEFAULT_TIER_THRESHOLDS)
 
 
 def test_scan_command_is_the_full_argv() -> None:
@@ -96,12 +97,22 @@ def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:
 
 
 def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
-    assert bot_command((Coordinate(2, 137, 14),))[1:] == [
+    """整条对比，不挑子串：`--probe --attack` 漏掉不会报错，只是白跑一趟。
+
+    `--tier-thresholds` 也在里面。这条命令行原样存进 `mission_runs.command`，
+    带上那三个数之后它才回答得了「那一轮按什么分的档」——runner 自己去查库的话，
+    台账上就只剩「打了谁」，分档依据无处可查。
+    """
+    assert bot_command((Coordinate(2, 137, 14),), DEFAULT_TIER_THRESHOLDS)[1:] == [
         "-u",
         "-m",
         "evo_helper.tools.bot_loop",
         "--targets",
         "2:137:14",
+        "--tier-thresholds",
+        "2000",
+        "4000",
+        "8000",
         "--probe",
         "--attack",
     ]
@@ -115,7 +126,7 @@ def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:
     many = tuple(Coordinate(2, system, 1) for system in range(1, 4000))
 
     with pytest.raises(MissionParamError):
-        bot_command(many)
+        bot_command(many, DEFAULT_TIER_THRESHOLDS)
 
 
 def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:

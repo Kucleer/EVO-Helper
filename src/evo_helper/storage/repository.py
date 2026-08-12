@@ -13,6 +13,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
+from evo_helper.domain.fleet_tier import DEFAULT_TIER_THRESHOLDS, TierThresholds
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
@@ -1657,6 +1658,47 @@ class SqlAlchemyRepository:
             row.disabled_reason = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+
+    def tier_thresholds(self) -> TierThresholds:
+        """bot 分档的三道边界，从 `scheduler_config` 读。
+
+        **只有这一个入口。** 领域层那边刻意没有回落默认值的路径
+        （`domain.fleet_tier` 是纯函数，不查库），所以「当前生效的是哪三个数」
+        只有这里答得上来。
+
+        配置行还没建出来时回落到 `DEFAULT_TIER_THRESHOLDS`：控制台开机会调
+        `ensure_mission_rows()` 把它补上，但 runner 是独立进程，手工跑一次
+        `tools.bot_loop` 完全可能撞上一个还没被控制台碰过的库。那时按默认值
+        分档，与新建库拿到的取值一致。
+
+        库里的三个数不成立（有人手改过）时照旧抛 `TierThresholdError`——
+        悄悄换回默认值，就等于用一套用户没见过的数派舰队。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.SchedulerConfigRow, 1)
+            if row is None:
+                return DEFAULT_TIER_THRESHOLDS
+            return TierThresholds(
+                alpha_from=row.tier_alpha_from,
+                beta_from=row.tier_beta_from,
+                gamma_from=row.tier_gamma_from,
+            )
+
+    def update_tier_thresholds(self, thresholds: TierThresholds) -> None:
+        """页面上那三个框保存走这里。
+
+        收的是已经构造好的 `TierThresholds`，不是三个裸 int：递增校验挂在它的
+        构造函数上，所以走到这里的取值必然是成立的——写库这一层不该有第二把
+        尺子，两把尺子迟早量出两个答案。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.SchedulerConfigRow, 1)
+            if row is None:
+                raise ValueError("scheduler_config 还没初始化；先调 ensure_mission_rows()")
+            row.tier_alpha_from = thresholds.alpha_from
+            row.tier_beta_from = thresholds.beta_from
+            row.tier_gamma_from = thresholds.gamma_from
             session.commit()
 
     def begin_bot_round(self, *, now_utc: datetime) -> None:
