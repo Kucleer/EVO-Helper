@@ -70,6 +70,31 @@ PRESET_DRAG_FROM_X = 1150
 PRESET_DRAG_TO_X = 800
 PRESET_SAVE_BUTTON_MARGIN_PX = 120
 
+#: 预设条上**允许落指的最右边界**：条右界减去保存按钮那条边距。
+#:
+#: 「+ 保存当前舰队」挂在预设条内容的最右端，只有把条拖到右端才会露出来；
+#: 露出来时它就贴着条的右界。所以这一条线以右的一切——不管 OCR 把它读成什么——
+#: 都当作可能是那个按钮：**既不点，也不在那里按下手指**。
+#:
+#: 两个用法各守一半：
+#:   - 点：命中的中心 x 落在线右一律拒绝（`game.preset_picker`）。
+#:   - 拖：往右拖时**按下**的那一点必须在线左（`PRESET_DRAG_RIGHT_FROM_X`）。
+#:     往左拖按在 800、松手才到 1150，松手落在按钮上不会触发它，所以旧的
+#:     左拖坐标一个不用改。
+#:
+#: 116px 的余量远大于 `human_input.CLICK_JITTER_PX`（±4），抖动吃不掉它。
+PRESET_SAFE_CLICK_MAX_X = PRESET_STRIP_ROI[2] - PRESET_SAVE_BUTTON_MARGIN_PX
+
+#: 往右拖（内容左移、露出右侧）的起止点。**两端都在 `PRESET_SAFE_CLICK_MAX_X` 左边**：
+#: 按下的那一点绝不落进保存按钮那段边距。行程 300px，与左拖的 350px 同量级。
+PRESET_DRAG_RIGHT_FROM_X = 1050
+PRESET_DRAG_RIGHT_TO_X = 750
+
+#: 保存按钮文字里最不会跟预设名撞车的两个字。OCR 读到含这两个字的「预设名」，
+#: 一律不当候选——这是独立于坐标的第二道闸：坐标那道靠的是量出来的几何，
+#: 万一哪天条的右界变了，这道还在。
+PRESET_SAVE_BUTTON_KEYWORD = "保存"
+
 #: 一次拖动大约推进的像素；用来判断「拖到底了」而不是无限拖下去。
 PRESET_MAX_DRAGS = 8
 
