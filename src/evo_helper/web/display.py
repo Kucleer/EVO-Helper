@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scheduler import TaskStatus
-from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS
 
 #: 三条任务链路在界面上的名字。
 #:
@@ -81,11 +80,23 @@ def missing_status_tones() -> list[str]:
 #: sorts targets by. Every other type stays in the detail dialog — a column per
 #: recorded ship type made the table wider than any laptop screen.
 #:
-#: **就是海盗侦察的四个判定舰种**，所以直接引用 `PIRATE_TRIGGER_SHIPS` 而不是
-#: 再抄一份字面量：这四列存在的理由就是「侦察判定看的是这四个」，判定表哪天增删
-#: 一种，列跟着变才对。抄一份的话，改了那边而这边没改，页面会安静地少显示一列——
-#: 而少的那一列恰恰是决定打不打的那一个数。
-LIST_SHIP_COLUMNS: tuple[str, ...] = PIRATE_TRIGGER_SHIPS
+#: **现在是空的：列表只看舰队总数。**（用户口径 2026-08-11：「不读了吧，节约性能，
+#: 在页面移除这4项，仅查看舰队总数」）
+#:
+#: 这四列原先是海盗侦察的四个判定舰种（`PIRATE_TRIGGER_SHIPS`）。移除的理由不是
+#: 版面，是**数据源**：
+#:
+#: - **bot 那半边根本没有这四个数。** 逐舰种明细在战斗回放页上，而 bot 链路刻意
+#:   只读详情页、`fleet_snapshots` 一行不写（见 `tools.bot_loop` 模块头）。要补上
+#:   得多点开一次「查看战斗回放」——那个按钮至今没有标定过的坐标，每份报告还要多
+#:   花两三秒 OCR。用户选择不为这四个数付这笔钱。
+#: - 海盗那半边有（`scout_trigger_ships`），但其中 `收割者` 一列在实机 98 份报告里
+#:   **一份都没读出来**（ROI 落空），摆在列表上也是满屏的「—」。
+#:
+#: 留成空元组而不是删掉这个常量：取数与渲染那条路仍然按它来，哪天回放页标定好了，
+#: 这里填回去就有列。**别改成 `or 0`**——`None` 是「没读到」，`0` 是「真的没有」，
+#: 整个 ATTACK/SKIP/UNREADABLE 三值判定就建立在这个区分上。
+LIST_SHIP_COLUMNS: tuple[str, ...] = ()
 
 
 #: 情报中心列表里 bot 与海盗各自的 chip 样式。

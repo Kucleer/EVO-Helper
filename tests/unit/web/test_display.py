@@ -45,13 +45,20 @@ def test_every_mission_kind_has_a_label() -> None:
     assert set(MISSION_LABELS) == {kind.value for kind in MissionKind}
 
 
-def test_the_list_columns_are_the_pirate_trigger_ships() -> None:
-    """情报中心那四列存在的理由就是「侦察判定看的是这四个」。
+def test_the_list_has_no_per_ship_columns() -> None:
+    """情报中心列表只看舰队总数，不再逐舰种开列（用户口径 2026-08-11）。
 
-    抄一份字面量的话，判定表增删一种舰船而这边没跟上，页面会安静地少显示一列——
-    而少的那一列恰恰是决定打不打的那个数。
+    移除的理由是**数据源**，不是版面：bot 那半边根本没有这四个数（逐舰种明细在
+    战斗回放页上，而 bot 链路刻意只读详情页），海盗那半边的 `收割者` 一列在实机
+    98 份报告里一份都没读出来。摆着的是满屏的「—」，而补齐它要多标定一个按钮、
+    每份报告多花两三秒 OCR——用户选择不付这笔钱。
+
+    钉成空元组而不是删掉常量：取数与渲染那条路仍然按它走，回放页哪天标定好了，
+    把 `PIRATE_TRIGGER_SHIPS` 填回去就有列。
     """
-    assert LIST_SHIP_COLUMNS == PIRATE_TRIGGER_SHIPS
+    assert LIST_SHIP_COLUMNS == ()
+    # 判定舰种本身没被删——它仍然是侦察判定的依据，只是不再上列表。
+    assert len(PIRATE_TRIGGER_SHIPS) == 4
 
 
 def test_every_intel_state_has_its_own_slot() -> None:
