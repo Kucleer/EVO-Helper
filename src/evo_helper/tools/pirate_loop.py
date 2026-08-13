@@ -326,6 +326,26 @@ MAIL_DETAIL_TITLE = "消息"
 #: 信箱与详情页左上角的返回/关闭键（同一个位置，语义随页面变）。
 MAIL_BACK = (750, 71)
 
+#: 一趟信箱最多重进几次。
+#:
+#: 重进的成因见 `_scan_mail_rows`：点开一封不是预期格式的邮件之后，那一下「返回」
+#: 可能把整个信箱关掉（`MAIL_BACK` 与「关闭面板」是同一个坐标）。
+#:
+#: 取 2 是因为**重进本身不便宜**：它要重新进信箱、从顶部把已经翻过的几屏重扫一遍
+#: （只读主题，不重复开封）。真需要重进三次以上，说明画面已经不是「偶尔掉出列表」
+#: 那种情形了，接着试只是在一个认不出的画面上多点几下。
+MAIL_MAX_REENTRIES = 4
+
+#: 从详情页退回列表最多点几次「返回」。
+#:
+#: 一次不够：`MAIL_BACK` 身兼两职（也是「关闭面板」），落在一个不是详情页的画面上
+#: 时会把整个信箱关掉。点第二次的最坏情况是**点空**——那个坐标在恒星系视图上
+#: 什么都不是（`_ensure_session` 的恢复阶梯里记着同一条）。
+#:
+#: 便宜太多：一次确认 + 一次补点约 2 秒，而丢了列表要重进信箱、从顶部重扫，
+#: 实机上那一趟 30 屏的预算有 12 屏花在重扫上。
+MAIL_BACK_ATTEMPTS = 2
+
 #: 详情页里把内容拖到底用的起止点（917 空间）。必须慢拖，见 `slow_drag`。
 PANEL_DRAG_FROM_Y = 700
 PANEL_DRAG_TO_Y = 300
@@ -527,6 +547,17 @@ class MailScan:
     pages: int = 0
     #: 真的打开过几封。
     opened: int = 0
+    #: 这一趟**没能好好走完**的理由；正常收工时是 None。
+    #:
+    #: ⚠️ 摘要必须把它说出来。实机 2026-08-13 20:35：一趟给了 30 屏预算的补录在
+    #: 第 3 屏丢了邮件列表、当场中止，打出来的却是
+    #:
+    #:     完成（bot · 补录（翻到 --since 为止））：翻了 3 屏，开了 3 封…
+    #:
+    #: ——一行**长得完全像成功**的话，而那一趟要救的 21 份战报一份都没碰到。
+    #: 「翻了 3 屏」本身没撒谎，但只有知道预算是 30 屏的人才看得出不对劲，
+    #: 而看摘要的人恰恰是不看命令行的那个人。
+    cut_short: str | None = None
 
 
 @dataclass
@@ -1217,6 +1248,9 @@ class PirateLoop:
         collected = False
         budget_noted = False
         done = False
+        reentries = 0
+        #: 上一屏的行身份。判「拖到底了」只能靠它，见下面 `fresh` 为空那一段。
+        last_identities: list[tuple[str, str]] | None = None
         for page in range(max_pages):
             if done:
                 break
@@ -1225,12 +1259,54 @@ class PirateLoop:
             # 上一次返回没退到列表（或把整个信箱关掉了），接着照列表的行坐标点下去，
             # 于是点在了地表 UI 上——一次点开了「取消任务」确认框，一次点开了「排名」。
             if not self._settle(self._on_mail_list):
-                say("  已经不在邮件列表上了；这一趟到此为止")
-                break
-            fresh = [row for row in self._mail_list_rows() if row.identity not in seen]
+                # **丢了列表就重进信箱接着翻，不是中止整趟。**
+                #
+                # 实机 2026-08-13 20:33：补录跑到第 3 屏时点开一封主题被 OCR 糊掉的
+                # 侦察报告，详情页标题读到「侦察」而不是「消息」，判据正确地拒了它；
+                # 但接着那一下 `MAIL_BACK` 落在一个不是详情页的画面上——那个坐标
+                # 身兼两职（在 `_reset_to_known_screen` 里它是「关闭面板」），于是
+                # 整个信箱被关掉了。原先的处置是 `break`：**30 屏的预算只走了 3 屏，
+                # 却打印出一行长得像成功的「完成」**，而那一趟要救的 21 份战报
+                # 一份都没碰到。
+                #
+                # 重进的代价是回到信箱顶部、把已经翻过的几屏重扫一遍（只读主题，
+                # 不重复开封——`seen` 挡着），比起丢掉整趟便宜得多。
+                if reentries >= MAIL_MAX_REENTRIES:
+                    say(f"  已经不在邮件列表上了，重进 {reentries} 次都没用；这一趟到此为止")
+                    scan.cut_short = f"丢了邮件列表，重进 {reentries} 次都没回去"
+                    break
+                reentries += 1
+                say(
+                    f"  已经不在邮件列表上了；重进信箱接着翻"
+                    f"（第 {reentries}/{MAIL_MAX_REENTRIES} 次）"
+                )
+                self._enter_mailbox()
+                # 重进之后**不在这里再判一次**：判了就得决定「不成怎么办」，而那正是
+                # 下一轮循环开头那道守卫的活。交给它，重进预算才真的是预算——
+                # 在这里 break 的话，第 2 次重进永远走不到。
+                last_identities = None
+                continue
+            rows = self._mail_list_rows()
+            identities = [row.identity for row in rows]
+            fresh = [row for row in rows if row.identity not in seen]
             if not fresh:
-                say(f"  第 {page + 1} 屏没有没见过的邮件；不再往下翻")
-                break
+                # ⚠️ **「这一屏没有新邮件」不等于「翻到底了」。** 重进信箱之后画面回到
+                # 顶部，头几屏必然全是见过的——原先在这里 `break`，等于让上面那条
+                # 重进永远走不到新内容，白重进。
+                #
+                # 真正的到底判据是**拖了一下还是同样几封**（与
+                # `domain.planet_switch.list_exhausted` 同一条）。比行身份而不是比
+                # 位置：身份取自主题+时间，拖动带惯性时位置会差几像素，按位置比会
+                # 永远判「还能拖」。
+                if identities and identities == last_identities:
+                    say(f"  第 {page + 1} 屏拖不动了（还是那几封）；不再往下翻")
+                    break
+                say(f"  第 {page + 1} 屏没有没见过的邮件；接着往下翻")
+                last_identities = identities
+                if page + 1 < max_pages:
+                    slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+                continue
+            last_identities = identities
             seen.update(row.identity for row in fresh)
             for row in fresh:
                 if observe is not None:
@@ -1262,6 +1338,12 @@ class PirateLoop:
                 done = True
             if not done and page + 1 < max_pages:
                 slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
+        else:
+            # `for ... else`：**没有 break，也就是把翻页上限用满了**。
+            # 那意味着既没翻到 `not_before`、也没拖到底——信箱比预算深，
+            # 下面还有没看过的邮件。这同样不是「好好走完」，摘要要说出来。
+            if not done:
+                scan.cut_short = f"翻满了 {max_pages} 屏的上限，信箱还没到底"
         self._close_mail()
         return scan
 
@@ -1270,6 +1352,20 @@ class PirateLoop:
 
         铺不开就存一帧（封顶）并当作这一封读不出来。**不读没铺开的那一屏**：
         读出来的字和「这封是别人的报告」分不开，而分不开就等于静默丢掉一份战报。
+
+        ## 退回列表要**确认**，不是点一下就走
+
+        实机 2026-08-13：主题被 OCR 糊掉的侦察报告会被放进来（主题筛故意往「开」
+        的一侧倒），它的详情页标题是「侦察」不是「消息」，判据正确地拒了它——
+        但接着那一下 `MAIL_BACK` 落在一个**不是详情页**的画面上，而那个坐标身兼
+        两职（在 `_reset_to_known_screen` 里它是「关闭面板」），于是整个信箱被关掉。
+
+        代价不是丢一封，是丢**一整趟**：调用方发现不在列表上，只能重进信箱、
+        从顶部重扫（`_scan_mail_rows` 的 `MAIL_MAX_REENTRIES`）。那一趟 30 屏的
+        预算里，12 屏花在重扫上、两次重进用尽仍然没走到要救的战报那里。
+
+        所以这里多花一次读屏确认：回到列表了就走，没回去就**再点一次**。
+        两次都不成才交给调用方去重进——那条路仍然在，只是不该动不动就走。
         """
         self._driver.click(
             MAIL_ROW_X, MAIL_FIRST_ROW_Y + row.index * MAIL_ROW_PITCH, label="打开邮件"
@@ -1281,8 +1377,13 @@ class PirateLoop:
             self._dump_mail_detail()
         else:
             done = visit(row, self._report_screens())
-        self._driver.click(*MAIL_BACK, label="返回")
-        self._driver.wait(MAIL_BACK_WAIT_S)
+        for attempt in range(MAIL_BACK_ATTEMPTS):
+            self._driver.click(*MAIL_BACK, label="返回")
+            self._driver.wait(MAIL_BACK_WAIT_S)
+            if self._settle(self._on_mail_list):
+                return done
+            if attempt + 1 < MAIL_BACK_ATTEMPTS:
+                say("  返回之后没回到邮件列表；再点一次")
         return done
 
     def _dump_mail_detail(self) -> None:

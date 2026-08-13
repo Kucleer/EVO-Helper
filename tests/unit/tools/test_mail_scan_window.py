@@ -41,6 +41,7 @@ import pytest
 
 from evo_helper.tools.pirate_loop import (
     MAIL_MAX_OPENS,
+    MAIL_MAX_REENTRIES,
     MAIL_SCAN_PAGES,
     LoopOptions,
     MailRow,
@@ -386,3 +387,156 @@ def test_a_row_without_a_time_still_reads_its_subject() -> None:
     assert row.kind is ReportKind.ATTACK
     assert row.raw_time_text is None
     assert row.reported_at_utc is None
+
+
+# -- 掉出列表：重进接着翻，不是中止整趟 --------------------------------------
+
+
+class _ListFlapping:
+    """让「还在列表上吗」这一问在指定的第几次返回 False。"""
+
+    def __init__(self, on_list, fail_on: set[int]) -> None:
+        self._on_list = on_list
+        self._fail_on = fail_on
+        self.asked = 0
+
+    def __call__(self, predicate, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
+        if predicate is not self._on_list:
+            return True
+        self.asked += 1
+        return self.asked not in self._fail_on
+
+
+def test_losing_the_list_re_enters_the_mailbox_instead_of_ending_the_trip() -> None:
+    """**实机 2026-08-13 20:33 的那一趟。**
+
+    补录翻到第 3 屏时点开一封主题被 OCR 糊掉的侦察报告，详情页标题读到「侦察」
+    而不是「消息」，判据正确地拒了它；但接着那一下 `MAIL_BACK` 落在一个不是详情页
+    的画面上——那个坐标身兼两职（在 `_reset_to_known_screen` 里它是「关闭面板」），
+    整个信箱被关掉了。
+
+    原先的处置是当场 `break`：**30 屏的预算只走了 3 屏，却打印出一行长得像成功的
+    「完成（补录）：翻了 3 屏」**，而那一趟要救的 21 份战报一份都没碰到。
+    """
+    pages = [
+        [_row(0, ReportKind.SCOUT, minutes_ago=1)],
+        [_row(1, ReportKind.SCOUT, minutes_ago=2)],
+        [_row(2, ReportKind.SCOUT, minutes_ago=3)],
+    ]
+    loop, events, opened = _loop(pages)
+    # ⚠️ 桩掉 `_open_mail_row`：它自己也要问「还在列表上吗」（退回列表要确认，
+    # 见那个方法），而这条用例是**按第几次问**来制造失败的。不桩掉的话，
+    # 计数会跟着开封次数漂，这条用例就变成了在测另一件事。
+    # 开封那一侧由 `test_a_back_click_that_missed_is_clicked_again` 单独守。
+    loop._open_mail_row = lambda row, visit: bool(visit(row, object()))
+    loop._settle = _ListFlapping(loop._on_mail_list, fail_on={2})
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=6,
+    )
+
+    assert events.count("开信箱") == 2, "掉出列表之后必须重进一次"
+    assert [row.index for row in opened] == [0, 1, 2], "重进之后要接着把剩下的翻完"
+
+
+def test_a_mailbox_that_keeps_falling_out_eventually_gives_up() -> None:
+    """重进也是要花钱的（重新进信箱 + 从顶部重扫），不能无限试。
+
+    连着掉出列表说明画面已经不是「偶尔掉一下」那种情形，接着试只是在一个认不出的
+    画面上多点几下。
+    """
+    loop, events, opened = _loop([[_row(0, ReportKind.SCOUT)] for _ in range(8)])
+    loop._open_mail_row = lambda row, visit: bool(visit(row, object()))  # 同上一条的理由
+    loop._settle = _ListFlapping(loop._on_mail_list, fail_on=set(range(1, 20)))
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=8,
+    )
+
+    assert events.count("开信箱") == 1 + MAIL_MAX_REENTRIES
+    assert events[-1] == "关信箱", "放弃也要正常收尾，不能把信箱开着走人"
+
+
+def test_a_back_click_that_missed_is_clicked_again() -> None:
+    """**退回列表要确认，不是点一下就走。**
+
+    实机 2026-08-13：点开一封主题被 OCR 糊掉的侦察报告，详情页标题读到「侦察」
+    不是「消息」，判据正确地拒了它；但接着那一下 `MAIL_BACK` 落在一个不是详情页的
+    画面上，而那个坐标身兼两职（也是「关闭面板」），于是整个信箱被关掉。
+
+    代价不是丢一封，是丢**一整趟**：那一趟 30 屏的预算有 12 屏花在重进后的重扫上，
+    两次重进用尽仍然没走到要救的战报那里。这里多花一次读屏确认便宜得多。
+    """
+    loop, _events, opened = _loop([[_row(0, ReportKind.SCOUT)]])
+    # 只摆布「还在列表上吗」这一问：进循环时答是，第一次退回后答否，补点之后答是。
+    # 详情页那一问一律答是——这条守的是退回，不是详情页判据。
+    on_list = iter([True, False, True])
+    loop._settle = lambda predicate, **_kwargs: (
+        next(on_list, True) if predicate is loop._on_mail_list else True
+    )
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=1,
+    )
+
+    assert loop._driver.clicks.count("返回") == 2, "第一次没回到列表就要再点一次"
+
+
+# -- 「没有新邮件」不等于「翻到底了」 ----------------------------------------
+
+
+def test_screens_of_already_seen_rows_keep_scrolling() -> None:
+    """重进之后画面回到顶部，头几屏必然全是见过的。
+
+    原先在这里 `break`，于是上面那条重进永远走不到新内容——**重进了，却等于没重进**。
+    """
+    first = _row(0, ReportKind.SCOUT, minutes_ago=1)
+    second = _row(1, ReportKind.SCOUT, minutes_ago=2)
+    pages = [
+        [first, second],
+        [second],  # 拖动落点飘了，这一屏全是见过的——但**和上一屏不是同一批**
+        [_row(2, ReportKind.SCOUT, minutes_ago=9)],  # 再拖才露出来的新的
+    ]
+    loop, _events, opened = _loop(pages)
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=6,
+    )
+
+    assert [row.index for row in opened] == [0, 1, 2]
+
+
+def test_the_trip_stops_when_a_drag_changes_nothing() -> None:
+    """真的到底了：拖了一下，还是那几封。
+
+    ⚠️ 判据是**行身份**（主题+时间）而不是行的位置：拖动带惯性，同一批行在两屏
+    之间位置会差几像素，按位置比会永远判「还能拖」，于是拖满上限才罢休。
+    """
+    same = [_row(0, ReportKind.SCOUT, minutes_ago=1)]
+    loop, _events, opened = _loop([list(same) for _ in range(6)])
+
+    scan = loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=6,
+    )
+
+    # ⚠️ 断言的是**它停下来了**（只走了 2 屏，不是把 6 屏预算拖完）。
+    # 只断言「同一封没被开第二次」是不够的——那在「没停下来」时同样成立，
+    # 因为 `seen` 本来就挡着重复开封。差别全在白拖掉的那四次。
+    assert scan.pages == 2
+    assert loop._driver.clicks.count("打开邮件") == 1, "同一封不许开第二次"
+    assert len(opened) == 1

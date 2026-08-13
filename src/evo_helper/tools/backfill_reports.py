@@ -100,14 +100,25 @@ def summary_lines(kind: str, tally: BackfillTally, *, exhaustive: bool) -> list[
     「认领上几份」只报单子的落差，而且要说清它是个下界：单子里只装派出不超过
     6 小时的那些，人手动补昨晚的战报时它多半从 0 开始也以 0 结束，
     而那一趟其实认领得好好的（理由见 `BackfillTally.claimed`）。
+
+    ⚠️ **中途出事的那一趟不许说「完成」。** 实机 2026-08-13 20:35：一趟给了 30 屏
+    预算的补录在第 3 屏丢了邮件列表、当场中止，打出来的却是「完成（bot · 补录）：
+    翻了 3 屏……」——只有知道预算是 30 屏的人才看得出不对劲，而看摘要的人恰恰是
+    不看命令行的那个人。头一个字就要说清这一趟是不是走完了。
     """
     mode = "补录（翻到 --since 为止）" if exhaustive else "对账（单子空了就收工）"
+    headline = "中断" if tally.scan.cut_short else "完成"
     lines = [
-        f"完成（{kind} · {mode}）：翻了 {tally.scan.pages} 屏，开了 {tally.scan.opened} 封，"
+        f"{headline}（{kind} · {mode}）：翻了 {tally.scan.pages} 屏，开了 {tally.scan.opened} 封，"
         f"读通 {tally.read} 份，新入库 {tally.stored} 份",
         f"  单子上到点没战报的派遣：开工 {tally.due_before} 发 → 收工 {tally.due_after} 发"
         f"（认领上 {tally.claimed} 发）",
     ]
+    if tally.scan.cut_short:
+        lines.append(
+            f"  ⚠️ 这一趟没走完：{tally.scan.cut_short}。"
+            "信箱里还有没看过的邮件，要救的战报可能就在下面——请重跑一次"
+        )
     if tally.due_before == 0 and tally.stored:
         lines.append(
             "  ⚠️ 单子开工时就是空的，所以「认领上 0 发」不代表没认领：过期派遣不在单子里，"

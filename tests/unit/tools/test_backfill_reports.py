@@ -344,3 +344,33 @@ def test_an_empty_worklist_gets_a_caveat_instead_of_a_silent_zero() -> None:
 def test_the_claimed_count_never_goes_negative() -> None:
     """单子在这一趟里变长（别的进程又派了几发）时，认领数记 0 而不是负数。"""
     assert BackfillTally(due_before=1, due_after=4).claimed == 0
+
+
+def test_a_trip_that_was_cut_short_does_not_say_it_finished() -> None:
+    """**实机 2026-08-13 20:35。**
+
+    一趟给了 30 屏预算的补录在第 3 屏丢了邮件列表、当场中止，打出来的却是
+
+        完成（bot · 补录（翻到 --since 为止））：翻了 3 屏，开了 3 封，读通 1 份…
+
+    ——一行**长得完全像成功**的话，而那一趟要救的 21 份战报一份都没碰到。
+    「翻了 3 屏」本身没撒谎，但只有知道预算是 30 屏的人才看得出不对劲，
+    而看摘要的人恰恰是不看命令行的那个人。
+    """
+    scan = MailScan(pages=3, opened=3, cut_short="丢了邮件列表")
+    tally = BackfillTally(scan=scan, read=1, stored=1)
+
+    lines = summary(tally)
+
+    assert lines[0].startswith("中断"), "头一个字就要说清这一趟没走完"
+    assert any("没走完" in line and "重跑" in line for line in lines), "还要说下一步该干什么"
+
+
+def test_a_trip_that_ran_its_course_still_says_it_finished() -> None:
+    """没有这条对照，「一律说中断」也能让上面那条变绿。"""
+    tally = BackfillTally(scan=MailScan(pages=3, opened=3), read=1, stored=1)
+
+    lines = summary(tally)
+
+    assert lines[0].startswith("完成")
+    assert not any("没走完" in line for line in lines)
