@@ -110,9 +110,11 @@ def test_the_badge_is_readable_on_every_surface_shot(ocr, name: str) -> None:  #
 def test_the_badge_reads_the_number_on_the_screen(ocr, name: str) -> None:  # type: ignore[no-untyped-def]
     """读出来的确实是画面上那个数（而不是碰巧读到别处的噪声）。
 
-    这一条与上一条的区别是**它允许日后被放宽**：真到了四位、五位而框只框得住
-    后几位时，读数会变成 `2345` 这样的后缀，那时该改的是这一条，
-    上面那条「非空」一个字都不能动。
+    这一条与上一条的区别是**它允许日后被放宽**：框只框得住后几位时，读数会
+    变成 `2345` 这样的后缀，那时该改的是这一条，上面那条「非空」一个字都不能动。
+
+    不过按用户口径（2026-08-13）「邮箱不需要考虑 4 位数情况」，这一天多半不会来
+    ——写在这里只是说明两条的分工，不是在为它做准备。
     """
     assert _badge(ocr, name) == ON_SURFACE[name]
 
