@@ -426,13 +426,25 @@ class Outcome:
     scouted: list[Coordinate] = field(default_factory=list)
     attacked: list[Coordinate] = field(default_factory=list)
     refused: list[tuple[Coordinate, str]] = field(default_factory=list)
-    #: 这一轮开工就退了的理由（目前只有「切不到出发星球」）。
+    #: 这一轮没派成的理由（目前只有「切不到出发星球」）。有值 = **一发都没派**。
     #:
-    #: 有值就意味着**一发都没派**，而且不算故障：`main()` 据此返回
-    #: `EXIT_ENVIRONMENT_BUSY`。用退出码而不是异常，是因为「这会儿轮不到我」
-    #: 已经有一档了（见 `application.mission_supervisor`），
-    #: 连撞几次也不该把整条链路自动停用——出发星球切不过去多半是画面状态问题。
+    #: 用退出码而不是异常，是因为「这会儿轮不到我」已经有一档了
+    #: （见 `application.mission_supervisor`）。
     busy: str | None = None
+    #: 上面那个理由是**不会自己好**的那一种吗。决定退出码，见 `exit_code_for`。
+    #:
+    #: ⚠️ 这一档不能省，因为 `EXIT_ENVIRONMENT_BUSY` 是**不计入连续失败**的：
+    #: 它原本只服务于「游戏窗口抢不到前台」，那是个必然自己好的条件（用户放开
+    #: 鼠标就行）。切换星球失败**跨了两种性质**，不区分就会出事：
+    #:
+    #: - `UNCONFIRMED`（点过了，回读没认出来）：画面状态问题，下一轮多半就好——
+    #:   该豁免。
+    #: - `NOT_FOUND`（列表里翻遍了都没这颗星球）：多半是把 `origin` 配错了，
+    #:   而**接口那侧无从校验**（自己有哪几颗星球只写在游戏画面上，库里没有）。
+    #:   它不会自己好。豁免它的后果是一个**静默死循环**：每轮 30 秒就退，
+    #:   不计故障、不报警，停顿看门狗也抓不到（那东西抓的是「跑着却没进展」，
+    #:   而这里根本没跑起来）。于是任务显示「在跑」，实际一发不派，能挂一整夜。
+    busy_is_permanent: bool = False
 
 
 class PirateLoop:
@@ -1790,6 +1802,19 @@ class PirateLoop:
         if session.reconnected:
             say("已重新登录")
             self._navigator.invalidate()
+            # ⚠️ **出发星球那份记忆也要一起清**，理由与清导航缓存**一模一样**：
+            # 它记的是重连之前的画面。重连的最后一级是关窗重开 Chrome，游戏重新
+            # 走一遍入口序列；这之后当前星球是哪一颗，本仓无从得知。
+            #
+            # 不清的后果恰恰是 #109 这个功能存在的理由：`switch_needed` 看到
+            # 「本轮已经切到 9:250:8」于是不再切，而画面可能已经回到主星——
+            # 本轮余下每一发都从主星飞出去，`attack_intents.origin_*` 上却写着
+            # 9:250:8，战报永远配不上。**而且一声不响。**
+            #
+            # 清掉的代价是下一次 `ensure_origin_planet` 多切一次；即便游戏其实
+            # 保住了当前星球，那一次也只是点自己那一行、回到自己的地表，无害。
+            # 两侧代价差着一整轮的错账，所以宁可多切。
+            self._current_planet = None
             return True
         return False
 
@@ -1854,7 +1879,13 @@ class PirateLoop:
         result = self.planet_switcher().switch_to(target)
         if result is not SwitchResult.SWITCHED:
             self._outcome.busy = f"切不到出发星球 {target}（{result.value}）"
+            # `SwitchResult` 早就把这两种分开了（「两句话对用户的意思完全不同」），
+            # 这里必须把那个区分**带出进程**：翻遍列表都没有 = 配错了坐标，不会
+            # 自己好，得让连续失败计数看见它。见 `Outcome.busy_is_permanent`。
+            self._outcome.busy_is_permanent = result is SwitchResult.NOT_FOUND
             say(f"  {self._outcome.busy}；这一轮一发都不派")
+            if self._outcome.busy_is_permanent:
+                say(f"  这颗星球不在你的行星列表里；请核对任务配的出发星球 {target}")
             return False
         self._current_planet = target
         # 浮层与派遣面板都开过，导航栏里是什么已经不可知了。
@@ -1873,14 +1904,22 @@ class PirateLoop:
         self._ensure_session(force=True)
         self._reset_to_known_screen()
         self._require_system_view("开工时切不到恒星系视图")
-        if not self.ensure_origin_planet():
-            # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
-            # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
-            # 退出码走 `EXIT_ENVIRONMENT_BUSY`（不算故障，等下一轮再来）。
-            return self._outcome
 
         try:
+            # ⚠️ **读信箱必须排在切星球前面，这个顺序是承重的。**
+            # 信箱是账号级的，读它跟站在哪颗星球上毫无关系；而切星球是开工阶段
+            # 最容易失手的一步（要认坐标、要拖列表、要回读）。
+            #
+            # 反过来排（落地时如此）的代价：切不过去就直接 return，于是**这一轮
+            # 一份战报都不入库**。而「预设舰队攻击后部分战报缺失、回读机制没入库」
+            # 正是用户 2026-08-13 报的那个毛病——一个防记账错乱的功能，反过来
+            # 成了战报缺失的新来源。切换失手只该挡住派遣，不该连带挡掉读战报。
             self.reconcile_today()
+            if not self.ensure_origin_planet():
+                # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
+                # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
+                # 走到这里战报已经读完入库了，这一轮不算白跑。
+                return self._outcome
             self._sweep()
         except RoundExhausted as exhausted:
             # 资源耗尽**不是失败**：正常收尾、退出码 0。当成失败的话，航线占满
@@ -2115,12 +2154,25 @@ def _ensure_run_row(session_factory: Any) -> UUID:
 def exit_code_for(outcome: Outcome) -> int:
     """这一趟的退出码。两条链路共用（`tools.bot_loop.main` 也调它）。
 
-    `busy` 有值 = 开工就退了（目前只有「切不到出发星球」），走
-    `EXIT_ENVIRONMENT_BUSY`：调度器把它当成「这会儿轮不到我」而**不计入连续失败**
-    （见 `application.mission_supervisor`）。按 1 收场的话，切换星球偶尔不成
-    连撞三次就会把整条链路自动停用，而它只是需要下一轮再试一次。
+    三档，按「会不会自己好」分：
+
+    - **没派成、但会自己好**（回读没认出来）→ `EXIT_ENVIRONMENT_BUSY`。
+      调度器当成「这会儿轮不到我」，**不计入连续失败**
+      （见 `application.mission_supervisor`）。按 1 收场的话，切换星球偶尔不成
+      连撞三次就把整条链路停用了，而它只是需要下一轮再试一次。
+    - **没派成、而且不会自己好**（列表里根本没这颗星球 = 配错了坐标）→ `1`。
+      走正常的异常退出：连撞三次自动停用并报警，这正是我们要的——它自己不会好，
+      得有人去改配置。豁免它等于让任务整夜显示「在跑」却一发不派。
+    - 其余 → `0`。
+
+    ⚠️ 别把这两档并回一档去。`EXIT_ENVIRONMENT_BUSY` 那一档的语义是
+    「外部条件占着，放手就好」，塞进一个永久性故障会把整个自停机制在这条路径上
+    架空，而且**停顿看门狗也接不住**：它抓的是「跑着却没进展」，
+    而这种情形每轮 30 秒就干净利落地退了。
     """
-    return EXIT_ENVIRONMENT_BUSY if outcome.busy else 0
+    if not outcome.busy:
+        return 0
+    return 1 if outcome.busy_is_permanent else EXIT_ENVIRONMENT_BUSY
 
 
 def parse_origin(text: str) -> Coordinate:
