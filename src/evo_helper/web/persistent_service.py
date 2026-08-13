@@ -789,11 +789,21 @@ class MissionConsoleService:
         *,
         max_pages: int | None = None,
         max_opens: int | None = None,
+        exhaustive: bool = True,
     ) -> BackfillView:
         """手动补录。**不进调度**：它是修复工具，不是日常任务。
 
         起始日期在未来一律拒：那趟信箱翻下来必然一封都不匹配，而它要占着游戏
         窗口十几分钟，跑完还显示「补录完成」——一句看着正常的假话。
+
+        ⚠️ **`exhaustive` 在这里默认开，在启动对账那条路上默认关。** 两个默认值
+        反着来是故意的：手动这一趟基本都是来救**过期**战报的，而那些派遣早就掉出
+        了 `due_attack_dispatches` 的 6 小时窗口——单子从头到尾是空的，对账模式在
+        第一封「库里已有」就收工，一份都够不着。而启动对账要的正是早停。
+
+        这个坑差点就落地了：命令契约是在 CLI 长出 `--exhaustive` 之前定的，
+        于是页面上的按钮一度只会跑对账模式——在它最主要的用途上静默地什么都
+        捞不回来，跑完还显示「补录完成」。
         """
         if kind not in BACKFILL_KINDS:
             raise ServiceError(f"补录链路只能是 {' / '.join(BACKFILL_KINDS)}（收到 {kind!r}）")
@@ -808,6 +818,7 @@ class MissionConsoleService:
                     reason=REASON_MANUAL,
                     max_pages=max_pages,
                     max_opens=max_opens,
+                    exhaustive=exhaustive,
                 )
             )
         except BackfillBusyError as exc:

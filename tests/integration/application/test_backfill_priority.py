@@ -334,6 +334,22 @@ def test_pressing_start_reconciles_both_chains_before_any_mission_runs(  # type:
     assert launcher.spawned == []
 
 
+def test_the_startup_reconciliation_stops_early_instead_of_sweeping_the_mailbox(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, backfill_launcher
+):
+    """启动那两趟走**对账模式**（单子空了就收工），不带 `--exhaustive`。
+
+    **和页面上那个手动按钮的默认值正好相反**，两边都是对的：手动那一趟是来救
+    过期战报的，非翻到底不可；而这两趟每按一次「开始」都要跑，用户还等着任务
+    开跑——带上 `--exhaustive` 就等于每次点开始都把 60 封的预算烧满（十几分钟）。
+    """
+    enable(repository, MissionKind.SCAN)
+
+    scheduler.start(reconcile=True)
+
+    assert "--exhaustive" not in backfill_launcher.commands[0]
+
+
 def test_the_startup_reconciliation_hands_the_window_back_when_it_is_done(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, backfill_launcher
 ):

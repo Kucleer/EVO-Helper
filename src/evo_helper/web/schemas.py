@@ -284,6 +284,16 @@ class BackfillStartIn(BaseModel):
     #: 值，改了一边就是另一边悄悄按旧值跑**。页面上不给这两个框。
     max_pages: int | None = None
     max_opens: int | None = None
+    #: 补录模式：一直翻到 `since` 为止，不因为单子空了就收工。
+    #:
+    #: **默认 True，而点「开始」时的启动对账默认 False**——两个默认值反着来是
+    #: 故意的，因为两条路要的东西相反：手动这一趟基本都是来救**过期**战报的
+    #: （那些派遣早掉出了 6 小时单子，对账模式在第一封「库里已有」就收工，
+    #: 一份都够不着），而启动对账要的正是早停，没有欠账时几十秒走完。
+    #:
+    #: 默认成 False 会让这个按钮在最常见的用法上静默地什么都捞不回来——
+    #: 而它跑完还会显示「补录完成」。
+    exhaustive: bool = True
 
 
 class BackfillSummaryOut(BaseModel):
