@@ -156,11 +156,27 @@ class BackfillRequest:
     reason: str = REASON_MANUAL
     max_pages: int | None = None
     max_opens: int | None = None
+    #: 补录模式：一直翻到 `since` 为止，不因为单子空了就收工。
+    #:
+    #: **默认关，而手动那一趟基本都要开。** 两种模式的分界见
+    #: `tools.backfill_reports` 的模块头，这里只说为什么默认必须是关：
+    #: 点「开始」时的启动对账走的是同一条路，而那一趟要的正是早停——
+    #: 没有欠账时几十秒走完，用户还等着任务开跑。默认开就等于每按一次「开始」
+    #: 都把 60 封的预算烧满。
+    #:
+    #: 反过来，**救过期的战报只能靠它**：那些派遣早就掉出了
+    #: `due_attack_dispatches` 的 6 小时窗口，单子从头到尾是空的，
+    #: 对账模式在第一封「库里已有」就收工，一份都够不着。
+    exhaustive: bool = False
 
     @property
     def command(self) -> tuple[str, ...]:
         return build_command(
-            self.kind, self.since, max_pages=self.max_pages, max_opens=self.max_opens
+            self.kind,
+            self.since,
+            max_pages=self.max_pages,
+            max_opens=self.max_opens,
+            exhaustive=self.exhaustive,
         )
 
 
@@ -328,6 +344,7 @@ def build_command(
     *,
     max_pages: int | None = None,
     max_opens: int | None = None,
+    exhaustive: bool = False,
 ) -> tuple[str, ...]:
     """补录命令行。
 
@@ -357,6 +374,9 @@ def build_command(
         command += ["--max-pages", str(max_pages)]
     if max_opens is not None:
         command += ["--max-opens", str(max_opens)]
+    if exhaustive:
+        # 只在开着时出现。CLI 那侧默认就是关，两处各写一份默认值迟早分家。
+        command.append("--exhaustive")
     return tuple(command)
 
 

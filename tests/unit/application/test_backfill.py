@@ -145,6 +145,36 @@ def test_the_budgets_are_passed_through_when_they_are_given() -> None:
     assert command[-4:] == ("--max-pages", "8", "--max-opens", "80")
 
 
+def test_the_exhaustive_flag_reaches_the_cli() -> None:
+    """**救过期战报只能靠这个开关。**
+
+    那些派遣早就掉出了 `due_attack_dispatches` 的 6 小时窗口，单子从头到尾是空的，
+    而默认的对账模式撞见第一封「库里已有」就收工——一份都够不着，跑完还显示
+    「补录完成」。
+
+    这条差点就漏了：命令契约是在 CLI 长出 `--exhaustive` 之前定下的，于是页面上
+    那个按钮一度只会跑对账模式，**而全套测试是绿的**——没有任何一条用例守着它。
+    """
+    assert "--exhaustive" in build_command("bot", SINCE, exhaustive=True)
+
+
+def test_the_exhaustive_flag_stays_off_unless_asked() -> None:
+    """默认必须是关：点「开始」时的启动对账走同一条路，而它要的正是早停。
+
+    默认开就等于每按一次「开始」都把 60 封的预算烧满，用户还等着任务开跑。
+    """
+    assert "--exhaustive" not in build_command("bot", SINCE)
+
+
+def test_a_request_carries_its_mode_into_the_command() -> None:
+    """`BackfillRequest` 到命令行这一段也要接上，不然上面两条守的是个没人用的函数。"""
+    manual = BackfillRequest(kind="bot", since=SINCE, exhaustive=True)
+    startup = BackfillRequest(kind="bot", since=SINCE)
+
+    assert "--exhaustive" in manual.command
+    assert "--exhaustive" not in startup.command
+
+
 def test_each_chain_writes_its_own_log(tmp_path: Path) -> None:
     """混进 `mission-pirate.log` 的话，事后翻「那一轮海盗干了什么」会读到一段
     根本不是它写的输出。

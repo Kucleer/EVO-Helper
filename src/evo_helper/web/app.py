@@ -1127,6 +1127,7 @@ def register_mission_routes(app: FastAPI) -> None:
                 payload.since,
                 max_pages=payload.max_pages,
                 max_opens=payload.max_opens,
+                exhaustive=payload.exhaustive,
             )
         )
 

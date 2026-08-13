@@ -177,6 +177,21 @@ def test_the_launched_command_carries_the_kind_and_the_since(console: Console) -
     assert command[-1] != "--attack"  # 补录只读，命令行上不该有任何派遣开关
 
 
+def test_the_button_can_reach_reports_that_fell_off_the_worklist(console: Console) -> None:
+    """**页面上那个按钮默认要跑补录模式，不是对账模式。**
+
+    它最主要的用途就是救过期战报（2026-08-12 那夜丢的 21 份），而那些派遣早就
+    掉出了 `due_attack_dispatches` 的 6 小时窗口——单子从头到尾是空的，对账模式
+    撞见第一封「库里已有」就收工，**一份都够不着，跑完还显示「补录完成」**。
+
+    这条差点漏掉：命令契约是在 CLI 长出 `--exhaustive` 之前定下的，于是这个按钮
+    一度只会跑对账模式，而当时全套测试是绿的。
+    """
+    console.ask(kind="bot", since=YESTERDAY)
+
+    assert "--exhaustive" in console.backfill.commands[0]
+
+
 def test_an_unknown_chain_is_refused(console: Console) -> None:
     assert console.ask(kind="scan").status_code == 400
     assert console.backfill.commands == []
