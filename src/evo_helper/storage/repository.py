@@ -738,16 +738,25 @@ class SqlAlchemyRepository:
             row = session.get(orm.AttackDispatchRow, dispatch_id)
             if row is None:
                 raise ValueError(f"dispatch {dispatch_id} not found")
-            flight = vet_flight_time(flight, mission_kind=row.mission_kind)
+            intent = session.get(orm.AttackIntentRow, row.intent_id)
+            if intent is None:  # pragma: no cover - 外键保证不会发生
+                raise ValueError(f"dispatch {dispatch_id} has no intent")
+            # 意图提到 `vet_flight_time` 前面取：跨恒星系那道下限要知道出发与目标
+            # 在不在同一个恒星系（同银河同系才算同系；跨银河当然不是）。
+            flight = vet_flight_time(
+                flight,
+                mission_kind=row.mission_kind,
+                same_system=(
+                    intent.origin_galaxy == intent.target_galaxy
+                    and intent.origin_system == intent.target_system
+                ),
+            )
             if flight is None:
                 row.flight_seconds = None
                 row.expected_report_at_utc = None
                 row.line_free_at_utc = None
             else:
                 dispatched = _require_utc(dispatched_at_utc, "dispatched_at_utc")
-                intent = session.get(orm.AttackIntentRow, row.intent_id)
-                if intent is None:  # pragma: no cover - 外键保证不会发生
-                    raise ValueError(f"dispatch {dispatch_id} has no intent")
                 row.flight_seconds = int(flight.total_seconds())
                 row.expected_report_at_utc = dispatched + flight
                 row.line_free_at_utc = line_free_at(
