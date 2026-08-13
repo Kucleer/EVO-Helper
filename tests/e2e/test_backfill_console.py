@@ -115,15 +115,20 @@ def test_the_default_start_date_is_yesterday_in_utc(client: TestClient) -> None:
     assert expected != datetime.now(UTC).date().isoformat()
 
 
-def test_the_start_button_reconciles_by_default(client: TestClient) -> None:
-    """「先对账再跑任务」默认勾着。
+def test_the_start_button_does_not_reconcile_by_default(client: TestClient) -> None:
+    """「先对账再跑任务」**默认不勾**（2026-08-13 实机之后改的）。
 
-    取消勾选是给「明知没有欠账」准备的口子，不是常规走法——所以它是一个要动手
-    取消的复选框，而不是一个要动手勾上的。
+    那一趟失败时闸门要等人点确认才放行任务，而无人值守时没人点——凌晨崩一次，
+    之后一整夜一个任务都不起（理由整段在 `web.schemas.SchedulerStartIn.reconcile`）。
+
+    ⚠️ **页面这一处必须跟另外两个默认值一起改。** 实机 2026-08-13 只改了 schema
+    默认，用户点「开始」照样先对账——因为页面不走 schema 默认，它把复选框的值
+    **显式**送出去，而那个框当时默认勾着。这条用例就是钉这一点的。
     """
     html = client.get("/missions").text
 
-    assert 'id="start-reconcile" checked' in html
+    assert 'id="start-reconcile"' in html, "复选框本身还在（人在跟前时仍然可以勾）"
+    assert 'id="start-reconcile" checked' not in html
 
 
 def test_the_page_says_why_the_tasks_are_paused(client: TestClient) -> None:

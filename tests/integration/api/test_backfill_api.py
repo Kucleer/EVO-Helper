@@ -268,15 +268,27 @@ def test_starting_again_while_already_running_is_not_refused(console: Console) -
 # -- 启动对账 -------------------------------------------------------------------
 
 
-def test_pressing_start_reconciles_by_default(console: Console) -> None:
-    """**默认是做。** 用户口径：「启动调度台之后，先检查有多少应读未读战报」。
+def test_pressing_start_does_not_reconcile_by_default(console: Console) -> None:
+    """**默认不做**（2026-08-13 实机之后改的）。
 
-    不带请求体也要对账：桌面悬浮窗和文档 4.3 节里那条 curl 都是不带体打的。
+    原先的口径是用户那句「启动调度台之后，先检查有多少应读未读战报」，而那句话
+    默认了**有人在看**：那一趟失败时闸门要等人点确认才放行任务。无人值守时它变成
+    「凌晨崩一次，之后一整夜一个任务都不起」，而页面上还显示「补录中」。
+
+    损失不大：每一轮开工本来就有 `reconcile_today` 翻一趟信箱。关掉的只是启动时
+    那趟额外的、翻得更深的对账。要它的时候勾页面上那个框。
     """
     assert console.start().status_code == 200
 
+    assert console.backfill.kinds == []
+    assert console.scheduler_running(), "不对账就该直接开工"
+
+
+def test_pressing_start_still_reconciles_when_asked(console: Console) -> None:
+    """勾了那个框就照做——关掉的是**默认值**，不是这个功能。"""
+    assert console.start(reconcile=True).status_code == 200
+
     assert console.backfill.kinds == ["pirate"]
-    assert console.state()["queued"] == 1
     assert console.state()["reason"] == "启动对账"
 
 
@@ -312,7 +324,7 @@ def test_the_startup_reconciliation_starts_from_yesterday(console: Console) -> N
 
     游戏时间按 UTC+0 显示，UTC 的今天要到现实时间早上 8 点才开始。
     """
-    console.start()
+    console.start(reconcile=True)
 
     command = console.backfill.commands[0]
     assert command[command.index("--since") + 1] == YESTERDAY
@@ -333,10 +345,30 @@ def test_a_manual_backfill_that_already_finished_never_blocks_start(console: Con
     console.scheduler.tick()
     assert console.state()["awaiting_ack"] is True
 
-    assert console.start().status_code == 200
+    assert console.start(reconcile=True).status_code == 200
 
     assert console.backfill.kinds == ["pirate", "pirate"]
     assert console.state()["reason"] == "启动对账"
+
+
+def test_start_clears_a_finished_manual_backfill_even_without_reconciling(
+    console: Console,
+) -> None:
+    """**不对账那条路也要顺手把待确认清掉**，否则挂机时它照样堵死。
+
+    手动补录跑完还没确认时任务是被扣着的。用户不勾「先对账」直接点开始，
+    如果这一下不清掉那个待确认，他会撞上一台开着却一个任务都不起的调度器
+    ——而那正是这次把默认关掉要防的那件事。
+    """
+    console.ask(kind="pirate")
+    console.backfill.spawned[0].exit_code = 0
+    console.scheduler.tick()
+    assert console.state()["awaiting_ack"] is True
+
+    assert console.start().status_code == 200
+
+    assert console.state()["awaiting_ack"] is False
+    assert console.scheduler_running()
 
 
 # -- 跑完：摘要与放行 -----------------------------------------------------------
