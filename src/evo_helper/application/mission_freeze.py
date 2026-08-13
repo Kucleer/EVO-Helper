@@ -280,7 +280,10 @@ def _optional_int(value: Any) -> int | None:
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return value
+    # `int(...)` 而不是直接 `return value`：入参是 `Any`，`isinstance` 之后 mypy
+    # 仍会把它当成 `Any` 返回（`no-any-return`）。对一个已经确认是 `int` 的值来说
+    # 这一步是恒等的。
+    return int(value)
 
 
 __all__ = [
