@@ -116,6 +116,43 @@ BRIEFING_WAIT_S = 2.6
 #: 点「出发！」之后等回到列表。
 LAUNCH_WAIT_S = 2.8
 
+#: 读简报上那一行飞行时间的配方，按顺序试到**第一个能解析成时长**的为止。
+#:
+#: 前四套是 `pirate_ui.FLIGHT_RECIPES`（那次「ROI 从落地起就没读出过东西」的
+#: 事故留下的），后四套是 2026-08-13 补的。补的理由：
+#: `domain.report_wait.parse_game_duration` 收紧成「部分匹配一律失败」之后
+#: （`3天19时36分7秒` 曾被静默读成 `0:36:07`，生产库 209 发里 66 发中招），
+#: 读不出来的那些从**错值**变成了 `None`，而 `None` 那条路按
+#: `UNKNOWN_LINE_HOLD`（90 分钟）占航线，比真实往返（10–62 分钟）保守得多。
+#: 把 NULL 压回去的正当手段是**多试几套把真值读出来**，不是放松解析判据——
+#: 读出一个小而合理的错值会同时污染两个钟，比 NULL 贵得多。
+#:
+#: 补的这四套是在两张实拍上量出来的（`var/logs/dump-briefing-unrecognised-182102
+#: .png` 画面上是 `8分26秒`、`…-182153.png` 是 `8分28秒`，原先四套**一套都读不出**）：
+#:
+#:     (6, 160)  三张实拍全中（含原来那张 14 秒的回归基准）
+#:     (5, 120)  8分26秒
+#:     (3, 140)  8分28秒
+#:     (6, 100)  8分26秒 与 8分28秒
+#:
+#: ⚠️ **一套 `nearest` 都不许加，哪怕它在某张图上读得出。** 那不是「多一次机会」
+#: 而是**多一次读错的机会**：同一张 182102 上 `3×/nearest/140` 把 `8分 PEPE`
+#: 解析成 `0:08:00`、`5×/nearest/120` 把 `as} 6秒` 解析成 `0:00:06`——两个都是
+#: 能解析、量级也合理的**错值**，而这个函数取的是第一个解析成功的。
+#: 上面这四套（连同原来四套）在三张实拍的整张 lanczos 网格里**没有一格读错**，
+#: 读得出的一律是真值。
+#:
+#: 同理 `(2, 90)` 也被排除在外：它在 14 秒那张上解析成 `0:00:01`。
+FLIGHT_RECIPES = (*pirate_ui.FLIGHT_RECIPES, (6, 160), (5, 120), (3, 140), (6, 100))
+
+#: 等简报页铺开时，飞行时间这一行比别处多等几轮。
+#:
+#: 页面是**滑进来**的（`_settle` 的注释记着「等 2.4 秒判一次判不到，而失败时
+#: 存下的那一帧读得清清楚楚」）。任务类型那道闸门读不出只是拦下一发，
+#: 而这一行读不出是**永久**的：点完「出发！」这一屏就没了，没有第二次机会。
+#: 所以这里加码到 6 轮（约 5 秒），代价只落在真的读不出来的那几发上。
+FLIGHT_SETTLE_TRIES = 6
+
 #: 侦察报告的等待：实机上 17 秒回报，留足余量再读，读不到就再等一轮。
 SCOUT_REPORT_WAIT_S = 45.0
 SCOUT_REPORT_RETRIES = 3
@@ -148,9 +185,64 @@ MAX_CREDIBLE_FLIGHT = timedelta(hours=6)
 #: 自己星球地表视图右上角的信箱入口。**底部导航里没有邮箱**，只有这一个入口。
 MAIL_BUTTON = (1131, 70)
 
-#: 信箱按钮旁边的未读数。**地表视图独有**：恒星系视图那个位置是坐标输入框，
-#: 各种浮层则把它盖住。用它当「我在地表」的正面凭据。
-MAIL_BADGE_ROI = (1145, 55, 1200, 92)
+#: 信箱按钮旁边的未读数。**地表视图独有**：恒星系视图那个位置是绿色的资源牌，
+#: 各种浮层则把它整个盖住。用它当「我在地表」的正面凭据。
+#:
+#: ## 框的两条边各自钉在什么上（2026-08-13 用 195 张实拍量出来的）
+#:
+#: 这个部件横着排三段：**信封白块**（x 1115–1147）、**数字**、**面板右描边**
+#: （x 1208–1210）。数字**居中于 x≈1165**、每位约 9px 宽——2 位的 `65` 占
+#: 1157–1173，3 位的 `332` 占 1153–1177，两者中心一模一样。也就是说未读数每多
+#: 一位，它就同时**往左和往右各长 4.5px**。
+#:
+#: 所以这个框不再按「当前是几位数」来定，而是按**部件本身**定：
+#:
+#: - 左界 1148 = 信封白块右缘（实拍上最靠右的一次是 1147）再往右 1px。
+#:   **不能再往左**：白块二值化之后是一大团纯白，psm 7 会被它压垮。实测（22 张
+#:   正面样本，最终这套配方）左界推到 1143 漏 1 张、1140 漏 2 张、1138 漏 3 张。
+#: - 右界 1206 = 面板右描边（1208）再往左 2px。往右到 1214 在现有样本上不掉分，
+#:   留 2px 只是不去框那道竖线——它是已知的噪声源（不二值化时右界一到 1210，
+#:   22 张里就有 7 张读不出来）。**要往右挪的话没有阻力，往左挪有。**
+#: - 上下界 55/92 同样不该放：上下各推 6px 就漏 3 张。
+#:
+#: 1148–1206 就是数字在**不改变版面**的前提下能占的全部空间。四位数按上面的
+#: 算式占 1148–1182，正好落在里面；五位数要占到 1143，那已经压到信封上了，
+#: 游戏自己必须改版面（缩字、加宽面板或显示 `999+`），而那时任何今天挑的框都
+#: 得重标。**这是这次改法能挡住四位数、而五位数只能实机验的原因。**
+#:
+#: 顺带：**读到半截也算数**。`var/logs/rank-closed.png` 上真值是 `118`，这套配方
+#: 读出来是 `'8'`——仍旧是非空，而调用方只看非空（见 `_on_planet_surface`）。
+#: 所以真到了五位数被左切一刀，读出来是「糊掉的首位 + 后几位」也照样成立。
+#: 致命的从来是整块读成空。
+MAIL_BADGE_ROI = (1148, 55, 1206, 92)
+
+#: 读未读数的二值化阈值。**不二值化就守不住负面**。
+#:
+#: 这一块的字是近白色（>235）压在暗面板纹理上，而**盖住画面的模态会把整屏压暗**。
+#: 不二值化时那两类都读得出来：173 张负面样本里有 2 张
+#: （`dump-bot-coord-mismatch-235334.png` 读作 `166`、
+#: `dump-mail-list-unrecognised-233223.png` 读作 `478`）——两张都是模态压着的暗屏，
+#: 判成「在地表」之后助手就会照地表的坐标往那个模态上点。
+#:
+#: 140 / 150 / 160 三档在 22 张正面 + 173 张负面上都是 **0 漏 0 误**，取中间那档。
+MAIL_BADGE_THRESHOLD = 150
+
+#: 读未读数的放大倍数，逐个试到第一个读出数字为止。**全部是 LANCZOS**。
+#:
+#: ⚠️ **不要往里加 `nearest`。** 噪声几乎全出自它：同一批负面样本上，
+#: `nearest` 会从暗纹理里读出 `'2'`、`'7'`、`'8'` 之类的单字符（3 套 lanczos +
+#: 3 套 nearest 时误判 4 张），而 lanczos 在那 173 张上一个字符都读不出来。
+#: 正面那侧 lanczos 也不吃亏——`332` 那一屏 2×/3× 都读得出。
+#:
+#: 也不要加 6×：`(3,2,4)` 是 0 误，加上 6× 就多出 1 张误判。
+#:
+#: ⚠️ **诚实说一句：现有 22 张正面实拍上，3× 一套就全读得出。**2× 与 4× 是保险，
+#: 没有任何样本能证明它们此刻必要（2× 单用反而漏 4 张，所以它排在后面）。
+#: 留着它们的理由是这一格的历史：未读数会变、版面会微移，而上一次「一套配方
+#: 恰好够用」的结论正是这次事故的起点。兜底那条**路径**由
+#: `tests/unit/tools/test_pirate_loop_mailbox_entry.py` 钉着（第一套读不出就换
+#: 下一套），至于哪一天真的轮得到第二套，只有实机知道。
+MAIL_BADGE_UPSCALES = (3, 2, 4)
 
 #: 信箱「报告」标签、邮件首行中心与行距（917 空间）。
 MAIL_REPORT_TAB = (897, 178)
@@ -249,6 +341,24 @@ class RoundExhausted(RuntimeError):
     **这不是失败。** 抛到 `run()` 就正常收尾、退出码 0——调度器据此不计入连续
     失败计数。反过来当成失败的话：航线占满是必然会发生的事，连撞三次就把整条
     链路自动停用了，而它其实只是需要等舰队飞回来。
+    """
+
+
+class MailboxUnreachable(RuntimeError):
+    """开工翻不了信箱，**而且单子上还有到点没战报的派遣**。
+
+    ⚠️ **这一档必须把整轮判死（退出码 1），不能像 `RoundExhausted` 那样正常收尾。**
+
+    翻不了信箱本身原先是被吞掉的，理由写在 `reconcile_today` 的 `except` 里：
+    「和不做对账一样，不比它更糟」。**那句话只在单子为空时成立。**单子非空时
+    那几发的 6 小时钟正在走（战报过期就永久判缺失），而「下一轮再试」连撞两次
+    同一堵墙就等于把它们全丢掉——2026-08-12 那夜就是这样：23:51 打印出 10 发、
+    00:30 打印出 15 发，两次都在下一行放弃，那 21 发全部过期。
+
+    也不能报 `EXIT_ENVIRONMENT_BUSY`：那一档的准入条件是「会自己好」
+    （见 `application.mission_supervisor.MissionOutcome.failed`），而这里已经
+    关窗重开过一次仍然翻不了，正是**不会自己好**的那一侧，得让连续失败计数
+    看见它、三次之后停用并报警。
     """
 
 
@@ -406,6 +516,45 @@ class DailyTally:
 
 
 @dataclass
+class MailScan:
+    """一趟信箱的账单。**只用来说话，不参与任何判据。**"""
+
+    #: 真的翻过几屏（不是上限，是实际翻了几屏）。
+    pages: int = 0
+    #: 真的打开过几封。
+    opened: int = 0
+
+
+@dataclass
+class BackfillTally:
+    """一次战报补录的摘要。退出前打成一行人话，见 `tools.backfill_reports`。"""
+
+    scan: MailScan = field(default_factory=MailScan)
+    #: 打开并**读通**几份（读不通的不算，那些没进库）。
+    read: int = 0
+    #: 其中新写进 `battle_reports` 的有几份。
+    stored: int = 0
+    #: 撞见「库里已有」时顺手补认上派遣的有几份（见 `rematch_note`）。
+    rematched: int = 0
+    #: 这一趟开工/收工时，单子上「到点还没战报」的派遣各有几发。
+    due_before: int = 0
+    due_after: int = 0
+
+    @property
+    def claimed(self) -> int:
+        """这一趟把几发派遣从单子上销掉了。
+
+        ⚠️ **这是个下界，不是全部认领数。** 单子（`due_attack_dispatches`）只装
+        派出不超过 `MAX_REPORT_AGE`（6 小时）的那些，所以人手动补昨晚的战报时
+        它多半从 0 开始、也以 0 结束——而那一趟其实认领得好好的：认领窗口是
+        `dispatched_at_utc >= reported_at - MAX_REPORT_AGE`，**相对战报自己的
+        时间戳**算的，不是相对现在（见 `storage.repository.
+        _unmatched_dispatch_candidates`）。所以补录过了六小时**照样有意义**。
+        """
+        return max(self.due_before - self.due_after, 0)
+
+
+@dataclass
 class LoopOptions:
     systems: tuple[tuple[int, int], ...]
     scout: bool
@@ -445,6 +594,12 @@ class Outcome:
     #:   不计故障、不报警，停顿看门狗也抓不到（那东西抓的是「跑着却没进展」，
     #:   而这里根本没跑起来）。于是任务显示「在跑」，实际一发不派，能挂一整夜。
     busy_is_permanent: bool = False
+    #: 这一轮**必须以失败收场**的理由。有值 = 退出码 1（见 `exit_code_for`）。
+    #:
+    #: 与 `busy` 分开是因为两者说的不是一件事：`busy` 说「一发都没派，但这不算
+    #: 故障」，而这个字段说「这一轮出了非得有人管的事」。目前唯一的来源是
+    #: `MailboxUnreachable`——单子非空却翻不了信箱，升级重启之后还是翻不了。
+    failed: str | None = None
 
 
 class PirateLoop:
@@ -800,7 +955,7 @@ class PirateLoop:
             # 逐个配方试。**必须二值化**：这一行是绿字压在蓝底上，灰度化之后
             # 对比度不够，调用方原先用的默认（3× 不二值化）在实机上读出来是
             # `'-'`——见 `pirate_ui.FLIGHT_RECIPES` 的注释。
-            for upscale, threshold in pirate_ui.FLIGHT_RECIPES:
+            for upscale, threshold in FLIGHT_RECIPES:
                 text = self._read(
                     pirate_ui.BRIEFING_FLIGHT_ROI, upscale=upscale, threshold=threshold
                 )
@@ -809,8 +964,13 @@ class PirateLoop:
                     return True
             return False
 
-        if not self._settle(read_once) or flight is None:
+        if not self._settle(read_once, tries=FLIGHT_SETTLE_TRIES) or flight is None:
+            # 一套配方都没读出来时**必须留下像素**。这一行现在是两个钟的唯一来源
+            # （战报到点时刻 + 航线空出时刻），读不出来的代价是那一发按
+            # `UNKNOWN_LINE_HOLD`（90 分钟）占着航线；而只留一句话的话，
+            # 下一次查这件事只能靠猜——2026-08-13 收紧解析判据之后正是如此。
             say("  简报上读不到飞行时间；这一发照派，回程闹钟留空")
+            self._dump_frame("briefing-flight-unreadable", pirate_ui.BRIEFING_FLIGHT_ROI)
             return None
         if flight > MAX_CREDIBLE_FLIGHT:
             # 宁可白跑一趟，也不要安安静静等一个读错的钟。
@@ -977,7 +1137,8 @@ class PirateLoop:
         self._reset_to_known_screen()
         if not self._goto_planet_surface():
             # 判据失败时最贵的事是「不知道当时画面长什么样」。存一帧的成本是一次写盘。
-            self._dump_frame("planet-surface-unreachable", MAIL_BADGE_ROI)
+            self._dump_frame("planet-surface-unreachable")
+            self._say_mail_badge_reads()
             raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
         self._open_mail()
         for _ in range(MAIL_SCROLL_TO_TOP_DRAGS):
@@ -993,8 +1154,12 @@ class PirateLoop:
         max_pages: int = MAIL_SCAN_PAGES,
         max_opens: int = MAIL_MAX_OPENS,
         observe: Callable[[MailRow], None] | None = None,
-    ) -> None:
+    ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
+
+        返回这一趟的账单（翻了几屏、开了几封）。活链路的三个调用方都不看它——
+        它是给补录入口打摘要用的（`backfill_reports`），因为「翻了 12 屏开了 0 封」
+        和「翻了 1 屏开了 0 封」对人的意思完全不同，而日志里原先分不出来。
 
         `visit(row, page)` 返回 True 表示「要的都收齐了」，这一趟就此收工。
         `not_before` 是「要找的报告最早可能是什么时候」：列表按时间倒序，翻到比它
@@ -1043,6 +1208,7 @@ class PirateLoop:
         """
         self._enter_mailbox()
         seen: set[tuple[str, str]] = set()
+        scan = MailScan()
         opened = 0
         collected = False
         budget_noted = False
@@ -1050,6 +1216,7 @@ class PirateLoop:
         for page in range(max_pages):
             if done:
                 break
+            scan.pages = page + 1
             # ⚠️ **每次点行之前都要先确认「还在邮件列表上」。** 实机踩过两次同一个错：
             # 上一次返回没退到列表（或把整个信箱关掉了），接着照列表的行坐标点下去，
             # 于是点在了地表 UI 上——一次点开了「取消任务」确认框，一次点开了「排名」。
@@ -1082,6 +1249,7 @@ class PirateLoop:
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
                     continue
                 opened += 1
+                scan.opened = opened
                 if self._open_mail_row(row, visit):
                     collected = True
             # 不再开封之后还翻不翻，取决于**有没有人在数数**：
@@ -1091,6 +1259,7 @@ class PirateLoop:
             if not done and page + 1 < max_pages:
                 slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
         self._close_mail()
+        return scan
 
     def _open_mail_row(self, row: MailRow, visit: Callable[[MailRow, Any], bool]) -> bool:
         """点开一行、等它铺开、交给 `visit`，然后退回列表。返回「可以收工了」。
@@ -1351,6 +1520,16 @@ class PirateLoop:
         """
         if self._ingest_report(row, page) is not ReportIngest.KNOWN:
             return False
+        return self._stop_after_known()
+
+    def _stop_after_known(self) -> bool:
+        """撞见一封「库里已有」之后，还要不要接着开封。
+
+        单独成一个方法，是为了让**补录入口能原样复用这条判据**
+        （`backfill_reports`）——补录现在挂在控制台「开始」按钮上，每次点开始都会
+        跑一趟，没有早停就等于每按一次开始都要把 60 封的预算烧满（十几分钟）。
+        判据只有这一份，不许在补录那边另写一条。
+        """
         outstanding = self._due_dispatches(datetime.now(UTC))
         if outstanding:
             say(
@@ -1360,6 +1539,70 @@ class PirateLoop:
             return False
         say("  往下都是更旧的报告，不再开封")
         return True
+
+    def backfill_reports(
+        self,
+        *,
+        not_before: datetime | None,
+        max_pages: int = BACKFILL_SCAN_PAGES,
+        max_opens: int = BACKFILL_MAX_OPENS,
+        exhaustive: bool = False,
+    ) -> BackfillTally:
+        """把**信箱里已经躺着的**战报补进库。只读信箱、只写库，一发都不派。
+
+        与开工那一趟（`reconcile_today`）读的是同一条路径、同一套判据、同一条
+        去重口径（`has_report_at`），区别只有三处：
+
+        - **不数今天的份数、不写 `daily_reconciliations`。** 补录会往回翻到昨天
+          甚至更早，那一趟数出来的「今天有几份」是错的；而 `record_daily_
+          reconciliation` 按 UTC 日取大，写进去就抹不掉了。
+        - **预算大得多**（12 屏 / 60 封，见 `BACKFILL_SCAN_PAGES`）。
+        - **`exhaustive` 决定早停还不早停**，见下。
+
+        ## 两种模式，判据必须分开
+
+        这个入口有两个完全不同的用法，混成一个判据的后果是二选一——要么每次点
+        「开始」都跑满 60 封，要么手动补录永远救不回过期的那些：
+
+        - **对账模式**（默认，控制台点「开始」时走这条）：撞见一封「库里已有」
+          且单子（`due_attack_dispatches`）已经空了就收工，判据原样复用
+          `_stop_after_known`。于是 `max_opens` 是**封顶而不是指标**：没有欠账时
+          几十秒走完，有欠账才真开封。这是它能被放进「每次点开始」这条路的前提。
+        - **补录模式**（`exhaustive=True`，人手动救过期的那些）：一直翻到
+          `not_before` 为止，不管单子空不空。**这一档不能省**：那些派遣早就掉出
+          单子了（`due_attack_dispatches` 有 6 小时上限），早停会让它一封都开不了。
+
+        ⚠️ **过了六小时的战报照样认领得上**，所以补录模式是有意义的：认领窗口是
+        `dispatched_at_utc >= reported_at - MAX_REPORT_AGE`，相对**战报自己的
+        时间戳**算的；单子那个 6 小时是相对现在算的，管的是「还追不追」。
+
+        ⚠️ **校几何与查会话不在这里做**，由调用方先调 `prepare_for_mailbox()`，
+        理由与 `backfill_scout_reports` 那段一字不差：会动操作系统的调用要留在
+        只有实机才走的那一层，否则任何一条忘了打桩的单元测试都会伸手去改用户的
+        窗口尺寸。
+        """
+        tally = BackfillTally(due_before=len(self._due_dispatches(datetime.now(UTC))))
+
+        def visit(row: MailRow, page: Any) -> bool:
+            outcome = self._ingest_report(row, page)
+            if outcome is not ReportIngest.UNREADABLE:
+                tally.read += 1
+            if outcome is ReportIngest.STORED:
+                tally.stored += 1
+            if exhaustive or outcome is not ReportIngest.KNOWN:
+                return False
+            return self._stop_after_known()
+
+        tally.scan = self._scan_mail_rows(
+            wanted=self.RECONCILE_KIND,
+            label=self.REPORT_LABEL,
+            visit=visit,
+            not_before=not_before,
+            max_pages=max_pages,
+            max_opens=max_opens,
+        )
+        tally.due_after = len(self._due_dispatches(datetime.now(UTC)))
+        return tally
 
     def _due_dispatches(self, now: datetime) -> list[Any]:
         """那张单子：已派出、理论上战报早该到了、库里却还没有的那些攻击发。
@@ -1474,24 +1717,26 @@ class PirateLoop:
             say(f"  库里有 {len(outstanding)} 发到点还没战报：{_targets_note(outstanding)}")
         else:
             say("  库里没有到点还没战报的派遣；这一趟只补没入库的和数今天的份数")
-        tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
         try:
-            self._scan_mail_rows(
-                wanted=self.RECONCILE_KIND,
-                label=self.REPORT_LABEL,
-                visit=self._ingest_report_row,
-                not_before=self._report_floor(day_start, now=now),
-                max_pages=RECONCILE_MAX_PAGES,
-                observe=tally,
-            )
+            tally = self._scan_for_reconcile(day_start, now=now)
         except RoundExhausted:
             raise
         except RuntimeError as error:
-            # 翻不了信箱**不该把这一轮判死**。它只是让配额判据退回按库计数，
-            # 也就是今天没修正的那个状态——和不做对账一样，不比它更糟。
-            # 不写记录，下一轮再试。
-            say(f"  开工翻不了信箱（{error}）；这一轮先按库内计数走")
-            return
+            if not outstanding:
+                # 单子为空时翻不了信箱**确实不该把这一轮判死**：它只是让配额判据
+                # 退回按库计数，也就是今天没修正的那个状态——不比不做对账更糟。
+                # 不写记录，下一轮再试。
+                say(f"  开工翻不了信箱（{error}）；单子上没有欠账，这一轮先按库内计数走")
+                return
+            # 单子非空是**完全不同的一件事**：那几发的 6 小时钟正在走，
+            # 而「下一轮再试」连撞两次同一堵墙就是永久丢数据（见 `MailboxUnreachable`）。
+            # 升级一级：走 `SessionKeeper` 那条既有的关窗重开（配额 3 次 / 滚动
+            # 1 小时，与 `_require_system_view` 共用，不另起一套），然后**再翻一次**。
+            say(
+                f"  开工翻不了信箱（{error}），而单子上还有 {len(outstanding)} 发到点没战报"
+                f"（{_targets_note(outstanding)}）；关窗重开一次再翻（兜底策略）"
+            )
+            tally = self._retry_mailbox_after_restart(error, outstanding, day_start, now=now)
         status = repository.record_daily_reconciliation(
             self.TARGET_KIND,
             day_utc=day_start,
@@ -1509,6 +1754,65 @@ class PirateLoop:
                 f"（库内 {status.dispatched_count} · 信箱 {status.observed_reports}），"
                 f"还有 {status.awaiting_reports} 发在等战报"
             )
+
+    def _scan_for_reconcile(self, day_start: datetime, *, now: datetime) -> DailyTally:
+        """开工那一趟信箱。返回这一趟数出来的当日份数。
+
+        单独成一个方法只为一件事：**重试要用一份干净的账**。`DailyTally` 是边翻
+        边累加的，失败那一趟已经数进去几行了；拿同一个对象再翻一遍，重叠的行会
+        被数两遍。多数的方向虽然安全（只会让助手提前收手），但库里那个数会变成
+        一个没人能解释的值，而它正是「今日 X/32」显示的东西。
+        """
+        tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
+        self._scan_mail_rows(
+            wanted=self.RECONCILE_KIND,
+            label=self.REPORT_LABEL,
+            visit=self._ingest_report_row,
+            not_before=self._report_floor(day_start, now=now),
+            max_pages=RECONCILE_MAX_PAGES,
+            observe=tally,
+        )
+        return tally
+
+    def _retry_mailbox_after_restart(
+        self,
+        error: Exception,
+        outstanding: Sequence[Any],
+        day_start: datetime,
+        *,
+        now: datetime,
+    ) -> DailyTally:
+        """关窗重开一次，再翻一趟信箱。还是翻不了就抛 `MailboxUnreachable`。
+
+        - **只重开一次。** 与 `_require_system_view` 同一条理由：做成循环的话，
+          服务端维护期间会变成「关一次 Chrome、开一次、再关」一直折腾到有人来看。
+        - **配额与那条共用**（`SessionKeeper._restart_now` 的 3 次 / 滚动 1 小时）。
+          配额用完时 `restart_and_reenter` 直接返回拒绝结局，这里照旧抛。
+        - **重开之后不假定自己在游戏内**：`restart_and_reenter` 仍然走判据驱动的
+          入口序列，`_enter_mailbox` 也照旧先复位画面再认地表。认不出就停，不乱点。
+
+        抛出去之后由 `run()` 收进 `Outcome.failed`，退出码 1。**这是本次修复的
+        另一半**：光有重试还不够，重试也失败时这一轮必须以可见的方式收场，
+        而不是把那张受害名单打印完就照常跑目标循环。
+        """
+        outcome = self._keeper().restart_and_reenter(f"开工翻不了信箱：{error}")
+        if not outcome.ready:
+            raise MailboxUnreachable(
+                f"开工翻不了信箱（{error}）；重开也没能回到游戏内（{outcome.detail}）；"
+                f"单子上 {len(outstanding)} 发到点没战报（{_targets_note(outstanding)}）"
+            )
+        # 重开之后画面整个换过一遍，导航器与出发星球那两份记忆记的都是重开前的。
+        self._navigator.invalidate()
+        self._current_planet = None
+        try:
+            return self._scan_for_reconcile(day_start, now=now)
+        except RoundExhausted:
+            raise
+        except RuntimeError as again:
+            raise MailboxUnreachable(
+                f"开工翻不了信箱：重开之后仍然翻不了（{again}）；"
+                f"单子上 {len(outstanding)} 发到点没战报（{_targets_note(outstanding)}）"
+            ) from again
 
     def _report_floor(self, day_start: datetime, *, now: datetime) -> datetime:
         """这一趟最早翻到哪一行为止。默认就是今天的 UTC 日界。
@@ -1589,7 +1893,7 @@ class PirateLoop:
         """在不在自己星球的地表视图上。正负两面各要一个凭据。
 
         - **负**：读不到恒星系那排坐标输入框的标签（银河系/恒星系/行星）。
-        - **正**：右上角信箱旁边的未读数读得出数字（实机 `70`）。
+        - **正**：右上角信箱旁边的未读数读得出数字。
 
         为什么不用星球名：那行「奥格瑞玛」是描边橙字压在金属牌上，
         实测 `chi_sim+eng` 读成 `“Rian`——拿读不准的东西当判据等于换个地方失败。
@@ -1597,12 +1901,58 @@ class PirateLoop:
         两面都要，是为了挡住浮层：信箱面板、派遣面板、飞行中列表也读不到坐标行，
         但它们会盖住右上角那个未读数。只看「没有坐标行」会把浮层当成地表，
         然后在浮层上照地表的坐标点下去——这就是本轮点到「取消任务」的那个错。
+
+        ⚠️ **这里只问「读不读得出数字」，一次都不用那个数。** 未读数是多少与
+        「我在不在地表」无关，所以偶尔把面板描边一起读成 `4160` 是无害的；
+        读成空才是致命的——2026-08-12 那夜 21 份战报就是这么丢的（信箱按钮明明
+        就在画面右上角，`_enter_mailbox` 却报「切不到自己星球地表」）。
+        新加的调用方要用这个数值的话，先回来重读这一段：判据是按「非空即可」
+        选的，值本身没有任何一条测试守着。
         """
         from evo_helper.game.system_navigator import on_system_view
 
         if on_system_view(self._nav_labels()):
             return False
-        return self._read(MAIL_BADGE_ROI, digits=True).strip() != ""
+        return self.mail_badge_text() != ""
+
+    def mail_badge_text(self) -> str:
+        """未读数那一块的读数；一套配方都读不出来就交空串。
+
+        逐个放大倍数试到**第一个读出纯数字的**为止，理由与
+        `_fleet_origin_text` / `_planet_rows` 同形：一套读不出是粘连，不是画面
+        不对，在同一张截图上换配方比换一次画面便宜得多。
+
+        ⚠️ **必须是「整串都是数字」而不是「非空」。** 数字白名单
+        （`COORD_WHITELIST`）里还有冒号——它是给坐标行 `2:137:18` 用的。
+        只判非空时，别的画面上的纹理噪声会读成 `':'` 或 `'7 :'`，于是浮层被判成
+        地表。实测（放宽到含 `nearest` 的配方表时）173 张负面样本里有 9 张这样。
+
+        ⚠️ 诚实说一句：**收成现在这套 lanczos + 二值化之后，195 张实拍里一处
+        非数字读数都不再出现**，也就是说这道判据此刻是纯冗余。留着是因为它便宜、
+        且方向单一（只会把「不确定」推向安全的那一侧）；它守的**行为**由
+        `tests/unit/tools/test_pirate_loop_mailbox_entry.py` 钉着，而不是靠像素。
+        """
+        for upscale in MAIL_BADGE_UPSCALES:
+            text = self._read_mail_badge(upscale)
+            if text.isdigit():
+                return text
+        return ""
+
+    def _read_mail_badge(self, upscale: int) -> str:
+        return self._read(
+            MAIL_BADGE_ROI, digits=True, upscale=upscale, threshold=MAIL_BADGE_THRESHOLD
+        ).strip()
+
+    def _say_mail_badge_reads(self) -> None:
+        """把每一套配方的原始读数打出来。**失败时才调。**
+
+        只说一句「ROI 读到 ''」复盘不了任何事——2026-08-12 那两条日志就是这样，
+        事后要重新跑一遍 OCR 才知道是哪一套读空了、读到的又是什么。
+        """
+        reads = ", ".join(
+            f"{upscale}x={self._read_mail_badge(upscale)!r}" for upscale in MAIL_BADGE_UPSCALES
+        )
+        say(f"  信箱未读数 ROI{MAIL_BADGE_ROI}（阈 {MAIL_BADGE_THRESHOLD}）逐套读到：{reads}")
 
     def _goto_planet_surface(self, *, attempts: int = 3) -> bool:
         """从恒星系视图切回自己星球地表。切不过去返回 False。
@@ -1921,6 +2271,16 @@ class PirateLoop:
                 # 走到这里战报已经读完入库了，这一轮不算白跑。
                 return self._outcome
             self._sweep()
+        except MailboxUnreachable as unreachable:
+            # ⚠️ **这一档必须排在 `RoundExhausted` 前面**（它也是 `RuntimeError`
+            # 的子类，但两者的收场完全相反），而且**这一轮就此打住、不跑目标循环**。
+            #
+            # 2026-08-12 那夜最刺眼的正是日志顺序：先把 10 发（下一轮 15 发）
+            # 一个不落地打印出来，下一行就放弃了它们，然后照常把 386 个目标走了
+            # 一遍。那一趟目标循环没有任何意义——库里的态全靠战报推进，战报一份
+            # 都没读进来，每个目标只会重复上一轮的判断。
+            say(f"这一轮判为失败：{unreachable}")
+            self._outcome.failed = str(unreachable)
         except RoundExhausted as exhausted:
             # 资源耗尽**不是失败**：正常收尾、退出码 0。当成失败的话，航线占满
             # （必然会发生）连撞三次就把整条链路自动停用了，而它只是需要等舰队
@@ -2154,8 +2514,11 @@ def _ensure_run_row(session_factory: Any) -> UUID:
 def exit_code_for(outcome: Outcome) -> int:
     """这一趟的退出码。两条链路共用（`tools.bot_loop.main` 也调它）。
 
-    三档，按「会不会自己好」分：
+    四档，按「会不会自己好」分：
 
+    - **单子非空却翻不了信箱**（`Outcome.failed`，升级重启之后还是翻不了）→ `1`。
+      排在最前面：这一档比「没派成」严重——那几发的 6 小时钟正在走，
+      再丢一轮就永久判缺失。理由整段写在 `MailboxUnreachable`。
     - **没派成、但会自己好**（回读没认出来）→ `EXIT_ENVIRONMENT_BUSY`。
       调度器当成「这会儿轮不到我」，**不计入连续失败**
       （见 `application.mission_supervisor`）。按 1 收场的话，切换星球偶尔不成
@@ -2170,6 +2533,8 @@ def exit_code_for(outcome: Outcome) -> int:
     架空，而且**停顿看门狗也接不住**：它抓的是「跑着却没进展」，
     而这种情形每轮 30 秒就干净利落地退了。
     """
+    if outcome.failed:
+        return 1
     if not outcome.busy:
         return 0
     return 1 if outcome.busy_is_permanent else EXIT_ENVIRONMENT_BUSY

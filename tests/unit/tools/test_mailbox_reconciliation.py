@@ -28,15 +28,19 @@ from typing import Any
 import pytest
 
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
 from evo_helper.tools.bot_loop import BotLoop
 from evo_helper.tools.pirate_loop import (
     MAIL_MAX_OPENS,
     RECONCILE_MAX_PAGES,
     LoopOptions,
+    MailboxUnreachable,
     MailRow,
+    Outcome,
     PirateLoop,
     ReportIngest,
     RoundExhausted,
+    exit_code_for,
 )
 from evo_helper.vision.parsers import ReportKind
 
@@ -91,14 +95,36 @@ class _Repository:
         return None
 
 
+class _Keeper:
+    """`SessionKeeper` 的替身：只记「关窗重开被叫过几次」，并按剧本给结局。
+
+    补的是升级那条路：翻不了信箱时**是不是真的走了既有的那条关窗重开**
+    （配额 3 次 / 滚动 1 小时），而不是另起一套重试。
+    """
+
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = ready
+        self.restarts: list[str] = []
+
+    def restart_and_reenter(self, reason: str) -> Any:
+        self.restarts.append(reason)
+        return SimpleNamespace(ready=self.ready, detail="重开结局")
+
+
 def _loop(
     pages: list[list[MailRow]],
     *,
     cls: type = PirateLoop,
     repository: _Repository | None = None,
     ingest: ReportIngest = ReportIngest.STORED,
+    surfaces: Sequence[bool] = (True,),
+    keeper: _Keeper | None = None,
 ) -> tuple[Any, _Repository, list[int]]:
-    """一个只装了「开工那一趟」所需零件的循环。第三个返回值是开过的行号。"""
+    """一个只装了「开工那一趟」所需零件的循环。第三个返回值是开过的行号。
+
+    `surfaces` 是每次 `_goto_planet_surface()` 的结果，用完之后一直沿用最后一个。
+    默认 `(True,)` = 永远切得到地表，也就是改这条之前的行为。
+    """
     repository = repository or _Repository()
     opened: list[int] = []
     loop = cls.__new__(cls)
@@ -106,10 +132,16 @@ def _loop(
     loop._started_at = NOON
     loop._driver = _Driver()
     loop._mail_dumps = 0
+    loop._current_planet = None
+    loop._navigator = SimpleNamespace(invalidate=lambda: None)
+    loop._session_keeper = keeper or _Keeper()
+    loop._keeper = lambda: loop._session_keeper
     loop._ensure_run = lambda: (repository, None)
     loop._reset_to_known_screen = lambda: None
-    loop._goto_planet_surface = lambda: True
+    reachable = list(surfaces)
+    loop._goto_planet_surface = lambda: reachable.pop(0) if len(reachable) > 1 else reachable[0]
     loop._dump_frame = lambda name, roi=None: None
+    loop._say_mail_badge_reads = lambda: None
     loop._open_mail = lambda: None
     loop._close_mail = lambda: None
     loop._settle = lambda predicate, **_kwargs: True
@@ -426,19 +458,174 @@ def test_every_start_counts_again(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [record["observed_reports"] for record in repository.records] == [1, 1]
 
 
-def test_an_unreachable_mailbox_does_not_kill_the_round(monkeypatch: pytest.MonkeyPatch) -> None:
-    """翻不了信箱**不该把这一轮判死**。
+def test_an_unreachable_mailbox_does_not_kill_the_round_when_nothing_is_owed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**单子为空**时翻不了信箱不该把这一轮判死。
 
     它只是让配额判据退回按库计数，也就是今天没修正的那个状态——不比没有对账更糟。
     而抛出去的话，`RuntimeError` 计入连续失败，三次就把整条链路自动停用。
     也不写记录：下一轮还要再试。
+
+    ⚠️ 这一条的前提是 `due=[]`。单子非空时结论完全相反，见下面那几条。
     """
-    loop, repository, _opened = _loop([])
-    loop._goto_planet_surface = lambda: False
+    keeper = _Keeper()
+    loop, repository, _opened = _loop(
+        [], repository=_Repository(due=[]), surfaces=(False,), keeper=keeper
+    )
 
     _reconcile(loop, monkeypatch)
 
     assert repository.records == []
+    assert keeper.restarts == [], "单子空着的时候不该为了对账去关一次 Chrome"
+
+
+# -- 单子非空却翻不了信箱：升级，然后必须以可见的方式收场 ----------------------
+
+
+def test_a_pending_worklist_escalates_to_a_window_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ **本次修复的落点之一。**
+
+    2026-08-12：BOT 在 6 小时死线内只跑起过三轮，其中两轮（23:51 / 00:30）都把
+    单子上那 10 发、15 发一个不落地打印出来，下一行就「这一轮先按库内计数走」。
+    那 21 发的钟一直在走，两轮撞同一堵墙 = 永久判缺失。
+
+    单子非空时唯一正确的动作是**升级**：走既有的关窗重开（`SessionKeeper`，
+    配额 3 次 / 滚动 1 小时）再翻一次，而不是把名单打印完就走。
+    """
+    keeper = _Keeper()
+    loop, repository, _opened = _loop(
+        [
+            [_row(0, ReportKind.PIRATE, NOON)],
+            [_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))],
+        ],
+        repository=_Repository(due=[Coordinate(2, 56, 20)]),
+        # 第一趟切不到地表，重开之后切得到。
+        surfaces=(False, True),
+        keeper=keeper,
+    )
+
+    _reconcile(loop, monkeypatch)
+
+    assert len(keeper.restarts) == 1, "单子非空却翻不了信箱，必须升级重启一次"
+    assert repository.records[0]["observed_reports"] == 1, "重开之后那一趟的账要真的记下来"
+
+
+def test_the_retry_counts_from_scratch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重试要用一份**干净的账**，不能接着失败那一趟继续加。
+
+    `DailyTally` 是边翻边累加的。第一趟已经数了两行才倒下去，拿同一个对象再翻
+    一遍，这两行会被数两遍——而这个数就是「今日 X/32」显示的东西。
+    """
+    page = [_row(0, ReportKind.PIRATE, NOON), _row(1, ReportKind.PIRATE, NOON)]
+    yesterday = [_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))]
+    loop, repository, _opened = _loop(
+        # 两趟各看同样的两行 + 一行昨天的。数对了是 2，接着上一趟加就是 4。
+        [list(page), list(yesterday), list(page), list(yesterday)],
+        repository=_Repository(due=[Coordinate(2, 56, 20)]),
+    )
+    # 第一趟一直翻到底，最后一步（关信箱）才倒下去。
+    calls: list[int] = []
+
+    def close_mail() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("读完邮件切不回恒星系视图")
+
+    loop._close_mail = close_mail
+
+    _reconcile(loop, monkeypatch)
+
+    assert calls == [1, 1], "该翻两趟"
+    assert repository.records[0]["observed_reports"] == 2, "重试那一趟只该数它自己翻到的两行"
+
+
+def test_a_restart_that_does_not_come_back_fails_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重开之后回不到游戏内 → `MailboxUnreachable`，整轮判失败。
+
+    这一档不能吞：`restart_and_reenter` 拒绝多半是**配额用完了**（1 小时内已经
+    重开过 3 次），也就是环境正在持续坏着，而单子上那几发还在倒计时。
+
+    ⚠️ 剧本刻意写成「重开被拒，但下一趟本来是切得到地表的」：不这么写，
+    把「重开被拒就抛」这一句删掉之后，第二趟照样失败、照样抛，这条就永远是绿的
+    ——那就成了一条拿被守代码当尺子的假测试。
+    """
+    loop, _repository, _opened = _loop(
+        [
+            [_row(0, ReportKind.PIRATE, NOON)],
+            [_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))],
+        ],
+        repository=_Repository(due=[Coordinate(2, 56, 20)]),
+        surfaces=(False, True),
+        keeper=_Keeper(ready=False),
+    )
+
+    with pytest.raises(MailboxUnreachable):
+        _reconcile(loop, monkeypatch)
+
+
+def test_still_unreachable_after_the_restart_fails_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **本次修复的另一半。** 重开之后还是翻不了 → 这一轮必须以失败收场。
+
+    光有重试不够。用户的原话是「不许打印完受害名单就走人」：升级之后仍然翻不了
+    而单子非空时，这一轮要计入失败（退出码 1、连撞三次自动停用并报警），
+    而不是把名单打印完照常跑目标循环。
+
+    也不能报 `EXIT_ENVIRONMENT_BUSY`——那一档**不计入连续失败**，准入条件是
+    「会自己好」，而这里已经关窗重开过一次仍然不行。
+    """
+    loop, repository, _opened = _loop(
+        [],
+        repository=_Repository(due=[Coordinate(2, 56, 20), Coordinate(2, 57, 5)]),
+        surfaces=(False,),
+    )
+
+    with pytest.raises(MailboxUnreachable) as caught:
+        _reconcile(loop, monkeypatch)
+
+    assert "2:56:20" in str(caught.value), "受害名单要写进异常，否则日志上只剩一句「翻不了」"
+    assert repository.records == [], "没翻成就不许写当日对账记录"
+
+
+def test_the_round_ends_as_a_failure_instead_of_sweeping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`run()` 收到 `MailboxUnreachable` → 记 `Outcome.failed`、**不跑目标循环**、退出码 1。
+
+    这条守的是「不能打印完名单照常跑目标循环」那一句：2026-08-12 那两轮在放弃
+    对账之后照样把 386 个目标走了一遍，而库里的态全靠战报推进——战报一份都没读
+    进来，那一趟目标循环只会把上一轮的判断重复一遍。
+    """
+    loop, _repository, _opened = _loop([])
+    swept: list[int] = []
+    loop._sweep = lambda: swept.append(1)
+    loop.reconcile_today = lambda: (_ for _ in ()).throw(MailboxUnreachable("翻不了信箱"))
+    loop.ensure_origin_planet = lambda: True
+    loop._require_system_view = lambda what: None
+    loop._ensure_session = lambda force=False: False
+    loop._outcome = Outcome()
+    monkeypatch.setattr("evo_helper.game.game_window.ensure_game_window", lambda: None)
+
+    outcome = loop.run()
+
+    assert swept == [], "对账都没做成，不该接着跑目标循环"
+    assert outcome.failed
+    assert exit_code_for(outcome) == 1
+
+
+def test_a_busy_exit_code_is_not_reused_for_a_failed_mailbox() -> None:
+    """`EXIT_ENVIRONMENT_BUSY` 是**不计入连续失败**的那一档，不许挪来盖这个场景。
+
+    挪过去的后果正是这次要修的那种静默：任务整夜显示「在跑」，每轮打印一遍受害
+    名单就退，不计故障、不报警，而战报一份都没读回来。
+    """
+    assert exit_code_for(Outcome(failed="翻不了信箱")) == 1
+    assert exit_code_for(Outcome(failed="翻不了信箱")) != EXIT_ENVIRONMENT_BUSY
+    # 没失败时原来那两档一个字没变。
+    assert exit_code_for(Outcome()) == 0
+    assert exit_code_for(Outcome(busy="切不到出发星球")) == EXIT_ENVIRONMENT_BUSY
 
 
 def test_running_out_of_resources_still_ends_the_round(monkeypatch: pytest.MonkeyPatch) -> None:

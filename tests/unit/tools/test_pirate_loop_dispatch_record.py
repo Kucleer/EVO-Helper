@@ -158,6 +158,52 @@ def test_a_flight_time_in_days_is_never_believed() -> None:
     assert loop._read_flight_time() is None  # type: ignore[attr-defined]
 
 
+def test_every_recipe_is_tried_on_every_settle_round() -> None:
+    """读不出来时要把**每一套配方 × 每一轮等待**都试满，而不是一次读不出就认输。
+
+    这一行现在是两个钟的唯一来源（战报到点时刻 + 航线空出时刻）。读不出来那一发
+    按 `UNKNOWN_LINE_HOLD`（90 分钟）占航线，而真实往返是 10–62 分钟——白压吞吐。
+    所以把 NULL 压回去的手段是**多试几次**（方向不许反过来去放松解析判据：
+    读出一个小而合理的错值会同时污染两个钟，比 NULL 贵得多）。
+    """
+    from evo_helper.tools.pirate_loop import FLIGHT_RECIPES, FLIGHT_SETTLE_TRIES
+
+    loop = _loop_reading("读不出来的一行")
+    seen: list[tuple[int, int | None]] = []
+    loop._read = lambda *_args, **kwargs: (  # type: ignore[attr-defined]
+        seen.append((kwargs.get("upscale"), kwargs.get("threshold"))),
+        "读不出来的一行",
+    )[1]
+    loop._dump_frame = lambda name, roi=None: None  # type: ignore[attr-defined]
+
+    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert seen == list(FLIGHT_RECIPES) * FLIGHT_SETTLE_TRIES
+
+
+def test_a_totally_unreadable_flight_line_leaves_a_frame_behind() -> None:
+    """四套配方全败就存一帧现场。
+
+    ⚠️ 没有这张图，下次查「为什么这一发的飞行时间是 NULL」只能靠猜——判据收紧
+    之后 NULL 变多了，而 NULL 与「ROI 框歪了」「面板还没铺开」在日志上长得一模一样。
+    """
+    loop = _loop_reading("读不出来的一行")
+    dumped: list[str] = []
+    loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[attr-defined]
+
+    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert dumped == ["briefing-flight-unreadable"]
+
+
+def test_a_readable_flight_line_leaves_no_frame_behind() -> None:
+    """反过来：读得出来就不许存图。一轮几十发，存图会把 `var/logs/` 淹掉。"""
+    loop = _loop_reading("8分3秒")
+    dumped: list[str] = []
+    loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[attr-defined]
+
+    assert loop._read_flight_time() == timedelta(minutes=8, seconds=3)  # type: ignore[attr-defined]
+    assert dumped == []
+
+
 def test_the_ceiling_leaves_room_for_the_longest_briefing_ever_observed() -> None:
     """上界不能收得太紧，否则误杀合法的长途飞行。
 

@@ -17,12 +17,14 @@ None 而不抛异常，于是 `expected_report_at_utc` 与 `line_free_at_utc` �
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from evo_helper.domain.report_wait import parse_game_duration
-from evo_helper.game.pirate_ui import FLIGHT_RECIPES
+from evo_helper.game.pirate_ui import BRIEFING_FLIGHT_ROI
+from evo_helper.tools.pirate_loop import FLIGHT_RECIPES
 
 Image = pytest.importorskip("PIL.Image", reason="requires the vision extra")
 pytest.importorskip("pytesseract", reason="requires the vision extra")
@@ -30,7 +32,21 @@ pytest.importorskip("pytesseract", reason="requires the vision extra")
 #: 侦察简报上那一行的 ROI 裁片，真值「14秒」（2:137:4，2026-08-10）。
 FLIGHT_CROP = Path("var/logs/briefing-flight-scout.png")
 
-pytestmark = pytest.mark.skipif(not FLIGHT_CROP.exists(), reason=f"缺实拍截图 {FLIGHT_CROP}")
+#: 整屏现场图 → 画面上那一行写着的飞行时间。
+#:
+#: 这两张是 2026-08-13 找出来的：`parse_game_duration` 收紧成「部分匹配一律失败」
+#: 之后（`3天19时36分7秒` 曾被静默读成 `0:36:07`，生产库 209 发里 66 发中招），
+#: 原来那四套配方在这两张上**一套都读不出**，于是它们只能记 NULL、按
+#: `UNKNOWN_LINE_HOLD`（90 分钟）占航线。补的四套就是照它们量出来的。
+FULL_SHOTS = {
+    "var/logs/dump-briefing-unrecognised-182102.png": timedelta(minutes=8, seconds=26),
+    "var/logs/dump-briefing-unrecognised-182153.png": timedelta(minutes=8, seconds=28),
+}
+
+pytestmark = pytest.mark.skipif(
+    not (FLIGHT_CROP.exists() and all(Path(name).exists() for name in FULL_SHOTS)),
+    reason=f"缺实拍截图 {FLIGHT_CROP} / var/logs/dump-briefing-unrecognised-1821*.png",
+)
 
 
 @pytest.fixture(scope="module")
@@ -77,3 +93,80 @@ def test_the_binarisation_is_what_makes_it_work(ocr) -> None:  # type: ignore[no
     """
     crop = Image.open(FLIGHT_CROP)
     assert parse_game_duration(ocr(crop, digits=False, upscale=3, threshold=None)) is None
+
+
+def _read_flight(ocr, path: str, recipes):  # type: ignore[no-untyped-def]
+    """照 `PirateLoop._read_flight_time()` 那条路读：第一个解析成功的算数。"""
+    crop = Image.open(path).crop(BRIEFING_FLIGHT_ROI)
+    for upscale, threshold in recipes:
+        value = parse_game_duration(ocr(crop, digits=False, upscale=upscale, threshold=threshold))
+        if value is not None:
+            return value
+    return None
+
+
+@pytest.mark.parametrize("path", sorted(FULL_SHOTS))
+def test_the_extra_recipes_recover_a_line_the_old_four_could_not_read(ocr, path: str) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 本轮补配方的落点：这两张原先**一套都读不出**，现在读得出，而且读对。
+
+    读不出的代价不是「白跑一趟」而是**一直占着航线**：`expected_report_at_utc` 与
+    `line_free_at_utc` 都留 NULL，那一发按 90 分钟算占用，而真实往返是 10–62 分钟。
+    """
+    assert _read_flight(ocr, path, FLIGHT_RECIPES) == FULL_SHOTS[path]
+
+
+@pytest.mark.parametrize("path", sorted(FULL_SHOTS))
+def test_the_original_four_recipes_really_could_not_read_these(ocr, path: str) -> None:  # type: ignore[no-untyped-def]
+    """把「为什么非补不可」钉住：原来那四套在这两张上确实全军覆没。
+
+    没有这条，日后有人把补的四套删掉会一路绿灯——上一条会因为原来那四套里
+    某一套碰巧读出来而仍然通过。
+    """
+    from evo_helper.game.pirate_ui import FLIGHT_RECIPES as ORIGINAL
+
+    assert _read_flight(ocr, path, ORIGINAL) is None
+
+
+@pytest.mark.parametrize("path", sorted(FULL_SHOTS))
+def test_no_recipe_produces_a_wrong_value(ocr, path: str) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **这条比「能读出来」更要紧。**
+
+    这个函数取的是**第一个解析成功的**，所以配方表里只要有一套会「成功地读错」，
+    排在前面就会把错值写进库。而错值比 NULL 贵得多：它同时污染两个钟
+    （战报到点时刻 + 航线空出时刻），还一声不响。
+
+    实测 `nearest` 就是这样的一套：同一张 182102 上 `3×/nearest/140` 把
+    `'8分 PEPE'` 解析成 `0:08:00`、`5×/nearest/120` 把 `'as} 6秒'` 解析成
+    `0:00:06`。所以 `FLIGHT_RECIPES` 一套 `nearest` 都不许加——这条守的就是它。
+    """
+    crop = Image.open(path).crop(BRIEFING_FLIGHT_ROI)
+    for upscale, threshold in FLIGHT_RECIPES:
+        value = parse_game_duration(ocr(crop, digits=False, upscale=upscale, threshold=threshold))
+        assert value in (None, FULL_SHOTS[path]), f"{upscale}x/thr{threshold} 读成了 {value}"
+
+
+def test_nearest_neighbour_is_excluded_because_it_reads_wrong_values(ocr) -> None:  # type: ignore[no-untyped-def]
+    """**把「为什么不加 nearest」的凭据本身钉住。**（形式同
+    `test_planet_switch_live.py` 里那条「LANCZOS 会把 9 读成 8」。）
+
+    上一条只能证明「现在这几套没读错」——它挡不住有人日后为了多读出几发而顺手
+    加一套 `nearest`。这一条说的是加了会怎样：同一块像素上，`nearest` 不是读不出
+    （那还安全），而是**成功地读错**。
+
+    这条哪天变绿（tesseract 换了版本、nearest 也读对了），该做的是回来重写
+    `FLIGHT_RECIPES` 上那段注释，而不是把它删掉。
+    """
+    crop = Image.open("var/logs/dump-briefing-unrecognised-182102.png").crop(BRIEFING_FLIGHT_ROI)
+    truth = FULL_SHOTS["var/logs/dump-briefing-unrecognised-182102.png"]
+
+    wrong = [
+        parse_game_duration(
+            ocr(crop, digits=False, upscale=upscale, resample="nearest", threshold=threshold)
+        )
+        for upscale, threshold in ((3, 140), (5, 120))
+    ]
+
+    assert [value for value in wrong if value not in (None, truth)] == [
+        timedelta(minutes=8),
+        timedelta(seconds=6),
+    ]
