@@ -39,6 +39,23 @@ RESTART_COOLDOWN = timedelta(minutes=5)
 #: 调度循环会在一个坏掉的任务上变成满速空转的重启循环。
 EXIT_ENVIRONMENT_BUSY = 75
 
+#: 多条链路的异常退出落在这么长的一个窗口里，就当成**同一阵**故障看。
+#:
+#: 取 15 分钟的依据是 `RESTART_COOLDOWN`（5 分钟）：环境坏掉时每条链路都是起来
+#: 就崩、崩完等一个冷却、再来，所以 15 分钟里每条启用着的链路都轮得到两三次。
+#: 也就是说「环境坏了」这件事**必然**在一个 15 分钟窗口里留下两条以上链路的
+#: 失败记录；反过来，两处互不相干的真故障恰好落进同一个 15 分钟窗口，在一整夜里
+#: 是小概率——除非它们各自都在高频复发，而那一档由 `MAX_ENVIRONMENT_EXEMPTIONS`
+#: 的上限兜底（见 `application.mission_scheduler`）。
+ENVIRONMENT_FAULT_WINDOW = timedelta(minutes=15)
+
+#: 至少要有这么多条**不同**链路一起失败，才谈得上「环境坏了」。
+#:
+#: 必须是 2 而不是 1：1 就等于「所有失败都不算失败」，自动停用直接失效。
+#: 也不该是 3——三条链路里可能只有两条启用着，要求三条会让这条判据在最常见的
+#: 配置下永远不成立。
+ENVIRONMENT_FAULT_KINDS = 2
+
 
 class MissionKind(Enum):
     PIRATE = "PIRATE"
@@ -153,6 +170,56 @@ class SchedulerFacts:
     #: 但照样要冷却——用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
     #: 由调用方按本次控制台运行期间的记忆填，这一层不去查库。
     last_failure_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
+
+
+def kinds_failing_together(
+    kind: MissionKind,
+    at: datetime,
+    recent_faults: Mapping[MissionKind, datetime],
+    *,
+    window: timedelta = ENVIRONMENT_FAULT_WINDOW,
+) -> frozenset[MissionKind]:
+    """和 `kind` 这次失败挤在同一个时间窗里的所有链路（含它自己）。
+
+    `recent_faults` 是「每条链路最近一次**真的算故障**的退出时刻」。
+    `EXIT_ENVIRONMENT_BUSY` 那一档不该进来——它本来就不计失败，拿它当佐证
+    等于让「用户在用别的窗口」去豁免另一条链路真正的崩溃。
+
+    比 `at` 还晚的记录一律忽略：调用方按事件顺序喂进来，出现未来的时刻只能是
+    时钟被调过，那时宁可少认一次环境故障，也不要凭一个说不清的差值去豁免。
+    """
+    return frozenset(
+        other for other, moment in recent_faults.items() if moment <= at and at - moment <= window
+    ) | {kind}
+
+
+def looks_like_an_environment_fault(
+    kind: MissionKind,
+    at: datetime,
+    recent_faults: Mapping[MissionKind, datetime],
+    *,
+    window: timedelta = ENVIRONMENT_FAULT_WINDOW,
+    min_kinds: int = ENVIRONMENT_FAULT_KINDS,
+) -> bool:
+    """这次失败该不该记到这条链路头上——不该，如果别的链路同时也在倒。
+
+    **实机 2026-08-12。** 01:55「BOT 已停用（连续 3 次异常退出，退出码 1）」，
+    04:37 三条**全部**已停用。三条链路共用一个游戏窗口、一个鼠标、一份网络连接
+    和一台机器，同时坏掉几乎必然是那些共用的东西坏了——掉线、服务端维护、窗口
+    被别的程序抢走、机器休眠——而不是三处互不相干的代码在同一晚一起长出 bug。
+    把它记成三条链路各自的故障，代价是 BOT 从 01:55 停到 04:37，近三个小时
+    一发没派，而中间那段时间环境早就好了。
+
+    **怎么和「三条恰好各自坏了」分开。** 单看一阵失败是分不开的，分得开的是
+    「之后有没有一起好起来」：环境故障会结束，结束之后三条都能跑通；三处真故障
+    不会。所以这一层只给出「值得怀疑是环境」这个信号，**豁免不是无限的**——
+    调用方按 `MAX_ENVIRONMENT_EXEMPTIONS` 记账，任何一条链路跑出一次退出码 0
+    就清零，一次都跑不通时豁免会用尽，自动停用照旧生效，只是来得晚一些。
+
+    这和仓库里已有的两档豁免是同一个形状：`RoundExhausted`（资源耗尽不是失败）、
+    `EXIT_ENVIRONMENT_BUSY`（抢不到前台不是失败）。缺的一直是「多条一起倒」。
+    """
+    return len(kinds_failing_together(kind, at, recent_faults, window=window)) >= min_kinds
 
 
 def quota_day_start_utc(now: datetime) -> datetime:

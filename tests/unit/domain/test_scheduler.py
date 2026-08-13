@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from evo_helper.domain.scheduler import (
+    ENVIRONMENT_FAULT_WINDOW,
     RESTART_COOLDOWN,
     Action,
     Decision,
@@ -21,6 +22,8 @@ from evo_helper.domain.scheduler import (
     came_back_empty,
     decide,
     has_work,
+    kinds_failing_together,
+    looks_like_an_environment_fault,
     quota_day_start_utc,
     waiting_for_a_line,
 )
@@ -546,3 +549,87 @@ def test_a_naive_timestamp_is_refused_rather_than_guessed() -> None:
     """没有时区的时刻无从判断它属于哪个 UTC 日，猜错就是整段配额算错。"""
     with pytest.raises(ValueError):
         quota_day_start_utc(datetime(2026, 8, 9, 3, 0))
+
+
+# -- 环境故障：多条链路在同一时间窗里一起倒 ------------------------------------
+#
+# **实机 2026-08-12。** 01:55「BOT 已停用（连续 3 次异常退出，退出码 1）」，
+# 04:37 三条**全部**已停用。BOT 从 01:55 停到 04:37，近三个小时一发没派。
+# 三条链路共用一个游戏窗口、一个鼠标、一份连接和一台机器，同时坏掉几乎必然是
+# 那些共用的东西坏了，而不是三处互不相干的代码在同一晚一起长出 bug。
+
+
+def test_a_chain_failing_by_itself_is_its_own_problem() -> None:
+    """**豁免不能退化成「所有失败都不算失败」。**
+
+    只有它一条在倒的时候，那就是它自己的毛病。这一条为假，自动停用整个失效，
+    调度循环会在一个坏掉的任务上一轮轮空转。
+    """
+    assert not looks_like_an_environment_fault(MissionKind.PIRATE, NOW, {})
+
+
+def test_two_chains_failing_minutes_apart_read_as_one_environment_fault() -> None:
+    """环境坏掉时三条链路是**接连**倒下的：起来就崩、崩完等一个冷却、再来。"""
+    recent = {MissionKind.SCAN: NOW - timedelta(seconds=30)}
+
+    assert looks_like_an_environment_fault(MissionKind.PIRATE, NOW, recent)
+
+
+def test_failures_far_apart_are_two_separate_faults() -> None:
+    """**这是「怎么区分」那道题的另一半。**
+
+    隔了大半个钟头才轮到第二条，那不是同一阵故障——环境坏掉时每条链路
+    五分钟就撞一次，不会等那么久。时间窗一放开，这条豁免就会开始吃掉真正的故障。
+
+    ⚠️ 这里的 40 分钟**写死**，不许写成 `ENVIRONMENT_FAULT_WINDOW + 1 分钟`：
+    那样的话时间窗改多大，这个时刻就跟着挪多远，用例永远绿——变异验证时正是
+    这么发现的，把窗口放大到一整天它照样通过。
+    """
+    recent = {MissionKind.SCAN: NOW - timedelta(minutes=40)}
+
+    assert not looks_like_an_environment_fault(MissionKind.PIRATE, NOW, recent)
+
+
+def test_the_window_covers_a_burst_but_not_a_night() -> None:
+    """窗口得比一次重启冷却宽、比一整夜窄，两头都会坏事。
+
+    - **窄于 `RESTART_COOLDOWN`**：环境坏掉时第二条链路要等前一条的冷却过去才
+      轮得到再崩一次，「接连倒下」根本落不进同一个窗口，豁免形同虚设。
+    - **宽到按小时算**：一整夜里两处互不相干的真故障必然会挤进同一个窗口，
+      于是自动停用被这条豁免整个吃掉。
+    """
+    assert RESTART_COOLDOWN < ENVIRONMENT_FAULT_WINDOW < timedelta(hours=1)
+
+
+def test_a_chain_repeating_its_own_crash_never_corroborates_itself() -> None:
+    """同一条链路崩两次不构成「多条一起倒」。
+
+    自己给自己作证的话，任何一条高频复发的真故障都会自动豁免掉，
+    `MAX_CONSECUTIVE_FAILURES` 从此永远数不到。
+    """
+    recent = {MissionKind.PIRATE: NOW - timedelta(seconds=30)}
+
+    assert not looks_like_an_environment_fault(MissionKind.PIRATE, NOW, recent)
+
+
+def test_the_kinds_in_one_fault_include_the_one_that_just_failed() -> None:
+    """调用方拿这一组去清计数：刚倒下的那条也记错了账，不能漏掉自己。"""
+    recent = {MissionKind.SCAN: NOW - timedelta(seconds=30), MissionKind.BOT: NOW}
+
+    together = kinds_failing_together(MissionKind.PIRATE, NOW, recent)
+
+    assert together == {MissionKind.PIRATE, MissionKind.SCAN, MissionKind.BOT}
+
+
+def test_a_record_from_the_future_is_ignored_rather_than_trusted() -> None:
+    """出现比「现在」还晚的记录只能是时钟被调过。
+
+    那时宁可少认一次环境故障，也不要凭一个说不清的差值去豁免一次真正的崩溃。
+
+    ⚠️ 这里的 5 分钟**必须落在时间窗以内**：取一个窗口以外的未来时刻，判据写成
+    `abs(at - moment) <= window` 也照样能通过——那样这条用例就只是在重测窗口宽度，
+    根本没碰「未来」这件事。
+    """
+    recent = {MissionKind.SCAN: NOW + timedelta(minutes=5)}
+
+    assert not looks_like_an_environment_fault(MissionKind.PIRATE, NOW, recent)

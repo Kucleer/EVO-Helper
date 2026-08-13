@@ -709,6 +709,37 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
     return session
 
 
+def restart_if_still_unusable(session: Any, keeper: Any) -> Any:
+    """恢复阶梯的最后一级：前面都试过了还是回不到游戏内，就关窗重开一次。
+
+    **「上一轮没能正常收尾」是常态不是意外**：进程被强杀、断电、强制重启、用户
+    点了任务管理器、runner 半路抛未捕获异常，都会留下一个停在半截画面上的窗口，
+    甚至压根没有窗口——实测 `taskkill /F /T` 杀 runner 时把 Chrome 一起收走了
+    （它是 `start-console.bat` 的子进程）。窗口不存在那一档由 `LiveDriver.window()`
+    → `ensure_game_window()` 兜住；这里兜的是「窗口在、画面救不回来」。
+
+    **每一级最坏情况下点到了什么**，这是本仓库那条底线（「认不出的画面绝不点击」）
+    要求逐级说清的：
+
+    1. `keeper.ensure_connected` —— 判据驱动的入口序列，认不出就停，不点。
+    2. `dismiss_overlays_if_unrecognised` —— 左上角 (750, 71) 那个 ✕。
+       各种浮层的关闭键都在同一处，而那个位置在恒星系视图上什么都不是，点空无害。
+    3. **这里** —— **什么都没点**。只往游戏窗口那个句柄送一个 `WM_CLOSE`
+       （等同用户点右上角 ×，别的 Chrome 窗口不受影响），再由 `ensure_game_window`
+       拉一个新的，然后重走判据驱动的入口序列。它是整条阶梯里唯一完全不在认不出
+       的画面上动手的一级——所以它排在最后，而不是因为它最危险。
+
+    **预算耗尽就停，不是接着重启**：`SessionKeeper` 的滚动配额是 3 次 / 1 小时，
+    用尽后 `restart_and_reenter` 直接返回一个 `ready` 为假的结局，调用方照旧
+    安全停止。服务端维护时每次巡检都会撞到这一屏，没有上限就成了「每 10 分钟
+    关一次 Chrome 再开一次」，一直折腾到有人来看。
+    """
+    if session is None or session.ready:
+        return session
+    say(f"会话不可用：{session.detail}；关窗重开一次再试（兜底策略）")
+    return keeper.restart_and_reenter(f"会话不可用：{session.detail}")
+
+
 def run_scan(
     *,
     limit: int | None,
@@ -749,6 +780,7 @@ def run_scan(
     # 一次都没提过巡检；而且那三次点击本身就违反「认不出的画面绝不点击」。
     session = keeper.ensure_connected(force=True)
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
+    session = restart_if_still_unusable(session, keeper)
     if session is not None and not session.ready:
         say(f"会话不可用：{session.detail}；安全停止")
         return 1
@@ -797,7 +829,9 @@ def run_scan(
             save_cursor(session_factory, run_id, coordinate)
             continue
 
-        outcome = keeper.ensure_connected()
+        outcome = restart_if_still_unusable(
+            dismiss_overlays_if_unrecognised(keeper.ensure_connected(), driver, keeper), keeper
+        )
         if outcome is not None:
             if not outcome.ready:
                 say(f"会话巡检未通过：{outcome.detail}；安全停止")
@@ -823,7 +857,12 @@ def run_scan(
             navigator.invalidate()
             # 核对失败最常见的原因就是掉线。巡检十分钟才一次，等不到——
             # 这里立刻查一次，否则接下来又会在入口页上朝视图菜单盲点。
-            dropped = keeper.ensure_connected(force=True)
+            dropped = restart_if_still_unusable(
+                dismiss_overlays_if_unrecognised(
+                    keeper.ensure_connected(force=True), driver, keeper
+                ),
+                keeper,
+            )
             if dropped is not None and not dropped.ready:
                 say(f"核对失败且会话不可用：{dropped.detail}；安全停止")
                 return 1

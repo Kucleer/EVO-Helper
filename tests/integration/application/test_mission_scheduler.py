@@ -13,7 +13,12 @@ from uuid import uuid4
 
 import pytest
 
-from evo_helper.application.mission_scheduler import MAX_CONSECUTIVE_FAILURES, MissionScheduler
+from evo_helper.application.mission_progress import STALL_TIMEOUT, ProgressReading
+from evo_helper.application.mission_scheduler import (
+    MAX_CONSECUTIVE_FAILURES,
+    MAX_ENVIRONMENT_EXEMPTIONS,
+    MissionScheduler,
+)
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
@@ -901,6 +906,56 @@ def test_prepare_marks_orphans_rather_than_shooting_at_a_recycled_pid(  # type: 
     assert repository.mission_runs(limit=1)[0].stopped_by == "UNKNOWN"
 
 
+def test_a_hard_killed_runner_does_not_leave_its_row_hanging(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """用户在任务管理器里把 runner 结束掉（或 `taskkill /F /T`），控制台还活着。
+
+    这一行不能永远挂在「运行中」：挂着的话，页面上那段历史永远显示它在跑，
+    而调度器的连续失败也就永远数不到三。收退出码这件事必须由 tick 自己做，
+    不能等到有人打开页面才做。
+    """
+    enable(repository, MissionKind.PIRATE)
+    scheduler.start()
+    scheduler.tick()
+    assert repository.mission_runs(limit=1)[0].ended_at_utc is None
+
+    launcher.latest.exit_code = 1  # 被外部强杀，进程没了
+    clock.now = NOW + timedelta(seconds=5)
+    scheduler.tick()
+
+    closed = next(row for row in repository.mission_runs(limit=10) if row.kind == "PIRATE")
+    assert closed.ended_at_utc == NOW + timedelta(seconds=5)
+    assert closed.stopped_by == "SELF"
+
+
+def test_a_row_left_open_by_a_dead_console_is_closed_on_the_next_start(  # type: ignore[no-untyped-def]
+    repository, launcher, clock
+) -> None:
+    """控制台自己被强杀时没人收退出码，那一行会留在库里没有 `ended_at_utc`。
+
+    **「上一轮没能正常收尾」是常态不是意外**：断电、强制重启、任务管理器。
+    下一次开机必须认得出并收尾——否则它永远显示成「运行中」，而那恰恰是
+    「我们已经不知道它死活了」的意思。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    repository.begin_mission_run(
+        MissionKind.PIRATE,
+        command=["python", "-m", "evo_helper.tools.pirate_loop"],
+        pid=31337,
+        started_at_utc=NOW - timedelta(hours=3),
+        log_path="var/logs/mission-pirate.log",
+    )
+
+    restarted = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    restarted.prepare()
+
+    row = repository.mission_runs(limit=1)[0]
+    assert row.ended_at_utc == NOW
+    assert row.stopped_by == "UNKNOWN"
+    assert repository.open_mission_runs() == []
+
+
 def test_prepare_seeds_the_three_chains_and_the_config(repository, launcher, clock) -> None:  # type: ignore[no-untyped-def]
     """迁移里没有 `bulk_insert`，这几行得有人保证存在。"""
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
@@ -909,3 +964,287 @@ def test_prepare_seeds_the_three_chains_and_the_config(repository, launcher, clo
 
     assert len(repository.mission_tasks()) == 3
     assert repository.scheduler_config().pirate_daily_quota == 32
+
+
+# -- 跑着不动 ------------------------------------------------------------------
+#
+# **实机 `var/logs/overnight-0812.log` 最后 1.5 小时**（心跳每半小时一行）：
+#
+#     05:14:51 运行=True 当前=PIRATE | 580/92/84/83/86/126/4536 | PIRATE:运行中 ...
+#     06:45:59 运行=True 当前=PIRATE | 580/92/84/83/86/126/4536 | PIRATE:运行中 ...
+#
+# 六次心跳、七个计数一个没变，而状态一直是「运行中」。调度器只知道子进程还活着。
+# 判据本身在 `tests/unit/application/test_mission_progress.py` 钉死，这里守的是
+# **接线**：判死之后有没有真的把子进程收掉、有没有落进台账、算不算故障。
+
+
+class _Counts:
+    """一份可以现改的进展读数，替掉真的去数那四张表。"""
+
+    def __init__(self) -> None:
+        self.reading = ProgressReading(
+            dispatches=580, battle_reports=92, scout_reports=84, coordinate_scans=4536
+        )
+
+    def read(self) -> ProgressReading:
+        return self.reading
+
+    def moved(self) -> None:
+        self.reading = ProgressReading(
+            dispatches=self.reading.dispatches + 1,
+            battle_reports=self.reading.battle_reports,
+            scout_reports=self.reading.scout_reports,
+            coordinate_scans=self.reading.coordinate_scans,
+        )
+
+
+def _watched(repository, launcher, clock):  # type: ignore[no-untyped-def]
+    counts = _Counts()
+    scheduler = MissionScheduler(
+        repository, make_supervisor(launcher, clock), clock=clock, progress=counts
+    )
+    scheduler.prepare()
+    return scheduler, counts
+
+
+def test_a_round_that_stops_producing_anything_is_cut_off(  # type: ignore[no-untyped-def]
+    repository, launcher, clock
+) -> None:
+    """**这条就是那一个半小时。**
+
+    子进程活着、日志照打，但库里一行都没多出来。原先没有任何超时把它掐掉。
+    """
+    scheduler, _counts = _watched(repository, launcher, clock)
+    enable(repository, MissionKind.PIRATE)
+    scheduler.start()
+    scheduler.tick()
+    stalled = launcher.latest
+
+    clock.now = NOW + STALL_TIMEOUT
+    scheduler.tick()
+
+    assert stalled.terminated
+    closed = next(row for row in repository.mission_runs(limit=10) if row.ended_at_utc is not None)
+    assert closed.stopped_by == "STALLED"
+    assert closed.ended_at_utc == NOW + STALL_TIMEOUT
+
+
+def test_a_round_that_keeps_working_is_never_cut_off(  # type: ignore[no-untyped-def]
+    repository, launcher, clock
+) -> None:
+    """**方向相反的另一半，同样要紧。**
+
+    一轮里合法的长等待是存在的（侦察报告等 45 秒、翻一趟信箱实测 83 秒），
+    误杀丢的是真实的舰队和当日配额。这里让它每隔一会儿就多派一发。
+    """
+    scheduler, counts = _watched(repository, launcher, clock)
+    enable(repository, MissionKind.PIRATE)
+    scheduler.start()
+    scheduler.tick()
+    running = launcher.latest
+
+    for minutes in range(1, int(STALL_TIMEOUT.total_seconds() // 60) * 3, 10):
+        counts.moved()
+        clock.now = NOW + timedelta(minutes=minutes)
+        scheduler.tick()
+
+    assert not running.terminated
+    assert len(launcher.spawned) == 1
+
+
+def test_a_stalled_round_is_charged_as_a_failure(  # type: ignore[no-untyped-def]
+    repository, launcher, clock
+) -> None:
+    """手是我们动的，毛病却是这条链路自己的。
+
+    不算故障的话，同一个卡死会一轮接一轮地复现，每轮白烧一个阈值那么久。
+    """
+    scheduler, _counts = _watched(repository, launcher, clock)
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    scheduler.start()
+    scheduler.tick()
+
+    clock.now = NOW + STALL_TIMEOUT
+    scheduler.tick()
+
+    assert task(repository, MissionKind.PIRATE).consecutive_failures == 1
+
+
+# -- 环境故障：多条链路一起倒，不记到任何一条头上 ------------------------------
+#
+# **实机 2026-08-12。** 01:55「BOT 已停用（连续 3 次异常退出，退出码 1）」，
+# 04:37 三条**全部**已停用。BOT 从 01:55 停到 04:37，近三个小时一发没派。
+# 三条链路共用一个游戏窗口、一个鼠标、一份连接和一台机器；同时坏掉几乎必然是
+# 那些共用的东西坏了，而不是三处互不相干的代码在同一晚一起长出 bug。
+
+
+def _launch(scheduler, launcher, clock, *, at: datetime, expect: MissionKind) -> None:  # type: ignore[no-untyped-def]
+    before = len(launcher.spawned)
+    clock.now = at
+    scheduler.tick()
+    assert len(launcher.spawned) == before + 1, f"{at} 这一刻没有起任何东西"
+    assert launcher.latest.kind is expect
+
+
+def _crash(scheduler, launcher, clock, *, at: datetime, expect: MissionKind) -> None:  # type: ignore[no-untyped-def]
+    """让**正在跑的**那一个在 `at` 以退出码 1 崩掉，并钉住它确实是 `expect`。
+
+    收退出码那一 tick 顺带会把顺位让给下一条链路（前一条进了冷却）——那正是
+    环境坏掉时三条链路接连倒下的样子，所以这里不去拦它。
+    """
+    assert launcher.latest.kind is expect, f"{at} 在跑的是 {launcher.latest.kind}"
+    launcher.latest.exit_code = 1
+    clock.now = at
+    scheduler.tick()
+
+
+def _crash_whatever_runs(scheduler, launcher, clock, *, at: datetime, limit: int = 6) -> None:  # type: ignore[no-untyped-def]
+    """从 `at` 起，把这一阵里起得来的链路挨个崩掉。
+
+    不指定是谁：链路被逐个停用之后，谁还起得来是会变的，写死顺序只会让用例在
+    「停用生效」的那一刻假红。
+    """
+    moment = at
+    for _ in range(limit):
+        if scheduler.current is None:
+            before = len(launcher.spawned)
+            clock.now = moment
+            scheduler.tick()
+            if len(launcher.spawned) == before:
+                return
+        launcher.latest.exit_code = 1
+        moment += timedelta(seconds=14)
+        clock.now = moment
+        scheduler.tick()
+
+
+def test_two_chains_crashing_together_are_not_charged_to_either(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """一起倒 = 环境坏了，两条的连续失败计数都要清干净。
+
+    原先这两次会各记一笔，撞满三次就把两条链路都自动停用——而环境早就好了。
+    """
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    _launch(scheduler, launcher, clock, at=NOW, expect=MissionKind.PIRATE)
+    # 海盗崩了就进冷却，顺位当场让给扫描；两次崩塌相隔不到一分钟。
+    _crash(scheduler, launcher, clock, at=NOW + timedelta(seconds=14), expect=MissionKind.PIRATE)
+    _crash(scheduler, launcher, clock, at=NOW + timedelta(seconds=30), expect=MissionKind.SCAN)
+
+    assert task(repository, MissionKind.PIRATE).consecutive_failures == 0
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 0
+    assert task(repository, MissionKind.PIRATE).disabled_reason is None
+    assert task(repository, MissionKind.SCAN).disabled_reason is None
+
+
+def test_a_chain_failing_on_its_own_is_still_charged(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """**豁免不能退化成「所有失败都不算失败」。**
+
+    只有它一条在倒的时候，那就是它自己的毛病，照记。没有这条，自动停用整个失效，
+    调度循环会在一个坏掉的任务上一轮轮空转。
+    """
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    scheduler.start()
+
+    for index in range(MAX_CONSECUTIVE_FAILURES):
+        at = NOW + (RESTART_COOLDOWN + timedelta(minutes=1)) * index
+        _launch(scheduler, launcher, clock, at=at, expect=MissionKind.PIRATE)
+        _crash(scheduler, launcher, clock, at=at + timedelta(seconds=14), expect=MissionKind.PIRATE)
+
+    assert task(repository, MissionKind.PIRATE).disabled_reason is not None
+
+
+def test_the_environment_busy_code_never_corroborates_a_real_crash(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """**「轮不到我」不能拿去佐证别人的崩溃。**
+
+    `EXIT_ENVIRONMENT_BUSY` 本来就不计失败（用户正在用别的窗口）。把它也算进
+    「一起倒」的证据里，等于让最常见的一档正常情况变成万能豁免——真坏了的那条
+    链路从此永远数不到三。
+    """
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    _launch(scheduler, launcher, clock, at=NOW, expect=MissionKind.PIRATE)
+    launcher.latest.exit_code = EXIT_ENVIRONMENT_BUSY
+    clock.now = NOW + timedelta(seconds=14)
+    scheduler.tick()
+    # 扫描顶上，然后真的崩了——只有它一条在倒。
+    _crash(scheduler, launcher, clock, at=NOW + timedelta(seconds=30), expect=MissionKind.SCAN)
+
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 1
+
+
+def test_the_exemption_runs_out_when_nothing_ever_runs_clean(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """**豁免必须有尽头。**
+
+    两条各自高频复发的真故障会一直互相佐证，判据永远说「像是环境坏了」——那就
+    退回到「一个坏掉的任务上空转」，正是自动停用当初要防的。所以豁免按
+    `MAX_ENVIRONMENT_EXEMPTIONS` 记账：一次都跑不通的话它会用尽，停用照旧生效，
+    只是来得晚一些（约 45 分钟，而不是原先的约 10 分钟）。
+    """
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    at = NOW
+    # 圈数上限**写死**，好让「永远停不掉」这种回归表现成断言失败而不是死循环。
+    # ⚠️ 不许写成由 `MAX_ENVIRONMENT_EXEMPTIONS` 算出来的数：变异验证要把那个常量
+    # 改成一个很大的值，跟着算的话这个循环会先跑上几十亿圈——用例不是变红，是挂死。
+    for _round in range(40):
+        if task(repository, MissionKind.PIRATE).disabled_reason is not None:
+            break
+        _crash_whatever_runs(scheduler, launcher, clock, at=at)
+        at += RESTART_COOLDOWN + timedelta(minutes=1)
+    else:  # pragma: no cover - 只有回归时才走到
+        raise AssertionError("一直没跑通，链路却永远没被停用：豁免成了无限的")
+
+    assert task(repository, MissionKind.PIRATE).disabled_reason is not None
+    # 而且它确实比「连撞三次」宽得多——否则这条豁免等于没做。
+    assert len(launcher.spawned) > MAX_CONSECUTIVE_FAILURES * 2
+
+
+def test_one_clean_round_hands_the_whole_exemption_budget_back(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock
+) -> None:
+    """任何一条链路跑出一次退出码 0，就证明环境是好的：窗口在、会话在、鼠标是我们的。
+
+    那一刻之前的几次豁免各自成立，不该再占着谁的额度——否则一台偶尔掉一次线的
+    机器，跑上几天照样会把额度耗光，然后又回到「环境一抖就停用一条链路」。
+    """
+    enable(repository, MissionKind.PIRATE)
+    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    scheduler.start()
+
+    at = NOW
+    for _round in range(MAX_ENVIRONMENT_EXEMPTIONS):
+        _launch(scheduler, launcher, clock, at=at, expect=MissionKind.PIRATE)
+        _crash(scheduler, launcher, clock, at=at + timedelta(seconds=14), expect=MissionKind.PIRATE)
+        _crash(scheduler, launcher, clock, at=at + timedelta(seconds=30), expect=MissionKind.SCAN)
+        at += RESTART_COOLDOWN + timedelta(minutes=1)
+
+    # 一轮干净的收尾。
+    _launch(scheduler, launcher, clock, at=at, expect=MissionKind.PIRATE)
+    launcher.latest.exit_code = 0
+    clock.now = at + timedelta(minutes=2)
+    scheduler.tick()
+
+    at += RESTART_COOLDOWN + timedelta(minutes=10)
+    _launch(scheduler, launcher, clock, at=at, expect=MissionKind.PIRATE)
+    _crash(scheduler, launcher, clock, at=at + timedelta(seconds=14), expect=MissionKind.PIRATE)
+    _crash(scheduler, launcher, clock, at=at + timedelta(seconds=30), expect=MissionKind.SCAN)
+
+    assert task(repository, MissionKind.PIRATE).consecutive_failures == 0
+    assert task(repository, MissionKind.SCAN).consecutive_failures == 0
