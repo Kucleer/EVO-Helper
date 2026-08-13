@@ -38,6 +38,7 @@ from evo_helper.domain.report_wait import (
     UNKNOWN_LINE_HOLD,
     PendingReport,
     line_free_at,
+    vet_flight_time,
 )
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
@@ -717,12 +718,27 @@ class SqlAlchemyRepository:
         谁要改其中一个，另一个就在同一屏里。
 
         读不到飞行时间时三列都留空。等待调度器会把「未知」当成「立即尝试收取」，
-        而不是无限等一个不知道何时抵达的战报；航线那一侧的 NULL 则当作不占航线。
+        而不是无限等一个不知道何时抵达的战报；**航线那一侧的 NULL 不是「不占
+        航线」**，而是按 `domain.report_wait.UNKNOWN_LINE_HOLD`（90 分钟）照占——
+        被游戏接受的那一发舰队一定占着一条航线，简报上读没读到飞行时间和它占不占位
+        毫无关系。（这句话此前写的是「当作不占航线」，那是更早的口径，`line_free_at`
+        的注释里记着它被实机推翻的过程。）
+
+        ## 下限关设在这里，是因为这里绕不过去
+
+        `vet_flight_time` 把「读出来但小得不可信」的攻击飞行时长降级成 None
+        （见 `MIN_CREDIBLE_ATTACK_FLIGHT`：生产库里 209 发攻击有 66 发落在 0–59 秒，
+        而 59 正好是一个「秒」字段的上限——那是解析截断的残骸，不是物理量）。
+
+        放在这个方法里而不是各个调用方：**`row.mission_kind` 就在手边，而三列都
+        从这里写出去**。搁在调用方就等于每新增一条派遣路径都要记得再关一次门，
+        而漏关的后果是一个错值同时污染两个钟，且一声不响。
         """
         with self._session_factory() as session:
             row = session.get(orm.AttackDispatchRow, dispatch_id)
             if row is None:
                 raise ValueError(f"dispatch {dispatch_id} not found")
+            flight = vet_flight_time(flight, mission_kind=row.mission_kind)
             if flight is None:
                 row.flight_seconds = None
                 row.expected_report_at_utc = None
