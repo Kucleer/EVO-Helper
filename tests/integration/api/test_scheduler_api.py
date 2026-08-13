@@ -837,16 +837,16 @@ def test_a_malformed_origin_is_refused_rather_than_guessed(console: Console) -> 
     assert "9:250" in response.json()["detail"]
 
 
-def test_a_planet_the_helper_cannot_switch_to_is_refused_with_both_coordinates(
+def test_another_planet_is_accepted_now_that_the_helper_can_switch_to_it(
     console: Console,
 ) -> None:
-    """**助手还不会在游戏里切换当前星球。**
+    """**别的星球现在收得下了。**
 
-    收下这个配置的代价不是「打不到」，是台账在撒谎：舰队照旧从主星飞出去，而
-    `attack_intents.origin_*` 上写着 9:250:8。错误信息里要出现**两颗**坐标，
-    否则用户看不出该改成什么。
+    这条原先钉的是反面（400，理由是助手还不会切星球）。那道临时闸门随
+    「切换星球」实装一起删了：runner 开工时真的把当前星球切过去，切不成就一发
+    都不派。页面上再拦一道等于把这个功能关在门外。
 
-    ⚠️ 这是一道**临时闸门**，切换星球实装之后这条用例随之改写。
+    仍然要拦的只有「写不成坐标」那一档，见上一条用例。
     """
     created = _create(console).json()
 
@@ -854,10 +854,8 @@ def test_a_planet_the_helper_cannot_switch_to_is_refused_with_both_coordinates(
         f"/api/missions/{created['task_id']}", json={"origin": "9:250:8"}
     )
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "9:250:8" in detail
-    assert "2:137:18" in detail
+    assert response.status_code == 200
+    assert response.json()["origin"] == "9:250:8"
 
 
 def test_clearing_the_origin_puts_it_back_on_the_home_planet(console: Console) -> None:

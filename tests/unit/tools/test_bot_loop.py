@@ -68,6 +68,9 @@ def _run_with_phases(
     # `run()` 归父类管（开工前置 + `RoundExhausted` 收尾），会话巡检要真截屏，
     # 这条测试只关心分态路由，桩掉即可。
     loop._ensure_session = lambda **_k: False
+    # 切出发星球要开浮层、OCR、回读派遣面板，那条链路自己有专门的用例
+    # （`tests/unit/game/test_planet_list.py` 与 `test_pirate_loop_origin_planet.py`）。
+    loop.ensure_origin_planet = lambda: True
     # 开工那一趟信箱（读战报 + 数今天打了几发）要开库、要看屏，这里只记它跑过。
     loop.reconcile_today = lambda: calls.append("开工那一趟信箱")
     loop._nav_labels = lambda: ""
@@ -255,6 +258,7 @@ def test_running_out_of_lines_ends_the_round_cleanly(monkeypatch: pytest.MonkeyP
     loop._navigator = _FakeNavigator()
     loop._reset_to_known_screen = lambda: None
     loop._ensure_session = lambda **_k: False
+    loop.ensure_origin_planet = lambda: True
     loop.reconcile_today = lambda: None
     loop._nav_labels = lambda: ""
     loop._phase_of = lambda _c: BotPhase.NEEDS_ATTACK

@@ -16,7 +16,6 @@ from evo_helper.application.mission_scheduler import MissionScheduler, Scheduler
 from evo_helper.domain.missions import (
     MissionParamError,
     bot_targets_in_range,
-    check_origin_dispatchable,
     pirate_systems,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
@@ -811,11 +810,10 @@ class MissionConsoleService:
         # 或者要**关掉**它时不校验：参数填错了还关不掉，那就真的没退路了。
         if params is not None or enabled is True:
             self._validate(kind, params_json or row.params_json, target_origin)
-        elif origin is not None:
-            # 只动了出发星球时**只量出发星球**，不连参数一起量：新建出来的任务
-            # 范围还是空的，而「先挑星球、再填范围」是最自然的填法——顺手把它
-            # 也校验一遍，等于逼用户倒着填。范围本身在启用那一下照样跑不掉。
-            self._check_origin(target_origin)
+        # ⚠️ 这里原先还有一条 `elif origin is not None: self._check_origin(...)`：
+        # 只改出发星球时单量那一项，因为「不是主星」当时会被临时闸门拒掉。
+        # 闸门随「切换星球」实装删了（runner 开工会真的切过去），于是出发星球本身
+        # 不再有「合不合法」这回事——写不成坐标那一档在 `_parse_origin` 就拒了。
         self._repository.update_mission_task(
             task_id,
             enabled=enabled,
@@ -998,22 +996,10 @@ class MissionConsoleService:
 
         走 `command_for` 而不是在这里重写几条 if：两边一旦分家，就会出现
         「页面收下了、调度器起不来」——而调度器起不来时只会把任务自动停用，
-        用户要等到下次看页面才发现。出发星球也在这把尺子上（还切不过去的那颗
-        会被拦下），理由同上。
+        用户要等到下次看页面才发现。
         """
         try:
             self._scheduler.command_for(kind, params_json, origin=origin)
-        except MissionParamError as exc:
-            raise ServiceError(str(exc)) from exc
-
-    def _check_origin(self, origin: Coordinate) -> None:
-        """只量出发星球这一项，量不过就 400。
-
-        走的是 `command_for` 内部用的**同一个**判据函数，不是在这里另写一条
-        `if`：两边一旦分家，页面就会收下一个调度器起不来的配置。
-        """
-        try:
-            check_origin_dispatchable(origin, self._scheduler.origin)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
 

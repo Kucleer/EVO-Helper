@@ -88,6 +88,7 @@ from evo_helper.tools.pirate_loop import (
     PirateLoop,
     ReportIngest,
     TargetCheck,
+    exit_code_for,
     parse_origin,
     rematch_note,
 )
@@ -436,7 +437,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     for coordinate, reason in outcome.refused:
         say(f"  [拦下] {coordinate} {reason}")
-    return 0
+    # 退出码与海盗那条共用一份判据（`exit_code_for`）：切不到出发星球时两边都要
+    # 报 `EXIT_ENVIRONMENT_BUSY`，各写一份迟早分家。
+    return exit_code_for(outcome)
 
 
 __all__ = ["BotLoop", "BotOptions", "main"]
