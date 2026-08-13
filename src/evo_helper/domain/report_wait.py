@@ -19,15 +19,75 @@ from datetime import datetime, timedelta
 from enum import Enum
 
 from evo_helper.domain.fleet_preset import is_probe_preset
-from evo_helper.domain.records import MISSION_KIND_SCOUT
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_SCOUT
 
 #: `X天Y时Z分W秒`，缺省段会被省略（`8时3分20秒`、`45秒`）。
+#:
+#: ⚠️ **每一段都是可选的，所以这条正则在任意位置都能匹配空串。** 它本身
+#: 不提供任何「读全了」的保证；判「读全了」的是 `_reads_the_whole_duration()`。
+#:
+#: 段与段之间只允许空白，**故意不容忍噪声**：容忍噪声就等于允许把一个数字
+#: 配到隔了一段距离的单位上，而那正是本模块最怕的错误（数量级错位）。
+#: 段间插进了怪字符的输入一律读不出来——理由见 `parse_game_duration()`。
 _CN_DURATION_RE = re.compile(
     r"(?:(\d+)\s*天)?\s*(?:(\d+)\s*时)?\s*(?:(\d+)\s*分)?\s*(?:(\d+)\s*秒)?"
 )
 
+#: 分段的单位字。匹配之外还留着一个，就说明有一段没被读进来。
+_DURATION_UNITS = frozenset("天时分秒")
+
+_DIGIT_RE = re.compile(r"\d")
+
 #: 顶部栏用的 `01:53:19` 冒号格式。
+#:
+#: **这条不跟着 `_CN_DURATION_RE` 一起收紧**：它三段全是必需的、且两侧有
+#: `(?<!\d)`/`(?!\d)` 守着，本来就没有「匹配上半截」这回事。
 _CLOCK_RE = re.compile(r"(?<!\d)(\d{1,3}):([0-5]\d):([0-5]\d)(?!\d)")
+
+#: 攻击派遣的飞行时长下限：读出来比这还短的，当**没读出来**处理。
+#:
+#: 这是**第二道防线**，兜的是「解析器挑不出毛病、值却仍然错」的那一类。
+#: 第一道（`parse_game_duration()` 的读全校验）从根上不产生截断值，但它只认
+#: 得出「有一段没读进来」的痕迹；痕迹被 OCR 一并抹掉时，剩下的碎片自身是
+#: 一条合法的时长，解析器没有任何依据拒绝它。
+#:
+#: 取 3 分钟的依据（生产库 `attack_dispatches`，2026-08-13）：
+#:
+#: - 攻击的 197 条飞行时长分成两簇，中间 60–300 秒**一条都没有**：
+#:   0–60 秒 66 条（最大值 **59 秒**）、300 秒以上 131 条（最小值 **300 秒**）。
+#: - 59 不是任何物理量，它是**一个「秒」字段能装下的最大数**——这就是
+#:   「只剩秒段活下来」的铁证。300 则正好是当前科技下的真实下限（5 分钟）。
+#: - 卡在 3 分钟而不是 5 分钟：科技会升级、舰队会变快，真实下限会往下走，
+#:   而 180 秒落在那段空白的正中，两边都留着余量。
+#:
+#: **只对攻击成立，因为只有攻击那一簇被量过。** 同一张表里 371 发侦察落在
+#: 14–135 秒，但那批数字**不能当成侦察的真实量程**：最久的几发全是 135 秒
+#: （= 2 分 15 秒）、次一批全是 121 秒（= 2 分 1 秒），都是「分+秒」两段的
+#: 形状，而飞得最久的那几发打的偏偏是主星系内最近的目标（2:137:1~4）——距离
+#: 完全解释不了。它们本身多半就是本模块修的那种截断产物（真值可能是
+#: `1时2分15秒`）。拿它们反推一条侦察下限，等于把截断读数当成基准。
+#:
+#: 所以侦察这一侧**先不设下限、也不做回归**：读全校验那一道对所有发次一视同仁
+#: 已经生效，攻击这一半是要及时处理的那一半。
+MIN_CREDIBLE_ATTACK_FLIGHT = timedelta(minutes=3)
+
+#: 同一个恒星系之内那一趟攻击要多久——也就是**攻击飞行时间出现过的最低值**。
+#:
+#: 用户口径（2026-08-13）：「同星系是 5 分钟，也就是出现过的最低值。」
+#:
+#: 拿它当**跨恒星系**那一档的下限（严格大于），见 `vet_flight_time`：更远不可能
+#: 更快。这一条不需要速度模型——而速度确实会变（简报上那行 `速度: 14.520` 随舰队
+#: 组成而不同，本仓根本没读它），所以任何按距离插值的估算都是靠不住的，
+#: 「不可能比最近的那一档还快」却始终成立。
+#:
+#: 用户实拍参考（同银河系、从主星发出，主星带银河石加成）：
+#:
+#:     跨 50 个恒星系   飞行 23 分 13 秒
+#:     跨 100 个恒星系  飞行 29 分 8 秒
+#:
+#: 注意**不是线性的**：距离翻倍只多两成半。所以别把这两个点连成一条直线去外推，
+#: 那样得到的下限在近距离处会高得离谱、把正常值判死。
+SAME_SYSTEM_ATTACK_FLIGHT = timedelta(minutes=5)
 
 #: 飞行时间读不到（`expected_report_at_utc` 为 NULL）时，按派出时刻算的放弃阈值。
 #:
@@ -246,25 +306,143 @@ class SessionBackoff:
         )
 
 
+def _reads_the_whole_duration(text: str, match: re.Match[str]) -> bool:
+    """这次匹配是不是把整个时长表达式都吃下去了。
+
+    三条判据，都在找「有一段没被读进来」留下的残骸：
+
+    1. **匹配之外还剩数字。** `3夭19旪36分7秒` 里只有 `36分7秒` 成了链，
+       而 `3` 和 `19` 还杵在外面——它们本该是天和时。
+    2. **紧贴左边的那个非空白字符是单位字。** `З天19时36分7秒`（首位数字被
+       认成西里尔字母）里外面一个数字都不剩，但 `36` 前面顶着一个 `时`，
+       说明时那一段的数字被吃掉了、单位还在。
+       左边**只看紧邻的一个字**：标签和散文都在左边，而它们自己就含单位字
+       （`飞行时间` 里有「时」），往左扫得太宽会把完全正常的输入判死。
+    3. **右边到下一处空白之前还有单位字。** `3天19时36分Ⅶ秒` 里秒那一段的
+       数字没了、`秒` 还留着。右边不会出现标签，所以这一侧可以看整个词；
+       到空白为止是为了不去管 `3分20秒 抵达` 后面那截散文。
+
+    **判据 1 判死的输入远多于必要**（散文里随便一个数字都会让它返回 False），
+    这是有意的：本模块宁可读不出，也不要读出一个小而合理的错值——理由见
+    `parse_game_duration()`。
+
+    残留的洞：整个前缀被糊成**既无数字也无单位**的乱码时（`ЖЖЖ36分7秒`），
+    三条都看不出异常，仍然会读成后半段。那一档由第二道防线
+    （`MIN_CREDIBLE_ATTACK_FLIGHT`）在攻击链路上兜。
+    """
+    head, tail = text[: match.start()], text[match.end() :]
+
+    if _DIGIT_RE.search(head) or _DIGIT_RE.search(tail):
+        return False
+
+    stripped_head = head.rstrip()
+    if stripped_head and stripped_head[-1] in _DURATION_UNITS:
+        return False
+
+    for char in tail:
+        if char.isspace():
+            break
+        if char in _DURATION_UNITS:
+            return False
+    return True
+
+
 def parse_game_duration(text: str) -> timedelta | None:
     """解析游戏内倒计时，读不到返回 None。
 
+    **部分匹配一律失败，绝不截断。** `_CN_DURATION_RE` 的每一段都是可选的，
+    于是任何一段被 OCR 认错，后面那个碎片都能自己成一条合法的链。老实现拿
+    `finditer` 逐个找、取第一个含数字的匹配，等于「前面糊了就丢掉前面」：
+
+        3夭19旪36分7秒  ->  0:36:07        （真值 3 天 19:36:07）
+        2旪15分7秒      ->  0:15:07        （真值 15:07 之外还有 2 小时）
+
+    返回的是一个**看起来完全合理**的值，没有异常、没有日志，只是小了两三个
+    数量级。生产库里 197 发有飞行时长的攻击中，66 发落在 0–60 秒、最大值正好
+    59 秒，而 60–300 秒一发都没有——59 是「秒」字段能装下的最大数，也就是
+    这条路径留下的指纹。
+
+    **方向不许反过来。** 读不全就返回 None，而 None 在这个仓里是有归宿的：
+    `expected_report_at_utc` 为 NULL 走「未知即立即收取」，`line_free_at_utc`
+    为 NULL 是「不知道什么时候回来」、按 `UNKNOWN_LINE_HOLD` 照旧占着航线。
+    多一条 NULL 只是多白跑一趟；一个错的小数字则会让战报被反复空收、让调度器
+    以为航线十几秒后就空出来，接着派、撞上游戏的「同时派遣的舰队数量已达上限」。
+
     读成 0 也返回 None：那说明一个数字都没匹配到，不能当成「已抵达」——
-    把 0 当成已抵达会让助手立刻去收一份还没产生的战报。
+    把 0 当成已抵达会让助手立刻去收一份还没产生的战报。「即将抵达」同理。
     """
-    clock = _CLOCK_RE.search(text or "")
+    raw = text or ""
+    clock = _CLOCK_RE.search(raw)
     if clock is not None:
         hours, minutes, seconds = (int(value) for value in clock.groups())
         total = timedelta(hours=hours, minutes=minutes, seconds=seconds)
         return total or None
 
-    # 所有分段都是可选的，所以正则会在任意位置匹配到空串。逐个匹配、取第一个
-    # 真的含数字的，否则 "即将抵达" 会被读成 0 秒。
-    for match in _CN_DURATION_RE.finditer(text or ""):
+    # 所有分段都是可选的，所以正则会在任意位置匹配到空串。跳过空匹配，
+    # 否则 "即将抵达" 会被读成 0 秒。
+    for match in _CN_DURATION_RE.finditer(raw):
         if not any(match.groups()):
             continue
+        # 第一个含数字的匹配就是**唯一**的候选：读不全就到此为止，
+        # 不再往后找下一个。往后找正是这个缺陷本身。
+        if not _reads_the_whole_duration(raw, match):
+            return None
         days, hours, minutes, seconds = (int(value or 0) for value in match.groups())
         total = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
-        if total:
-            return total
+        return total or None
     return None
+
+
+def vet_flight_time(
+    flight: timedelta | None, *, mission_kind: str, same_system: bool | None = None
+) -> timedelta | None:
+    """给读到的飞行时长把两道下限关，不可信的降级成 None。
+
+    第二道防线，和 `parse_game_duration()` 的读全校验互补、都要：
+
+    | 防线 | 管什么 | 管不住什么 |
+    |---|---|---|
+    | 读全校验 | 所有发次；从根上不产生截断值 | 痕迹被一并抹掉的那一档 |
+    | 本函数 | 只管攻击；解析得干干净净、值却偏小的 | 值仍大于下限的截断（`3天19时` 丢了 36 分） |
+
+    **不要因为有了这一道就把读全校验放松。** 被截成 `3天19:00:00` 的那种值
+    远在下限之上，两道都不会响，只能靠第一道从根上不产生它。
+
+    ## 两道关
+
+    1. **绝对下限** `MIN_CREDIBLE_ATTACK_FLIGHT`（3 分钟）——取值理由见那个常量。
+    2. **跨恒星系下限** `SAME_SYSTEM_ATTACK_FLIGHT`（5 分钟）：目标不在出发星球
+       那个恒星系里，飞行时间就必须**严格大于**同星系那个最低值。
+
+    第 2 道是第 1 道漏掉的那一类的出口。实机（生产库 2026-08-13）三发：
+
+        08-10 18:25  探路 → 2:320:11   300 秒
+        08-11 01:07  探路 → 2:320:11   300 秒
+        08-11 07:31  探路 → 2:320:11   300 秒
+
+    出发星球 2:137:18，跨了 183 个恒星系，却只用 300 秒——**比同星系那一档还
+    快**，物理上不可能（真值多半是 `X时5分0秒` 被截成了 `5分0秒`）。三次是同一个
+    目标、同一个值，说明那份简报上的失手是**可重复的**，不是偶然噪声。而 300 秒
+    在第 1 道那里稳稳过关（300 > 180），只有拿距离才拦得住。
+
+    **不需要任何速度模型**，只需要「更远不可能更快」这一条。余量也足够大：库里
+    距离 1 个恒星系的实测是 932–960 秒，是这道门槛的三倍以上。
+
+    `same_system=None` 表示调用方不知道位置关系，此时**只过第 1 道**——宁可漏判，
+    也不要在缺少事实时凭空拒绝一个可能正确的值。
+
+    下限只对 `MISSION_KIND_ATTACK` 生效。**其余发次原样放行**，包括侦察和将来
+    新增的发次类型：一条没被量过的下限没有理由套用攻击的经验值，而侦察那批历史值
+    自己就疑似截断产物、量不出下限来。侦察靠读全校验那一道防，不靠这一道。
+
+    返回 None 的归宿与解析失败完全相同，见 `parse_game_duration()`。
+    """
+    if flight is None:
+        return None
+    if mission_kind != MISSION_KIND_ATTACK:
+        return flight
+    if flight < MIN_CREDIBLE_ATTACK_FLIGHT:
+        return None
+    if same_system is False and flight <= SAME_SYSTEM_ATTACK_FLIGHT:
+        return None
+    return flight
