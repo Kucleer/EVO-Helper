@@ -340,6 +340,24 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
 .delta-up { color: var(--ok); }
 .delta-down { color: var(--danger); }
 
+/* 补录日志的尾巴。补录最坏要跑十几分钟，这块是页面上唯一的进度来源，所以它
+   要能一直往下长又不把整页撑开——固定高度 + 自己滚。 */
+.log-tail {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .muted { color: var(--text-muted); }
 .empty { color: var(--text-muted); padding: 28px; text-align: center; border: 1px dashed var(--border-strong); border-radius: var(--radius); }
 .error { color: var(--danger); border: 1px solid #562b2a; background: #2a1817; border-radius: 4px; padding: 9px 12px; }

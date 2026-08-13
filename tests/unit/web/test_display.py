@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from evo_helper.application.backfill import BackfillPhase
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scheduler import MissionKind, TaskStatus
 from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS
 from evo_helper.web.display import (
+    BACKFILL_PHASE_GLYPHS,
+    BACKFILL_PHASE_TONES,
     BATTLE_RESULT_LABELS,
     DISPATCH_STATE_LABELS,
     LIST_SHIP_COLUMNS,
@@ -14,6 +17,8 @@ from evo_helper.web.display import (
     STATUS_TONES,
     TARGET_KIND_GLYPHS,
     TARGET_KIND_TONES,
+    missing_backfill_kind_labels,
+    missing_backfill_phases,
     missing_intel_labels,
     missing_status_tones,
 )
@@ -87,3 +92,23 @@ def test_no_two_dispatch_states_share_a_label() -> None:
 
 def test_no_two_battle_results_share_a_label() -> None:
     assert len(set(BATTLE_RESULT_LABELS.values())) == len(BATTLE_RESULT_LABELS)
+
+
+def test_every_backfill_phase_has_its_own_slot() -> None:
+    """补录六档一个都不能少。
+
+    最不能混的是「补录完成」与「补录失败」：失败意味着那批战报还躺在信箱里，
+    而任务马上要拿这份仍然不全的数据去决定要不要再打一遍。
+    """
+    assert missing_backfill_phases() == []
+    assert len(BACKFILL_PHASE_TONES) == len(BackfillPhase)
+
+
+def test_no_two_backfill_phases_share_a_glyph() -> None:
+    """色永远配一个字形：两档共用一个字形，在灰度下、对色盲用户就等于合并了。"""
+    assert len(set(BACKFILL_PHASE_GLYPHS.values())) == len(BackfillPhase)
+
+
+def test_every_backfill_chain_has_a_label() -> None:
+    """页面上那个下拉框按它建，漏一条就等于那条链路在页面上补不了。"""
+    assert missing_backfill_kind_labels() == []

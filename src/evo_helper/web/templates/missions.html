@@ -37,16 +37,96 @@
     <span class="inline-label">当前</span>
     <span id="current-line" class="muted">没有任务在跑</span>
     <span class="spacer"></span>
-    <button class="btn primary small" type="button" id="btn-start"
-            data-endpoint="/api/scheduler/start">开始</button>
+    {#
+      「先对账再跑任务」默认勾着。取消勾选＝跳过启动对账，那是给「刚停了两分钟
+      又点开始、明知没有欠账」准备的口子，不是常规走法——所以它是一个要动手取消
+      的复选框，而不是一个要动手勾上的。
+    #}
+    <label class="inline-label" for="start-reconcile" style="cursor:pointer">
+      <input type="checkbox" id="start-reconcile" checked>先对账再跑任务
+    </label>
+    <button class="btn primary small" type="button" id="btn-start">开始</button>
     <button class="btn small" type="button" id="btn-stop"
             data-endpoint="/api/scheduler/stop">结束</button>
   </div>
   <p class="muted" style="margin:8px 0 0;font-size:12px">
     点「开始」之后调度器常驻运行，自己决定什么时候起哪条链路，直到点「结束」。
     任何时刻最多一个子进程在点鼠标。控制台重启后一律停在「已停止」。
+    <br>
+    「开始」会<b>先跑一趟战报对账</b>（海盗、bot 各一趟），读完信箱里应读未读的战报
+    再放行任务——不然已经打赢的目标会被当成还要再打，配额也会数少。
+    没有欠账时那一趟几十秒就走完（信箱单子一空就早停）。
   </p>
 </section>
+
+{#
+  战报补录 / 对账。手动触发，**不进调度**：它是修复工具，会独占游戏窗口十几分钟，
+  做成定时任务就会跟正经的攻击轮抢窗口。
+
+  它反过来**优先于**任务：补录改的正是任务读来做决策的那批数据（战报在不在库里
+  决定 bot 目标要不要再打一遍、海盗还剩几次配额）。所以补录一排上，正在跑的扫描
+  会被抢占，海盗/bot 则等它自己跑完（硬杀会留下一发飞出去了却没记账的舰队），
+  期间一个任务都不起。
+#}
+{% if backfill_enabled %}
+<section class="panel" aria-labelledby="backfill-head">
+  <h2 id="backfill-head">战报补录</h2>
+  <div class="filter-bar">
+    <span class="inline-label">状态</span>
+    <span class="chip" id="backfill-phase">
+      <span class="glyph" aria-hidden="true">○</span><span id="backfill-word">未在补录</span>
+    </span>
+    <span class="muted" id="backfill-detail"></span>
+    <span class="spacer"></span>
+    <span class="inline-label">链路</span>
+    <select id="backfill-kind" aria-label="补哪条链路的战报">
+      {% for kind, label in backfill_kind_labels.items() %}
+        <option value="{{ kind }}">{{ label }}</option>
+      {% endfor %}
+    </select>
+    <span class="inline-label">起始日期（UTC）</span>
+    {#
+      默认退一天，由服务端算（浏览器算的是 UTC+8，早上 8 点之前会差一天）。
+      **默认「今天」是反的**：昨夜漏掉的那批会被整批藏起来，而漏掉的恰恰是昨夜的。
+    #}
+    <input type="date" id="backfill-since" value="{{ backfill_default_since }}"
+           aria-label="补录起始日期，按 UTC 日算">
+    <button class="btn small" type="button" id="btn-backfill">开始补录</button>
+    <button class="btn small" type="button" id="btn-backfill-cancel" hidden>取消补录</button>
+    <button class="btn primary small" type="button" id="btn-backfill-resume" hidden>继续任务</button>
+  </div>
+  {# 400 / 409 显示在这里。静默失败等于把后端那句中文说明扔了。 #}
+  <p class="chip danger" id="backfill-error" role="status" style="margin:10px 0 0" hidden></p>
+
+  {#
+    跑完摆出「改了什么」，**用户看过点「继续任务」才放行**。三个数分别是：
+    补进来几份、认领上几发（认领上了才影响任务决策）、几个 bot 目标从「还要打」
+    变成了「已完成」——最后那个就是省下来的重复攻击。
+  #}
+  <div id="backfill-summary" hidden style="margin-top:10px">
+    <div class="filter-bar">
+      <span class="chip ok"><span class="glyph" aria-hidden="true">★</span>这一批改了什么</span>
+      <span class="muted">新入库战报 <b id="backfill-reports">0</b></span>
+      <span class="sep" role="separator"></span>
+      <span class="muted">认领上派遣 <b id="backfill-claimed">0</b></span>
+      <span class="sep" role="separator"></span>
+      <span class="muted">bot 目标不用再打 <b id="backfill-settled">0</b>
+        <span id="backfill-measured"></span></span>
+    </div>
+  </div>
+
+  {#
+    日志尾巴。补录最坏要跑十几分钟（60 封 × 约 15 秒），除了它页面上没有别的
+    进度来源——「点了没反应」正是这一块要防的。
+  #}
+  <pre id="backfill-log" class="log-tail" hidden aria-label="补录日志的最后几十行"></pre>
+  <p class="muted" style="margin:8px 0 0;font-size:12px">
+    只读：不删邮件、不领奖励、不派遣舰队。补录期间<b>一个任务都不起</b>；
+    跑完不自动放行，看过上面那几个数再点「继续任务」。
+    完整日志在 <span class="coord" id="backfill-log-path">var/logs/backfill-*.log</span>。
+  </p>
+</section>
+{% endif %}
 
 <section class="panel" aria-labelledby="tasks-head">
   <h2 id="tasks-head">任务</h2>
@@ -200,6 +280,10 @@
   // 由 /api/scheduler 算好送来。
   const STATUS_TONES = {{ status_tones | tojson }};
   const STATUS_GLYPHS = {{ status_glyphs | tojson }};
+  // 补录六档状态的色调与字形，同样由服务端下发。
+  const BACKFILL_TONES = {{ backfill_phase_tones | tojson }};
+  const BACKFILL_GLYPHS = {{ backfill_phase_glyphs | tojson }};
+  const BACKFILL_ENABLED = {{ backfill_enabled | tojson }};
   // 链路的中文名。任务没起名时用它兜底——服务端下发的 label 已经做过这一步，
   // 这里只在建行的说明文字上用。
   const MISSION_LABELS = {{ mission_labels | tojson }};
@@ -428,6 +512,7 @@
   // ---- 渲染 ---------------------------------------------------------------
 
   let latest = null;
+  let latestBackfill = null;
 
   function render(state) {
     latest = state;
@@ -607,6 +692,11 @@
       currentLine.textContent =
         `${latest.current.label} · 已运行 ${elapsed(latest.current.started_at_utc, now)} · ${latest.current.log_path}`;
       currentLine.className = '';
+    } else if (latestBackfill && latestBackfill.blocking) {
+      // 补录扣着窗口时，任务那几行会一直显示「待命」而什么都不起。不把原因写在
+      // 这里的话，那看起来就是调度器坏了——而它其实正在按顺序办事。
+      currentLine.textContent = `任务已暂停：${latestBackfill.phase}（补录优先于任务）`;
+      currentLine.className = '';
     } else {
       currentLine.textContent = latest.running ? '空转中，暂时没有链路有活干' : '没有任务在跑';
       currentLine.className = 'muted';
@@ -624,6 +714,74 @@
     return EVOHelper.post(endpoint).then(refresh).catch(fail);
   }
 
+  // ---- 战报补录 -----------------------------------------------------------
+  //
+  // 手动补录与「开始」时的启动对账是**同一套机制**：这一段只显示状态，判据
+  // （谁先谁后、什么时候能起任务）全在服务端。页面上抄一份就会出现「页面说在
+  // 等任务、调度器其实已经在补录」。
+
+  const backfillBox = document.getElementById('backfill-phase');
+  const backfillError = document.getElementById('backfill-error');
+
+  function showBackfillError(message) {
+    if (!backfillError) return;
+    backfillError.textContent = message;
+    backfillError.hidden = !message;
+  }
+
+  function renderBackfill(state) {
+    latestBackfill = state;
+    const tone = BACKFILL_TONES[state.phase] || '';
+    backfillBox.className = `chip ${tone}`.trim();
+    backfillBox.querySelector('.glyph').textContent = BACKFILL_GLYPHS[state.phase] || '·';
+    // 链路与起始日期跟在状态后面：「补录完成」不说补的是哪条链路，就是一个
+    // 没有主语的对勾。
+    const scope = state.label ? `${state.label} · 起自 ${state.since} · ${state.reason}` : '';
+    document.getElementById('backfill-word').textContent =
+      scope ? `${state.phase}（${scope}）` : state.phase;
+    document.getElementById('backfill-detail').textContent = state.detail || '';
+
+    // 排着或跑着时不给再排一趟：一个游戏窗口，一只鼠标。后端也会 409，
+    // 但用户不该点下去才发现。
+    const busy = state.blocking && !state.awaiting_ack;
+    document.getElementById('btn-backfill').disabled = busy;
+    document.getElementById('btn-backfill-cancel').hidden = !busy;
+    document.getElementById('btn-backfill-resume').hidden = !state.awaiting_ack;
+
+    const summary = state.summary;
+    const summaryBox = document.getElementById('backfill-summary');
+    summaryBox.hidden = !summary;
+    if (summary) {
+      document.getElementById('backfill-reports').textContent = summary.reports_ingested;
+      document.getElementById('backfill-claimed').textContent = summary.dispatches_claimed;
+      document.getElementById('backfill-settled').textContent = summary.bot_targets_settled;
+      // 「量了 0 个」和「一个都没变」不是一回事：没有参与调度的 bot 任务时，
+      // 那个 0 的意思是没量，写成「0 个不用再打」是一句假话。
+      document.getElementById('backfill-measured').textContent =
+        summary.bot_targets_measured
+          ? `／ 共 ${summary.bot_targets_measured} 个`
+          : '（没有参与调度的 bot 任务，这一项没量）';
+    }
+
+    const log = document.getElementById('backfill-log');
+    log.hidden = !state.log_tail;
+    log.textContent = state.log_tail || '';
+    if (state.log_path) document.getElementById('backfill-log-path').textContent = state.log_path;
+  }
+
+  function refreshBackfill() {
+    if (!BACKFILL_ENABLED) return Promise.resolve();
+    return EVOHelper.get('/api/backfill').then(renderBackfill).catch(showBackfillError);
+  }
+
+  function backfillCommand(endpoint) {
+    showBackfillError('');
+    return EVOHelper.post(endpoint)
+      .then(renderBackfill)
+      .then(refresh)
+      .catch((error) => showBackfillError(error.detail || error.message));
+  }
+
   function patch(taskId, payload) {
     showError('');
     return EVOHelper.request('PATCH', `/api/missions/${taskId}`, payload)
@@ -631,8 +789,37 @@
       .catch((error) => { fail(error); return refresh(); });
   }
 
-  for (const id of ['btn-start', 'btn-stop', 'btn-force-kill']) {
+  for (const id of ['btn-stop', 'btn-force-kill']) {
     document.getElementById(id).onclick = (event) => command(event.currentTarget.dataset.endpoint);
+  }
+
+  // 「开始」带一个请求体：勾着就先对账。**不给请求体等于对账**（服务端的默认
+  // 值就是做），所以这里送的是取消勾选时的那个 false，而不是反过来。
+  document.getElementById('btn-start').onclick = () => {
+    showError('');
+    const reconcile = document.getElementById('start-reconcile').checked;
+    return EVOHelper.post('/api/scheduler/start', { reconcile })
+      .then(refresh)
+      .then(refreshBackfill)
+      .catch(fail);
+  };
+
+  if (BACKFILL_ENABLED) {
+    document.getElementById('btn-backfill').onclick = () => {
+      showBackfillError('');
+      const payload = {
+        kind: document.getElementById('backfill-kind').value,
+        since: document.getElementById('backfill-since').value,
+      };
+      return EVOHelper.post('/api/backfill', payload)
+        .then(renderBackfill)
+        .then(refresh)
+        .catch((error) => showBackfillError(error.detail || error.message));
+    };
+    document.getElementById('btn-backfill-cancel').onclick =
+      () => backfillCommand('/api/backfill/cancel');
+    document.getElementById('btn-backfill-resume').onclick =
+      () => backfillCommand('/api/backfill/resume');
   }
 
   document.getElementById('btn-new-task').onclick = () => {
@@ -749,8 +936,12 @@
   });
 
   refresh();
+  refreshBackfill();
   // 状态区单独轮询，**不刷整页**——刷整页会清掉用户正在输入的参数框。
   setInterval(refresh, 2000);
+  // 补录跟着一起轮询：它最坏要跑十几分钟，日志尾巴要一直往前走，否则页面上
+  // 看起来就是「点了没反应」。
+  setInterval(refreshBackfill, 2000);
   // 秒表本地走，免得只有轮询到了才跳一下。
   setInterval(tickClock, 1000);
 })();

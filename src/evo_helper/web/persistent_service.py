@@ -11,6 +11,15 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from evo_helper.application.backfill import (
+    BACKFILL_KINDS,
+    LOG_TAIL_LINES,
+    REASON_MANUAL,
+    BackfillBusyError,
+    BackfillPhase,
+    BackfillRequest,
+    BackfillState,
+)
 from evo_helper.application.mission_freeze import FrozenTask, MissionConfigFreeze
 from evo_helper.application.mission_scheduler import MissionScheduler, SchedulerSnapshot
 from evo_helper.domain.missions import (
@@ -36,10 +45,12 @@ from evo_helper.storage.intel import (
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
 
-from .display import MISSION_LABELS, PARAM_LABELS
+from .display import BACKFILL_KIND_LABELS, MISSION_LABELS, PARAM_LABELS
 from .service import (
     AttackLogOptions,
     AttackLogView,
+    BackfillSummaryView,
+    BackfillView,
     BotTargetView,
     ConfigFreezeView,
     ConflictError,
@@ -737,13 +748,143 @@ class MissionConsoleService:
 
     # -- 开关 ------------------------------------------------------------------
 
-    def start_scheduler(self) -> SchedulerView:
-        self._scheduler.start()
+    def start_scheduler(self, *, reconcile: bool = True) -> SchedulerView:
+        """点「开始」。**默认先对账再放行任务**（用户口径 2026-08-13）。
+
+        `reconcile=False` 是页面上那个「跳过启动对账」的复选框：刚停了两分钟又
+        点开始、明知没有欠账时不必再翻一趟信箱。默认是做——默认跳过等于把这条
+        修复关掉，而它要防的是「拿不全的数据决定要不要再打一遍」。
+
+        **补录正在跑或正在排队时拒绝**（409）。理由和「起任务」那道闸门是同一
+        条：一个游戏窗口、一只鼠标。区别只在这一层拦得更早——让用户点下去、
+        看着调度器开着却一个任务都不起，比当场说明白糟得多。
+
+        只拦「停 → 开」这一次跃迁：调度器**已经开着**时这一下本来就是空操作
+        （`MissionScheduler.start` 自己会 return），而启动对账恰恰是它自己排出来
+        的——不加这个条件，点一次「开始」之后紧接着再点一次就会被自己排的那批
+        补录 409 掉。
+        """
+        state = self._scheduler.backfill_state()
+        if not self._scheduler.enabled and state.active:
+            raise ConflictError(
+                f"正在{state.phase.value}（{_backfill_label(state.kind)}），"
+                "补录期间不能启动调度器；等它跑完，或先点「取消补录」"
+            )
+        self._scheduler.start(reconcile=reconcile)
         return self.scheduler_view()
 
     def stop_scheduler(self) -> SchedulerView:
         self._scheduler.stop()
         return self.scheduler_view()
+
+    # -- 战报补录 --------------------------------------------------------------
+
+    def backfill_view(self) -> BackfillView:
+        return self._backfill_view()
+
+    def start_backfill(
+        self,
+        kind: str,
+        since: date,
+        *,
+        max_pages: int | None = None,
+        max_opens: int | None = None,
+    ) -> BackfillView:
+        """手动补录。**不进调度**：它是修复工具，不是日常任务。
+
+        起始日期在未来一律拒：那趟信箱翻下来必然一封都不匹配，而它要占着游戏
+        窗口十几分钟，跑完还显示「补录完成」——一句看着正常的假话。
+        """
+        if kind not in BACKFILL_KINDS:
+            raise ServiceError(f"补录链路只能是 {' / '.join(BACKFILL_KINDS)}（收到 {kind!r}）")
+        today = self._scheduler.now_utc().astimezone(UTC).date()
+        if since > today:
+            raise ServiceError(f"起始日期在未来（{since.isoformat()} > {today.isoformat()}）")
+        try:
+            self._scheduler.request_backfill(
+                BackfillRequest(
+                    kind=kind,
+                    since=since,
+                    reason=REASON_MANUAL,
+                    max_pages=max_pages,
+                    max_opens=max_opens,
+                )
+            )
+        except BackfillBusyError as exc:
+            raise ConflictError(str(exc)) from exc
+        return self._backfill_view()
+
+    def cancel_backfill(self) -> BackfillView:
+        """「取消补录」：排队中的撤掉，跑着的杀掉，之后立刻放行任务。"""
+        self._scheduler.cancel_backfill()
+        return self._backfill_view()
+
+    def resume_after_backfill(self) -> BackfillView:
+        """「继续任务」：用户看过摘要，放任务出来。
+
+        **补录跑完不自动放行**，所以这一下是必需的一步而不是装饰：用户要在
+        放行之前看一眼「认领上了几发、几个 bot 目标不用再打了」。
+        """
+        self._scheduler.acknowledge_backfill()
+        return self._backfill_view()
+
+    def _backfill_view(self) -> BackfillView:
+        state = self._scheduler.backfill_state()
+        summary = state.summary
+        return BackfillView(
+            phase=state.phase.value,
+            kind=state.kind,
+            label=_backfill_label(state.kind),
+            since="" if state.since is None else state.since.isoformat(),
+            reason=state.reason,
+            started_at_utc=state.started_at_utc,
+            ended_at_utc=state.ended_at_utc,
+            exit_code=state.exit_code,
+            log_path="" if state.log_path is None else str(state.log_path),
+            # 日志尾巴认的是**这一趟自己那份状态里的路径**，没有请求过就没有路径、
+            # 也就没有尾巴。不认状态、按链路名去猜一个路径的话，「未在补录」旁边
+            # 会摆着上一次留下的输出——一段没有主语的日志。
+            log_tail=self.backfill_log_tail(),
+            queued=state.queued,
+            blocking=state.blocking,
+            awaiting_ack=state.blocking and not state.active,
+            detail=self._backfill_detail(state),
+            summary=(
+                None
+                if summary is None
+                else BackfillSummaryView(
+                    reports_ingested=summary.reports_ingested,
+                    dispatches_claimed=summary.dispatches_claimed,
+                    bot_targets_settled=summary.bot_targets_settled,
+                    bot_targets_measured=summary.bot_targets_measured,
+                )
+            ),
+        )
+
+    def _backfill_detail(self, state: BackfillState) -> str:
+        """状态旁边那句随行的事实。
+
+        `PENDING` 那一档必须说清楚**在等谁**：页面上只写「等任务结束」的话，
+        用户看到的是一个半小时不动的状态条，而它其实完全正常——海盗那一轮就是
+        要跑那么久，而硬杀它会留下一发飞出去了却没记账的舰队。
+        """
+        if state.phase is BackfillPhase.PENDING:
+            running = self._scheduler.current
+            queued = f"；后面还排着 {state.queued} 趟" if state.queued else ""
+            if running is None:
+                return f"窗口空着，马上开始{queued}"
+            label = running.name or MISSION_LABELS.get(running.kind.value, running.kind.value)
+            return f"在等「{label}」这一轮自己跑完（不硬杀：硬杀会留下没记账的派遣）{queued}"
+        if state.phase is BackfillPhase.RUNNING:
+            queued = f"；后面还排着 {state.queued} 趟" if state.queued else ""
+            return f"正在翻信箱，这期间一个任务都不起{queued}"
+        if state.blocking:
+            return "任务已暂停：看过下面这几个数，点「继续任务」放行"
+        return ""
+
+    def backfill_log_tail(self) -> str:
+        """补录日志的尾巴。页面上那块滚动区读它。"""
+        return self._scheduler.backfill_log_tail(LOG_TAIL_LINES)
 
     def force_kill(self) -> SchedulerView:
         """孤儿红条上的「强制结束」。
@@ -1200,6 +1341,17 @@ def _parse_origin(text: str) -> Coordinate:
         return Coordinate(galaxy, system, position)
     except ValueError as exc:
         raise ServiceError(f"出发星球 {text!r} 不是一个合法坐标：{exc}") from exc
+
+
+def _backfill_label(kind: str | None) -> str:
+    """补录链路的中文名。没有请求时是空串，认不出来就原样显示。
+
+    认不出来时回落到原值而不是「未知」：宁可在页面上露出一个英文取值，也不要
+    把「补的到底是哪条链路」这件事换成一句没有信息的话。
+    """
+    if kind is None:
+        return ""
+    return BACKFILL_KIND_LABELS.get(kind, kind)
 
 
 def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:

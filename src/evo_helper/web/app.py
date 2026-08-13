@@ -19,6 +19,7 @@ from pydantic import BeforeValidator
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import Lifespan
 
+from evo_helper.application.backfill import default_since
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
@@ -30,6 +31,9 @@ from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import (
+    BACKFILL_KIND_LABELS,
+    BACKFILL_PHASE_GLYPHS,
+    BACKFILL_PHASE_TONES,
     BATTLE_RESULT_GLYPHS,
     BATTLE_RESULT_LABELS,
     BATTLE_RESULT_TONES,
@@ -48,6 +52,9 @@ from .display import (
 # 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
 from .persistent_service import MissionConsoleService, PersistentApplicationService
 from .schemas import (
+    BackfillOut,
+    BackfillStartIn,
+    BackfillSummaryOut,
     BotTargetOut,
     ConfigFreezeOut,
     CoordinateModel,
@@ -70,6 +77,7 @@ from .schemas import (
     ScanRangeIn,
     ScanRangeOut,
     SchedulerOut,
+    SchedulerStartIn,
     StateEventOut,
 )
 from .security import LocalSecurityMiddleware, default_local_token
@@ -79,6 +87,7 @@ from .service import (
     PLANET_KINDS,
     SHANGHAI,
     ApplicationService,
+    BackfillView,
     BotTargetView,
     ConfigFreezeView,
     FakeApplicationService,
@@ -549,6 +558,17 @@ def create_app(
                 "mission_labels": MISSION_LABELS,
                 "status_tones": STATUS_TONES,
                 "status_glyphs": STATUS_GLYPHS,
+                # 补录那一段只在常驻 app 上出现：假服务那条路没有调度器，
+                # `/api/backfill` 压根不存在，渲染出来只会是一块点了就报错的面板。
+                "backfill_enabled": console is not None,
+                "backfill_kind_labels": BACKFILL_KIND_LABELS,
+                "backfill_phase_tones": BACKFILL_PHASE_TONES,
+                "backfill_phase_glyphs": BACKFILL_PHASE_GLYPHS,
+                # 起始日期的默认值由**服务端**算：浏览器算的是本地时区
+                # （UTC+8），而这个日期是 UTC 日，早上 8 点之前算出来会差一天。
+                # 默认退一天的理由见 `application.backfill.default_since`——
+                # 默认「今天」会把昨夜漏掉的那批整批藏起来。
+                "backfill_default_since": default_since(datetime.now(UTC)).isoformat(),
                 "runs": [] if console is None else console.recent_runs(limit=50),
                 # 历次「开始」固化下来的配置。**本轮**那一份不在这里，它由
                 # /api/scheduler 随状态一起下发——刚点完「开始」就要看得见，
@@ -926,6 +946,36 @@ def _config_freeze_out(freeze: ConfigFreezeView) -> ConfigFreezeOut:
     )
 
 
+def _backfill_out(view: BackfillView) -> BackfillOut:
+    summary = view.summary
+    return BackfillOut(
+        phase=view.phase,
+        kind=view.kind,
+        label=view.label,
+        since=view.since,
+        reason=view.reason,
+        started_at_utc=view.started_at_utc,
+        ended_at_utc=view.ended_at_utc,
+        exit_code=view.exit_code,
+        log_path=view.log_path,
+        log_tail=view.log_tail,
+        queued=view.queued,
+        blocking=view.blocking,
+        awaiting_ack=view.awaiting_ack,
+        detail=view.detail,
+        summary=(
+            None
+            if summary is None
+            else BackfillSummaryOut(
+                reports_ingested=summary.reports_ingested,
+                dispatches_claimed=summary.dispatches_claimed,
+                bot_targets_settled=summary.bot_targets_settled,
+                bot_targets_measured=summary.bot_targets_measured,
+            )
+        ),
+    )
+
+
 def _scheduler_out(view: SchedulerView) -> SchedulerOut:
     return SchedulerOut(
         running=view.running,
@@ -973,9 +1023,18 @@ def register_mission_routes(app: FastAPI) -> None:
 
     @app.post("/api/scheduler/start", response_model=SchedulerOut)
     def scheduler_start(
+        payload: SchedulerStartIn | None = None,
         console: MissionConsoleService = Depends(get_console),
     ) -> SchedulerOut:
-        return _scheduler_out(console.start_scheduler())
+        """点「开始」。**默认先跑一趟战报对账，跑完才放行任务。**
+
+        请求体整个可以省略（桌面悬浮窗和文档里那条 curl 都不带体），省略时
+        按默认值走。要跳过对账得显式送 `{"reconcile": false}`——默认跳过等于
+        把这条修复关掉。
+        """
+        return _scheduler_out(
+            console.start_scheduler(reconcile=True if payload is None else payload.reconcile)
+        )
 
     @app.post("/api/scheduler/stop", response_model=SchedulerOut)
     def scheduler_stop(
@@ -1039,6 +1098,51 @@ def register_mission_routes(app: FastAPI) -> None:
         console: MissionConsoleService = Depends(get_console),
     ) -> MissionTaskOut:
         return _mission_task_out(console.restart_bot_round(task_id))
+
+    # ---- 战报补录 --------------------------------------------------------
+    #
+    # 手动触发，**不进调度**：它是修复工具，会独占游戏窗口十几分钟，做成定时
+    # 任务就会跟正经的攻击轮抢窗口。为什么它反过来优先于任务，见
+    # `application.backfill` 的模块头。
+
+    @app.get("/api/backfill", response_model=BackfillOut)
+    def backfill_state(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> BackfillOut:
+        return _backfill_out(console.backfill_view())
+
+    @app.post("/api/backfill", response_model=BackfillOut, status_code=202)
+    def start_backfill(
+        payload: BackfillStartIn,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> BackfillOut:
+        """排一趟补录。**202 而不是 201**：这一下只是排上了。
+
+        窗口可能还在海盗那一轮手上（那一轮不硬杀，要等它自己跑完），所以
+        「收下了」和「开跑了」必须分得开——回 201 会让人以为鼠标已经在动了。
+        """
+        return _backfill_out(
+            console.start_backfill(
+                payload.kind,
+                payload.since,
+                max_pages=payload.max_pages,
+                max_opens=payload.max_opens,
+            )
+        )
+
+    @app.post("/api/backfill/cancel", response_model=BackfillOut)
+    def cancel_backfill(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> BackfillOut:
+        """排队中的撤掉，跑着的杀掉，之后立刻放行任务。"""
+        return _backfill_out(console.cancel_backfill())
+
+    @app.post("/api/backfill/resume", response_model=BackfillOut)
+    def resume_after_backfill(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> BackfillOut:
+        """「继续任务」：用户看过摘要，放任务出来。"""
+        return _backfill_out(console.resume_after_backfill())
 
 
 async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:
