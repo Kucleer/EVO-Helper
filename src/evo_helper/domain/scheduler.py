@@ -15,6 +15,8 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import assert_never
 
+from evo_helper.domain.models import Coordinate
+
 #: 同一条**攻击**链路两次启动之间的最小间隔。
 #:
 #: 堵的是「立即收取」的空转：`expected_report_at_utc` 为 NULL 时战报判据恒为
@@ -49,12 +51,17 @@ EXIT_ENVIRONMENT_BUSY = 75
 #: 的上限兜底（见 `application.mission_scheduler`）。
 ENVIRONMENT_FAULT_WINDOW = timedelta(minutes=15)
 
-#: 至少要有这么多条**不同**链路一起失败，才谈得上「环境坏了」。
+#: 至少要有这么多个**不同任务**一起失败，才谈得上「环境坏了」。
 #:
 #: 必须是 2 而不是 1：1 就等于「所有失败都不算失败」，自动停用直接失效。
-#: 也不该是 3——三条链路里可能只有两条启用着，要求三条会让这条判据在最常见的
+#: 也不该是 3——启用着的任务可能只有两个，要求三个会让这条判据在最常见的
 #: 配置下永远不成立。
-ENVIRONMENT_FAULT_KINDS = 2
+#:
+#: 口径从「不同链路」放宽到「不同任务」是多任务带来的：两个 bot 任务共用同一个
+#: 游戏窗口、同一只鼠标，它们一起倒同样是那些共用的东西坏了的证据。代价是两个
+#: 配置写错的 bot 任务会互相佐证——但配置不合格走的是 `disable_mission_task`
+#: 那条路（不计失败），而豁免本身有上限（`MAX_ENVIRONMENT_EXEMPTIONS`）。
+ENVIRONMENT_FAULT_TASKS = 2
 
 
 class MissionKind(Enum):
@@ -106,102 +113,158 @@ class TaskStatus(Enum):
 
 @dataclass(frozen=True)
 class TaskSnapshot:
+    """一个任务的身份与配置。**同一 `kind` 可以有多行**（用户口径 2026-08-13：
+    「可能会新增多个同一个类型的任务，比如 2 个 bot 攻击」）。
+
+    因此判据一律按 `task_id` 认人，不再按 `kind` 认人：按 kind 认的话，两个 bot
+    任务会共用冷却、共用「上一轮空手而归」，一个刚跑完就把另一个压住五分钟。
+    """
+
+    task_id: int
     kind: MissionKind
+    #: 用户给这个任务起的名字。**只用于显示与记账**，判据一个字都不看它。
+    name: str
     enabled: bool
     priority: int
+    #: 出发星球。**航线上限是按星球各一份的**（用户口径 2026-08-13），所以它不只
+    #: 是显示值：占用只算同一颗星球上的在飞派遣，见 `free_lines_for`。
+    origin: Coordinate
+    #: 这个任务允许在它那颗出发星球上占用几条航线。
+    fleet_lines: int
     #: 连续失败被自动停用的原因。非空即视为不参与调度。
     disabled_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class RunningProcess:
+    task_id: int
     kind: MissionKind
     started_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class TaskFacts:
+    """**某一个任务**自己的事实。按 `task_id` 挂在 `SchedulerFacts.per_task` 上。
+
+    分成两层（任务一层、账号一层）是因为两类事实的作用域本来就不同：航线按
+    **星球**算，海盗每天 32 次按**账号**算。把它们摊平在一个扁平的结构里，迟早
+    有人拿账号级的数去判一颗星球，或者反过来。
+    """
+
+    #: 这个任务此刻还能派几发。**已经把它自己的航线数、以及它那颗出发星球上的
+    #: 在飞数算进去了**（`free_lines_for`）。
+    #:
+    #: 它是**乐观估算**，不含用户自己派出去的舰队。权威的航线闸门在 runner 的
+    #: `game.capacity.LineCapacityGate` 里——它看屏。估高了不会误派，但**也不是
+    #: 没有代价**：runner 空跑那一轮要几十秒导航，还一直占着鼠标，而且错估没有
+    #: 回写路径，同一轮会每隔一个 `RESTART_COOLDOWN` 原样再来。兜这一层的是
+    #: `waiting_for_a_line`。
+    free_lines: int = 0
+    #: 来自 `ReportWaitPlanner.plan(...).action is WaitAction.COLLECT`，
+    #: **不是**自己另写一份 SQL 判据——规格明令只能有一份战报判据。
+    #: `expected_report_at_utc` 为 NULL（飞行时间没读到）时 planner 的语义
+    #: 是「立即收取」，若自建 `WHERE expected_report_at_utc <= now_utc`
+    #: 会把这一档漏掉。
+    reports_due: bool = False
+    #: 仅 BOT：本轮范围内还有几个目标没走完流程。
+    targets_remaining: int = 0
+    #: 上一次**启动**的时刻（不是上一次结束）。冷却按启动算：一个刚起来就秒退的
+    #: runner，正是最该被节流的那种。事实来自 `mission_runs` 里该任务的最大
+    #: `started_at_utc`，这一层不去查库。
+    last_started_at_utc: datetime | None = None
+    #: 最近一次从**这个任务的出发星球**上真的把舰队派出去的时刻。和上一条比大小，
+    #: 就知道上一轮是不是从头跑到尾一发都没派出去，见 `came_back_empty`。
+    last_dispatch_at_utc: datetime | None = None
+    #: **这颗出发星球上**已知最早会空出来的那条航线在什么时刻空。一条在飞记录都
+    #: 没有（或全是航线钟读不到的那种）时为 None。`free_lines` 说的是「现在有
+    #: 几条」，这一条说的是「下一条什么时候来」——`free_lines` 被现场推翻之后，
+    #: 只有后者能给出一个值得再试的时刻。
+    next_line_free_at_utc: datetime | None = None
+    #: 上一次**自己退、且退出码非 0** 的时刻（正常收尾、抢占、用户点停都不算）。
+    #: 只有 `cooling_down` 用它，而且只对 `SCAN` 用——理由写在那里。
+    #:
+    #: 口径比「算不算连续失败」宽一档：`EXIT_ENVIRONMENT_BUSY` 不计入失败，
+    #: 但照样要冷却——用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
+    #: 由调用方按本次控制台运行期间的记忆填，这一层不去查库。
+    last_failure_at_utc: datetime | None = None
+
+
+#: 没有任何事实的任务看到的那一份。`free_lines=0` 是有意的保守值：
+#: 事实没读到就当作「派不了」，而不是当作「随便派」。
+NO_FACTS = TaskFacts()
 
 
 @dataclass(frozen=True)
 class SchedulerFacts:
     """一次调度所需的全部事实，全部来自数据库。
 
-    `free_lines` 是**乐观估算**，不含用户自己派出去的舰队。权威的航线闸门
-    在 runner 的 `game.capacity.LineCapacityGate` 里——它看屏。估高了不会误派，
-    但**也不是没有代价**：runner 空跑那一轮要几十秒导航，还一直占着鼠标，而且
-    错估没有回写路径，同一轮会每隔一个 `RESTART_COOLDOWN` 原样再来。兜这一层的
-    是 `waiting_for_a_line`——它用 `last_dispatch_at_utc` 与 `next_line_free_at_utc`
-    把「上一轮空手而归」变成「等到有航线真的空出来再试」。
+    只留**账号级**的那几个；按任务分的都在 `per_task` 里。
     """
 
     now_utc: datetime
-    free_lines: int
     #: 口径是 **UTC 00:00** 起累计（对应本地早 8 点），不是本地日历天。
     #: 按本地日历数，每天 UTC 0–8 点这段会把跨天前的次数错当成当天的，
     #: 提前把配额判成用尽。
-    pirate_dispatches_today: int
-    pirate_quota: int
-    #: 收到游戏的超限邮件时写下的封锁截止时刻。比计数更硬的信号。
-    pirate_blocked_until_utc: datetime | None
-    #: 来自 `ReportWaitPlanner.plan(...).action is WaitAction.COLLECT`，
-    #: **不是**自己另写一份 SQL 判据——规格明令只能有一份战报判据。
-    #: `expected_report_at_utc` 为 NULL（飞行时间没读到）时 planner 的语义
-    #: 是「立即收取」，若自建 `WHERE expected_report_at_utc <= now_utc`
-    #: 会把这一档漏掉。
-    pirate_reports_due: bool
-    #: 同上，针对 BOT 链路，同样必须来自对应的 `ReportWaitPlanner.plan(...)`。
-    bot_reports_due: bool
-    bot_targets_remaining: int
-    #: 每条链路上一次**启动**的时刻（不是上一次结束）。冷却按启动算：
-    #: 一个刚起来就秒退的 runner，正是最该被节流的那种。
-    #: 事实来自 `mission_runs` 里各 kind 的最大 `started_at_utc`，
-    #: 这一层不去查库。
-    last_started_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
-    #: 每条链路最近一次**真的把舰队派出去**的时刻。和上一条比大小，就知道上一轮
-    #: 是不是从头跑到尾一发都没派出去，见 `came_back_empty`。
-    #: 来自 `repository.last_dispatch_at`，这一层不去查库。
-    last_dispatch_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
-    #: 已知最早会空出来的那条航线在什么时刻空。一条在飞记录都没有（或全是航线钟
-    #: 读不到的那种）时为 None。`free_lines` 说的是「现在有几条」，这一条说的是
-    #: 「下一条什么时候来」——`free_lines` 被现场推翻之后，只有后者能给出一个
-    #: 值得再试的时刻。
-    next_line_free_at_utc: datetime | None = None
-    #: 每条链路上一次**自己退、且退出码非 0** 的时刻（正常收尾、抢占、用户点停
-    #: 都不算）。只有 `cooling_down` 用它，而且只对 `SCAN` 用——理由写在那里。
     #:
-    #: 口径比「算不算连续失败」宽一档：`EXIT_ENVIRONMENT_BUSY` 不计入失败，
-    #: 但照样要冷却——用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
-    #: 由调用方按本次控制台运行期间的记忆填，这一层不去查库。
-    last_failure_at_utc: Mapping[MissionKind, datetime] = field(default_factory=dict)
+    #: ⚠️ **它是账号级的，不按星球分。** 海盗每天 32 次是游戏对账号的硬限制，
+    #: 和航线（按星球各一份）不是一回事——跟着改成按星球，等于把配额凭空翻倍，
+    #: 超了会收到超限邮件且舰队被强制返回。
+    pirate_dispatches_today: int = 0
+    pirate_quota: int = 32
+    #: 收到游戏的超限邮件时写下的封锁截止时刻。比计数更硬的信号。同样是账号级。
+    pirate_blocked_until_utc: datetime | None = None
+    #: 按 `task_id` 挂的逐任务事实。查不到的任务看到的是 `NO_FACTS`。
+    per_task: Mapping[int, TaskFacts] = field(default_factory=dict)
+
+    def of(self, task: TaskSnapshot) -> TaskFacts:
+        return self.per_task.get(task.task_id, NO_FACTS)
 
 
-def kinds_failing_together(
-    kind: MissionKind,
+def free_lines_for(task: TaskSnapshot, *, inflight_from_origin: int, reserved_lines: int) -> int:
+    """这个任务此刻还能派几发。
+
+    **`inflight_from_origin` 必须只数同一颗出发星球上的在飞派遣。** 游戏的航线
+    上限是按星球各一份的（用户口径 2026-08-13：「航线上限是按星球各一份的，不是
+    账号共享」），跨星球一起数等于把两颗星球的额度当成一份用——主星打满 6 条之后，
+    2 号星那个任务会以为自己也没位子了，一发都不派。
+
+    `reserved_lines` 是给用户自己留的缓冲，**按星球生效**：`free_lines` 只是估算
+    （数不到用户手动派出去的舰队），这几条位子就是为那段误差留的。
+    """
+    usable = max(task.fleet_lines - reserved_lines, 0)
+    return max(usable - inflight_from_origin, 0)
+
+
+def tasks_failing_together(
+    task_id: int,
     at: datetime,
-    recent_faults: Mapping[MissionKind, datetime],
+    recent_faults: Mapping[int, datetime],
     *,
     window: timedelta = ENVIRONMENT_FAULT_WINDOW,
-) -> frozenset[MissionKind]:
-    """和 `kind` 这次失败挤在同一个时间窗里的所有链路（含它自己）。
+) -> frozenset[int]:
+    """和这次失败挤在同一个时间窗里的所有任务（含它自己）。
 
-    `recent_faults` 是「每条链路最近一次**真的算故障**的退出时刻」。
+    `recent_faults` 是「每个任务最近一次**真的算故障**的退出时刻」。
     `EXIT_ENVIRONMENT_BUSY` 那一档不该进来——它本来就不计失败，拿它当佐证
-    等于让「用户在用别的窗口」去豁免另一条链路真正的崩溃。
+    等于让「用户在用别的窗口」去豁免另一个任务真正的崩溃。
 
     比 `at` 还晚的记录一律忽略：调用方按事件顺序喂进来，出现未来的时刻只能是
     时钟被调过，那时宁可少认一次环境故障，也不要凭一个说不清的差值去豁免。
     """
     return frozenset(
         other for other, moment in recent_faults.items() if moment <= at and at - moment <= window
-    ) | {kind}
+    ) | {task_id}
 
 
 def looks_like_an_environment_fault(
-    kind: MissionKind,
+    task_id: int,
     at: datetime,
-    recent_faults: Mapping[MissionKind, datetime],
+    recent_faults: Mapping[int, datetime],
     *,
     window: timedelta = ENVIRONMENT_FAULT_WINDOW,
-    min_kinds: int = ENVIRONMENT_FAULT_KINDS,
+    min_tasks: int = ENVIRONMENT_FAULT_TASKS,
 ) -> bool:
-    """这次失败该不该记到这条链路头上——不该，如果别的链路同时也在倒。
+    """这次失败该不该记到这个任务头上——不该，如果别的任务同时也在倒。
 
     **实机 2026-08-12。** 01:55「BOT 已停用（连续 3 次异常退出，退出码 1）」，
     04:37 三条**全部**已停用。三条链路共用一个游戏窗口、一个鼠标、一份网络连接
@@ -219,7 +282,7 @@ def looks_like_an_environment_fault(
     这和仓库里已有的两档豁免是同一个形状：`RoundExhausted`（资源耗尽不是失败）、
     `EXIT_ENVIRONMENT_BUSY`（抢不到前台不是失败）。缺的一直是「多条一起倒」。
     """
-    return len(kinds_failing_together(kind, at, recent_faults, window=window)) >= min_kinds
+    return len(tasks_failing_together(task_id, at, recent_faults, window=window)) >= min_tasks
 
 
 def quota_day_start_utc(now: datetime) -> datetime:
@@ -243,16 +306,19 @@ def quota_day_start_utc(now: datetime) -> datetime:
 @dataclass(frozen=True)
 class Decision:
     action: Action
-    kind: MissionKind | None = None
+    #: 该起（或该抢占换上）的那个任务。`IDLE` 时为 None。
+    #: 带整个快照而不是只带 `task_id`：调用方接下来要拿它的 `kind` 组命令行、
+    #: 拿它的 `origin` 记账，再去库里按 id 捞一遍只是给两份事实走散留机会。
+    task: TaskSnapshot | None = None
 
 
 def cooling_down(
-    kind: MissionKind,
+    task: TaskSnapshot,
     facts: SchedulerFacts,
     *,
     restart_cooldown: timedelta = RESTART_COOLDOWN,
 ) -> bool:
-    """这条链路是不是还在两次启动之间的最小间隔里。
+    """这个任务是不是还在两次启动之间的最小间隔里。
 
     **`SCAN` 只在上一次是异常退出时才冷却。** 冷却堵的 churn 是收战报特有的：
     `expected_report_at_utc` 为 NULL → 恒判「该去收」→ 进信箱扑空 → 退出 → 再来。
@@ -271,11 +337,15 @@ def cooling_down(
     起算点两档不同，也必须不同：别人按**启动**算（刚起来就秒退的 runner 正是最
     该被节流的那种），扫描按**上一次崩**算——按启动算就等于把它那条「跑完随时
     可以再来」的特性一起砍掉了。
+
+    **按任务算，不按链路算。** 两个 bot 任务各自有各自的冷却：按链路算的话，
+    主星那个任务刚跑完，2 号星那个就得干等五分钟，而它俩占的根本不是同一份航线。
     """
-    if kind is MissionKind.SCAN:
-        last_failure = facts.last_failure_at_utc.get(kind)
+    task_facts = facts.of(task)
+    if task.kind is MissionKind.SCAN:
+        last_failure = task_facts.last_failure_at_utc
         return last_failure is not None and facts.now_utc - last_failure < restart_cooldown
-    last_started = facts.last_started_at_utc.get(kind)
+    last_started = task_facts.last_started_at_utc
     return last_started is not None and facts.now_utc - last_started < restart_cooldown
 
 
@@ -292,8 +362,8 @@ def pirate_quota_exhausted(facts: SchedulerFacts) -> bool:
     return facts.pirate_dispatches_today >= facts.pirate_quota
 
 
-def came_back_empty(kind: MissionKind, facts: SchedulerFacts) -> bool:
-    """这条链路上一轮跑完，一发都没派出去。
+def came_back_empty(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
+    """这个任务上一轮跑完，一发都没派出去。
 
     判据就是两个时刻比大小：上一次启动之后再没有过一条被接受的派遣记录。
     没跑过的链路不算（没有「上一轮」可言）。
@@ -302,15 +372,19 @@ def came_back_empty(kind: MissionKind, facts: SchedulerFacts) -> bool:
     「同时派遣的舰队数量已达上限。」之后走的是正常收尾、退出码 0——和「这一圈
     没有海盗」在进程间协议上一模一样，调度器这一侧分不出来，也不该去猜。
     这里只陈述一个能查证的事实：那一轮空手而归。
+
+    ⚠️ **「派出去了」按出发星球数**（`TaskFacts.last_dispatch_at_utc` 由调用方按
+    `origin` 过滤）。跨星球一起数的话，主星那个任务派出去的一发会让 2 号星那个
+    任务看起来「上一轮有派出去」，于是它撞满航线之后照样每五分钟白跑一轮。
     """
-    started = facts.last_started_at_utc.get(kind)
+    started = facts.of(task).last_started_at_utc
     if started is None:
         return False
-    dispatched = facts.last_dispatch_at_utc.get(kind)
+    dispatched = facts.of(task).last_dispatch_at_utc
     return dispatched is None or dispatched < started
 
 
-def waiting_for_a_line(kind: MissionKind, facts: SchedulerFacts) -> bool:
+def waiting_for_a_line(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     """要不要压着这条链路，等到有一条航线真的空出来再让它去派。
 
     两个条件同时成立才压：**上一轮空手而归**，而且**还有一条在飞的舰队没回来**。
@@ -337,26 +411,33 @@ def waiting_for_a_line(kind: MissionKind, facts: SchedulerFacts) -> bool:
     一条只是在崩溃冷却里的扫描会被 `status_of` 说成「等航线」——一句用户照着
     去调航线数、调完也不会有任何变化的假话。
     """
-    if kind is MissionKind.SCAN:
+    if task.kind is MissionKind.SCAN:
         return False
-    if not came_back_empty(kind, facts):
+    if not came_back_empty(task, facts):
         return False
-    next_free = facts.next_line_free_at_utc
+    # 同样是**这颗出发星球上**下一条航线什么时候空：拿别的星球的返航时刻当闹钟，
+    # 压住的那段时间与这个任务能不能派毫无关系。
+    next_free = facts.of(task).next_line_free_at_utc
     return next_free is not None and next_free > facts.now_utc
 
 
-def bot_round_complete(facts: SchedulerFacts) -> bool:
-    """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。"""
-    return facts.bot_targets_remaining <= 0
+def bot_round_complete(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
+    """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。
+
+    每个 bot 任务各有各的范围与各自的 `round_started_at_utc`，所以它是**按任务**
+    问的：合起来数的话，两个任务里只要有一个还剩目标，另一个就永远显示不出
+    「已完成」，「重开一轮」那个按钮也就永远不出现。
+    """
+    return facts.of(task).targets_remaining <= 0
 
 
 def has_work(
-    kind: MissionKind,
+    task: TaskSnapshot,
     facts: SchedulerFacts,
     *,
     restart_cooldown: timedelta = RESTART_COOLDOWN,
 ) -> bool:
-    """这条链路现在有没有事可做。
+    """这个任务现在有没有事可做。
 
     冷却期内一律算「没活干」（`cooling_down`；`SCAN` 只在崩过之后才有冷却），
     顺位让给下一个——它是判据的一部分而不是启动前的一道额外闸门，这样抢占那一路
@@ -367,29 +448,34 @@ def has_work(
     两条攻击链路的判据都是「**有航线可派** 或 **有战报该收**」。左半边多一道
     `waiting_for_a_line`：`free_lines` 只是估算，被现场推翻过就不能再照着它起轮。
     右半边不加任何闸门——收报告不占航线。
+
+    `free_lines` 是**这个任务在它那颗出发星球上**还剩几条（见 `free_lines_for`），
+    所以「同一颗星球在飞数达到该任务的航线数就不再派」与「不同星球互不影响」
+    这两条在这里是同一个判据的两面，不需要各写一份。
     """
-    if cooling_down(kind, facts, restart_cooldown=restart_cooldown):
+    if cooling_down(task, facts, restart_cooldown=restart_cooldown):
         return False
 
-    if kind is MissionKind.SCAN:
+    if task.kind is MissionKind.SCAN:
         # 扫描不派遣，因此不受航线约束，也没有完成态。它正是用来填空隙的。
         return True
 
-    can_dispatch = facts.free_lines > 0 and not waiting_for_a_line(kind, facts)
+    can_dispatch = facts.of(task).free_lines > 0 and not waiting_for_a_line(task, facts)
 
-    if kind is MissionKind.PIRATE:
+    if task.kind is MissionKind.PIRATE:
+        # 配额是账号级的（见 `SchedulerFacts.pirate_dispatches_today`）。
         if pirate_quota_exhausted(facts):
             return False
-        return can_dispatch or facts.pirate_reports_due
+        return can_dispatch or facts.of(task).reports_due
 
-    if kind is MissionKind.BOT:
-        if bot_round_complete(facts):
+    if task.kind is MissionKind.BOT:
+        if bot_round_complete(task, facts):
             return False
-        return can_dispatch or facts.bot_reports_due
+        return can_dispatch or facts.of(task).reports_due
 
     # 穷举到这里说明 MissionKind 加了新成员却没人补上面的分支——宁可让
     # strict mypy 在这里报错，也不要让新种类静默套用 BOT 的判据跑起来。
-    assert_never(kind)
+    assert_never(task.kind)
 
 
 def scheduling_order(task: TaskSnapshot) -> tuple[bool, int]:
@@ -426,22 +512,24 @@ def status_of(
         return TaskStatus.DISABLED
     if not task.enabled:
         return TaskStatus.OFF
-    if running is not None and running.kind is task.kind:
+    # 认的是 `task_id` 而不是 `kind`：两个 bot 任务同时显示「运行中」是句谎话，
+    # 而任何时刻只有一个子进程在点鼠标。
+    if running is not None and running.task_id == task.task_id:
         return TaskStatus.RUNNING
-    if has_work(task.kind, facts, restart_cooldown=restart_cooldown):
+    if has_work(task, facts, restart_cooldown=restart_cooldown):
         return TaskStatus.READY
     # 以下都是「没活干」的几种原因。先说结构性的（配额、完成），再说会自己
     # 好起来的（冷却、航线）——前两种要用户动手，后两种只要等。
     if task.kind is MissionKind.PIRATE and pirate_quota_exhausted(facts):
         return TaskStatus.QUOTA_EXHAUSTED
-    if task.kind is MissionKind.BOT and bot_round_complete(facts):
+    if task.kind is MissionKind.BOT and bot_round_complete(task, facts):
         return TaskStatus.DONE
     # 「等航线」排在「冷却中」前面：两者同时成立时，等航线是那个更长、也更该让
     # 用户看到的原因。反过来显示成「冷却中」，用户会以为再等五分钟就动，
     # 然后眼看着它到点也不动。
-    if waiting_for_a_line(task.kind, facts):
+    if waiting_for_a_line(task, facts):
         return TaskStatus.WAITING_LINES
-    if cooling_down(task.kind, facts, restart_cooldown=restart_cooldown):
+    if cooling_down(task, facts, restart_cooldown=restart_cooldown):
         return TaskStatus.COOLING_DOWN
     return TaskStatus.WAITING_LINES
 
@@ -465,11 +553,7 @@ def decide(
         key=scheduling_order,
     )
     wanted = next(
-        (
-            task.kind
-            for task in candidates
-            if has_work(task.kind, facts, restart_cooldown=restart_cooldown)
-        ),
+        (task for task in candidates if has_work(task, facts, restart_cooldown=restart_cooldown)),
         None,
     )
 
@@ -481,7 +565,7 @@ def decide(
             # 上面的排序键已经让 SCAN 结构性地排最后，`wanted` 理论上不可能
             # 再是 SCAN——这一条在逻辑上恒真，留着是零成本的双保险，防的是
             # 排序键将来被改动却没人第一时间注意到。
-            and wanted is not MissionKind.SCAN
+            and wanted.kind is not MissionKind.SCAN
             and facts.now_utc - running.started_at_utc >= min_dwell
         ):
             return Decision(Action.PREEMPT, wanted)

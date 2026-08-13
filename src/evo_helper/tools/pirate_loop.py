@@ -409,6 +409,13 @@ class LoopOptions:
     scout: bool
     attack: bool
     preset: str = pirate_ui.ATTACK_PRESET_NAME
+    #: 这一轮记账用的出发星球。None 表示回落到全局 `origin()`
+    #: （`EVO_HELPER_ORIGIN`）——手工跑命令行时的默认。
+    #:
+    #: ⚠️ 调度器**一律显式传**。任务现在各带各的出发星球，而这个坐标会原样写进
+    #: `attack_intents.origin_*`，战报认领正是靠「出发坐标 + 目标坐标 + 时间就近」
+    #: 配对的。让 runner 自己去猜，等于两个任务的账可能记到同一颗星球上。
+    origin: Coordinate | None = None
 
 
 @dataclass
@@ -1611,7 +1618,7 @@ class PirateLoop:
             AttackIntent(
                 intent_id=intent_id,
                 run_id=run_id,
-                origin=origin(),
+                origin=self._options.origin or origin(),
                 target=coordinate,
                 preset=FleetPresetRef(
                     name=preset or self._options.preset,
@@ -1978,6 +1985,16 @@ def _ensure_run_row(session_factory: Any) -> UUID:
         return UUID(str(run.id))
 
 
+def parse_origin(text: str) -> Coordinate:
+    parts = text.split(":")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            f"出发星球要写成 银河:恒星系:行星，例如 2:137:18（收到 {text!r}）"
+        )
+    galaxy, system, position = (int(part) for part in parts)
+    return Coordinate(galaxy, system, position)
+
+
 def parse_system(text: str) -> tuple[int, int]:
     parts = text.split(":")
     if len(parts) != 2 or not all(part.isdigit() for part in parts):
@@ -1995,6 +2012,12 @@ def main(argv: list[str] | None = None) -> int:
         help="判定为「打」时真的攻击。不配 --scout 时用信箱里已有的侦察报告",
     )
     parser.add_argument("--preset", default=pirate_ui.ATTACK_PRESET_NAME)
+    parser.add_argument(
+        "--origin",
+        type=parse_origin,
+        default=None,
+        help="出发星球（记账用）。调度器会传；手工跑不给则用 EVO_HELPER_ORIGIN",
+    )
     args = parser.parse_args(argv)
 
     import ctypes
@@ -2002,7 +2025,11 @@ def main(argv: list[str] | None = None) -> int:
     getattr(ctypes, "windll").shcore.SetProcessDpiAwareness(2)
 
     options = LoopOptions(
-        systems=tuple(args.systems), scout=args.scout, attack=args.attack, preset=args.preset
+        systems=tuple(args.systems),
+        scout=args.scout,
+        attack=args.attack,
+        preset=args.preset,
+        origin=args.origin,
     )
     mode = "扫描" if not args.scout else ("侦察+攻击" if args.attack else "只侦察")
     listed = ", ".join(f"{galaxy}:{system}" for galaxy, system in options.systems)

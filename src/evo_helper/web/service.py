@@ -283,7 +283,10 @@ class MissionTaskView:
     合成一句的话，页面想给状态单独上色就只能去解析字符串。
     """
 
+    #: 任务 id。页面上一切写操作都按它寻址——同一 `kind` 可以有多行。
+    task_id: int
     kind: str
+    #: 展示用的名字。用户没起名时回落到链路标签。
     label: str
     enabled: bool
     priority: int
@@ -294,10 +297,21 @@ class MissionTaskView:
     #: 半径 10 是多大范围用户心里没数，回显出来才看得见填错没有。
     summary: str
     disabled_reason: str | None
+    #: 解析完默认值之后的出发星球，写成 `星系:恒星系:位置`。
+    #: 页面回显的必须是这个而不是库里那三列——NULL 的含义是「用全局主星」，
+    #: 显示成空白等于让用户以为舰队不知道从哪出发。
+    origin: str = ""
+    #: 解析完默认值之后的航线数（这颗星球上这个任务能占几条）。
+    fleet_lines: int = 0
+    #: 这两个字段有没有**自己填**过。页面据此区分「跟着全局走」与「就是这个值」
+    #: ——两者显示成同一个数字的话，用户改了全局值之后会以为任务也跟着变了。
+    origin_is_default: bool = True
+    fleet_lines_is_default: bool = True
 
 
 @dataclass(frozen=True)
 class CurrentMissionView:
+    task_id: int
     kind: str
     label: str
     started_at_utc: datetime
@@ -339,6 +353,10 @@ class FrozenTaskView:
     #: 参数的人话回显，**只从固化的那份参数算**，不查库：
     #: 「半径 8」「2:100 – 2:200」。查库算出来的是今天的库，不是当时的。
     summary: str
+    #: 当时的出发星球与航线数，同样只从记录里取。旧记录没有这两个字段，
+    #: 那时显示成「—」——那不是 0，是「这条记录里没有这一项」。
+    origin: str = ""
+    fleet_lines: int | None = None
 
 
 @dataclass(frozen=True)

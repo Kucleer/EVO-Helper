@@ -124,10 +124,52 @@ def test_seeding_twice_does_not_duplicate_or_overwrite(repository) -> None:  # t
     """每次开机都会调一遍。第二遍要是覆盖，用户拖出来的优先级每次重启都被抹掉。"""
     now = datetime.now(UTC)
     repository.ensure_mission_rows(now_utc=now)
-    repository.update_mission_task(MissionKind.PIRATE, priority=7)
+    pirate = next(row.id for row in repository.mission_tasks() if row.kind == "PIRATE")
+    repository.update_mission_task(pirate, priority=7)
 
     repository.ensure_mission_rows(now_utc=now)
 
     rows = repository.mission_tasks()
     assert len(rows) == 3
     assert next(row.priority for row in rows if row.kind == "PIRATE") == 7
+
+
+def test_seeding_does_not_re_add_a_row_when_that_chain_already_has_two(repository) -> None:  # type: ignore[no-untyped-def]
+    """开机补行的判据是「这条链路一行都没有」，不是「行数不对」。
+
+    用户新建的第二个 bot 任务不该让下次开机又补一行出来——那样每重启一次就多
+    一行，而且多出来的那一行还带着种子的默认参数。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    now = datetime.now(UTC)
+    repository.ensure_mission_rows(now_utc=now)
+    repository.create_mission_task(
+        MissionKind.BOT,
+        name="2 号星",
+        priority=5,
+        params_json="{}",
+        origin=Coordinate(9, 250, 8),
+        fleet_lines=2,
+        now_utc=now,
+    )
+
+    repository.ensure_mission_rows(now_utc=now)
+
+    assert [row.kind for row in repository.mission_tasks()].count("BOT") == 2
+
+
+def test_seeded_rows_follow_the_global_origin_and_line_limit(repository) -> None:  # type: ignore[no-untyped-def]
+    """种下来的三行**不填**出发星球与航线数。
+
+    NULL 的含义是「用全局主星 / 用 `scheduler_config.fleet_line_limit`」。种一个
+    值进去等于在仓储层替用户做主，还会让「改了 `EVO_HELPER_ORIGIN` 却不生效」
+    变成一个查不出来的毛病——舰队会继续按上一个账号的星球算飞行时间。
+    """
+    repository.ensure_mission_rows(now_utc=datetime.now(UTC))
+
+    for row in repository.mission_tasks():
+        assert row.origin_galaxy is None
+        assert row.origin_system is None
+        assert row.origin_position is None
+        assert row.fleet_lines is None

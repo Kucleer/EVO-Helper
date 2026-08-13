@@ -110,20 +110,21 @@ def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
     """扫描恒在最后一位，页面上就不能给它一个能拖的把手。
 
     它永远有活干，排在谁前面谁就永远轮不到——拖到海盗之前等于当天 32 次
-    配额悄无声息地全流失。后端会拒（`PATCH /api/missions/SCAN` 带 priority
-    返回 400），但用户不该拖完了才发现。
+    配额悄无声息地全流失。后端会拒（带 priority 的 PATCH 返回 400），
+    但用户不该拖完了才发现。
+
+    **行现在由页面脚本按 `/api/scheduler` 下发的任务列表建**（同一 kind 可以有
+    多行，服务端渲染不出固定几行），所以断言落在建行那一段的判据上：
+    `draggable` 取值只由「是不是 SCAN」决定，而且拖动那一路还要再挡一次
+    「把别人拖到它后面」。
     """
-    html = client.get("/missions").text
-    scan_row = _row_html(html, "SCAN")
+    body = _page_body(client.get("/missions").text)
 
-    assert 'draggable="true"' not in scan_row
-    assert 'draggable="false"' in scan_row
-    assert "始终填空隙" in scan_row
-
-    # 另外两行必须真的能拖，否则「扫描不可拖」这条断言用一个全都不能拖的
-    # 页面也能满足。
-    for kind in ("PIRATE", "BOT"):
-        assert 'draggable="true"' in _row_html(html, kind), kind
+    # 建行时：SCAN 不可拖，别的都可拖。写成常量 'false' 就等于全都不能拖。
+    assert "row.setAttribute('draggable', isScan ? 'false' : 'true')" in body
+    # 拖动过程中也不许把别人插到它后面。
+    assert "if (row.getAttribute('draggable') !== 'true') return;" in body
+    assert "始终填空隙" in body
 
 
 def test_all_eight_statuses_survive_the_trip_to_the_page(client: TestClient) -> None:
@@ -140,11 +141,17 @@ def test_all_eight_statuses_survive_the_trip_to_the_page(client: TestClient) -> 
 
 
 def test_the_bot_row_carries_a_new_round_button(client: TestClient) -> None:
-    """bot 打完一轮就退出调度，**不自动开下一轮**——开新一轮只能是用户按的。"""
-    bot_row = _row_html(client.get("/missions").text, "BOT")
+    """bot 打完一轮就退出调度，**不自动开下一轮**——开新一轮只能是用户按的。
 
-    assert "重开一轮" in bot_row
-    assert "/api/missions/BOT/new-round" in bot_row
+    按钮只长在 bot 那一类行上（海盗与扫描没有「一轮」这个概念），而接口按
+    **任务 id** 寻址：同一 kind 可以有多个任务，各开各的轮，写死 `/BOT/` 会把
+    两个任务的轮一起推掉。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "重开一轮" in body
+    assert "if (task.kind === 'BOT') {" in body
+    assert "`/api/missions/${taskId}/new-round`" in body
 
 
 def test_the_page_offers_force_kill_for_an_orphan(client: TestClient) -> None:

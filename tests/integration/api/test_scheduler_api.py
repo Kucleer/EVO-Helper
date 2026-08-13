@@ -92,6 +92,20 @@ class Console:
                 return found
         raise AssertionError(f"调度台上没有 {kind} 这一行")
 
+    def task_id(self, kind: str) -> int:
+        """这条链路那一行的 id。
+
+        接口按 **id** 寻址（同一 kind 可以有多行），而这些用例说的是「海盗那一
+        行」「bot 那一行」——种子行每条链路各一个，从状态接口里把 id 捞出来即可。
+        """
+        return int(self.task(kind)["task_id"])  # type: ignore[arg-type]
+
+    def patch(self, kind: str, payload: dict[str, object]):  # type: ignore[no-untyped-def]
+        return self.client.patch(f"/api/missions/{self.task_id(kind)}", json=payload)
+
+    def new_round(self, kind: str = "BOT"):  # type: ignore[no-untyped-def]
+        return self.client.post(f"/api/missions/{self.task_id(kind)}/new-round")
+
 
 def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
     """往 `bot_targets` 里放一颗已记录的 bot。
@@ -178,9 +192,9 @@ def test_the_pirate_row_echoes_the_systems_its_radius_covers(console: Console) -
 def test_the_bot_row_echoes_how_many_bots_the_range_holds(console: Console) -> None:
     """N=0 就禁止启用，所以 N 必须先看得见。"""
     _seed_bot(console.repository, Coordinate(2, 150, 4))
-    console.client.patch(
-        "/api/missions/BOT",
-        json={"params": {"galaxy": 2, "first_system": 100, "last_system": 200}},
+    console.patch(
+        "BOT",
+        {"params": {"galaxy": 2, "first_system": 100, "last_system": 200}},
     )
 
     summary = console.task("BOT")["summary"]
@@ -228,7 +242,7 @@ def test_stopping_kills_the_child(console: Console) -> None:
 
 
 def test_priority_can_be_reordered(console: Console) -> None:
-    assert console.client.patch("/api/missions/BOT", json={"priority": -1}).status_code == 200
+    assert console.patch("BOT", {"priority": -1}).status_code == 200
 
     tasks = console.get()["tasks"]
     assert isinstance(tasks, list)
@@ -242,7 +256,7 @@ def test_the_scan_priority_cannot_be_written(console: Console) -> None:
     真的改变次序——正因为如此才必须拒绝：默默收下一个不起作用的值，页面会
     显示成「排序已保存」，刷新后又弹回去，用户只能得出「这个控件坏了」。
     """
-    response = console.client.patch("/api/missions/SCAN", json={"priority": 0})
+    response = console.patch("SCAN", {"priority": 0})
 
     assert response.status_code == 400
     assert "扫描" in response.json()["detail"]
@@ -253,7 +267,7 @@ def test_the_scan_priority_cannot_be_written(console: Console) -> None:
 
 def test_the_scan_row_can_still_be_switched_off(console: Console) -> None:
     """挡的只是 priority 那一个字段，别把整行改成只读。"""
-    response = console.client.patch("/api/missions/SCAN", json={"enabled": False})
+    response = console.patch("SCAN", {"enabled": False})
 
     assert response.status_code == 200
     assert console.task("SCAN")["enabled"] is False
@@ -261,9 +275,9 @@ def test_the_scan_row_can_still_be_switched_off(console: Console) -> None:
 
 def test_a_bot_range_with_no_recorded_bots_is_refused(console: Console) -> None:
     """拉起一个必然空转的 runner 没有意义，早一步告诉用户。"""
-    response = console.client.patch(
-        "/api/missions/BOT",
-        json={"enabled": True, "params": {"galaxy": 9, "first_system": 1, "last_system": 2}},
+    response = console.patch(
+        "BOT",
+        {"enabled": True, "params": {"galaxy": 9, "first_system": 1, "last_system": 2}},
     )
 
     assert response.status_code == 400
@@ -274,9 +288,9 @@ def test_a_bot_range_with_no_recorded_bots_is_refused(console: Console) -> None:
 def test_enabling_a_bot_range_that_holds_bots_is_accepted(console: Console) -> None:
     _seed_bot(console.repository, Coordinate(2, 150, 4))
 
-    response = console.client.patch(
-        "/api/missions/BOT",
-        json={"enabled": True, "params": {"galaxy": 2, "first_system": 100, "last_system": 200}},
+    response = console.patch(
+        "BOT",
+        {"enabled": True, "params": {"galaxy": 2, "first_system": 100, "last_system": 200}},
     )
 
     assert response.status_code == 200
@@ -285,22 +299,22 @@ def test_enabling_a_bot_range_that_holds_bots_is_accepted(console: Console) -> N
 
 def test_enabling_without_params_still_checks_the_stored_ones(console: Console) -> None:
     """勾复选框那一下也要过校验——否则先存一个空范围、再单独勾上就绕过去了。"""
-    response = console.client.patch("/api/missions/BOT", json={"enabled": True})
+    response = console.patch("BOT", {"enabled": True})
 
     assert response.status_code == 400
     assert console.task("BOT")["enabled"] is False
 
 
 def test_a_non_positive_pirate_radius_is_refused(console: Console) -> None:
-    response = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 0}})
+    response = console.patch("PIRATE", {"params": {"radius": 0}})
 
     assert response.status_code == 400
 
 
 def test_a_reversed_system_range_is_refused(console: Console) -> None:
-    response = console.client.patch(
-        "/api/missions/BOT",
-        json={"params": {"galaxy": 2, "first_system": 200, "last_system": 100}},
+    response = console.patch(
+        "BOT",
+        {"params": {"galaxy": 2, "first_system": 200, "last_system": 100}},
     )
 
     assert response.status_code == 400
@@ -309,16 +323,16 @@ def test_a_reversed_system_range_is_refused(console: Console) -> None:
 
 def test_switching_a_task_off_never_needs_valid_params(console: Console) -> None:
     """关一条链路必须永远做得到。参数填错了还关不掉，那就真的没退路了。"""
-    response = console.client.patch("/api/missions/BOT", json={"enabled": False})
+    response = console.patch("BOT", {"enabled": False})
 
     assert response.status_code == 200
 
 
 def test_patching_clears_an_automatic_disable(console: Console) -> None:
     """参数填错一次、改好了也永远起不来，是最容易踩的那个坑。"""
-    console.repository.disable_mission_task(MissionKind.PIRATE, "连续 3 次异常退出")
+    console.repository.disable_mission_task(console.task_id("PIRATE"), "连续 3 次异常退出")
 
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    console.patch("PIRATE", {"params": {"radius": 5}})
 
     assert console.task("PIRATE")["disabled_reason"] is None
 
@@ -331,10 +345,10 @@ def test_a_disabled_scan_is_revived_by_enabling_it_again(console: Console) -> No
     「连续 3 次异常退出」停掉的扫描在页面上永远没有恢复的办法，用户只能去改库。
     计数也必须一起清零，否则下一次崩溃立刻又满三次。
     """
-    console.repository.record_mission_failure(MissionKind.SCAN, exit_code=1, limit=1)
+    console.repository.record_mission_failure(console.task_id("SCAN"), exit_code=1, limit=1)
     assert console.task("SCAN")["disabled_reason"] is not None
 
-    response = console.client.patch("/api/missions/SCAN", json={"enabled": True})
+    response = console.patch("SCAN", {"enabled": True})
 
     assert response.status_code == 200, response.text
     assert console.task("SCAN")["disabled_reason"] is None
@@ -344,7 +358,7 @@ def test_a_disabled_scan_is_revived_by_enabling_it_again(console: Console) -> No
 
 
 def test_an_unknown_kind_is_a_404(console: Console) -> None:
-    assert console.client.patch("/api/missions/DRAGON", json={"enabled": True}).status_code == 404
+    assert console.client.patch("/api/missions/9999", json={"enabled": True}).status_code == 404
 
 
 # -- 运行中不许改 ---------------------------------------------------------------
@@ -362,10 +376,10 @@ def _start(console: Console) -> None:
 
 
 def test_params_cannot_be_changed_while_the_scheduler_runs(console: Console) -> None:
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    console.patch("PIRATE", {"params": {"radius": 5}})
     _start(console)
 
-    response = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 30}})
+    response = console.patch("PIRATE", {"params": {"radius": 30}})
 
     assert response.status_code == 409, response.text
     assert "运行中" in response.json()["detail"]
@@ -377,7 +391,7 @@ def test_priority_cannot_be_reordered_while_the_scheduler_runs(console: Console)
     """拖拽也走这个 PATCH，所以这一条同时守住了那个拖拽把手。"""
     _start(console)
 
-    response = console.client.patch("/api/missions/BOT", json={"priority": -1})
+    response = console.patch("BOT", {"priority": -1})
 
     assert response.status_code == 409
     tasks = console.get()["tasks"]
@@ -389,7 +403,7 @@ def test_a_chain_cannot_be_switched_off_while_the_scheduler_runs(console: Consol
     """复选框也是任务配置的一部分：中途摘掉一条链路同样是「一轮之内两套口径」。"""
     _start(console)
 
-    response = console.client.patch("/api/missions/SCAN", json={"enabled": False})
+    response = console.patch("SCAN", {"enabled": False})
 
     assert response.status_code == 409
     assert console.task("SCAN")["enabled"] is True
@@ -410,10 +424,10 @@ def test_a_disabled_chain_can_still_be_revived_while_the_scheduler_runs(
     不动固化记录里的任何一个字段。
     """
     _start(console)
-    console.repository.record_mission_failure(MissionKind.SCAN, exit_code=1, limit=1)
+    console.repository.record_mission_failure(console.task_id("SCAN"), exit_code=1, limit=1)
     assert console.task("SCAN")["disabled_reason"] is not None
 
-    response = console.client.patch("/api/missions/SCAN", json={"enabled": True})
+    response = console.patch("SCAN", {"enabled": True})
 
     assert response.status_code == 200, response.text
     assert console.task("SCAN")["disabled_reason"] is None
@@ -421,13 +435,11 @@ def test_a_disabled_chain_can_still_be_revived_while_the_scheduler_runs(
 
 def test_reviving_while_running_may_not_smuggle_in_a_param_change(console: Console) -> None:
     """口子只给「清停用状态」，不给「趁着恢复顺手改一笔」。"""
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    console.patch("PIRATE", {"params": {"radius": 5}})
     _start(console)
-    console.repository.disable_mission_task(MissionKind.PIRATE, "连续 3 次异常退出")
+    console.repository.disable_mission_task(console.task_id("PIRATE"), "连续 3 次异常退出")
 
-    response = console.client.patch(
-        "/api/missions/PIRATE", json={"enabled": True, "params": {"radius": 30}}
-    )
+    response = console.patch("PIRATE", {"enabled": True, "params": {"radius": 30}})
 
     assert response.status_code == 409
     assert console.task("PIRATE")["params"] == {"radius": 5}
@@ -438,7 +450,7 @@ def test_enabling_a_chain_that_is_not_disabled_is_still_refused(console: Console
     """没被停用的行收到 `enabled: true` 不是「恢复」，是在勾一条没参与的链路。"""
     _start(console)
 
-    response = console.client.patch("/api/missions/BOT", json={"enabled": True})
+    response = console.patch("BOT", {"enabled": True})
 
     assert response.status_code == 409
 
@@ -446,10 +458,10 @@ def test_enabling_a_chain_that_is_not_disabled_is_still_refused(console: Console
 def test_the_configuration_is_editable_again_after_stopping(console: Console) -> None:
     """「只有结束状态才可以修改」的另一半：结束之后必须真的能改回来。"""
     _start(console)
-    assert console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 9}}) is not None
+    assert console.patch("PIRATE", {"params": {"radius": 9}}) is not None
     console.client.post("/api/scheduler/stop")
 
-    response = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 9}})
+    response = console.patch("PIRATE", {"params": {"radius": 9}})
 
     assert response.status_code == 200, response.text
     assert console.task("PIRATE")["params"] == {"radius": 9}
@@ -470,7 +482,7 @@ def test_a_child_that_is_still_running_keeps_the_configuration_locked(console: C
     console.scheduler._enabled = False  # noqa: SLF001 - 造出「关了但子进程还在」
 
     assert console.get()["config_locked"] is True
-    refused = console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 7}})
+    refused = console.patch("PIRATE", {"params": {"radius": 7}})
     assert refused.status_code == 409
 
 
@@ -483,7 +495,7 @@ def test_a_new_bot_round_is_still_allowed_while_running(console: Console) -> Non
     """
     _start(console)
 
-    assert console.client.post("/api/missions/BOT/new-round").status_code == 200
+    assert console.new_round().status_code == 200
 
 
 # -- 配置固化 -------------------------------------------------------------------
@@ -491,7 +503,7 @@ def test_a_new_bot_round_is_still_allowed_while_running(console: Console) -> Non
 
 def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> None:
     """「开始」那一下抄一份，页面据此回答「这一轮到底按什么跑的」。"""
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 6}})
+    console.patch("PIRATE", {"params": {"radius": 6}})
     _start(console)
 
     frozen = console.get()["frozen_config"]
@@ -516,12 +528,12 @@ def test_a_stopped_scheduler_shows_no_frozen_configuration(console: Console) -> 
 
 def test_the_second_start_records_what_changed_in_between(console: Console) -> None:
     """用户口径里的「记录任务内容」有两半，这是「改了什么、什么时候改的」那半。"""
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 5}})
+    console.patch("PIRATE", {"params": {"radius": 5}})
     _start(console)
     console.client.post("/api/scheduler/stop")
     console.clock.now = NOW + timedelta(hours=1)
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 12}})
-    console.client.patch("/api/missions/BOT", json={"priority": -1})
+    console.patch("PIRATE", {"params": {"radius": 12}})
+    console.patch("BOT", {"priority": -1})
     _start(console)
 
     frozen = console.get()["frozen_config"]
@@ -544,7 +556,7 @@ def test_pressing_start_twice_does_not_record_a_second_freeze(console: Console) 
 
 def test_the_freeze_is_written_where_a_restarted_console_can_read_it(console: Console) -> None:
     """控制台重启后内存里的一切都没了，而用户多半是重启之后才来翻这份记录。"""
-    console.client.patch("/api/missions/PIRATE", json={"params": {"radius": 4}})
+    console.patch("PIRATE", {"params": {"radius": 4}})
     _start(console)
 
     lines = console.freeze_log.read_text(encoding="utf-8").splitlines()
@@ -564,7 +576,7 @@ def test_the_freeze_is_written_where_a_restarted_console_can_read_it(console: Co
 
 def test_a_new_round_pushes_the_round_start_to_now(console: Console) -> None:
     """不推的话，上一轮打完的那批目标今天仍算「已完成」，新一轮永远开不起来。"""
-    response = console.client.post("/api/missions/BOT/new-round")
+    response = console.new_round()
 
     assert response.status_code == 200
     row = next(row for row in console.repository.mission_tasks() if row.kind == "BOT")
@@ -587,6 +599,9 @@ def test_an_orphan_run_is_surfaced_with_its_pid(tmp_path: Path) -> None:
     repository.ensure_mission_rows(now_utc=NOW)
     repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=next(
+            row.id for row in repository.mission_tasks() if row.kind == MissionKind.SCAN.value
+        ),
         command=["python"],
         pid=4321,
         started_at_utc=NOW - timedelta(hours=1),
@@ -670,14 +685,19 @@ def test_the_old_missions_page_still_renders(console: Console) -> None:
 
 
 def test_every_row_carries_a_revive_button(console: Console) -> None:
-    """三条链路都可能被自动停用，恢复的入口就不能只长在其中一行上。
+    """每一行都要有恢复的入口，任何一条链路都可能被自动停用。
 
-    显隐由 `status === '已停用'` 决定（脚本里），这里只钉住「按钮在每一行」——
-    渲染在 `{% for %}` 外面写漏一次，页面上就再没有恢复的办法。
+    **行现在由页面脚本按 `/api/scheduler` 下发的任务列表建**（行数是用户加出来
+    的，服务端渲染不出来），所以这里钉的是建行那一段：`buildRow` 无条件给每一行
+    加上这个按钮，而不是只给某一类加。写在 `if` 里面一次，就会有链路再也恢复
+    不了。显隐仍由 `status === '已停用'` 决定。
     """
     page = console.client.get("/missions").text
 
-    assert page.count('class="btn small mission-revive"') == 3
+    assert "btn small mission-revive" in page
+    # 挂在建行函数上、不在任何分支里：`revive.hidden = true` 与它紧邻，
+    # 而按 kind 分叉的那几个（重开一轮、删除）在后面单独一段。
+    assert page.index("mission-revive") < page.index("mission-new-round")
 
 
 # -- bot 命令行 ---------------------------------------------------------------
@@ -695,12 +715,12 @@ def test_the_launched_bot_command_has_no_probe_and_no_thresholds(console: Consol
     看着一切正常，而一发都没打。
     """
     _seed_bot(console.repository, Coordinate(2, 137, 14))
-    console.client.patch(
-        "/api/missions/BOT",
-        json={"enabled": True, "params": {"galaxy": 2, "first_system": 130, "last_system": 140}},
+    console.patch(
+        "BOT",
+        {"enabled": True, "params": {"galaxy": 2, "first_system": 130, "last_system": 140}},
     )
-    console.client.patch("/api/missions/PIRATE", json={"enabled": False})
-    console.client.patch("/api/missions/SCAN", json={"enabled": False})
+    console.patch("PIRATE", {"enabled": False})
+    console.patch("SCAN", {"enabled": False})
     _start(console)
     console.scheduler.tick()
 
@@ -721,3 +741,205 @@ def test_the_tier_thresholds_api_is_gone(console: Console) -> None:
     """
     assert console.client.get("/api/tier-thresholds").status_code == 404
     assert console.client.get("/tiers").status_code == 404
+
+
+# -- 多任务：新建、删除、出发星球与航线数 ---------------------------------------
+#
+# 用户口径（2026-08-13）：「之后的任务需要配置一个出发星球（默认主星，也就是第一
+# 颗），以及航线数。也就是可能会新增多个同一个类型的任务，比如 2 个 bot 攻击」。
+# 追问确认：**只有 bot 攻击需要多任务**，海盗与扫描保持一个。
+
+
+def _create(console: Console, **payload: object):  # type: ignore[no-untyped-def]
+    body = {"kind": "BOT", "name": "2 号星"} | payload
+    return console.client.post("/api/missions", json=body)
+
+
+def test_a_second_bot_task_can_be_created(console: Console) -> None:
+    """新建之后页面上就该有两行 bot。"""
+    response = _create(console, fleet_lines=2)
+
+    assert response.status_code == 201, response.text
+    kinds = [item["kind"] for item in console.get()["tasks"]]  # type: ignore[union-attr]
+    assert kinds.count("BOT") == 2
+
+
+def test_a_new_task_starts_switched_off(console: Console) -> None:
+    """**点了新建不该就开始派舰队。**
+
+    刚建出来的任务还没填范围、也没排优先级。启用那一下会走 PATCH，
+    而那条路上有参数校验。
+    """
+    created = _create(console).json()
+
+    assert created["enabled"] is False
+
+
+def test_a_new_task_needs_a_name(console: Console) -> None:
+    """两行长得一模一样的话，用户分不出改的是哪一个。"""
+    assert _create(console, name="   ").status_code == 400
+
+
+def test_only_the_bot_chain_may_have_more_than_one_task(console: Console) -> None:
+    """海盗每天 32 次是**账号级**配额，扫描恒在最后一位且永远有活干。
+
+    给这两条链路加第二个任务不会让它们打得更多，只会让页面上多一行看着能配、
+    实际互相抢同一份配额的东西。
+    """
+    for kind in ("PIRATE", "SCAN"):
+        response = console.client.post("/api/missions", json={"kind": kind, "name": "另一个"})
+        assert response.status_code == 400, kind
+
+
+def test_a_new_task_defaults_to_the_home_planet_and_the_global_line_limit(
+    console: Console,
+) -> None:
+    """留空表示**跟着全局走**，而回显必须是解析之后的值。
+
+    显示成空白等于让用户以为舰队不知道从哪出发。
+    """
+    created = _create(console).json()
+
+    assert created["origin"] == "2:137:18"
+    assert created["origin_is_default"] is True
+    assert created["fleet_lines_is_default"] is True
+
+
+def test_a_created_task_keeps_the_planet_and_lines_it_was_given(console: Console) -> None:
+    created = _create(console, origin="2:137:18", fleet_lines=2).json()
+
+    assert created["origin"] == "2:137:18"
+    assert created["fleet_lines"] == 2
+    assert created["origin_is_default"] is False
+    assert created["fleet_lines_is_default"] is False
+
+
+def test_zero_lines_is_refused_rather_than_stored(console: Console) -> None:
+    """0 条航线的任务永远派不出去，而它在页面上看起来完全正常（「等航线」）。"""
+    assert _create(console, fleet_lines=0).status_code == 400
+
+    created = _create(console).json()
+    assert (
+        console.client.patch(
+            f"/api/missions/{created['task_id']}", json={"fleet_lines": 0}
+        ).status_code
+        == 400
+    )
+
+
+def test_a_malformed_origin_is_refused_rather_than_guessed(console: Console) -> None:
+    """回落到主星的话，用户以为改成了 2 号星，实际舰队照旧从主星出发。"""
+    created = _create(console).json()
+
+    response = console.client.patch(f"/api/missions/{created['task_id']}", json={"origin": "9:250"})
+
+    assert response.status_code == 400
+    assert "9:250" in response.json()["detail"]
+
+
+def test_a_planet_the_helper_cannot_switch_to_is_refused_with_both_coordinates(
+    console: Console,
+) -> None:
+    """**助手还不会在游戏里切换当前星球。**
+
+    收下这个配置的代价不是「打不到」，是台账在撒谎：舰队照旧从主星飞出去，而
+    `attack_intents.origin_*` 上写着 9:250:8。错误信息里要出现**两颗**坐标，
+    否则用户看不出该改成什么。
+
+    ⚠️ 这是一道**临时闸门**，切换星球实装之后这条用例随之改写。
+    """
+    created = _create(console).json()
+
+    response = console.client.patch(
+        f"/api/missions/{created['task_id']}", json={"origin": "9:250:8"}
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "9:250:8" in detail
+    assert "2:137:18" in detail
+
+
+def test_clearing_the_origin_puts_it_back_on_the_home_planet(console: Console) -> None:
+    """空串是一个**动作**：退回「用全局主星」。
+
+    它和 `null`（这次不动它）必须分得开，否则任何一次只改优先级的 PATCH 都会
+    顺手把出发星球抹掉。
+    """
+    created = _create(console, origin="2:137:18").json()
+    assert created["origin_is_default"] is False
+
+    updated = console.client.patch(
+        f"/api/missions/{created['task_id']}", json={"origin": ""}
+    ).json()
+
+    assert updated["origin_is_default"] is True
+    assert updated["origin"] == "2:137:18"
+
+
+def test_changing_only_the_priority_never_touches_the_origin(console: Console) -> None:
+    """**不许改用户已配置的取值。** 拖一下顺序不该把出发星球一起清掉。"""
+    created = _create(console, origin="2:137:18", fleet_lines=2).json()
+
+    updated = console.client.patch(
+        f"/api/missions/{created['task_id']}", json={"priority": 3}
+    ).json()
+
+    assert updated["origin_is_default"] is False
+    assert updated["fleet_lines"] == 2
+
+
+def test_the_last_task_of_a_chain_cannot_be_deleted(console: Console) -> None:
+    """删光了页面上就再也建不回来（海盗与扫描连「新建」的入口都没有）。
+
+    不想让它跑的正确做法是取消勾选。
+    """
+    response = console.client.delete(f"/api/missions/{console.task_id('PIRATE')}")
+
+    assert response.status_code == 400
+
+
+def test_a_second_bot_task_can_be_deleted_again(console: Console) -> None:
+    created = _create(console).json()
+
+    assert console.client.delete(f"/api/missions/{created['task_id']}").status_code == 204
+    assert [item["kind"] for item in console.get()["tasks"]].count("BOT") == 1  # type: ignore[union-attr]
+
+
+def test_tasks_cannot_be_created_or_deleted_while_the_scheduler_runs(console: Console) -> None:
+    """运行中配置已固化。加一行、删一行同样是改配置。"""
+    created = _create(console).json()
+    _start(console)
+
+    assert _create(console, name="第三个").status_code == 409
+    assert console.client.delete(f"/api/missions/{created['task_id']}").status_code == 409
+
+
+def test_two_bot_tasks_keep_their_own_priorities(console: Console) -> None:
+    """**拖拽排序按 id 寻址。**
+
+    按 kind 寻址的话，拖动其中一行会打到不确定的那一行上——用户配好的优先级
+    就此变成随机的。
+    """
+    created = _create(console).json()
+    main = console.task_id("BOT")
+
+    console.client.patch(f"/api/missions/{main}", json={"priority": 0})
+    console.client.patch(f"/api/missions/{created['task_id']}", json={"priority": 1})
+
+    rows = {
+        item["task_id"]: item["priority"]
+        for item in console.get()["tasks"]  # type: ignore[union-attr]
+    }
+    assert rows[main] == 0
+    assert rows[created["task_id"]] == 1
+
+
+def test_the_row_summary_says_which_planet_and_how_many_lines(console: Console) -> None:
+    """多任务之后，「这一行从哪出发、能占几条」是区分两行 bot 的第一件事，
+    而它俩都不在参数框里。
+    """
+    created = _create(console, fleet_lines=2).json()
+
+    assert "2:137:18" in created["summary"]
+    assert "2 条航线" in created["summary"]

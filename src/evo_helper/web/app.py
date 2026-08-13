@@ -11,7 +11,7 @@ from typing import Annotated, Any, cast
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -59,6 +59,7 @@ from .schemas import (
     FleetEntryOut,
     FleetSnapshotOut,
     FrozenTaskOut,
+    MissionTaskCreate,
     MissionTaskOut,
     MissionTaskPatch,
     RevisitIn,
@@ -887,6 +888,7 @@ def create_app(
 
 def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
     return MissionTaskOut(
+        task_id=task.task_id,
         kind=task.kind,
         label=task.label,
         enabled=task.enabled,
@@ -896,6 +898,10 @@ def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
         detail=task.detail,
         summary=task.summary,
         disabled_reason=task.disabled_reason,
+        origin=task.origin,
+        fleet_lines=task.fleet_lines,
+        origin_is_default=task.origin_is_default,
+        fleet_lines_is_default=task.fleet_lines_is_default,
     )
 
 
@@ -907,6 +913,8 @@ def _frozen_task_out(task: FrozenTaskView) -> FrozenTaskOut:
         priority=task.priority,
         params=task.params,
         summary=task.summary,
+        origin=task.origin,
+        fleet_lines=task.fleet_lines,
     )
 
 
@@ -926,6 +934,7 @@ def _scheduler_out(view: SchedulerView) -> SchedulerOut:
             None
             if view.current is None
             else CurrentMissionOut(
+                task_id=view.current.task_id,
                 kind=view.current.kind,
                 label=view.current.label,
                 started_at_utc=view.current.started_at_utc,
@@ -981,26 +990,55 @@ def register_mission_routes(app: FastAPI) -> None:
         """孤儿红条上的「强制结束」。**不按 pid 杀不认识的进程。**"""
         return _scheduler_out(console.force_kill())
 
-    @app.patch("/api/missions/{kind}", response_model=MissionTaskOut)
+    # 任务按 **id** 寻址，不再按 kind：同一 `kind` 可以有多行（多个 bot 攻击
+    # 任务），按 kind 寻址会打到不确定的那一行上。桌面悬浮窗
+    # （`tools/scan_console.py`）只用 `/api/scheduler*`，不受这次改动影响。
+    @app.post("/api/missions", response_model=MissionTaskOut, status_code=201)
+    def create_mission(
+        payload: MissionTaskCreate,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MissionTaskOut:
+        return _mission_task_out(
+            console.create_mission(
+                payload.kind,
+                name=payload.name,
+                origin=payload.origin,
+                fleet_lines=payload.fleet_lines,
+            )
+        )
+
+    @app.patch("/api/missions/{task_id}", response_model=MissionTaskOut)
     def patch_mission(
-        kind: str,
+        task_id: int,
         payload: MissionTaskPatch,
         console: MissionConsoleService = Depends(get_console),
     ) -> MissionTaskOut:
         return _mission_task_out(
             console.patch_mission(
-                kind,
+                task_id,
                 enabled=payload.enabled,
                 priority=payload.priority,
                 params=payload.params,
+                name=payload.name,
+                origin=payload.origin,
+                fleet_lines=payload.fleet_lines,
             )
         )
 
-    @app.post("/api/missions/BOT/new-round", response_model=MissionTaskOut)
+    @app.delete("/api/missions/{task_id}", status_code=204)
+    def delete_mission(
+        task_id: int,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> Response:
+        console.delete_mission(task_id)
+        return Response(status_code=204)
+
+    @app.post("/api/missions/{task_id}/new-round", response_model=MissionTaskOut)
     def restart_bot_round(
+        task_id: int,
         console: MissionConsoleService = Depends(get_console),
     ) -> MissionTaskOut:
-        return _mission_task_out(console.restart_bot_round())
+        return _mission_task_out(console.restart_bot_round(task_id))
 
 
 async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:

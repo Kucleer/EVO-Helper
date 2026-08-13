@@ -185,7 +185,9 @@ class TestOrigin:
         from evo_helper.domain.scheduler import MissionKind
 
         scheduler = MissionScheduler(cast(Any, None), cast(Any, None), origin=Coordinate(3, 42, 7))
-        command = scheduler.command_for(MissionKind.PIRATE, '{"radius": 1}')
+        command = scheduler.command_for(
+            MissionKind.PIRATE, '{"radius": 1}', origin=Coordinate(3, 42, 7)
+        )
 
         assert "3:42" in command
         assert not any(item.startswith("2:") for item in command)
@@ -202,4 +204,4 @@ class TestOrigin:
         scheduler = MissionScheduler(cast(Any, None), cast(Any, None), origin=Coordinate(3, 42, 7))
         console = MissionConsoleService(cast(Any, None), scheduler)
 
-        assert "3:41" in console._pirate_summary({"radius": 1})
+        assert "3:41" in console._pirate_summary(scheduler.origin, {"radius": 1})
