@@ -257,17 +257,32 @@ class SchedulerOut(BaseModel):
 class SchedulerStartIn(BaseModel):
     """POST /api/scheduler/start 的请求体。**整个可以省略。**
 
-    省略时按默认值走，也就是「先对账再放行任务」——桌面悬浮窗
-    （`tools/scan_console.py`）和 4.3 节里那条 curl 都是不带体打的，
-    它们不该因为多了这个字段而换一种行为。
+    省略时按默认值走——桌面悬浮窗（`tools/scan_console.py`）和 4.3 节里那条
+    curl 都是不带体打的，它们不该因为多了这个字段而换一种行为。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     #: 点「开始」之后先跑一趟战报对账（海盗、bot 各一趟），跑完才起任务。
-    #: **默认为真**：默认跳过等于把这条修复关掉，而它防的是「拿不全的数据
-    #: 决定要不要再打一遍」，代价是白送一支舰队。
-    reconcile: bool = True
+    #:
+    #: ⚠️ **默认关（2026-08-13 实机之后改的），因为它会把整夜挂机堵死。**
+    #:
+    #: 那一趟一旦失败，`application.backfill.BackfillState.blocking` 把
+    #: `FAILED` 也算成「扣着窗口」，要等人点确认才放行——用户口径本来是
+    #: 「看过摘要再放行」，而那条口径默认了**有人在看**。无人值守时它变成：
+    #: 凌晨崩一次，之后一整夜一个任务都不起，而页面上只显示「补录中」。
+    #:
+    #: 实机 2026-08-13 22:56 就是这样：启动对账那一趟倒在
+    #: 「游戏窗口抢不到前台」（那是个已知条件，见 `domain.scheduler`
+    #: `EXIT_ENVIRONMENT_BUSY`），而它在 CLI 里是未捕获的异常、退出码不是 75。
+    #:
+    #: **关掉它损失不大**：每一轮开工本来就有 `reconcile_today` 翻一趟信箱，
+    #: 启动对账只是额外多一趟、翻得更深。真正要救过期战报时走页面上那个手动
+    #: 按钮——那时人在跟前，确认也就有人点。
+    #:
+    #: 要恢复默认开，先解决两件事：CLI 把「抢不到前台」按 75 收场，
+    #: 且 `blocking` 对 `FAILED` 那一档给一条无人值守的出路。
+    reconcile: bool = False
 
 
 class BackfillStartIn(BaseModel):

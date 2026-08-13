@@ -100,8 +100,11 @@ class Console:
         return self.client.post("/api/backfill", json=body)
 
     def start(self, **payload: object):  # type: ignore[no-untyped-def]
-        """点「开始」。**不带请求体 = 走真实默认（先对账）。**"""
+        """点「开始」。**不带请求体 = 走真实默认（现在是「不对账」）。**"""
         return self.client.post("/api/scheduler/start", json=payload or None)
+
+    def scheduler_running(self) -> bool:
+        return bool(self.client.get("/api/scheduler").json()["running"])
 
 
 @pytest.fixture
@@ -277,16 +280,23 @@ def test_pressing_start_reconciles_by_default(console: Console) -> None:
     assert console.state()["reason"] == "启动对账"
 
 
-def test_an_empty_body_also_reconciles(console: Console) -> None:
-    """**两个默认值，两条路。**
+def test_an_empty_body_does_not_reconcile(console: Console) -> None:
+    """**两个默认值，两条路，而现在两条都是「不对账」。**
 
     不带请求体走的是路由那个默认（悬浮窗与文档里那条 curl 都是这条）；带一个
-    `{}` 走的是 `SchedulerStartIn` 里那个默认。两处任意一个写成 False，都会让
-    「点开始先对账」在某一条路上悄悄失效。
+    `{}` 走的是 `SchedulerStartIn` 里那个默认。两处必须一致，否则「点开始要不要
+    先对账」会因为客户端怎么发请求而不同。
+
+    ⚠️ **这条原先断言的正好相反**（默认对账）。改口径的理由写在
+    `web.schemas.SchedulerStartIn.reconcile` 上：那一趟失败时
+    `BackfillState.blocking` 把 `FAILED` 也算成扣着窗口、要等人点确认，
+    而无人值守时没人点——凌晨崩一次，之后一整夜一个任务都不起。
+    实机 2026-08-13 22:56 就倒在这上面（「游戏窗口抢不到前台」）。
     """
     assert console.client.post("/api/scheduler/start", json={}).status_code == 200
 
-    assert console.backfill.kinds == ["pirate"]
+    assert console.backfill.kinds == []
+    assert console.scheduler_running(), "不对账就该直接开工，而不是停在那里"
 
 
 def test_the_reconciliation_can_be_skipped_on_purpose(console: Console) -> None:
