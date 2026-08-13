@@ -424,6 +424,11 @@ def test_losing_the_list_re_enters_the_mailbox_instead_of_ending_the_trip() -> N
         [_row(2, ReportKind.SCOUT, minutes_ago=3)],
     ]
     loop, events, opened = _loop(pages)
+    # ⚠️ 桩掉 `_open_mail_row`：它自己也要问「还在列表上吗」（退回列表要确认，
+    # 见那个方法），而这条用例是**按第几次问**来制造失败的。不桩掉的话，
+    # 计数会跟着开封次数漂，这条用例就变成了在测另一件事。
+    # 开封那一侧由 `test_a_back_click_that_missed_is_clicked_again` 单独守。
+    loop._open_mail_row = lambda row, visit: bool(visit(row, object()))
     loop._settle = _ListFlapping(loop._on_mail_list, fail_on={2})
 
     loop._scan_mail_rows(
@@ -443,18 +448,47 @@ def test_a_mailbox_that_keeps_falling_out_eventually_gives_up() -> None:
     连着掉出列表说明画面已经不是「偶尔掉一下」那种情形，接着试只是在一个认不出的
     画面上多点几下。
     """
-    loop, events, opened = _loop([[_row(0, ReportKind.SCOUT)] for _ in range(6)])
-    loop._settle = _ListFlapping(loop._on_mail_list, fail_on={1, 2, 3, 4, 5, 6})
+    loop, events, opened = _loop([[_row(0, ReportKind.SCOUT)] for _ in range(8)])
+    loop._open_mail_row = lambda row, visit: bool(visit(row, object()))  # 同上一条的理由
+    loop._settle = _ListFlapping(loop._on_mail_list, fail_on=set(range(1, 20)))
 
     loop._scan_mail_rows(
         wanted=ReportKind.SCOUT,
         label="侦察报告",
         visit=lambda row, page: opened.append(row) or False,
-        max_pages=6,
+        max_pages=8,
     )
 
     assert events.count("开信箱") == 1 + MAIL_MAX_REENTRIES
     assert events[-1] == "关信箱", "放弃也要正常收尾，不能把信箱开着走人"
+
+
+def test_a_back_click_that_missed_is_clicked_again() -> None:
+    """**退回列表要确认，不是点一下就走。**
+
+    实机 2026-08-13：点开一封主题被 OCR 糊掉的侦察报告，详情页标题读到「侦察」
+    不是「消息」，判据正确地拒了它；但接着那一下 `MAIL_BACK` 落在一个不是详情页的
+    画面上，而那个坐标身兼两职（也是「关闭面板」），于是整个信箱被关掉。
+
+    代价不是丢一封，是丢**一整趟**：那一趟 30 屏的预算有 12 屏花在重进后的重扫上，
+    两次重进用尽仍然没走到要救的战报那里。这里多花一次读屏确认便宜得多。
+    """
+    loop, _events, opened = _loop([[_row(0, ReportKind.SCOUT)]])
+    # 只摆布「还在列表上吗」这一问：进循环时答是，第一次退回后答否，补点之后答是。
+    # 详情页那一问一律答是——这条守的是退回，不是详情页判据。
+    on_list = iter([True, False, True])
+    loop._settle = lambda predicate, **_kwargs: (
+        next(on_list, True) if predicate is loop._on_mail_list else True
+    )
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.SCOUT,
+        label="侦察报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=1,
+    )
+
+    assert loop._driver.clicks.count("返回") == 2, "第一次没回到列表就要再点一次"
 
 
 # -- 「没有新邮件」不等于「翻到底了」 ----------------------------------------

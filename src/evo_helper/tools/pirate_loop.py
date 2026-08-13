@@ -334,7 +334,17 @@ MAIL_BACK = (750, 71)
 #: 取 2 是因为**重进本身不便宜**：它要重新进信箱、从顶部把已经翻过的几屏重扫一遍
 #: （只读主题，不重复开封）。真需要重进三次以上，说明画面已经不是「偶尔掉出列表」
 #: 那种情形了，接着试只是在一个认不出的画面上多点几下。
-MAIL_MAX_REENTRIES = 2
+MAIL_MAX_REENTRIES = 4
+
+#: 从详情页退回列表最多点几次「返回」。
+#:
+#: 一次不够：`MAIL_BACK` 身兼两职（也是「关闭面板」），落在一个不是详情页的画面上
+#: 时会把整个信箱关掉。点第二次的最坏情况是**点空**——那个坐标在恒星系视图上
+#: 什么都不是（`_ensure_session` 的恢复阶梯里记着同一条）。
+#:
+#: 便宜太多：一次确认 + 一次补点约 2 秒，而丢了列表要重进信箱、从顶部重扫，
+#: 实机上那一趟 30 屏的预算有 12 屏花在重扫上。
+MAIL_BACK_ATTEMPTS = 2
 
 #: 详情页里把内容拖到底用的起止点（917 空间）。必须慢拖，见 `slow_drag`。
 PANEL_DRAG_FROM_Y = 700
@@ -1342,6 +1352,20 @@ class PirateLoop:
 
         铺不开就存一帧（封顶）并当作这一封读不出来。**不读没铺开的那一屏**：
         读出来的字和「这封是别人的报告」分不开，而分不开就等于静默丢掉一份战报。
+
+        ## 退回列表要**确认**，不是点一下就走
+
+        实机 2026-08-13：主题被 OCR 糊掉的侦察报告会被放进来（主题筛故意往「开」
+        的一侧倒），它的详情页标题是「侦察」不是「消息」，判据正确地拒了它——
+        但接着那一下 `MAIL_BACK` 落在一个**不是详情页**的画面上，而那个坐标身兼
+        两职（在 `_reset_to_known_screen` 里它是「关闭面板」），于是整个信箱被关掉。
+
+        代价不是丢一封，是丢**一整趟**：调用方发现不在列表上，只能重进信箱、
+        从顶部重扫（`_scan_mail_rows` 的 `MAIL_MAX_REENTRIES`）。那一趟 30 屏的
+        预算里，12 屏花在重扫上、两次重进用尽仍然没走到要救的战报那里。
+
+        所以这里多花一次读屏确认：回到列表了就走，没回去就**再点一次**。
+        两次都不成才交给调用方去重进——那条路仍然在，只是不该动不动就走。
         """
         self._driver.click(
             MAIL_ROW_X, MAIL_FIRST_ROW_Y + row.index * MAIL_ROW_PITCH, label="打开邮件"
@@ -1353,8 +1377,13 @@ class PirateLoop:
             self._dump_mail_detail()
         else:
             done = visit(row, self._report_screens())
-        self._driver.click(*MAIL_BACK, label="返回")
-        self._driver.wait(MAIL_BACK_WAIT_S)
+        for attempt in range(MAIL_BACK_ATTEMPTS):
+            self._driver.click(*MAIL_BACK, label="返回")
+            self._driver.wait(MAIL_BACK_WAIT_S)
+            if self._settle(self._on_mail_list):
+                return done
+            if attempt + 1 < MAIL_BACK_ATTEMPTS:
+                say("  返回之后没回到邮件列表；再点一次")
         return done
 
     def _dump_mail_detail(self) -> None:
