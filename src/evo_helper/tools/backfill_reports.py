@@ -66,7 +66,12 @@ from evo_helper.tools.pirate_loop import (
     LoopOptions,
     PirateLoop,
 )
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, say
+from evo_helper.tools.scan_coordinates import (
+    LiveDriver,
+    make_console_encoding_safe,
+    make_ocr,
+    say,
+)
 
 #: `--kind` 的两档。名字与 `domain.scheduler.MissionKind` 的小写一致，
 #: 控制台那侧按这两个字符串拼命令。
@@ -146,6 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 必须在 `parse_args` 之前：argparse 的 `--help` 与「参数写错了」都直接往
+    # stderr 写字，绕开 `say()`，而本文件的帮助文本里有 `⚠️`。见那个函数的注释。
+    make_console_encoding_safe()
     args = build_parser().parse_args(argv)
 
     import ctypes

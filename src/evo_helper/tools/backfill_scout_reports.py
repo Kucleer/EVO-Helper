@@ -45,7 +45,12 @@ from evo_helper.tools.pirate_loop import (
     LoopOptions,
     PirateLoop,
 )
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, say
+from evo_helper.tools.scan_coordinates import (
+    LiveDriver,
+    make_console_encoding_safe,
+    make_ocr,
+    say,
+)
 
 
 def parse_day(text: str) -> datetime:
@@ -80,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    make_console_encoding_safe()  # 必须在 parse_args 之前，理由见那个函数
     args = build_parser().parse_args(argv)
 
     if args.all:
