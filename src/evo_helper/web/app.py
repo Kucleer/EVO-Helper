@@ -70,9 +70,6 @@ from .schemas import (
     ScanRangeOut,
     SchedulerOut,
     StateEventOut,
-    TierBandOut,
-    TierThresholdsOut,
-    TierThresholdsPatch,
 )
 from .security import LocalSecurityMiddleware, default_local_token
 from .service import (
@@ -98,7 +95,6 @@ from .service import (
     SchedulerView,
     ServiceError,
     StateEventView,
-    TierThresholdsView,
     _parse_coordinate,
     _parse_window,
 )
@@ -563,26 +559,6 @@ def create_app(
             },
         )
 
-    @app.get("/tiers", response_class=HTMLResponse)
-    async def tiers_page(request: Request) -> HTMLResponse:
-        """分档阈值。
-
-        三个数在这里**渲染出初值**（不像调度台那样全靠轮询）：这一页没有任何
-        随时间变的东西，一次 GET 就够，多一条 2 秒一次的轮询只会让用户正在输入
-        的数字被顶掉。「现在改不改得动」是唯一会变的，页面上那个「保存」按钮
-        撞上 409 时会把话说明白。
-
-        `mission_console` 用 `getattr` 取（同 `missions_page`）：假服务那条路上
-        没有库也没有调度器，取不到就渲染一张只读的默认值表。
-        """
-        console = getattr(request.app.state, "mission_console", None)
-        view = None if console is None else console.tier_thresholds()
-        return templates.TemplateResponse(
-            request=request,
-            name="tiers.html",
-            context={"active": "tiers", "thresholds": view},
-        )
-
     @app.get("/intel", response_class=HTMLResponse)
     async def intel_page(request: Request) -> HTMLResponse:
         """情报中心的筛选数据走 /api/intel/*，扫描结果随页面一起渲染。"""
@@ -939,17 +915,6 @@ def _config_freeze_out(freeze: ConfigFreezeView) -> ConfigFreezeOut:
         frozen_at_utc=freeze.frozen_at_utc,
         tasks=[_frozen_task_out(task) for task in freeze.tasks],
         changes=list(freeze.changes),
-        tier_thresholds=freeze.tier_thresholds,
-    )
-
-
-def _tier_thresholds_out(view: TierThresholdsView) -> TierThresholdsOut:
-    return TierThresholdsOut(
-        alpha_from=view.alpha_from,
-        beta_from=view.beta_from,
-        gamma_from=view.gamma_from,
-        bands=[TierBandOut(preset=band.preset, span=band.span) for band in view.bands],
-        locked=view.locked,
     )
 
 
@@ -1036,26 +1001,6 @@ def register_mission_routes(app: FastAPI) -> None:
         console: MissionConsoleService = Depends(get_console),
     ) -> MissionTaskOut:
         return _mission_task_out(console.restart_bot_round())
-
-    @app.get("/api/tier-thresholds", response_model=TierThresholdsOut)
-    def tier_thresholds(
-        console: MissionConsoleService = Depends(get_console),
-    ) -> TierThresholdsOut:
-        return _tier_thresholds_out(console.tier_thresholds())
-
-    @app.patch("/api/tier-thresholds", response_model=TierThresholdsOut)
-    def patch_tier_thresholds(
-        payload: TierThresholdsPatch,
-        console: MissionConsoleService = Depends(get_console),
-    ) -> TierThresholdsOut:
-        """三个数一次全给。运行中 409，不递增 400。见 `patch_tier_thresholds`。"""
-        return _tier_thresholds_out(
-            console.patch_tier_thresholds(
-                alpha_from=payload.alpha_from,
-                beta_from=payload.beta_from,
-                gamma_from=payload.gamma_from,
-            )
-        )
 
 
 async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> None:

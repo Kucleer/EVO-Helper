@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from evo_helper.domain.bot_round import PROBE_PRESET_NAME
+from evo_helper.domain.fleet_preset import PROBE_PRESET_NAME
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,

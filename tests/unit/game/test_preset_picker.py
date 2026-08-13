@@ -131,7 +131,7 @@ def test_a_preset_only_reachable_by_dragging_right_is_found() -> None:
     """用户口径（2026-08-11）：「BBB 和 CCC 需要拖动才可以找到，实际是有的」。
 
     左端那一屏是 `AAA / 探路`，BBB、CCC 在更右边。只在左端那一屏找的话它俩
-    永远进不了候选，5K 以上和 8K 以上两档（`domain.fleet_tier`）一发也派不出去,
+    永远进不了候选，而 bot 现在**每一发**用的都是 BBB（`domain.bot_round`），
     而报出来的是「预设条上找不到 'CCC'」，看着像游戏里根本没有这个预设。
     """
     screens = [

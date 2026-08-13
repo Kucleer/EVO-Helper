@@ -454,6 +454,6 @@ def _time_text_from_header(header: str) -> str | None:
 
 def _unit_count(text: str) -> int | None:
     """把「单位」读数解析成艘数；认不出返回 None。"""
-    from evo_helper.domain.fleet_tier import parse_fleet_count
+    from evo_helper.domain.fleet_counts import parse_fleet_count
 
     return parse_fleet_count(text) if text else None

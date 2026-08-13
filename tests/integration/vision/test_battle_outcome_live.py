@@ -99,7 +99,7 @@ def test_no_unscrolled_screen_yields_the_losses_at_all(
     而战损是算胜负的两个输入之一。所以不拖那一屏，攻击日志的战果列会永远空着，
     这跟 OCR 调得好不好一点关系都没有。
     """
-    from evo_helper.domain.fleet_tier import parse_fleet_count
+    from evo_helper.domain.fleet_counts import parse_fleet_count
 
     left, right = screens(name).loss_totals()
 
@@ -119,7 +119,7 @@ def test_the_verdict_computed_off_the_real_numbers() -> None:
 
     我方 100−0 = 100（还有船），对方 783−783 = 0（被全歼）→ `VICTORY`。
     """
-    from evo_helper.domain.fleet_tier import parse_fleet_count
+    from evo_helper.domain.fleet_counts import parse_fleet_count
 
     bottom = screens(BOTTOM_SAMPLE)
     units = bottom.unit_totals()
@@ -143,7 +143,7 @@ def test_the_arithmetic_and_the_banner_agree_on_the_one_report_we_can_check_both
     （读作 `'VICTORY'`）。两个来源相互独立：一个是两行小字的数值，
     一个是一行半透明大字的字形。它们对上，是这条新判据目前最硬的一条旁证。
     """
-    from evo_helper.domain.fleet_tier import parse_fleet_count
+    from evo_helper.domain.fleet_counts import parse_fleet_count
 
     bottom = screens(BOTTOM_SAMPLE)
     units, losses = bottom.unit_totals(), bottom.loss_totals()

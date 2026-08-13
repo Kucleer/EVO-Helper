@@ -1,6 +1,6 @@
 """钉死任务参数换算里几处一错就很危险、但错了也不会报错的地方。
 
-三块：`--scout`/`--attack`/`--probe` 这类真正派遣舰队的开关必须原样出现在
+三块：`--scout`/`--attack` 这类真正派遣舰队的开关必须原样出现在
 生成的命令行里——漏掉不会报错，效果是配额被吃掉却毫无动静；恒星系范围的
 钳制在盘面两端都要生效，不能只挡住下边界；命令行超长必须报错而不是被
 Windows 静默截断成看起来成功的半条命令。
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pytest
 
-from evo_helper.domain.fleet_tier import DEFAULT_TIER_THRESHOLDS
 from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
@@ -72,7 +71,7 @@ def test_a_reversed_system_range_is_rejected() -> None:
 def test_an_empty_target_set_is_rejected_before_a_process_is_started() -> None:
     """范围内一个已记录 bot 都没有时，拉起一个必然空转的 runner 没有意义。"""
     with pytest.raises(MissionParamError):
-        bot_command((), DEFAULT_TIER_THRESHOLDS)
+        bot_command(())
 
 
 def test_scan_command_is_the_full_argv() -> None:
@@ -97,23 +96,18 @@ def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:
 
 
 def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
-    """整条对比，不挑子串：`--probe --attack` 漏掉不会报错，只是白跑一趟。
+    """整条对比，不挑子串：`--attack` 漏掉不会报错，只是白跑一趟。
 
-    `--tier-thresholds` 也在里面。这条命令行原样存进 `mission_runs.command`，
-    带上那三个数之后它才回答得了「那一轮按什么分的档」——runner 自己去查库的话，
-    台账上就只剩「打了谁」，分档依据无处可查。
+    ⚠️ **`--probe` 与 `--tier-thresholds` 必须不在里面。** bot 不再做攻击侦查、
+    不再分档（用户口径 2026-08-13）：多传一个 runner 已经不认识的参数，
+    argparse 会当场 `SystemExit(2)`，而调度器看到的只是「这条链路又崩了一次」。
     """
-    assert bot_command((Coordinate(2, 137, 14),), DEFAULT_TIER_THRESHOLDS)[1:] == [
+    assert bot_command((Coordinate(2, 137, 14),))[1:] == [
         "-u",
         "-m",
         "evo_helper.tools.bot_loop",
         "--targets",
         "2:137:14",
-        "--tier-thresholds",
-        "2000",
-        "4000",
-        "8000",
-        "--probe",
         "--attack",
     ]
 
@@ -126,7 +120,7 @@ def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:
     many = tuple(Coordinate(2, system, 1) for system in range(1, 4000))
 
     with pytest.raises(MissionParamError):
-        bot_command(many, DEFAULT_TIER_THRESHOLDS)
+        bot_command(many)
 
 
 def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:

@@ -19,7 +19,6 @@ from evo_helper.application.mission_freeze import (
     MissionFreezeLog,
     freeze_now,
 )
-from evo_helper.domain.fleet_tier import TierThresholds
 from evo_helper.domain.scheduler import MissionKind
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -130,52 +129,43 @@ def test_a_hand_edited_broken_line_does_not_take_the_console_down(tmp_path: Path
     assert records[0].frozen_at_utc == NOW
 
 
-def test_the_tier_thresholds_survive_a_console_restart(tmp_path: Path) -> None:
-    """阈值决定这一轮每一发用哪套预设，所以它也要写进这份记录。
+def test_a_record_written_before_the_tier_thresholds_were_removed_still_reads(
+    tmp_path: Path,
+) -> None:
+    """**旧行必须照样读得出来。**
 
-    只留在 `mission_runs.command` 里是不够的：那是一轮一行的命令行，回答不了
-    「点开始那一刻页面上填的是什么」。
+    `var/mission-config-freezes.jsonl` 里已经写进过 `tier_thresholds`
+    （PR #105 加的字段，2026-08-13 随分档删掉）。这份记录的**全部用意**就是
+    事后知道当时用的哪套参数——为了几个不认识的键把整行读成 `None`，
+    等于把历史毁掉。
+
+    这条盯的是 `from_json` 逐个 `data.get(...)` 取字段这个写法：改成
+    「先校验键集合」「用 dataclass 直接反序列化」之类的做法都会让它变红。
     """
     path = tmp_path / "freezes.jsonl"
-    MissionFreezeLog(path).append(
-        freeze_now(
-            [_task(MissionKind.BOT)],
-            frozen_at_utc=NOW,
-            tier_thresholds=TierThresholds(alpha_from=1500, beta_from=5000, gamma_from=9000),
-        )
+    legacy = (
+        '{"frozen_at_utc": "2026-08-12T14:30:31+00:00", '
+        '"tasks": [{"kind": "BOT", "enabled": true, "priority": 1, "params_json": "{}"}], '
+        '"tier_thresholds": [1000, 4000, 8000]}'
+    )
+    path.write_text(legacy + "\n", encoding="utf-8")
+
+    records = MissionFreezeLog(path).records()
+
+    assert len(records) == 1
+    task = records[0].task(MissionKind.BOT)
+    assert task is not None
+    assert (task.enabled, task.priority) == (True, 1)
+
+
+def test_an_unknown_key_never_costs_the_whole_line() -> None:
+    """同一条规则的一般形式：多出来的键一律无视，不是丢行的理由。"""
+    line = (
+        '{"frozen_at_utc": "2026-08-11T12:00:00+00:00", "tasks": [], '
+        '"something_added_later": {"a": 1}}'
     )
 
-    record = MissionFreezeLog(path).records()[0]
-
-    assert record.tier_thresholds is not None
-    assert record.tier_thresholds.edges == (1500, 5000, 9000)
-
-
-def test_an_older_record_without_thresholds_reads_back_as_unrecorded() -> None:
-    """已有的历史行没有这个字段。**不给它编一个默认值。**
-
-    那几轮实际用的是当时写死在代码里的 2K/5K/8K，回填一个今天的默认值会把
-    记录变成一份看起来完整的假账——翻账的人会对着它找一个不存在的原因。
-    """
-    line = '{"frozen_at_utc": "2026-08-11T12:00:00+00:00", "tasks": []}'
-
-    record = MissionConfigFreeze.from_json(line)
-
-    assert record is not None
-    assert record.tier_thresholds is None
-
-
-def test_a_hand_broken_threshold_list_is_dropped_not_repaired() -> None:
-    """手改坏的阈值一律读成「没记」，同样不回落到默认值。
-
-    一条写着 2K/4K/8K 的记录必须真的来自那一轮的配置。
-    """
-    head = '{"frozen_at_utc": "2026-08-11T12:00:00+00:00", "tasks": []'
-    for broken in ("[2000, 9000, 8000]", "[2000, 4000]", '[2000, "4000", 8000]', "2000"):
-        record = MissionConfigFreeze.from_json(f'{head}, "tier_thresholds": {broken}}}')
-
-        assert record is not None
-        assert record.tier_thresholds is None
+    assert MissionConfigFreeze.from_json(line) is not None
 
 
 def test_a_memory_only_log_writes_no_file(tmp_path: Path) -> None:
