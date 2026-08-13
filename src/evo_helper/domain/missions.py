@@ -36,29 +36,11 @@ class MissionParamError(ValueError):
     """任务参数不合格。调度器据此拒绝启动，而不是拉起一个注定空转的进程。"""
 
 
-def check_origin_dispatchable(origin: Coordinate, current: Coordinate) -> None:
-    """这个任务的出发星球，现在派得出去吗。
-
-    ⚠️ **这是一道临时闸门，等「切换星球」实装就该整段删掉。**
-
-    助手目前**不会在游戏里切换当前星球**：派遣面板上的出发地就是游戏此刻选中的
-    那一颗，而那一颗一直是主星。任务上的 `origin` 是记账用的——它会原样写进
-    `attack_intents.origin_*`，而战报认领正是靠「出发坐标 + 目标坐标 + 时间就近」
-    配对的（`repository.append_report`）。
-
-    所以放行一个和实际出发地不符的 `origin`，代价不是「打不到」，而是**账本在
-    撒谎**：舰队从主星飞出去，台账上却写着从 9:250:8 出发，战报永远配不上那一发，
-    飞行时间与航线钟也全按错的距离算。宁可在这里拒掉，让用户看见一句话。
-
-    留成一个具名函数而不是散在几处 `if`：切换星球落地时，删掉的是这一个函数和
-    它的调用点，而不是去几个文件里找那几行条件。
-    """
-    if origin != current:
-        raise MissionParamError(
-            f"出发星球 {origin} 与游戏当前选中的 {current} 不是同一颗，"
-            f"而助手还不会在游戏里切换星球；照这样派出去，台账上的出发坐标会与"
-            f"实际不符，战报也永远配不上。请先把出发星球改回 {current}。"
-        )
+# ⚠️ 这里原先有一道临时闸门 `check_origin_dispatchable`：助手还不会在游戏里切换
+# 当前星球时，配一颗不是主星的出发星球会被当场拒掉。**它已经随「切换星球」实装
+# 一起删掉了**（runner 开工时走 `game.planet_list.PlanetSwitcher` 真的切过去，
+# 并回读派遣面板的「起点」确认）。不要照着旧注释把它加回来——加回来的效果是
+# 「除主星以外的任务一律派不出去」，而那正是这一版要解决的问题。
 
 
 def pirate_systems(origin: Coordinate, radius: int) -> tuple[tuple[int, int], ...]:

@@ -53,6 +53,7 @@ from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef
+from evo_helper.domain.planet_switch import switch_needed
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
     MISSION_KIND_SCOUT,
@@ -62,8 +63,9 @@ from evo_helper.domain.records import (
 )
 from evo_helper.domain.report_wait import parse_game_duration
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
-from evo_helper.domain.scheduler import quota_day_start_utc
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
 from evo_helper.game import pirate_ui
+from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
     NAV_LABEL_ROI,
@@ -424,6 +426,13 @@ class Outcome:
     scouted: list[Coordinate] = field(default_factory=list)
     attacked: list[Coordinate] = field(default_factory=list)
     refused: list[tuple[Coordinate, str]] = field(default_factory=list)
+    #: 这一轮开工就退了的理由（目前只有「切不到出发星球」）。
+    #:
+    #: 有值就意味着**一发都没派**，而且不算故障：`main()` 据此返回
+    #: `EXIT_ENVIRONMENT_BUSY`。用退出码而不是异常，是因为「这会儿轮不到我」
+    #: 已经有一档了（见 `application.mission_supervisor`），
+    #: 连撞几次也不该把整条链路自动停用——出发星球切不过去多半是画面状态问题。
+    busy: str | None = None
 
 
 class PirateLoop:
@@ -481,6 +490,10 @@ class PirateLoop:
         #: 本趟开工时刻。本轮派出去的侦察/攻击，其报告一定比它新——
         #: 翻信箱时据此早停（见 `MailRow.is_older_than`）。
         self._started_at = datetime.now(UTC)
+        #: 本轮**回读确认过**的当前星球。None = 还没切过（进程刚起来一定是 None：
+        #: 上一轮把游戏停在哪颗星球上不可知）。这就是「一轮只切一次」的记忆，
+        #: 判据在 `domain.planet_switch.switch_needed`。
+        self._current_planet: Coordinate | None = None
 
     # -- 读屏 ---------------------------------------------------------------
 
@@ -548,6 +561,47 @@ class PirateLoop:
         import pytesseract
 
         return name_words(self._driver.capture(), pytesseract)
+
+    def _planet_rows(self) -> list[tuple[int, str]]:
+        """行星列表浮层坐标列上，这一屏每个词框的 `(中心 y, 文字)`。
+
+        逐套配方试到**读出至少一个三段坐标**为止。理由与
+        `vision.scan_reading.read_panel_confirming` 同形：粘连是读不出，不是没翻到，
+        在同一张截图上换配方比重新拖一屏便宜得多；而这里换配方还有第二个理由——
+        实测 3× LANCZOS 会把 `9` 读成 `8`（见 `pirate_ui.PLANET_LIST_COORD_RECIPES`），
+        错的那一套给出的不是空结果而是**另一颗星球**。
+
+        一套都读不出来就交空清单出去，调用方于是什么都不点。
+        """
+        import pytesseract
+
+        from evo_helper.game.planet_list import coordinate_words
+        from evo_helper.vision.scan_reading import COORD_WHITELIST, COORDINATE_RE
+
+        # 视口漂了的话坐标列 ROI 框的是别处的像素，而这里读出来的 y 是要拿去点的。
+        self._ensure_geometry()
+        image = self._driver.capture()
+        for upscale, resample in pirate_ui.PLANET_LIST_COORD_RECIPES:
+            words = coordinate_words(
+                image, pytesseract, upscale=upscale, resample=resample, whitelist=COORD_WHITELIST
+            )
+            if any(COORDINATE_RE.search(text) for _y, text in words):
+                return words
+        return []
+
+    def _fleet_origin_text(self) -> str:
+        """派遣面板「起点」那一行的读数。读不出来就交空串（= 没切成）。"""
+        for upscale, resample in pirate_ui.FLEET_ORIGIN_RECIPES:
+            text = self._read_coord_line(pirate_ui.FLEET_ORIGIN_ROI, upscale, resample)
+            if text:
+                return text
+        return ""
+
+    def _read_coord_line(self, roi: tuple[int, int, int, int], upscale: int, resample: str) -> str:
+        self._ensure_geometry()
+        return crop_reader(self._driver.capture(), self._ocr)(
+            roi, digits=True, upscale=upscale, resample=resample
+        )
 
     # -- 识别 ---------------------------------------------------------------
 
@@ -1548,6 +1602,10 @@ class PirateLoop:
         ⚠️ **不要走底部导航的「行星」**（用户 2026-08-09 明确指出）。那个开出来的是
         行星列表浮层，每颗星球一行、每行八个图标全是真实操作（运输/部署/传送/转移/
         投送/保护/扩张），而且「前往此处」的位置随行走——在那上面找坐标既没必要又危险。
+
+        ⚠️ 这句只管「回地表」。**切换出发星球**走的正是那个浮层，见
+        `ensure_origin_planet` 与 `game.planet_list`：那边一屏一屏认坐标、
+        只点「前往此处」那一列，代价换来的是唯一一条换星球的路。
         """
         for attempt in range(attempts):
             if self._on_planet_surface():
@@ -1763,6 +1821,47 @@ class PirateLoop:
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise RuntimeError(f"{what_failed}；重开之后仍然切不回来；安全停止")
 
+    # -- 出发星球 -----------------------------------------------------------
+
+    def planet_switcher(self, *, dry_run: bool = False) -> PlanetSwitcher:
+        """建一个切换器。拖动接 `slow_drag`，理由见 `game.planet_list` 的模块头。"""
+        return PlanetSwitcher(
+            driver=_PlanetListDriver(self._driver),
+            read_rows=self._planet_rows,
+            read_origin=self._fleet_origin_text,
+            say=say,
+            dry_run=dry_run,
+        )
+
+    def ensure_origin_planet(self) -> bool:
+        """**开工阶段**把当前星球切到这一轮配的那颗；切不成返回 False。
+
+        ⚠️ **一轮只切一次。** 判「要不要切」的是纯函数
+        `domain.planet_switch.switch_needed`，记「已经切到哪」的是
+        `self._current_planet`——而那份记忆只在**回读确认之后**才写下去，
+        与 `SystemNavigator.current` 是同一条规矩：打过的字不算数，读回来的才算。
+
+        放在这里而不是每个目标前面：出发星球在一轮之内不会变，而一次切换是
+        「开浮层 + 可能几次拖动 + 回读」，挂在每个目标上等于每颗星球白花十几秒。
+
+        切完还要把画面拨回恒星系视图——切换会把游戏丢到新星球的地表上，
+        而 `_sweep` 的第一件事就是照恒星系视图的坐标导航。
+        """
+        target = self._options.origin or origin()
+        if not switch_needed(target, self._current_planet):
+            return True
+        say(f"出发星球：切到 {target}")
+        result = self.planet_switcher().switch_to(target)
+        if result is not SwitchResult.SWITCHED:
+            self._outcome.busy = f"切不到出发星球 {target}（{result.value}）"
+            say(f"  {self._outcome.busy}；这一轮一发都不派")
+            return False
+        self._current_planet = target
+        # 浮层与派遣面板都开过，导航栏里是什么已经不可知了。
+        self._navigator.invalidate()
+        self._require_system_view("切换出发星球之后切不回恒星系视图")
+        return True
+
     # -- 主循环 -------------------------------------------------------------
 
     def run(self) -> Outcome:
@@ -1774,6 +1873,11 @@ class PirateLoop:
         self._ensure_session(force=True)
         self._reset_to_known_screen()
         self._require_system_view("开工时切不到恒星系视图")
+        if not self.ensure_origin_planet():
+            # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
+            # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
+            # 退出码走 `EXIT_ENVIRONMENT_BUSY`（不算故障，等下一轮再来）。
+            return self._outcome
 
         try:
             self.reconcile_today()
@@ -1933,6 +2037,29 @@ def slow_drag(driver: LiveDriver, from_y: int, to_y: int, *, x: int = 960, steps
     time.sleep(1.4)
 
 
+class _PlanetListDriver:
+    """把 `LiveDriver` 包成 `game.planet_list` 要的那个操作面。
+
+    只为一件事存在：**纵向拖动必须走 `slow_drag`**。`LiveDriver.drag` 是一步式的
+    `dragTo`，游戏面板会把它当成点击（`slow_drag` 的注释里记着这条实测），而这里
+    按下的那一点就在星球名那一行——被当成点击的那一下点在什么上面，取决于版面
+    有没有微调。包一层比让切换器自己知道「实机要慢拖」干净。
+    """
+
+    def __init__(self, driver: LiveDriver) -> None:
+        self._driver = driver
+
+    def click(self, x: int, y: int, *, label: str = "") -> None:
+        self._driver.click(x, y, label=label)
+
+    def drag_vertical(self, x: int, from_y: int, to_y: int, *, label: str = "") -> None:
+        del label  # 慢拖是分步的，`HumanInput` 那条带标签的路径走不通。
+        slow_drag(self._driver, from_y, to_y, x=x)
+
+    def wait(self, seconds: float) -> None:
+        self._driver.wait(seconds)
+
+
 def _preset_signature(name: str) -> str:
     """预设签名就是标题本身。
 
@@ -1983,6 +2110,17 @@ def _ensure_run_row(session_factory: Any) -> UUID:
         session.add(run)
         session.commit()
         return UUID(str(run.id))
+
+
+def exit_code_for(outcome: Outcome) -> int:
+    """这一趟的退出码。两条链路共用（`tools.bot_loop.main` 也调它）。
+
+    `busy` 有值 = 开工就退了（目前只有「切不到出发星球」），走
+    `EXIT_ENVIRONMENT_BUSY`：调度器把它当成「这会儿轮不到我」而**不计入连续失败**
+    （见 `application.mission_supervisor`）。按 1 收场的话，切换星球偶尔不成
+    连撞三次就会把整条链路自动停用，而它只是需要下一轮再试一次。
+    """
+    return EXIT_ENVIRONMENT_BUSY if outcome.busy else 0
 
 
 def parse_origin(text: str) -> Coordinate:
@@ -2047,7 +2185,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     for coordinate, reason in outcome.refused:
         say(f"  [拦下] {coordinate} {reason}")
-    return 0
+    return exit_code_for(outcome)
 
 
 if __name__ == "__main__":  # pragma: no cover

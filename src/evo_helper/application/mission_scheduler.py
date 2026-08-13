@@ -45,7 +45,6 @@ from evo_helper.domain.missions import (
     MissionParamError,
     bot_command,
     bot_targets_in_range,
-    check_origin_dispatchable,
     pirate_command,
     pirate_systems,
     scan_command,
@@ -851,13 +850,14 @@ class MissionScheduler:
         就不通，合成一个入口就得让 `params` 退化成 `dict[str, Any]`，在 strict
         mypy 下等于放弃检查。
 
-        两条派遣链路都要先过 `check_origin_dispatchable`：助手还不会在游戏里切换
-        当前星球，放行一个和实际出发地不符的 `origin`，代价是台账凭空撒谎。
-        扫描不派遣，也就没有出发地这回事，不过这道闸门。
+        ⚠️ 这里原先还有一道临时闸门（`check_origin_dispatchable`）：出发星球不是
+        主星就当场拒掉。它随「切换星球」实装一起删了——runner 开工时会真的把当前
+        星球切过去（`tools.pirate_loop.ensure_origin_planet`），切不成就一发都不派
+        并报 `EXIT_ENVIRONMENT_BUSY`。**不要把它加回来**：加回来等于除主星以外的
+        任务一律派不出去。
         """
         if kind is MissionKind.SCAN:
             return scan_command()
-        check_origin_dispatchable(origin, self._origin)
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin

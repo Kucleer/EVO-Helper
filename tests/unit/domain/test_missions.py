@@ -15,7 +15,6 @@ from evo_helper.domain.missions import (
     MissionParamError,
     bot_command,
     bot_targets_in_range,
-    check_origin_dispatchable,
     pirate_command,
     pirate_systems,
     scan_command,
@@ -144,29 +143,3 @@ def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:
 
     assert pirate_loop.origin is scan_coordinates.origin
     assert scan_coordinates.origin() == ORIGIN
-
-
-# -- 出发星球现在派不派得出去 --------------------------------------------------
-#
-# 助手还不会在游戏里切换当前星球，所以任务上配的 `origin` 只有等于游戏此刻选中
-# 的那一颗（也就是主星）时才派得出去。这是一道**临时闸门**，切换星球实装就删。
-
-
-def test_the_home_planet_is_dispatchable() -> None:
-    check_origin_dispatchable(ORIGIN, ORIGIN)
-
-
-def test_another_planet_is_refused_rather_than_dispatched_from_the_wrong_place() -> None:
-    """**放行的代价不是「打不到」，是台账在撒谎。**
-
-    舰队会照旧从游戏当前选中的星球飞出去，而 `attack_intents.origin_*` 上写着
-    另一颗——战报认领靠「出发坐标 + 目标坐标 + 时间就近」配对，飞行时间与航线钟
-    也全按错的距离算。
-
-    ⚠️ 错误信息里要出现**两颗**坐标：只说「不支持」的话，用户看不出该改成什么。
-    """
-    with pytest.raises(MissionParamError) as error:
-        check_origin_dispatchable(Coordinate(9, 250, 8), ORIGIN)
-
-    assert "9:250:8" in str(error.value)
-    assert "2:137:18" in str(error.value)

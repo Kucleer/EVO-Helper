@@ -1407,17 +1407,19 @@ def test_a_second_bot_task_keeps_its_own_round(  # type: ignore[no-untyped-def]
     assert rows[main].round_started_at_utc is None
 
 
-def test_a_task_whose_planet_cannot_be_reached_yet_is_disabled_with_a_reason(  # type: ignore[no-untyped-def]
+def test_a_task_on_another_planet_is_now_dispatched_with_its_own_origin(  # type: ignore[no-untyped-def]
     scheduler, repository, session_factory, launcher
 ) -> None:
-    """**助手还不会在游戏里切换当前星球。**
+    """**配在别的星球上的任务现在派得出去了。**
 
-    所以配在别的星球上的任务不能就这么派出去：舰队会照旧从主星飞出去，而
-    `attack_intents.origin_*` 上写着 9:250:8——战报永远配不上那一发，飞行时间与
-    航线钟也全按错的距离算。宁可停用并写清原因。
+    这条用例原先钉的是反面：助手还不会切星球，所以 9:250:8 会被
+    `check_origin_dispatchable` 当场拒掉、任务被停用。那道临时闸门随「切换星球」
+    实装一起删了——runner 开工时会真的把当前星球切过去
+    （`tools.pirate_loop.ensure_origin_planet`），切不成就一发都不派并报
+    `EXIT_ENVIRONMENT_BUSY`。
 
-    ⚠️ 这是一道**临时闸门**，切换星球实装之后连同
-    `domain.missions.check_origin_dispatchable` 一起删掉，这条用例也随之改写。
+    所以现在要钉的是：**任务照常起得来，而且 `--origin` 带的是它自己那颗**。
+    退回到「拒掉」的话，多出发星球这整件事就等于没做。
     """
     add_bot_target(session_factory, Coordinate(2, 150, 3))
     disable(repository, MissionKind.SCAN)
@@ -1428,10 +1430,10 @@ def test_a_task_whose_planet_cannot_be_reached_yet_is_disabled_with_a_reason(  #
     scheduler.tick()
 
     row = {item.id: item for item in repository.mission_tasks()}[second]
-    assert row.disabled_reason is not None
-    assert "9:250:8" in row.disabled_reason
-    # 一发都没派出去：闸门在**起进程之前**，不是在 runner 里。
-    assert launcher.spawned == []
+    assert row.disabled_reason is None
+    assert launcher.spawned, "配在 9:250:8 上的任务应该照常起得来"
+    command = list(launcher.latest.command)
+    assert command[command.index("--origin") + 1] == "9:250:8"
 
 
 def test_the_bot_command_carries_the_task_origin(  # type: ignore[no-untyped-def]
