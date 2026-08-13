@@ -22,6 +22,17 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from evo_helper.application.backfill import (
+    BACKFILL_KINDS,
+    REASON_STARTUP,
+    BackfillCoordinator,
+    BackfillCounts,
+    BackfillMeasurement,
+    BackfillRequest,
+    BackfillState,
+    SqlAlchemyBackfillCounts,
+    default_since,
+)
 from evo_helper.application.mission_freeze import (
     FrozenTask,
     MissionConfigFreeze,
@@ -153,10 +164,18 @@ class MissionScheduler:
         freeze_log: MissionFreezeLog | None = None,
         progress: MissionProgress | None = None,
         watchdog: StallWatchdog | None = None,
+        backfill: BackfillCoordinator | None = None,
+        backfill_counts: BackfillCounts | None = None,
     ) -> None:
         self._repository = repository
         self._supervisor = supervisor
         self._clock = clock
+        #: 手动战报补录。**它优先于所有任务**，理由写在 `application.backfill`
+        #: 的模块头上（一句话：补录改的正是任务读来做决策的那批数据）。
+        #: 默认那一份一直停在 `IDLE`，除非有人真的请求过一次，所以给它一个真的
+        #: 协调器不会让任何测试意外拉起子进程。
+        self._backfill = backfill or BackfillCoordinator(clock=clock)
+        self._backfill_counts = backfill_counts
         #: 每按一次「开始」记一条当时的配置。默认是只留在内存里的那种——
         #: 往仓库里写文件必须是组装点（`web.app.create_persistent_app`）明确
         #: 决定的事，不能由一个默认值替测试和假服务做主。
@@ -289,16 +308,35 @@ class MissionScheduler:
             )
             return self._repository.mark_orphan_mission_runs(ended_at_utc=now)
 
-    def start(self) -> None:
+    def start(self, *, reconcile: bool = False) -> None:
         """用户点「开始」。顺手把这一刻的三条链路配置固化成一条记录。
+
+        **先对账，再放行任务。** 用户口径（2026-08-13）：「启动调度台之后，
+        先检查有多少应读未读战报 → 读完所有应读未读战报 → …… → 继续执行任务，
+        但是已攻击的海盗/BOT 不再重复侦查/攻击」。所以点「开始」会先排一批补录
+        （海盗一趟、bot 一趟——两条链路的信箱主题不同，一趟只读得了一种），
+        走的是和手动补录**同一套闸门**（`_act` 里那一句），不是第二套机制。
+        为什么这个顺序是硬要求，见 `application.backfill` 的模块头。
+
+        那趟不怕慢：信箱单子一空就早停，没有欠账时几十秒走完。
+
+        ⚠️ **这里的默认值是「不对账」，而用户那一侧的默认是「对账」**
+        （`web.persistent_service.MissionConsoleService.start_scheduler` 与
+        `web.schemas.SchedulerStartIn.reconcile`，页面上那个复选框默认勾着）。
+        两个默认值反着来是**故意的**，同 `freeze_log` 那一条：`reconcile=True`
+        会真的 `Popen` 一个去点鼠标翻信箱的子进程，而「起一个真的子进程」必须是
+        组装点明确决定的事，不能由一个默认值替所有调用方做主。默认成 True 的
+        代价是具体的：一大批只关心调度循环的测试会在 CI 上真的拉起补录进程。
+        用户意图（「点开始要不要先对账」）本来也属于有用户的那一层。
+
+        固化只发生在**停 → 开**这一次跃迁上。连点两下「开始」不该记两条——
+        第二下什么都没变，记下来只会让历史表里多一条「与上一次相同」，把真正
+        改过的那几条淹掉；秒表同理，不按回零。对账也只排一批：`request_batch`
+        对已经排着的链路直接跳过。
 
         **查库在锁外**（同 `snapshot()`）：`mission_tasks()` 只有三行、比
         `_facts()` 轻得多，但把任何一次查库压进这把锁都是在给「结束」排队，
         而那正是上一轮修复刚拆开的东西。锁里只剩几个字段的赋值。
-
-        固化只发生在**停 → 开**这一次跃迁上。连点两下「开始」不该记两条——
-        第二下什么都没变，记下来只会让历史表里多一条「与上一次相同」，把真正
-        改过的那几条淹掉；秒表同理，不按回零。
         """
         # 抄配置和按下秒表用的是同一个时刻：两次取「现在」的话，记录上的固化
         # 时刻会和页面上那块秒表的起点差一点，而事后翻账正是拿这两个对时间线。
@@ -334,20 +372,43 @@ class MissionScheduler:
         # 落账在锁外：写文件的耗时没有上界（磁盘、杀毒软件），而它对
         # 「任何时刻最多一个子进程」这条不变量毫无影响。
         self._freezes.append(freeze)
+        # 「开始」这一下本身就是「放任务出来」的意思，所以它顺带确认掉上一批
+        # 补录的摘要。不确认的话，手动补完、看完、直接点「开始」的用户会撞上一
+        # 台开着却一个任务都不起的调度器，而页面上唯一的解释是另一个按钮。
+        self._backfill.acknowledge()
+        if reconcile:
+            self._backfill.request_batch(
+                [
+                    BackfillRequest(kind=kind, since=default_since(now), reason=REASON_STARTUP)
+                    for kind in BACKFILL_KINDS
+                ]
+            )
+            self._advance_backfill()
 
     def stop(self) -> None:
-        """用户点「结束」。立刻杀，不等它跑完手上这一个。"""
+        """用户点「结束」。立刻杀，不等它跑完手上这一个。
+
+        **不动补录。** 它不是一条链路，也不由这个开关管：正在补录时点「结束」
+        的含义是「补完之后别再起任务了」，而不是「把补录也掐了」。要掐补录有
+        它自己的「取消」按钮，以及红条上的「强制结束」（那一下的口径是全停）。
+        """
         with self._lock:
             self._enabled = False
             self._started_at_utc = None
             self._finish(self._supervisor.stop(StopReason.USER))
 
     def shutdown(self) -> None:
-        """控制台关闭时清场，覆盖「正常重启」这条最常见的路径。"""
+        """控制台关闭时清场，覆盖「正常重启」这条最常见的路径。
+
+        **补录也要一起收掉。** 不收的话，控制台关了，一个还在翻信箱点鼠标的
+        补录进程留在后台——和 `supervisor.stop()` 挡的是同一件事，只是它归另一个
+        进程管理器管。
+        """
         with self._lock:
             self._enabled = False
             self._started_at_utc = None
             self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
+            self._backfill.cancel(self._measure_backfill)
 
     def force_kill(self) -> None:
         """页面顶部那条红条上的「强制结束」。
@@ -357,10 +418,12 @@ class MissionScheduler:
         那一枪可能打在别人身上。
 
         它顺带把调度器停掉（走 `stop()`）：只杀不停的话，下一个 tick 立刻又起
-        一个新的，按钮看上去毫无作用。「强制结束」的用户口径是全停。
+        一个新的，按钮看上去毫无作用。「强制结束」的用户口径是全停——**补录也
+        算在「全」里面**，它同样是一个在点鼠标的子进程。
         """
         with self._lock:
             self.stop()
+            self._backfill.cancel(self._measure_backfill)
             self._repository.mark_orphan_mission_runs(ended_at_utc=self._clock())
             self._orphan_pid = None
 
@@ -421,9 +484,16 @@ class MissionScheduler:
 
         **读事实那一段在锁外**（见 `_lock` 上的注释）：它没有上界，而「结束」
         必须能立刻插进来。
+
+        补录那两句在 `if not self._enabled` **上面**：补录不归调度器的开关管，
+        用户完全可以在调度器停着的时候点一次补录，而那时也得有人去起它、去收
+        它的退出码。
         """
         with self._lock:
             self._finish(self._supervisor.poll())
+        # 锁外：收到退出码那一次要量两个 `COUNT(*)` 外加逐个 bot 目标问库。
+        self._backfill.poll(self._measure_backfill)
+        self._advance_backfill()
         if not self._enabled:
             return
         self._cut_off_a_stalled_round()
@@ -432,6 +502,120 @@ class MissionScheduler:
         for _ in range(len(MissionKind)):
             if not self._step():
                 return
+
+    # -- 手动战报补录 ----------------------------------------------------------
+    #
+    # 补录**优先于所有任务**，理由在 `application.backfill` 的模块头上。这一节
+    # 只做「动手」那一半：判据（能不能起、扣不扣着窗口）全在协调器那边。
+
+    def backfill_state(self) -> BackfillState:
+        return self._backfill.state()
+
+    def backfill_log_tail(self, lines: int) -> str:
+        return self._backfill.log_tail(lines)
+
+    def request_backfill(self, request: BackfillRequest) -> BackfillState:
+        """用户点了「开始补录」。
+
+        请求落下之后**立刻推一格**，不等下一个 tick：窗口空着时用户按下按钮
+        就该看见「补录中」，正在跑扫描时那一下就该把扫描抢占掉。差的那一秒
+        本身无所谓，但「点了之后页面上什么都没变」会让人再点一次。
+        """
+        self._backfill.request(request)
+        self._advance_backfill()
+        return self._backfill.state()
+
+    def cancel_backfill(self) -> BackfillState:
+        """排队中就撤销，跑着就杀掉。取消之后立刻放行。"""
+        return self._backfill.cancel(self._measure_backfill)
+
+    def acknowledge_backfill(self) -> BackfillState:
+        """用户看过摘要，点了「继续任务」。**这一下才放行。**"""
+        return self._backfill.acknowledge()
+
+    def _advance_backfill(self) -> None:
+        """把补录往前推一格：抢占扫描 / 等海盗跑完 / 窗口空了就起。
+
+        三条分支对应用户口径里的三段：
+
+        - 正在跑**扫描** → 立刻抢占。扫描的游标持久化，随时可断，`decide()` 里
+          那条「只有扫描会被抢占」用的也是同一个理由。
+        - 正在跑**海盗 / bot** → 什么都不做，等它自己跑完。**绝不硬杀**：
+          它们可能正卡在「点了出发」和「把这一发记进库」之间，硬杀会留下一发
+          飞出去了却没记账的舰队，而那正是战报永远配不上的成因。
+        - 窗口空着 → 量一次底数，起补录。
+
+        **量底数在锁外**（同 `_facts`、`snapshot`、`_cut_off_a_stalled_round`）：
+        它要跑两个 `COUNT(*)` 外加逐个 bot 目标问库，压进 `_lock` 就是给用户的
+        「结束」排队。进锁之后重新确认一遍——不是就作废，照着一份过期的快照去
+        抢占，杀掉的可能是下一轮刚起来的那个。
+
+        ⚠️ 进锁前那两行**只是省钱，不是判据**：判据是锁里那一份（照着锁外读到的
+        状态动手，等于凭一份可能已经过期的快照去杀子进程）。省的是量底数那一下
+        ——海盗那一轮能跑半小时，而 tick 每秒一次，不省就是每秒白付一次逐个 bot
+        目标问库。改坏这两行只会变慢，不会变错；真正的护栏在下面。
+        """
+        if not self._backfill.pending:
+            return
+        running = self._supervisor.running
+        if running is not None and running.kind is not MissionKind.SCAN:
+            return
+        before = self._measure_backfill()
+        with self._lock:
+            if not self._backfill.pending:
+                return
+            running = self._supervisor.running
+            if running is not None:
+                if running.kind is not MissionKind.SCAN:
+                    return
+                self._finish(self._supervisor.stop(StopReason.PREEMPTED))
+            self._backfill.launch_if_pending(before)
+
+    def _measure_backfill(self) -> BackfillMeasurement:
+        """补录前后各量一次的那份底数。**只读。**
+
+        「新入库几份战报」「认领上几发派遣」两个数来自 `battle_reports`；
+        「哪几个 bot 目标的态变了」只能逐个目标问库，那正是任务自己判「还要不要
+        再打一遍」用的同一段判据（`_bot_remaining` 也这么问），所以摘要里那个数
+        和调度器下一步的行为出自同一份事实。
+        """
+        reports, claimed = self._backfill_reader.read()
+        return BackfillMeasurement(reports=reports, claimed=claimed, bot_phases=self._bot_phases())
+
+    @property
+    def _backfill_reader(self) -> BackfillCounts:
+        """战报计数器，第一次真要用时才建（同 `_watchdog` 那一份，理由一样）。"""
+        if self._backfill_counts is None:
+            self._backfill_counts = SqlAlchemyBackfillCounts(self._repository._session_factory)  # noqa: SLF001
+        return self._backfill_counts
+
+    def _bot_phases(self) -> dict[tuple[int, str], str]:
+        """每个参与调度的 bot 任务、本轮范围内每个目标此刻的态。
+
+        **只量参与调度的那些**：没勾或已停用的任务不会因为补录而动起来，为它们
+        逐个目标问一遍库只是白付钱（这段在 tick 线程之外，但 bot 范围里有四千
+        多个目标）。参数填错的任务同样跳过——它此刻连命令行都换算不出来。
+        """
+        phases: dict[tuple[int, str], str] = {}
+        targets: list[Coordinate] | None = None
+        now = self._clock()
+        for row in self._repository.mission_tasks():
+            if row.kind != MissionKind.BOT.value or not row.enabled:
+                continue
+            if row.disabled_reason is not None:
+                continue
+            if targets is None:
+                targets = self._bot_targets()
+            try:
+                in_range = bot_targets_in_range(targets, **_bot_range(row.params_json))
+            except MissionParamError:
+                continue
+            for target in in_range:
+                facts = self._repository.bot_dispatch_facts(
+                    target, since=row.round_started_at_utc, now_utc=now
+                )
+                phases[(row.id, str(target))] = phase_of(facts).name
+        return phases
 
     # -- 跑着不动 --------------------------------------------------------------
 
@@ -529,6 +713,19 @@ class MissionScheduler:
             return False
         with self._lock:
             if not self._enabled:
+                return False
+            # **补录扣着窗口时一个任务都不起。** 这是「完成补录才会继续任务」
+            # 那句用户口径的唯一落点，理由见 `application.backfill` 的模块头：
+            # 补录改的正是任务读来做决策的那批数据，抢在它前面跑等于拿一份已知
+            # 不完整的数据决定要不要再打一遍——那会白送一支舰队出去。
+            #
+            # 闸门必须在抢占**之前**：放在 `_launch` 里的话，`Action.PREEMPT`
+            # 会先把正在跑的扫描杀掉，然后才发现这一轮根本起不来，等于白掐一轮。
+            #
+            # 返回 False（不必再算）而不是 True：这一下没有停用任何任务，次序
+            # 一个字都没变，重算只是白付一次 `_facts()`——而补录要跑十几分钟，
+            # 那就是十几分钟每秒三次的空转。
+            if self._backfill.blocking:
                 return False
             running = self._supervisor.running
             if decision.action is Action.PREEMPT:

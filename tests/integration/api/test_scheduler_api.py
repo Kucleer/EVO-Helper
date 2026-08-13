@@ -5,6 +5,11 @@
 
 **这里不真的 Popen 任何 runner**：`launch` 一律注入假的。真起一个会去点用户的
 真实鼠标、派真实舰队。后台 tick 也被推到一小时一次，免得测试里冒出计划外的启动。
+
+⚠️ **补录那个协调器也要注入假的 `launch`。** 它是第二个进程管理器，默认那份用
+的是真的 `subprocess.Popen`——点「开始」默认会先排一批对账，漏了这一下，
+`pytest` 会真的去起 `evo_helper.tools.backfill_reports`（实测在工作区里落下了一份
+`var/logs/backfill-pirate.log`）。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from evo_helper.application.backfill import BackfillCoordinator
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
@@ -59,6 +65,20 @@ class FakeLauncher:
         return FakeProcess(pid=9000 + len(self.commands))
 
 
+class FakeBackfillLauncher:
+    """补录那一侧的假 `Popen`。签名少一个 `kind`——补录不是一条链路。"""
+
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, ...]] = []
+        self.processes: list[FakeProcess] = []
+
+    def __call__(self, command: Sequence[str], log_path: Path) -> FakeProcess:
+        self.commands.append(tuple(command))
+        process = FakeProcess(pid=8000 + len(self.commands))
+        self.processes.append(process)
+        return process
+
+
 class MovableClock:
     def __init__(self, now: datetime) -> None:
         self.now = now
@@ -76,6 +96,17 @@ class Console:
     clock: MovableClock
     #: 配置固化记录落盘的地方。**临时目录**，测试不许往仓库里写文件。
     freeze_log: Path
+    backfill_launcher: FakeBackfillLauncher
+
+    def start(self, *, reconcile: bool = False):  # type: ignore[no-untyped-def]
+        """点「开始」。**这些用例默认跳过启动对账。**
+
+        对账本身是真实默认（`reconcile` 不给就是做，见 `SchedulerStartIn`），
+        但它会先扣住窗口——本节这些用例说的是「调度器起不起得了任务」，带上对账
+        的话每一条都得先把那批补录走完，测的东西就从判据变成了补录。对账那几条
+        单独在 `test_backfill_api.py` 里。
+        """
+        return self.client.post("/api/scheduler/start", json={"reconcile": reconcile})
 
     def get(self) -> dict[str, object]:
         response = self.client.get("/api/scheduler")
@@ -137,8 +168,15 @@ def console(tmp_path: Path) -> Iterator[Console]:
     launcher = FakeLauncher()
     supervisor = MissionSupervisor(launch=launcher, clock=clock, log_dir=tmp_path / "logs")
     freeze_log = tmp_path / "freezes.jsonl"
+    backfill_launcher = FakeBackfillLauncher()
     scheduler = MissionScheduler(
-        repository, supervisor, clock=clock, freeze_log=MissionFreezeLog(freeze_log)
+        repository,
+        supervisor,
+        clock=clock,
+        freeze_log=MissionFreezeLog(freeze_log),
+        backfill=BackfillCoordinator(
+            launch=backfill_launcher, clock=clock, log_dir=tmp_path / "logs"
+        ),
     )
     app = create_persistent_app(
         factory,
@@ -148,7 +186,7 @@ def console(tmp_path: Path) -> Iterator[Console]:
         tick_interval_s=3600.0,
     )
     with TestClient(app, headers={"X-Evo-Helper-Token": TOKEN}) as client:
-        yield Console(client, repository, scheduler, launcher, clock, freeze_log)
+        yield Console(client, repository, scheduler, launcher, clock, freeze_log, backfill_launcher)
 
 
 # -- 读 -------------------------------------------------------------------------
@@ -206,7 +244,7 @@ def test_the_bot_row_echoes_how_many_bots_the_range_holds(console: Console) -> N
 
 
 def test_starting_and_stopping_flips_the_flag(console: Console) -> None:
-    assert console.client.post("/api/scheduler/start").status_code == 200
+    assert console.start().status_code == 200
     assert console.get()["running"] is True
 
     assert console.client.post("/api/scheduler/stop").status_code == 200
@@ -215,7 +253,7 @@ def test_starting_and_stopping_flips_the_flag(console: Console) -> None:
 
 def test_the_running_child_is_reported_with_its_log(console: Console) -> None:
     """悬浮窗要显示「当前跑的是哪条链路、已运行多久」，两样都从这里取。"""
-    console.client.post("/api/scheduler/start")
+    console.start()
     console.scheduler.tick()
     console.clock.now = NOW + timedelta(minutes=2)
 
@@ -229,7 +267,7 @@ def test_the_running_child_is_reported_with_its_log(console: Console) -> None:
 
 
 def test_stopping_kills_the_child(console: Console) -> None:
-    console.client.post("/api/scheduler/start")
+    console.start()
     console.scheduler.tick()
     assert console.get()["current"] is not None
 
@@ -372,7 +410,7 @@ def test_an_unknown_kind_is_a_404(console: Console) -> None:
 
 
 def _start(console: Console) -> None:
-    assert console.client.post("/api/scheduler/start").status_code == 200
+    assert console.start().status_code == 200
 
 
 def test_params_cannot_be_changed_while_the_scheduler_runs(console: Console) -> None:
@@ -637,7 +675,7 @@ def test_the_console_writes_its_freezes_under_var(tmp_path: Path) -> None:
 
 def test_force_kill_stops_the_child_we_do_know_about(console: Console) -> None:
     """认识的那个进程照常停掉；不认识的 pid 一律不碰。"""
-    console.client.post("/api/scheduler/start")
+    console.start()
     console.scheduler.tick()
 
     console.client.post("/api/scheduler/force-kill")
@@ -662,7 +700,7 @@ def test_the_desktop_window_can_read_this_endpoint(console: Console) -> None:
     assert stopped.running is False
     assert stopped.current is None
 
-    console.client.post("/api/scheduler/start")
+    console.start()
     console.scheduler.tick()
     console.clock.now = NOW + timedelta(minutes=2)
 

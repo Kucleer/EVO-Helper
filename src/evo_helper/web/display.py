@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from evo_helper.application.backfill import BACKFILL_KINDS, BackfillPhase
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scheduler import TaskStatus
 
@@ -66,6 +67,57 @@ STATUS_GLYPHS: dict[str, str] = {
     TaskStatus.DISABLED.value: "✕",
     TaskStatus.OFF.value: "○",
 }
+
+
+#: 补录能补的两条链路在界面上的名字。键是 `application.backfill.BACKFILL_KINDS`
+#: 的取值，也就是 CLI 的 `--kind`。接口与命令行一律英文，界面只显示中文。
+BACKFILL_KIND_LABELS: dict[str, str] = {
+    "pirate": "海盗战报",
+    "bot": "bot 战报",
+}
+
+#: 补录六档状态各自的 chip 色调与字形。键是 `BackfillPhase` 的**每一个**成员。
+#:
+#: 「补录完成」与「补录失败」不能共用一格：失败意味着那批战报还躺在信箱里，
+#: 而任务马上要拿这份仍然不全的数据去决定要不要再打一遍。
+#:
+#: 色永远配一个字形（见 `STATUS_TONES` 上那条）：控制台要在灰度下、对色盲用户
+#: 也读得懂，所以 chip 里写的是那六个中文词，色只是加速。
+BACKFILL_PHASE_TONES: dict[str, str] = {
+    BackfillPhase.IDLE.value: "",
+    BackfillPhase.PENDING.value: "warn",
+    BackfillPhase.RUNNING.value: "ok",
+    BackfillPhase.DONE.value: "ok",
+    BackfillPhase.FAILED.value: "danger",
+    BackfillPhase.CANCELLED.value: "",
+}
+
+BACKFILL_PHASE_GLYPHS: dict[str, str] = {
+    BackfillPhase.IDLE.value: "○",
+    BackfillPhase.PENDING.value: "◷",
+    BackfillPhase.RUNNING.value: "▶",
+    BackfillPhase.DONE.value: "★",
+    BackfillPhase.FAILED.value: "✕",
+    BackfillPhase.CANCELLED.value: "■",
+}
+
+
+def missing_backfill_phases() -> list[str]:
+    """色调表或字形表里没有位置的补录状态。测试拿它当断言。
+
+    同 `missing_status_tones()`：漏一档就意味着页面上会出现一个没有颜色、
+    没有字形的 chip，而最可能漏的恰恰是新加的那一档。
+    """
+    return [
+        phase.name
+        for phase in BackfillPhase
+        if phase.value not in BACKFILL_PHASE_TONES or phase.value not in BACKFILL_PHASE_GLYPHS
+    ]
+
+
+def missing_backfill_kind_labels() -> list[str]:
+    """没有中文名的补录链路。页面上那个下拉框按它建，漏一条就少一个选项。"""
+    return [kind for kind in BACKFILL_KINDS if kind not in BACKFILL_KIND_LABELS]
 
 
 def missing_status_tones() -> list[str]:

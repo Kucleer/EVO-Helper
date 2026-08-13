@@ -386,6 +386,55 @@ class SchedulerView:
     frozen_config: ConfigFreezeView | None = None
 
 
+@dataclass(frozen=True)
+class BackfillSummaryView:
+    """一批补录改了什么。**跑完摆在页面上，用户看过才放行任务。**
+
+    三个数分别回答用户口径里的三件事：补进来几份、认领上几发（认领上了才会
+    影响任务决策）、几个 bot 目标从「还要打」变成了「已完成」——最后那个就是
+    省下来的重复攻击。
+    """
+
+    reports_ingested: int
+    dispatches_claimed: int
+    bot_targets_settled: int
+    #: 一共量了几个 bot 目标。0 表示**没量**（没有参与调度的 bot 任务），
+    #: 和「量了但一个都没变」在页面上必须分得开。
+    bot_targets_measured: int
+
+
+@dataclass(frozen=True)
+class BackfillView:
+    """补录 / 对账此刻的样子。页面每两秒问一次。"""
+
+    #: `未在补录` / `等任务结束` / `补录中` / `补录完成` / `补录失败` / `已取消`，
+    #: 由 `application.backfill.BackfillPhase` 判定。页面按它上色配字形。
+    phase: str
+    #: 这一趟补的是哪条链路（`pirate` / `bot`），没有请求时为 None。
+    kind: str | None = None
+    #: 链路的中文名，页面不自己维护第二份映射。
+    label: str = ""
+    #: 起始日期（UTC 日），`YYYY-MM-DD`。
+    since: str = ""
+    #: `手动补录` / `启动对账`。同一套机制两个入口，页面上要说得清是谁要的。
+    reason: str = ""
+    started_at_utc: datetime | None = None
+    ended_at_utc: datetime | None = None
+    exit_code: int | None = None
+    log_path: str = ""
+    #: 日志的最后几十行。补录跑十几分钟，这是唯一的进度来源。
+    log_tail: str = ""
+    #: 这一批里还排着几趟（启动对账一次排两趟）。
+    queued: int = 0
+    #: 补录此刻扣不扣着游戏窗口。为真时**一个任务都不起**。
+    blocking: bool = False
+    #: 跑完了但还没确认放行。页面据此显示「继续任务」按钮。
+    awaiting_ack: bool = False
+    #: 状态旁边那句随行的事实：在等谁跑完、跑了多久、为什么起不来。
+    detail: str = ""
+    summary: BackfillSummaryView | None = None
+
+
 class ApplicationService(Protocol):
     def list_plans(self) -> list[ScanPlanView]: ...
     def get_plan(self, plan_id: UUID) -> ScanPlanView | None: ...
@@ -787,6 +836,8 @@ __all__ = [
     "ATTACK_LOG_RESULTS",
     "ApplicationService",
     "AttackLogOptions",
+    "BackfillSummaryView",
+    "BackfillView",
     "BotTargetView",
     "ConflictError",
     "CurrentMissionView",

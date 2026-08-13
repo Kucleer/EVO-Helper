@@ -1,6 +1,6 @@
 """Pydantic request/response models for the local HTTP API."""
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -254,6 +254,73 @@ class SchedulerOut(BaseModel):
     frozen_config: ConfigFreezeOut | None = None
 
 
+class SchedulerStartIn(BaseModel):
+    """POST /api/scheduler/start 的请求体。**整个可以省略。**
+
+    省略时按默认值走，也就是「先对账再放行任务」——桌面悬浮窗
+    （`tools/scan_console.py`）和 4.3 节里那条 curl 都是不带体打的，
+    它们不该因为多了这个字段而换一种行为。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: 点「开始」之后先跑一趟战报对账（海盗、bot 各一趟），跑完才起任务。
+    #: **默认为真**：默认跳过等于把这条修复关掉，而它防的是「拿不全的数据
+    #: 决定要不要再打一遍」，代价是白送一支舰队。
+    reconcile: bool = True
+
+
+class BackfillStartIn(BaseModel):
+    """POST /api/backfill 的请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: `pirate` / `bot`。两条链路的信箱主题不同，一趟只读得了一种。
+    kind: str
+    #: 起始日期（**UTC 日**，`YYYY-MM-DD`）。和战报上写的时间同一套口径——
+    #: 游戏一律按 UTC+0 显示。
+    since: date
+    #: 翻几页信箱、最多开几封。不填就用 CLI 自己的默认值：**两处各写一份默认
+    #: 值，改了一边就是另一边悄悄按旧值跑**。页面上不给这两个框。
+    max_pages: int | None = None
+    max_opens: int | None = None
+
+
+class BackfillSummaryOut(BaseModel):
+    """一批补录改了什么。跑完摆在页面上，用户看过才放行任务。"""
+
+    reports_ingested: int
+    #: 认领上了几发派遣。**认领上了才会影响任务决策**——一份挂在那里没认领的
+    #: 战报，`domain.bot_round.phase_of` 根本看不见。
+    dispatches_claimed: int
+    #: 几个 bot 目标从「本轮还要打」变成了「本轮已完成」。这就是省下来的重复攻击。
+    bot_targets_settled: int
+    #: 一共量了几个 bot 目标。0 表示没量（没有参与调度的 bot 任务），
+    #: 和「量了但一个都没变」不是一回事。
+    bot_targets_measured: int
+
+
+class BackfillOut(BaseModel):
+    phase: str
+    kind: str | None = None
+    label: str = ""
+    since: str = ""
+    reason: str = ""
+    started_at_utc: datetime | None = None
+    ended_at_utc: datetime | None = None
+    exit_code: int | None = None
+    log_path: str = ""
+    #: 日志的最后几十行。补录跑十几分钟，这是页面上唯一的进度来源。
+    log_tail: str = ""
+    queued: int = 0
+    #: 补录此刻扣不扣着游戏窗口。为真时调度器一个任务都不起。
+    blocking: bool = False
+    #: 跑完了但还没确认放行。页面据此显示「继续任务」按钮。
+    awaiting_ack: bool = False
+    detail: str = ""
+    summary: BackfillSummaryOut | None = None
+
+
 class DashboardOut(BaseModel):
     plan_count: int
     active_run_count: int
@@ -262,6 +329,9 @@ class DashboardOut(BaseModel):
 
 
 __all__ = [
+    "BackfillOut",
+    "BackfillStartIn",
+    "BackfillSummaryOut",
     "BotTargetOut",
     "ConfigFreezeOut",
     "CoordinateModel",
@@ -283,5 +353,6 @@ __all__ = [
     "ScanRangeIn",
     "ScanRangeOut",
     "SchedulerOut",
+    "SchedulerStartIn",
     "StateEventOut",
 ]
