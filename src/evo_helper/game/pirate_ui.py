@@ -269,8 +269,8 @@ PLANET_ICON_ROW_OFFSET_Y = 60
 #: 是可以进行拖动按下的点」。
 #:
 #: ⚠️ **按下点的 y 必须跟着当前这一屏识别出来的行走**，见
-#: `domain.planet_switch.PlanetRow`。这个 x 在星球名那一行是空白，往下 70px
-#: 就是图标排，同一个 x 上坐着「部署」。
+#: `domain.planet_switch.PlanetRow`。这个 x 在星球名那一行是空白，往下 60px
+#: 就是图标上排，同一个 x 上坐着「部署」。
 PLANET_LIST_DRAG_X = 961
 
 #: 往上拖时松手的 y（内容上移、露出下面的行）。落在浮层内的第一行名字高度上。

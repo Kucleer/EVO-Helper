@@ -214,7 +214,7 @@ class TestDraggingThroughTheList:
     def test_the_finger_presses_down_on_a_name_row_read_from_this_screen(self) -> None:
         """按下点的 y 必须跟着**当前这一屏识别出来的行**走。
 
-        写死一个绝对值不行：横向中点只在星球名那一行是空白，往下 70px 就是图标排，
+        写死一个绝对值不行：横向中点只在星球名那一行是空白，往下 60px 就是图标上排，
         同一个 x 上坐着「部署」。列表拖过之后行会移位——而按下再拖起来，
         游戏可能当成点击。
 
