@@ -680,148 +680,24 @@ def test_every_row_carries_a_revive_button(console: Console) -> None:
     assert page.count('class="btn small mission-revive"') == 3
 
 
-# -- 分档阈值 -------------------------------------------------------------------
+# -- bot 命令行 ---------------------------------------------------------------
 
 
-def test_the_thresholds_start_at_the_numbers_the_user_asked_for(console: Console) -> None:
-    """用户口径（2026-08-11）：2K 以下不打、2–4K AAA、4–8K BBB、8K+ CCC。"""
-    body = console.client.get("/api/tier-thresholds").json()
+def test_the_launched_bot_command_has_no_probe_and_no_thresholds(console: Console) -> None:
+    """runner 拿到的 argv 只有目标和 `--attack`。
 
-    assert (body["alpha_from"], body["beta_from"], body["gamma_from"]) == (2000, 4000, 8000)
+    ⚠️ **多传一个参数的后果不是「多余」，是这条链路起不来**：`bot_loop` 的
+    argparse 见到不认识的 `--probe` / `--tier-thresholds` 会 `SystemExit(2)`，
+    而调度器看到的只是退出码非零、连撞三次就把整条 bot 链路自动停用。
+    分档已经整套删除（用户口径 2026-08-13）。
 
-
-def test_the_thresholds_echo_which_band_gets_which_preset(console: Console) -> None:
-    """三个输入框只是三个数，「填成这样之后哪一档打哪个区间」得看得见。
-
-    区间在服务端算好送出去，页面不自己拼——两边各拼一次，界面和日志迟早对同一
-    套阈值说出两种区间。
-    """
-    bands = console.client.get("/api/tier-thresholds").json()["bands"]
-
-    assert [(band["preset"], band["span"]) for band in bands] == [
-        ("（不派）", "2K 以下"),
-        ("AAA", "2K–4K"),
-        ("BBB", "4K–8K"),
-        ("CCC", "8K+"),
-    ]
-
-
-def test_the_thresholds_can_be_changed_and_read_back(console: Console) -> None:
-    response = console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 1500, "beta_from": 5000, "gamma_from": 9000},
-    )
-
-    assert response.status_code == 200, response.text
-    assert console.repository.tier_thresholds().edges == (1500, 5000, 9000)
-    # 区间回显跟着新取值走，不是照旧念默认那一套。
-    assert response.json()["bands"][1]["span"] == "1.5K–5K"
-
-
-def test_non_increasing_thresholds_are_refused_not_sorted(console: Console) -> None:
-    """把 BBB 的起点推到 CCC 之上，BBB 就成了永远取不到的死区。
-
-    **拒绝，不排序也不截断**：静默收下之后页面会显示成「保存成功」，而实际生效
-    的是另外三个数，那一档一发都不会派而没人看得出来。
-    """
-    response = console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 2000, "beta_from": 9000, "gamma_from": 8000},
-    )
-
-    assert response.status_code == 400, response.text
-    assert "严格递增" in response.json()["detail"]
-    # 拒了就得真的没改。
-    assert console.repository.tier_thresholds().edges == (2000, 4000, 8000)
-
-
-def test_equal_thresholds_are_refused_too(console: Console) -> None:
-    """相等同样是死区：那一档的区间宽度为零。"""
-    response = console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 2000, "beta_from": 4000, "gamma_from": 4000},
-    )
-
-    assert response.status_code == 400, response.text
-
-
-def test_the_thresholds_cannot_be_changed_while_the_scheduler_runs(console: Console) -> None:
-    """和任务参数同一条口径（PR #93）：运行中一律锁死。
-
-    阈值决定每一发派哪套预设，一轮之内换一次口径，事后从台账里分不出当时用的是
-    哪一套。用户口径（2026-08-11）：「运行中我不会修改，只有在开始任务之前可以
-    修改。」这里没有「恢复」那种例外——阈值页上没有任何一个操作是「把调度器
-    自己弄出来的状态改回去」。
-    """
-    _start(console)
-
-    response = console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 1000, "beta_from": 2000, "gamma_from": 3000},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "运行中" in response.json()["detail"]
-    assert console.repository.tier_thresholds().edges == (2000, 4000, 8000)
-    # 页面据此把三个框置灰，同任务参数那一侧。
-    assert console.client.get("/api/tier-thresholds").json()["locked"] is True
-
-
-def test_the_thresholds_are_editable_again_after_stopping(console: Console) -> None:
-    _start(console)
-    console.client.post("/api/scheduler/stop")
-
-    response = console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 1000, "beta_from": 2000, "gamma_from": 3000},
-    )
-
-    assert response.status_code == 200, response.text
-    assert console.client.get("/api/tier-thresholds").json()["locked"] is False
-
-
-def test_starting_freezes_the_thresholds_of_that_moment(console: Console) -> None:
-    """阈值属于「这一轮用的是哪一套参数」，所以它也进固化记录。"""
-    console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 1500, "beta_from": 5000, "gamma_from": 9000},
-    )
-    _start(console)
-
-    frozen = console.get()["frozen_config"]
-    assert isinstance(frozen, dict)
-    assert frozen["tier_thresholds"] == "1500 / 5000 / 9000"
-
-
-def test_the_second_start_records_that_the_thresholds_moved(console: Console) -> None:
-    _start(console)
-    console.client.post("/api/scheduler/stop")
-    console.clock.now = NOW + timedelta(hours=1)
-    console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 2000, "beta_from": 5000, "gamma_from": 8000},
-    )
-    _start(console)
-
-    frozen = console.get()["frozen_config"]
-    assert isinstance(frozen, dict)
-    assert "分档阈值：2000 / 4000 / 8000 → 2000 / 5000 / 8000" in frozen["changes"]
-
-
-def test_the_launched_bot_command_carries_the_configured_thresholds(console: Console) -> None:
-    """runner 拿到的是**启动那一刻**库里的取值，写在 argv 上。
-
-    这条命令行原样存进 `mission_runs.command`，所以事后翻账时它既回答「打了谁」
-    也回答「按哪三个数分的档」。runner 自己去查库的话，台账上就查不到后者。
+    这条同时守着 `--attack` 必须在：漏掉它这一轮只会站过去看一眼，不报错、
+    看着一切正常，而一发都没打。
     """
     _seed_bot(console.repository, Coordinate(2, 137, 14))
     console.client.patch(
         "/api/missions/BOT",
         json={"enabled": True, "params": {"galaxy": 2, "first_system": 130, "last_system": 140}},
-    )
-    console.client.patch(
-        "/api/tier-thresholds",
-        json={"alpha_from": 1500, "beta_from": 5000, "gamma_from": 9000},
     )
     console.client.patch("/api/missions/PIRATE", json={"enabled": False})
     console.client.patch("/api/missions/SCAN", json={"enabled": False})
@@ -831,5 +707,17 @@ def test_the_launched_bot_command_carries_the_configured_thresholds(console: Con
     command = next(
         item for item in console.launcher.commands if "evo_helper.tools.bot_loop" in item
     )
-    index = command.index("--tier-thresholds")
-    assert command[index + 1 : index + 4] == ("1500", "5000", "9000")
+
+    assert "--attack" in command
+    assert "--probe" not in command
+    assert "--tier-thresholds" not in command
+
+
+def test_the_tier_thresholds_api_is_gone(console: Console) -> None:
+    """`/api/tier-thresholds` 与 `/tiers` 都不该再在了。
+
+    留一条只读的旧接口比删掉更糟：页面上那三个框还能填、还能保存，而没有任何
+    地方读它——用户会以为自己改了这一轮的打法。
+    """
+    assert console.client.get("/api/tier-thresholds").status_code == 404
+    assert console.client.get("/tiers").status_code == 404

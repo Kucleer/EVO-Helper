@@ -231,7 +231,7 @@ def _time_text_of(header: str) -> str | None:
 
 def _totals(texts: tuple[str, str]) -> tuple[int, int] | None:
     """双方各一个数；任一读不出就返回 None（由调用方决定拒收还是留空）。"""
-    from evo_helper.domain.fleet_tier import parse_fleet_count
+    from evo_helper.domain.fleet_counts import parse_fleet_count
 
     left = parse_fleet_count(texts[0]) if texts[0] else None
     right = parse_fleet_count(texts[1]) if texts[1] else None

@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from evo_helper.domain.fleet_tier import DEFAULT_TIER_THRESHOLDS, TierThresholds
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage import models as orm
 
@@ -73,35 +72,18 @@ def test_scheduler_config_carries_the_tunables(session_factory) -> None:  # type
         assert row.min_dwell_seconds == 60
         assert row.report_grace_minutes == 30
         assert row.restart_cooldown_seconds == 300
-        # 用户口径（2026-08-11）。⚠️ 中间那道是 4000，不是原先写死的 5000。
-        assert (row.tier_alpha_from, row.tier_beta_from, row.tier_gamma_from) == (
-            2000,
-            4000,
-            8000,
-        )
 
 
-def test_tier_thresholds_round_trip_through_the_repository(repository) -> None:  # type: ignore[no-untyped-def]
-    """页面保存 → 读回来是同一套。"""
-    repository.ensure_mission_rows(now_utc=datetime.now(UTC))
+def test_the_tier_thresholds_are_gone_from_the_config_row() -> None:
+    """分档删干净了：这张单行配置表上不该再有那三列。
 
-    assert repository.tier_thresholds() == DEFAULT_TIER_THRESHOLDS
-
-    repository.update_tier_thresholds(
-        TierThresholds(alpha_from=1500, beta_from=5000, gamma_from=9000)
-    )
-
-    assert repository.tier_thresholds().edges == (1500, 5000, 9000)
-
-
-def test_tier_thresholds_fall_back_to_the_defaults_on_a_fresh_database(repository) -> None:  # type: ignore[no-untyped-def]
-    """配置行还没建出来时给默认值，不抛。
-
-    控制台开机会补这一行，但 runner 是独立进程：手工跑一次 `tools.bot_loop`
-    完全可能撞上一个还没被控制台碰过的库。那时按默认值分档，与新建库拿到的
-    取值一致。
+    列在、代码不在是最难查的那种不一致——有值、有默认值，看起来像还生效的
+    配置，而实际上没有任何地方读它（用户口径 2026-08-13：分档功能可以移除）。
+    迁移 `c1f70b8a26d4` 把它们 drop 掉，这条守住 ORM 这一侧不再声明它们。
     """
-    assert repository.tier_thresholds() == DEFAULT_TIER_THRESHOLDS
+    columns = set(orm.SchedulerConfigRow.__table__.columns.keys())
+
+    assert not {name for name in columns if name.startswith("tier_")}
 
 
 # -- 三行任务与单行配置的初始化 ------------------------------------------------

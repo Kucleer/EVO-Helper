@@ -1,18 +1,19 @@
-"""进信箱收战报这一趟：怎么进、翻多少、开哪几封、怎么认、怎么入库。
+"""收 bot 战报这一侧：怎么认、怎么入库、算出来的战果怎么落进那一行。
 
-**探路发与攻击发共用这一趟**，这里的每一条对两种发都成立：两种发打的是同一个坐标、
-走的是同一条攻击链路、报告主题同为「攻击报告」，认归属靠的都是 VS 块里的目标坐标。
-这条路径上从头到尾没有一处读得到「这一份是哪个预设打的」——也不需要读。
-「哪些目标交进来收」在 `test_bot_loop.py`（分态路由）那一侧。
+认归属靠的是 VS 块里的目标坐标——这条路径上从头到尾没有一处读得到「这一份是
+哪个预设打的」，也不需要读。「哪些目标交进来收」在 `test_bot_loop.py`（分态路由）
+那一侧。
 
-翻信箱的动作两条链路共用（`PirateLoop._scan_mail_rows`），这里守的是 bot 这一侧：
+守三件事：
 
-1. **进信箱前必须先关浮层**，切不过去要留下现场。
-2. **认报告靠 VS 块里的目标坐标，不靠行号。** 行序随新邮件变。
-3. **入库前后各有一道闸门**：复核 VS 坐标、按报告时间去重。
+1. **入库前后各有一道闸门**：复核 VS 坐标、按报告时间去重。
+2. **战果是算出来的**（剩余 = 单位 − 损失），算不出就留空——而留空的下游后果是
+   这个坐标本轮不会被补刀（平局才重打，见 `domain.bot_round`）。
+3. **收不到时那句话要说准**：「还没到点」和「到点了却没翻到」处置相反。
 
-窗口那一侧（先读主题再决定开不开、翻屏、按时间早停）钉在
-`test_mail_scan_window.py`——那是两条链路共用的部分。
+进信箱的姿势（关浮层 → 切地表 → 开面板）与窗口那一侧（先读主题再决定开不开、
+翻屏、按时间早停）是两条链路共用的部分，钉在 `test_pirate_loop_mailbox_entry.py`
+与 `test_mail_scan_window.py`。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop, BotOptions
-from evo_helper.tools.pirate_loop import LoopOptions, MailRow, ReportIngest, TargetCheck
+from evo_helper.tools.pirate_loop import LoopOptions, MailRow, ReportIngest
 from evo_helper.vision.parsers import ReportKind
 
 A = Coordinate(2, 149, 17)
@@ -80,11 +81,15 @@ def _attack_rows(count: int) -> list[MailRow]:
 
 
 def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]]:
-    """一个只装了「翻信箱」所需零件的 `BotLoop`。"""
+    """一个装好了「会碰屏的那些零件」的 `BotLoop`。
+
+    `events` 记的是它有没有去动屏幕——`_say_still_waiting` 那几条正是靠这个
+    断言「这句话是纯日志，不再进一趟信箱」。
+    """
     events: list[str] = []
     loop = BotLoop.__new__(BotLoop)
-    loop._bot = BotOptions(targets=(), probe=True, attack=True)
-    loop._options = LoopOptions(systems=(), scout=True, attack=True)
+    loop._bot = BotOptions(targets=(), attack=True)
+    loop._options = LoopOptions(systems=(), scout=False, attack=True)
     loop._started_at = datetime(2026, 8, 6, tzinfo=UTC)
     loop._driver = _Driver()
     loop._mail_dumps = 0
@@ -108,124 +113,6 @@ def _no_dragging(monkeypatch: pytest.MonkeyPatch) -> None:
     from evo_helper.tools import pirate_loop
 
     monkeypatch.setattr(pirate_loop, "slow_drag", lambda *args, **kwargs: None)
-
-
-# -- 进信箱的姿势 ------------------------------------------------------------
-
-
-def test_overlays_are_closed_before_the_surface_check() -> None:
-    """**关浮层必须排在切地表之前。**
-
-    `_on_planet_surface()` 的正面凭据是右上角那个未读数，而浮层会盖住它；
-    `_goto_planet_surface()` 自己不关浮层，只会反复点视图菜单——而那个坐标
-    此刻正压在浮层底下。顺序反了等于没修。
-    """
-    loop, events = _loop([_Page(None)])
-    loop._open_mail = lambda: (_ for _ in ()).throw(RuntimeError("到此为止"))
-
-    with pytest.raises(RuntimeError, match="到此为止"):
-        loop._scan_mail((A,), lambda target, page: None)
-
-    assert events == ["关浮层", "切地表"]
-
-
-def test_an_unreachable_surface_leaves_a_frame_behind() -> None:
-    """切不过去就存一帧：不知道当时画面长什么样是最贵的失败。"""
-    loop, events = _loop([], reachable=False)
-
-    with pytest.raises(RuntimeError, match="切不到自己星球地表"):
-        loop._scan_mail((A,), lambda target, page: None)
-
-    assert events == ["关浮层", "切地表", "存图:planet-surface-unreachable"]
-
-
-# -- 认报告 ------------------------------------------------------------------
-
-
-def test_a_report_is_matched_by_its_own_coordinate_not_its_row() -> None:
-    """**行序随新邮件变，而报告自己写着打的是谁。**
-
-    这里目标按 (A, B) 给，信箱里却是 B 在前——照行号对位就会把 B 那份当成 A 的，
-    于是一份战报挂到另一个 bot 头上，接着按它的舰队量去挑攻击组合。
-    """
-    loop, _events = _loop([_Page(B), _Page(A)])
-    seen: list[Coordinate] = []
-
-    missing = loop._scan_mail((A, B), lambda target, page: seen.append(target))
-
-    assert seen == [B, A]
-    assert missing == set()
-
-
-def test_several_targets_are_collected_in_one_trip() -> None:
-    """一趟读完。一个目标进一次信箱要切视图、开面板、慢拖三下，一趟十几秒。"""
-    loop, events = _loop([_Page(A), _Page(B)])
-    seen: list[Coordinate] = []
-
-    loop._scan_mail((A, B), lambda target, page: seen.append(target))
-
-    assert seen == [A, B]
-    assert events.count("开信箱") == 1
-
-
-def test_a_target_whose_report_has_not_arrived_is_reported_as_missing() -> None:
-    """**收不到不是错误。** 探路刚派出去，战报本来就还没到；
-    这一趟不动它，下一趟再来（真的一直收不到，由放弃阈值兜底）。"""
-    loop, _events = _loop([_Page(B)])
-
-    missing = loop._scan_mail((A,), lambda target, page: None)
-
-    assert missing == {A}
-
-
-def test_an_unrendered_panel_is_skipped_rather_than_guessed() -> None:
-    """VS 块读不出来时不猜是谁的报告——猜错就把战报挂到别的目标上。"""
-    loop, _events = _loop([_Page(None)])
-    seen: list[Coordinate] = []
-
-    missing = loop._scan_mail((A,), lambda target, page: seen.append(target))
-
-    assert seen == []
-    assert missing == {A}
-
-
-def test_a_detail_page_that_never_renders_is_not_read_at_all() -> None:
-    """**点开之后要等详情页真的铺开，铺不开就一个字都不读。**
-
-    面板是滑进来的（`_settle` 的注释记着「等 2.4 秒判一次判不到，而失败时存下的
-    那一帧读得清清楚楚」）。没铺开的那一屏读出来是一堆读不通的字，和「这封是别人
-    的报告」在下游长得一模一样——于是一份本来在信箱里的战报被静默丢掉，
-    而日志上只有一句「还没翻到」。
-
-    这里让 `_on_mail_detail` 恒为假：即使那一屏其实是 A 的战报，也一封都不读，
-    并且留下现场图。
-    """
-    loop, events = _loop([_Page(A)])
-    loop._settle = lambda predicate, **_kwargs: predicate is not loop._on_mail_detail
-    seen: list[Coordinate] = []
-
-    missing = loop._scan_mail((A,), lambda target, page: seen.append(target))
-
-    assert seen == []
-    assert missing == {A}
-    assert "存图:mail-detail-unrendered" in events
-
-
-def test_the_mailbox_is_closed_even_when_nothing_matched() -> None:
-    """不关信箱，下一个目标的 `goto` 会在浮层上朝导航栏坐标盲点。"""
-    loop, events = _loop([_Page(B)])
-
-    loop._scan_mail((A,), lambda target, page: None)
-
-    assert events[-1] == "关信箱"
-
-
-def test_nothing_wanted_means_no_mailbox_trip_at_all() -> None:
-    """没有要收的目标就别进信箱——一趟十几秒，白跑还占着鼠标。"""
-    loop, events = _loop([])
-
-    assert loop._scan_mail((), lambda target, page: None) == set()
-    assert events == []
 
 
 # -- 入库前后的两道闸门 ------------------------------------------------------
@@ -303,7 +190,7 @@ def test_an_already_stored_report_is_not_appended_again() -> None:
 def test_an_unreadable_report_is_skipped_and_dumped() -> None:
     """读不出来就放过，**不存半份**，并留下现场。
 
-    这一份就这么放着，等 `MAX_REPORT_AGE` 把那发派遣判掉、允许重新探路——
+    这一份就这么放着，等 `MAX_REPORT_AGE` 把那发派遣判掉、允许重打一发——
     这就是「报告就是读不到」时的出路，而不是让目标静默卡死。
     """
     repository = _Repository()
@@ -454,8 +341,11 @@ def test_the_unscrolled_screen_wins_when_it_already_has_the_units() -> None:
 
 
 def test_units_that_neither_screen_shows_stay_empty() -> None:
-    """拖到底也没读到就留空。**不能拿 0 顶替**：0 会落进「不值得打」那一档，
-    于是一个真有舰队的 bot 被静默跳过（`_tier_and_attack` 那两条测试守着同一件事）。
+    """拖到底也没读到就留空。**不能拿 0 顶替**。
+
+    0 会让 `剩余 = 单位 − 损失` 算成负数或零，于是一份读不出的战报会被记成
+    一场全歼或一场惨败——而战果决定这个坐标要不要再挨一发。留空则整份不判，
+    这是安全的那一侧（`domain.battle_outcome.survivors`）。
     """
     repository = _Repository()
 
@@ -537,77 +427,3 @@ class _DueRepository:
         self, coordinates: Any, *, since: datetime | None
     ) -> dict[Coordinate, tuple[datetime, datetime | None]]:
         return dict(self._due)
-
-
-# -- 兜底路径也要拖 ----------------------------------------------------------
-
-
-def test_the_fallback_read_also_scrolls_when_the_first_screen_has_no_units() -> None:
-    """`read_defender_units` 是**兜底路径**，同样得拖到底。
-
-    只修入库那一条不够：兜底这条读不出来就返回 None，而 None 会让
-    `_tier_and_attack` 整个跳过这个目标——一个真有舰队的 bot 被静默放走，
-    和「库里没数」长得一模一样。
-    """
-    loop, _events = _loop([_Page(A, units="")])
-    loop._bottom_screens = lambda: _Page(A, units="319")
-
-    assert loop.read_defender_units(A) == 319
-
-
-def test_the_fallback_read_does_not_scroll_when_it_already_has_the_number() -> None:
-    """看得见就别拖——拖一次要真的按住鼠标分步走两趟，而那个数已经在手上了。"""
-    loop, _events = _loop([_Page(A, units="5.36K")])
-    loop._bottom_screens = lambda: pytest.fail("第一屏读到了就不该再拖")
-
-    assert loop.read_defender_units(A) == 5360
-
-
-# -- 分档取数 ----------------------------------------------------------------
-
-
-def test_the_tier_uses_the_stored_total_without_a_second_mailbox_trip() -> None:
-    """走到这一态的前提就是「本轮的探路战报已经入库」，那个数已经读过了。
-
-    再进一趟信箱不只是多花十几秒：信箱那条路**没有时间闸门**，翻到的可能是
-    上一轮甚至上一天的报告，照它分档挑出来的档次是错的，而且完全静默。
-    """
-    loop = BotLoop.__new__(BotLoop)
-    loop._bot = BotOptions(targets=(A,), probe=True, attack=True)
-    loop._ensure_run = lambda: (_StoredUnits(5360), None)
-    loop.read_defender_units = lambda coordinate: pytest.fail("库里有数就不该再进信箱")
-    attacked: list[tuple[Coordinate, str]] = []
-    # 合流后 `_tier_and_attack` 走父类的 `_goto_checked`（两条链路共用的自愈）。
-    # 这两条测试钉的是「分档的数从哪来」，导航不在范围内，桩掉即可。
-    loop._goto_checked = lambda coordinate: TargetCheck.CONFIRMED
-    loop.attack = lambda coordinate, *, preset: attacked.append((coordinate, preset))
-
-    loop._tier_and_attack(A)
-
-    assert attacked == [(A, "BBB")]
-
-
-def test_the_tier_falls_back_to_the_mailbox_when_the_row_has_no_total() -> None:
-    """库里那一列可空（「单位」那一行读不出来时留空）。**不能把 None 当 0**——
-    0 会落进「不值得打」那一档，于是一个真有舰队的 bot 被静默跳过。"""
-    loop = BotLoop.__new__(BotLoop)
-    loop._bot = BotOptions(targets=(A,), probe=True, attack=True)
-    loop._ensure_run = lambda: (_StoredUnits(None), None)
-    loop.read_defender_units = lambda coordinate: 9000
-    attacked: list[tuple[Coordinate, str]] = []
-    # 合流后 `_tier_and_attack` 走父类的 `_goto_checked`（两条链路共用的自愈）。
-    # 这两条测试钉的是「分档的数从哪来」，导航不在范围内，桩掉即可。
-    loop._goto_checked = lambda coordinate: TargetCheck.CONFIRMED
-    loop.attack = lambda coordinate, *, preset: attacked.append((coordinate, preset))
-
-    loop._tier_and_attack(A)
-
-    assert attacked == [(A, "CCC")]
-
-
-class _StoredUnits:
-    def __init__(self, units: int | None) -> None:
-        self._units = units
-
-    def latest_defender_units(self, target: Coordinate, *, since: datetime) -> int | None:
-        return self._units

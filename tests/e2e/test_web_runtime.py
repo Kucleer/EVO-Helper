@@ -39,9 +39,13 @@ def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> 
     }
     # 调度器的可调项走迁移加列。漏了这条迁移，模型和真实的表就会静默分叉：
     # 本地测试用 `create_all` 建表，一路全绿，只有真实的库会在启动时炸。
-    assert {"restart_cooldown_seconds", "tier_alpha_from", "tier_beta_from", "tier_gamma_from"} <= {
-        column["name"] for column in inspect(engine).get_columns("scheduler_config")
-    }
+    #
+    # 删列同理，方向相反：`c1f70b8a26d4` 把分档那三列 drop 掉了，漏跑它的话
+    # 真实的库上会多出三列没有任何代码认识的配置——而 `create_all` 建出来的
+    # 测试库压根不会有它们，两边看起来都对。
+    config_columns = {column["name"] for column in inspect(engine).get_columns("scheduler_config")}
+    assert "restart_cooldown_seconds" in config_columns
+    assert not {name for name in config_columns if name.startswith("tier_")}
     assert engine.connect().execute(text("SELECT version_num FROM alembic_version")).scalar_one()
 
 

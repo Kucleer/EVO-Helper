@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from evo_helper.application.mission_scheduler import MAX_CONSECUTIVE_FAILURES, MissionScheduler
-from evo_helper.domain.fleet_preset import DEFAULT_PRESET
+from evo_helper.domain.bot_round import BOT_ATTACK_PRESET
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -113,10 +113,17 @@ def dispatch(  # type: ignore[no-untyped-def]
     return dispatch_id
 
 
-def attach_report(session_factory, dispatch_id, target: Coordinate, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
+def attach_report(  # type: ignore[no-untyped-def]
+    session_factory,
+    dispatch_id,
+    target: Coordinate,
+    reported_at: datetime,
+    outcome: str | None = None,
+) -> None:
     """直接挂一份战报，不走 `append_report` 的坐标+时间容差匹配。
 
-    那条路等于让测试依赖匹配算法，而这里要验的只是「有没有战报」这一个事实。
+    那条路等于让测试依赖匹配算法，而这里要验的只是「有没有战报、战果是什么」
+    这两个事实。
     """
     with session_factory() as session:
         session.add(
@@ -130,6 +137,7 @@ def attach_report(session_factory, dispatch_id, target: Coordinate, reported_at:
                 defender_target_galaxy=target.galaxy,
                 defender_target_system=target.system,
                 defender_target_position=target.position,
+                outcome=outcome,
             )
         )
         session.commit()
@@ -326,7 +334,13 @@ def test_the_bot_command_only_carries_targets_inside_the_range(  # type: ignore[
     command = launcher.latest.command
     assert "2:150:3" in command
     assert "2:900:4" not in command
-    assert command[-2:] == ["--probe", "--attack"]
+    # `--attack` 是「真的动鼠标派舰队」的意思，漏掉不报错、看着一切正常，
+    # 代价是这一轮一发都没打。⚠️ `--probe` / `--tier-thresholds` 必须**不在**：
+    # runner 已经不认识它们，多传一个就是 `SystemExit(2)`，而调度器只看得到
+    # 「这条链路又崩了一次」。
+    assert command[-1] == "--attack"
+    assert "--probe" not in command
+    assert "--tier-thresholds" not in command
 
 
 def test_bad_parameters_disable_the_chain_instead_of_killing_the_loop(  # type: ignore[no-untyped-def]
@@ -847,13 +861,16 @@ def test_a_target_that_got_its_attack_report_no_longer_counts_as_remaining(  # t
     assert launcher.kinds == [MissionKind.SCAN]
 
 
-def test_a_target_that_only_got_a_probe_report_still_counts_as_remaining(  # type: ignore[no-untyped-def]
+def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type: ignore[no-untyped-def]
     repository, launcher, clock, run_id, session_factory
 ) -> None:
-    """探路发的战报只说明该分档了，不说明这一轮走完了。
+    """平局的战报说明该**再打一发**，不说明这一轮走完了。
 
-    把探路当成完成，bot 会在只探不打的状态下「完成」整轮。
+    把平局当成完成，调度器会在还欠着补刀的状态下宣布 bot 这一轮跑完、
+    再也不起这条链路——而用户口径明写着「平局则继续进行攻击」。
     """
+    from evo_helper.domain.battle_outcome import OUTCOME_DRAW
+
     target = Coordinate(2, 150, 3)
     add_bot_target(session_factory, target)
     dispatch_id = dispatch(
@@ -862,12 +879,12 @@ def test_a_target_that_only_got_a_probe_report_still_counts_as_remaining(  # typ
         TARGET_KIND_BOT,
         target=target,
         dispatched_at=NOW - timedelta(hours=1),
-        preset_name=DEFAULT_PRESET.name,
+        preset_name=BOT_ATTACK_PRESET,
         # 这一发早该回来了。飞行时间不给的话航线钟留空，那一档算「还占着」，
         # 唯一那条航线被压住，验的就不再是「目标还剩几个」了。
         flight=timedelta(minutes=20),
     )
-    attach_report(session_factory, dispatch_id, target, NOW - timedelta(minutes=30))
+    attach_report(session_factory, dispatch_id, target, NOW - timedelta(minutes=30), OUTCOME_DRAW)
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)

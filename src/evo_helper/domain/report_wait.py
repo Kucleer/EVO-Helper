@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 
-from evo_helper.domain.bot_round import is_probe_preset
+from evo_helper.domain.fleet_preset import is_probe_preset
 from evo_helper.domain.records import MISSION_KIND_SCOUT
 
 #: `X天Y时Z分W秒`，缺省段会被省略（`8时3分20秒`、`45秒`）。

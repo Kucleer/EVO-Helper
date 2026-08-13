@@ -221,6 +221,28 @@ All notable changes to this project are documented in this file.
   默认排序改看「情报时间」（战报时间与侦察报告时间取晚的那个）：海盗一份战报都没有，只按
   战报时间排会把「刚侦察完的海盗」整批沉到几百行开外，而那恰恰是最该顶在前面的一批。
   取数同时从 N+1 改成五条成批查询（全宇宙 4000 多个 bot 原先要 8000 多次往返）。
+- **bot 攻击模式：不再攻击侦查，直接用预设 BBB 打，平局就对同一坐标再打**（#48，用户口径
+  2026-08-13）。改动的**依据**是 8/12 通宵那一夜在生产库副本上按类别数出来的账：UTC 8/12
+  共派 80 发，其中侦察 44 发（本来就不产生攻击战报）、真正该有战报的攻击发 36 发，而认领上
+  的战报只有 15 份；bot 这一侧 21 发（探路 18 + AAA 3）只回来 6 份，且全是头一批——从 UTC
+  15:04 起 bot 再没有一发的战报被读回来，链路从 15:51 到 23:12 一发未派、目标全卡在等战报。
+  按类别拆开之后缺的那一类是明确的：**不是「还在飞」，也不是被游戏拒绝**（那一夜
+  `accepted=False` 0 条），而是**翻信箱的开封预算被别的链路的报告吃光**——11 趟开工里 8 趟
+  撞上 `MAIL_MAX_OPENS`（8 封），开出来的封数里 37 次「VS 块读不出来」、16 次「not an attack
+  report: 海盗攻击报告」，而同样那几封海盗报告每一趟都被重开一遍（「这一封不是我的」只活在
+  一趟之内）。这条改动**不动那个共用预算**，它换的是分母：每个目标要等的战报从两份（探路
+  一发 + 分档一发）减到一份，同样预算下能闭合的目标数直接翻倍。`BotPhase` 从五态减到三态，
+  `NEEDS_PROBE` / `AWAITING_PROBE_REPORT` **删掉而不是留成死态**——留着就是 `phase_of` 里两条
+  永远走不到的分支。平局重打**有硬上限**：`MAX_ATTACKS_PER_TARGET = 3`（初打一发 + 最多补
+  两发），周期是「一轮」，计数直接由 `bot_dispatch_facts(since=本轮起点)` 的行数给出，
+  点「新一轮」就归零，**不新增任何一列**；取 3 是与仓里另外两条自愈配额同一档（断线重开
+  3 次/滚动 1 小时、认不出目标只自愈一次）。「读不到战报算不算一次」由既有的
+  `MAX_REPORT_AGE` 回答，不新增第二套计时：6 小时之内算（那一发还在事实表上，目标停在等
+  战报，走不到重打），超过就整条剔掉、配额退回去——合起来的上界是「每个目标每 6 小时最多
+  因此多打一发」。**算不出战果 ≠ 平局**：四个数缺一个时 `outcome` 为空，那种目标不重打，
+  重打的唯一依据是确认平局；拿一次 OCR 失手去再送一支舰队出去是反的。判据只看**最后一发**
+  的战果（按 any 判会让先平后胜的目标一直打到撞上限），所以仓储按 `dispatched_at_utc` 排序
+  交出，次序是判据的一部分。海盗链路一个字没改——它走 `domain.scout_verdict`，不看战果。
 
 ### Fixed
 
@@ -352,6 +374,27 @@ All notable changes to this project are documented in this file.
   同一恒星系里的字段输入从 12 次降到 6 次，但那是结果，不是目的。
 
 ### Removed
+
+- **bot 分档整套删除**（#48，用户口径 2026-08-13「bot分档相关功能可以移除」）：不是把它留成
+  没人读的死配置，是让 `domain/fleet_tier.py`、`/tiers` 页与侧栏入口、
+  `GET|PATCH /api/tier-thresholds`、`TierThresholdsOut/Patch/View`、`TierBandView`、
+  `bot_command` 与 `bot_loop` 的 `--tier-thresholds`、`repository.tier_thresholds` /
+  `update_tier_thresholds` / `latest_defender_units` / `mark_bot_target_skipped`、
+  `MissionConfigFreeze.tier_thresholds` 都不再存在。⚠️ **`parse_fleet_count` 不能跟着删**——
+  它的消费者全在读战报那一侧（`vision.live_reports` / `vision.pirate_reports` /
+  `vision.optional.report_screens`），是 `domain.battle_outcome` 那四个输入的解析器，与分档
+  无关；搬到 `domain/fleet_counts.py`，模块名跟着用途走。迁移 `c1f70b8a26d4` 用
+  `batch_alter_table` 删掉 `scheduler_config` 的 `tier_alpha_from` / `tier_beta_from` /
+  `tier_gamma_from`（前一天 `a3d7b1e64c92` 刚加上）：**列在、代码不在是最难查的那种不一致**
+  ——有值、有默认值，看起来像还生效的配置。已在生产库副本上验过
+  `upgrade → downgrade → upgrade` 往返：20 张表逐表行数不变、配置行其余值不变、回滚后列集合
+  与起点逐字一致、`integrity_check` ok、`foreign_key_check` 空。**旧的固化记录仍要读得出来**
+  ——生产的 `var/mission-config-freezes.jsonl` 7 行里有 5 行写着 `tier_thresholds`，实测 7 行
+  全部照常解析（`from_json` 逐个 `data.get(...)` 取字段，不认识的键一律无视；那份记录的用意
+  就是事后知道当时用的哪套参数，为几个多余的键丢整行等于毁账）。
+  `test_each_tier_maps_to_a_real_in_game_preset_title` **没有被连带删掉**：它守的「预设标题
+  必须是游戏里真实存在的」仍然成立，改写成守 BBB，而且比原先更要紧——BBB 正是要往右拖才
+  看得到的那一档（#100），标题一旦对不上，这条链路一发都派不出去。
 
 - **演习模式 / `dry_run` 整个删除**（#35）：不是把默认值改成 False，是让这个字段、这个分支、
   这个开关、这一列都不再存在——派遣就是真派遣，没有第二条路径。迁移 `a2f6c8d31b70` 用

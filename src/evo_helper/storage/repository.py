@@ -13,7 +13,6 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
-from evo_helper.domain.fleet_tier import DEFAULT_TIER_THRESHOLDS, TierThresholds
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
@@ -50,14 +49,6 @@ from . import models as orm
 #: count as the same dispatch under the strict origin/target/time match rule.
 MATCH_TIME_TOLERANCE = timedelta(hours=12)
 
-#: 分档判定「不值得打」的目标，记在 `target_revisits` 上（其语义正是「需要复查的
-#: 目标」），用独立 scope 与「战报缺失」那批分开。
-#:
-#: **不写 `attack_intents.guard_status`。** 那一列被 `application/workflow.py` 用
-#: `ALLOWED` / `REFUSED` 占着，`logs.html` 把它渲染成「未派出 · {guard_status}」；
-#: 塞第三套词汇进去，一发确实飞出去了的攻击会在日志页显示成「未派出」。
-REVISIT_SCOPE_TIER_NEGLIGIBLE = "BOT_TIER_NEGLIGIBLE"
-
 #: 孤儿行的 `stopped_by`：控制台重启时发现的、上次没走正常关闭路径的子进程。
 STOPPED_BY_UNKNOWN = "UNKNOWN"
 
@@ -73,11 +64,6 @@ _MISSION_SEEDS: tuple[tuple[MissionKind, bool, int, str], ...] = (
     (MissionKind.BOT, False, 1, "{}"),
     (MissionKind.SCAN, True, 2, "{}"),
 )
-
-#: 这些复查行写 `DONE` 而不是默认的 `PENDING`。`persistent_service` 数的是
-#: PENDING 的条数、missions 页显示成「待复查」——分档说不值得打是一个已经
-#: 下完的判定，不是等人去做的活，用 PENDING 会凭空撑起那个计数。
-REVISIT_STATUS_DONE = "DONE"
 
 
 class StorageConflictError(ValueError):
@@ -1235,9 +1221,16 @@ class SqlAlchemyRepository:
         链路打的是同系目标，飞行按分钟计，而 `MAX_CREDIBLE_FLIGHT` 已经把简报上
         读出来的时长封在 6 小时内——比派出时刻晚 6 小时还没到的战报，只可能是丢了。
 
-        剔干净之后这个目标会退回 `NEEDS_PROBE`（或 `NEEDS_ATTACK`），也就是
-        **允许重新探路**。代价有界：每个目标每 6 小时最多重来一次；而不剔的
-        代价是它这一整轮再也不动，且画面上只是「在等」。
+        剔干净之后这个目标会退回 `NEEDS_ATTACK`，也就是**允许重打一发**。
+        代价有界：每个目标每 6 小时最多重来一次；而不剔的代价是它这一整轮
+        再也不动，且画面上只是「在等」。
+
+        ⚠️ 这也正是「读不到战报的那一发算不算一次重打配额」的答案
+        （`domain.bot_round.MAX_ATTACKS_PER_TARGET`）：**6 小时之内算**——它还在
+        这张表上，目标就停在 `AWAITING_ATTACK_REPORT`，压根走不到重打那一步；
+        **超过 6 小时不算**——那一条被剔掉，配额跟着退回去。两段合起来的上界是
+        「每个目标每 6 小时最多多打一发」，与既有的「战报丢了就允许重来一次」
+        是同一条规则，没有新增第二套计时。
 
         `accepted` 这个过滤不能省，与兄弟方法 `count_dispatches_since` /
         `pending_reports_for_kind` 同口径：被游戏拒掉的那一发没有舰队飞出去，
@@ -1245,18 +1238,19 @@ class SqlAlchemyRepository:
         该目标永远停在 `AWAITING_ATTACK_REPORT`，bot 的完成态永远达不到。
 
         `mission_kind` 是另一个同口径的过滤，理由一样：侦察发也收不到
-        `battle_reports`。而 `phase_of` 只按预设名分探路发和攻击发，认不出
-        「这一发根本不会有战报」——一条带着非探路预设名的侦察发混进来，
-        就会被当成攻击发，把目标永久钉在等战报上。
+        `battle_reports`。而 `phase_of` 现在连预设名都不看了（bot 一律 BBB），
+        更认不出「这一发根本不会有战报」——一条侦察发混进来就会被当成攻击发，
+        把目标永久钉在等战报上。PR #95 修的正是这个形状。
 
-        `skipped` 查的是 `target_revisits`，**按坐标+本轮**取，不是逐条派遣取：
-        「分档说这个目标不值得打」是对**这一轮的这个坐标**下的判定，复查表里
-        也没有指回某一条意图的列。`phase_of` 只用 `any(...)`，粒度对得上。
+        ⚠️ **按 `dispatched_at_utc` 排序交出去。** `phase_of` 只看**最后一发**打成
+        了什么（平局才重打），乱序的话，先赢后平的目标会被读成先平后赢、就此收工，
+        而先平后赢的会被无限重打到撞上限。SQLite 不保证不带 `ORDER BY` 的次序。
         """
         give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
         with self._session_factory() as session:
             statement = (
-                select(orm.AttackIntentRow.preset_name, orm.BattleReportRow.id)
+                select(orm.BattleReportRow.id, orm.BattleReportRow.outcome)
+                .select_from(orm.AttackIntentRow)
                 .join(
                     orm.AttackDispatchRow,
                     orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
@@ -1278,19 +1272,15 @@ class SqlAlchemyRepository:
                         orm.AttackDispatchRow.dispatched_at_utc > give_up_before,
                     ),
                 )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc, orm.AttackDispatchRow.id)
             )
             if since is not None:
                 statement = statement.where(
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
-            skipped = _tier_negligible(session, coordinate, since=since)
             return [
-                DispatchFact(
-                    preset_name=preset_name,
-                    has_report=report_id is not None,
-                    skipped=skipped,
-                )
-                for preset_name, report_id in session.execute(statement).all()
+                DispatchFact(has_report=report_id is not None, outcome=outcome)
+                for report_id, outcome in session.execute(statement).all()
             ]
 
     def pirate_progress(
@@ -1497,64 +1487,6 @@ class SqlAlchemyRepository:
                 or 0
             ) > 0
 
-    def latest_defender_units(self, target: Coordinate, *, since: datetime) -> int | None:
-        """本轮这个目标最新那份战报里守方的「单位」总数；没有就 None。
-
-        分档要的就是这个数，而它在收报告那一趟已经读过一次了（见
-        `tools.bot_loop.BotLoop._ingest_report`）。从库里取而不是再进一趟信箱，
-        省的不只是十几秒 OCR：信箱里那几行**没有时间闸门**，翻到的可能是
-        上一轮甚至上一天的报告，照它分档就是拿旧情报去挑舰队组合。
-        `since` 把范围钉在本轮上。
-
-        「本轮没有战报」与「有战报但没读出这个数」都返回 None——调用方两种
-        情况都得退回现场读一次，分开也没有不同的处置。
-        """
-        _require_utc(since, "since")
-        with self._session_factory() as session:
-            return session.scalar(
-                select(orm.BattleReportRow.defender_units)
-                .where(
-                    orm.BattleReportRow.defender_target_galaxy == target.galaxy,
-                    orm.BattleReportRow.defender_target_system == target.system,
-                    orm.BattleReportRow.defender_target_position == target.position,
-                    orm.BattleReportRow.reported_at_utc >= since,
-                )
-                .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id.desc())
-                .limit(1)
-            )
-
-    def mark_bot_target_skipped(self, coordinate: Coordinate, *, since: datetime) -> None:
-        """把「分档说不值得打」记成本轮的一条 `target_revisits`。
-
-        不记的话，下一趟又会重新分一次档、重新读一次战报，而结论不会变。
-
-        **`since` 必填，且本轮真的探过路才写。** 分档结论是对刚读到的那份战报
-        下的，本轮没有依据就没有判定可记。原先 `since` 可空，而 `None` 在查询侧
-        的含义是「不限时间范围」：手工跑一次 `--probe --attack`，只要有一个目标
-        被判成「不值得打」，这个坐标历史上每一轮的记录就全被刷掉。
-
-        一轮只写一条：同轮里探了两次、或者这一趟重跑了，都不该越堆越多。
-        """
-        _require_utc(since, "since")
-        with self._session_factory() as session:
-            if _tier_negligible(session, coordinate, since=since):
-                return
-            if _latest_bot_intent_at(session, coordinate, since=since) is None:
-                return
-            session.add(
-                orm.TargetRevisitRow(
-                    id=uuid4(),
-                    scope=REVISIT_SCOPE_TIER_NEGLIGIBLE,
-                    reason="分档判定不值得打",
-                    target_galaxy=coordinate.galaxy,
-                    target_system=coordinate.system,
-                    target_position=coordinate.position,
-                    requested_at_utc=datetime.now(UTC),
-                    status=REVISIT_STATUS_DONE,
-                )
-            )
-            session.commit()
-
     def set_resume_at(self, run_id: UUID, resume_at_utc: datetime | None) -> None:
         with self._session_factory() as session:
             row = session.get(orm.RunInstance, run_id)
@@ -1658,47 +1590,6 @@ class SqlAlchemyRepository:
             row.disabled_reason = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
-            session.commit()
-
-    def tier_thresholds(self) -> TierThresholds:
-        """bot 分档的三道边界，从 `scheduler_config` 读。
-
-        **只有这一个入口。** 领域层那边刻意没有回落默认值的路径
-        （`domain.fleet_tier` 是纯函数，不查库），所以「当前生效的是哪三个数」
-        只有这里答得上来。
-
-        配置行还没建出来时回落到 `DEFAULT_TIER_THRESHOLDS`：控制台开机会调
-        `ensure_mission_rows()` 把它补上，但 runner 是独立进程，手工跑一次
-        `tools.bot_loop` 完全可能撞上一个还没被控制台碰过的库。那时按默认值
-        分档，与新建库拿到的取值一致。
-
-        库里的三个数不成立（有人手改过）时照旧抛 `TierThresholdError`——
-        悄悄换回默认值，就等于用一套用户没见过的数派舰队。
-        """
-        with self._session_factory() as session:
-            row = session.get(orm.SchedulerConfigRow, 1)
-            if row is None:
-                return DEFAULT_TIER_THRESHOLDS
-            return TierThresholds(
-                alpha_from=row.tier_alpha_from,
-                beta_from=row.tier_beta_from,
-                gamma_from=row.tier_gamma_from,
-            )
-
-    def update_tier_thresholds(self, thresholds: TierThresholds) -> None:
-        """页面上那三个框保存走这里。
-
-        收的是已经构造好的 `TierThresholds`，不是三个裸 int：递增校验挂在它的
-        构造函数上，所以走到这里的取值必然是成立的——写库这一层不该有第二把
-        尺子，两把尺子迟早量出两个答案。
-        """
-        with self._session_factory() as session:
-            row = session.get(orm.SchedulerConfigRow, 1)
-            if row is None:
-                raise ValueError("scheduler_config 还没初始化；先调 ensure_mission_rows()")
-            row.tier_alpha_from = thresholds.alpha_from
-            row.tier_beta_from = thresholds.beta_from
-            row.tier_gamma_from = thresholds.gamma_from
             session.commit()
 
     def begin_bot_round(self, *, now_utc: datetime) -> None:
@@ -1896,49 +1787,6 @@ def _scout_report_exists(session: Session, target: Coordinate, reported_at_utc: 
         )
         or 0
     ) > 0
-
-
-def _latest_bot_intent_at(
-    session: Session, coordinate: Coordinate, *, since: datetime
-) -> datetime | None:
-    """本轮针对这个 bot 最新那条意图是什么时候建的；本轮没有则 None。
-
-    只取最新一条而不是「有没有」，是为了让「那一条」这个意思留在代码里：
-    分档结论是对**最近那份战报**下的，不是对这个坐标的全部历史下的。
-    """
-    return session.scalar(
-        select(orm.AttackIntentRow.created_at_utc)
-        .where(
-            orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
-            orm.AttackIntentRow.target_galaxy == coordinate.galaxy,
-            orm.AttackIntentRow.target_system == coordinate.system,
-            orm.AttackIntentRow.target_position == coordinate.position,
-            orm.AttackIntentRow.created_at_utc >= since,
-        )
-        .order_by(orm.AttackIntentRow.created_at_utc.desc())
-        .limit(1)
-    )
-
-
-def _tier_negligible(session: Session, coordinate: Coordinate, *, since: datetime | None) -> bool:
-    """本轮这个坐标有没有被分档判成「不值得打」。
-
-    读写两侧共用，判据才不会分叉：写的时候拿它去重（一轮写一条就够），
-    读的时候拿它填 `DispatchFact.skipped`。
-    """
-    statement = (
-        select(func.count())
-        .select_from(orm.TargetRevisitRow)
-        .where(
-            orm.TargetRevisitRow.scope == REVISIT_SCOPE_TIER_NEGLIGIBLE,
-            orm.TargetRevisitRow.target_galaxy == coordinate.galaxy,
-            orm.TargetRevisitRow.target_system == coordinate.system,
-            orm.TargetRevisitRow.target_position == coordinate.position,
-        )
-    )
-    if since is not None:
-        statement = statement.where(orm.TargetRevisitRow.requested_at_utc >= since)
-    return bool(session.scalar(statement) or 0)
 
 
 def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from evo_helper.domain.bot_round import PROBE_PRESET_NAME
+from evo_helper.domain.fleet_preset import PROBE_PRESET_NAME
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_SCOUT
 from evo_helper.domain.report_wait import MAX_REPORT_AGE, UNKNOWN_LINE_HOLD, line_free_at
 
