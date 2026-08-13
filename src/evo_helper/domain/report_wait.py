@@ -71,6 +71,24 @@ _CLOCK_RE = re.compile(r"(?<!\d)(\d{1,3}):([0-5]\d):([0-5]\d)(?!\d)")
 #: 已经生效，攻击这一半是要及时处理的那一半。
 MIN_CREDIBLE_ATTACK_FLIGHT = timedelta(minutes=3)
 
+#: 同一个恒星系之内那一趟攻击要多久——也就是**攻击飞行时间出现过的最低值**。
+#:
+#: 用户口径（2026-08-13）：「同星系是 5 分钟，也就是出现过的最低值。」
+#:
+#: 拿它当**跨恒星系**那一档的下限（严格大于），见 `vet_flight_time`：更远不可能
+#: 更快。这一条不需要速度模型——而速度确实会变（简报上那行 `速度: 14.520` 随舰队
+#: 组成而不同，本仓根本没读它），所以任何按距离插值的估算都是靠不住的，
+#: 「不可能比最近的那一档还快」却始终成立。
+#:
+#: 用户实拍参考（同银河系、从主星发出，主星带银河石加成）：
+#:
+#:     跨 50 个恒星系   飞行 23 分 13 秒
+#:     跨 100 个恒星系  飞行 29 分 8 秒
+#:
+#: 注意**不是线性的**：距离翻倍只多两成半。所以别把这两个点连成一条直线去外推，
+#: 那样得到的下限在近距离处会高得离谱、把正常值判死。
+SAME_SYSTEM_ATTACK_FLIGHT = timedelta(minutes=5)
+
 #: 飞行时间读不到（`expected_report_at_utc` 为 NULL）时，按派出时刻算的放弃阈值。
 #:
 #: 没有这条阈值，NULL 的派遣就既永远「可收」、又永远不被判缺失：`plan()` 见到
@@ -375,8 +393,10 @@ def parse_game_duration(text: str) -> timedelta | None:
     return None
 
 
-def vet_flight_time(flight: timedelta | None, *, mission_kind: str) -> timedelta | None:
-    """给读到的飞行时长把一道**按发次类型**的下限关，不可信的降级成 None。
+def vet_flight_time(
+    flight: timedelta | None, *, mission_kind: str, same_system: bool | None = None
+) -> timedelta | None:
+    """给读到的飞行时长把两道下限关，不可信的降级成 None。
 
     第二道防线，和 `parse_game_duration()` 的读全校验互补、都要：
 
@@ -388,15 +408,41 @@ def vet_flight_time(flight: timedelta | None, *, mission_kind: str) -> timedelta
     **不要因为有了这一道就把读全校验放松。** 被截成 `3天19:00:00` 的那种值
     远在下限之上，两道都不会响，只能靠第一道从根上不产生它。
 
-    下限只对 `MISSION_KIND_ATTACK` 生效，理由与取值见
-    `MIN_CREDIBLE_ATTACK_FLIGHT`。**其余发次原样放行**，包括侦察和将来新增的
-    发次类型：一条没被量过的下限没有理由套用攻击的经验值，而侦察那批历史值
+    ## 两道关
+
+    1. **绝对下限** `MIN_CREDIBLE_ATTACK_FLIGHT`（3 分钟）——取值理由见那个常量。
+    2. **跨恒星系下限** `SAME_SYSTEM_ATTACK_FLIGHT`（5 分钟）：目标不在出发星球
+       那个恒星系里，飞行时间就必须**严格大于**同星系那个最低值。
+
+    第 2 道是第 1 道漏掉的那一类的出口。实机（生产库 2026-08-13）三发：
+
+        08-10 18:25  探路 → 2:320:11   300 秒
+        08-11 01:07  探路 → 2:320:11   300 秒
+        08-11 07:31  探路 → 2:320:11   300 秒
+
+    出发星球 2:137:18，跨了 183 个恒星系，却只用 300 秒——**比同星系那一档还
+    快**，物理上不可能（真值多半是 `X时5分0秒` 被截成了 `5分0秒`）。三次是同一个
+    目标、同一个值，说明那份简报上的失手是**可重复的**，不是偶然噪声。而 300 秒
+    在第 1 道那里稳稳过关（300 > 180），只有拿距离才拦得住。
+
+    **不需要任何速度模型**，只需要「更远不可能更快」这一条。余量也足够大：库里
+    距离 1 个恒星系的实测是 932–960 秒，是这道门槛的三倍以上。
+
+    `same_system=None` 表示调用方不知道位置关系，此时**只过第 1 道**——宁可漏判，
+    也不要在缺少事实时凭空拒绝一个可能正确的值。
+
+    下限只对 `MISSION_KIND_ATTACK` 生效。**其余发次原样放行**，包括侦察和将来
+    新增的发次类型：一条没被量过的下限没有理由套用攻击的经验值，而侦察那批历史值
     自己就疑似截断产物、量不出下限来。侦察靠读全校验那一道防，不靠这一道。
 
     返回 None 的归宿与解析失败完全相同，见 `parse_game_duration()`。
     """
     if flight is None:
         return None
-    if mission_kind == MISSION_KIND_ATTACK and flight < MIN_CREDIBLE_ATTACK_FLIGHT:
+    if mission_kind != MISSION_KIND_ATTACK:
+        return flight
+    if flight < MIN_CREDIBLE_ATTACK_FLIGHT:
+        return None
+    if same_system is False and flight <= SAME_SYSTEM_ATTACK_FLIGHT:
         return None
     return flight

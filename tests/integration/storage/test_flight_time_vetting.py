@@ -27,12 +27,17 @@ from evo_helper.domain.records import (
 
 AT = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 ORIGIN = Coordinate(2, 137, 18)
+#: 同一个恒星系里的另一颗星球。
+NEAR = Coordinate(2, 137, 2)
+#: 隔壁恒星系。
 TARGET = Coordinate(2, 138, 2)
 
 #: 实机上真实出现过的截断值：`2:55:9` 那一发读作 9 秒（真值远不止）。
 TRUNCATED = timedelta(seconds=9)
-#: 真值那一簇的下沿，也就是当前科技的最快一趟。
+#: **同星系**那一趟，也就是攻击飞行时间出现过的最低值（用户口径 2026-08-13）。
 CREDIBLE = timedelta(minutes=5)
+#: 跨恒星系的一趟真值。用户实拍：跨 50 个恒星系是 23 分 13 秒。
+FAR_FLIGHT = timedelta(minutes=23, seconds=13)
 
 
 def _dispatch(  # type: ignore[no-untyped-def]
@@ -41,6 +46,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
     *,
     flight: timedelta | None,
     mission: str = MISSION_KIND_ATTACK,
+    target: Coordinate = TARGET,
 ) -> UUID:
     intent_id, dispatch_id = uuid4(), uuid4()
     repository.save_attack_intent(
@@ -48,7 +54,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
             intent_id=intent_id,
             run_id=run_id,
             origin=ORIGIN,
-            target=TARGET,
+            target=target,
             preset=FleetPresetRef(name="AAA", signature="sig"),
             cycle_start_utc=AT,
             created_at_utc=AT,
@@ -88,17 +94,48 @@ def test_an_attack_flight_under_the_floor_lands_as_null(repository, run_id) -> N
     assert row.line_free_at_utc is None
 
 
-def test_a_credible_attack_flight_is_stored_as_read(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """5 分钟（当前科技的最快一趟）必须原样存下。
+def test_the_fastest_credible_attack_is_stored_as_read(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """同星系那一趟 5 分钟——出现过的最低值——必须原样存下。
 
     没有这条对照，「一律返回 None」也能让上面那条变绿。
     """
-    row = _row(repository, _dispatch(repository, run_id, flight=CREDIBLE))
+    row = _row(repository, _dispatch(repository, run_id, flight=CREDIBLE, target=NEAR))
 
     assert row.flight_seconds == int(CREDIBLE.total_seconds())
     assert row.expected_report_at_utc == AT + CREDIBLE
     # 攻击是 ×2：打完还要飞回来。
     assert row.line_free_at_utc == AT + CREDIBLE * 2
+
+
+def test_a_real_cross_system_flight_is_stored_as_read(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """跨恒星系的真值（用户实拍：跨 50 系 = 23 分 13 秒）照常存下。
+
+    跨系那道门槛只是「不能比同星系还快」，不是把跨系的都拒掉。
+    """
+    row = _row(repository, _dispatch(repository, run_id, flight=FAR_FLIGHT))
+
+    assert row.flight_seconds == int(FAR_FLIGHT.total_seconds())
+
+
+def test_a_cross_system_flight_no_faster_than_the_same_system_one_is_rejected(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    """**更远不可能更快。** 跨了恒星系却只用同星系那个最低值 → 判为没读出来。
+
+    实机三发（生产库 2026-08-13）：探路 → `2:320:11`，出发 `2:137:18`，跨 183 个
+    恒星系，飞行读作 300 秒。而用户对同一条路线实测是 **25 分 1 秒**，库里同预设
+    在 184–186 系也正好是 1501–1505 秒。三次同一个目标、同一个错值，是那份简报上
+    **可重复**的失手。
+
+    ⚠️ **这一档 `parse_game_duration` 的读全校验永远看不出来。** 错法是段内部的
+    数字丢了（`25分1秒` 的 `2` 没了 → `5分1秒`），剩下的字符串完全合法、没有任何
+    残骸。而 300 秒在 3 分钟那道绝对下限那里也稳稳过关。**只有拿距离才拦得住。**
+    """
+    row = _row(repository, _dispatch(repository, run_id, flight=CREDIBLE))
+
+    assert row.flight_seconds is None
+    assert row.expected_report_at_utc is None
+    assert row.line_free_at_utc is None
 
 
 def test_the_floor_does_not_reach_scout_dispatches(repository, run_id) -> None:  # type: ignore[no-untyped-def]
