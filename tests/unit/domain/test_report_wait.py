@@ -4,14 +4,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_SCOUT
 from evo_helper.domain.report_wait import (
     BATCH_WINDOW,
     MAX_SESSION_BACKOFF,
+    MIN_CREDIBLE_ATTACK_FLIGHT,
     PendingReport,
     ReportWaitPlanner,
     SessionBackoff,
     WaitAction,
     parse_game_duration,
+    vet_flight_time,
 )
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -54,6 +57,113 @@ class TestGameDuration:
     def test_zero_duration_is_rejected(self) -> None:
         """读成 0 说明没读到数字，不能当成「已抵达」。"""
         assert parse_game_duration("0秒") is None
+
+
+#: OCR 把某一段认错之后的实测输入，以及**真值**。
+#:
+#: 每一条老实现都返回一个看起来完全合理的错值、不报错、不打日志：
+#:
+#:     3夭19旪36分7秒  ->  0:36:07        （少了 3 天 19 小时）
+#:     3天19时36外7秒  ->  3 days, 19:00  （少了 36 分 7 秒）
+#:     З天19时36分7秒  ->  19:36:07       （少了 3 天）
+#:     3天19:36分7秒   ->  3 days, 0:00   （少了 19:36:07）
+#:     2旪15分7秒      ->  0:15:07        （少了 2 小时）
+#:
+#: 断言的一律是**返回 None**，不是「返回某个截断值」。
+GARBLED_DURATIONS = [
+    pytest.param("3夭19旪36分7秒", id="天与时都被认错"),
+    pytest.param("3天19时36外7秒", id="分被认错"),
+    pytest.param("З天19时36分7秒", id="首位数字被认成西里尔字母"),
+    pytest.param("3天19:36分7秒", id="时被认成冒号"),
+    pytest.param("2旪15分7秒", id="时被认错-只剩分秒"),
+    pytest.param("3天19时36分Ⅶ秒", id="末段数字被认错-单位还在"),
+]
+
+
+class TestGarbledDurationIsRejected:
+    """OCR 认错一段之后，**整条都不许读出来**。
+
+    老实现用 `finditer` 逐个找、取第一个含数字的匹配，于是「前面糊了就丢掉
+    前面」：返回的碎片自己是一条合法的时长，小两三个数量级却一声不响。
+    生产库 `attack_dispatches` 里 197 发有飞行时长的攻击，66 发落在 0–60 秒、
+    最大值正好 **59 秒**（一个「秒」字段能装下的最大数），而 60–300 秒一发都
+    没有——那 66 发就是这条路径的指纹。
+
+    后果分两头：`expected_report_at_utc` 读成 7 秒 → 战报一产生就被判到点，
+    每趟信箱都白烧开封预算；`line_free_at_utc` 读成 7 秒 → 调度器以为航线
+    十几秒后就空，接着派、撞上游戏的「同时派遣的舰队数量已达上限」。
+    """
+
+    @pytest.mark.parametrize("text", GARBLED_DURATIONS)
+    def test_partial_match_returns_none(self, text: str) -> None:
+        assert parse_game_duration(text) is None
+
+    def test_the_intact_form_still_parses(self) -> None:
+        """对照组：同一串没被认错时必须照旧读得出来。
+
+        没有这一条，「一律返回 None」也能让上面那组全绿。
+        """
+        assert parse_game_duration("3天19时36分7秒") == timedelta(
+            days=3, hours=19, minutes=36, seconds=7
+        )
+
+    def test_a_leftover_digit_anywhere_rejects(self) -> None:
+        """匹配之外还剩数字 = 有一段没成链。"""
+        assert parse_game_duration("19x36分7秒") is None
+
+    def test_a_stranded_unit_on_the_left_rejects(self) -> None:
+        """数字被吃掉、单位还杵在紧邻左边：外面一个数字都不剩，照样不许读。"""
+        assert parse_game_duration("时36分7秒") is None
+
+    def test_noise_between_segments_rejects(self) -> None:
+        """段间只允许空白。插进噪声就等于把数字配到隔了一段的单位上。"""
+        assert parse_game_duration("3天.19时36分7秒") is None
+
+
+class TestFlightTimeVetting:
+    """第二道防线：攻击读出小于 3 分钟的，当没读出来。"""
+
+    def test_short_attack_flight_is_rejected(self) -> None:
+        """生产库里攻击的两簇之间（60–300 秒）一发都没有，59 秒不是物理量。"""
+        assert vet_flight_time(timedelta(seconds=59), mission_kind=MISSION_KIND_ATTACK) is None
+        assert vet_flight_time(timedelta(seconds=7), mission_kind=MISSION_KIND_ATTACK) is None
+
+    def test_the_boundary_is_three_minutes(self) -> None:
+        """3 分钟整放行：下限是「低于就丢」，不是「不高于就丢」。
+
+        卡在 3 分钟而不是当前科技的真实下限 5 分钟——科技会升级、舰队会变快。
+        """
+        assert MIN_CREDIBLE_ATTACK_FLIGHT == timedelta(minutes=3)
+        exactly = MIN_CREDIBLE_ATTACK_FLIGHT
+        assert vet_flight_time(exactly, mission_kind=MISSION_KIND_ATTACK) == exactly
+
+    def test_normal_attack_flight_passes(self) -> None:
+        """生产库里攻击那一簇的最小值 300 秒，以及最长的 1877 秒。"""
+        for seconds in (300, 907, 1877):
+            flight = timedelta(seconds=seconds)
+            assert vet_flight_time(flight, mission_kind=MISSION_KIND_ATTACK) == flight
+
+    def test_scout_flights_are_untouched(self) -> None:
+        """侦察不进这道闸门——**不是**因为它那批历史值可信。
+
+        生产库 371 发侦察落在 14–135 秒，但那批数字本身就疑似截断产物：
+        最久的几发全是 135 秒（= 2 分 15 秒）、次一批全是 121 秒（= 2 分 1 秒），
+        都是「分+秒」两段的形状，而飞得最久的那几发打的偏偏是主星系内最近的
+        目标。所以侦察量不出下限来，这道闸门就不该管它；它靠读全校验那一道防。
+
+        这条钉的是「别顺手把攻击的下限推广到所有发次」。
+        """
+        for seconds in (14, 121):
+            flight = timedelta(seconds=seconds)
+            assert vet_flight_time(flight, mission_kind=MISSION_KIND_SCOUT) == flight
+
+    def test_unknown_mission_kinds_are_untouched(self) -> None:
+        """还没被量过的发次类型没有理由套用攻击的经验值。"""
+        flight = timedelta(seconds=7)
+        assert vet_flight_time(flight, mission_kind="EXPEDITION") == flight
+
+    def test_none_stays_none(self) -> None:
+        assert vet_flight_time(None, mission_kind=MISSION_KIND_ATTACK) is None
 
 
 def pending(minutes: int, closed: bool = False) -> PendingReport:
