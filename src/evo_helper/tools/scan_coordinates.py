@@ -112,6 +112,38 @@ def say(message: str) -> None:
     print(safe, flush=True)
 
 
+def make_console_encoding_safe() -> None:
+    """把 `say()` 那层保护推广到**整个进程的输出**，命令行入口第一句就调它。
+
+    `say()` 只保护自己那一行，而进程里还有别的地方会往 stdout / stderr 写字，
+    最要命的是 **argparse**：`--help` 与「参数写错了」都直接 `file.write()`，
+    绕开 `say()`。本仓的帮助文本里有 `⚠️`（U+26A0），而 Windows 控制台是 GBK——
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\u26a0'
+
+    `--help` 打不出来只是难受；**参数写错那一条要命**：argparse 本来要告诉你
+    错在哪，结果那句话自己崩了，你看到的是一段和真实错误毫无关系的编码栈。
+
+    这是 2026-08-10 那次事故（`say()` 的注释里记着：OCR 读出个 `™` 把 runner
+    崩在诊断路径上）的**同一个教训、另一条出口**。当时只补了 `say()` 这一处。
+
+    做法是给流本身挂上 `errors="replace"`，**不改编码**：改成 UTF-8 会让所有中文
+    在 GBK 控制台上变成乱码，那是拿一个小毛病换一个大毛病。编不出来的字符换成
+    替代符——宁可丢一个字符，不能丢一个进程。
+
+    流不支持 `reconfigure`（被重定向成别的对象、或者根本没有 stdout）时什么都不做：
+    这个函数自己绝不能成为新的崩溃点。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - 流已关闭或不可重配
+            continue
+
+
 # -- 计划与游标 ----------------------------------------------------------------
 
 
