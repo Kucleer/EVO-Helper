@@ -122,6 +122,14 @@ class PlanetSwitcher:
             return SwitchResult.DRY_RUN
         self.driver.click(*point, label=f"前往 {target}")
         self.driver.wait(PLANET_SWITCH_WAIT_S)
+        # ⚠️ 这里**故意不 `_close()`**，另外两个出口都关。点完「前往此处」浮层会
+        # 自己关掉（用户实机确认 2026-08-13），画面直接落到新星球上，已经没有浮层
+        # 可关了。这一条是隐形依赖，所以写在这儿：浮层横跨 x≈740-1230、y≈71-890，
+        # 而 `_confirm` 下一步要点的 `NAV_FLEET`(920, 862) 正在这个范围里——浮层
+        # 要是没关，那一下就点在浮层上，回读读不出、整轮白等。
+        #
+        # 反过来，顺手在这里补一个 `_close()` 同样是错的：那时点的 (750, 71) 落在
+        # 新星球的画面上，那个位置上有什么本仓没有标定过。
         return self._confirm(target)
 
     # -- 找那一行 -----------------------------------------------------------
@@ -175,8 +183,13 @@ class PlanetSwitcher:
 
         开的是**舰队**那个入口（`NAV_FLEET`）而不是从某个目标点「攻击」：
         这一步只读不派，不该为了读一行字先站到一个可攻击目标上去。
-        面板本身是同一块（标定图 `calib-舰队面板-client.png`），
         绿✓ 在 `DISPATCH_CONFIRM`，这里一步都不靠近它，读完就点 ✕。
+
+        ⚠️ `FLEET_ORIGIN_ROI` 是在标定图 `calib-舰队面板-client.png` 上量的，
+        而**那张图就是底部导航「舰队」开出来的这一块**（用户实机确认 2026-08-13）。
+        这句得写下来：ROI 是像素坐标，量在哪块面板上就只在哪块面板上成立；
+        要是量的是另一条路径开出来的面板，单元测试与离线实拍会全绿，
+        实机上却永远读不出「起点」——于是每一轮都判「没切成」、一发都不派。
         """
         self.driver.click(*NAV_FLEET, label="舰队面板")
         self.driver.wait(FLEET_PANEL_OPEN_WAIT_S)
