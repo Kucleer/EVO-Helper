@@ -40,6 +40,9 @@ class StopReason(Enum):
     SELF = "SELF"
     #: 扫描被攻击任务抢占。
     PREEMPTED = "PREEMPTED"
+    #: 一轮跑着但什么都没做成，被看门狗掐掉（`application.mission_progress`）。
+    #: 和上面三条不同：手是我们动的，**毛病却是这条链路自己的**，所以它算故障。
+    STALLED = "STALLED"
     #: 控制台关闭时清场。
     SHUTDOWN = "SHUTDOWN"
     #: 控制台重启后发现的孤儿——上次没走正常的关闭路径，死活未知。
@@ -107,7 +110,14 @@ class MissionExit:
 
         ⚠️ 豁免只认这**一个**退出码，不是「非 0 都不算」也不是「1 都不算」：
         真坏了必须还能数到三，否则调度循环会在一个坏掉的任务上满速空转。
+
+        **`STALLED` 反过来：手是我们动的，但它算故障。** 那一轮跑着却一件事都
+        没做成（判据见 `application.mission_progress`），退出码是 `terminate()`
+        留下的、说明不了任何事，而「一件事都没做成」本身就是这条链路此刻起不来的
+        证据。不算的话，同一个卡死会一轮接一轮地复现，每轮白烧 45 分钟。
         """
+        if self.stopped_by is StopReason.STALLED:
+            return True
         if self.stopped_by is not StopReason.SELF:
             return False
         if self.exit_code == EXIT_ENVIRONMENT_BUSY:

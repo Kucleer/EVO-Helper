@@ -1677,6 +1677,22 @@ class PirateLoop:
         是 START 登录页。
 
         重连之后一定要清导航缓存：那份记忆记的是掉线前的坐标。
+
+        **恢复阶梯，逐级加码，每一级只在上一级失败之后才走**（`run()` 开工前置
+        的第二级；第一级是 `ensure_game_window`，第三、四级是
+        `_reset_to_known_screen` 与 `_require_system_view`）：
+
+        1. 巡检一次。会话好好的就到此为止，一下都不点。
+        2. 读到 `UNKNOWN` → 关浮层再问一次。**最坏情况下点到了什么：**
+           左上角 (750, 71) 那个 ✕；各种浮层的关闭键都在同一处，而那个位置在
+           恒星系视图上什么都不是，点空无害。
+        3. 还是不行 → 关窗重开一次。**最坏情况下点到了什么：什么都没点。**
+           重开只往游戏窗口那个句柄送一个 `WM_CLOSE`（等同用户点右上角 ×），
+           再由 `ensure_game_window` 拉一个新的；新窗口停在入口页，之后仍旧走
+           判据驱动的入口序列，认不出就停。所以「认不出的画面绝不点击」在这一级
+           一样成立——它恰恰是**唯一一级完全不在认不出的画面上动手**的。
+           配额是 3 次 / 滚动 1 小时（`SessionKeeper._restart_now`），用尽就返回
+           拒绝结局，这里照旧抛出去。
         """
         from evo_helper.game.session_keeper import ScreenState
 
@@ -1696,8 +1712,16 @@ class PirateLoop:
             self._reset_to_known_screen()
             session = self._keeper().ensure_connected(force=True)
         if session is None or not session.ready:
+            # 阶梯最后一级。走到这里说明关浮层也没用：画面既不是入口序列里的
+            # 任何一屏，也读不出导航条——上一轮多半没能正常收尾（进程被强杀、
+            # 断电、用户点了任务管理器），而那是常态不是意外。
             detail = session.detail if session else "巡检没返回结果"
-            raise RuntimeError(f"会话不可用：{detail}；安全停止")
+            say(f"  会话不可用：{detail}；关窗重开一次再试（兜底策略）")
+            session = self._keeper().restart_and_reenter(f"会话不可用：{detail}")
+            if not session.ready:
+                raise RuntimeError(
+                    f"会话不可用：{detail}；重开也没能回到游戏内（{session.detail}）；安全停止"
+                )
         if session.reconnected:
             say("已重新登录")
             self._navigator.invalidate()

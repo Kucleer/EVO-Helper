@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -26,6 +27,11 @@ from evo_helper.application.mission_freeze import (
     MissionConfigFreeze,
     MissionFreezeLog,
     freeze_now,
+)
+from evo_helper.application.mission_progress import (
+    MissionProgress,
+    SqlAlchemyMissionProgress,
+    StallWatchdog,
 )
 from evo_helper.application.mission_supervisor import (
     MissionExit,
@@ -54,10 +60,14 @@ from evo_helper.domain.scheduler import (
     SchedulerFacts,
     TaskSnapshot,
     decide,
+    kinds_failing_together,
+    looks_like_an_environment_fault,
     quota_day_start_utc,
 )
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
+
+_LOGGER = logging.getLogger(__name__)
 
 #: 同一任务连续这么多次异常退出就自动停用。
 #:
@@ -65,6 +75,21 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 #: 下一 tick 判据仍为真、再起。失败多半是「窗口抢不到前台」或「甩鼠标触发
 #: FAILSAFE」，重试只会再来一遍，所以三次就够——再多只是多刷几行日志。
 MAX_CONSECUTIVE_FAILURES = 3
+
+#: 「多条链路一起倒 → 不记到任何一条头上」这条豁免，同一条链路最多连着吃几次。
+#:
+#: **豁免必须有尽头，否则两处真故障就永远停不掉。** 两条链路各自都在高频复发
+#: 时，它们的失败会一直互相佐证，判据永远说「像是环境坏了」——那就退回到
+#: 「一个坏掉的任务上满速空转」，正是 `MAX_CONSECUTIVE_FAILURES` 当初要防的。
+#:
+#: 取 6：每次豁免之间至少隔一个 `RESTART_COOLDOWN`（5 分钟），六次≈半小时。
+#: 真的环境故障（掉线、服务端维护、被抢前台）里，半小时足够撑过绝大多数；
+#: 撑不过的那种（整晚维护）本来也该停下来等人。豁免用尽之后计数照常，
+#: 再撞三次才停用，加起来给了一条链路约 45 分钟的余地——而原先只有约 10 分钟。
+#:
+#: **任何一条链路跑出一次退出码 0 就全部清零**：那一刻环境被证明是好的，
+#: 之前那几次豁免不该再算在谁头上（见 `_finish`）。
+MAX_ENVIRONMENT_EXEMPTIONS = 6
 
 #: 调度器的任务种类 → `attack_intents.target_kind` 的取值。
 #: 两套词汇本来就不同（一个是链路，一个是打谁），映射写明白比两边硬凑一致好。
@@ -120,6 +145,8 @@ class MissionScheduler:
         planner: ReportWaitPlanner | None = None,
         origin: Coordinate = ORIGIN,
         freeze_log: MissionFreezeLog | None = None,
+        progress: MissionProgress | None = None,
+        watchdog: StallWatchdog | None = None,
     ) -> None:
         self._repository = repository
         self._supervisor = supervisor
@@ -149,6 +176,22 @@ class MissionScheduler:
         #: **只记在内存里**：它的用途是压住本次运行里的重启 churn，控制台重启就
         #: 该忘掉；真正跨进程的那份记忆是 `mission_tasks.consecutive_failures`。
         self._last_failure_at: dict[MissionKind, datetime] = {}
+        #: 每条链路上一次**真的算故障**的退出时刻，喂给
+        #: `domain.scheduler.kinds_failing_together`。
+        #:
+        #: ⚠️ 和上面那份**必须分开**：上面那份连 `EXIT_ENVIRONMENT_BUSY` 也记
+        #: （它要吃冷却），而拿「用户正在用别的窗口」去佐证另一条链路真正的崩溃，
+        #: 等于把最常见的一档正常情况变成万能豁免。
+        self._last_fault_at: dict[MissionKind, datetime] = {}
+        #: 每条链路连着吃了几次「环境故障」豁免，上限 `MAX_ENVIRONMENT_EXEMPTIONS`。
+        #: 任何一条链路跑出退出码 0 就整个清空。
+        self._exemptions: dict[MissionKind, int] = {}
+        #: 「跑着不动」的看门狗。**惰性建**：组装点
+        #: （`web.app.create_persistent_app`）只往这里传 repository，所以默认那
+        #: 一个要自己从 repository 摸出 session 工厂，而摸这一下必须等到真的要用
+        #: ——有测试拿 `None` 当 repository，只为验参数换算。
+        self._progress = progress
+        self._watchdog_instance = watchdog
         #: tick 跑在后台线程里，而页面的「开始 / 结束」来自请求线程。没有这把锁，
         #: 一次「结束」可能正好落在 tick 的「起进程」中间——supervisor 停掉的是
         #: 上一个，紧接着 tick 又起了一个新的，于是控制台以为已经停了，实际还有
@@ -354,11 +397,59 @@ class MissionScheduler:
             self._finish(self._supervisor.poll())
         if not self._enabled:
             return
+        self._cut_off_a_stalled_round()
         # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
         # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
         for _ in range(len(MissionKind)):
             if not self._step():
                 return
+
+    # -- 跑着不动 --------------------------------------------------------------
+
+    @property
+    def _watchdog(self) -> StallWatchdog:
+        """看门狗，第一次真要用时才建。
+
+        默认那一份借 repository 的 session 工厂：那四个 `COUNT(*)` 是只读的，
+        而 `storage/repository.py` 这一轮由别人在改，加不了公开的只读入口。
+        下一轮该在 `SqlAlchemyRepository` 上开一个 `progress_counts()`，
+        把这一行收掉。
+        """
+        if self._watchdog_instance is None:
+            self._watchdog_instance = StallWatchdog(
+                self._progress or SqlAlchemyMissionProgress(self._repository._session_factory)  # noqa: SLF001
+            )
+        return self._watchdog_instance
+
+    def _cut_off_a_stalled_round(self) -> None:
+        """一轮跑着却一件事都没做成，到阈值就掐掉。
+
+        **调度器原本只知道子进程还活着，不知道它已经不干活了。** 实机
+        2026-08-12 05:14–06:46：六次心跳、七个计数一个没变，状态一直是「运行中」，
+        白丢一个半小时。判据（什么算「进展」、阈值为什么是这个数）全在
+        `application.mission_progress`，这里只负责按它的结论动手。
+
+        **查库在锁外**（同 `_facts` 与 `snapshot`）：看门狗每 30 秒去数四张表，
+        把它压进 `_lock` 就是给用户的「结束」排队。进锁之后必须重新确认
+        「在跑的还是刚才那个」——不是就作废，照着一份过期的快照去杀子进程，
+        杀掉的可能是下一轮刚起来的那个。
+        """
+        running = self._supervisor.running
+        now = self._clock()
+        idle = self._watchdog.check(running, now)
+        if idle is None or running is None:
+            return
+        with self._lock:
+            current = self._supervisor.running
+            if current is None or current.started_at_utc != running.started_at_utc:
+                return
+            _LOGGER.warning(
+                "%s 这一轮已经 %.0f 分钟没有任何进展（没有新的派遣、战报、"
+                "侦察报告或坐标扫描）；判死并收掉",
+                running.kind.value,
+                idle.total_seconds() / 60,
+            )
+            self._finish(self._supervisor.stop(StopReason.STALLED))
 
     # -- 一次决策 --------------------------------------------------------------
 
@@ -451,22 +542,77 @@ class MissionScheduler:
                 exit_code=exited.exit_code,
                 stopped_by=exited.stopped_by.value,
             )
-        if exited.stopped_by is not StopReason.SELF:
-            # 抢占、用户点停、控制台关闭：我们自己动的手，两个计数都不动。
-            return
-        if exited.exit_code == 0:
+        if exited.stopped_by is StopReason.SELF and exited.exit_code == 0:
             # 跑完一轮。「连续」是连续，成功过一次就重新数。
             self._last_failure_at.pop(exited.kind, None)
+            self._last_fault_at.pop(exited.kind, None)
+            # 这一刻环境被证明是好的：窗口在、会话在、鼠标是我们的。之前那几次
+            # 「多条一起倒」的豁免因此各自成立，不该再占着谁的额度。
+            self._exemptions.clear()
             self._repository.clear_mission_failures(exited.kind)
             return
-        # 自己退且退出码非 0。**冷却与「算不算故障」是两件事，分开记。**
+        if exited.stopped_by not in (StopReason.SELF, StopReason.STALLED):
+            # 抢占、用户点停、控制台关闭：我们自己动的手，两个计数都不动。
+            # `STALLED` 手也是我们动的，但毛病是这条链路自己的，所以它不在这里。
+            return
+        # 自己退且退出码非 0，或者跑着不动被掐掉。
+        # **冷却与「算不算故障」是两件事，分开记。**
         # 冷却按「起来就没好好跑完」算，`EXIT_ENVIRONMENT_BUSY` 那一档也要吃：
         # 用户正在用别的窗口，14 秒后再起一次同样抢不到前台，纯 churn。
         self._last_failure_at[exited.kind] = exited.ended_at_utc
-        if exited.failed:
-            self._repository.record_mission_failure(
-                exited.kind, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
+        if not exited.failed:
+            return
+        self._last_fault_at[exited.kind] = exited.ended_at_utc
+        if self._excused_as_an_environment_fault(exited):
+            return
+        self._repository.record_mission_failure(
+            exited.kind, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
+        )
+
+    def _excused_as_an_environment_fault(self, exited: MissionExit) -> bool:
+        """这次失败要不要免记——免，如果同一时间窗里别的链路也在倒。
+
+        三条链路共用一个游戏窗口、一个鼠标、一份连接和一台机器。它们同时坏掉
+        几乎必然是那些共用的东西坏了，而不是三处互不相干的代码一起长出 bug。
+        判据本身在 `domain.scheduler.looks_like_an_environment_fault`，
+        为什么这么判、怎么和「三条恰好各自坏了」分开，都写在那里。
+
+        免记时**把同一阵里所有链路的计数一起清零**：那些数字同样是记错了账。
+        清的是 `consecutive_failures`，不动 `disabled_reason`——已经被自动停用的
+        那条要不要放出来，得先能分清「连续失败停用」和「参数不合格停用」，
+        而那个区分住在 `storage/repository.py` 里，本轮不动那个文件。
+
+        豁免有上限（`MAX_ENVIRONMENT_EXEMPTIONS`），用尽就退回正常计数：
+        没有上限的话，两条各自高频复发的真故障会一直互相佐证，永远停不掉。
+        """
+        if not looks_like_an_environment_fault(
+            exited.kind, exited.ended_at_utc, self._last_fault_at
+        ):
+            return False
+        # 判据只问一次，这里只是再问一遍「同一阵里都有谁」，好知道该清谁的计数。
+        together = kinds_failing_together(exited.kind, exited.ended_at_utc, self._last_fault_at)
+        used = self._exemptions.get(exited.kind, 0)
+        names = "、".join(sorted(kind.value for kind in together))
+        if used >= MAX_ENVIRONMENT_EXEMPTIONS:
+            _LOGGER.warning(
+                "%s 与 %s 又一起失败，但这条链路已经连着免记 %d 次、期间没有任何一轮"
+                "跑通；不再当成环境故障，照常计入连续失败",
+                exited.kind.value,
+                names,
+                used,
             )
+            return False
+        self._exemptions[exited.kind] = used + 1
+        _LOGGER.warning(
+            "%s 在同一时间窗里一起失败，判为环境故障（掉线 / 维护 / 窗口被抢 / 机器休眠），"
+            "不计到任何一条链路头上（第 %d/%d 次）",
+            names,
+            used + 1,
+            MAX_ENVIRONMENT_EXEMPTIONS,
+        )
+        for kind in together:
+            self._repository.clear_mission_failures(kind)
+        return True
 
     # -- 事实 ------------------------------------------------------------------
 
