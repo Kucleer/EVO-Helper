@@ -42,8 +42,16 @@
       又点开始、明知没有欠账」准备的口子，不是常规走法——所以它是一个要动手取消
       的复选框，而不是一个要动手勾上的。
     #}
+    {#
+      ⚠️ **默认不勾**（2026-08-13 实机之后改的）。这一趟失败时闸门要等人点确认
+      才放行任务，而无人值守时没人点——凌晨崩一次，之后一整夜一个任务都不起。
+      整段理由在 web/schemas.py 的 SchedulerStartIn.reconcile 上。
+
+      页面这一处**必须跟着另外两个默认值一起改**：它不走 schema 默认，而是把
+      复选框的值显式送出去。只改后端默认的话，点「开始」照样会先对账。
+    #}
     <label class="inline-label" for="start-reconcile" style="cursor:pointer">
-      <input type="checkbox" id="start-reconcile" checked>先对账再跑任务
+      <input type="checkbox" id="start-reconcile">先对账再跑任务（挂机时别勾）
     </label>
     <button class="btn primary small" type="button" id="btn-start">开始</button>
     <button class="btn small" type="button" id="btn-stop"

@@ -1026,14 +1026,20 @@ def register_mission_routes(app: FastAPI) -> None:
         payload: SchedulerStartIn | None = None,
         console: MissionConsoleService = Depends(get_console),
     ) -> SchedulerOut:
-        """点「开始」。**默认先跑一趟战报对账，跑完才放行任务。**
+        """点「开始」。**默认直接开工，不先跑对账**（2026-08-13 改的）。
 
         请求体整个可以省略（桌面悬浮窗和文档里那条 curl 都不带体），省略时
-        按默认值走。要跳过对账得显式送 `{"reconcile": false}`——默认跳过等于
-        把这条修复关掉。
+        按默认值走。要先对账得显式送 `{"reconcile": true}`。
+
+        ⚠️ 默认值有**三处**，必须一起改，理由见
+        `web.schemas.SchedulerStartIn.reconcile`：这里（不带请求体那条路）、
+        `MissionConsoleService.start_scheduler`（内部调用那条路）、
+        以及 `missions.html` 上那个复选框勾没勾。实机 2026-08-13 只改了 schema
+        那一处，用户点「开始」照样先对账——因为页面根本不走 schema 默认，
+        它**显式**送 `{reconcile: 复选框}`，而那个框当时默认勾着。
         """
         return _scheduler_out(
-            console.start_scheduler(reconcile=True if payload is None else payload.reconcile)
+            console.start_scheduler(reconcile=False if payload is None else payload.reconcile)
         )
 
     @app.post("/api/scheduler/stop", response_model=SchedulerOut)
