@@ -12,20 +12,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.application.mission_freeze import FrozenTask, MissionConfigFreeze
-from evo_helper.application.mission_scheduler import (
-    MissionScheduler,
-    SchedulerSnapshot,
-    task_snapshot,
-)
+from evo_helper.application.mission_scheduler import MissionScheduler, SchedulerSnapshot
 from evo_helper.domain.missions import (
     MissionParamError,
     bot_targets_in_range,
+    check_origin_dispatchable,
     pirate_systems,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
 from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
+    TaskSnapshot,
     TaskStatus,
     scheduling_order,
     status_of,
@@ -761,19 +759,31 @@ class MissionConsoleService:
 
     def patch_mission(
         self,
-        kind_text: str,
+        task_id: int,
         *,
         enabled: bool | None = None,
         priority: int | None = None,
         params: dict[str, int] | None = None,
+        name: str | None = None,
+        origin: str | None = None,
+        fleet_lines: int | None = None,
     ) -> MissionTaskView:
-        """改开关 / 参数 / 优先级。三样各自独立，`None` 表示这次不动它。
+        """改开关 / 参数 / 优先级 / 名字 / 出发星球 / 航线数。各自独立，
+        `None` 表示这次不动它。
 
         **调度器运行中一律拒绝**（`_refuse_while_running`），只留「恢复」一个口子。
         """
-        kind = self._kind(kind_text)
-        row = self._row(kind)
-        self._refuse_while_running(row, enabled=enabled, priority=priority, params=params)
+        row = self._row(task_id)
+        kind = MissionKind(row.kind)
+        self._refuse_while_running(
+            row,
+            enabled=enabled,
+            priority=priority,
+            params=params,
+            name=name,
+            origin=origin,
+            fleet_lines=fleet_lines,
+        )
         if kind is MissionKind.SCAN and priority is not None:
             # 领域层的排序键已经把扫描结构性地钉在最后一位，所以收下这个值也
             # 不会真的改变次序——正因为如此才必须拒绝：默默收下一个不起作用的
@@ -783,27 +793,111 @@ class MissionConsoleService:
             raise ServiceError("扫描恒在最后一位（它永远有活干，排它后面的链路就永远轮不到）")
         if kind is MissionKind.SCAN and params:
             raise ServiceError("扫描不吃参数：它自己维护扫描计划与游标")
+        if fleet_lines is not None and fleet_lines < 1:
+            # 0 条航线的任务永远派不出去，而它在页面上看起来完全正常（状态是
+            # 「等航线」，一句用户照着去等、等到天亮也不会动的话）。
+            raise ServiceError("航线数至少是 1；填 0 等于这个任务永远派不出去")
 
         params_json = None if params is None else json.dumps(params, ensure_ascii=False)
-        # 校验的时机有两个：动了参数，或者这一下是在**启用**它。
-        # 后者不能省——先存一个空范围、再单独勾复选框，就绕过去了。
-        # 只改 priority、或者要**关掉**它时不校验：参数填错了还关不掉，
-        # 那就真的没退路了。
-        if params is not None or enabled is True:
-            self._validate(kind, params_json or row.params_json)
-        self._repository.update_mission_task(
-            kind, enabled=enabled, priority=priority, params_json=params_json
+        clear_origin = origin == ""
+        parsed_origin = None if origin in (None, "") else _parse_origin(origin or "")
+        # 用户没动出发星球时按库里现在那颗量。`clear_origin` 那一档要按「退回
+        # 全局主星之后」的那颗量，所以两者都不能拿 `row` 的现值兜底。
+        target_origin = (
+            self._scheduler.origin if clear_origin else (parsed_origin or self._origin_of(row))
         )
-        return self._task_view_for(kind)
+        # 校验的时机有两个：动了参数，或者这一下是在**启用**它。后者不能省——
+        # 先存一个空范围、再单独勾复选框，就绕过去了。只改 priority / 名字、
+        # 或者要**关掉**它时不校验：参数填错了还关不掉，那就真的没退路了。
+        if params is not None or enabled is True:
+            self._validate(kind, params_json or row.params_json, target_origin)
+        elif origin is not None:
+            # 只动了出发星球时**只量出发星球**，不连参数一起量：新建出来的任务
+            # 范围还是空的，而「先挑星球、再填范围」是最自然的填法——顺手把它
+            # 也校验一遍，等于逼用户倒着填。范围本身在启用那一下照样跑不掉。
+            self._check_origin(target_origin)
+        self._repository.update_mission_task(
+            task_id,
+            enabled=enabled,
+            priority=priority,
+            params_json=params_json,
+            name=name,
+            origin=parsed_origin,
+            clear_origin=clear_origin,
+            fleet_lines=fleet_lines,
+        )
+        return self._task_view_for(task_id)
 
-    def restart_bot_round(self) -> MissionTaskView:
-        """「重开一轮」：把 `round_started_at_utc` 推到当前。
+    def create_mission(
+        self,
+        kind_text: str,
+        *,
+        name: str,
+        origin: str | None = None,
+        fleet_lines: int | None = None,
+    ) -> MissionTaskView:
+        """新建一个任务。**目前只有 bot 攻击可以有多个**（用户口径 2026-08-13）。
+
+        新任务一律建成「不参与调度、参数为空」：它此刻既没有范围也没排优先级，
+        直接参与调度等于「点了新建就开始派舰队」。用户填好范围、勾上复选框那一下
+        会走 `patch_mission`，那条路上有参数校验。
+        """
+        kind = self._kind(kind_text)
+        if self._scheduler.config_locked:
+            raise ConflictError("调度器运行中，任务配置已固化，不能新建任务；点「结束」后可改")
+        if kind is not MissionKind.BOT:
+            existing = MISSION_LABELS.get(kind.value, kind.value)
+            raise ServiceError(
+                f"只有 bot 攻击可以有多个任务；「{existing}」保持一个"
+                "（海盗每天 32 次是账号级配额，扫描恒在最后一位且永远有活干）"
+            )
+        if not name.strip():
+            raise ServiceError("给这个任务起个名字，否则页面上两行长得一模一样")
+        if fleet_lines is not None and fleet_lines < 1:
+            raise ServiceError("航线数至少是 1；填 0 等于这个任务永远派不出去")
+        parsed_origin = None if origin in (None, "") else _parse_origin(origin or "")
+        rows = self._repository.mission_tasks()
+        # 排在所有非扫描任务之后：新任务的优先级由用户拖，而默认插在最前面等于
+        # 让一个还没配好的任务抢在正在正常工作的那些前面。
+        priority = 1 + max(
+            (row.priority for row in rows if row.kind != MissionKind.SCAN.value), default=-1
+        )
+        task_id = self._repository.create_mission_task(
+            kind,
+            name=name.strip(),
+            priority=priority,
+            params_json="{}",
+            origin=parsed_origin,
+            fleet_lines=fleet_lines,
+            now_utc=self._scheduler.now_utc(),
+        )
+        return self._task_view_for(task_id)
+
+    def delete_mission(self, task_id: int) -> None:
+        """删掉一个任务。**每条链路至少留一行**，删光了页面上就再也建不回来。"""
+        row = self._row(task_id)
+        if self._scheduler.config_locked:
+            raise ConflictError("调度器运行中，任务配置已固化，不能删除任务；点「结束」后可改")
+        siblings = [item for item in self._repository.mission_tasks() if item.kind == row.kind]
+        if len(siblings) <= 1:
+            label = MISSION_LABELS.get(row.kind, row.kind)
+            raise ServiceError(f"「{label}」只剩这一个任务了，删不得；不想让它跑就取消勾选")
+        self._repository.delete_mission_task(task_id)
+
+    def restart_bot_round(self, task_id: int) -> MissionTaskView:
+        """「重开一轮」：把这个任务的 `round_started_at_utc` 推到当前。
 
         bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人看着的
         时候一直派舰队。开新一轮只能是用户按下的这一下。
+
+        **只推这一个任务的轮**：两个 bot 任务各打各的范围，一起推等于把另一个
+        还没打完的那一轮也归零。
         """
-        self._scheduler.begin_bot_round()
-        return self._task_view_for(MissionKind.BOT)
+        row = self._row(task_id)
+        if row.kind != MissionKind.BOT.value:
+            raise ServiceError("只有 bot 攻击有「一轮」这个概念")
+        self._scheduler.begin_bot_round(task_id)
+        return self._task_view_for(task_id)
 
     # -- 内部 ------------------------------------------------------------------
 
@@ -814,6 +908,9 @@ class MissionConsoleService:
         enabled: bool | None,
         priority: int | None,
         params: dict[str, int] | None,
+        name: str | None = None,
+        origin: str | None = None,
+        fleet_lines: int | None = None,
     ) -> None:
         """调度器跑着的时候不许改配置。**「恢复」是唯一的例外。**
 
@@ -830,8 +927,8 @@ class MissionConsoleService:
         配置，所以这一下不动固化记录里的任何一个字段。
 
         因此口子开得很窄：**只认「这一行确实处在已停用状态」且这次 PATCH 除了
-        `enabled: true` 之外什么都没带**。带上 params 或 priority 就不是恢复，
-        是趁着恢复顺手改一笔。
+        `enabled: true` 之外什么都没带**。带上 params / priority / 名字 / 出发星球 /
+        航线数里的任何一样都不是恢复，是趁着恢复顺手改一笔。
         """
         if not self._scheduler.config_locked:
             return
@@ -839,6 +936,9 @@ class MissionConsoleService:
             enabled is True
             and priority is None
             and params is None
+            and name is None
+            and origin is None
+            and fleet_lines is None
             and row.disabled_reason is not None
         )
         if is_revive:
@@ -893,23 +993,46 @@ class MissionConsoleService:
         previous = records[index - 1] if index else None
         return self._freeze_view(record, previous)
 
-    def _validate(self, kind: MissionKind, params_json: str) -> None:
+    def _validate(self, kind: MissionKind, params_json: str, origin: Coordinate) -> None:
         """用调度器自己那把尺子量一遍，量不过就 400。
 
         走 `command_for` 而不是在这里重写几条 if：两边一旦分家，就会出现
         「页面收下了、调度器起不来」——而调度器起不来时只会把任务自动停用，
-        用户要等到下次看页面才发现。
+        用户要等到下次看页面才发现。出发星球也在这把尺子上（还切不过去的那颗
+        会被拦下），理由同上。
         """
         try:
-            self._scheduler.command_for(kind, params_json)
+            self._scheduler.command_for(kind, params_json, origin=origin)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
 
+    def _check_origin(self, origin: Coordinate) -> None:
+        """只量出发星球这一项，量不过就 400。
+
+        走的是 `command_for` 内部用的**同一个**判据函数，不是在这里另写一条
+        `if`：两边一旦分家，页面就会收下一个调度器起不来的配置。
+        """
+        try:
+            check_origin_dispatchable(origin, self._scheduler.origin)
+        except MissionParamError as exc:
+            raise ServiceError(str(exc)) from exc
+
+    def _origin_of(self, row: orm.MissionTaskRow) -> Coordinate:
+        """这一行解析完默认值之后的出发星球。三列缺一就回落到全局主星。
+
+        规则与 `MissionScheduler._origin_of` 必须一致，所以这里问的是调度器的
+        `origin`，而不是再读一次 Settings。
+        """
+        galaxy, system, position = row.origin_galaxy, row.origin_system, row.origin_position
+        if galaxy is None or system is None or position is None:
+            return self._scheduler.origin
+        return Coordinate(galaxy, system, position)
+
     def _view(self, snapshot: SchedulerSnapshot) -> SchedulerView:
         running = snapshot.running
-        tasks = [row for row in snapshot.tasks if row.kind in MISSION_LABELS]
+        tasks = [task for task in snapshot.snapshots if task.kind.value in MISSION_LABELS]
         # 展示次序用领域层那把尺子，页面上排第一的就是下一个会被起的那条。
-        tasks.sort(key=lambda row: (*scheduling_order(task_snapshot(row)), row.id))
+        tasks.sort(key=lambda task: (*scheduling_order(task), task.task_id))
         return SchedulerView(
             running=snapshot.enabled,
             started_at_utc=snapshot.started_at_utc,
@@ -917,14 +1040,15 @@ class MissionConsoleService:
                 None
                 if running is None
                 else CurrentMissionView(
+                    task_id=running.task_id,
                     kind=running.kind.value,
-                    label=MISSION_LABELS[running.kind.value],
+                    label=running.name or MISSION_LABELS[running.kind.value],
                     started_at_utc=running.started_at_utc,
                     log_path=str(running.log_path),
                 )
             ),
             orphan_pid=snapshot.orphan_pid,
-            tasks=tuple(self._task_view(row, snapshot) for row in tasks),
+            tasks=tuple(self._task_view(task, snapshot) for task in tasks),
             config_locked=snapshot.config_locked,
             frozen_config=(
                 None
@@ -933,87 +1057,100 @@ class MissionConsoleService:
             ),
         )
 
-    def _task_view(self, row: orm.MissionTaskRow, snapshot: SchedulerSnapshot) -> MissionTaskView:
-        kind = MissionKind(row.kind)
+    def _task_view(self, task: TaskSnapshot, snapshot: SchedulerSnapshot) -> MissionTaskView:
+        row = next(item for item in snapshot.tasks if item.id == task.task_id)
         running = snapshot.running
         status = status_of(
-            task_snapshot(row),
+            task,
             snapshot.facts,
             running=(
                 None
                 if running is None
-                else RunningProcess(kind=running.kind, started_at_utc=running.started_at_utc)
+                else RunningProcess(
+                    task_id=running.task_id,
+                    kind=running.kind,
+                    started_at_utc=running.started_at_utc,
+                )
             ),
             restart_cooldown=timedelta(seconds=snapshot.config.restart_cooldown_seconds),
         )
         params = _int_params(row.params_json)
         return MissionTaskView(
-            kind=row.kind,
-            label=MISSION_LABELS[row.kind],
-            enabled=row.enabled,
-            priority=row.priority,
+            task_id=task.task_id,
+            kind=task.kind.value,
+            label=task.name or MISSION_LABELS[task.kind.value],
+            enabled=task.enabled,
+            priority=task.priority,
             params=params,
             status=status.value,
-            detail=self._detail(kind, status, snapshot, row),
-            summary=self._summary(kind, params),
-            disabled_reason=row.disabled_reason,
+            detail=self._detail(task, status, snapshot),
+            summary=self._summary(task, params),
+            disabled_reason=task.disabled_reason,
+            origin=str(task.origin),
+            fleet_lines=task.fleet_lines,
+            origin_is_default=row.origin_galaxy is None,
+            fleet_lines_is_default=row.fleet_lines is None,
         )
 
-    def _task_view_for(self, kind: MissionKind) -> MissionTaskView:
+    def _task_view_for(self, task_id: int) -> MissionTaskView:
         snapshot = self._scheduler.snapshot()
-        for row in snapshot.tasks:
-            if row.kind == kind.value:
-                return self._task_view(row, snapshot)
-        raise NotFoundError(f"mission_tasks 里没有 {kind.value} 这一行")
+        for task in snapshot.snapshots:
+            if task.task_id == task_id:
+                return self._task_view(task, snapshot)
+        raise NotFoundError(f"mission_tasks 里没有 id={task_id} 这一行")
 
     @staticmethod
     def _detail(
-        kind: MissionKind,
+        task: TaskSnapshot,
         status: TaskStatus,
         snapshot: SchedulerSnapshot,
-        row: orm.MissionTaskRow,
     ) -> str:
         """状态旁边那句随行的事实。
 
-        没在参与调度的链路一律不报数字：`SchedulerFacts` 对它们填的是 0，
+        没在参与调度的任务一律不报数字：`SchedulerFacts` 对它们填的是 0，
         照着写出来就是「今日 0/32」——一句看着正常的假话。
         """
         if status is TaskStatus.DISABLED:
-            return row.disabled_reason or ""
+            return task.disabled_reason or ""
         if status is TaskStatus.OFF:
             return ""
         facts = snapshot.facts
-        if kind is MissionKind.PIRATE:
+        if task.kind is MissionKind.PIRATE:
             used = f"今日 {facts.pirate_dispatches_today}/{facts.pirate_quota}"
             if status is TaskStatus.QUOTA_EXHAUSTED:
                 # 重置点是 UTC 00:00，本地（UTC+8）就是次日早上 8 点。
                 return f"{used} · 次日 08:00 恢复"
             return used
-        if kind is MissionKind.BOT:
-            remaining = facts.bot_targets_remaining
+        if task.kind is MissionKind.BOT:
+            remaining = facts.of(task).targets_remaining
             if remaining <= 0:
                 return "本轮已全部完成"
             return f"还剩 {remaining} 个未完成"
         return "始终填空隙"
 
-    def _summary(self, kind: MissionKind, params: dict[str, int]) -> str:
-        if kind is MissionKind.PIRATE:
-            return self._pirate_summary(params)
-        if kind is MissionKind.BOT:
-            return self._bot_summary(params)
+    def _summary(self, task: TaskSnapshot, params: dict[str, int]) -> str:
+        """参数与出发星球的人话回显。
+
+        出发星球与航线数摆在最前面：多任务之后，「这一行到底从哪出发、能占几条」
+        是区分两行 bot 任务的第一件事，而它俩都不在参数框里。
+        """
+        lines = f"{task.origin} · {task.fleet_lines} 条航线"
+        if task.kind is MissionKind.PIRATE:
+            return f"{lines} · {self._pirate_summary(task.origin, params)}"
+        if task.kind is MissionKind.BOT:
+            return f"{lines} · {self._bot_summary(params)}"
         return "—"
 
-    def _pirate_summary(self, params: dict[str, int]) -> str:
+    def _pirate_summary(self, origin: Coordinate, params: dict[str, int]) -> str:
         """半径 10 是多大范围，用户心里没数；把实际覆盖区间回显出来。
 
-        主星取**调度器认定的那个**，不另读一次默认值：两边各读一次的话，
+        主星取**这个任务解析之后的那颗**，不另读一次默认值：两边各读一次的话，
         配了 `EVO_HELPER_ORIGIN` 之后页面会显示旧主星、舰队却从新主星出发，
         而用户看着「没问题」。
         """
         radius = params.get("radius")
         if radius is None:
             return "未设置半径"
-        origin = self._scheduler.origin
         try:
             systems = pirate_systems(origin, radius)
         except MissionParamError as exc:
@@ -1046,11 +1183,11 @@ class MissionConsoleService:
             for row in self._repository.list_bot_targets()
         ]
 
-    def _row(self, kind: MissionKind) -> orm.MissionTaskRow:
-        for row in self._repository.mission_tasks():
-            if row.kind == kind.value:
-                return row
-        raise NotFoundError(f"mission_tasks 里没有 {kind.value} 这一行")
+    def _row(self, task_id: int) -> orm.MissionTaskRow:
+        row = self._repository.mission_task(task_id)
+        if row is None:
+            raise NotFoundError(f"mission_tasks 里没有 id={task_id} 这一行")
+        return row
 
     @staticmethod
     def _kind(kind_text: str) -> MissionKind:
@@ -1062,16 +1199,35 @@ class MissionConsoleService:
             raise NotFoundError(f"没有 {kind_text} 这条任务链路") from exc
 
 
+def _parse_origin(text: str) -> Coordinate:
+    """`星系:恒星系:位置` → 坐标。格式不对就 400。
+
+    与 `config.Settings.origin_coordinate` 同一套格式（也是游戏里显示的那套），
+    刻意不回落到主星：回落的后果是用户以为改成了 2 号星，实际舰队照旧从主星
+    出发，而全程一句提示都没有。
+    """
+    parts = text.split(":")
+    if len(parts) != 3 or not all(part.strip().isdigit() for part in parts):
+        raise ServiceError(f"出发星球要写成 `星系:恒星系:位置`，收到 {text!r}")
+    galaxy, system, position = (int(part) for part in parts)
+    try:
+        return Coordinate(galaxy, system, position)
+    except ValueError as exc:
+        raise ServiceError(f"出发星球 {text!r} 不是一个合法坐标：{exc}") from exc
+
+
 def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
     params = _int_params(task.params_json)
     kind = task.kind
     return FrozenTaskView(
         kind=kind.value,
-        label=MISSION_LABELS[kind.value],
+        label=task.name or MISSION_LABELS[kind.value],
         enabled=task.enabled,
         priority=task.priority,
         params=params,
         summary=_frozen_summary(kind, params),
+        origin=task.origin,
+        fleet_lines=task.fleet_lines,
     )
 
 
@@ -1111,8 +1267,8 @@ def _describe_changes(
         return ("首次记录",)
     changes: list[str] = []
     for task in after.tasks:
-        label = MISSION_LABELS.get(task.kind.value, task.kind.value)
-        old = before.task(task.kind)
+        label = task.name or MISSION_LABELS.get(task.kind.value, task.kind.value)
+        old = _matching_task(before, task)
         if old is None:
             changes.append(f"{label}：首次出现")
             continue
@@ -1120,8 +1276,39 @@ def _describe_changes(
             changes.append(f"{label}：参与调度 {_yes(old.enabled)} → {_yes(task.enabled)}")
         if old.priority != task.priority:
             changes.append(f"{label}：优先级 {old.priority} → {task.priority}")
+        if old.name != task.name:
+            changes.append(f"{label}：名字 {_or_dash_text(old.name)} → {_or_dash_text(task.name)}")
+        if old.origin != task.origin:
+            changes.append(
+                f"{label}：出发星球 {_or_dash_text(old.origin)} → {_or_dash_text(task.origin)}"
+            )
+        if old.fleet_lines != task.fleet_lines:
+            changes.append(
+                f"{label}：航线数 {_or_dash(old.fleet_lines)} → {_or_dash(task.fleet_lines)}"
+            )
         changes.extend(_param_changes(label, old.params_json, task.params_json))
     return tuple(changes)
+
+
+def _matching_task(before: MissionConfigFreeze, task: FrozenTask) -> FrozenTask | None:
+    """上一条记录里对应的那个任务。
+
+    **先按 `task_id` 认人**：同一 `kind` 现在可以有多行，按 kind 认会把两个 bot
+    任务当成同一个，于是每次「开始」都报出一串其实没发生过的改动。
+
+    id 对不上时再按 kind 回落一次，只为读得懂**旧记录**——本轮之前写的行没有
+    `task_id`，不回落的话，升级后的第一条记录会把每一条链路都说成「首次出现」，
+    而那正是这份账要避免的走样。回落只认「上一条里这个 kind 恰好只有一个任务」：
+    有两个的时候猜哪一个都是编的。
+    """
+    if task.task_id is not None:
+        matched = next((item for item in before.tasks if item.task_id == task.task_id), None)
+        if matched is not None:
+            return matched
+    same_kind = [item for item in before.tasks if item.kind is task.kind]
+    if len(same_kind) == 1 and same_kind[0].task_id is None:
+        return same_kind[0]
+    return None
 
 
 def _param_changes(label: str, before_json: str, after_json: str) -> list[str]:
@@ -1157,6 +1344,11 @@ def _yes(value: bool) -> str:
 def _or_dash(value: int | None) -> str:
     """没有这一项时显示破折号。`0` 是个合法取值，不能和「没填」显示成一样。"""
     return "—" if value is None else str(value)
+
+
+def _or_dash_text(value: str) -> str:
+    """同上，字符串版。空串的含义是「没填 / 跟着全局走」，不是一个名字。"""
+    return "—" if not value else value
 
 
 def _int_params(raw: str) -> dict[str, int]:

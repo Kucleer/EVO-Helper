@@ -366,13 +366,23 @@ class IntelFilterRow(Base):
 
 
 class MissionTaskRow(Base):
-    """三条任务链路各一行。优先级由用户在页面上拖出来。"""
+    """一个任务一行。优先级由用户在页面上拖出来。
+
+    ⚠️ **`kind` 不再唯一。** 用户口径（2026-08-13）：「可能会新增多个同一个类型的
+    任务，比如 2 个 bot 攻击，从主星出发 5 条航线，从 2 号线出发 2 条航线」。
+    所以任务的身份是 `id`，不是 `kind`——接口、调度判据、`mission_runs` 的台账
+    全部按 `id` 认人。海盗与扫描仍然各只有一行（用户确认只有 bot 需要多任务），
+    但那是配置上的事实，不再是数据库约束。
+    """
 
     __tablename__ = "mission_tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    #: `PIRATE` / `BOT` / `SCAN`
-    kind: Mapped[str] = mapped_column(String(16), unique=True)
+    #: `PIRATE` / `BOT` / `SCAN`。**不唯一**，见类文档。
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    #: 用户给这个任务起的名字。同类型的多个任务全靠它区分。
+    #: 空串表示没起名，显示层回落到 `web.display.MISSION_LABELS[kind]`。
+    name: Mapped[str] = mapped_column(String(60), default="", server_default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     #: 升序即优先级。
     priority: Mapped[int] = mapped_column(Integer, default=0)
@@ -380,6 +390,25 @@ class MissionTaskRow(Base):
     #: `{"galaxy": G, "first_system": A, "last_system": B}`，扫描 `{}`。
     #: 存 JSON 而不是逐列：以后加任务种类不用再动表结构。
     params_json: Mapped[str] = mapped_column(Text, default="{}")
+    #: 出发星球。**三列一起为 NULL 表示「用全局主星」**（`EVO_HELPER_ORIGIN`，
+    #: 解析在 `config.Settings.origin_coordinate`）。
+    #:
+    #: 逐列存而不是塞进 `params_json`：它不是「这一轮打谁」那种参数，而是账本的
+    #: 一部分——`attack_intents.origin_*` 照它写，战报认领与航线记账都按它分组，
+    #: 那些都要能在 SQL 里 join。
+    #:
+    #: 留成可空而不是给每行都填死一个坐标：海盗与扫描从来没有过「自己的出发
+    #: 星球」这个概念，给它们钉死一个值等于把换账号（改 `EVO_HELPER_ORIGIN`）
+    #: 这条路悄悄堵掉——舰队会继续从上一个账号的星球算飞行时间。
+    origin_galaxy: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    origin_system: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    origin_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 这个任务允许在它那颗出发星球上占用几条航线。
+    #: NULL 表示「用 `scheduler_config.fleet_line_limit`」。
+    #:
+    #: **上限是按星球各一份的**（用户口径 2026-08-13），所以它必须挂在任务上而不是
+    #: 只有一个全局值：主星 5 条 + 2 号星 2 条是两颗星各占各的，不是一共 7 条。
+    fleet_lines: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: 仅 bot 用：本轮从何时算起。早于这个时刻的战报属于上一轮。
     round_started_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: 仅海盗用：收到游戏超限邮件时写下的封锁截止时刻。比计数更硬的信号。
@@ -398,6 +427,13 @@ class MissionRunRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     kind: Mapped[str] = mapped_column(String(16), index=True)
+    #: 是**哪一个任务**起的这一轮。同类型可以有多个任务，光看 `kind` 分不出来，
+    #: 而重启冷却正是按任务算的（`domain.scheduler.cooling_down`）。
+    #:
+    #: 可空：这一列加进来之前的历史行没有它。那些行不参与冷却判据——最坏的代价
+    #: 是升级后的头五分钟里某个任务少等一次冷却，比给它硬猜一个任务号好。
+    #: 不加外键约束：任务删掉之后这一行仍然要留着，它是账。
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     #: 实际拉起的命令行。事后翻账时「那一轮到底打了谁」全靠它。
     command: Mapped[str] = mapped_column(Text)
     #: 用来在控制台重启后认出可能还活着的孤儿进程。

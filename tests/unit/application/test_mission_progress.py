@@ -37,7 +37,13 @@ def child(kind: MissionKind = MissionKind.PIRATE, *, started_at: datetime = NOW)
     from pathlib import Path
 
     return RunningChild(
-        kind=kind, command=("python",), pid=7001, started_at_utc=started_at, log_path=Path("x.log")
+        task_id=1,
+        kind=kind,
+        name="",
+        command=("python",),
+        pid=7001,
+        started_at_utc=started_at,
+        log_path=Path("x.log"),
     )
 
 

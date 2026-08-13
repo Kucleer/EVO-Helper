@@ -150,6 +150,9 @@ class StateEventOut(BaseModel):
 
 
 class MissionTaskOut(BaseModel):
+    #: 任务 id。**页面上一切写操作都按它寻址**——同一 `kind` 可以有多行
+    #: （多个 bot 攻击任务），按 kind 寻址会打到不确定的那一行上。
+    task_id: int
     kind: str
     #: 界面上的名字。桌面悬浮窗是个瘦客户端，它只认接口给的这个字符串。
     label: str
@@ -161,24 +164,51 @@ class MissionTaskOut(BaseModel):
     status: str
     #: 状态旁边那句随行的事实：`今日 12/32`、`还剩 37 个未完成`。
     detail: str
-    #: 参数的人话回显：半径实际覆盖到哪、区间里有几个已记录的 bot。
+    #: 参数的人话回显：出发星球、航线数、半径实际覆盖到哪、区间里有几个 bot。
     summary: str
     disabled_reason: str | None = None
+    #: 解析完默认值之后的出发星球（`星系:恒星系:位置`）与航线数。
+    #: 回显的是**解析后**的值：库里那三列为 NULL 时含义是「用全局主星」，
+    #: 显示成空白等于让用户以为舰队不知道从哪出发。
+    origin: str = ""
+    fleet_lines: int = 0
+    #: 这两样是不是还跟着全局值走（也就是任务自己没填过）。
+    origin_is_default: bool = True
+    fleet_lines_is_default: bool = True
 
 
 class MissionTaskPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    #: 三样各自独立，`None` 一律表示「这次不动它」而不是「清空」。
+    #: 每一样各自独立，`None` 一律表示「这次不动它」而不是「清空」。
     enabled: bool | None = None
     priority: int | None = None
     #: 海盗 `{"radius": N}`、bot `{"galaxy": G, "first_system": A, "last_system": B}`。
     #: 只收整数：`{"radius": true}` 这种会被当成半径 1，悄悄打出一圈不是用户
     #: 想要的范围。
     params: dict[str, int] | None = None
+    name: str | None = None
+    #: 出发星球，`星系:恒星系:位置`。
+    #: **空串是一个动作**：把它退回「用全局主星」。它和 `None`（这次不动它）
+    #: 必须分得开，否则任何一次只改优先级的 PATCH 都会顺手把出发星球抹掉。
+    origin: str | None = None
+    fleet_lines: int | None = None
+
+
+class MissionTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: 目前只收 `BOT`：只有 bot 攻击需要多任务（用户口径 2026-08-13）。
+    kind: str
+    #: 必填。同类型的多个任务在页面上全靠它区分。
+    name: str
+    #: 留空表示跟着全局值走。
+    origin: str | None = None
+    fleet_lines: int | None = None
 
 
 class CurrentMissionOut(BaseModel):
+    task_id: int
     kind: str
     label: str
     started_at_utc: datetime
@@ -195,6 +225,10 @@ class FrozenTaskOut(BaseModel):
     params: dict[str, int]
     #: 只从固化的那份参数算出来的人话回显：`半径 8`、`2:100 – 2:200`。
     summary: str
+    #: 当时的出发星球与航线数，同样只从记录里取。旧记录没有这两项，
+    #: 那时分别是空串与 None——不是 0，是「这条记录里没有这一项」。
+    origin: str = ""
+    fleet_lines: int | None = None
 
 
 class ConfigFreezeOut(BaseModel):
@@ -238,6 +272,7 @@ __all__ = [
     "FleetEntryOut",
     "FleetSnapshotOut",
     "FrozenTaskOut",
+    "MissionTaskCreate",
     "MissionTaskOut",
     "MissionTaskPatch",
     "RevisitIn",

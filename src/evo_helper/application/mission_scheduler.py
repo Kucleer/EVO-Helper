@@ -16,7 +16,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,7 @@ from evo_helper.domain.missions import (
     MissionParamError,
     bot_command,
     bot_targets_in_range,
+    check_origin_dispatchable,
     pirate_command,
     pirate_systems,
     scan_command,
@@ -58,11 +59,13 @@ from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
     SchedulerFacts,
+    TaskFacts,
     TaskSnapshot,
     decide,
-    kinds_failing_together,
+    free_lines_for,
     looks_like_an_environment_fault,
     quota_day_start_utc,
+    tasks_failing_together,
 )
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
@@ -76,18 +79,18 @@ _LOGGER = logging.getLogger(__name__)
 #: FAILSAFE」，重试只会再来一遍，所以三次就够——再多只是多刷几行日志。
 MAX_CONSECUTIVE_FAILURES = 3
 
-#: 「多条链路一起倒 → 不记到任何一条头上」这条豁免，同一条链路最多连着吃几次。
+#: 「多个任务一起倒 → 不记到任何一个头上」这条豁免，同一个任务最多连着吃几次。
 #:
-#: **豁免必须有尽头，否则两处真故障就永远停不掉。** 两条链路各自都在高频复发
+#: **豁免必须有尽头，否则两处真故障就永远停不掉。** 两个任务各自都在高频复发
 #: 时，它们的失败会一直互相佐证，判据永远说「像是环境坏了」——那就退回到
 #: 「一个坏掉的任务上满速空转」，正是 `MAX_CONSECUTIVE_FAILURES` 当初要防的。
 #:
 #: 取 6：每次豁免之间至少隔一个 `RESTART_COOLDOWN`（5 分钟），六次≈半小时。
 #: 真的环境故障（掉线、服务端维护、被抢前台）里，半小时足够撑过绝大多数；
 #: 撑不过的那种（整晚维护）本来也该停下来等人。豁免用尽之后计数照常，
-#: 再撞三次才停用，加起来给了一条链路约 45 分钟的余地——而原先只有约 10 分钟。
+#: 再撞三次才停用，加起来给了一个任务约 45 分钟的余地——而原先只有约 10 分钟。
 #:
-#: **任何一条链路跑出一次退出码 0 就全部清零**：那一刻环境被证明是好的，
+#: **任何一个任务跑出一次退出码 0 就全部清零**：那一刻环境被证明是好的，
 #: 之前那几次豁免不该再算在谁头上（见 `_finish`）。
 MAX_ENVIRONMENT_EXEMPTIONS = 6
 
@@ -119,6 +122,10 @@ class SchedulerSnapshot:
     #: 上次没走正常关闭路径留下的进程号，只用来显示，**不拿它开枪**。
     orphan_pid: int | None
     tasks: tuple[orm.MissionTaskRow, ...]
+    #: 与 `tasks` 一一对应的领域快照（出发星球与航线数已经把默认值解析完）。
+    #: 一起带出来而不是让每个读者自己再算一遍：解析规则（NULL = 用全局）只该有
+    #: 一份，两份迟早会在「页面显示的出发星球」和「舰队真正从哪出发」上分家。
+    snapshots: tuple[TaskSnapshot, ...]
     config: orm.SchedulerConfigRow
     facts: SchedulerFacts
     #: 任务配置现在改不改得动。见 `MissionScheduler.config_locked`。
@@ -172,20 +179,23 @@ class MissionScheduler:
         #: 就清掉——那一下的含义是「我知道了，别再提醒我」。
         self._orphan_pid: int | None = None
         self._run_id: UUID | None = None
-        #: 每条链路上一次异常退出的时刻，喂给 `domain.scheduler.cooling_down`。
+        #: 每个**任务**上一次异常退出的时刻，喂给 `domain.scheduler.cooling_down`。
         #: **只记在内存里**：它的用途是压住本次运行里的重启 churn，控制台重启就
         #: 该忘掉；真正跨进程的那份记忆是 `mission_tasks.consecutive_failures`。
-        self._last_failure_at: dict[MissionKind, datetime] = {}
-        #: 每条链路上一次**真的算故障**的退出时刻，喂给
-        #: `domain.scheduler.kinds_failing_together`。
+        #:
+        #: 键从 `MissionKind` 换成 `task_id`：按链路记的话，两个 bot 任务共用一份
+        #: 冷却，一个崩了会把另一个也压住五分钟。
+        self._last_failure_at: dict[int, datetime] = {}
+        #: 每个任务上一次**真的算故障**的退出时刻，喂给
+        #: `domain.scheduler.tasks_failing_together`。
         #:
         #: ⚠️ 和上面那份**必须分开**：上面那份连 `EXIT_ENVIRONMENT_BUSY` 也记
-        #: （它要吃冷却），而拿「用户正在用别的窗口」去佐证另一条链路真正的崩溃，
+        #: （它要吃冷却），而拿「用户正在用别的窗口」去佐证另一个任务真正的崩溃，
         #: 等于把最常见的一档正常情况变成万能豁免。
-        self._last_fault_at: dict[MissionKind, datetime] = {}
-        #: 每条链路连着吃了几次「环境故障」豁免，上限 `MAX_ENVIRONMENT_EXEMPTIONS`。
-        #: 任何一条链路跑出退出码 0 就整个清空。
-        self._exemptions: dict[MissionKind, int] = {}
+        self._last_fault_at: dict[int, datetime] = {}
+        #: 每个任务连着吃了几次「环境故障」豁免，上限 `MAX_ENVIRONMENT_EXEMPTIONS`。
+        #: 任何一个任务跑出退出码 0 就整个清空。
+        self._exemptions: dict[int, int] = {}
         #: 「跑着不动」的看门狗。**惰性建**：组装点
         #: （`web.app.create_persistent_app`）只往这里传 repository，所以默认那
         #: 一个要自己从 repository 摸出 session 工厂，而摸这一下必须等到真的要用
@@ -215,6 +225,15 @@ class MissionScheduler:
     def origin(self) -> Coordinate:
         """本次运行认定的主星。页面回显必须读这个，而不是再读一次默认值。"""
         return self._origin
+
+    def now_utc(self) -> datetime:
+        """调度器认的「现在」。
+
+        写库的时刻要和判据用的「现在」同源：调用方各取一次 `datetime.now()` 的话，
+        测试里注入的假时钟就只管住一半，而两个时钟差一点就足以让刚建好的一轮把
+        边界上那条战报算成上一轮的。
+        """
+        return self._clock()
 
     @property
     def enabled(self) -> bool:
@@ -285,6 +304,7 @@ class MissionScheduler:
         # 抄配置和按下秒表用的是同一个时刻：两次取「现在」的话，记录上的固化
         # 时刻会和页面上那块秒表的起点差一点，而事后翻账正是拿这两个对时间线。
         tasks = self._repository.mission_tasks()
+        config = self._repository.scheduler_config()
         now = self._clock()
         with self._lock:
             if self._enabled:
@@ -298,6 +318,14 @@ class MissionScheduler:
                         enabled=row.enabled,
                         priority=row.priority,
                         params_json=row.params_json,
+                        task_id=row.id,
+                        name=row.name,
+                        # 存**解析后**的出发星球，不是 `origin_*` 那三列原样。
+                        # 记录要回答的是「那一轮舰队从哪出发」，而 NULL 的答案是
+                        # 「当时的全局主星」——原样存 NULL，改了
+                        # `EVO_HELPER_ORIGIN` 之后旧记录会跟着一起改口。
+                        origin=str(self._origin_of(row)),
+                        fleet_lines=self._fleet_lines_of(row, config),
                     )
                     for row in tasks
                     if _known(row.kind)
@@ -349,7 +377,8 @@ class MissionScheduler:
         """
         tasks = self._repository.mission_tasks()
         config = self._repository.scheduler_config()
-        facts = self._facts(tasks, config, self._clock())
+        snapshots = self._snapshots(tasks, config)
+        facts = self._facts(snapshots, config, self._clock())
         with self._lock:
             return SchedulerSnapshot(
                 enabled=self._enabled,
@@ -357,32 +386,33 @@ class MissionScheduler:
                 running=self._supervisor.running,
                 orphan_pid=self._orphan_pid,
                 tasks=tuple(tasks),
+                snapshots=snapshots,
                 config=config,
                 facts=facts,
                 config_locked=self.config_locked,
                 frozen_config=self._freezes.latest() if self._enabled else None,
             )
 
-    def begin_bot_round(self) -> None:
-        """页面上的「重开一轮」：把 `round_started_at_utc` 推到当前。
+    def begin_bot_round(self, task_id: int) -> None:
+        """页面上的「重开一轮」：把这个任务的 `round_started_at_utc` 推到当前。
 
         走调度器的时钟而不是调用方自己取一个 `now()`：本轮的起点和判定完成度
         时用的「现在」必须同源，否则两个时钟差一点，刚开的一轮就可能把边界上
         那条战报算成本轮的。
         """
         with self._lock:
-            self._repository.begin_bot_round(now_utc=self._clock())
+            self._repository.begin_bot_round(task_id, now_utc=self._clock())
 
-    def command_for(self, kind: MissionKind, params_json: str) -> list[str]:
+    def command_for(self, kind: MissionKind, params_json: str, *, origin: Coordinate) -> list[str]:
         """把一份参数换算成命令行，换不出来就抛 `MissionParamError`。
 
         对外开放是为了让 API 能在**写库之前**用调度器自己的那把尺子量一遍：
-        范围内一个 bot 都没有、半径 ≤ 0、系号区间首尾颠倒，这些配置存下来只会
-        让调度器起一个必然空转的 runner，或者干脆在启动时把任务自动停用——
-        两种都要等用户下次看页面才发现。校验必须和启动走同一段代码，否则
-        「页面收下了、调度器起不来」这种分歧迟早出现。
+        范围内一个 bot 都没有、半径 ≤ 0、系号区间首尾颠倒、出发星球还切不过去，
+        这些配置存下来只会让调度器起一个必然空转的 runner，或者干脆在启动时把
+        任务自动停用——两种都要等用户下次看页面才发现。校验必须和启动走同一段
+        代码，否则「页面收下了、调度器起不来」这种分歧迟早出现。
         """
-        return self._command_for(kind, params_json)
+        return self._command_for(kind, params_json, origin)
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -458,24 +488,29 @@ class MissionScheduler:
         now = self._clock()
         tasks = self._repository.mission_tasks()
         config = self._repository.scheduler_config()
-        facts = self._facts(tasks, config, now)
+        snapshots = self._snapshots(tasks, config)
+        facts = self._facts(snapshots, config, now)
         running = self._supervisor.running
         decision = decide(
-            [task_snapshot(row) for row in tasks if _known(row.kind)],
+            snapshots,
             facts,
             running=(
                 None
                 if running is None
-                else RunningProcess(kind=running.kind, started_at_utc=running.started_at_utc)
+                else RunningProcess(
+                    task_id=running.task_id,
+                    kind=running.kind,
+                    started_at_utc=running.started_at_utc,
+                )
             ),
             min_dwell=timedelta(seconds=config.min_dwell_seconds),
             restart_cooldown=timedelta(seconds=config.restart_cooldown_seconds),
         )
-        if decision.action is Action.IDLE or decision.kind is None:
+        if decision.action is Action.IDLE or decision.task is None:
             return False
-        return self._act(decision, tasks)
+        return self._act(decision)
 
-    def _act(self, decision: Decision, tasks: Sequence[orm.MissionTaskRow]) -> bool:
+    def _act(self, decision: Decision) -> bool:
         """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
 
         上面那段读事实是在锁外跑的，因此进锁之后必须重新问两个问题——它们正是
@@ -491,7 +526,7 @@ class MissionScheduler:
         `_facts()` 的钱。只有「刚把某条链路就地停用」才值得重算，那时次序真的
         变了，顺位该立刻让给下一条。
         """
-        if decision.kind is None:
+        if decision.task is None:
             return False
         with self._lock:
             if not self._enabled:
@@ -504,25 +539,31 @@ class MissionScheduler:
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             elif running is not None:
                 return False
-            return not self._launch(decision.kind, tasks)
+            return not self._launch(decision.task)
 
-    def _launch(self, kind: MissionKind, tasks: Sequence[orm.MissionTaskRow]) -> bool:
+    def _launch(self, task: TaskSnapshot) -> bool:
         """组命令行、起进程、记账。参数不合格则停用该任务并返回 False。
 
         调用方必须已经持有 `_lock`：这里会真的拉起一个去点鼠标的子进程。
 
         `MissionParamError` 必须在这里被接住：让它冒出去就是整个调度循环停摆，
-        而它表达的只是「这条链路的配置填错了」——另外两条没有理由跟着停。
+        而它表达的只是「这个任务的配置填错了」——别的任务没有理由跟着停。
         """
-        row = _row_for(tasks, kind)
-        try:
-            command = self._command_for(kind, row.params_json)
-        except MissionParamError as exc:
-            self._repository.disable_mission_task(kind, str(exc))
+        row = self._repository.mission_task(task.task_id)
+        if row is None:
+            # 决策与这一刻之间用户把这个任务删了。作废本轮，等下一 tick 拿新事实
+            # 重算——照着一份指向已删任务的决策去起子进程，起出来的是一轮没有账
+            # 可记的派遣。
             return False
-        child = self._supervisor.start(kind, command)
+        try:
+            command = self._command_for(task.kind, row.params_json, task.origin)
+        except MissionParamError as exc:
+            self._repository.disable_mission_task(task.task_id, str(exc))
+            return False
+        child = self._supervisor.start(task.kind, command, task_id=task.task_id, name=task.name)
         self._run_id = self._repository.begin_mission_run(
-            kind,
+            task.kind,
+            task_id=task.task_id,
             command=command,
             pid=child.pid,
             started_at_utc=child.started_at_utc,
@@ -544,12 +585,12 @@ class MissionScheduler:
             )
         if exited.stopped_by is StopReason.SELF and exited.exit_code == 0:
             # 跑完一轮。「连续」是连续，成功过一次就重新数。
-            self._last_failure_at.pop(exited.kind, None)
-            self._last_fault_at.pop(exited.kind, None)
+            self._last_failure_at.pop(exited.task_id, None)
+            self._last_fault_at.pop(exited.task_id, None)
             # 这一刻环境被证明是好的：窗口在、会话在、鼠标是我们的。之前那几次
             # 「多条一起倒」的豁免因此各自成立，不该再占着谁的额度。
             self._exemptions.clear()
-            self._repository.clear_mission_failures(exited.kind)
+            self._repository.clear_mission_failures(exited.task_id)
             return
         if exited.stopped_by not in (StopReason.SELF, StopReason.STALLED):
             # 抢占、用户点停、控制台关闭：我们自己动的手，两个计数都不动。
@@ -559,14 +600,14 @@ class MissionScheduler:
         # **冷却与「算不算故障」是两件事，分开记。**
         # 冷却按「起来就没好好跑完」算，`EXIT_ENVIRONMENT_BUSY` 那一档也要吃：
         # 用户正在用别的窗口，14 秒后再起一次同样抢不到前台，纯 churn。
-        self._last_failure_at[exited.kind] = exited.ended_at_utc
+        self._last_failure_at[exited.task_id] = exited.ended_at_utc
         if not exited.failed:
             return
-        self._last_fault_at[exited.kind] = exited.ended_at_utc
+        self._last_fault_at[exited.task_id] = exited.ended_at_utc
         if self._excused_as_an_environment_fault(exited):
             return
         self._repository.record_mission_failure(
-            exited.kind, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
+            exited.task_id, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
         )
 
     def _excused_as_an_environment_fault(self, exited: MissionExit) -> bool:
@@ -586,123 +627,171 @@ class MissionScheduler:
         没有上限的话，两条各自高频复发的真故障会一直互相佐证，永远停不掉。
         """
         if not looks_like_an_environment_fault(
-            exited.kind, exited.ended_at_utc, self._last_fault_at
+            exited.task_id, exited.ended_at_utc, self._last_fault_at
         ):
             return False
         # 判据只问一次，这里只是再问一遍「同一阵里都有谁」，好知道该清谁的计数。
-        together = kinds_failing_together(exited.kind, exited.ended_at_utc, self._last_fault_at)
-        used = self._exemptions.get(exited.kind, 0)
-        names = "、".join(sorted(kind.value for kind in together))
+        together = tasks_failing_together(exited.task_id, exited.ended_at_utc, self._last_fault_at)
+        used = self._exemptions.get(exited.task_id, 0)
+        names = "、".join(str(task_id) for task_id in sorted(together))
         if used >= MAX_ENVIRONMENT_EXEMPTIONS:
             _LOGGER.warning(
-                "%s 与 %s 又一起失败，但这条链路已经连着免记 %d 次、期间没有任何一轮"
-                "跑通；不再当成环境故障，照常计入连续失败",
+                "任务 %d（%s）与任务 %s 又一起失败，但它已经连着免记 %d 次、期间没有"
+                "任何一轮跑通；不再当成环境故障，照常计入连续失败",
+                exited.task_id,
                 exited.kind.value,
                 names,
                 used,
             )
             return False
-        self._exemptions[exited.kind] = used + 1
+        self._exemptions[exited.task_id] = used + 1
         _LOGGER.warning(
-            "%s 在同一时间窗里一起失败，判为环境故障（掉线 / 维护 / 窗口被抢 / 机器休眠），"
-            "不计到任何一条链路头上（第 %d/%d 次）",
+            "任务 %s 在同一时间窗里一起失败，判为环境故障（掉线 / 维护 / 窗口被抢 / "
+            "机器休眠），不计到任何一个任务头上（第 %d/%d 次）",
             names,
             used + 1,
             MAX_ENVIRONMENT_EXEMPTIONS,
         )
-        for kind in together:
-            self._repository.clear_mission_failures(kind)
+        for task_id in together:
+            self._repository.clear_mission_failures(task_id)
         return True
 
     # -- 事实 ------------------------------------------------------------------
 
+    def _snapshots(
+        self, tasks: Sequence[orm.MissionTaskRow], config: orm.SchedulerConfigRow
+    ) -> tuple[TaskSnapshot, ...]:
+        """把 `mission_tasks` 的行翻成领域层认识的快照，顺手把两个默认值解析掉。
+
+        解析（`origin_*` 全 NULL → 全局主星；`fleet_lines` NULL → 全局上限）**只在
+        这一处发生**。散在各处的话，页面显示的出发星球和舰队真正的出发地会分家，
+        而那种错静默、且只有在战报永远配不上之后才看得见。
+        """
+        return tuple(
+            task_snapshot(
+                row,
+                origin=self._origin_of(row),
+                fleet_lines=self._fleet_lines_of(row, config),
+            )
+            for row in tasks
+            if _known(row.kind)
+        )
+
+    def _origin_of(self, row: orm.MissionTaskRow) -> Coordinate:
+        """这个任务的出发星球。三列有一列缺就回落到全局主星。
+
+        「有一列缺就整个回落」而不是逐列补：半份坐标（比如只填了星系）不是一个
+        能派舰队的地方，凑出来的那颗星球既不是用户填的、也不是主星。
+        """
+        galaxy, system, position = row.origin_galaxy, row.origin_system, row.origin_position
+        if galaxy is None or system is None or position is None:
+            return self._origin
+        return Coordinate(galaxy, system, position)
+
+    @staticmethod
+    def _fleet_lines_of(row: orm.MissionTaskRow, config: orm.SchedulerConfigRow) -> int:
+        """这个任务在它那颗星球上能占几条航线。没填就用全局那个默认值。
+
+        全局 `scheduler_config.fleet_line_limit` **保留**，含义从「账号一共几条」
+        降级成「任务没填时用几条」：海盗与扫描没有必要各配一份，新建的任务也该
+        有个不至于一发都派不出去的起点。真正的上限判据一律走任务这一层。
+        """
+        return config.fleet_line_limit if row.fleet_lines is None else row.fleet_lines
+
     def _facts(
         self,
-        tasks: Sequence[orm.MissionTaskRow],
+        tasks: Sequence[TaskSnapshot],
         config: orm.SchedulerConfigRow,
         now: datetime,
     ) -> SchedulerFacts:
-        """一次调度所需的全部事实：一条来自内存，其余全部来自数据库。
+        """一次调度所需的全部事实：一部分来自内存，其余全部来自数据库。
 
-        没在参与调度的链路一律不去查：bot 的完成判据要按目标逐个问库，
-        而 tick 每秒一次。查了也只是丢掉。
+        没在参与调度的任务一律不去查库：bot 的完成判据要按目标逐个问库，
+        而 tick 每秒一次。查了也只是丢掉。它们仍然拿得到启动/失败时刻——那两个
+        本来就已经在手上（一次查询 + 一份内存），而页面要靠它们说「冷却中」。
+
+        **按出发星球查的那几样按星球缓存**：两个任务配在同一颗星球上时，
+        `count_inflight` / `next_line_free_at` 各只查一次。tick 每秒一次，
+        任务数是用户加出来的，不缓存就是一路乘上去。
 
         **这段没有上界，所以它必须在 `_lock` 外面跑**——生产库里 bot 范围有
         4237 个目标，实测一次 0.32 秒，把它压在锁上，用户点「结束」就得排队。
         """
-        active = {
-            MissionKind(row.kind)
-            for row in tasks
-            if _known(row.kind) and row.enabled and row.disabled_reason is None
-        }
         grace = timedelta(minutes=config.report_grace_minutes)
-        pirate_row = _row_for(tasks, MissionKind.PIRATE)
+        starts = self._repository.last_mission_starts()
+        pirate_active = any(
+            task.kind is MissionKind.PIRATE and _participating(task) for task in tasks
+        )
+        inflight: dict[Coordinate, int] = {}
+        next_free: dict[Coordinate, datetime | None] = {}
+        per_task: dict[int, TaskFacts] = {}
+
+        for task in tasks:
+            base = TaskFacts(
+                last_started_at_utc=starts.get(task.task_id),
+                last_failure_at_utc=self._last_failure_at.get(task.task_id),
+            )
+            if not _participating(task) or task.kind is MissionKind.SCAN:
+                # 扫描不派遣、也没有完成态，剩下那几样对它恒为「没有」。
+                per_task[task.task_id] = base
+                continue
+            if task.origin not in inflight:
+                inflight[task.origin] = self._repository.count_inflight(
+                    now_utc=now, origin=task.origin
+                )
+                next_free[task.origin] = self._repository.next_line_free_at(
+                    now_utc=now, origin=task.origin
+                )
+            target_kind = _TARGET_KIND[task.kind]
+            per_task[task.task_id] = replace(
+                base,
+                free_lines=free_lines_for(
+                    task,
+                    inflight_from_origin=inflight[task.origin],
+                    reserved_lines=config.reserved_lines,
+                ),
+                reports_due=self._reports_due(task, now, grace),
+                targets_remaining=(
+                    self._bot_remaining(task) if task.kind is MissionKind.BOT else 0
+                ),
+                last_dispatch_at_utc=self._repository.last_dispatch_at(
+                    target_kind, origin=task.origin
+                ),
+                next_line_free_at_utc=next_free[task.origin],
+            )
+
         return SchedulerFacts(
             now_utc=now,
-            free_lines=self._free_lines(config, now),
             pirate_dispatches_today=(
                 self._repository.count_dispatches_since(
                     TARGET_KIND_PIRATE, since=quota_day_start_utc(now)
                 )
-                if MissionKind.PIRATE in active
+                if pirate_active
                 else 0
             ),
             pirate_quota=config.pirate_daily_quota,
-            pirate_blocked_until_utc=pirate_row.quota_exhausted_until_utc,
-            pirate_reports_due=(
-                self._reports_due(MissionKind.PIRATE, now, grace)
-                if MissionKind.PIRATE in active
-                else False
-            ),
-            bot_reports_due=(
-                self._reports_due(MissionKind.BOT, now, grace)
-                if MissionKind.BOT in active
-                else False
-            ),
-            bot_targets_remaining=(
-                self._bot_remaining(_row_for(tasks, MissionKind.BOT))
-                if MissionKind.BOT in active
-                else 0
-            ),
-            last_started_at_utc=self._repository.last_mission_starts(),
-            last_dispatch_at_utc=self._last_dispatches(active),
-            next_line_free_at_utc=self._repository.next_line_free_at(now_utc=now),
-            last_failure_at_utc=dict(self._last_failure_at),
+            pirate_blocked_until_utc=self._pirate_block_until(tasks),
+            per_task=per_task,
         )
 
-    def _last_dispatches(self, active: set[MissionKind]) -> dict[MissionKind, datetime]:
-        """每条派遣链路最近一次真的把舰队派出去是什么时候。
+    def _pirate_block_until(self, tasks: Sequence[TaskSnapshot]) -> datetime | None:
+        """收到游戏超限邮件时写下的封锁截止时刻，取最晚的那一个。
 
-        供 `domain.scheduler.came_back_empty` 和上一次启动时刻比大小。派遣按
-        `target_kind` 存（打谁），调度器按 `MissionKind` 想（哪条链路），所以这里
-        走 `_TARGET_KIND` 那张映射，而不是让两套词汇硬凑成一套。
-
-        `SCAN` 不在映射里，也不该在：它压根不派遣。
+        它是**账号级**的（配额也是），所以哪一行任务上写着都算数，取最晚的那个
+        才是安全的一侧：取最早的话，一旦以后有第二个海盗任务，它那条还没过期的
+        封锁会被另一行早已过期的记录盖掉，于是助手在被封的时段里照样派。
         """
-        moments: dict[MissionKind, datetime] = {}
-        for kind, target_kind in _TARGET_KIND.items():
-            if kind not in active:
-                continue
-            moment = self._repository.last_dispatch_at(target_kind)
-            if moment is not None:
-                moments[kind] = moment
-        return moments
+        moments = [
+            row.quota_exhausted_until_utc
+            for task in tasks
+            if task.kind is MissionKind.PIRATE
+            and (row := self._repository.mission_task(task.task_id)) is not None
+            and row.quota_exhausted_until_utc is not None
+        ]
+        return max(moments) if moments else None
 
-    def _free_lines(self, config: orm.SchedulerConfigRow, now: datetime) -> int:
-        """空闲航线的**乐观估算**——不含用户自己派出去的舰队。
-
-        权威闸门仍在 runner 的 `game.capacity.LineCapacityGate`（它看屏），
-        `reserved_lines` 是为这段误差留的缓冲。**不要把看屏搬进调度器。**
-
-        估高了不会误派，但空跑一轮要几十秒导航、还占着鼠标，而且这个错估自己
-        不会好——纠偏在 `domain.scheduler.waiting_for_a_line`：上一轮空手而归就
-        等到有航线真的空出来再试，而不是照旧五分钟一轮。
-        """
-        usable = max(config.fleet_line_limit - config.reserved_lines, 0)
-        return max(usable - self._repository.count_inflight(now_utc=now), 0)
-
-    def _reports_due(self, kind: MissionKind, now: datetime, grace: timedelta) -> bool:
-        """这条链路有没有到期未收的战报。
+    def _reports_due(self, task: TaskSnapshot, now: datetime, grace: timedelta) -> bool:
+        """这个任务有没有到期未收的战报。**只问它自己那颗出发星球派出去的那些。**
 
         **`grace` 与 `max_age` 是两档完全不同的规则，不能互换也不能同值。**
         `grace` 管「飞行时间读到了」的那些：过了预计时间再等这么久还没战报就
@@ -712,22 +801,33 @@ class MissionScheduler:
         战报，扫描永远抢不到空隙。
         """
         pending = self._repository.pending_reports_for_kind(
-            _TARGET_KIND[kind], now_utc=now, grace=grace, max_age=MAX_REPORT_AGE
+            _TARGET_KIND[task.kind],
+            now_utc=now,
+            grace=grace,
+            max_age=MAX_REPORT_AGE,
+            origin=task.origin,
         )
         return self._planner.plan(pending, now_utc=now).action is WaitAction.COLLECT
 
-    def _bot_remaining(self, row: orm.MissionTaskRow) -> int:
+    def _bot_remaining(self, task: TaskSnapshot) -> int:
         """本轮范围内还有几个 bot 没走完。
 
         完成 = 收到那一发攻击的战报，而且**战果不是平局**——平局要对同一坐标再打
         一发（用户口径 2026-08-13），所以它还没走完。打满上限之后也算完成，
         哪怕最后一发仍是平局。这几条都在 `domain.bot_round.phase_of` 里，
         这里只负责把事实喂给它。
+
+        本轮的起点是**这个任务自己的** `round_started_at_utc`：两个 bot 任务各打
+        各的范围、各开各的轮，共用一个起点会让先开一轮的那个把另一个的战报一起
+        判成上一轮的。
         """
+        row = self._repository.mission_task(task.task_id)
+        if row is None:
+            return 0
         try:
             targets = bot_targets_in_range(self._bot_targets(), **_bot_range(row.params_json))
         except MissionParamError as exc:
-            self._repository.disable_mission_task(MissionKind.BOT, str(exc))
+            self._repository.disable_mission_task(task.task_id, str(exc))
             return 0
         return sum(
             1
@@ -744,45 +844,60 @@ class MissionScheduler:
 
     # -- 参数换算 --------------------------------------------------------------
 
-    def _command_for(self, kind: MissionKind, params_json: str) -> list[str]:
+    def _command_for(self, kind: MissionKind, params_json: str, origin: Coordinate) -> list[str]:
         """三条链路各有各的换算，`domain.missions` 里是纯函数。
 
         刻意不做成一个 `mission_command(kind, params)`：三条链路的参数类型本来
         就不通，合成一个入口就得让 `params` 退化成 `dict[str, Any]`，在 strict
         mypy 下等于放弃检查。
+
+        两条派遣链路都要先过 `check_origin_dispatchable`：助手还不会在游戏里切换
+        当前星球，放行一个和实际出发地不符的 `origin`，代价是台账凭空撒谎。
+        扫描不派遣，也就没有出发地这回事，不过这道闸门。
         """
         if kind is MissionKind.SCAN:
             return scan_command()
+        check_origin_dispatchable(origin, self._origin)
         if kind is MissionKind.PIRATE:
-            return pirate_command(pirate_systems(self._origin, _pirate_radius(params_json)))
-        return bot_command(bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)))
+            return pirate_command(
+                pirate_systems(origin, _pirate_radius(params_json)), origin=origin
+            )
+        return bot_command(
+            bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)), origin=origin
+        )
 
 
-def task_snapshot(row: orm.MissionTaskRow) -> TaskSnapshot:
+def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: int) -> TaskSnapshot:
     """一行 `mission_tasks` → 领域层认识的那个不可变快照。
 
     公开是给 API 用的：页面要按 `domain.scheduler` 的判据算状态和展示次序，
     而它拿到的只有 ORM 行。转换只能有一份，否则两边对「什么算已停用」的
     理解迟早分家。
+
+    `origin` 与 `fleet_lines` 是**解析完默认值之后**的取值，由调用方传进来
+    （`MissionScheduler._snapshots`）：那两条回落规则要用到 Settings 与
+    `scheduler_config`，而这个函数不该去碰它们中的任何一个。
     """
     return TaskSnapshot(
+        task_id=row.id,
         kind=MissionKind(row.kind),
+        name=row.name,
         enabled=row.enabled,
         priority=row.priority,
+        origin=origin,
+        fleet_lines=fleet_lines,
         disabled_reason=row.disabled_reason,
     )
+
+
+def _participating(task: TaskSnapshot) -> bool:
+    """这个任务此刻参不参与调度。停用（不论哪种）与没勾都算不参与。"""
+    return task.enabled and task.disabled_reason is None
 
 
 def _known(kind: str) -> bool:
     """库里出现不认识的 kind（手改或旧版本留下的）就跳过，不让调度器崩掉。"""
     return kind in {item.value for item in MissionKind}
-
-
-def _row_for(tasks: Sequence[orm.MissionTaskRow], kind: MissionKind) -> orm.MissionTaskRow:
-    for row in tasks:
-        if row.kind == kind.value:
-            return row
-    raise ValueError(f"mission_tasks 里没有 {kind.value} 这一行；先调 prepare()")
 
 
 def _params(raw: str) -> dict[str, Any]:

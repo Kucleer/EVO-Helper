@@ -88,6 +88,7 @@ from evo_helper.tools.pirate_loop import (
     PirateLoop,
     ReportIngest,
     TargetCheck,
+    parse_origin,
     rematch_note,
 )
 
@@ -107,6 +108,10 @@ class BotOptions:
     #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态，
     #: 也不占本轮的重打配额（`domain.bot_round.MAX_ATTACKS_PER_TARGET`）。
     round_started_at: datetime | None = None
+    #: 这一轮记账用的出发星球。语义与理由同 `pirate_loop.LoopOptions.origin`：
+    #: 多个 bot 任务的区别就在这一个参数上，让 runner 自己去猜，两个任务的账
+    #: 会记到同一颗星球上。
+    origin: Coordinate | None = None
 
 
 class BotLoop(PirateLoop):
@@ -131,10 +136,19 @@ class BotLoop(PirateLoop):
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
         # 父类要一个 LoopOptions。`scout=False`：这条链路不派任何前置侦查发了。
+        # `origin` 必须原样带过去——父类的 `_record_intent` 读的是**父类那一份**
+        # options，漏传的话这条链路写进 `attack_intents` 的出发坐标会退回全局
+        # 主星，而多任务的区别恰恰就在这一个坐标上。
         super().__init__(
             driver,
             ocr,
-            LoopOptions(systems=(), scout=False, attack=options.attack, preset=BOT_ATTACK_PRESET),
+            LoopOptions(
+                systems=(),
+                scout=False,
+                attack=options.attack,
+                preset=BOT_ATTACK_PRESET,
+                origin=options.origin,
+            ),
         )
         self._bot = options
 
@@ -386,6 +400,12 @@ def main(argv: list[str] | None = None) -> int:
         "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
     )
     parser.add_argument(
+        "--origin",
+        type=parse_origin,
+        default=None,
+        help="出发星球（记账用）。调度器会传；手工跑不给则用 EVO_HELPER_ORIGIN",
+    )
+    parser.add_argument(
         "--round-started-at",
         type=parse_round_start,
         default=None,
@@ -401,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         targets=tuple(args.targets),
         attack=args.attack,
         round_started_at=args.round_started_at,
+        origin=args.origin,
     )
     mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(str(target) for target in options.targets)

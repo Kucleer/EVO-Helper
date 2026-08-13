@@ -56,8 +56,21 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     return scheduler
 
 
+def task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
+    """这条链路那一行的 id。
+
+    任务的身份是 `id` 而不是 `kind`（同一 kind 可以有多行），写库的入口全部按 id
+    寻址，测试也就得先把 id 捞出来。种子行每条链路各一个，所以这里取第一个。
+    """
+    return next(row.id for row in repository.mission_tasks() if row.kind == kind.value)
+
+
 def enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object) -> None:
-    repository.update_mission_task(kind, enabled=True, **fields)  # type: ignore[arg-type]
+    repository.update_mission_task(task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
+
+
+def disable(repository: SqlAlchemyRepository, kind: MissionKind) -> None:
+    repository.update_mission_task(task_id(repository, kind), enabled=False)
 
 
 def add_bot_target(session_factory, coordinate: Coordinate) -> None:  # type: ignore[no-untyped-def]
@@ -332,7 +345,7 @@ def test_the_bot_command_only_carries_targets_inside_the_range(  # type: ignore[
     add_bot_target(session_factory, Coordinate(2, 150, 3))
     add_bot_target(session_factory, Coordinate(2, 900, 4))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
     scheduler.tick()
 
@@ -448,14 +461,14 @@ class SpyRepository(SqlAlchemyRepository):
 
     def __init__(self, session_factory) -> None:  # type: ignore[no-untyped-def]
         super().__init__(session_factory)
-        self.pending_calls: list[tuple[str, timedelta, timedelta]] = []
+        self.pending_calls: list[tuple[str, timedelta, timedelta, Coordinate]] = []
 
     def pending_reports_for_kind(  # type: ignore[override]
-        self, target_kind, *, now_utc, grace, max_age
+        self, target_kind, *, now_utc, grace, max_age, origin
     ):
-        self.pending_calls.append((target_kind, grace, max_age))
+        self.pending_calls.append((target_kind, grace, max_age, origin))
         return super().pending_reports_for_kind(
-            target_kind, now_utc=now_utc, grace=grace, max_age=max_age
+            target_kind, now_utc=now_utc, grace=grace, max_age=max_age, origin=origin
         )
 
 
@@ -478,7 +491,14 @@ def test_the_pending_report_query_gets_the_configured_grace_and_the_domain_max_a
 
     scheduler.tick()
 
-    assert (TARGET_KIND_PIRATE, timedelta(minutes=45), MAX_REPORT_AGE) in repository.pending_calls
+    # 出发星球也在这条查询上：它没有默认值，漏传同样不会报错，只会让两个任务
+    # 互相替对方判「该回去收了」。
+    assert (
+        TARGET_KIND_PIRATE,
+        timedelta(minutes=45),
+        MAX_REPORT_AGE,
+        Coordinate(2, 137, 18),
+    ) in repository.pending_calls
 
 
 def test_an_old_unknown_flight_still_counts_as_work_until_max_age(  # type: ignore[no-untyped-def]
@@ -543,7 +563,7 @@ def test_a_chain_that_just_ran_waits_out_the_cooldown(  # type: ignore[no-untype
 ) -> None:
     """runner 扑空退出后立刻再起一次，几十秒的导航全白费，还占着鼠标。"""
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
     scheduler.tick()
     launcher.latest.exit_code = 0
@@ -608,7 +628,7 @@ def test_a_round_that_dispatched_nothing_does_not_restart_while_a_fleet_is_out( 
     scheduler.prepare()
     set_config(session_factory, fleet_line_limit=6)
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     _scout_still_out(
         repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
     )
@@ -639,7 +659,7 @@ def test_the_chain_restarts_once_a_line_actually_frees_up(  # type: ignore[no-un
     scheduler.prepare()
     set_config(session_factory, fleet_line_limit=6)
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     _scout_still_out(
         repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
     )
@@ -662,7 +682,7 @@ def test_three_consecutive_crashes_disable_the_chain(  # type: ignore[no-untyped
 ) -> None:
     """没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。"""
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
 
     for index in range(MAX_CONSECUTIVE_FAILURES):
@@ -707,8 +727,8 @@ def test_a_burst_of_scan_crashes_does_not_disable_the_chain(  # type: ignore[no-
 
     冷却之后它一趟只起得来一次，所以这 43 秒里只该有一次失败记录。
     """
-    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.PIRATE)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     started = [
@@ -728,8 +748,8 @@ def test_a_scan_that_keeps_crashing_for_ten_minutes_still_gets_disabled(  # type
     """**冷却是节流，不是豁免。** 真坏了还得数到三，否则调度循环会在一个坏掉的
     任务上满速空转——而扫描没有别的闸门拦着它。
     """
-    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.PIRATE)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     # 扫描的冷却从**崩掉那一刻**起算（不是启动那一刻），所以每一轮要多留出
@@ -748,8 +768,8 @@ def test_the_environment_busy_code_never_reaches_the_failure_counter(  # type: i
 
     但它照样要吃冷却：用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
     """
-    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.PIRATE)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     # 冷却从崩掉那一刻起算，所以每轮要多留出它跑的那 14 秒。
@@ -773,8 +793,8 @@ def test_the_environment_busy_code_does_not_clear_a_real_failure_streak(  # type
     当成成功去清零的话，崩一次、轮不到一次、再崩一次……的链路永远数不到三，
     自动停用就等于没有。清零只认退出码 0。
     """
-    repository.update_mission_task(MissionKind.PIRATE, enabled=False)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.PIRATE)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     for index, code in enumerate((1, EXIT_ENVIRONMENT_BUSY)):
@@ -893,7 +913,7 @@ def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type:
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
 
     scheduler.tick()
@@ -911,6 +931,7 @@ def test_prepare_marks_orphans_rather_than_shooting_at_a_recycled_pid(  # type: 
     repository.ensure_mission_rows(now_utc=NOW)
     repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=task_id(repository, MissionKind.SCAN),
         command=["python"],
         pid=31337,
         started_at_utc=NOW - timedelta(hours=1),
@@ -958,6 +979,7 @@ def test_a_row_left_open_by_a_dead_console_is_closed_on_the_next_start(  # type:
     repository.ensure_mission_rows(now_utc=NOW)
     repository.begin_mission_run(
         MissionKind.PIRATE,
+        task_id=task_id(repository, MissionKind.PIRATE),
         command=["python", "-m", "evo_helper.tools.pirate_loop"],
         pid=31337,
         started_at_utc=NOW - timedelta(hours=3),
@@ -1078,7 +1100,7 @@ def test_a_stalled_round_is_charged_as_a_failure(  # type: ignore[no-untyped-def
     """
     scheduler, _counts = _watched(repository, launcher, clock)
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
     scheduler.tick()
 
@@ -1144,7 +1166,7 @@ def test_two_chains_crashing_together_are_not_charged_to_either(  # type: ignore
     原先这两次会各记一笔，撞满三次就把两条链路都自动停用——而环境早就好了。
     """
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     _launch(scheduler, launcher, clock, at=NOW, expect=MissionKind.PIRATE)
@@ -1167,8 +1189,8 @@ def test_a_chain_failing_on_its_own_is_still_charged(  # type: ignore[no-untyped
     调度循环会在一个坏掉的任务上一轮轮空转。
     """
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
-    repository.update_mission_task(MissionKind.SCAN, enabled=False)
+    disable(repository, MissionKind.BOT)
+    disable(repository, MissionKind.SCAN)
     scheduler.start()
 
     for index in range(MAX_CONSECUTIVE_FAILURES):
@@ -1189,7 +1211,7 @@ def test_the_environment_busy_code_never_corroborates_a_real_crash(  # type: ign
     链路从此永远数不到三。
     """
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     _launch(scheduler, launcher, clock, at=NOW, expect=MissionKind.PIRATE)
@@ -1213,7 +1235,7 @@ def test_the_exemption_runs_out_when_nothing_ever_runs_clean(  # type: ignore[no
     只是来得晚一些（约 45 分钟，而不是原先的约 10 分钟）。
     """
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     at = NOW
@@ -1242,7 +1264,7 @@ def test_one_clean_round_hands_the_whole_exemption_budget_back(  # type: ignore[
     机器，跑上几天照样会把额度耗光，然后又回到「环境一抖就停用一条链路」。
     """
     enable(repository, MissionKind.PIRATE)
-    repository.update_mission_task(MissionKind.BOT, enabled=False)
+    disable(repository, MissionKind.BOT)
     scheduler.start()
 
     at = NOW
@@ -1265,3 +1287,184 @@ def test_one_clean_round_hands_the_whole_exemption_budget_back(  # type: ignore[
 
     assert task(repository, MissionKind.PIRATE).consecutive_failures == 0
     assert task(repository, MissionKind.SCAN).consecutive_failures == 0
+
+
+# -- 多个 bot 任务：各自的出发星球、各自的航线账 --------------------------------
+#
+# 用户口径（2026-08-13）：「可能会新增多个同一个类型的任务，比如 2 个 bot 攻击，
+# 从主星出发 5 条航线，从 2 号线出发 2 条航线」。追问确认：**航线上限是按星球各
+# 一份的**，只有 bot 攻击需要多任务。
+#
+# 这一段验的是**接线**：判据本身在 `tests/unit/domain/test_scheduler.py` 里已经
+# 钉死，这里守的是「事实有没有按出发星球分组读出来」。
+
+SECOND_PLANET = Coordinate(9, 250, 8)
+
+
+def _second_bot_task(  # type: ignore[no-untyped-def]
+    repository,
+    *,
+    origin: Coordinate = SECOND_PLANET,
+    fleet_lines: int = 2,
+    params_json: str = BOT_RANGE,
+) -> int:
+    """再建一个 bot 任务，启用并填好范围。返回它的 id。"""
+    new_id = repository.create_mission_task(
+        MissionKind.BOT,
+        name="2 号星",
+        priority=5,
+        params_json=params_json,
+        origin=origin,
+        fleet_lines=fleet_lines,
+        now_utc=NOW,
+    )
+    repository.update_mission_task(new_id, enabled=True)
+    return new_id
+
+
+def _free_lines(scheduler, wanted: int) -> int:  # type: ignore[no-untyped-def]
+    return scheduler.snapshot().facts.per_task[wanted].free_lines
+
+
+def test_each_bot_task_gets_the_lines_of_its_own_planet(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory, run_id
+) -> None:
+    """**不同出发星球互不影响。**
+
+    主星那个任务配 5 条、已经派满 5 支；2 号星那个配 2 条、一支都没派。
+    全库一起数的话两边都会看到「5 支在飞」，于是 2 号星那个也不敢派了——
+    而它那颗星球上一条航线都没被占。
+
+    ⚠️ 两个任务的航线数**故意不同**（5 与 2）：填成一样的话，把出发星球那道
+    过滤整个删掉也未必露馅。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    main = task_id(repository, MissionKind.BOT)
+    repository.update_mission_task(main, fleet_lines=5)
+    second = _second_bot_task(repository)
+    for index in range(5):
+        # 每发错开一分钟：意图按 (run_id, 目标, cycle_start) 去重，同一刻的五发
+        # 会被当成同一发挡回来。
+        moment = NOW - timedelta(minutes=5 + index)
+        dispatch(
+            repository,
+            run_id,
+            TARGET_KIND_BOT,
+            target=Coordinate(2, 150, 3),
+            dispatched_at=moment,
+            flight=timedelta(hours=1),
+        )
+
+    assert _free_lines(scheduler, main) == 0
+    assert _free_lines(scheduler, second) == 2
+
+
+def test_two_bot_tasks_on_the_same_planet_share_that_planets_lines(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory, run_id
+) -> None:
+    """反过来的一半：**同一颗星球上**的在飞数两个任务都要看得见。
+
+    只有这一条成立，「按星球各一份」才不是「谁也不管谁」——同一颗星球上两个
+    任务抢的确实是同一批位子。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    main = task_id(repository, MissionKind.BOT)
+    repository.update_mission_task(main, fleet_lines=3)
+    # 同一颗主星，只是范围不同。
+    same_planet = _second_bot_task(repository, origin=Coordinate(2, 137, 18), fleet_lines=3)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=Coordinate(2, 150, 3),
+        dispatched_at=NOW - timedelta(minutes=5),
+        flight=timedelta(hours=1),
+    )
+
+    assert _free_lines(scheduler, main) == 2
+    assert _free_lines(scheduler, same_planet) == 2
+
+
+def test_a_second_bot_task_keeps_its_own_round(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """**「重开一轮」只推这一个任务的轮。**
+
+    两个 bot 任务各打各的范围，一起推等于把另一个还没打完的那一轮也归零：
+    它已经收到的战报会被当成上一轮的，目标全部重来。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    main = task_id(repository, MissionKind.BOT)
+    second = _second_bot_task(repository)
+
+    scheduler.begin_bot_round(second)
+
+    rows = {row.id: row for row in repository.mission_tasks()}
+    assert rows[second].round_started_at_utc == NOW
+    assert rows[main].round_started_at_utc is None
+
+
+def test_a_task_whose_planet_cannot_be_reached_yet_is_disabled_with_a_reason(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory, launcher
+) -> None:
+    """**助手还不会在游戏里切换当前星球。**
+
+    所以配在别的星球上的任务不能就这么派出去：舰队会照旧从主星飞出去，而
+    `attack_intents.origin_*` 上写着 9:250:8——战报永远配不上那一发，飞行时间与
+    航线钟也全按错的距离算。宁可停用并写清原因。
+
+    ⚠️ 这是一道**临时闸门**，切换星球实装之后连同
+    `domain.missions.check_origin_dispatchable` 一起删掉，这条用例也随之改写。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    disable(repository, MissionKind.SCAN)
+    disable(repository, MissionKind.BOT)
+    second = _second_bot_task(repository)
+    scheduler.start()
+
+    scheduler.tick()
+
+    row = {item.id: item for item in repository.mission_tasks()}[second]
+    assert row.disabled_reason is not None
+    assert "9:250:8" in row.disabled_reason
+    # 一发都没派出去：闸门在**起进程之前**，不是在 runner 里。
+    assert launcher.spawned == []
+
+
+def test_the_bot_command_carries_the_task_origin(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """`--origin` 必须原样出现在 argv 里。
+
+    漏掉的话 runner 会回落到 `EVO_HELPER_ORIGIN`，于是两个任务写进
+    `attack_intents` 的出发坐标可能是同一颗——而多任务的整个记账就建立在
+    这一个坐标上。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    disable(repository, MissionKind.SCAN)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert command[command.index("--origin") + 1] == "2:137:18"
+
+
+def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """台账要记得住是**哪一个任务**跑的那一轮。
+
+    只记 `kind` 的话，两个 bot 任务的历史混成一片，而重启冷却正是按任务算的
+    ——认不出人就等于那个任务永远没有冷却记录。
+    """
+    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    disable(repository, MissionKind.SCAN)
+    scheduler.start()
+    scheduler.tick()
+
+    assert repository.mission_runs(limit=1)[0].task_id == task_id(repository, MissionKind.BOT)

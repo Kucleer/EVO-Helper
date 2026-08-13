@@ -52,17 +52,21 @@ MATCH_TIME_TOLERANCE = timedelta(hours=12)
 #: 孤儿行的 `stopped_by`：控制台重启时发现的、上次没走正常关闭路径的子进程。
 STOPPED_BY_UNKNOWN = "UNKNOWN"
 
-#: 三行任务的初始值：`(kind, enabled, priority, params_json)`。
+#: 三行任务的初始值：`(kind, 名字, enabled, priority, params_json)`。
 #:
 #: **扫描排最后**，它永远有活干，排在谁前面谁就永远轮不到。
 #:
 #: **只有扫描默认开着**：它不派遣、全程只读。两条攻击链路默认关着，理由和
 #: `evo_bot.AUTO_ENABLED` 默认 False 一样——装好就会派舰队不是好默认。bot 的
 #: 系号区间也没法猜，留空等页面上填。
-_MISSION_SEEDS: tuple[tuple[MissionKind, bool, int, str], ...] = (
-    (MissionKind.PIRATE, False, 0, '{"radius": 10}'),
-    (MissionKind.BOT, False, 1, "{}"),
-    (MissionKind.SCAN, True, 2, "{}"),
+#:
+#: 出发星球与航线数**一律不种**（留 NULL）：NULL 的含义是「用全局主星 /
+#: 用 `scheduler_config.fleet_line_limit`」，而种一个值进去就等于在这里替用户
+#: 做主，还会让「改了 `EVO_HELPER_ORIGIN` 却不生效」变成一个查不出来的毛病。
+_MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
+    (MissionKind.PIRATE, "侦查+攻击海盗", False, 0, '{"radius": 10}'),
+    (MissionKind.BOT, "扫描+攻击 bot", False, 1, "{}"),
+    (MissionKind.SCAN, "扫描全星系 bot", True, 2, "{}"),
 )
 
 
@@ -1053,8 +1057,17 @@ class SqlAlchemyRepository:
             session.commit()
             return _daily_status(row)
 
-    def count_inflight(self, *, now_utc: datetime) -> int:
-        """还占着航线的舰队有几支。**跨 kind**——航线是全局资源。
+    def count_inflight(self, *, now_utc: datetime, origin: Coordinate) -> int:
+        """**这颗出发星球上**还占着航线的舰队有几支。**跨 kind**——同一颗星球上
+        海盗与 bot 抢的是同一批航线。
+
+        ⚠️ **必须按出发星球分。** 游戏的航线上限是按星球各一份的（用户口径
+        2026-08-13：「航线上限是按星球各一份的，不是账号共享」）。全库一起数，
+        主星打满之后 2 号星那个任务会以为自己也没位子了，一发都不派；反过来
+        只数自己那颗，两颗星球的额度才各归各。
+
+        `origin` 是必填的关键字参数，没有默认值：漏传不会报错、只会静默退回到
+        「全局一份」那个错口径，而那正是这一轮要改掉的东西。
 
         供调度器估算空闲航线：`usable_limit − 在飞数`。这个估算不含用户自己
         派出去的舰队，因此是乐观的；`reserved_lines` 正是为这段误差留的缓冲，
@@ -1087,7 +1100,12 @@ class SqlAlchemyRepository:
                 session.scalar(
                     select(func.count())
                     .select_from(orm.AttackDispatchRow)
+                    .join(
+                        orm.AttackIntentRow,
+                        orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                    )
                     .where(
+                        _from_origin(origin),
                         orm.AttackDispatchRow.accepted.is_(True),
                         _still_holding_a_line(now_utc),
                     )
@@ -1095,11 +1113,13 @@ class SqlAlchemyRepository:
                 or 0
             )
 
-    def next_line_free_at(self, *, now_utc: datetime) -> datetime | None:
-        """已知最早会空出来的那条航线，什么时候空。算不出来时返回 None。
+    def next_line_free_at(self, *, now_utc: datetime, origin: Coordinate) -> datetime | None:
+        """**这颗出发星球上**已知最早会空出来的那条航线，什么时候空。
+        算不出来时返回 None。
 
         供调度器把「等航线」锚在一个**真会发生的事件**上，而不是又一段拍脑袋的
-        固定间隔。
+        固定间隔。按星球分的理由同 `count_inflight`：拿别的星球的返航时刻当闹钟，
+        压住的那段时间与这个任务能不能派毫无关系。
 
         **只看有航线钟的那些。** 飞行时间读不到的那一档虽然照样算占位（见
         `count_inflight`），但它的 `UNKNOWN_LINE_HOLD` 是「等到这里就放弃」的
@@ -1109,18 +1129,28 @@ class SqlAlchemyRepository:
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
             moment: datetime | None = session.scalar(
-                select(func.min(orm.AttackDispatchRow.line_free_at_utc)).where(
+                select(func.min(orm.AttackDispatchRow.line_free_at_utc))
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .where(
+                    _from_origin(origin),
                     orm.AttackDispatchRow.accepted.is_(True),
                     orm.AttackDispatchRow.line_free_at_utc > now_utc,
                 )
             )
         return moment
 
-    def last_dispatch_at(self, target_kind: str) -> datetime | None:
-        """这种目标最近一次**真的派出去**是什么时候。一次都没有则为 None。
+    def last_dispatch_at(self, target_kind: str, *, origin: Coordinate) -> datetime | None:
+        """这种目标最近一次**从这颗星球**真的派出去是什么时候。一次都没有则为 None。
 
-        供调度器判「上一轮是不是空手而归」：这个时刻早于该链路上一次启动，就说明
+        供调度器判「上一轮是不是空手而归」：这个时刻早于该任务上一次启动，就说明
         那一轮从头跑到尾一发都没派出去。
+
+        **按出发星球分**，理由同 `count_inflight`：不分的话，主星那个任务派出去的
+        一发会让 2 号星那个任务看起来「上一轮有派出去」，于是它撞满航线之后照样
+        每五分钟白跑一轮——而 `waiting_for_a_line` 存在的全部意义就是不让这件事
+        重复发生。
 
         **侦察发照数、被拒的那发不数**，和 `count_inflight` 同口径：侦察一样占
         航线，一轮只派了侦察不算空手；被游戏拒掉的那一发根本没飞出去，算进来就
@@ -1134,6 +1164,7 @@ class SqlAlchemyRepository:
                 )
                 .where(
                     orm.AttackIntentRow.target_kind == target_kind,
+                    _from_origin(origin),
                     orm.AttackDispatchRow.accepted.is_(True),
                 )
             )
@@ -1146,6 +1177,7 @@ class SqlAlchemyRepository:
         now_utc: datetime,
         grace: timedelta,
         max_age: timedelta,
+        origin: Coordinate,
     ) -> list[PendingReport]:
         """某种目标下尚未放弃的派遣，供 `ReportWaitPlanner` 判「该等还是该收」。
 
@@ -1165,6 +1197,10 @@ class SqlAlchemyRepository:
         **侦察发一律排除。** 它不产生 `battle_reports`（侦察报告走信箱里另一条路），
         所以那一行永远不会闭合。留在结果里就是第三种「永远可收又永远不缺失」，
         和上面那条 NULL 是同一个形状：防卡死机制原样反转成卡死机制。
+
+        **按出发星球再分一层。** 同一 kind 现在可以有多个任务（多个 bot 任务），
+        它们各自只该为**自己派出去的那些**回信箱。不分的话，2 号星那个任务会因为
+        主星那些还没到的战报而一直判「该去收」，每五分钟进一趟信箱扑空。
         """
         _require_utc(now_utc, "now_utc")
         expected = orm.AttackDispatchRow.expected_report_at_utc
@@ -1180,6 +1216,7 @@ class SqlAlchemyRepository:
                 )
                 .where(
                     orm.AttackIntentRow.target_kind == target_kind,
+                    _from_origin(origin),
                     orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                     orm.AttackDispatchRow.accepted.is_(True),
                     or_(
@@ -1522,12 +1559,16 @@ class SqlAlchemyRepository:
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
             existing = set(session.scalars(select(orm.MissionTaskRow.kind)).all())
-            for kind, enabled, priority, params in _MISSION_SEEDS:
+            for kind, name, enabled, priority, params in _MISSION_SEEDS:
+                # 判据是「这条链路一行都没有」而不是「行数不对」：用户新建的第二个
+                # bot 任务不该让开机时又补一行出来，删掉的那一行也不该被悄悄种回来
+                # ——只有整条链路彻底空了才补。
                 if kind.value in existing:
                     continue
                 session.add(
                     orm.MissionTaskRow(
                         kind=kind.value,
+                        name=name,
                         enabled=enabled,
                         priority=priority,
                         params_json=params,
@@ -1541,7 +1582,7 @@ class SqlAlchemyRepository:
             session.commit()
 
     def mission_tasks(self) -> list[orm.MissionTaskRow]:
-        """三条链路的当前配置，按 (priority, id) 升序。
+        """全部任务的当前配置，按 (priority, id) 升序。
 
         并列的 priority 之间用 id 决出胜负：`priority` 列没有唯一约束，而
         `decide()` 的排序是稳定排序——输入次序不确定，谁先起就成了随机的。
@@ -1555,6 +1596,62 @@ class SqlAlchemyRepository:
                 ).all()
             )
 
+    def mission_task(self, task_id: int) -> orm.MissionTaskRow | None:
+        """按 id 取一个任务。没有这一行时返回 None，由调用方决定说什么。"""
+        with self._session_factory() as session:
+            return session.get(orm.MissionTaskRow, task_id)
+
+    def create_mission_task(
+        self,
+        kind: MissionKind,
+        *,
+        name: str,
+        priority: int,
+        params_json: str,
+        origin: Coordinate | None,
+        fleet_lines: int | None,
+        now_utc: datetime,
+    ) -> int:
+        """新建一个任务，返回它的 id。
+
+        **一律建成「不参与调度」**（`enabled=False`）：新任务刚建出来的时候参数
+        还没核对过、优先级也还没排，直接参与调度就等于「点了新建就开始派舰队」。
+        用户勾上那一下会走 `update_mission_task`，那条路上有参数校验。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            row = orm.MissionTaskRow(
+                kind=kind.value,
+                name=name,
+                enabled=False,
+                priority=priority,
+                params_json=params_json,
+                origin_galaxy=None if origin is None else origin.galaxy,
+                origin_system=None if origin is None else origin.system,
+                origin_position=None if origin is None else origin.position,
+                fleet_lines=fleet_lines,
+                consecutive_failures=0,
+                created_at_utc=now_utc,
+                updated_at_utc=now_utc,
+            )
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def delete_mission_task(self, task_id: int) -> None:
+        """删掉一个任务。
+
+        **只删 `mission_tasks` 这一行。** `mission_runs` 里那些 `task_id` 指着它的
+        历史行原样留着——那是账，删掉就再也说不清「昨晚那几轮是谁跑的」；
+        `attack_intents` / `attack_dispatches` 更是一个字都不碰。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.MissionTaskRow, task_id)
+            if row is None:
+                raise ValueError(f"mission_tasks 里没有 id={task_id} 这一行")
+            session.delete(row)
+            session.commit()
+
     def scheduler_config(self) -> orm.SchedulerConfigRow:
         with self._session_factory() as session:
             row = session.get(orm.SchedulerConfigRow, 1)
@@ -1564,43 +1661,64 @@ class SqlAlchemyRepository:
 
     def update_mission_task(
         self,
-        kind: MissionKind,
+        task_id: int,
         *,
         enabled: bool | None = None,
         priority: int | None = None,
         params_json: str | None = None,
+        name: str | None = None,
+        origin: Coordinate | None = None,
+        clear_origin: bool = False,
+        fleet_lines: int | None = None,
     ) -> None:
-        """页面上改开关、拖顺序、编参数走这一个入口。
+        """页面上改开关、拖顺序、编参数、改名字、改出发星球与航线数，走这一个入口。
 
-        `None` 一律表示「这次不动它」，而不是「清空」：三样东西各自独立，
-        改一样就把另外两样重置回默认是页面上最容易出的那种错。
+        `None` 一律表示「这次不动它」，而不是「清空」：这几样东西各自独立，
+        改一样就把另外几样重置回默认是页面上最容易出的那种错。
+
+        `clear_origin=True` 是**把出发星球退回「用全局主星」**这一个动作的专用开关。
+        它必须和「这次不动它」分得开：两者都只能写成 `origin=None`，合成一个的话，
+        任何一次只改优先级的 PATCH 都会顺手把出发星球抹掉。
 
         改任何一样都清掉 `disabled_reason`：自动停用是对**旧配置**下的判定，
         用户既然动手改了，就该给它一次重新开始的机会——否则参数填错一次，
         修好了也永远起不来。
         """
         with self._session_factory() as session:
-            row = _mission_task(session, kind)
+            row = _mission_task(session, task_id)
             if enabled is not None:
                 row.enabled = enabled
             if priority is not None:
                 row.priority = priority
             if params_json is not None:
                 row.params_json = params_json
+            if name is not None:
+                row.name = name
+            if fleet_lines is not None:
+                row.fleet_lines = fleet_lines
+            if clear_origin:
+                row.origin_galaxy = row.origin_system = row.origin_position = None
+            elif origin is not None:
+                row.origin_galaxy = origin.galaxy
+                row.origin_system = origin.system
+                row.origin_position = origin.position
             row.disabled_reason = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
-    def begin_bot_round(self, *, now_utc: datetime) -> None:
-        """「重开一轮」：把 `round_started_at_utc` 推到当前。
+    def begin_bot_round(self, task_id: int, *, now_utc: datetime) -> None:
+        """「重开一轮」：把这个任务的 `round_started_at_utc` 推到当前。
 
         上一轮的战报据此被排除在完成判据之外——不推的话，昨天打完的那批目标
         今天仍然算「已完成」，新的一轮永远开不起来。
+
+        **按任务推，不按链路推。** 两个 bot 任务各打各的范围，一起推等于把另一个
+        还没打完的那一轮也归零，它已经收到的战报会被当成上一轮的、目标全部重来。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
-            row = _mission_task(session, MissionKind.BOT)
+            row = _mission_task(session, task_id)
             row.round_started_at_utc = now_utc
             row.updated_at_utc = now_utc
             session.commit()
@@ -1609,12 +1727,17 @@ class SqlAlchemyRepository:
         self,
         kind: MissionKind,
         *,
+        task_id: int | None,
         command: Sequence[str],
         pid: int | None,
         started_at_utc: datetime,
         log_path: str,
     ) -> UUID:
-        """起了一个子进程，记一行。返回的 id 用来在它结束时回填。"""
+        """起了一个子进程，记一行。返回的 id 用来在它结束时回填。
+
+        `task_id` 是必填的关键字参数（可以显式给 None）：同一 `kind` 现在可以有多个
+        任务，而重启冷却按任务算——漏记就等于让那个任务永远没有冷却记录。
+        """
         _require_utc(started_at_utc, "started_at_utc")
         run_id = uuid4()
         with self._session_factory() as session:
@@ -1622,6 +1745,7 @@ class SqlAlchemyRepository:
                 orm.MissionRunRow(
                     id=run_id,
                     kind=kind.value,
+                    task_id=task_id,
                     # 存成一行是给人看的。argv 列表在页面上排不开，而这一列的
                     # 唯一用途就是事后翻账「那一轮到底打了谁」。
                     command=" ".join(command),
@@ -1696,38 +1820,32 @@ class SqlAlchemyRepository:
             session.commit()
             return len(rows)
 
-    def last_mission_starts(self) -> dict[MissionKind, datetime]:
-        """每条链路上一次**启动**的时刻，供重启冷却判据用。
+    def last_mission_starts(self) -> dict[int, datetime]:
+        """每个**任务**上一次启动的时刻，按 `task_id` 挂，供重启冷却判据用。
 
         取启动而不是结束：一个刚起来就秒退的 runner 正是最该被节流的那种，
         按结束时刻算等于对它完全不设防。
+
+        **`task_id` 为 NULL 的历史行不参与**（那一列是本轮才加的）。它们不该被
+        硬认到某个任务头上：同一 `kind` 可以有多个任务，认错人就等于让另一个任务
+        白吃一次冷却。代价是升级后的头五分钟里可能少等一次冷却，比认错人小得多。
         """
         with self._session_factory() as session:
             rows = session.execute(
-                select(orm.MissionRunRow.kind, func.max(orm.MissionRunRow.started_at_utc)).group_by(
-                    orm.MissionRunRow.kind
-                )
+                select(orm.MissionRunRow.task_id, func.max(orm.MissionRunRow.started_at_utc))
+                .where(orm.MissionRunRow.task_id.is_not(None))
+                .group_by(orm.MissionRunRow.task_id)
             ).all()
-        result: dict[MissionKind, datetime] = {}
-        for kind, started_at in rows:
-            try:
-                result[MissionKind(kind)] = started_at
-            except ValueError:
-                # 库里出现不认识的 kind（手改或旧版本留下的）不该让调度器崩掉：
-                # 它只是没有冷却记录而已。
-                continue
-        return result
+        return {int(task_id): started_at for task_id, started_at in rows}
 
-    def record_mission_failure(
-        self, kind: MissionKind, *, exit_code: int | None, limit: int
-    ) -> int:
+    def record_mission_failure(self, task_id: int, *, exit_code: int | None, limit: int) -> int:
         """记一次异常退出，返回当前连续次数；到 `limit` 就自动停用。
 
         没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。
         失败多半是「窗口抢不到前台」或「甩鼠标触发 FAILSAFE」，重启只会再来一遍。
         """
         with self._session_factory() as session:
-            row = _mission_task(session, kind)
+            row = _mission_task(session, task_id)
             row.consecutive_failures += 1
             if row.consecutive_failures >= limit and row.disabled_reason is None:
                 row.disabled_reason = (
@@ -1738,27 +1856,33 @@ class SqlAlchemyRepository:
             session.commit()
             return failures
 
-    def clear_mission_failures(self, kind: MissionKind) -> None:
-        """跑完一轮且退出码为 0。「连续」是连续，中间成功过就重新数。"""
+    def clear_mission_failures(self, task_id: int) -> None:
+        """跑完一轮且退出码为 0。「连续」是连续，中间成功过就重新数。
+
+        任务可能已经被用户删掉（豁免那一路会回头清同一阵里每个任务的计数），
+        那时什么都不做：删掉的行没有计数可清，为它抛异常只会让调度循环停摆。
+        """
         with self._session_factory() as session:
-            row = _mission_task(session, kind)
+            row = session.get(orm.MissionTaskRow, task_id)
+            if row is None:
+                return
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
-    def disable_mission_task(self, kind: MissionKind, reason: str) -> None:
+    def disable_mission_task(self, task_id: int, reason: str) -> None:
         """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。"""
         with self._session_factory() as session:
-            row = _mission_task(session, kind)
+            row = _mission_task(session, task_id)
             row.disabled_reason = reason
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
 
-def _mission_task(session: Session, kind: MissionKind) -> orm.MissionTaskRow:
-    row = session.scalar(select(orm.MissionTaskRow).where(orm.MissionTaskRow.kind == kind.value))
+def _mission_task(session: Session, task_id: int) -> orm.MissionTaskRow:
+    row = session.get(orm.MissionTaskRow, task_id)
     if row is None:
-        raise ValueError(f"mission_tasks 里没有 {kind.value} 这一行；先调 ensure_mission_rows()")
+        raise ValueError(f"mission_tasks 里没有 id={task_id} 这一行")
     return row
 
 
@@ -1787,6 +1911,20 @@ def _scout_report_exists(session: Session, target: Coordinate, reported_at_utc: 
         )
         or 0
     ) > 0
+
+
+def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
+    """「这一发是从这颗星球派出去的」。
+
+    出发坐标存在 `attack_intents` 上（派遣行本身没有坐标），所以每个用它的查询
+    都得先 join 到意图表。抽成一个函数是为了让四处航线记账用的是同一条判据——
+    各写一遍的话，迟早有一处漏掉一个分量，而漏掉之后只是数字偏小，不报错。
+    """
+    return and_(
+        orm.AttackIntentRow.origin_galaxy == origin.galaxy,
+        orm.AttackIntentRow.origin_system == origin.system,
+        orm.AttackIntentRow.origin_position == origin.position,
+    )
 
 
 def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:

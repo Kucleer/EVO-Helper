@@ -15,6 +15,7 @@ from evo_helper.domain.missions import (
     MissionParamError,
     bot_command,
     bot_targets_in_range,
+    check_origin_dispatchable,
     pirate_command,
     pirate_systems,
     scan_command,
@@ -71,7 +72,7 @@ def test_a_reversed_system_range_is_rejected() -> None:
 def test_an_empty_target_set_is_rejected_before_a_process_is_started() -> None:
     """范围内一个已记录 bot 都没有时，拉起一个必然空转的 runner 没有意义。"""
     with pytest.raises(MissionParamError):
-        bot_command(())
+        bot_command((), origin=ORIGIN)
 
 
 def test_scan_command_is_the_full_argv() -> None:
@@ -84,12 +85,14 @@ def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:
     只断言「`--systems` 在里面」测不出 `--attack` 被漏掉——那种情况下海盗
     只侦查不打，当天配额白白流失，而且不会有任何报错。
     """
-    assert pirate_command(((2, 137),))[1:] == [
+    assert pirate_command(((2, 137),), origin=ORIGIN)[1:] == [
         "-u",
         "-m",
         "evo_helper.tools.pirate_loop",
         "--systems",
         "2:137",
+        "--origin",
+        "2:137:18",
         "--scout",
         "--attack",
     ]
@@ -102,12 +105,14 @@ def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
     不再分档（用户口径 2026-08-13）：多传一个 runner 已经不认识的参数，
     argparse 会当场 `SystemExit(2)`，而调度器看到的只是「这条链路又崩了一次」。
     """
-    assert bot_command((Coordinate(2, 137, 14),))[1:] == [
+    assert bot_command((Coordinate(2, 137, 14),), origin=ORIGIN)[1:] == [
         "-u",
         "-m",
         "evo_helper.tools.bot_loop",
         "--targets",
         "2:137:14",
+        "--origin",
+        "2:137:18",
         "--attack",
     ]
 
@@ -120,7 +125,7 @@ def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:
     many = tuple(Coordinate(2, system, 1) for system in range(1, 4000))
 
     with pytest.raises(MissionParamError):
-        bot_command(many)
+        bot_command(many, origin=ORIGIN)
 
 
 def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:
@@ -139,3 +144,29 @@ def test_the_home_planet_is_resolved_in_exactly_one_place() -> None:
 
     assert pirate_loop.origin is scan_coordinates.origin
     assert scan_coordinates.origin() == ORIGIN
+
+
+# -- 出发星球现在派不派得出去 --------------------------------------------------
+#
+# 助手还不会在游戏里切换当前星球，所以任务上配的 `origin` 只有等于游戏此刻选中
+# 的那一颗（也就是主星）时才派得出去。这是一道**临时闸门**，切换星球实装就删。
+
+
+def test_the_home_planet_is_dispatchable() -> None:
+    check_origin_dispatchable(ORIGIN, ORIGIN)
+
+
+def test_another_planet_is_refused_rather_than_dispatched_from_the_wrong_place() -> None:
+    """**放行的代价不是「打不到」，是台账在撒谎。**
+
+    舰队会照旧从游戏当前选中的星球飞出去，而 `attack_intents.origin_*` 上写着
+    另一颗——战报认领靠「出发坐标 + 目标坐标 + 时间就近」配对，飞行时间与航线钟
+    也全按错的距离算。
+
+    ⚠️ 错误信息里要出现**两颗**坐标：只说「不支持」的话，用户看不出该改成什么。
+    """
+    with pytest.raises(MissionParamError) as error:
+        check_origin_dispatchable(Coordinate(9, 250, 8), ORIGIN)
+
+    assert "9:250:8" in str(error.value)
+    assert "2:137:18" in str(error.value)

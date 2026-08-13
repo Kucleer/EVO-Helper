@@ -71,7 +71,12 @@ class SupervisorBusyError(RuntimeError):
 
 @dataclass(frozen=True)
 class RunningChild:
+    #: 是**哪一个任务**起的。同一 `kind` 可以有多个任务，光看 kind 分不出来，
+    #: 而页面上「哪一行显示运行中」、冷却按谁算、失败记到谁头上，全按它。
+    task_id: int
     kind: MissionKind
+    #: 任务名，只为日志与页面显示。判据一个字都不看它。
+    name: str
     command: tuple[str, ...]
     #: 供 `mission_runs` 记账、页面上认孤儿用。**不拿它去杀进程**：
     #: pid 会被系统回收复用。
@@ -84,6 +89,7 @@ class RunningChild:
 class MissionExit:
     """一次子进程从起到停的全过程，调用方据此写 `mission_runs`。"""
 
+    task_id: int
     kind: MissionKind
     command: tuple[str, ...]
     #: 退出码是唯一的进程间协议：0 = 这一轮正常跑完，
@@ -126,7 +132,14 @@ class MissionExit:
 
 
 def log_path_for(kind: MissionKind, *, log_dir: Path = LOG_DIR) -> Path:
-    """每条链路一个日志文件。混在一起，出事时分不出是谁的输出。"""
+    """每条链路一个日志文件。混在一起，出事时分不出是谁的输出。
+
+    **按链路分而不是按任务分**，哪怕同一链路现在可以有多个任务：任何时刻只有一个
+    子进程在跑，同一条链路的两个任务在时间上天然不重叠，交错写进同一个文件读起来
+    仍然是一条连贯的时间线。而按任务分会让文件名跟着 `task_id` 走——删掉一个任务
+    再建一个，日志就落到新文件里，用户手上那条「看 `mission-bot.log`」的路径
+    也就断了。「那一轮是哪个任务跑的」由 `mission_runs.task_id` 回答。
+    """
     return log_dir / f"mission-{kind.value.lower()}.log"
 
 
@@ -168,7 +181,9 @@ class MissionSupervisor:
     def running(self) -> RunningChild | None:
         return self._running
 
-    def start(self, kind: MissionKind, command: Sequence[str]) -> RunningChild:
+    def start(
+        self, kind: MissionKind, command: Sequence[str], *, task_id: int, name: str = ""
+    ) -> RunningChild:
         """起一个子进程。已经有一个在跑就拒绝，不排队也不替换。"""
         if self._running is not None:
             raise SupervisorBusyError(f"{self._running.kind.value} 还在跑，不能同时起 {kind.value}")
@@ -176,7 +191,9 @@ class MissionSupervisor:
         process = self.launch(kind, command, log_path)
         self._process = process
         self._running = RunningChild(
+            task_id=task_id,
             kind=kind,
+            name=name,
             command=tuple(command),
             pid=getattr(process, "pid", None),
             started_at_utc=self.clock(),
@@ -220,6 +237,7 @@ class MissionSupervisor:
         self, running: RunningChild, *, exit_code: int | None, stopped_by: StopReason
     ) -> MissionExit:
         return MissionExit(
+            task_id=running.task_id,
             kind=running.kind,
             command=running.command,
             exit_code=exit_code,

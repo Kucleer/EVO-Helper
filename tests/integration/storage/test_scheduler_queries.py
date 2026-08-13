@@ -25,6 +25,11 @@ from evo_helper.domain.report_wait import MAX_REPORT_AGE, UNKNOWN_LINE_HOLD
 #: 宽限期取 `scheduler_config.report_grace_minutes` 的默认值。
 GRACE = timedelta(minutes=30)
 
+#: 用户的两颗星球（实机截图确认 2026-08-12）：主星奥格瑞玛与 2 号星风暴哨壁。
+#: 航线上限是**按星球各一份**的，所以这几个查询全部要按出发星球分组。
+HOME = Coordinate(2, 137, 18)
+SECOND = Coordinate(9, 250, 8)
+
 
 def test_todays_pirate_dispatches_are_counted_from_utc_midnight(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """重置点是 UTC 00:00，也就是本地 UTC+8 的每天早上 8 点。"""
@@ -223,8 +228,8 @@ def test_a_long_flight_is_not_abandoned_for_being_old(repository, run_id) -> Non
 # -- 在飞数：航线估算的分子 --------------------------------------------------
 
 
-def test_inflight_counts_every_kind_together(repository, run_id, session_factory) -> None:  # type: ignore[no-untyped-def]
-    """航线是全局资源，不分海盗还是 bot。
+def test_inflight_counts_every_kind_on_the_same_planet(repository, run_id, session_factory) -> None:  # type: ignore[no-untyped-def]
+    """**同一颗星球上**的航线不分海盗还是 bot，一起数。
 
     按 kind 分开数会把两条链路各自算成「还有位子」，于是两个 runner 一起起来，
     第二个到了游戏里才发现没航线——权威闸门拦得住，但一趟导航全白跑。
@@ -236,7 +241,7 @@ def test_inflight_counts_every_kind_together(repository, run_id, session_factory
         )
         repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
 
-    assert repository.count_inflight(now_utc=now) == 2
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 2
 
 
 def test_a_returned_fleet_no_longer_occupies_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -252,7 +257,7 @@ def test_a_returned_fleet_no_longer_occupies_a_line(repository, run_id) -> None:
     )
     repository.record_flight_time(dispatch_id, timedelta(minutes=10), dispatched_at)
 
-    assert repository.count_inflight(now_utc=now) == 0
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
 
 
 def test_an_attack_still_flying_home_keeps_its_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -269,7 +274,7 @@ def test_an_attack_still_flying_home_keeps_its_line(repository, run_id) -> None:
     )
     repository.record_flight_time(dispatch_id, timedelta(minutes=30), dispatched_at)
 
-    assert repository.count_inflight(now_utc=now) == 1
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
 
 
 def test_a_collected_report_does_not_free_the_line_early(
@@ -294,7 +299,7 @@ def test_a_collected_report_does_not_free_the_line_early(
     repository.record_flight_time(dispatch_id, timedelta(hours=1), dispatched_at)
     _attach_report(session_factory, dispatch_id, now)
 
-    assert repository.count_inflight(now_utc=now) == 1
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
 
 
 def test_a_probe_frees_its_line_on_arrival(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -315,7 +320,7 @@ def test_a_probe_frees_its_line_on_arrival(repository, run_id) -> None:  # type:
     )
     repository.record_flight_time(dispatch_id, timedelta(minutes=30), dispatched_at)
 
-    assert repository.count_inflight(now_utc=now) == 0
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
 
 
 # -- 侦察发：占航线，但不占配额、也不产生战报 --------------------------------
@@ -340,7 +345,7 @@ def test_a_scout_occupies_a_line_until_it_flies_home(repository, run_id) -> None
     )
     repository.record_flight_time(dispatch_id, timedelta(minutes=30), dispatched_at)
 
-    assert repository.count_inflight(now_utc=now) == 1
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
 
 
 def test_scouts_do_not_eat_the_daily_attack_quota(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -403,7 +408,7 @@ def test_refused_dispatches_do_not_occupy_a_line(repository, run_id) -> None:  #
     )
     repository.record_flight_time(dispatch_id, timedelta(hours=1), now - timedelta(minutes=5))
 
-    assert repository.count_inflight(now_utc=now) == 0
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
 
 
 def test_a_dispatch_with_no_flight_time_still_holds_a_line(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -425,7 +430,7 @@ def test_a_dispatch_with_no_flight_time_still_holds_a_line(repository, run_id) -
         dispatched_at=now - timedelta(minutes=5),
     )
 
-    assert repository.count_inflight(now_utc=now) == 1
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
 
 
 def test_a_dispatch_with_no_flight_time_lets_go_after_the_hold_expires(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -443,7 +448,7 @@ def test_a_dispatch_with_no_flight_time_lets_go_after_the_hold_expires(repositor
         dispatched_at=now - UNKNOWN_LINE_HOLD - timedelta(minutes=1),
     )
 
-    assert repository.count_inflight(now_utc=now) == 0
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
 
 
 def test_the_next_free_line_ignores_dispatches_with_no_flight_time(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -462,8 +467,8 @@ def test_the_next_free_line_ignores_dispatches_with_no_flight_time(repository, r
         dispatched_at=now - timedelta(minutes=5),
     )
 
-    assert repository.count_inflight(now_utc=now) == 1
-    assert repository.next_line_free_at(now_utc=now) is None
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
+    assert repository.next_line_free_at(now_utc=now, origin=HOME) is None
 
 
 def test_the_next_free_line_is_the_earliest_one_still_out(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -476,12 +481,12 @@ def test_the_next_free_line_is_the_earliest_one_still_out(repository, run_id) ->
         repository.record_flight_time(dispatch_id, flight, now)
 
     # 攻击发按 2× 算（打完还要飞回来），所以最早的是 40 分钟那发的 80 分钟。
-    assert repository.next_line_free_at(now_utc=now) == now + timedelta(minutes=80)
+    assert repository.next_line_free_at(now_utc=now, origin=HOME) == now + timedelta(minutes=80)
 
 
 def test_the_next_free_line_is_none_when_nothing_is_out(repository) -> None:  # type: ignore[no-untyped-def]
     """一支在飞的都没有：这一层对「航线满不满」没有任何证据，不许瞎猜一个时刻。"""
-    assert repository.next_line_free_at(now_utc=datetime.now(UTC)) is None
+    assert repository.next_line_free_at(now_utc=datetime.now(UTC), origin=HOME) is None
 
 
 def test_the_last_dispatch_time_is_per_target_kind(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -492,8 +497,8 @@ def test_the_last_dispatch_time_is_per_target_kind(repository, run_id) -> None: 
     now = datetime.now(UTC)
     _dispatch(repository, run_id, TARGET_KIND_BOT, position=11, dispatched_at=now)
 
-    assert repository.last_dispatch_at(TARGET_KIND_BOT) == now
-    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) is None
+    assert repository.last_dispatch_at(TARGET_KIND_BOT, origin=HOME) == now
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE, origin=HOME) is None
 
 
 def test_the_last_dispatch_time_counts_scouts_too(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -512,7 +517,7 @@ def test_the_last_dispatch_time_counts_scouts_too(repository, run_id) -> None:  
         mission_kind=MISSION_KIND_SCOUT,
     )
 
-    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) == now
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE, origin=HOME) == now
 
 
 def test_a_refused_dispatch_is_not_a_dispatch(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -530,7 +535,7 @@ def test_a_refused_dispatch_is_not_a_dispatch(repository, run_id) -> None:  # ty
         accepted=False,
     )
 
-    assert repository.last_dispatch_at(TARGET_KIND_PIRATE) is None
+    assert repository.last_dispatch_at(TARGET_KIND_PIRATE, origin=HOME) is None
 
 
 def _attach_report(session_factory, dispatch_id, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
@@ -558,9 +563,9 @@ def _attach_report(session_factory, dispatch_id, reported_at: datetime) -> None:
         session.commit()
 
 
-def _pending(repository, target_kind: str, now: datetime):  # type: ignore[no-untyped-def]
+def _pending(repository, target_kind: str, now: datetime, origin: Coordinate = HOME):  # type: ignore[no-untyped-def]
     return repository.pending_reports_for_kind(
-        target_kind, now_utc=now, grace=GRACE, max_age=MAX_REPORT_AGE
+        target_kind, now_utc=now, grace=GRACE, max_age=MAX_REPORT_AGE, origin=origin
     )
 
 
@@ -574,6 +579,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
     accepted: bool = True,
     preset_name: str = "AAA",
     mission_kind: str = MISSION_KIND_ATTACK,
+    origin: Coordinate = HOME,
 ):
     """一条意图 + 一条派遣。返回派遣 id，好让调用方补写飞行时间。"""
     intent_id = uuid4()
@@ -582,7 +588,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
         AttackIntent(
             intent_id=intent_id,
             run_id=run_id,
-            origin=Coordinate(2, 137, 18),
+            origin=origin,
             target=Coordinate(2, 137, position),
             preset=FleetPresetRef(name=preset_name, signature="sig"),
             cycle_start_utc=dispatched_at,
@@ -604,3 +610,94 @@ def _dispatch(  # type: ignore[no-untyped-def]
 
 def _utc_midnight(moment: datetime) -> datetime:
     return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+# -- 按出发星球分：主星与 2 号星各占各的 --------------------------------------
+#
+# 用户口径（2026-08-13，追问确认）：「航线上限是按星球各一份的，不是账号共享」。
+# 这几条盯的是「全库一起数」那个旧口径会不会从哪个角落回来。
+
+
+def test_inflight_only_counts_fleets_that_left_this_planet(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**不同出发星球互不影响。**
+
+    主星派出去两支、2 号星派出去一支：主星那颗看到 2，2 号星那颗看到 1。
+    全库一起数的话两边都会看到 3，于是主星打满之后 2 号星也不敢派了。
+
+    ⚠️ 两颗星的在飞数**故意不同**（2 与 1）：填成一样的话，把过滤条件整个删掉
+    也未必露馅。
+    """
+    now = datetime.now(UTC)
+    dispatched_at = now - timedelta(minutes=5)
+    for position in (41, 42):
+        dispatch_id = _dispatch(
+            repository, run_id, TARGET_KIND_BOT, position=position, dispatched_at=dispatched_at
+        )
+        repository.record_flight_time(dispatch_id, timedelta(hours=1), dispatched_at)
+    elsewhere = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=43,
+        dispatched_at=dispatched_at,
+        origin=SECOND,
+    )
+    repository.record_flight_time(elsewhere, timedelta(hours=1), dispatched_at)
+
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 2
+    assert repository.count_inflight(now_utc=now, origin=SECOND) == 1
+
+
+def test_the_next_free_line_is_the_earliest_one_on_that_same_planet(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """闹钟也按星球分。
+
+    拿别的星球的返航时刻当闹钟，压住的那段时间与这个任务能不能派毫无关系
+    ——2 号星那个任务会为主星的一支远征白等两小时。
+    """
+    now = datetime.now(UTC)
+    dispatched_at = now - timedelta(minutes=5)
+    far = _dispatch(repository, run_id, TARGET_KIND_BOT, position=44, dispatched_at=dispatched_at)
+    repository.record_flight_time(far, timedelta(hours=2), dispatched_at)
+    near = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=45,
+        dispatched_at=dispatched_at,
+        origin=SECOND,
+    )
+    repository.record_flight_time(near, timedelta(minutes=20), dispatched_at)
+
+    assert repository.next_line_free_at(now_utc=now, origin=HOME) == dispatched_at + timedelta(
+        hours=4
+    )
+    assert repository.next_line_free_at(now_utc=now, origin=SECOND) == dispatched_at + timedelta(
+        minutes=40
+    )
+
+
+def test_the_last_dispatch_time_is_per_origin_too(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """「上一轮空手而归」按出发星球判。
+
+    不分的话，主星那个任务派出去的一发会让 2 号星那个任务看起来「上一轮有派
+    出去」，于是它撞满航线之后照样每五分钟白跑一轮——而 `waiting_for_a_line`
+    存在的全部意义就是不让这件事重复发生。
+    """
+    now = datetime.now(UTC)
+    _dispatch(repository, run_id, TARGET_KIND_BOT, position=46, dispatched_at=now)
+
+    assert repository.last_dispatch_at(TARGET_KIND_BOT, origin=HOME) == now
+    assert repository.last_dispatch_at(TARGET_KIND_BOT, origin=SECOND) is None
+
+
+def test_pending_reports_are_scoped_by_origin_as_well_as_kind(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """战报也按出发星球分。
+
+    两个 bot 任务各自只该为自己派出去的那些回信箱：不分的话，2 号星那个任务会
+    因为主星那些还没到的战报而一直判「该去收」，每五分钟进一趟信箱扑空。
+    """
+    now = datetime.now(UTC)
+    _dispatch(repository, run_id, TARGET_KIND_BOT, position=47, dispatched_at=now)
+
+    assert len(_pending(repository, TARGET_KIND_BOT, now, HOME)) == 1
+    assert _pending(repository, TARGET_KIND_BOT, now, SECOND) == []

@@ -49,7 +49,7 @@
 </section>
 
 <section class="panel" aria-labelledby="tasks-head">
-  <h2 id="tasks-head">任务链路</h2>
+  <h2 id="tasks-head">任务</h2>
   <div class="table-wrap">
     <table>
       <thead>
@@ -57,87 +57,33 @@
           <th scope="col" style="width:26px"><span class="visually-hidden">排序</span></th>
           <th scope="col" style="width:34px"><span class="visually-hidden">是否参与</span></th>
           <th scope="col">任务</th>
+          <th scope="col">出发星球 / 航线</th>
           <th scope="col">参数</th>
           <th scope="col">状态</th>
         </tr>
       </thead>
-      <tbody id="mission-rows">
       {#
-        三行只渲染壳。状态、随行事实、参数回显、参数当前值全部由
-        /api/scheduler 下发——判据在页面上抄一份就会和调度器走散。
+        整个 tbody 由 JS 按 /api/scheduler 下发的任务列表建出来。**不能再在这里
+        按 mission_labels 渲染固定几行**：同一类型现在可以有多个任务（多个 bot
+        攻击），行数是用户加出来的，服务端这一页只渲染一次，加完一个任务不刷新
+        整页就看不见它。状态、随行事实、参数回显仍然全部由接口下发——判据在页面
+        上抄一份就会和调度器走散。
       #}
-      {% for kind, label in mission_labels.items() %}
-        {% set is_scan = kind == 'SCAN' %}
-        <tr class="mission-row" data-kind="{{ kind }}"
-            draggable="{{ 'false' if is_scan else 'true' }}">
-          <td>
-            {% if is_scan %}
-              <span class="muted" aria-hidden="true" title="扫描恒在最后一位，不参与排序">·</span>
-            {% else %}
-              <span class="drag-handle" aria-hidden="true" title="拖拽调整优先级">⠿</span>
-            {% endif %}
-          </td>
-          <td>
-            <input type="checkbox" class="mission-enabled" aria-label="让「{{ label }}」参与调度">
-          </td>
-          <td>
-            <div>{{ label }}</div>
-            {% if is_scan %}
-              {#
-                这句话必须在页面上，不能只靠「拖不动」让用户自己猜。扫描永远有
-                活干，排在它后面的链路就永远轮不到——把它拖到海盗前面等于当天
-                32 次配额悄无声息地全流失。只想跑扫描的话，取消另外两个复选框。
-              #}
-              <div class="muted" style="font-size:11px">
-                始终填空隙 · 不参与排序（它永远有活干，排它后面的链路就永远轮不到）
-              </div>
-            {% endif %}
-          </td>
-          <td>
-            {% if kind == 'PIRATE' %}
-              <span class="inline-label">半径</span>
-              <input type="number" class="mission-param" data-param="radius" min="1" max="999"
-                     style="width:78px" aria-label="海盗攻击半径">
-            {% elif kind == 'BOT' %}
-              <span class="inline-label">星系</span>
-              <input type="number" class="mission-param" data-param="galaxy" min="1"
-                     style="width:60px" aria-label="星系号">
-              <span class="inline-label">系号</span>
-              <input type="number" class="mission-param" data-param="first_system" min="1"
-                     style="width:78px" aria-label="起始系号">
-              <span class="dash">–</span>
-              <input type="number" class="mission-param" data-param="last_system" min="1"
-                     style="width:78px" aria-label="结束系号">
-            {% else %}
-              <span class="muted">—</span>
-            {% endif %}
-            <div class="muted mission-summary" style="font-size:11px">…</div>
-          </td>
-          <td>
-            <span class="chip mission-status"><span class="glyph" aria-hidden="true">·</span><span class="mission-status-word">读取中</span></span>
-            <div class="muted mission-detail" style="font-size:11px"></div>
-            {#
-              自动停用是对**当时那一阵**的判定，不是墓碑：连崩三次多半是「窗口
-              抢不到前台」这种环境原因，人回到座位上它就好了。而停用时复选框
-              仍然是勾着的，页面上没有这个按钮的话，用户只能靠「取消勾选再勾回来」
-              猜出恢复的办法。PATCH `enabled: true` 会连 `disabled_reason` 和
-              连续失败计数一起清掉（参数不合格的话照样会被 400 拦下）。
-            #}
-            <button class="btn small mission-revive" type="button" style="margin-top:6px"
-                    hidden>恢复</button>
-            {% if kind == 'BOT' %}
-              {#
-                bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人
-                看着的时候一直派舰队。开新一轮只能是用户按下的这一下。
-              #}
-              <button class="btn small mission-new-round" type="button" style="margin-top:6px"
-                      data-endpoint="/api/missions/BOT/new-round" hidden>重开一轮</button>
-            {% endif %}
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
+      <tbody id="mission-rows"></tbody>
     </table>
+  </div>
+  <div class="filter-bar" style="margin-top:10px">
+    <span class="inline-label">新建 bot 攻击任务</span>
+    <input type="text" id="new-task-name" placeholder="任务名，例如「2 号星 · 近系」"
+           style="width:200px" aria-label="新任务的名字">
+    <input type="text" id="new-task-origin" placeholder="出发星球，留空=主星"
+           style="width:150px" aria-label="新任务的出发星球">
+    <input type="number" id="new-task-lines" min="1" placeholder="航线"
+           style="width:70px" aria-label="新任务的航线数">
+    <button class="btn small" type="button" id="btn-new-task">新建</button>
+    <span class="muted" style="font-size:11px">
+      只有 bot 攻击可以有多个：海盗每天 32 次是账号级配额，扫描恒在最后一位。
+    </span>
   </div>
   {# 400 / 409 一律显示在这里。静默失败等于把后端那句中文说明扔了。 #}
   <p class="chip danger" id="mission-error" role="status" style="margin:10px 0 0" hidden></p>
@@ -147,6 +93,7 @@
   #}
   <p class="muted" id="mission-hint" style="margin:8px 0 0;font-size:12px">
     改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。
+    航线数是**这颗出发星球上**这个任务能占几条——上限按星球各一份，不是账号共享。
   </p>
 </section>
 
@@ -177,6 +124,12 @@
             {% for task in freeze.tasks %}
               <div class="muted" style="font-size:11px">
                 {{ task.label }} · {{ '参与' if task.enabled else '未参与' }} · {{ task.summary }}
+                {#
+                  旧记录（本轮之前写下的那些行）没有出发星球与航线数这两项。
+                  显示成「—」而不是补一个数字：那时候出发星球只有一个全局值，
+                  把今天的默认值贴在旧记录上正是这份账要防的那种走样。
+                #}
+                · 出发 {{ task.origin or '—' }} · 航线 {{ task.fleet_lines if task.fleet_lines is not none else '—' }}
               </div>
             {% endfor %}
           </td>
@@ -247,6 +200,21 @@
   // 由 /api/scheduler 算好送来。
   const STATUS_TONES = {{ status_tones | tojson }};
   const STATUS_GLYPHS = {{ status_glyphs | tojson }};
+  // 链路的中文名。任务没起名时用它兜底——服务端下发的 label 已经做过这一步，
+  // 这里只在建行的说明文字上用。
+  const MISSION_LABELS = {{ mission_labels | tojson }};
+
+  // 每条链路的参数框。**次序即页面上从左到右的次序**，与
+  // `web.display.PARAM_LABELS` 是同一批键。扫描没有参数（它自己维护计划与游标）。
+  const PARAM_FIELDS = {
+    PIRATE: [{ key: 'radius', label: '半径', width: 78, min: 1, max: 999 }],
+    BOT: [
+      { key: 'galaxy', label: '星系', width: 60, min: 1 },
+      { key: 'first_system', label: '系号', width: 78, min: 1 },
+      { key: 'last_system', label: '–', width: 78, min: 1 },
+    ],
+    SCAN: [],
+  };
 
   // 运行中改配置一律被后端 409 拒掉（`_refuse_while_running`）。页面这一侧
   // 只做同一件事的**提前显形**：控件置灰 + 说明为什么。两边都要有——只置灰
@@ -270,9 +238,10 @@
   const uptimeText = document.getElementById('sched-uptime');
   const currentLine = document.getElementById('current-line');
 
-  // 参数框只在第一次拿到数据时填一次。每轮轮询都写回去的话，用户正在输入的
-  // 半径会被上一次保存的值顶掉——这正是「状态区单独轮询、不刷整页」要躲的坑。
-  let paramsPrimed = false;
+  // 输入框只在这一行第一次拿到数据时填一次（标记在 `row.dataset.primed` 上）。
+  // 每轮轮询都写回去的话，用户正在输入的半径会被上一次保存的值顶掉——这正是
+  // 「状态区单独轮询、不刷整页」要躲的坑。标记挂在行上而不是一个全局开关：
+  // 新建出来的那一行必须也能填一次，而那时别的行早就填过了。
   // 拖拽进行中不重排，否则行会在手底下跳走。
   let dragging = null;
 
@@ -287,8 +256,164 @@
     showError(error.detail || error.message || String(error));
   }
 
-  function rowFor(kind) {
-    return rows.querySelector(`[data-kind="${kind}"]`);
+  function rowFor(taskId) {
+    return rows.querySelector(`[data-task-id="${taskId}"]`);
+  }
+
+  // ---- 建行 ---------------------------------------------------------------
+  //
+  // 行数由服务端下发的任务列表决定（同一类型可以有多个），所以每一行都在这里
+  // 建。**建过就不再重建**：重建会让正在编辑的输入框失焦，而状态每 2 秒轮询
+  // 一次，那样参数永远填不完。
+
+  function makeInput(className, attrs) {
+    const input = document.createElement('input');
+    input.className = className;
+    for (const [key, value] of Object.entries(attrs)) {
+      if (value !== undefined && value !== null) input.setAttribute(key, value);
+    }
+    return input;
+  }
+
+  function makeCell(row, ...nodes) {
+    const cell = document.createElement('td');
+    cell.append(...nodes);
+    row.append(cell);
+    return cell;
+  }
+
+  function buildRow(task) {
+    const isScan = task.kind === 'SCAN';
+    const row = document.createElement('tr');
+    row.className = 'mission-row';
+    row.dataset.taskId = task.task_id;
+    row.dataset.kind = task.kind;
+    row.setAttribute('draggable', isScan ? 'false' : 'true');
+
+    // 排序把手。扫描恒在最后一位，拖不动。
+    const handle = document.createElement('span');
+    if (isScan) {
+      handle.className = 'muted';
+      handle.title = '扫描恒在最后一位，不参与排序';
+      handle.textContent = '·';
+    } else {
+      handle.className = 'drag-handle';
+      handle.title = '拖拽调整优先级';
+      handle.textContent = '⠿';
+    }
+    handle.setAttribute('aria-hidden', 'true');
+    makeCell(row, handle);
+
+    const checkbox = makeInput('mission-enabled', { type: 'checkbox' });
+    checkbox.setAttribute('aria-label', `让「${task.label}」参与调度`);
+    makeCell(row, checkbox);
+
+    // 名字。同类型的多个任务全靠它区分，所以它必须能改。
+    const name = makeInput('mission-name', {
+      type: 'text', style: 'width:150px', 'aria-label': '任务名',
+    });
+    const kindLine = document.createElement('div');
+    kindLine.className = 'muted';
+    kindLine.style.fontSize = '11px';
+    kindLine.textContent = MISSION_LABELS[task.kind] || task.kind;
+    if (isScan) {
+      // 这句话必须在页面上，不能只靠「拖不动」让用户自己猜。扫描永远有活干，
+      // 排在它后面的链路就永远轮不到——把它拖到海盗前面等于当天 32 次配额
+      // 悄无声息地全流失。只想跑扫描的话，取消另外两个复选框。
+      kindLine.textContent += ' · 始终填空隙 · 不参与排序（它永远有活干，排它后面的永远轮不到）';
+    }
+    makeCell(row, name, kindLine);
+
+    // 出发星球与航线数。**航线上限按星球各一份**，所以这两个必须成对出现在
+    // 同一格里——只看到航线数会以为那是账号总额。
+    //
+    // **扫描这一行不给这两个框**：它压根不派遣，填了不会有任何效果，而一个改了
+    // 也不生效的输入框比没有更糟——用户会以为自己配好了。
+    const defaults = document.createElement('div');
+    defaults.className = 'muted mission-defaults';
+    defaults.style.fontSize = '11px';
+    if (isScan) {
+      const dash = document.createElement('span');
+      dash.className = 'muted';
+      dash.textContent = '— 不派遣';
+      makeCell(row, dash);
+    } else {
+      const origin = makeInput('mission-origin', {
+        type: 'text', style: 'width:110px', 'aria-label': '出发星球',
+      });
+      const lines = makeInput('mission-lines', {
+        type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
+      });
+      makeCell(row, origin, document.createTextNode(' '), lines, defaults);
+    }
+
+    // 参数框。
+    const params = document.createElement('span');
+    for (const field of PARAM_FIELDS[task.kind] || []) {
+      const label = document.createElement('span');
+      label.className = field.label === '–' ? 'dash' : 'inline-label';
+      label.textContent = field.label;
+      const input = makeInput('mission-param', {
+        type: 'number', min: field.min, max: field.max,
+        style: `width:${field.width}px`, 'aria-label': field.label,
+      });
+      input.dataset.param = field.key;
+      params.append(label, input);
+    }
+    if (!params.childNodes.length) {
+      const dash = document.createElement('span');
+      dash.className = 'muted';
+      dash.textContent = '—';
+      params.append(dash);
+    }
+    const summary = document.createElement('div');
+    summary.className = 'muted mission-summary';
+    summary.style.fontSize = '11px';
+    summary.textContent = '…';
+    makeCell(row, params, summary);
+
+    // 状态。
+    const chip = document.createElement('span');
+    chip.className = 'chip mission-status';
+    const glyph = document.createElement('span');
+    glyph.className = 'glyph';
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = '·';
+    const word = document.createElement('span');
+    word.className = 'mission-status-word';
+    word.textContent = '读取中';
+    chip.append(glyph, word);
+    const detail = document.createElement('div');
+    detail.className = 'muted mission-detail';
+    detail.style.fontSize = '11px';
+    // 自动停用是对**当时那一阵**的判定，不是墓碑：连崩三次多半是「窗口抢不到
+    // 前台」这种环境原因，人回到座位上它就好了。而停用时复选框仍然是勾着的，
+    // 页面上没有这个按钮的话，用户只能靠「取消勾选再勾回来」猜出恢复的办法。
+    const revive = document.createElement('button');
+    revive.className = 'btn small mission-revive';
+    revive.type = 'button';
+    revive.style.marginTop = '6px';
+    revive.hidden = true;
+    revive.textContent = '恢复';
+    const cell = makeCell(row, chip, detail, revive);
+    if (task.kind === 'BOT') {
+      // bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人看着的
+      // 时候一直派舰队。开新一轮只能是用户按下的这一下。
+      const newRound = document.createElement('button');
+      newRound.className = 'btn small mission-new-round';
+      newRound.type = 'button';
+      newRound.style.marginTop = '6px';
+      newRound.hidden = true;
+      newRound.textContent = '重开一轮';
+      // 删除只给 bot：另外两条链路各只有一个任务，后端也会拒。
+      const remove = document.createElement('button');
+      remove.className = 'btn small mission-delete';
+      remove.type = 'button';
+      remove.style.marginTop = '6px';
+      remove.textContent = '删除';
+      cell.append(newRound, remove);
+    }
+    return row;
   }
 
   function elapsed(startedIso, now) {
@@ -324,14 +449,23 @@
     orphanBanner.hidden = state.orphan_pid === null || state.orphan_pid === undefined;
     if (!orphanBanner.hidden) orphanPid.textContent = state.orphan_pid;
 
+    // 建出还不存在的行、删掉已经不在列表里的行。**已经在的一个都不重建**：
+    // 重建会让正在编辑的输入框失焦，而这里每 2 秒跑一次。
+    const wantedIds = new Set(state.tasks.map((task) => String(task.task_id)));
+    for (const row of [...rows.querySelectorAll('.mission-row')]) {
+      if (!wantedIds.has(row.dataset.taskId)) row.remove();
+    }
+    for (const task of state.tasks) {
+      if (!rowFor(task.task_id)) rows.append(buildRow(task));
+    }
+
     // tasks 已经按调度次序排好（扫描恒最后），页面照抄，不自己排。
-    // **次序没变就一个节点都不动**：把 <tr> 搬来搬去会让里面正在编辑的输入框
-    // 失焦，每两秒一次，参数就永远填不完。
-    const wanted = state.tasks.map((task) => task.kind).join(',');
-    const shown = [...rows.querySelectorAll('.mission-row')].map((row) => row.dataset.kind).join(',');
+    // **次序没变就一个节点都不动**，理由同上。
+    const wanted = state.tasks.map((task) => task.task_id).join(',');
+    const shown = [...rows.querySelectorAll('.mission-row')].map((row) => row.dataset.taskId).join(',');
     if (!dragging && wanted !== shown) {
       for (const task of state.tasks) {
-        const row = rowFor(task.kind);
+        const row = rowFor(task.task_id);
         if (row) rows.append(row);
       }
     }
@@ -339,9 +473,10 @@
     const locked = state.config_locked === true;
     hint.textContent = locked ? LOCKED_HINT : EDITABLE_HINT;
     renderFreeze(state.frozen_config, locked);
+    document.getElementById('btn-new-task').disabled = locked;
 
     for (const task of state.tasks) {
-      const row = rowFor(task.kind);
+      const row = rowFor(task.task_id);
       if (!row) continue;
 
       // 复选框**无条件**跟库走，哪怕它此刻还带着焦点：勾了却被 400 拒掉
@@ -350,7 +485,17 @@
       const checkbox = row.querySelector('.mission-enabled');
       checkbox.checked = task.enabled;
       checkbox.disabled = locked;
-      for (const input of row.querySelectorAll('.mission-param')) input.disabled = locked;
+      for (const input of row.querySelectorAll('input')) input.disabled = locked;
+      checkbox.disabled = locked;
+      // 删除只在这条链路还有别的任务时才给。每条链路至少留一行——删光了页面上
+      // 就再也建不回来（海盗与扫描连「新建」的入口都没有）。后端也会拒，
+      // 但用户不该点下去才发现。
+      const removeButton = row.querySelector('.mission-delete');
+      if (removeButton) {
+        const siblings = state.tasks.filter((item) => item.kind === task.kind).length;
+        removeButton.hidden = siblings <= 1;
+        removeButton.disabled = locked;
+      }
       // 扫描那一行本来就不能拖，锁上之后另外两行也不能。`dragstart` 认的就是
       // 这个属性，所以改它就等于真的拖不动，不是只把把手画灰。
       row.setAttribute('draggable', locked || task.kind === 'SCAN' ? 'false' : 'true');
@@ -374,17 +519,35 @@
       // 这条恢复路径在页面上本来看不见——这个按钮就是把它显式化。
       row.querySelector('.mission-revive').hidden = task.status !== '已停用';
 
-      // 参数框平时只填一次（每轮都写回去会把用户正在输入的值顶掉），但锁着的
+      // 「跟着全局走」和「就是这个值」显示成同一个数字的话，用户改了全局值
+      // 之后会以为任务也跟着变了。所以这一句必须写出来。
+      const following = [];
+      if (task.origin_is_default) following.push('出发星球');
+      if (task.fleet_lines_is_default) following.push('航线数');
+      const defaultsLine = row.querySelector('.mission-defaults');
+      if (defaultsLine) {
+        defaultsLine.textContent =
+          following.length ? `${following.join(' / ')}跟随全局默认` : '';
+      }
+
+      // 输入框平时只填一次（每轮都写回去会把用户正在输入的值顶掉），但锁着的
       // 时候没人能输入，那就每轮都跟库走——否则「结束」之后框里留着的可能是
       // 上一次输入到一半的值，而它看起来和已保存的值一模一样。
-      if (!paramsPrimed || locked) {
+      // **刚建出来的行也要填一次**，否则新加的任务是一排空框。
+      if (!row.dataset.primed || locked) {
+        row.dataset.primed = '1';
         for (const input of row.querySelectorAll('.mission-param')) {
           const value = task.params[input.dataset.param];
           input.value = value === undefined ? '' : value;
         }
+        row.querySelector('.mission-name').value = task.label;
+        // 扫描那一行没有这两个框（它不派遣），所以这里得先看有没有。
+        const originInput = row.querySelector('.mission-origin');
+        if (originInput) originInput.value = task.origin || '';
+        const linesInput = row.querySelector('.mission-lines');
+        if (linesInput) linesInput.value = task.fleet_lines || '';
       }
     }
-    paramsPrimed = true;
     tickClock();
   }
 
@@ -412,8 +575,13 @@
       const line = document.createElement('div');
       line.className = 'muted';
       line.style.fontSize = '11px';
+      // 「—」的含义是「这条记录里没有这一项」（旧记录），不是 0。
+      const origin = task.origin || '—';
+      const fleetLines = task.fleet_lines === null || task.fleet_lines === undefined
+        ? '—' : task.fleet_lines;
       line.textContent =
-        `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`;
+        `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`
+        + ` · 出发 ${origin} · 航线 ${fleetLines}`;
       lines.append(line);
     }
     const changed = document.createElement('div');
@@ -456,9 +624,9 @@
     return EVOHelper.post(endpoint).then(refresh).catch(fail);
   }
 
-  function patch(kind, payload) {
+  function patch(taskId, payload) {
     showError('');
-    return EVOHelper.request('PATCH', `/api/missions/${kind}`, payload)
+    return EVOHelper.request('PATCH', `/api/missions/${taskId}`, payload)
       .then(refresh)
       .catch((error) => { fail(error); return refresh(); });
   }
@@ -467,21 +635,66 @@
     document.getElementById(id).onclick = (event) => command(event.currentTarget.dataset.endpoint);
   }
 
+  document.getElementById('btn-new-task').onclick = () => {
+    showError('');
+    const lines = document.getElementById('new-task-lines').value.trim();
+    const payload = {
+      kind: 'BOT',
+      name: document.getElementById('new-task-name').value,
+      origin: document.getElementById('new-task-origin').value.trim() || null,
+      // 空框不往上送：`Number('')` 是 0，而 0 条航线的任务永远派不出去。
+      fleet_lines: lines === '' ? null : Number(lines),
+    };
+    return EVOHelper.request('POST', '/api/missions', payload)
+      .then(() => {
+        for (const id of ['new-task-name', 'new-task-origin', 'new-task-lines']) {
+          document.getElementById(id).value = '';
+        }
+        return refresh();
+      })
+      .catch((error) => { fail(error); return refresh(); });
+  };
+
   rows.addEventListener('click', (event) => {
-    const button = event.target.closest('.mission-new-round');
-    if (button) command(button.dataset.endpoint);
-    const revive = event.target.closest('.mission-revive');
+    const row = event.target.closest('.mission-row');
+    if (!row) return;
+    const taskId = row.dataset.taskId;
+    if (event.target.closest('.mission-new-round')) command(`/api/missions/${taskId}/new-round`);
     // 走的是和复选框同一个 PATCH：`enabled: true` 顺带清掉停用原因与失败计数，
-    // 而参数不合格的链路照样会被 400 拦下（错误显示在下面那条红字里）。
-    if (revive) patch(revive.closest('.mission-row').dataset.kind, { enabled: true });
+    // 而参数不合格的任务照样会被 400 拦下（错误显示在下面那条红字里）。
+    if (event.target.closest('.mission-revive')) patch(taskId, { enabled: true });
+    if (event.target.closest('.mission-delete')) {
+      // 删掉的是用户自己配出来的东西，而且不可撤销（历史台账留着，配置不留）。
+      if (!window.confirm(`删除任务「${row.querySelector('.mission-name').value}」？`)) return;
+      showError('');
+      EVOHelper.request('DELETE', `/api/missions/${taskId}`)
+        .then(refresh)
+        .catch((error) => { fail(error); return refresh(); });
+    }
   });
 
   rows.addEventListener('change', (event) => {
     const row = event.target.closest('.mission-row');
     if (!row) return;
-    const kind = row.dataset.kind;
+    const taskId = row.dataset.taskId;
     if (event.target.matches('.mission-enabled')) {
-      patch(kind, { enabled: event.target.checked });
+      patch(taskId, { enabled: event.target.checked });
+      return;
+    }
+    if (event.target.matches('.mission-name')) {
+      patch(taskId, { name: event.target.value });
+      return;
+    }
+    if (event.target.matches('.mission-origin')) {
+      // 空串在接口上是一个**动作**：把出发星球退回「用全局主星」。
+      patch(taskId, { origin: event.target.value.trim() });
+      return;
+    }
+    if (event.target.matches('.mission-lines')) {
+      const value = event.target.value.trim();
+      // 空框不往上送：清空航线数目前没有对应的动作（后端的 null 表示「不动它」），
+      // 送 0 上去会被 400 拦下，而那条错在用户眼里是「删了个数字就报错」。
+      if (value !== '') patch(taskId, { fleet_lines: Number(value) });
       return;
     }
     if (event.target.matches('.mission-param')) {
@@ -490,7 +703,7 @@
         // 空框不往上送：`Number('')` 是 0，会把「还没填」变成一个合法的 0。
         if (input.value.trim() !== '') params[input.dataset.param] = Number(input.value);
       }
-      patch(kind, { params });
+      patch(taskId, { params });
     }
   });
 
@@ -505,7 +718,7 @@
     dragging = row;
     event.dataTransfer.effectAllowed = 'move';
     // Firefox 不带数据的拖拽根本起不来。
-    event.dataTransfer.setData('text/plain', row.dataset.kind);
+    event.dataTransfer.setData('text/plain', row.dataset.taskId);
   });
 
   rows.addEventListener('dragover', (event) => {
@@ -529,7 +742,7 @@
     const movable = [...rows.querySelectorAll('.mission-row[draggable="true"]')];
     movable
       .reduce(
-        (chain, row, index) => chain.then(() => patch(row.dataset.kind, { priority: index })),
+        (chain, row, index) => chain.then(() => patch(row.dataset.taskId, { priority: index })),
         Promise.resolve(),
       )
       .then(refresh);

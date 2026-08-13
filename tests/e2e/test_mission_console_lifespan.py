@@ -77,6 +77,9 @@ def test_startup_marks_orphans_without_shooting_at_a_recycled_pid(tmp_path: Path
     repository.ensure_mission_rows(now_utc=NOW)
     repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=next(
+            row.id for row in repository.mission_tasks() if row.kind == MissionKind.SCAN.value
+        ),
         command=["python"],
         pid=31337,
         started_at_utc=NOW - timedelta(hours=2),
@@ -112,7 +115,10 @@ def test_shutdown_kills_the_child_so_it_does_not_outlive_the_console(tmp_path: P
     app = create_persistent_app(factory, local_token="t", mission_scheduler=scheduler)
 
     with TestClient(app):
-        repository.update_mission_task(MissionKind.PIRATE, enabled=True)
+        pirate = next(
+            row.id for row in repository.mission_tasks() if row.kind == MissionKind.PIRATE.value
+        )
+        repository.update_mission_task(pirate, enabled=True)
         scheduler.start()
         scheduler.tick()
         assert len(launcher.spawned) == 1

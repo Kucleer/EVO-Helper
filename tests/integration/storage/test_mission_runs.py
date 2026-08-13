@@ -12,9 +12,19 @@ from evo_helper.domain.scheduler import MissionKind
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
+def task_id(repository, kind: MissionKind) -> int:  # type: ignore[no-untyped-def]
+    """这条链路那一行的 id。
+
+    任务的身份是 `id` 而不是 `kind`（同一 kind 可以有多行），所以写库的入口全部
+    按 id 寻址；测试也就得先把 id 捞出来。
+    """
+    return next(row.id for row in repository.mission_tasks() if row.kind == kind.value)
+
+
 def test_a_run_is_recorded_when_it_starts_and_closed_when_it_ends(repository) -> None:  # type: ignore[no-untyped-def]
     run_id = repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=3,
         command=["python", "-m", "evo_helper.tools.scan_coordinates"],
         pid=4242,
         started_at_utc=NOW,
@@ -33,11 +43,17 @@ def test_a_run_is_recorded_when_it_starts_and_closed_when_it_ends(repository) ->
     assert "scan_coordinates" in row.command
 
 
-def test_the_last_start_per_chain_is_what_the_cooldown_reads(repository) -> None:  # type: ignore[no-untyped-def]
-    """冷却按**启动**算，所以取的是每种 kind 最新的 `started_at_utc`。"""
+def test_the_last_start_per_task_is_what_the_cooldown_reads(repository) -> None:  # type: ignore[no-untyped-def]
+    """冷却按**启动**算，而且**按任务分**——取的是每个 `task_id` 最新的
+    `started_at_utc`。
+
+    按 kind 分的话，同一链路的两个任务会共用一份冷却：主星那个刚跑完，
+    2 号星那个就得干等五分钟，而它俩占的根本不是同一份航线。
+    """
     for minutes in (30, 5):
         repository.begin_mission_run(
             MissionKind.PIRATE,
+            task_id=1,
             command=["python"],
             pid=None,
             started_at_utc=NOW - timedelta(minutes=minutes),
@@ -45,6 +61,7 @@ def test_the_last_start_per_chain_is_what_the_cooldown_reads(repository) -> None
         )
     repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=3,
         command=["python"],
         pid=None,
         started_at_utc=NOW - timedelta(hours=1),
@@ -53,9 +70,9 @@ def test_the_last_start_per_chain_is_what_the_cooldown_reads(repository) -> None
 
     starts = repository.last_mission_starts()
 
-    assert starts[MissionKind.PIRATE] == NOW - timedelta(minutes=5)
-    assert starts[MissionKind.SCAN] == NOW - timedelta(hours=1)
-    assert MissionKind.BOT not in starts
+    assert starts[1] == NOW - timedelta(minutes=5)
+    assert starts[3] == NOW - timedelta(hours=1)
+    assert 2 not in starts
 
 
 def test_orphans_are_marked_unknown_rather_than_shot_by_pid(repository) -> None:  # type: ignore[no-untyped-def]
@@ -66,6 +83,7 @@ def test_orphans_are_marked_unknown_rather_than_shot_by_pid(repository) -> None:
     """
     repository.begin_mission_run(
         MissionKind.BOT,
+        task_id=2,
         command=["python"],
         pid=9999,
         started_at_utc=NOW - timedelta(minutes=20),
@@ -84,6 +102,7 @@ def test_orphans_are_marked_unknown_rather_than_shot_by_pid(repository) -> None:
 def test_a_closed_run_is_not_marked_as_an_orphan(repository) -> None:  # type: ignore[no-untyped-def]
     run_id = repository.begin_mission_run(
         MissionKind.SCAN,
+        task_id=3,
         command=["python"],
         pid=None,
         started_at_utc=NOW - timedelta(minutes=20),
@@ -101,8 +120,9 @@ def test_three_consecutive_failures_disable_the_task(repository) -> None:  # typ
     """没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。"""
     repository.ensure_mission_rows(now_utc=NOW)
 
+    pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(3):
-        repository.record_mission_failure(MissionKind.PIRATE, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.consecutive_failures == 3
@@ -112,8 +132,9 @@ def test_three_consecutive_failures_disable_the_task(repository) -> None:  # typ
 def test_two_failures_are_not_enough(repository) -> None:  # type: ignore[no-untyped-def]
     repository.ensure_mission_rows(now_utc=NOW)
 
+    pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(2):
-        repository.record_mission_failure(MissionKind.PIRATE, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.disabled_reason is None
@@ -122,11 +143,12 @@ def test_two_failures_are_not_enough(repository) -> None:  # type: ignore[no-unt
 def test_a_clean_exit_resets_the_streak(repository) -> None:  # type: ignore[no-untyped-def]
     """「连续」是连续。中间成功过一次，之前那两次就不该再算数。"""
     repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(2):
-        repository.record_mission_failure(MissionKind.PIRATE, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3)
 
-    repository.clear_mission_failures(MissionKind.PIRATE)
-    repository.record_mission_failure(MissionKind.PIRATE, exit_code=1, limit=3)
+    repository.clear_mission_failures(pirate)
+    repository.record_mission_failure(pirate, exit_code=1, limit=3)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.consecutive_failures == 1
@@ -137,7 +159,132 @@ def test_disabling_for_bad_parameters_says_why(repository) -> None:  # type: ign
     """参数不合格是配置问题，重试一万次也一样。写清原因，页面上标红给人看。"""
     repository.ensure_mission_rows(now_utc=NOW)
 
-    repository.disable_mission_task(MissionKind.BOT, reason="该范围内没有已记录的 bot；先跑扫描")
+    repository.disable_mission_task(
+        task_id(repository, MissionKind.BOT), reason="该范围内没有已记录的 bot；先跑扫描"
+    )
 
     row = next(item for item in repository.mission_tasks() if item.kind == "BOT")
     assert row.disabled_reason == "该范围内没有已记录的 bot；先跑扫描"
+
+
+def test_two_tasks_of_one_kind_have_their_own_last_start(repository) -> None:  # type: ignore[no-untyped-def]
+    """**同一链路的两个任务各记各的启动时刻。**
+
+    冷却按启动算，而 `last_mission_starts()` 是它唯一的事实来源。按 `kind` 分组
+    的话，两个 bot 任务会共用一个时刻：主星那个刚跑完，2 号星那个就得干等五分钟
+    ——而它俩占的根本不是同一份航线。
+
+    ⚠️ 两个时刻**故意相差很远**（5 分钟 vs 3 小时）：只差几秒的话，分组键改错了
+    也可能碰巧取到同一个值。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    repository.ensure_mission_rows(now_utc=NOW)
+    main = task_id(repository, MissionKind.BOT)
+    second = repository.create_mission_task(
+        MissionKind.BOT,
+        name="2 号星",
+        priority=5,
+        params_json="{}",
+        origin=Coordinate(9, 250, 8),
+        fleet_lines=2,
+        now_utc=NOW,
+    )
+    for wanted, minutes in ((main, 5), (second, 180)):
+        repository.begin_mission_run(
+            MissionKind.BOT,
+            task_id=wanted,
+            command=["python"],
+            pid=None,
+            started_at_utc=NOW - timedelta(minutes=minutes),
+            log_path="var/logs/mission-bot.log",
+        )
+
+    starts = repository.last_mission_starts()
+
+    assert starts[main] == NOW - timedelta(minutes=5)
+    assert starts[second] == NOW - timedelta(hours=3)
+
+
+def test_failures_are_counted_per_task_not_per_kind(repository) -> None:  # type: ignore[no-untyped-def]
+    """**多个 BOT 任务各自独立记账。**
+
+    按 kind 记的话，主星那个任务崩三次会把 2 号星那个一起停用——它俩跑的是不同
+    的范围、不同的出发星球，没有任何理由共担一份失败计数。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    repository.ensure_mission_rows(now_utc=NOW)
+    main = task_id(repository, MissionKind.BOT)
+    second = repository.create_mission_task(
+        MissionKind.BOT,
+        name="2 号星",
+        priority=5,
+        params_json="{}",
+        origin=Coordinate(9, 250, 8),
+        fleet_lines=2,
+        now_utc=NOW,
+    )
+
+    for _ in range(3):
+        repository.record_mission_failure(main, exit_code=1, limit=3)
+
+    rows = {row.id: row for row in repository.mission_tasks()}
+    assert rows[main].disabled_reason is not None
+    assert rows[second].consecutive_failures == 0
+    assert rows[second].disabled_reason is None
+
+
+def test_clearing_failures_on_a_deleted_task_is_not_an_error(repository) -> None:  # type: ignore[no-untyped-def]
+    """「多个一起倒」那条豁免会回头清同一阵里每个任务的计数。
+
+    其中一个可能已经被用户删掉了——为它抛异常会让整个调度循环停摆，而它想做的
+    事（把记错的账清掉）在那一行上本来就没有意义。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    repository.ensure_mission_rows(now_utc=NOW)
+    gone = repository.create_mission_task(
+        MissionKind.BOT,
+        name="待删",
+        priority=6,
+        params_json="{}",
+        origin=Coordinate(9, 250, 8),
+        fleet_lines=2,
+        now_utc=NOW,
+    )
+    repository.delete_mission_task(gone)
+
+    repository.clear_mission_failures(gone)
+
+
+def test_a_deleted_task_keeps_its_run_history(repository) -> None:  # type: ignore[no-untyped-def]
+    """删任务只删配置，**不删账**。
+
+    `mission_runs` 里那些行回答的是「昨晚那几轮是谁跑的」，跟着任务一起删掉，
+    事后就再也说不清了。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    repository.ensure_mission_rows(now_utc=NOW)
+    doomed = repository.create_mission_task(
+        MissionKind.BOT,
+        name="待删",
+        priority=7,
+        params_json="{}",
+        origin=Coordinate(9, 250, 8),
+        fleet_lines=2,
+        now_utc=NOW,
+    )
+    repository.begin_mission_run(
+        MissionKind.BOT,
+        task_id=doomed,
+        command=["python"],
+        pid=None,
+        started_at_utc=NOW,
+        log_path="var/logs/mission-bot.log",
+    )
+
+    repository.delete_mission_task(doomed)
+
+    assert [row.task_id for row in repository.mission_runs(limit=10)] == [doomed]

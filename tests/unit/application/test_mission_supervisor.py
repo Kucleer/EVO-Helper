@@ -80,10 +80,12 @@ def test_nothing_runs_until_something_is_started() -> None:
 def test_starting_records_what_is_running() -> None:
     supervisor, spawned = make()
 
-    child = supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    child = supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
 
     assert len(spawned) == 1
     assert child.kind is MissionKind.SCAN
+    # **身份是 task_id**：同一 kind 可以有多个任务，冷却与失败计数都按它记。
+    assert child.task_id == 3
     assert child.pid == 1000
     assert child.started_at_utc == NOW
     assert supervisor.running == child
@@ -92,10 +94,10 @@ def test_starting_records_what_is_running() -> None:
 def test_a_second_start_is_refused_while_one_is_running() -> None:
     """一个游戏窗口，一个鼠标。两个子进程同时点，就是互相抢窗口。"""
     supervisor, spawned = make()
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
 
     with pytest.raises(SupervisorBusyError):
-        supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+        supervisor.start(MissionKind.PIRATE, PIRATE_ARGV, task_id=1)
 
     assert len(spawned) == 1
 
@@ -104,7 +106,7 @@ def test_stopping_kills_it_now_rather_than_waiting_out_the_round() -> None:
     """用户口径：点了停就是停，不等它跑完手上这一个。"""
     clock = Clock()
     supervisor, spawned = make(clock)
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
     clock.advance(90)
 
     exited = supervisor.stop(StopReason.USER)
@@ -113,6 +115,9 @@ def test_stopping_kills_it_now_rather_than_waiting_out_the_round() -> None:
     assert spawned[0].wait_timeouts == [5]
     assert exited is not None
     assert exited.kind is MissionKind.SCAN
+    # 起进程时给的 task_id 必须原样回到退出记录上——`_finish` 靠它把这次失败
+    # 记到对的那个任务头上，认错人就是给另一个任务白记一次连续失败。
+    assert exited.task_id == 3
     assert exited.stopped_by is StopReason.USER
     assert exited.started_at_utc == NOW
     assert exited.ended_at_utc == NOW + timedelta(seconds=90)
@@ -134,7 +139,7 @@ def test_a_process_that_will_not_die_does_not_hang_the_caller() -> None:
             raise TimeoutError("还没死")
 
     supervisor = MissionSupervisor(launch=lambda kind, command, log: Stubborn(), clock=Clock())
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
 
     exited = supervisor.stop(StopReason.PREEMPTED)
 
@@ -145,7 +150,7 @@ def test_a_process_that_will_not_die_does_not_hang_the_caller() -> None:
 
 def test_polling_a_live_process_reports_nothing() -> None:
     supervisor, spawned = make()
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
 
     assert supervisor.poll() is None
     assert supervisor.running is not None
@@ -154,7 +159,7 @@ def test_polling_a_live_process_reports_nothing() -> None:
 def test_polling_collects_a_clean_exit() -> None:
     clock = Clock()
     supervisor, spawned = make(clock)
-    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV, task_id=1)
     spawned[0].exit_code = 0
     clock.advance(120)
 
@@ -175,7 +180,7 @@ def test_a_finished_attack_round_is_not_restarted() -> None:
     起不起下一个由调度器按判据决定，不由子进程的退出来决定。
     """
     supervisor, spawned = make()
-    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV)
+    supervisor.start(MissionKind.PIRATE, PIRATE_ARGV, task_id=1)
     spawned[0].exit_code = 0
 
     supervisor.poll()
@@ -188,7 +193,7 @@ def test_a_finished_attack_round_is_not_restarted() -> None:
 def test_a_crashed_process_is_not_restarted_either() -> None:
     """失败多半是「窗口抢不到前台」或「甩鼠标触发 FAILSAFE」，重启只会再来一遍。"""
     supervisor, spawned = make()
-    supervisor.start(MissionKind.BOT, ["python", "-m", "evo_helper.tools.bot_loop"])
+    supervisor.start(MissionKind.BOT, ["python", "-m", "evo_helper.tools.bot_loop"], task_id=2)
     spawned[0].exit_code = 3
 
     exited = supervisor.poll()
@@ -207,7 +212,7 @@ def test_a_crash_counts_as_a_failure() -> None:
     也永远不会停用，调度循环会在一个坏掉的任务上满速空转地重启。
     """
     supervisor, spawned = make()
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
     spawned[0].exit_code = 1
 
     exited = supervisor.poll()
@@ -224,7 +229,7 @@ def test_being_stopped_by_us_is_never_a_failure() -> None:
     """
     for reason in (StopReason.PREEMPTED, StopReason.USER, StopReason.SHUTDOWN):
         supervisor, spawned = make()
-        supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+        supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
 
         exited = supervisor.stop(reason)
 
@@ -239,7 +244,7 @@ def test_the_environment_busy_code_is_not_a_failure() -> None:
     ⚠️ 豁免只认这一个码。`1` 仍然是故障——见上面那条正面用例。
     """
     supervisor, spawned = make()
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
     spawned[0].exit_code = EXIT_ENVIRONMENT_BUSY
 
     exited = supervisor.poll()
@@ -252,7 +257,7 @@ def test_the_environment_busy_code_is_not_a_failure() -> None:
 def test_polling_after_the_exit_was_collected_reports_nothing_again() -> None:
     """退出只该被收一次，否则每个 tick 都会再记一次失败，三次就误停用。"""
     supervisor, spawned = make()
-    supervisor.start(MissionKind.SCAN, SCAN_ARGV)
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
     spawned[0].exit_code = 1
 
     assert supervisor.poll() is not None
