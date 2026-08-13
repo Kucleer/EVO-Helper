@@ -31,5 +31,24 @@ def composition_signature(counts: Mapping[str, int]) -> str:
     return ",".join(f"{ship}:{count}" for ship, count in sorted(counts.items()))
 
 
-#: 本账号用于攻击侦查的游戏内预设：探路 = 小型运输船 × 1（实机核对，2026-08-08）。
+#: 本账号里那套一次性的探路组合：探路 = 小型运输船 × 1（实机核对，2026-08-08）。
 DEFAULT_PRESET = FleetPreset(name="探路", signature=composition_signature({"小型运输船": 1}))
+
+#: 探路预设的标题。
+PROBE_PRESET_NAME = DEFAULT_PRESET.name
+
+
+def is_probe_preset(preset_name: str) -> bool:
+    """这一发用的是不是探路组合。
+
+    ⚠️ **这条判据与 bot 那条链路无关了。** bot 从 2026-08-13 起不再派探路发
+    （直接用 BBB 打，见 `domain.bot_round`），所以它原先住在 `domain.bot_round`
+    里已经名不副实——留在那里会让人以为「没有 bot 探路发 = 这个函数没用了」。
+
+    它现在只剩一个消费者，而那个用途和轮次判态毫无关系：
+    `report_wait.line_free_at` 用它决定这条航线按 1× 还是 2× 飞行时长释放。
+    **探路舰队会在攻击中损失，没有返程**，按 2× 记就会凭空多占一条航线到天亮。
+    只要 `config.default_fleet_preset` 还是探路（`application.workflow` 那条老
+    路径照用），就仍然会有用这个预设派出去的舰队，这条分岔就不是死枝。
+    """
+    return preset_name == PROBE_PRESET_NAME

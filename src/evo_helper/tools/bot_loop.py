@@ -1,53 +1,57 @@
-"""bot 目标的「攻击侦查 → 分档 → 攻击」自动化。
+"""bot 目标的「直接 BBB 攻击 → 读战报 → 平局就再打」自动化。
 
     # 只看目标认不认得出，一次点击都不派（默认）
     python -m evo_helper.tools.bot_loop --targets 2:137:14
 
-    # 攻击侦查：用「探路」预设打一发，回来读战报分档
-    python -m evo_helper.tools.bot_loop --targets 2:137:14 --probe
-
-    # 完整：侦查 → 分档 → 用该档预设攻击
-    python -m evo_helper.tools.bot_loop --targets 2:137:14 --probe --attack
+    # 真打：用预设 BBB 打一发，回来读战报；平局就对同一坐标再打
+    python -m evo_helper.tools.bot_loop --targets 2:137:14 --attack
 
 与海盗那条链路的区别只在**判定依据**：
 
-- 海盗看侦察报告里几个特定舰种的数量（`vision.scout_reports`），
-  因为海盗要么有舰队要么没有，不需要分档。
-- bot 看**攻击侦查打回来的战报**里守方的「单位」总数，按 `domain.fleet_tier`
-  分成三档，各档一个预设（AAA / BBB / CCC），最低那一档不派——用户明确说过
-  那个量级不值得为它挑组合。三道边界（默认 2K / 4K / 8K）由用户在控制台的
-  「分档阈值」页上配，经 `--tier-thresholds` 传进来；档位数量与预设名不可配。
+- 海盗先派侦察，看侦察报告里几个特定舰种的数量（`vision.scout_reports`）决定打不打；
+- bot **不做任何前置侦查**，直接用预设 BBB 打，打完读战报按
+  `domain.battle_outcome` 算胜负（剩余 = 单位 − 损失），平局就对同一坐标再打一发。
 
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
 
+## 为什么不再探路、不再分档（用户口径 2026-08-13）
+
+> 基于第一条，bot攻击模式变更，不再进行攻击侦查，直接用预设BBB进行攻击，
+> 如果同一坐标攻击结果为平局，则继续进行攻击
+
+「第一条」是战报缺失那件事。原先每个目标要**两发**才走得完（探路一发拿守方
+单位数、按 `fleet_tier` 分档再打一发），也就是每个目标要等**两份**战报；而
+2026-08-12 通宵的实测是：bot 攻击发 21 发、战报只认领上 6 份，其余全卡在
+等战报。少一发就少一份要等的战报，这条链路的完成率直接跟着翻倍。
+
+分档整套（`domain.fleet_tier`、`/tiers` 页、`scheduler_config` 上那三列、
+`--tier-thresholds`）已随之删除，不是留成死配置。
+
 ## 一趟推一态，战报在开工那一趟信箱里收
 
-五个态见 `domain.bot_round.phase_of`。两个等待态（`AWAITING_PROBE_REPORT` 与
-`AWAITING_ATTACK_REPORT`）的出路是**开工那一趟信箱**（父类 `reconcile_today`）：
-把认得出的攻击报告读出来写进 `battle_reports`，`phase_of` 才看得到 `has_report`。
+三个态见 `domain.bot_round.phase_of`。等待态（`AWAITING_ATTACK_REPORT`）的出路是
+**开工那一趟信箱**（父类 `reconcile_today`）：把认得出的攻击报告读出来写进
+`battle_reports`，`phase_of` 才看得到 `has_report` 和那一发的战果。
 
 这一步以前**没有人做**，于是每个目标都永久停在等战报（实机一整夜 152 次），
-而唯一读战报的代码只挂在 `NEEDS_ATTACK` 分支上——读战报的代码只在读过战报
+而唯一读战报的代码只挂在「该攻击了」那条分支上——读战报的代码只在读过战报
 之后才会被执行。补上之后它仍然一份都收不到，原因换成了**信箱窗口太小**：
 两条链路的报告混在同一个收件箱里按时间倒序排，海盗链路整夜产出攻击报告，
 而收取只盲开最上面 6 行。实机 2026-08-11 四趟全部报「翻不到」。
 
-**而这两修都只修了探路那一半。** 收取当时只挑 `AWAITING_PROBE_REPORT` 的目标进
-信箱，攻击发的战报没人读；后来两个等待态一起交进来，仍旧是一张**会漏项的名单**。
-现在干脆不按名单收：这条路径认归属本来就只靠 VS 块里的目标坐标，翻信箱只靠
-「攻击报告」这个主题，两种发的战报长得一模一样——读到就存，名单也就漏不了态。
+**而这两修都只修了探路那一半。** 收取当时只挑等探路战报的目标进信箱，攻击发的
+战报没人读；后来两个等待态一起交进来，仍旧是一张**会漏项的名单**。现在干脆不按
+名单收：这条路径认归属本来就只靠 VS 块里的目标坐标，翻信箱只靠「攻击报告」这个
+主题，读到就存，名单也就漏不了态。
 
 收取与「数今天已经打了几发」共用同一趟信箱，理由见 `PirateLoop.reconcile_today`。
 
 ## 只读详情页，但那是**两屏**
 
-分档防的是**量级错**，不是末位误差（见 `domain.fleet_tier` 模块头）。「单位」总数是
-详情页上独立给出的一个数，一个 ROI 就读到——**前提是它画出来了**。
-
 bot 战报比海盗战报多一行「生成卫星概率」，「战斗详情」横幅因此下移约 30px，
 「单位」整行落到面板可视区之外。2026-08-11 的五张实拍里四张如此（第五张恰好
-没有那一行，「单位」就读得出来）。所以详情页要拖到底再拍一屏，只为这一行。
+没有那一行，「单位」就读得出来）。所以详情页要拖到底再拍一屏。
 
 而 VS 块与那行 `VICTORY` / `FAIL` 大字**只在没拖过的那一屏上**——拖到底之后
 它们都滚出了可视区。两屏各读各的，见 `BotLoop._bottom_screens` 与
@@ -57,7 +61,8 @@ bot 战报比海盗战报多一行「生成卫星概率」，「战斗详情」�
 
 用户口径（2026-08-11）：剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、
 两边都有船判平（`domain.battle_outcome`）。于是拖那一屏从「补一个展示字段」变成了
-**判据的输入**——「损失单位」只有拖到底才读得到，不拖就永远算不出战果。
+**判据的输入**——四个数缺一个就算不出战果，而 `DRAW` 算不出来时这个目标**不会**
+被重打（见 `domain.bot_round.DispatchFact.outcome`）：重打的唯一依据是确认平局。
 
 逐舰种明细则**整整差一屏**：参战战舰那两列在**回放页**上（`ReportLayout.
 participating_rows` 是对着回放页量的，`tools.ingest_report` 也是从 replay 那一屏取的），
@@ -70,20 +75,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from evo_helper.domain.bot_round import BotPhase, DispatchFact, phase_of
-from evo_helper.domain.fleet_preset import DEFAULT_PRESET
-from evo_helper.domain.fleet_tier import (
-    DEFAULT_TIER_THRESHOLDS,
-    FleetTier,
-    TierThresholdError,
-    TierThresholds,
-    tier_for,
-)
+from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, DispatchFact, phase_of
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
 from evo_helper.game import pirate_ui
@@ -100,39 +96,26 @@ from evo_helper.tools.pirate_loop import (
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, say
 from evo_helper.vision.parsers import ReportKind
 
-#: 攻击侦查用的预设标题：探路（`domain.fleet_preset.DEFAULT_PRESET`）。
-PROBE_PRESET = DEFAULT_PRESET.name
-
-#: 「这个目标在等一份战报」的那几个态。**两个都要在这里。**
-#:
-#: 写成一个具名集合而不是在 `_sweep` 里手写 `phase is ...`：那种写法漏一个态
-#: 不报错、不留日志，只是那一档目标再也不被收取——`AWAITING_ATTACK_REPORT`
-#: 就是这么漏掉的（见 `_sweep`）。往 `BotPhase` 里加新的等待态时，
-#: 编译器同样不会提醒，但至少只有这一处要改。
-_AWAITING_REPORT = frozenset({BotPhase.AWAITING_PROBE_REPORT, BotPhase.AWAITING_ATTACK_REPORT})
-
 
 @dataclass
 class BotOptions:
+    """这一轮的参数。"""
+
     targets: tuple[Coordinate, ...]
-    probe: bool
+    #: 真的动鼠标派舰队。False 是默认档：站过去认一眼，一次点击都不做。
     attack: bool
-    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态。
+    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态，
+    #: 也不占本轮的重打配额（`domain.bot_round.MAX_ATTACKS_PER_TARGET`）。
     round_started_at: datetime | None = None
-    #: 本轮分档用的三道边界。调度器从 `scheduler_config` 读出来写进 argv
-    #: （`domain.missions.bot_command`），手工跑时由 `main()` 现查一次库。
-    #: 这里给默认值只是让 `BotOptions(targets=..., probe=..., attack=...)`
-    #: 这种最小构造在测试里还写得出来；两条真实入口都会明确传值。
-    tier_thresholds: TierThresholds = DEFAULT_TIER_THRESHOLDS
 
 
 class BotLoop(PirateLoop):
-    """复用海盗那条链路的驱动，换成 bot 的识别与分档判定。"""
+    """复用海盗那条链路的驱动，换成 bot 的识别与胜负判定。"""
 
     TARGET_KIND: str = TARGET_KIND_BOT
 
     #: bot 星球是**有主**面板，按钮排布和敌对海盗那套完全不同。不覆盖的话每一发
-    #: 都会点在空白处，然后倒在「找不到预设 探路」上——实机上这条链路就是这么
+    #: 都会点在空白处，然后倒在「找不到预设」上——实机上这条链路就是这么
     #: 一发都没派出去过的。
     ATTACK_BUTTON: tuple[int, int] = pirate_ui.BOT_ATTACK_BUTTON
 
@@ -147,13 +130,11 @@ class BotLoop(PirateLoop):
     REPORT_LABEL: str = "攻击战报"
 
     def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
-        # 父类要一个 LoopOptions；预设按档现选，这里先填探路。
+        # 父类要一个 LoopOptions。`scout=False`：这条链路不派任何前置侦查发了。
         super().__init__(
             driver,
             ocr,
-            LoopOptions(
-                systems=(), scout=options.probe, attack=options.attack, preset=PROBE_PRESET
-            ),
+            LoopOptions(systems=(), scout=False, attack=options.attack, preset=BOT_ATTACK_PRESET),
         )
         self._bot = options
 
@@ -187,72 +168,19 @@ class BotLoop(PirateLoop):
             return TargetCheck.ABSENT
         return TargetCheck.CONFIRMED
 
-    # -- 判定 ---------------------------------------------------------------
-
-    def _scan_mail(
-        self,
-        wanted: Sequence[Coordinate],
-        visit: Callable[[Coordinate, Any], None],
-        *,
-        not_before: datetime | None = None,
-    ) -> set[Coordinate]:
-        """**一趟信箱**：把认得出的那几份战报交给 `visit`。返回没找到的目标。
-
-        为什么一趟读完而不是「一个目标进一次」：进出信箱要切视图、开面板、翻标签，
-        每次还要慢拖三下，一趟十几秒；而这些报告本来就并排躺在同一页上。
-
-        找报告靠 **VS 块里的目标坐标**核对，不靠行号：行序随新邮件变，
-        而报告自己写着打的是谁。
-
-        翻信箱的姿势（关浮层、先读主题再决定开不开、翻屏、按时间早停）由父类的
-        `_scan_mail_rows` 统一管——两条链路共用一份，见那边的模块级说明。
-        这里只提供「这一封是不是我要的」和「拿到之后干什么」。
-        """
-        from evo_helper.vision.parsers import parse_versus_block
-
-        remaining = set(wanted)
-
-        def visit_row(row: Any, page: Any) -> bool:
-            versus = parse_versus_block(page.versus_block(), "ocr")
-            if versus is None:
-                # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，接着按它的
-                # 舰队量去挑攻击组合。
-                say(f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报")
-                return False
-            target = versus.defender.coordinate.value
-            if target not in remaining:
-                say(f"  第 {row.index} 行是 {target} 的战报，不在这一趟要收的目标里")
-                return False
-            remaining.discard(target)
-            say(f"  第 {row.index} 行是 {target} 的战报")
-            visit(target, page)
-            return not remaining
-
-        if not remaining:
-            return remaining
-        self._scan_mail_rows(
-            wanted=ReportKind.ATTACK, label="攻击战报", visit=visit_row, not_before=not_before
-        )
-        return remaining
+    # -- 收战报 -------------------------------------------------------------
 
     def _ingest_report(self, row: Any, page: Any) -> ReportIngest:
         """开工那一趟里读到的一封「攻击报告」：认出打的是谁，读通就入库。
 
-        **探路发与攻击发共用这一条路径，而且必须共用。** 两种发打的是同一个坐标、
-        走的是同一条攻击链路、产出的报告主题同为「攻击报告」，认归属靠的又都是 VS
-        块里的目标坐标——这里从头到尾没有一处读得到「这一份是哪个预设打的」，
-        也不需要读。按预设各写一条读法，只会让下一次修补又只修好一半。
-
         这一步以前**根本不存在**，而它是整条链路的死结：`phase_of` 要看到
         `DispatchFact.has_report` 才放目标往下走，那个字段来自 `battle_reports`
         里有没有一行指着这发派遣；而全仓没有任何代码为 bot 写过那张表。于是每个
-        目标都永久停在 `AWAITING_PROBE_REPORT`——实机跑一整夜，那一态出现 152 次，
-        `NEEDS_ATTACK` 出现 0 次。
+        目标都永久停在等战报——实机跑一整夜，那一态出现 152 次。
 
-        ⚠️ **不按「是不是本轮在等的那个目标」筛。** 读到就存。原先只把
-        `AWAITING_PROBE_REPORT` 那几个目标交进来，攻击发的战报于是没人读；
-        后来两个等待态一起交，仍旧是一张会漏项的名单。名单越窄，漏的越多，
-        而这条路径认归属本来就只靠报告自己写的目标坐标——按名单筛纯属多余。
+        ⚠️ **不按「是不是本轮在等的那个目标」筛。** 读到就存。原先只把一部分等待
+        态的目标交进来，另一档的战报于是没人读；名单越窄，漏的越多，而这条路径
+        认归属本来就只靠报告自己写的目标坐标——按名单筛纯属多余。
         先例是侦察报告那条链路（`PirateLoop.collect_scout_reports` 里那段注释）。
 
         入库走 `append_report`，它会按「出发坐标 + 目标坐标 + 时间就近」自己认领
@@ -262,8 +190,8 @@ class BotLoop(PirateLoop):
 
         versus = parse_versus_block(page.versus_block(), "ocr")
         if versus is None:
-            # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，接着按它的
-            # 舰队量去挑攻击组合。
+            # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，而那份战报的战果
+            # 会决定那个坐标要不要再挨一发。
             say(f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报")
             return ReportIngest.UNREADABLE
         return self._ingest_battle_report(versus.defender.coordinate.value, page)
@@ -288,7 +216,7 @@ class BotLoop(PirateLoop):
             )
         except (UnknownUiVersionError, ValueError) as error:
             # 读不出来不是「没有战报」。这一份就放着，等 `MAX_REPORT_AGE` 到点把
-            # 那发派遣判掉、允许重新探路（见 `repository.bot_dispatch_facts`）。
+            # 那发派遣判掉、允许重打一发（见 `repository.bot_dispatch_facts`）。
             say(f"  {target} 的战报读不出来：{error}")
             self._dump_frame("battle-report-unreadable")
             return ReportIngest.UNREADABLE
@@ -306,7 +234,8 @@ class BotLoop(PirateLoop):
         repository.append_report(to_battle_report(live, report_id=uuid4()))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
         # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
-        # （没拖到底 / 那一屏的行位置偏了）。
+        # （没拖到底 / 那一屏的行位置偏了）。算不出还有第二个后果：`DRAW` 算不出来
+        # 的那一发不会触发重打，这个目标本轮就此收工。
         say(
             f"  {target} 战报入库：{live.raw_time_text}，"
             f"战果 {live.outcome or '算不出'}"
@@ -314,30 +243,6 @@ class BotLoop(PirateLoop):
             f"敌 {live.defender_units}−{live.defender_losses}）"
         )
         return ReportIngest.STORED
-
-    def read_defender_units(self, coordinate: Coordinate) -> int | None:
-        """去信箱把这个目标最近那份攻击报告的守方「单位」总数读回来。
-
-        只读详情页的一个 ROI。**这是兜底路径**：正常情况下这个数在收报告那一趟
-        已经读过并入库了，`_tier_and_attack` 先问库（`latest_defender_units`）。
-
-        没拖过的那一屏上读不到时要拖到底再读一次，理由与 `_bottom_screens` 同——
-        bot 战报的「单位」那一行多半压根不在可视区里。这里不能只修入库那一条路：
-        兜底路径读不出来就返回 None，而 None 会让 `_tier_and_attack` 整个跳过。
-        """
-        found: int | None = None
-
-        def visit(target: Coordinate, page: Any) -> None:
-            nonlocal found
-            units = page.unit_totals()[1]
-            # 判据是「读不出来」，不是「读出来是 0」——0 是一条真读数。
-            if _count(units) is None:
-                units = self._bottom_screens().unit_totals()[1]
-            found = _count(units)
-            say(f"  {target} 的战报：守方单位 {units!r} → {found}")
-
-        self._scan_mail((coordinate,), visit)
-        return found
 
     # -- 主循环 -------------------------------------------------------------
 
@@ -367,24 +272,17 @@ class BotLoop(PirateLoop):
         顺手把认得出的都开了、都入了库，比另起一趟省下整套「切视图 → 开面板 →
         慢拖回顶 → 翻页 → 关面板」（约 20 秒）。
 
-        收取那一步认归属只靠报告自己写的目标坐标，不认名单——所以两个等待态
-        （`AWAITING_PROBE_REPORT` / `AWAITING_ATTACK_REPORT`）不需要在这里列出来，
-        也就不会再出现「名单漏了一个态，那一档目标永远收不到战报」这种事。
-        `AWAITING_ATTACK_REPORT` 当初就是这么被漏掉的：注释写着「等攻击战报……
-        这一趟没事可做」，而那句话预设了别处有人收，别处却没有人。
-
-        态在开头一次算完，收进来的战报本轮就作数：`reconcile_today` 排在
-        `_sweep` 之前，所以刚回来的探路战报这一趟就能拿去分档。**仍旧一趟只推进
-        一态**——每个目标在这个循环里只走一个分支。
+        态在开头一次算完，收进来的战报本趟就作数：`reconcile_today` 排在
+        `_sweep` 之前，所以刚回来的战报这一趟就能拿去判平局。**仍旧一趟只推进
+        一态**——每个目标在这个循环里只走一个分支，所以「平局再打一发」也是一趟
+        一发，不会在同一趟里把配额一次烧光。
         """
         for coordinate in self._bot.targets:
             phase = self._phase_of(coordinate)
             say(f"目标 {coordinate}（{phase.value}）")
-            if phase is BotPhase.NEEDS_PROBE:
-                self._probe(coordinate)
-            elif phase is BotPhase.NEEDS_ATTACK:
-                self._tier_and_attack(coordinate)
-            elif phase in _AWAITING_REPORT:
+            if phase is BotPhase.NEEDS_ATTACK:
+                self._attack_once(coordinate)
+            elif phase is BotPhase.AWAITING_ATTACK_REPORT:
                 self._say_still_waiting(coordinate)
             # `DONE` 无事可做。
 
@@ -408,75 +306,40 @@ class BotLoop(PirateLoop):
         """这个目标这一趟走到哪一步了。
 
         **只认目标模式（默认档，一次点击都不做）不查库。** 那一档根本不派，
-        没有派遣事实可言，查库只会凭空要求一个数据库。`_probe` 自己会在
-        `probe=False` 时停在识别那一步，所以这里直接当成「该去看一眼」。
+        没有派遣事实可言，查库只会凭空要求一个数据库。`_attack_once` 自己会在
+        `attack=False` 时停在识别那一步，所以这里直接当成「该去看一眼」。
         """
-        if not self._bot.probe:
-            return BotPhase.NEEDS_PROBE
+        if not self._bot.attack:
+            return BotPhase.NEEDS_ATTACK
         return phase_of(self._dispatch_facts(coordinate))
 
     def _dispatch_facts(self, coordinate: Coordinate) -> tuple[DispatchFact, ...]:
-        """本轮针对这个目标已经派过哪些发、战报回来了没有。"""
+        """本轮针对这个目标已经打过哪几发、战报回来了没有、打成了什么。"""
         repository, _run_id = self._ensure_run()
         return tuple(repository.bot_dispatch_facts(coordinate, since=self._round_start()))
 
-    def _probe(self, coordinate: Coordinate) -> None:
-        """派一发探路。走的是攻击链路，所以简报上写的是「攻击」。"""
+    def _attack_once(self, coordinate: Coordinate) -> None:
+        """对这个坐标打一发 BBB。
+
+        走到这里只有两种情形：本轮第一发，或者上一发打成了平局而配额还有剩
+        （`domain.bot_round.phase_of`）。**两种在这里没有分别**——打法完全一样，
+        分开写只会多一处可能和判态那边分家的地方。「还能不能再打」的判定只有
+        `phase_of` 一处。
+        """
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             return
         self._outcome.pirates.append(coordinate)
-        if not self._bot.probe:
-            return
-        if self.attack(coordinate, preset=PROBE_PRESET):
-            self._outcome.scouted.append(coordinate)
-
-    def _tier_and_attack(self, coordinate: Coordinate) -> None:
-        """探路战报已回：取守方单位数、分档、按档位真打。
-
-        **先问库。** 走到这一态的前提就是「本轮的探路战报已经入库」，那个数在
-        开工那一趟信箱已经读过了；再进一趟信箱既多花十几秒，翻到的
-        还可能是上一轮的报告（信箱那条路没有时间闸门）。库里没有才现场读一次。
-        """
         if not self._bot.attack:
             return
-        units = self._stored_defender_units(coordinate)
-        if units is None:
-            units = self.read_defender_units(coordinate)
-        if units is None:
-            say(f"  {coordinate} 读不到战报里的守方单位数；不打")
-            self._outcome.refused.append((coordinate, "读不到守方单位数"))
-            return
-        thresholds = self._bot.tier_thresholds
-        tier = tier_for(units, thresholds)
-        preset = tier.preset
-        label = thresholds.label(tier)
-        say(f"  {coordinate} 守方 {units} → {label}；预设 {preset or '（不派）'}")
-        if preset is None:
-            self._outcome.refused.append((coordinate, f"{label}，不值得打"))
-            self._mark_skipped(coordinate)
-            return
-        if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
-            self._outcome.refused.append((coordinate, "攻击前面板认不出"))
-            return
-        self.attack(coordinate, preset=preset)
-
-    def _stored_defender_units(self, coordinate: Coordinate) -> int | None:
-        """本轮已入库的守方「单位」总数；没有就 None（调用方现场再读一次）。"""
-        repository, _run_id = self._ensure_run()
-        return repository.latest_defender_units(coordinate, since=self._round_start())
-
-    def _mark_skipped(self, coordinate: Coordinate) -> None:
-        """把「分档说不值得打」记进库，否则下一趟又会重新分一次档。"""
-        repository, _run_id = self._ensure_run()
-        repository.mark_bot_target_skipped(coordinate, since=self._round_start())
+        self.attack(coordinate, preset=BOT_ATTACK_PRESET)
 
     def _round_start(self) -> datetime:
         """本轮从何时算起。**绝不返回 None。**
 
         `--round-started-at` 是可选的（手工跑时没人会填），但 `None` 一路传到
-        仓储那边就是「不限时间范围」：`mark_bot_target_skipped(since=None)` 会把
-        这个坐标**历史上每一轮的每一条 intent** 全刷成跳过。手工跑一次
-        `--probe --attack`，只要有一个目标被分档判成「不值得打」就会触发。
+        仓储那边就是「不限时间范围」：`bot_dispatch_facts(since=None)` 会把这个
+        坐标**历史上每一发**都算进本轮，于是它的重打配额永远是满的，看起来像是
+        「这个目标早就打完了」。
 
         所以这里兜底成**当日 UTC 00:00**。取当天而不是「此刻」，是因为一趟里
         先派出的那几发必须仍算本轮；取 UTC 而不是本地时区，是因为游戏内时间
@@ -485,12 +348,6 @@ class BotLoop(PirateLoop):
         if self._bot.round_started_at is not None:
             return self._bot.round_started_at
         return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def _count(text: str) -> int | None:
-    from evo_helper.domain.fleet_tier import parse_fleet_count
-
-    return parse_fleet_count(text) if text else None
 
 
 def parse_round_start(text: str) -> datetime:
@@ -512,36 +369,6 @@ def parse_round_start(text: str) -> datetime:
     return value.astimezone(UTC)
 
 
-def configured_thresholds() -> TierThresholds:
-    """库里当前生效的三道边界。手工跑（不带 `--tier-thresholds`）时用它。
-
-    **不回落到 `DEFAULT_TIER_THRESHOLDS`。** 手工跑一趟和控制台起一轮打的是同一
-    批目标、派的是同一批舰队，用两套不同的阈值分档没有任何道理，而且那种分歧
-    在日志里看不出来——两边都只会打印自己用的那三个数。
-
-    库里还没有配置行时 `SqlAlchemyRepository.tier_thresholds()` 自己会给默认值，
-    那是「新库」而不是「忽略配置」。
-    """
-    from evo_helper.config import Settings
-    from evo_helper.storage.database import create_database_engine, create_session_factory
-    from evo_helper.storage.repository import SqlAlchemyRepository
-
-    factory = create_session_factory(create_database_engine(Settings().database_url))
-    return SqlAlchemyRepository(factory).tier_thresholds()
-
-
-def parse_thresholds(values: Sequence[int]) -> TierThresholds:
-    """`--tier-thresholds A B C` → 三道边界。不递增就当场拒收。
-
-    在入口就拒，而不是让一套不成立的阈值一路走到分档那一步：中间那一档变成
-    死区之后，日志里看到的只是「这一轮一发 BBB 都没派」，看不出是阈值的问题。
-    """
-    try:
-        return TierThresholds(*values)
-    except TierThresholdError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-
-
 def parse_target(text: str) -> Coordinate:
     parts = text.split(":")
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
@@ -555,34 +382,16 @@ def parse_target(text: str) -> Coordinate:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", nargs="+", type=parse_target, required=True)
-    parser.add_argument("--probe", action="store_true", help="真的用「探路」打一发攻击侦查")
-    parser.add_argument("--attack", action="store_true", help="拿到战报后按档位真的攻击")
+    parser.add_argument(
+        "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
+    )
     parser.add_argument(
         "--round-started-at",
         type=parse_round_start,
         default=None,
         help="本轮起始时刻（ISO 8601，必须带时区）。调度器会传；手工跑不给则按当日 UTC 00:00 算",
     )
-    parser.add_argument(
-        "--tier-thresholds",
-        nargs=3,
-        type=int,
-        metavar=("AAA", "BBB", "CCC"),
-        default=None,
-        help="三档的下界（艘），必须严格递增。调度器会传；手工跑不给则读库里的配置",
-    )
     args = parser.parse_args(argv)
-
-    if args.attack and not args.probe:
-        parser.error("--attack 需要 --probe：没有攻击侦查打回来的战报就没有分档依据")
-
-    if args.tier_thresholds is None:
-        thresholds = configured_thresholds()
-    else:
-        try:
-            thresholds = parse_thresholds(args.tier_thresholds)
-        except argparse.ArgumentTypeError as error:
-            parser.error(str(error))
 
     import ctypes
 
@@ -590,41 +399,26 @@ def main(argv: list[str] | None = None) -> int:
 
     options = BotOptions(
         targets=tuple(args.targets),
-        probe=args.probe,
         attack=args.attack,
         round_started_at=args.round_started_at,
-        tier_thresholds=thresholds,
     )
-    mode = "只认目标" if not args.probe else ("侦查+攻击" if args.attack else "只侦查")
+    mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(str(target) for target in options.targets)
-    say(f"模式：{mode}；目标 {listed}")
-    # 阈值要打印出来。这一轮派了哪套预设全由它决定，而日志是事后唯一能回答
-    # 「当时按哪三个数分的档」的东西（`mission_runs.command` 记的是调度器那条路）。
-    say(
-        f"分档阈值：AAA {thresholds.alpha_from} / BBB {thresholds.beta_from}"
-        f" / CCC {thresholds.gamma_from}"
-    )
+    say(f"模式：{mode}；预设 {BOT_ATTACK_PRESET}；目标 {listed}")
 
-    driver = LiveDriver(allow_actions=args.probe or args.attack)
+    driver = LiveDriver(allow_actions=args.attack)
     driver.window()
     outcome = BotLoop(driver, make_ocr(), options).run()
     say(
-        f"完成：目标 {len(outcome.pirates)} 个，侦查 {len(outcome.scouted)} 发，"
-        f"攻击 {len(outcome.attacked)} 发，拦下 {len(outcome.refused)} 次"
+        f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
+        f"拦下 {len(outcome.refused)} 次"
     )
     for coordinate, reason in outcome.refused:
         say(f"  [拦下] {coordinate} {reason}")
     return 0
 
 
-__all__ = [
-    "BotLoop",
-    "BotOptions",
-    "FleetTier",
-    "configured_thresholds",
-    "main",
-    "parse_thresholds",
-]
+__all__ = ["BotLoop", "BotOptions", "main"]
 
 
 if __name__ == "__main__":  # pragma: no cover

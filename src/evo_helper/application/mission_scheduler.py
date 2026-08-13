@@ -285,9 +285,6 @@ class MissionScheduler:
         # 抄配置和按下秒表用的是同一个时刻：两次取「现在」的话，记录上的固化
         # 时刻会和页面上那块秒表的起点差一点，而事后翻账正是拿这两个对时间线。
         tasks = self._repository.mission_tasks()
-        # 分档阈值和三条链路的配置一起抄：它决定这一轮每一发用哪套预设，属于
-        # 「这一轮用的是哪一套参数」的一部分。同样在锁外读，理由同上。
-        thresholds = self._repository.tier_thresholds()
         now = self._clock()
         with self._lock:
             if self._enabled:
@@ -306,7 +303,6 @@ class MissionScheduler:
                     if _known(row.kind)
                 ],
                 frozen_at_utc=now,
-                tier_thresholds=thresholds,
             )
         # 落账在锁外：写文件的耗时没有上界（磁盘、杀毒软件），而它对
         # 「任何时刻最多一个子进程」这条不变量毫无影响。
@@ -723,9 +719,10 @@ class MissionScheduler:
     def _bot_remaining(self, row: orm.MissionTaskRow) -> int:
         """本轮范围内还有几个 bot 没走完。
 
-        完成 = 收到**攻击发**（非探路预设）的战报。分档判为「不值得打」而没派
-        攻击的目标同样算完成——它已经走完该走的流程。这两条都在
-        `domain.bot_round.phase_of` 里，这里只负责把事实喂给它。
+        完成 = 收到那一发攻击的战报，而且**战果不是平局**——平局要对同一坐标再打
+        一发（用户口径 2026-08-13），所以它还没走完。打满上限之后也算完成，
+        哪怕最后一发仍是平局。这几条都在 `domain.bot_round.phase_of` 里，
+        这里只负责把事实喂给它。
         """
         try:
             targets = bot_targets_in_range(self._bot_targets(), **_bot_range(row.params_json))
@@ -758,12 +755,7 @@ class MissionScheduler:
             return scan_command()
         if kind is MissionKind.PIRATE:
             return pirate_command(pirate_systems(self._origin, _pirate_radius(params_json)))
-        # 阈值在**起进程这一刻**读一次，从此写死在 argv 里。运行中改了库也不会
-        # 追进已经飞着的那一轮——而页面本来就不让改（`config_locked`）。
-        return bot_command(
-            bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)),
-            self._repository.tier_thresholds(),
-        )
+        return bot_command(bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)))
 
 
 def task_snapshot(row: orm.MissionTaskRow) -> TaskSnapshot:

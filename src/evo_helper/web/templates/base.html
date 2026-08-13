@@ -47,7 +47,8 @@
     <a href="/missions" {% if active == 'missions' %}aria-current="page"{% endif %}>任务中心</a>
     <a href="/intel" {% if active == 'intel' %}aria-current="page"{% endif %}>情报中心</a>
     <a href="/planets" {% if active == 'planets' %}aria-current="page"{% endif %}>星球列表</a>
-    <a href="/tiers" {% if active == 'tiers' %}aria-current="page"{% endif %}>分档阈值</a>
+    {# 「分档阈值」已关闭：bot 不再按守方舰队量分档，一律用预设 BBB 打
+       （用户口径 2026-08-13，见 `domain.bot_round`）。那一页的三个数没有读者了。 #}
     <div class="group-label">辅助</div>
     {# 「运行详情」已关闭：它操作的是更早的 run_instances/scan_plans 那条路径，
        起停与记账都由任务中心（常驻调度器 + mission_runs）接手了。 #}

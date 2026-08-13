@@ -369,7 +369,7 @@ class ImageReportScreens:
         实测那个孤零零的 `0` 只有 2× 那一档读得出来（见 `TOTALS_RECIPES`），
         对它要求两票就等于永远读不出 0——那会把「这里是空的」变成「不知道」。
         """
-        from evo_helper.domain.fleet_tier import parse_fleet_count
+        from evo_helper.domain.fleet_counts import parse_fleet_count
         from evo_helper.vision.fleet_counts import pick_count
 
         crop = self._image.crop((column[0], top - 3, column[1], top + pitch - 3)).convert("L")
@@ -550,7 +550,7 @@ class ImageReportScreens:
         """
         if self._details_anchor_read:
             return self._details_anchor
-        from evo_helper.domain.fleet_tier import parse_fleet_count
+        from evo_helper.domain.fleet_counts import parse_fleet_count
 
         profile = row_brightness(
             self._image,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from evo_helper.domain.fleet_tier import parse_fleet_count as parse_count
+from evo_helper.domain.fleet_counts import parse_fleet_count as parse_count
 from evo_helper.vision.fleet_counts import (
     COUNT_RECIPES,
     FleetCountsUnresolved,

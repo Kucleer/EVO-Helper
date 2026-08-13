@@ -812,8 +812,8 @@ class PirateLoop:
     def attack(self, coordinate: Coordinate, *, preset: str | None = None) -> bool:
         """用预设攻击。闸门是「预设标题选中了」与「简报写着攻击」。
 
-        `preset` 允许按次指定：bot 那条链路先用「探路」做攻击侦查，再按分档换预设
-        （见 `tools.bot_loop`），而海盗链路始终用同一个。
+        `preset` 允许按次指定：bot 那条链路用自己的预设（`domain.bot_round.
+        BOT_ATTACK_PRESET`，见 `tools.bot_loop`），而海盗链路始终用同一个。
 
         **只按标题选预设，不读预设内容**（用户口径 2026-08-09）：内容是用户自己在
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
