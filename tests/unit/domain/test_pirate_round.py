@@ -10,9 +10,12 @@ from __future__ import annotations
 import pytest
 
 from evo_helper.domain.pirate_round import (
+    MAX_SCOUTS_PER_DAY,
     PHASE_LABELS,
     AttackFact,
+    PirateAction,
     PiratePhase,
+    action_for,
     phase_for,
     phase_of,
 )
@@ -101,3 +104,81 @@ def test_every_phase_has_its_own_chinese_label() -> None:
 
     assert set(PHASE_LABELS) == set(PiratePhase)
     assert len(set(labels)) == len(labels)
+
+
+class TestWhatToDoAboutIt:
+    """态 → 动作。用户口径 2026-08-13：海盗刷新是当日内（游戏内 UTC+0）。
+
+    实机账（2026-08-13 通宵 UTC 15:00–19:00）：侦察 111 发打在 54 个坐标上
+    （2:137:1~4 各 5 发），攻击只有 12 发。判据 2026-08-11 就写好了，缺的是
+    没有人问它——所以这一组钉的是**每个态各自该做什么**，一态一条。
+    """
+
+    def test_a_target_untouched_today_gets_a_scout(self) -> None:
+        assert action_for(PiratePhase.NEEDS_SCOUT, scout_count=0) is PirateAction.SCOUT
+
+    def test_a_scout_already_in_flight_is_not_scouted_again(self) -> None:
+        """**这一条是 111 发那笔账的正主。**
+
+        原先每一轮都当作今天没侦察过：认出是海盗就发一发，四个坐标一轮四发。
+        """
+        assert action_for(PiratePhase.AWAITING_SCOUT_REPORT, scout_count=1) is PirateAction.WAIT
+
+    def test_a_verdict_of_attack_attacks_without_scouting_again(self) -> None:
+        """报告已经判为「打」，再派一发侦察只是把配额烧掉再得出同一个结论。"""
+        assert action_for(PiratePhase.NEEDS_ATTACK, scout_count=1) is PirateAction.ATTACK
+
+    def test_an_attack_in_flight_is_left_alone(self) -> None:
+        assert action_for(PiratePhase.AWAITING_ATTACK_REPORT, scout_count=1) is PirateAction.WAIT
+
+    def test_a_finished_attack_ends_the_day_for_that_target(self) -> None:
+        """今天已经攻击过 → 不侦查、不攻击。"""
+        assert action_for(PiratePhase.ATTACK_DONE, scout_count=1) is PirateAction.DONE
+
+    def test_a_fully_read_empty_pirate_is_not_scouted_again(self) -> None:
+        """四格都读全了、都 ≤ 1：结论是确定的，再读一次还是它。"""
+        assert action_for(PiratePhase.NO_ATTACK, scout_count=1) is PirateAction.DONE
+
+    def test_an_unreadable_report_earns_exactly_one_make_up_scout(self) -> None:
+        """**这一条是本组分量最重的：`UNREADABLE` 与 `SKIP` 的处置相反。**
+
+        没看清 ≠ 这里是空的。补一次是为了给「下一次可能读全」一个机会；
+        补完还是没看清就收手——ROI 落空是系统性的（库里 98 份报告里
+        `收割者` 一格一份都没读出来），补第三次读到的还是同一个空格子。
+        """
+        assert action_for(PiratePhase.SCOUT_UNREADABLE, scout_count=1) is PirateAction.SCOUT
+        assert action_for(PiratePhase.SCOUT_UNREADABLE, scout_count=2) is PirateAction.DONE
+
+    def test_the_make_up_scout_is_capped_at_the_stated_maximum(self) -> None:
+        """封顶就是 `MAX_SCOUTS_PER_DAY`，不是「再来一次」这种相对说法。"""
+        assert MAX_SCOUTS_PER_DAY == 2
+        for count in range(MAX_SCOUTS_PER_DAY):
+            assert action_for(PiratePhase.SCOUT_UNREADABLE, scout_count=count) is PirateAction.SCOUT
+        for count in (MAX_SCOUTS_PER_DAY, MAX_SCOUTS_PER_DAY + 3):
+            assert action_for(PiratePhase.SCOUT_UNREADABLE, scout_count=count) is PirateAction.DONE
+
+    def test_the_scout_count_only_matters_for_the_unreadable_phase(self) -> None:
+        """别的态跟发数无关——发数一变结论就变的话，那是把两条规则搅在一起了。"""
+        others = [phase for phase in PiratePhase if phase is not PiratePhase.SCOUT_UNREADABLE]
+        for phase in others:
+            assert action_for(phase, scout_count=0) is action_for(phase, scout_count=9)
+
+    def test_a_negative_scout_count_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="侦察发数"):
+            action_for(PiratePhase.SCOUT_UNREADABLE, scout_count=-1)
+
+    def test_every_phase_maps_to_an_action(self) -> None:
+        """新加一个态却忘了给它动作时，这条会当场炸而不是悄悄走进某个兜底分支。
+
+        兜底分支是这里最危险的写法：漏掉的那个态会拿到 `SCOUT`（多派一发）或者
+        `DONE`（整天不碰），两种都不响。所以 `action_for` 认不出的态直接抛，
+        这条就是那个抛的凭据。
+        """
+        for phase in PiratePhase:
+            assert isinstance(action_for(phase, scout_count=0), PirateAction)
+
+        class _Bogus:
+            pass
+
+        with pytest.raises(ValueError, match="未知的海盗态"):
+            action_for(_Bogus(), scout_count=0)  # type: ignore[arg-type]

@@ -42,6 +42,8 @@ def _loop(*, reachable: bool) -> tuple[Any, list[str]]:
     # 逐套配方把未读数打进日志，是纯诊断（要真截图，所以这里打桩）。
     loop._say_mail_badge_reads = lambda: events.append("打印角标读数")  # type: ignore[assignment, method-assign]
     loop._open_mail = lambda: events.append("开信箱")  # type: ignore[assignment, method-assign]
+    # 拖回顶部另有专文（`test_mailbox_scroll_to_top.py`）。
+    loop._scroll_mail_list_to_top = lambda: events.append("拖回顶部")  # type: ignore[assignment, method-assign]
     return loop, events
 
 

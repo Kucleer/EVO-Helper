@@ -37,6 +37,9 @@ def _loop(events: list[str], *, scout: bool, pirates_at: set[int]) -> PirateLoop
     loop._options = LoopOptions(systems=((2, 137),), scout=scout, attack=True)  # type: ignore[attr-defined]
     loop._outcome = Outcome()  # type: ignore[attr-defined]
     loop._navigator = _Navigator(events)  # type: ignore[attr-defined]
+    # 今天的账是空的 = 每个坐标都还没侦察过，侦察照常派。这几条钉的是交错顺序，
+    # 当日去重另有专文（`test_pirate_loop_daily_dedup.py`）。
+    loop._daily = {}  # type: ignore[attr-defined]
 
     def _check(coordinate: Coordinate) -> TargetCheck:
         return TargetCheck.CONFIRMED if coordinate.position in pirates_at else TargetCheck.ABSENT

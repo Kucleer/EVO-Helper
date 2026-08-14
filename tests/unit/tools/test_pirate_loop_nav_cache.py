@@ -200,6 +200,9 @@ def _sweeping_loop(driver: _NavDriver, *, pirate_at: int) -> Any:
     loop._outcome = Outcome()  # type: ignore[attr-defined]
     loop._options = LoopOptions(systems=((2, 137),), scout=True, attack=False)  # type: ignore[attr-defined]
     loop._coord_dumps = 0  # type: ignore[attr-defined]
+    # 今天的账是空的 = 每个坐标都还没侦察过，侦察照常派。这几条钉的是导航缓存，
+    # 当日去重另有专文（`test_pirate_loop_daily_dedup.py`）。
+    loop._daily = {}  # type: ignore[attr-defined]
     loop._dump_frame = lambda name, roi=None: None  # type: ignore[assignment, method-assign]
     loop._require_system_view = lambda _what: None  # type: ignore[assignment, method-assign]
 

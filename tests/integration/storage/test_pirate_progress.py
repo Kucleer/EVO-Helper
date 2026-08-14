@@ -233,6 +233,94 @@ def test_rows_come_back_in_coordinate_order(repository, run_id) -> None:  # type
     assert [row.target for row in rows] == [TARGET, OTHER]
 
 
+# -- 给活链路的两个字段：今天派了几发侦察、报告是不是今天的 ------------------
+
+
+def test_the_scout_count_is_a_count_not_a_flag(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**这条守的是「补一次为限」**（`domain.pirate_round.MAX_SCOUTS_PER_DAY`）。
+
+    只有一个「侦察过没有」的布尔时，「今天补过一次」和「今天补过四次」在数据上
+    长得一模一样，`SCOUT_UNREADABLE` 那一档就会无限补——2026-08-13 通宵
+    2:137:1~4 各挨 5 发侦察，正是这条路。
+    """
+    _scout_dispatch(repository, run_id, TARGET)
+    _scout_dispatch(repository, run_id, TARGET, at=SCOUT_AT + timedelta(hours=1))
+    _scout_dispatch(repository, run_id, OTHER, at=SCOUT_AT + timedelta(minutes=1))
+
+    counts = {row.target: row.scout_count for row in repository.pirate_progress(since=DAY)}
+
+    assert counts == {TARGET: 2, OTHER: 1}
+
+
+def test_a_refused_scout_does_not_burn_the_daily_scout_budget(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """被游戏拒掉的那一发没有探测器飞出去，也就不该占掉当天两发里的一发。
+
+    口径与攻击那一侧同源（`accepted` 为假的一律不算）。
+    """
+    _dispatch(
+        repository, run_id, TARGET, at=SCOUT_AT, mission_kind=MISSION_KIND_SCOUT, accepted=False
+    )
+    _scout_dispatch(repository, run_id, TARGET, at=SCOUT_AT + timedelta(minutes=5))
+
+    (row,) = repository.pirate_progress(since=DAY)
+
+    assert row.scout_count == 1
+
+
+def test_an_attack_dispatch_is_not_counted_as_a_scout(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """攻击发混进侦察发数里，`SCOUT_UNREADABLE` 那一档会提前判成「今天补过了」。"""
+    _scout_dispatch(repository, run_id, TARGET)
+    _attack_dispatch(repository, run_id, TARGET)
+
+    (row,) = repository.pirate_progress(since=DAY)
+
+    assert row.scout_count == 1
+
+
+def test_yesterdays_report_does_not_decide_todays_attack(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**这条是活链路那条口径的落点。**
+
+    海盗每天刷新，昨天那份报告说的是昨天那批舰队。今天的侦察发刚派出去、报告
+    还没回的那十几分钟里，不设下界的话这个坐标会显示成「待触发攻击」，活链路
+    据此照着过期情报把舰队扔出去。2:137:1~4 天天侦察，库里永远躺着昨天那份。
+
+    控制台那一侧**不传** `scout_not_before`，口径本来就不同（它要解释窗口里
+    那一发，哪怕报告是昨天的）。
+    """
+    _scout_report(repository, TARGET, HAS_FLEET, at=DAY - timedelta(hours=3))
+    _scout_dispatch(repository, run_id, TARGET)
+
+    (live,) = repository.pirate_progress(since=DAY, scout_not_before=DAY)
+    (console,) = repository.pirate_progress(since=DAY)
+
+    assert live.phase is PiratePhase.AWAITING_SCOUT_REPORT
+    assert live.verdict is None
+    assert live.scout_reported_at_utc is None
+    # 同一份数据，控制台口径仍旧看得到昨天那份——这两条一起才说明下界只加在活链路上。
+    assert console.phase is PiratePhase.NEEDS_ATTACK
+
+
+def test_todays_report_still_decides_todays_attack(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """下界不能把今天那份也挡掉——挡掉就是永远侦察、永远不打。"""
+    _scout_dispatch(repository, run_id, TARGET)
+    _scout_report(repository, TARGET, HAS_FLEET, at=SCOUT_AT)
+
+    (row,) = repository.pirate_progress(since=DAY, scout_not_before=DAY)
+
+    assert row.phase is PiratePhase.NEEDS_ATTACK
+    assert row.scout_reported_at_utc == SCOUT_AT
+
+
+def test_a_naive_scout_floor_is_refused(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """不带时区的下界要当场拒收，别在 SQLite 上悄悄比错。"""
+    import pytest
+
+    _scout_dispatch(repository, run_id, TARGET)
+
+    with pytest.raises(ValueError):
+        repository.pirate_progress(since=DAY, scout_not_before=datetime(2026, 8, 11))  # noqa: DTZ001
+
+
 def test_no_new_table_or_column_was_added_for_the_verdict(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """判定是**现算**的，库里一列都不存（`domain.records.ScoutReport`）。
 

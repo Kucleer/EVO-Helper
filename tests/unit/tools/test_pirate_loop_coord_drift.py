@@ -250,6 +250,9 @@ def _sweeping_loop(events: list[str], per_position: dict[int, list[TargetCheck]]
     loop._options = LoopOptions(systems=((2, 137),), scout=True, attack=False)  # type: ignore[attr-defined]
     loop._outcome = Outcome()  # type: ignore[attr-defined]
     loop._navigator = _Navigator(events)  # type: ignore[attr-defined]
+    # 今天的账是空的 = 每个坐标都还没侦察过。这几条钉的是导航与自愈，
+    # 当日去重另有专文（`test_pirate_loop_daily_dedup.py`）。
+    loop._daily = {}  # type: ignore[attr-defined]
 
     def _check(coordinate: Coordinate) -> TargetCheck:
         return per_position[coordinate.position].pop(0)
