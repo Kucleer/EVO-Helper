@@ -23,6 +23,9 @@ from typing import Any
 
 from evo_helper.game.session_keeper import ScreenState
 from evo_helper.tools.scan_coordinates import (
+    ENTRY_BUTTON_ROI,
+    ENTRY_BUTTON_TEXT,
+    ENTRY_LOCATE_ATTEMPTS,
     ENTRY_TITLE_ROI,
     NAV_TEXT_ROI,
     OBSERVE_FRAMES,
@@ -123,3 +126,56 @@ def test_it_waits_between_frames() -> None:
 
     assert len(slept) == OBSERVE_FRAMES - 1
     assert all(gap > 0 for gap in slept)
+
+
+# -- 点击定位器也要多取几帧 ----------------------------------------------------
+
+
+class _ClickingDriver(_Driver):
+    """和 `_Driver` 一样，但**允许点击**——上面那个故意在点击时抛，因为它只测判定。"""
+
+    def __init__(self, frames: list[dict[Any, str]]) -> None:
+        super().__init__(frames)
+        self.clicks: list[tuple[int, int, str]] = []
+
+    def click(self, x: int, y: int, *, label: str = "") -> None:
+        self.clicks.append((x, y, label))
+
+
+def _clicking_keeper(frames: list[dict[Any, str]]) -> tuple[Any, _ClickingDriver]:
+    driver = _ClickingDriver(frames)
+    return make_session_keeper(driver, _ocr, sleep=lambda _s: None), driver
+
+
+def test_the_entry_button_is_looked_for_across_frames() -> None:
+    """**`observe()` 早就多取几帧了，两个点击定位器一直只读一帧。**
+
+    于是同一个页面上 `classify_screen` 说「这是入口页」、`click_entry` 说
+    「找不到进入」，两个读屏器结论相反。实机 2026-08-14 一小时内撞了三次
+    （两次「进入」、一次 START），每次都是整个进程抛异常退出——挂机时那就是
+    一整轮没了。而当场手工用同一套配方读同一个 ROI，十帧十中。
+    """
+    # ⚠️ 这一帧要带**按钮**那块（`entry_button` 读的是它），不是标题那块。
+    button_frame = {**ENTRY_FRAME, ENTRY_BUTTON_ROI: ENTRY_BUTTON_TEXT}
+    keeper, driver = _clicking_keeper([BLANK_FRAME, BLANK_FRAME, button_frame])
+
+    keeper._click_entry()
+
+    assert driver.captures == 3
+    assert len(driver.clicks) == 1, "第三帧读到了，就该点下去"
+
+
+def test_a_page_that_never_shows_the_button_still_refuses_to_click() -> None:
+    """判据没有被放松：真的一帧都读不出，仍旧抛，而不是往固定坐标乱点。
+
+    没有这条对照，「无限重试」也能让上面那条变绿——而那意味着一个真的坏掉的
+    画面会把进程永远钉在原地。
+    """
+    import pytest
+
+    keeper, driver = _clicking_keeper([BLANK_FRAME])
+
+    with pytest.raises(RuntimeError):
+        keeper._click_entry()
+    assert driver.captures == ENTRY_LOCATE_ATTEMPTS
+    assert driver.clicks == [], "读不出就绝不点"

@@ -537,6 +537,14 @@ NAV_TEXT_UPSCALE = 3
 
 #: START 按钮所在的横条。整屏 OCR 读不出 START——那是压在星空上的半透明大字，
 #: psm 6/11/12 全军覆没；紧凑裁剪 + 3× + 二值化才读得出来。
+#: 「进入」/ START 定位读几帧、每帧之间等多久。
+#:
+#: 这两个页面都在做明暗动画，单帧是抛硬币——理由整段写在
+#: `make_session_keeper._locate_confirming` 上。取 5 × 0.8 秒 ≈ 最多多花 3.2 秒，
+#: 而它挡住的是「整个进程抛异常退出」，挂机时那就是一整轮没了。
+ENTRY_LOCATE_ATTEMPTS = 5
+ENTRY_LOCATE_WAIT_S = 0.8
+
 START_ROI = (820, 745, 1100, 830)
 START_UPSCALE = 3
 START_THRESHOLD = 180
@@ -677,14 +685,36 @@ def make_session_keeper(
             return entry
         return ScreenState.START if start_button(image) is not None else state
 
+    def _locate_confirming(find: Callable[[Any], tuple[int, int] | None]) -> tuple[int, int] | None:
+        """多取几帧再说「找不到」。**入口页和 START 页都在做动画。**
+
+        `observe()` 早就这么干了（它的注释里记着实测：连读 6 帧，第 0 帧读到
+        `进入`、第 1 帧读到空），但这两个**点击**的定位器一直只读一帧——于是
+        `classify_screen` 说「这是入口页」而 `click_entry` 说「找不到进入」，
+        两个读屏器对同一个页面结论相反。
+
+        实机 2026-08-14 一小时内撞了三次：两次「要点『进入』时却读不到它」、
+        一次「要点 START 时却读不到它」。而当场手工用同一套配方读同一个 ROI，
+        **十帧十中**——定位器没毛病，是它读的那一帧正好在过渡。
+
+        每一次失败的代价是整个进程抛异常退出：挂机时这一下就是一整轮没了。
+        """
+        for attempt in range(ENTRY_LOCATE_ATTEMPTS):
+            spot = find(driver.capture())
+            if spot is not None:
+                return spot
+            if attempt + 1 < ENTRY_LOCATE_ATTEMPTS:
+                driver.wait(ENTRY_LOCATE_WAIT_S)
+        return None
+
     def click_start() -> None:
-        spot = start_button(driver.capture())
+        spot = _locate_confirming(start_button)
         if spot is None:
             raise RuntimeError("要点 START 时却读不到它；停止而不是往固定坐标乱点")
         driver.click(*spot, label="START")
 
     def click_entry() -> None:
-        spot = entry_button(driver.capture())
+        spot = _locate_confirming(entry_button)
         if spot is None:
             raise RuntimeError("要点「进入」时却读不到它；停止而不是往固定坐标乱点")
         driver.click(*spot, label=ENTRY_BUTTON_TEXT)
