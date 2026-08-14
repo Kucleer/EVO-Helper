@@ -475,6 +475,93 @@ class LiveDriver:
         time.sleep(seconds)
 
 
+class SlowDragDriver:
+    """把 `LiveDriver` 包成 `game.ranking_nav.RankingDriver` 要的那个操作面。
+
+    多出来的只有分步慢拖的三个原语 `press` / `move_to` / `release`。
+    `LiveDriver.drag` 是一步式的 `dragTo`，游戏面板会把它当成点击
+    （`pirate_loop.slow_drag` 的注释里记着这条实测），而**分步这件事必须发生在
+    `game` 层**——否则 `game.ranking_nav` 就得反过来 import `tools`。
+    所以分步的循环在那边，这里只提供三个原语。同 `pirate_loop._PlanetListDriver`。
+
+    ⚠️ **这一层是有状态的**，而 `LiveDriver` 的其余部分不是。「手指正按着」这个
+    状态就是它单独存在、而不是把三个方法加到 `LiveDriver` 上的理由：按着不放的
+    鼠标是能弄坏用户桌面的东西，把它关在一个用完就扔的小对象里，比让每一条链路
+    共用的驱动多一个模式安全。
+    """
+
+    def __init__(self, driver: LiveDriver) -> None:
+        self._driver = driver
+        #: 按下时的窗口原点，同时兼作「手指按着没有」。整趟拖动共用它——
+        #: 见 `move_to`。
+        self._origin: tuple[int, int] | None = None
+
+    def click(self, x: int, y: int, *, label: str = "") -> None:
+        self._driver.click(x, y, label=label)
+
+    def wait(self, seconds: float) -> None:
+        self._driver.wait(seconds)
+
+    def press(self, x: int, y: int, *, label: str = "") -> None:
+        """抢前台、取原点、移到位、按下。**顺序是有讲究的。**
+
+        先移到位再按下：反过来的话，按下的那一瞬间鼠标还停在上一次的落点上，
+        那一下就成了在别的东西上按下并拖走。
+
+        `_origin` 在碰鼠标**之前**就记上，宁可记早了：`moveTo` 抛出来
+        （pyautogui 的急停就是从这里抛的）时按键状态是不确定的，而多松一次
+        完全无害、漏松一次是把按着的鼠标交还给用户。
+        """
+        import random
+
+        del label  # 慢拖是分步的，`HumanInput` 那条带标签的路径走不通。
+        self._driver.focus()
+        origin_x, origin_y = self._driver.origin()
+        self._origin = (origin_x, origin_y)
+        gui = self._driver._gui  # noqa: SLF001 - 分步控制，`HumanInput` 只有一步式 drag
+        gui.moveTo(origin_x + x, origin_y + y, random.uniform(0.2, 0.4))
+        gui.mouseDown()
+
+    def move_to(self, x: int, y: int) -> None:
+        """拖动途中的一步。**用按下时那个原点，不重新取。**
+
+        `LiveDriver.origin()` 走 `client_box(self.window())`，而 `window()` 会在
+        窗口不见时把游戏重新拉起来——这个调用不便宜，而且有副作用。更要紧的是：
+        每一步重取一次，窗口只要在拖动途中动了一下，后半程就换了一套参照系，
+        这一拖会从中间开始拐弯。
+
+        ⚠️ 这里**不抢前台**。`focus()` 抢不到会退避重试最多 4.5 秒、还会抛异常，
+        而这两件事都发生在手指按着的时候（详见测试）。
+
+        x 上的 ±1 抖动照抄 `pirate_loop.slow_drag`：只抖垂直于榜单滚动方向的那一轴，
+        步长二十几个像素，抖 1px 不会让路径回头。
+        """
+        import random
+
+        if self._origin is None:
+            raise RuntimeError("没有按下就移动：这一拖没有参照系，不动手")
+        origin_x, origin_y = self._origin
+        self._driver._gui.moveTo(  # noqa: SLF001 - 同上
+            origin_x + x + random.randint(-1, 1),
+            origin_y + y,
+            random.uniform(0.02, 0.05),
+        )
+
+    def release(self) -> None:
+        """松手。没按过就什么都不做。
+
+        `ranking_nav._slow_drag` 在 `finally` 里调它，而 `press` 在 `try` 外面
+        ——`press` 还没碰鼠标就失败（抢不到前台）时，这里会在一次都没按下的情况下
+        被调用。那时候发 mouseUp 会**把用户自己正按着的拖动给松开**。
+
+        `mouseUp` 抛了就不清状态，好让下一次 `release` 还能再试一遍。
+        """
+        if self._origin is None:
+            return
+        self._driver._gui.mouseUp()  # noqa: SLF001 - 同上
+        self._origin = None
+
+
 # -- 扫描循环 ------------------------------------------------------------------
 
 
