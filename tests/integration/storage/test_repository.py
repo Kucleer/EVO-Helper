@@ -296,6 +296,59 @@ def test_save_ranking_targets_marks_new_coordinates_and_preserves_scan_source(
     ]
 
 
+def test_a_scan_upgrades_a_coordinate_the_ranking_only_guessed(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **榜单发现的坐标是「未验证」，逐坐标扫过之后必须升级成 scan。**
+
+    榜单里名字是坐标的唯一来源，而区间校验挡不住「合法但错」
+    （`bot_2_121_7` 读成 `bot_2_127_7` 完全合法）。所以两种来源必须分得清。
+
+    这条钉的是**更新已有行**那条分支：先由榜单建行、再被扫描核实。
+    漏掉的话，一个真的扫过的坐标会一直挂着 `ranking`，事后分不清哪些验过。
+    """
+    coordinate = Coordinate(4, 30, 12)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    _plan_id, run_id = _seed_run(session_factory)
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=moment),)
+    )
+
+    repository.save_scan(
+        CoordinateScan(run_id=run_id, coordinate=coordinate, scanned_at_utc=moment, is_bot=True)
+    )
+
+    with session_factory() as session:
+        row = session.scalars(select(BotTargetRow)).one()
+    assert row.source == "scan"
+    assert row.military_score == 28.5  # 升级来源不该抹掉榜单读到的军力值
+
+
+def test_an_unreadable_score_overwrites_an_existing_one_with_none_not_zero(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **`None` 不是 `0`。** 0 分在这个榜上有含义（经济榜的 bot 就是 0），
+    把「这次没读出来」写成 0 就是造一条假数据，而分档正是按这个数切的。
+
+    这条钉的是**更新已有行**那条分支：上一轮读到了、这一轮没读到。
+    """
+    coordinate = Coordinate(4, 30, 12)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=moment),)
+    )
+
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=None, military_score_at_utc=moment),)
+    )
+
+    with session_factory() as session:
+        row = session.scalars(select(BotTargetRow)).one()
+    assert row.military_score is None
+
+
 def test_save_ranking_targets_rejects_naive_timestamp(repository) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         repository.save_ranking_targets(
