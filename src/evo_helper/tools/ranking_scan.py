@@ -78,47 +78,26 @@ def release_stuck_mouse(driver: LiveDriver) -> None:
 
 
 def ensure_in_game(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> bool:
-    """确认画面在游戏里；掉回入口页就点一次「进入」。返回「现在在游戏里」。
+    """确认画面在游戏里；不在就交给 `SessionKeeper` 走完整条入口序列。
 
-    ⚠️ **挂机整夜必须有这一步。** 会话闲置会掉回入口页（实测 2026-08-15 闲置四
-    小时就掉了），而 `open_military_ranking` 在那种画面上只会抛 `RankingNotReached`
-    ——外面的 bat 于是每两分钟重试一次，一整夜空转，什么都采不到。
+    ⚠️ **不要自己手写这一段。** 2026-08-15 实机：原先这里只认「进入」那一页，
+    于是会话掉回 **START 页**时读到全空、如实拒绝，一整趟采集起不来——而画面
+    好好的，只差点一下 START。
 
-    ⚠️ **空结果不是证据。** 入口页有淡入动画，那一帧读「进入」会读到空串
-    （实测撞到过）。所以逐次重读，读到了才点；八次都读不出来就如实返回 False，
-    **绝不朝着一个认不出的画面盲点**。
+    `SessionKeeper` 认得 ENTRY / START / 掉线弹窗 / 会话已死 / 服务器维护五种，
+    每一种的善后都不一样（点「进入」/ 点 START / 点掉弹窗 / 关窗重开 / 点「知道了」），
+    而且那几条都是实机踩出来的。重写一份必然漏，漏掉的那种就是下一次卡整夜的。
     """
-    from evo_helper.game.ranking_nav import merged_labels, nav_label_words
-    from evo_helper.tools.scan_coordinates import (
-        ENTRY_BUTTON_ROI,
-        ENTRY_BUTTON_TEXT,
-        ENTRY_UPSCALE,
-        make_ocr,
-    )
+    del attempts  # 重试与等待都由 SessionKeeper 自己管
+    from evo_helper.tools.scan_coordinates import make_ocr, make_session_keeper
 
-    read = make_ocr()
-    seen: list[str] = []
-    for _ in range(attempts):
-        if len(merged_labels(nav_label_words(driver.capture(), ocr))) >= 4:
-            return True
-        text = read(driver.capture().crop(ENTRY_BUTTON_ROI), digits=False, upscale=ENTRY_UPSCALE)
-        seen.append(text)
-        if ENTRY_BUTTON_TEXT in text:
-            left, top, right, bottom = ENTRY_BUTTON_ROI
-            driver.click((left + right) // 2, (top + bottom) // 2, label=ENTRY_BUTTON_TEXT)
-            break
-        driver.wait(1.0)
-    else:
-        print(f"认不出入口页也不在游戏里，不点；逐次读到 {seen}")
-        return False
-
-    # 登录要时间。实测 2026-08-15（有游戏活动、卡顿）用了 111 秒。
-    for _ in range(40):
-        driver.wait(3.0)
-        if len(merged_labels(nav_label_words(driver.capture(), ocr))) >= 4:
-            return True
-    print("点完「进入」等了两分钟仍没进游戏")
-    return False
+    del ocr
+    outcome = make_session_keeper(driver, make_ocr()).ensure_connected(force=True)
+    if outcome is None:
+        return True
+    if not outcome.ready:
+        print(f"进不去游戏：{outcome.state.value} — {outcome.detail}")
+    return bool(outcome.ready)
 
 
 def name_column_text(image: Any, ocr: Any, columns: RankingColumns | None = None) -> str:
