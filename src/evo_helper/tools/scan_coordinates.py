@@ -672,6 +672,16 @@ DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
 
+#: 服务器维护公告：标题横栏与「知道了」按钮。实机 2026-08-15 03:30 量的
+#: （`var/logs/rankv/B0-dialog.png`）。
+#:
+#: 标题**不能**和掉线弹窗共用 `DISCONNECT_TEXT_ROI`：那块 ROI 在 y=440–500，
+#: 而公告在那个位置上是正文（整段话，OCR 出来碎）。标题「服务器维护」在
+#: y=295–325 一条独立横栏里，读得稳。
+MAINTENANCE_TEXT_ROI = (750, 295, 1170, 325)
+MAINTENANCE_BUTTON = (958, 783)
+MAINTENANCE_UPSCALE = 3
+
 #: 判定当前是哪一屏时最多取几帧。入口页在做明暗动画，实测约一半的帧什么都读不出
 #: （见 `observe` 的注释）。4 帧足够：实测空帧与好帧大致交替，连着 4 帧全空的概率
 #: 可以忽略，而代价只有认不出时才付。
@@ -749,6 +759,24 @@ def make_session_keeper(
             return state
         return None
 
+    def maintenance_notice(image: Any) -> ScreenState | None:
+        """服务器维护公告在不在。不是就返回 None。
+
+        ⚠️ **2026-08-15 03:30 实机：这一屏把整晚堵死了。** 服务器停机维护，
+        公告盖在 START 页上，而 `START_ROI` 那个位置上坐着的是公告的「知道了」
+        ——`start_button` 于是一遍遍读到「知道了」、一遍遍判「读不出 START」，
+        bot 链路空转了二十分钟，一发都没派。
+        """
+        text = ocr(image.crop(MAINTENANCE_TEXT_ROI), digits=False, upscale=MAINTENANCE_UPSCALE)
+        return ScreenState.MAINTENANCE if classify_screen(text) is ScreenState.MAINTENANCE else None
+
+    def dismiss_notice() -> None:
+        # 同 `dismiss_disconnect`：**先回读确认公告真的在**，再点。
+        # 认不出就停止，而不是朝固定坐标乱点。
+        if maintenance_notice(driver.capture()) is not ScreenState.MAINTENANCE:
+            raise RuntimeError("要关维护公告时却读不到标题；停止而不是往固定坐标乱点")
+        driver.click(*MAINTENANCE_BUTTON, label="知道了")
+
     def observe() -> ScreenState:
         """多取几帧再下结论。**单帧在会动的页面上是抛硬币。**
 
@@ -781,6 +809,11 @@ def make_session_keeper(
         # **掉线要排在导航条之前判。** 弹窗是浮层，底下的导航条还在画面上，
         # 「商店/联盟」照样读得出来——先判导航条就会把死会话认成在线，
         # 之后每一步点击都石沉大海，而且全程不报错。实机上确认过这一屏。
+        # ⚠️ 维护公告排在最前，理由同下面掉线那一段：它是浮层，底下的 START
+        # 与导航条照样读得出来，后判就会把一台停机的服务器认成「在 START 页上」。
+        notice = maintenance_notice(image)
+        if notice is not None:
+            return notice
         popup = disconnect_screen(image)
         if popup is not None:
             return popup
@@ -849,6 +882,7 @@ def make_session_keeper(
         click_entry=click_entry,
         click_start=click_start,
         dismiss_disconnect=dismiss_disconnect,
+        dismiss_notice=dismiss_notice,
         restart_window=restart_window or restart_game_window_now,
         log=say,
         clock=clock,
