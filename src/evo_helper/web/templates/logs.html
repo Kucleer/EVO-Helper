@@ -160,6 +160,12 @@
           <td><a href="/targets/{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}?back=%2Flogs">{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}</a></td>
           <td class="muted">{{ entry.origin.galaxy }}:{{ entry.origin.system }}:{{ entry.origin.position }}</td>
           <td>
+            {# 侦察发与攻击发在这一页混排，而它们等的东西完全不同（见右边那一格）。
+               色永远配一个字形和一个词——控制台要在灰度下、对色盲用户也读得懂。 #}
+            {% if entry.mission_kind %}
+              <span class="chip {{ mission_kind_tones.get(entry.mission_kind, '') }}">
+                <span class="glyph" aria-hidden="true">{{ mission_kind_glyphs.get(entry.mission_kind, '•') }}</span>{{ mission_kind_labels.get(entry.mission_kind, entry.mission_kind) }}</span>
+            {% endif %}
             {{ entry.preset_name }}
             <div class="muted" style="font-size:11px">{{ entry.preset_signature }}</div>
           </td>
@@ -176,7 +182,19 @@
           </td>
           <td>
             {# 海盗战报只记胜负与战损总数，所以这一格就是战果的全部。 #}
-            {% if entry.outcome is none %}
+            {#
+              ⚠️ **侦察发先分流出去。** 侦察不产生战报（它产出的是侦察报告，走
+              `scout_reports` 那张表），落到下面那条「没战报 → 待战报」上就是
+              永远等一个不会来的东西。实机 2026-08-13 通宵：111 发侦察全部挂着
+              「待战报」，而其中不少早就把攻击带出去了——攻击都打完了，它的侦察
+              还显示「待战报」，这一格自己打自己的脸。
+            #}
+            {% if entry.mission_kind == 'SCOUT' %}
+              {% set scout_state = 'SCOUT_BACK' if entry.scout_report_back else 'SCOUT_WAITING' %}
+              <span class="chip {{ scout_tones.get(scout_state, '') }}">
+                <span class="glyph" aria-hidden="true">{{ scout_glyphs.get(scout_state, '') }}</span>{{ scout_labels.get(scout_state, scout_state) }}</span>
+              <div class="muted" style="font-size:11px">侦察发没有战报</div>
+            {% elif entry.outcome is none %}
               {# 还没战报是常态，不是一种要上色的状态——每行都挂个黄 chip 只会
                  让真正读到胜负的那几行不显眼。下拉框里它叫「待战报」，同一个词。 #}
               <span class="muted">{{ result_labels.get('AWAITING', '待战报') }}</span>

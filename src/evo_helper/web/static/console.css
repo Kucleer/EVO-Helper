@@ -171,6 +171,15 @@ body {
 .chip.kind-bot { color: var(--accent-strong); border-color: #1f5462; }
 .chip.kind-pirate { color: var(--pirate); border-color: #4c2f5e; }
 
+/* 发次类型（侦察 / 攻击）。用户口径 2026-08-14：「预设中的侦查和攻击需要标记
+   不同颜色」。同上一条的理由，**不借 ok/warn/danger**：侦察和攻击之间没有好坏，
+   借状态色会让人以为侦察行出了问题。
+
+   这两档与 kind-bot/kind-pirate **在同一行并排出现**（目标那格是 bot/海盗，
+   预设那格是侦察/攻击），所以色相要岔开：那两个占了青与紫，这里走琥珀与赤。 */
+.chip.kind-scout { color: #d8a657; border-color: #5a4520; }
+.chip.kind-attack { color: #e07a5f; border-color: #5e3327; }
+
 /* ---- stat tiles ----------------------------------------------------- */
 
 .tile { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
