@@ -20,11 +20,13 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    mentions_bot,
     repair_ranks,
 )
 from evo_helper.domain.records import RankingTarget
 from evo_helper.game.ranking_nav import RankingNavigator, ScrollOutcome, nav_label_words
 from evo_helper.game.ranking_ui import (
+    BLIND_SCROLLS,
     NAME_COLUMN,
     RANK_COLUMN,
     RANKING_LIST_MAX_Y,
@@ -56,6 +58,19 @@ def parse_score(text: str) -> float | None:
         return None
     value = float(match.group(1))
     return value * {"K": 1_000.0, "M": 1_000_000.0, None: 1.0}[match.group(2)]
+
+
+def name_column_text(image: Any, ocr: Any, columns: RankingColumns | None = None) -> str:
+    """把**整条名字列**一次读出来（多行）。翻真人段时只需要这一个。
+
+    ⚠️ 这是「便宜的那一半」：逐格细读一屏要 13 行 × 3 列 = 39 次 OCR，
+    而真人段占了整整 73 屏（bot 从第 ~587 名才开始，实测 8 名/滚）。
+    在那 73 屏里三列全读是纯浪费——那一段里唯一要回答的问题只有
+    「到 bot 区了没有」。
+    """
+    columns = columns or RankingColumns()
+    box = (columns.name[0], ROW_FIRST_Y - 25, columns.name[1], RANKING_LIST_MAX_Y)
+    return _read_cell(image.crop(box), ocr, single_line=False)
 
 
 def is_self_row(name: str, player_name: str) -> bool:
@@ -141,7 +156,13 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
     ]
 
 
-def scan(columns: RankingColumns | None = None) -> int:
+def scan(
+    columns: RankingColumns | None = None,
+    *,
+    blind_scrolls: int = BLIND_SCROLLS,
+    human_scrolls: int = 140,
+    bot_scrolls: int = 40,
+) -> int:
     """跑一趟榜单采集。返回 0 = 正常到底，2 = 中途离页（多半断线）。
 
     ⚠️ **离页也要入库。** 原先这里 `return 2` 排在 `save_ranking_targets` 前面，
@@ -172,42 +193,69 @@ def scan(columns: RankingColumns | None = None) -> int:
     # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
     # 那是这条链路的硬红线。放在外面就没有「记得判断开没开」这回事：
     # 抛出去的时候根本走不到 finally。
-    initial = list(nav.open_military_ranking())
+    nav.open_military_ranking()
 
-    screens: list[list[RankingTarget]] = [targets_from_rows(initial, observed_at=datetime.now(UTC))]
+    screens: list[list[RankingTarget]] = []
     outcome = 0
     try:
-        previous_top = initial[0].name if initial else ""
-        window: tuple[int, ...] = (progress_mark(initial),)
-        scrolls = 0
-        while True:
-            step = nav.scroll_once()
-            scrolls += 1
-            if step.outcome is ScrollOutcome.OFF_PAGE:
-                print(f"第 {scrolls} 次滚动后离页（多半断线）；丢掉最后一屏，其余照常入库")
+        # -- 第一段：翻真人段，只问「到 bot 区了没有」 ----------------------
+        #
+        # 用户口径（2026-08-15）：「你应该不停的滚屏，直到你识别到了 bot 关键字，
+        # 这样就可以了，然后再开始取军力」。
+        #
+        # ⚠️ **这一段刻意不判「滚到底了没有」。** 那条判据建在名次 OCR 上，而名次
+        # 恰恰是唯一读不准的一列（榜首的 1–2 位数尤其串），实机 2026-08-15 连着
+        # 假阳性四次。而 bot 名字是纯 ASCII、读得稳——把判据换到读得准的信号上，
+        # 整段就不需要那条判据了。这一段只靠 `human_scrolls` 兜底。
+        # 头 `blind_scrolls` 屏连检测都省了——那一段**必定**还在真人区。
+        for _ in range(blind_scrolls):
+            nav.scroll_blind()
+        scrolled = blind_scrolls
+        if blind_scrolls:
+            print(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
+
+        marker = name_column_text(driver.capture(), ocr, columns)
+        while not mentions_bot(marker):
+            if scrolled >= human_scrolls:
+                print(f"翻满 {human_scrolls} 屏仍没见到 bot；本轮到此为止")
                 outcome = 2
                 break
-            rows = list(step.rows)
-            # 打点：滚动到底是不是真的在推进，实机上要盯的就是这两个数
-            top = rows[0].name if rows else ""
-            ranks = [row.rank for row in rows if row.rank]
-            print(
-                f"  第{scrolls:>3}滚 名次 {min(ranks) if ranks else '?'}"
-                f"-{max(ranks) if ranks else '?'} 首行 {previous_top!r}->{top!r} "
-                f"{'（没动）' if top == previous_top else ''}"
-            )
-            previous_top = top
+            nav.scroll_blind()
+            scrolled += 1
+            marker = name_column_text(driver.capture(), ocr, columns)
+            if not marker:
+                # 整条名字列一个字都读不出来 = 已经不在榜单页上（多半断线）。
+                # 这同时是「只在刚确认过的画面上按下手指」那条不变式的把关点。
+                print(f"翻真人段第 {scrolled} 屏之后名字列全空；已离页")
+                outcome = 2
+                break
+            if scrolled % 10 == 0:
+                print(f"  翻真人段 {scrolled} 屏…")
+        else:
+            print(f"翻了 {scrolled} 屏到达 bot 区")
+
+        # -- 第二段：细读三列 ------------------------------------------------
+        if outcome == 0:
+            rows = read_rows()
             screens.append(targets_from_rows(rows, observed_at=datetime.now(UTC)))
-            window, done = track_progress(window, progress_mark(rows))
-            if done:
-                print(f"名次 {SCROLL_STALL_CONFIRMATIONS} 屏没往前走（{window}）：到底了")
-                break
-            if step.outcome is ScrollOutcome.EXHAUSTED:
-                break
+            dry = 0
+            for extra in range(1, bot_scrolls + 1):
+                step = nav.scroll_once()
+                if step.outcome is ScrollOutcome.OFF_PAGE:
+                    print(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
+                    outcome = 2
+                    break
+                rows = list(step.rows)
+                fresh = targets_from_rows(rows, observed_at=datetime.now(UTC))
+                # ⚠️ **停止判据建在 bot 名字上，不在名次上。** 名字是这一层唯一
+                # 读得准的东西；连着几屏一个新 bot 都没有，才算这一段跑完了。
+                dry = 0 if fresh else dry + 1
+                screens.append(fresh)
+                print(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
+                if dry >= SCROLL_STALL_CONFIRMATIONS:
+                    print(f"连续 {dry} 屏没有新 bot：这一段到头了")
+                    break
     finally:
-        # ⚠️ 只有真的开出面板才收尾。`open_military_ranking` 在读标签行那一步就
-        # 失败时面板压根没开，这时点 `RANKING_CLOSE`(750, 71) 就是**在认不出的
-        # 画面上点击**——那是这条链路的硬红线。
         if not nav.close():
             print("排行榜已关闭，但导航条还原未确认")
 
@@ -315,11 +363,13 @@ def _rank_of(text: str) -> int | None:
     return int(match.group()) if match is not None else None
 
 
-def _read_cell(cell: Any, ocr: Any) -> str:
+def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
+    """灰度、**不二值化**、3× LANCZOS。单格用 `--psm 7`，整条列用 `--psm 6`。"""
     from PIL import Image
 
     grey = cell.convert("L").resize((cell.width * 3, cell.height * 3), Image.Resampling.LANCZOS)
-    return str(ocr.image_to_string(grey, lang="eng", config="--psm 7")).strip()
+    config = "--psm 7" if single_line else "--psm 6"
+    return str(ocr.image_to_string(grey, lang="eng", config=config)).strip()
 
 
 __all__ = [
@@ -327,6 +377,7 @@ __all__ = [
     "progress_mark",
     "is_self_row",
     "keep_screens",
+    "name_column_text",
     "main",
     "parse_score",
     "rows_from_image",

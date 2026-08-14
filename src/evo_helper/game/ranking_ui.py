@@ -219,6 +219,35 @@ ROW_CROP_HALF_HEIGHT = 15
 #: **只用来估时间，不用来算行**：滚动带惯性，按它外推行号必错。
 ROWS_PER_SCROLL = 8.3
 
+#: 开榜之后先**盲拖**几屏：那一段必定还在真人区，连「到 bot 区了没有」都不用问。
+#:
+#: 用户建议（2026-08-15）：「当你获得了每秒拖动的轮数时，你甚至可以直接默认先拖个
+#: 1 分钟」。实测 12.3 秒/屏，一分钟约 5 屏——但真正的约束不是时间，是**别拖过头**。
+#:
+#: 取 40 的算法：bot 从第 ~587 名开始；推进速率实测 8.0 名/屏，而那是今天（有游戏
+#: 活动、卡顿）的数，不卡时只会更快。按一个保守的**上界** 12 名/屏 算，
+#: 40 屏最多推进 480 名 < 587 —— 怎么都到不了 bot 区。
+#:
+#: ⚠️ **宁可少拖，不可多拖。** 少拖只是多花几次廉价检测（一屏一次整列 OCR）；
+#: 多拖会**直接跳过榜首那批 bot**，而那批正是军力最高、最该先看到的。
+#: 这个数要在实机上重新评估过再往上调（用户口径：等实际执行之后再评估）。
+BLIND_SCROLLS = 40
+
+#: bot 起始名次（实测 2026-08-15）。只用来给 `BLIND_SCROLLS` 算余量，
+#: **不作为判据**——判据是名字反解得出坐标（见 `domain.ranking.bot_rows`），
+#: 真人数量会变，写死名次下次刷新就错了。
+FIRST_BOT_RANK = 587
+
+#: 单屏实测推进多少名（2026-08-15，49 屏推进 392 名 = 8.0）。
+RANKS_PER_SCROLL_MEASURED = 8
+
+#: 单屏推进的**上界**估计。只用来给 `BLIND_SCROLLS` 算余量。
+#:
+#: ⚠️ 必须**严格大于**实测值：那天有游戏活动、卡顿明显，不卡时只会更快。
+#: 拿实测值当上界的话，余量就没了——而余量没了意味着盲拖可能拖过 bot 起点，
+#: 直接跳过榜首那批军力最高的 bot。
+RANKS_PER_SCROLL_MAX = 12
+
 #: 连续几次「最大名次没往前走」才算滚到底了。
 #:
 #: ⚠️ **不能只看「两屏 OCR 输出完全相等」**（`ranking_nav.scroll_once` 那条）。
@@ -263,6 +292,8 @@ REREAD_WAIT_S = 0.6
 
 __all__ = [
     "ALLIANCE_TAB",
+    "BLIND_SCROLLS",
+    "FIRST_BOT_RANK",
     "DRAG_PRESS_HOLD_S",
     "DRAG_RELEASE_HOLD_S",
     "DRAG_STEPS",
@@ -280,6 +311,8 @@ __all__ = [
     "PANEL_OPEN_WAIT_S",
     "PLAYER_TAB",
     "RANKING_CLOSE",
+    "RANKS_PER_SCROLL_MAX",
+    "RANKS_PER_SCROLL_MEASURED",
     "RANKING_LABEL",
     "RANKING_LIST_MAX_Y",
     "READ_ATTEMPTS",

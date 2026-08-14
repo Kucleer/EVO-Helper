@@ -13,6 +13,7 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    mentions_bot,
     repair_ranks,
 )
 
@@ -188,3 +189,43 @@ def test_there_is_no_single_screen_test_for_which_board_this_is() -> None:
     assert all(row.score for row in top_of_economy)
     assert all(row.score for row in top_of_military)
     assert [r.score for r in top_of_economy] == [r.score for r in top_of_military]
+
+
+# -- 翻到 bot 区了没有 ----------------------------------------------------------
+
+
+def test_a_bot_shaped_name_anywhere_in_the_strip_counts() -> None:
+    """⚠️ 用户口径（2026-08-15）：「不停的滚屏，直到你识别到了 bot 关键字」。
+
+    翻真人段时把**整条名字列**读一次就够，不必逐格细读三列——那一段有 73 屏
+    （bot 从第 ~587 名才开始，实测 8 名/滚），细读是纯浪费。
+    """
+    strip = """探险12
+资源32
+bot_4_155_13
+探险19"""
+
+    assert mentions_bot(strip)
+
+
+def test_a_human_called_goodbot_does_not_count() -> None:
+    """⚠️ **不能用子串 `bot` 判。** 实机 2026-08-15 第 7 名就是真人 `goodbot`，
+    而它在开榜第一屏上——用子串判的话，一屏都还没翻就宣布「到 bot 区了」。
+    """
+    assert not mentions_bot("[7] goodbot UNSE 76.66M")
+    assert not mentions_bot("Rambo42088")
+
+
+def test_the_shape_survives_the_ocr_variants_seen_live() -> None:
+    """实机读到过大小写变体和空格分隔符，都要认得。"""
+    assert mentions_bot("Bot_1_1_1")
+    assert mentions_bot("bot 8 352 15")
+
+
+def test_the_range_check_is_not_this_functions_job() -> None:
+    """只看形状，不校验区间——区间是 `coordinate_of` 的事。
+
+    这里宁可宽：判早了只多读几屏，判晚了会一直翻不到头。
+    """
+    assert mentions_bot("bot_2_1121_7")  # 1121 越界，但形状对
+    assert coordinate_of("bot_2_1121_7") is None  # 真正的把关在这儿

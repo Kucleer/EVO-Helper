@@ -22,6 +22,7 @@ from evo_helper.game.ranking_ui import (
 from evo_helper.tools.ranking_scan import (
     is_self_row,
     keep_screens,
+    name_column_text,
     parse_score,
     progress_mark,
     rows_from_image,
@@ -70,7 +71,13 @@ class _Image:
 
 
 class _Ocr:
-    def image_to_string(self, cell: _Cell, **_kwargs: object) -> str:
+    """假 OCR。**记下 config**——「整条列用 psm 6 而不是 psm 7」是配方的一部分。"""
+
+    def __init__(self) -> None:
+        self.configs: list[str] = []
+
+    def image_to_string(self, cell: _Cell, **kwargs: object) -> str:
+        self.configs.append(str(kwargs.get("config", "")))
         return cell.text
 
 
@@ -333,3 +340,27 @@ def test_a_half_scrolled_board_is_never_called_finished_early() -> None:
     for mark in (10, 10):
         window, done = track_progress(window, mark)
         assert not done
+
+
+def test_the_whole_name_column_is_read_as_multiple_lines() -> None:
+    """⚠️ **整条名字列要用 `--psm 6`（多行），不是 `--psm 7`（单行）。**
+
+    翻真人段时靠一次整列 OCR 回答「到 bot 区了没有」。用单行模式的话，
+    十三行里只读得出一行——bot 可能就在没读到的那十二行里，于是一路翻到
+    预算耗尽也「没见到 bot」。
+
+    单格细读仍然是 `--psm 7`：那才是真的单行。
+    """
+    ocr = _Ocr()
+
+    name_column_text(_Image({0: ("[1]", "bot_4_30_12", "29.59K")}), ocr)
+
+    assert ocr.configs == ["--psm 6"]
+
+
+def test_single_cells_are_still_read_as_one_line() -> None:
+    ocr = _Ocr()
+
+    rows_from_image(_Image({0: ("[1]", "halo", "115.9M")}), ocr)
+
+    assert set(ocr.configs) == {"--psm 7"}

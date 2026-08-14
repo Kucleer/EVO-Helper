@@ -14,6 +14,8 @@ from math import hypot
 
 from evo_helper.game.ranking_ui import (
     ALLIANCE_TAB,
+    BLIND_SCROLLS,
+    FIRST_BOT_RANK,
     MILITARY_TAB,
     NAV_BAR_Y,
     NAV_DRAG_FROM_X,
@@ -23,6 +25,8 @@ from evo_helper.game.ranking_ui import (
     PLAYER_TAB,
     RANKING_CLOSE,
     RANKING_LIST_MAX_Y,
+    RANKS_PER_SCROLL_MAX,
+    RANKS_PER_SCROLL_MEASURED,
     RECHARGE_KEEPOUT_CENTER,
     RECHARGE_KEEPOUT_PX,
     ROW_FIRST_Y,
@@ -138,3 +142,25 @@ def test_one_scroll_advances_less_than_a_screenful_so_no_rank_is_skipped() -> No
     visible_rows = (ROW_LAST_Y - ROW_FIRST_Y) / ROW_PITCH_PX + 1
 
     assert ROWS_PER_SCROLL < visible_rows
+
+
+def test_the_blind_drag_can_never_overshoot_the_first_bot() -> None:
+    """⚠️ **宁可少拖，不可多拖。**
+
+    开榜之后先盲拖几屏省掉检测（用户建议 2026-08-15：「直接默认先拖个 1 分钟」）。
+    少拖只是多花几次廉价检测；**多拖会直接跳过榜首那批 bot**——而那批正是军力
+    最高、最该先看到的，也正是用户「先扫前 10-20 就出发」要的那批。
+
+    所以这个数不是按时间定的，是按余量定的：按推进速率的**上界**算，盲拖那一段
+    也够不到 bot 起点。速率上界取 12 名/屏（实测 8.0，那还是卡顿时的数）。
+    """
+    assert BLIND_SCROLLS * RANKS_PER_SCROLL_MAX < FIRST_BOT_RANK
+
+
+def test_the_upper_bound_really_is_above_the_measured_rate() -> None:
+    """⚠️ 上界拿实测值填就没有余量了。
+
+    实测那天（2026-08-15）有游戏活动、卡顿明显，8.0 名/屏是**偏慢**的一天。
+    不卡时只会更快，而余量没了就意味着盲拖可能越过 bot 起点。
+    """
+    assert RANKS_PER_SCROLL_MAX > RANKS_PER_SCROLL_MEASURED

@@ -262,6 +262,21 @@ class RankingNavigator[RowT]:
             return ScrollStep(ScrollOutcome.EXHAUSTED, after)
         return ScrollStep(ScrollOutcome.SCROLLED, after)
 
+    def scroll_blind(self) -> None:
+        """拖一屏，**不读也不判**。翻长段时用。
+
+        ⚠️ 与 `scroll_once` 的差别只有一处：不在按下手指之前重读一遍。
+        代价由调用方补上——它每拖完一次都要自己读一次并确认还在榜单上，
+        于是「只在刚确认过的画面上按下手指」这条不变式仍然成立，
+        只是确认发生在**上一轮的末尾**而不是这一轮的开头。
+
+        为什么值得省这一次：翻真人段要 73 屏（bot 从第 ~587 名才开始，
+        实测 8 名/滚），而 `scroll_once` 每屏读两遍。那一段里唯一要回答的问题
+        是「到 bot 区了没有」——一次廉价的整列 OCR 就够，不必读两遍全表。
+        """
+        self._slow_drag(SCROLL_X, SCROLL_FROM_Y, SCROLL_X, SCROLL_TO_Y, label="榜单下滚")
+        self.driver.wait(SCROLL_SETTLE_WAIT_S)
+
     # -- 收尾 ---------------------------------------------------------------
 
     def close(self) -> bool:
