@@ -51,6 +51,7 @@ from evo_helper.application.mission_supervisor import (
     StopReason,
 )
 from evo_helper.domain.bot_round import BotPhase, phase_of
+from evo_helper.domain.distance import nearest_first
 from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
@@ -1059,9 +1060,18 @@ class MissionScheduler:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
             )
-        return bot_command(
-            bot_targets_in_range(self._bot_targets(), **_bot_range(params_json)), origin=origin
-        )
+        # ⚠️ **筛范围与排顺序是两件事，分两步写。**
+        #
+        # 排序按「离这个任务自己的 `origin` 由近到远」（`domain.distance`）。
+        # 一夜的航线有限，而近目标的往返比远目标短一个量级（同银河近距离约
+        # 20–30 分钟，跨银河约 2.6 小时，都是实机读到的）：同样 6 条航线，
+        # 先打近的能派十几发，先打远的只能派两三发。
+        #
+        # 原先没有这一步，目标顺序就是库里的返回顺序（大致按坐标升序）。实机
+        # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
+        # 而一夜只走到第 121 系——后面那些永远轮不到。
+        targets = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
+        return bot_command(nearest_first(targets, origin), origin=origin)
 
 
 def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: int) -> TaskSnapshot:
