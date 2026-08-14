@@ -117,6 +117,13 @@ class BotTargetRow(Base):
     last_attack_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_dispatch_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 坐标扫描已核验；排行榜只从名字反解，可能是合法但错误的 OCR 结果。
+    source: Mapped[str] = mapped_column(String(16), default="scan", server_default="scan")
+    military_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    military_score_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    military_score_estimated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
 
 
 class AttackIntentRow(Base):

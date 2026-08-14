@@ -46,6 +46,16 @@ class CoordinateScan:
 
 
 @dataclass(frozen=True)
+class RankingTarget:
+    """军事榜读出的 bot；坐标尚未经过逐坐标面板核验。"""
+
+    coordinate: Coordinate
+    military_score: float | None
+    military_score_at_utc: datetime
+    military_score_estimated: bool = False
+
+
+@dataclass(frozen=True)
 class AttackIntent:
     intent_id: UUID
     run_id: UUID

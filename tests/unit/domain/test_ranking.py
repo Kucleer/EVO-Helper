@@ -13,6 +13,7 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    is_military_board,
     repair_ranks,
 )
 
@@ -165,3 +166,14 @@ def test_bots_are_told_apart_by_name_not_by_rank() -> None:
     ]
 
     assert [row.name for row in bot_rows(rows)] == ["bot_4_30_12"]
+
+
+def test_only_a_non_zero_score_confirms_the_military_board() -> None:
+    """经济榜的 bot 分数全为 0；读空不能被误判成切对了页签。"""
+    economic = [RankingRow(rank=639, name="bot_4_30_12", score=0.0, coordinate=None)]
+    military = [RankingRow(rank=639, name="bot_4_30_12", score=29.59, coordinate=None)]
+    unreadable = [RankingRow(rank=639, name="bot_4_30_12", score=None, coordinate=None)]
+
+    assert not is_military_board(economic)
+    assert is_military_board(military)
+    assert not is_military_board(unreadable)

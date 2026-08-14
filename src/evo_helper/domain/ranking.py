@@ -212,6 +212,15 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
     return [row for row in rows if row.coordinate is not None]
 
 
+def is_military_board(rows: Sequence[RankingRow]) -> bool:
+    """这一屏不是「分数列全 0」的经济榜，才准当作军事榜。
+
+    分数读空不能反证页签：OCR 在加载帧可能一格也读不出来。反过来，只要读到
+    一个非零分数，经济榜的实机形状就不成立，可以确认是军事榜。
+    """
+    return any(row.score not in (None, 0.0) for row in rows)
+
+
 __all__ = [
     "POSITIONS_PER_SYSTEM",
     "RankingRow",
@@ -219,5 +228,6 @@ __all__ = [
     "coordinate_of",
     "descending_breaks",
     "interpolate_scores",
+    "is_military_board",
     "repair_ranks",
 ]

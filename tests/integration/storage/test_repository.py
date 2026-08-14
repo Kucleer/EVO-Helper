@@ -16,6 +16,7 @@ from evo_helper.domain.records import (
     BattleReport,
     CoordinateScan,
     FleetSnapshotEntry,
+    RankingTarget,
     StateEvent,
     TargetRevisit,
 )
@@ -261,6 +262,45 @@ def test_save_scan_rejects_naive_timestamp(repository, session_factory) -> None:
     )
     with pytest.raises(ValueError, match="timezone-aware"):
         repository.save_scan(scan)
+
+
+def test_save_ranking_targets_marks_new_coordinates_and_preserves_scan_source(
+    session_factory,
+    repository,
+) -> None:
+    ranked = Coordinate(4, 30, 12)
+    scanned = Coordinate(4, 100, 13)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    _plan_id, run_id = _seed_run(session_factory)
+    repository.save_scan(
+        CoordinateScan(run_id=run_id, coordinate=scanned, scanned_at_utc=moment, is_bot=True)
+    )
+
+    repository.save_ranking_targets(
+        (
+            RankingTarget(ranked, military_score=None, military_score_at_utc=moment),
+            RankingTarget(
+                scanned,
+                military_score=28.5,
+                military_score_at_utc=moment,
+                military_score_estimated=True,
+            ),
+        )
+    )
+
+    with session_factory() as session:
+        rows = session.scalars(select(BotTargetRow).order_by(BotTargetRow.system)).all()
+    assert [(row.source, row.military_score, row.military_score_estimated) for row in rows] == [
+        ("ranking", None, False),
+        ("scan", 28.5, True),
+    ]
+
+
+def test_save_ranking_targets_rejects_naive_timestamp(repository) -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repository.save_ranking_targets(
+            (RankingTarget(Coordinate(4, 30, 12), 29.59, datetime(2026, 8, 14, 1, 0)),)
+        )
 
 
 def test_duplicate_attack_intent_rejected_but_forced_revisit_allowed(

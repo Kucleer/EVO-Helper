@@ -47,6 +47,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "bot_targets.last_dispatch_at_utc",
         "bot_targets.last_report_at_utc",
         "bot_targets.last_scanned_at_utc",
+        "bot_targets.military_score_at_utc",
         "coordinate_scans.scanned_at_utc",
         "daily_reconciliations.reconciled_at_utc",
         "intel_filters.created_at_utc",
@@ -117,8 +118,10 @@ def test_the_migration_covers_every_timestamp_column() -> None:
     要到 Postgres 上才暴露：那一列会留在 ``TIMESTAMP WITHOUT TIME ZONE``，
     而 ORM 已经按 ``TIMESTAMPTZ`` 在写它。
     """
-    migration = _load_migration("b6e0a4f21c98_timestamps_with_timezone")
-    covered = {f"{table}.{column}" for table, column, _ in migration._COLUMNS}
+    original = _load_migration("b6e0a4f21c98_timestamps_with_timezone")
+    ranking = _load_migration("e8b7c1d23a40_ranking_military_scores")
+    covered = {f"{table}.{column}" for table, column, _ in original._COLUMNS}
+    covered.update(f"{table}.{column}" for table, column in ranking._TIMESTAMP_COLUMNS)
 
     assert covered == EXPECTED_TIMESTAMP_COLUMNS
 

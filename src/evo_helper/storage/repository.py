@@ -26,6 +26,7 @@ from evo_helper.domain.records import (
     BattleReport,
     CoordinateScan,
     FleetDiff,
+    RankingTarget,
     ReportHistoryEntry,
     ScoutReport,
     ScoutTriggerShip,
@@ -287,12 +288,45 @@ class SqlAlchemyRepository:
                         is_bot=record.is_bot,
                         latest_owner_name=record.owner_name,
                         last_scanned_at_utc=record.scanned_at_utc,
+                        source="scan",
                     )
                 )
             else:
                 target.latest_owner_name = record.owner_name
                 target.last_scanned_at_utc = record.scanned_at_utc
                 target.is_bot = record.is_bot or target.is_bot
+                # 实机逐坐标读过的证据比排行榜名字反解强，不能被后者降级。
+                target.source = "scan"
+            session.commit()
+
+    def save_ranking_targets(self, targets: Sequence[RankingTarget]) -> None:
+        """把军事榜上的 bot 与分数写进星球列表。
+
+        新发现的坐标标为 ``ranking``，而已由坐标扫描核验过的行保留 ``scan``。
+        军力值为 None 时原样保存，绝不以 0 代替；插值所得的值也必须同时标估算。
+        """
+        with self._session_factory() as session:
+            for record in targets:
+                _require_utc(record.military_score_at_utc, "military_score_at_utc")
+                target = _bot_target_for(session, record.coordinate)
+                if target is None:
+                    session.add(
+                        orm.BotTargetRow(
+                            galaxy=record.coordinate.galaxy,
+                            system=record.coordinate.system,
+                            position=record.coordinate.position,
+                            is_bot=True,
+                            source="ranking",
+                            military_score=record.military_score,
+                            military_score_at_utc=record.military_score_at_utc,
+                            military_score_estimated=record.military_score_estimated,
+                        )
+                    )
+                    continue
+                target.is_bot = True
+                target.military_score = record.military_score
+                target.military_score_at_utc = record.military_score_at_utc
+                target.military_score_estimated = record.military_score_estimated
             session.commit()
 
     def save_attack_intent(self, intent: object) -> None:
