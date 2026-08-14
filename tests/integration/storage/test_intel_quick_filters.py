@@ -1,10 +1,14 @@
-"""情报中心：海盗行、四个判定舰种、以及三个快速过滤（预设 / 结果 / 战果）。
+"""情报中心：海盗不进这张表、四个判定舰种、以及三个快速过滤（预设 / 结果 / 战果）。
 
 这一份钉死三件在实机上出过错的事：
 
-1. **海盗根本进不了这张表。** `bot_targets` 是坐标扫描写的，而海盗是在星系视图上
-   认出来的，一行都不会写进去。只列 `bot_targets` 的话，情报中心里一个海盗都没有，
-   于是侦察报告读到的四个判定舰种永远显示不出来——用户报的就是这一条。
+1. **海盗一行都不进这张表**（用户口径 2026-08-14）。海盗每 24 小时刷新一次，
+   「这颗星球上有什么舰队」对它根本不成立；而情报中心是 bot 星球的**长期台账**，
+   每一行都默认「它明天还是这样」。海盗仍然记在攻击日志里（那一页一行是一次派遣，
+   是流水不是台账）。
+   **收必须收在数据这一侧**：只在模板里跳过的话，「共 N 条」、页码、以及三个下拉框
+   的候选值仍然按含海盗的集合算，总数就和看得见的行数对不上——所以下面既有「行没了」
+   的用例，也有「计数与候选值跟着收了」的用例。
 2. **`NULL` 不是 0。** 数量为 0 的格子在画面上只是一个孤零零的 `0`，实测最容易
    读空；读空当成 0 就是把「没看清」记成「这里是空的」，而整套
    ATTACK / SKIP / UNREADABLE 判定就建立在这个区分上。
@@ -58,6 +62,9 @@ SPAN = parse_coordinate_span("2:1", "2:999")
 BOT = Coordinate(2, 320, 11)
 PIRATE = Coordinate(2, 137, 4)
 SCOUTED_ONLY = Coordinate(2, 137, 9)
+#: 扫描认出来的 bot，身上又挂着一份侦察报告。实机上罕见，但它是「类型判错就丢一行」
+#: 的那个口子：判成海盗就等于把一颗真的 bot 从台账里删掉。
+SCOUTED_BOT = Coordinate(2, 330, 7)
 
 
 @pytest.fixture
@@ -81,8 +88,10 @@ class _Seed:
         self.intel = SqlAlchemyIntelRepository(factory)
         self.run_id = _make_run(factory)
         self._cycle = 0
+        self._scanned: set[Coordinate] = set()
 
     def bot(self, coordinate: Coordinate, *, at: datetime = BASE_TIME) -> None:
+        self._scanned.add(coordinate)
         self.repository.save_scan(
             CoordinateScan(
                 run_id=self.run_id,
@@ -100,13 +109,21 @@ class _Seed:
         *,
         preset: str,
         at: datetime,
-        kind: str = TARGET_KIND_PIRATE,
+        kind: str = TARGET_KIND_BOT,
         dispatched: bool = True,
         accepted: bool = True,
         mission_kind: str = MISSION_KIND_ATTACK,
         outcome: str | None = None,
     ) -> None:
-        """一发派遣：意图 →（可选）派遣 →（可选）战报。"""
+        """一发派遣：意图 →（可选）派遣 →（可选）战报。
+
+        打的是 bot 就顺手把它写进 `bot_targets`（一次坐标扫描）：情报中心的候选集
+        来自那张表，而一发攻击不会往里写一行。实机上每个被打的 bot 都是先扫出来的，
+        夹具照着实机来——不然这里造出来的会是一种现实中不存在的目标，用它测出来的
+        「在不在列表里」也就说明不了什么。
+        """
+        if kind == TARGET_KIND_BOT and coordinate not in self._scanned:
+            self.bot(coordinate, at=at)
         self._cycle += 1
         intent = AttackIntent(
             intent_id=uuid4(),
@@ -182,28 +199,43 @@ def _make_run(factory: sessionmaker[Session]) -> UUID:
     )
 
 
-# -- 海盗行 -------------------------------------------------------------------
+# -- 海盗不进这张表 -----------------------------------------------------------
 
 
-class TestPirateRowsAreListedAtAll:
-    def test_a_scouted_pirate_shows_up_even_though_it_is_not_a_bot_target(
-        self, seed: _Seed
-    ) -> None:
-        """海盗从来不写 `bot_targets`——只列那张表的话，这一行根本不存在。"""
+class TestPiratesAreNotInTheLedger:
+    """海盗每 24 小时刷新，「这颗星球上有什么舰队」对它不成立，所以不进台账。
+
+    海盗进这张表的路一共两条——有侦察报告、有海盗派遣——两条都得堵上；
+    而**堵不能只堵在模板里**，页面上的计数、分页、候选值都要跟着收。
+    """
+
+    def test_a_scouted_pirate_is_not_listed(self, seed: _Seed) -> None:
+        """侦察报告是海盗进这张表的第一条路。"""
         seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 3}, missing=("噬能截击者",))
 
-        rows = seed.rows()
+        assert SCOUTED_ONLY not in seed.rows()
 
-        assert SCOUTED_ONLY in rows
-        assert rows[SCOUTED_ONLY].kind == TARGET_KIND_PIRATE
-
-    def test_a_pirate_that_was_only_ever_attacked_shows_up(self, seed: _Seed) -> None:
-        """一发都没侦察、直接打的海盗，也得在列——派遣自己记着 target_kind。"""
+    def test_a_pirate_that_was_only_ever_attacked_is_not_listed(self, seed: _Seed) -> None:
+        """第二条路：一发都没侦察、直接打的海盗，派遣自己记着 `target_kind`。"""
         seed.attempt(PIRATE, preset="AAA", at=BASE_TIME, kind=TARGET_KIND_PIRATE)
 
-        rows = seed.rows()
+        assert PIRATE not in seed.rows()
 
-        assert rows[PIRATE].kind == TARGET_KIND_PIRATE
+    def test_the_count_and_the_rows_shrink_together(self, seed: _Seed) -> None:
+        """**这条钉的是「计数也跟着收了」。**
+
+        只在渲染那一层跳过海盗的话，行看不见了，但「共 N 条」、页码、还有页脚的
+        「正在看第 1–50 条」仍然按含海盗的集合算——于是第 2 页上一行都没有，
+        而标题写着共 3 条。所以数的和显示的必须是同一批行。
+        """
+        seed.bot(BOT)
+        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME, kind=TARGET_KIND_PIRATE)
+        seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 3})
+
+        page = seed.intel.search(IntelSearchQuery(span=SPAN))
+
+        assert [row.coordinate for row in page.rows] == [BOT]
+        assert page.total == 1
 
     def test_a_bot_target_stays_a_bot(self, seed: _Seed) -> None:
         seed.bot(BOT)
@@ -228,10 +260,28 @@ class TestPirateRowsAreListedAtAll:
         assert empty not in seed.rows()
 
 
-# -- 四个判定舰种：0 与「没读到」 ---------------------------------------------
+# -- 扫出来的 bot + 一份侦察报告：四个判定舰种、0 与「没读到」 -----------------
 
 
-class TestTriggerShipCounts:
+class TestAScannedBotSurvivesAScoutReport:
+    """一颗扫描认出来的 bot，身上又挂着一份侦察报告。
+
+    从前这只是 chip 上错个色的问题；海盗被收掉之后，**类型判错就等于丢一行**——
+    按「有侦察报告 = 海盗」去判，这颗 bot 会连同它的战报一起从台账里消失。
+    所以 `bot_targets` 里那一行（坐标扫描的正面证据）必须压过那条推断。
+
+    这也是侦察那条取数路现在唯一还走得到的地方，「`None` 不是 0」跟着一起钉在这里。
+    """
+
+    def test_a_scout_report_does_not_turn_a_scanned_bot_into_a_pirate(self, seed: _Seed) -> None:
+        seed.bot(SCOUTED_BOT)
+        seed.scout(SCOUTED_BOT, counts={"深空吞噬者": 3}, missing=("噬能截击者",))
+
+        rows = seed.rows()
+
+        assert SCOUTED_BOT in rows
+        assert rows[SCOUTED_BOT].kind == TARGET_KIND_BOT
+
     def test_a_zero_stays_zero_and_an_unread_cell_stays_none(self, seed: _Seed) -> None:
         """**这条是整份文件的重点。**
 
@@ -239,13 +289,14 @@ class TestTriggerShipCounts:
         长得可以一样（都是一小格），含义却相反；把 `None` 折成 0 就是把一支实打实
         的舰队记成空的。
         """
+        seed.bot(SCOUTED_BOT)
         seed.scout(
-            SCOUTED_ONLY,
+            SCOUTED_BOT,
             counts={"深空吞噬者": 0, "钛能守卫者": 7},
             missing=("噬能截击者", "收割者"),
         )
 
-        ships = seed.rows()[SCOUTED_ONLY].scout_ships
+        ships = seed.rows()[SCOUTED_BOT].scout_ships
 
         assert ships["深空吞噬者"] == 0
         assert ships["钛能守卫者"] == 7
@@ -256,21 +307,23 @@ class TestTriggerShipCounts:
         assert set(ships) == {"深空吞噬者", "噬能截击者", "钛能守卫者", "收割者"}
 
     def test_only_the_newest_scout_report_counts(self, seed: _Seed) -> None:
-        """海盗会补船。拿旧报告当现状，下一发就是照着上周的情报打的。"""
-        seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 3}, at=BASE_TIME)
-        seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 88}, at=BASE_TIME + timedelta(days=1))
+        """对方会补船。拿旧报告当现状，下一发就是照着上周的情报打的。"""
+        seed.bot(SCOUTED_BOT)
+        seed.scout(SCOUTED_BOT, counts={"深空吞噬者": 3}, at=BASE_TIME)
+        seed.scout(SCOUTED_BOT, counts={"深空吞噬者": 88}, at=BASE_TIME + timedelta(days=1))
 
-        assert seed.rows()[SCOUTED_ONLY].scout_ships["深空吞噬者"] == 88
+        assert seed.rows()[SCOUTED_BOT].scout_ships["深空吞噬者"] == 88
 
     def test_scout_counts_do_not_leak_into_the_fleet_condition_input(self, seed: _Seed) -> None:
         """侦察报告**不是舰队快照**：它只有四个判定舰种，不是对方的全部家当。
 
         混进 `counts` 的话，「舰队总数 > 2000」这种条件会拿一份只读了四行的报告
-        去算总数，把一个实际上厚得打不动的海盗算成小猫两三只。
+        去算总数，把一个实际上厚得打不动的目标算成小猫两三只。
         """
-        seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 3, "钛能守卫者": 4})
+        seed.bot(SCOUTED_BOT)
+        seed.scout(SCOUTED_BOT, counts={"深空吞噬者": 3, "钛能守卫者": 4})
 
-        row = seed.rows()[SCOUTED_ONLY]
+        row = seed.rows()[SCOUTED_BOT]
 
         assert row.counts == {}
         assert row.total is None
@@ -342,28 +395,32 @@ class TestQuickFiltersUseTheLatestAttempt:
         assert row.preset_name is None
 
     def test_a_dispatched_attack_without_a_report_is_awaiting(self, seed: _Seed) -> None:
-        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME)
+        seed.attempt(BOT, preset="AAA", at=BASE_TIME)
 
-        assert seed.rows()[PIRATE].battle_result == RESULT_AWAITING
+        assert seed.rows()[BOT].battle_result == RESULT_AWAITING
 
     def test_a_scout_leg_is_never_left_waiting_for_a_battle_report(self, seed: _Seed) -> None:
         """侦察发不产生战报，把它算成「待战报」会让页面上永远挂着等不到的行。
 
         PR #95 是在认领那一侧踩的同一个坑：自己那一发侦察被当成了战报候选。
-        """
-        seed.attempt(PIRATE, preset="侦察", at=BASE_TIME, mission_kind=MISSION_KIND_SCOUT)
 
-        row = seed.rows()[PIRATE]
+        判据是 `mission_kind`，不是 `target_kind`：海盗离场之后这一档在页面上暂时
+        碰不到（侦察只对海盗发），但那条分支还在 `_battle_result` 里——哪天 bot 链路
+        也加一发侦察，这条就是它的护栏。
+        """
+        seed.attempt(BOT, preset="侦察", at=BASE_TIME, mission_kind=MISSION_KIND_SCOUT)
+
+        row = seed.rows()[BOT]
 
         assert row.dispatch_state == DISPATCH_SENT
         assert row.battle_result == RESULT_NONE
-        assert PIRATE not in seed.rows(battle_result=RESULT_AWAITING)
+        assert BOT not in seed.rows(battle_result=RESULT_AWAITING)
 
     def test_a_rejected_dispatch_is_not_awaiting_either(self, seed: _Seed) -> None:
         """没飞出去就不会有战报。挂成「待战报」是在等一个永远不来的东西。"""
-        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME, accepted=False)
+        seed.attempt(BOT, preset="AAA", at=BASE_TIME, accepted=False)
 
-        assert seed.rows()[PIRATE].battle_result == RESULT_NONE
+        assert seed.rows()[BOT].battle_result == RESULT_NONE
 
     def test_filters_compose(self, seed: _Seed) -> None:
         """三个一起用是 AND。"""
@@ -382,14 +439,15 @@ class TestQuickFiltersUseTheLatestAttempt:
 
     def test_no_filter_means_no_filter(self, seed: _Seed) -> None:
         """None 是「不筛」，不是「筛一个叫 None 的预设」。"""
-        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME)
+        attacked = Coordinate(2, 211, 2)
+        seed.attempt(attacked, preset="AAA", at=BASE_TIME)
         seed.bot(BOT)
 
-        assert set(seed.rows()) == {PIRATE, BOT}
+        assert set(seed.rows()) == {attacked, BOT}
 
     def test_the_total_count_is_the_filtered_count(self, seed: _Seed) -> None:
         """分页的总数要算筛完之后的，否则页码指向的位置根本没有行。"""
-        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME)
+        seed.attempt(Coordinate(2, 211, 2), preset="AAA", at=BASE_TIME)
         seed.attempt(Coordinate(2, 211, 1), preset="BBB", at=BASE_TIME)
 
         page = seed.intel.search(IntelSearchQuery(span=SPAN, preset="AAA"))
@@ -411,19 +469,32 @@ class TestUnknownFilterValues:
 class TestPresetNames:
     def test_it_lists_what_was_actually_dispatched(self, seed: _Seed) -> None:
         """下拉框的选项来自库，不写死：预设是用户在游戏里配的。"""
-        seed.attempt(PIRATE, preset="AAA", at=BASE_TIME)
-        seed.attempt(Coordinate(2, 212, 1), preset="侦察", at=BASE_TIME)
+        seed.attempt(Coordinate(2, 212, 1), preset="BBB", at=BASE_TIME)
         seed.attempt(Coordinate(2, 212, 2), preset="AAA", at=BASE_TIME)
 
-        assert seed.intel.preset_names() == ["AAA", "侦察"]
+        assert seed.intel.preset_names() == ["AAA", "BBB"]
+
+    def test_a_preset_only_ever_used_on_pirates_is_not_offered(self, seed: _Seed) -> None:
+        """**这条钉的是「候选值也跟着收了」。**
+
+        海盗不在这张表里了（见文件头），而「侦察」这个预设只对海盗用过——留在下拉框
+        里就是留一个**选下去必然是空页**的选项。那比没有这个选项更糟：用户会以为侦察
+        记录被弄丢了，而它们一直在攻击日志里。
+        """
+        seed.attempt(PIRATE, preset="侦察", at=BASE_TIME, kind=TARGET_KIND_PIRATE)
+        seed.attempt(BOT, preset="探路", at=BASE_TIME)
+
+        assert seed.intel.preset_names() == ["探路"]
+        # 候选值与行说的是同一批数据：选项没了，那个筛选原本会命中的行也没了。
+        assert seed.rows(preset="侦察") == {}
 
 
-class TestSortingKeepsPiratesVisible:
-    def test_a_freshly_scouted_pirate_outranks_an_old_battle_report(self, seed: _Seed) -> None:
-        """按「最新情报时间 ↓」排时，海盗行不该整批沉底。
+class TestSortingUsesTheLatestIntelTime:
+    def test_a_fresh_scout_report_outranks_an_old_battle_report(self, seed: _Seed) -> None:
+        """按「最新情报时间 ↓」排时，只有侦察报告的那一行不该沉底。
 
-        海盗一份战报都没有，只按 `snapshot_at` 排的话它们全排在几百行开外——
-        而「刚侦察完的海盗」恰恰是最该顶在前面的一批。
+        排序键是 `intel_at`（战报时间与侦察报告时间取晚的那个），不是 `snapshot_at`：
+        列名写的是「最新情报时间」，而一行的最新情报可以只是一份侦察报告。
         """
         seed.bot(BOT)
         seed.repository.append_report(
@@ -436,20 +507,21 @@ class TestSortingKeepsPiratesVisible:
                 defender_units=319,
             )
         )
-        seed.scout(SCOUTED_ONLY, counts={"深空吞噬者": 1}, at=BASE_TIME + timedelta(days=2))
+        seed.bot(SCOUTED_BOT)
+        seed.scout(SCOUTED_BOT, counts={"深空吞噬者": 1}, at=BASE_TIME + timedelta(days=2))
 
         page = seed.intel.search(IntelSearchQuery(span=SPAN, sort="snapshot_desc"))
 
-        assert [row.coordinate for row in page.rows] == [SCOUTED_ONLY, BOT]
+        assert [row.coordinate for row in page.rows] == [SCOUTED_BOT, BOT]
 
 
 class TestSpanStillBounds:
-    def test_a_pirate_outside_the_span_is_excluded(self, seed: _Seed) -> None:
+    def test_a_target_outside_the_span_is_excluded(self, seed: _Seed) -> None:
         outside = Coordinate(3, 137, 4)
-        seed.scout(PIRATE, counts={"深空吞噬者": 1})
-        seed.scout(outside, counts={"深空吞噬者": 1})
+        seed.bot(BOT)
+        seed.bot(outside)
 
-        assert set(seed.rows()) == {PIRATE}
+        assert set(seed.rows()) == {BOT}
 
     def test_the_span_is_compared_on_the_packed_coordinate(self, seed: _Seed) -> None:
         """**判据在位号上**：区间 `2:130:15` – `2:140:3` 里有 2:135:9。
@@ -466,7 +538,7 @@ class TestSpanStillBounds:
         outside_low = Coordinate(2, 130, 14)
         outside_high = Coordinate(2, 140, 4)
         for coordinate in (inside, low_edge, outside_low, outside_high):
-            seed.scout(coordinate, counts={"深空吞噬者": 1})
+            seed.bot(coordinate)
 
         page = seed.intel.search(
             IntelSearchQuery(span=parse_coordinate_span("2:130:15", "2:140:3"))
