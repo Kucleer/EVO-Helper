@@ -18,7 +18,6 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
-    is_military_board,
     repair_ranks,
 )
 from evo_helper.domain.records import RankingTarget
@@ -115,7 +114,6 @@ def scan(columns: RankingColumns) -> int:
         driver=SlowDragDriver(driver),
         read_labels=lambda: nav_label_words(driver.capture(), ocr),
         read_rows=read_rows,
-        on_military_board=is_military_board,
     )
     collected: list[RankingTarget] = []
     try:

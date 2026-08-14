@@ -7,7 +7,7 @@
     任意一屏
       → 拖底部导航（横向）→ 露出 `太空舱 商店 联盟 排名 设置`
       → **按文本**找「排名」→ 点它当屏读到的那个 x
-      → 排行榜面板 → 切「军事评分」→ **回读确认真的在军事榜上**
+      → 排行榜面板（默认停在**经济评分**）→ **点一次**「军事评分」→ 回读确认还在榜上
       → `scroll_once()` 一屏一屏往下
 
 ## 三条规矩
@@ -31,7 +31,7 @@
 
 **一行长什么样，这一层不关心**（所以类型是参数化的 `RowT`，实机上就是
 `domain.ranking.RankingRow`）。它只对这些行做三件事：看空不空、
-跟上一屏比相等、交给 `on_military_board` 判。原样传出去而不是压成字符串，
+跟上一屏比相等、交给调用方解析。原样传出去而不是压成字符串，
 是为了让调用方拿到的就是它自己解析好的那份，不必为了配合本层再读一遍
 ——那一遍是另一帧画面，两帧之间列表可能已经动过。
 
@@ -55,7 +55,6 @@ from evo_helper.game.ranking_ui import (
     DRAG_RELEASE_HOLD_S,
     DRAG_STEPS,
     MILITARY_TAB,
-    MILITARY_TAB_ATTEMPTS,
     NAV_BAR_Y,
     NAV_DRAG_FROM_X,
     NAV_DRAG_TO_X,
@@ -145,14 +144,13 @@ class RankingNavigator[RowT]:
       那个 x 就是待会儿要点的地方——所以必须是**这一屏**读出来的。
     - `read_rows`：当前这一屏的榜单行，**认不出的丢掉**（见模块头的契约）。
       行是什么类型由调用方定，实机上是 `domain.ranking.RankingRow`。
-    - `on_military_board`：这一屏读到的行是不是军事榜。判据在 `domain.ranking`
-      （实机上的形状是「分数列全 0 就说明还在经济榜」），不在这里。
+    ⚠️ **没有「这一屏是不是军事榜」这个回调**，因为那个判据不存在——见
+    `_switch_to_military`。想看哪个榜就点哪个页签。
     """
 
     driver: RankingDriver
     read_labels: Callable[[], Sequence[tuple[int, str]]]
     read_rows: Callable[[], Sequence[RowT]]
-    on_military_board: Callable[[Sequence[RowT]], bool]
     say: Callable[[str], None] = print
 
     # -- 进榜单 -------------------------------------------------------------
@@ -171,38 +169,37 @@ class RankingNavigator[RowT]:
                 f"点完「{RANKING_LABEL}」之后一行榜单都读不出来："
                 "面板没开出来，或者已经不在榜单页上了（比如断线）"
             )
-        return self._switch_to_military(rows)
+        del rows  # 打开时那一屏是经济榜，没有用；真正要的是切过去之后那一屏
+        return self._switch_to_military()
 
-    def _switch_to_military(self, rows: tuple[RowT, ...]) -> tuple[RowT, ...]:
-        """确认这一屏是军事榜；不是就点「军事评分」，**点完再回读**。
+    def _switch_to_military(self) -> tuple[RowT, ...]:
+        """点一次「军事评分」，回读确认还在榜单上。
 
-        先读后点而不是先点后读：面板本来就停在军事榜时，多点那一下毫无必要，
-        而这一层的规矩是「认出这一屏再动手」。
+        ⚠️ **面板打开时停在「经济评分」**（用户 2026-08-14 实测），所以这一下是必须的，
+        不是可选的兜底。
 
-        回读是这一步的全部意义。两个页签长得一模一样，点过了证明不了切对了——
-        实机 2026-08-14 拿错页签，经济榜上 bot 全是 0 分、按坐标顺序排，
-        看上去也像一份正经数据。判据由 `on_military_board` 给（住在 `domain.ranking`），
-        这里只负责「不确认就不放行」。
+        ⚠️ **页签是幂等的按钮，不是开关**（用户实测：已经在军事榜上再点一次不会切回去）。
+        所以用户的口径是「你不用管现在是什么，你需要看什么，就点什么切换」——
+        先点再说比先判断再点简单，而且**不需要一个单屏判据**。
+
+        ⚠️ **那个单屏判据本来就不存在。** 这里原先有个 `on_military_board` 回调，
+        实机上用的判据是「读到任何非零分数就说明在军事榜」。2026-08-14 当场证伪：
+        两个页签的榜首十三行都是真人、分数都在 404.17M 这个量级，非零判据两边都成立。
+        「经济榜 bot 全是 0」只对第 639 名之后成立，而看到那一段要先滚六十屏。
+
+        回读仍然要做，但它回答的是**另一个**问题：「我还在不在排行榜面板上」
+        （读到 0 行 = 断线或面板没开），不是「我在哪个页签上」。
         """
-        clicked = 0
-        while True:
-            if self.on_military_board(rows):
-                self.say(f"  回读确认在军事榜上（这一屏 {len(rows)} 行，头一行 {rows[0]!r}）")
-                return rows
-            if clicked >= MILITARY_TAB_ATTEMPTS:
-                raise RankingNotReached(
-                    f"点了 {clicked} 次「军事评分」，回读说这仍然不是军事榜；读到的是 {list(rows)}"
-                )
-            self.say(f"  回读说这还不是军事榜（读到 {list(rows[:3])}）；点一下「军事评分」")
-            self.driver.click(*MILITARY_TAB, label="军事评分")
-            self.driver.wait(TAB_SWITCH_WAIT_S)
-            clicked += 1
-            rows = self._rows_confirming()
-            if not rows:
-                raise RankingNotReached(
-                    "点完「军事评分」之后一行榜单都读不出来；"
-                    "画面已经不是排行榜面板了（比如断线），不再点下去"
-                )
+        self.driver.click(*MILITARY_TAB, label="军事评分")
+        self.driver.wait(TAB_SWITCH_WAIT_S)
+        rows = self._rows_confirming()
+        if not rows:
+            raise RankingNotReached(
+                "点完「军事评分」之后一行榜单都读不出来；"
+                "画面已经不是排行榜面板了（比如断线），不再点下去"
+            )
+        self.say(f"  已切到军事榜（这一屏 {len(rows)} 行，头一行 {rows[0]!r}）")
+        return rows
 
     def _reveal_ranking_label(self) -> int:
         """把「排名」拖出来，返回它**这一屏**的中心 x。

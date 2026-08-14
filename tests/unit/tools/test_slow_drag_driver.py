@@ -252,7 +252,6 @@ def test_a_real_navigator_scroll_comes_out_as_one_proper_drag() -> None:
         driver=driver,
         read_labels=list,
         read_rows=lambda: screens.pop(0) if screens else [("b",)],
-        on_military_board=lambda _rows: True,
         say=lambda _message: None,
     )
 

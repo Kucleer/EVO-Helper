@@ -13,7 +13,6 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
-    is_military_board,
     repair_ranks,
 )
 
@@ -168,12 +167,24 @@ def test_bots_are_told_apart_by_name_not_by_rank() -> None:
     assert [row.name for row in bot_rows(rows)] == ["bot_4_30_12"]
 
 
-def test_only_a_non_zero_score_confirms_the_military_board() -> None:
-    """经济榜的 bot 分数全为 0；读空不能被误判成切对了页签。"""
-    economic = [RankingRow(rank=639, name="bot_4_30_12", score=0.0, coordinate=None)]
-    military = [RankingRow(rank=639, name="bot_4_30_12", score=29.59, coordinate=None)]
-    unreadable = [RankingRow(rank=639, name="bot_4_30_12", score=None, coordinate=None)]
+def test_there_is_no_single_screen_test_for_which_board_this_is() -> None:
+    """⚠️ **这条是负面结论，记在这里免得有人再发明一遍。**
 
-    assert not is_military_board(economic)
-    assert is_military_board(military)
-    assert not is_military_board(unreadable)
+    这里曾经有个 `is_military_board(rows)`，判据是「读到任何非零分数就算军事榜」。
+    实机 2026-08-14 当场证伪：两个页签的榜首十三行都是真人、分数都在 404.17M
+    这个量级，非零判据在**两边都返回 True**。
+
+    模块头那条「经济榜 bot 全是 0」只对**第 639 名之后**成立，而看到那一段
+    要先滚六十屏——开榜时用不上。
+
+    用户口径（2026-08-14）：「你不用管现在是什么，你需要看什么，就点什么切换」。
+    页签是幂等的按钮，不是开关，所以正确做法是**无条件点一次**「军事评分」
+    （见 `game.ranking_nav.RankingNavigator._switch_to_military`），
+    而不是先判断再点。
+    """
+    top_of_economy = [RankingRow(1, "unkn0wn", 404_170_000.0, None)]
+    top_of_military = [RankingRow(1, "unkn0wn", 404_170_000.0, None)]
+
+    assert all(row.score for row in top_of_economy)
+    assert all(row.score for row in top_of_military)
+    assert [r.score for r in top_of_economy] == [r.score for r in top_of_military]
