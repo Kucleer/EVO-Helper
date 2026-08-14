@@ -178,8 +178,7 @@ def scan(columns: RankingColumns | None = None) -> int:
     outcome = 0
     try:
         previous_top = initial[0].name if initial else ""
-        furthest = furthest_rank(initial)
-        stalled = 0
+        window: tuple[int, ...] = (progress_mark(initial),)
         scrolls = 0
         while True:
             step = nav.scroll_once()
@@ -199,9 +198,9 @@ def scan(columns: RankingColumns | None = None) -> int:
             )
             previous_top = top
             screens.append(targets_from_rows(rows, observed_at=datetime.now(UTC)))
-            furthest, stalled, done = track_progress(furthest, stalled, furthest_rank(rows))
+            window, done = track_progress(window, progress_mark(rows))
             if done:
-                print(f"连续 {stalled} 次最大名次没往前走（仍是 {furthest}）：到底了")
+                print(f"名次 {SCROLL_STALL_CONFIRMATIONS} 屏没往前走（{window}）：到底了")
                 break
             if step.outcome is ScrollOutcome.EXHAUSTED:
                 break
@@ -221,34 +220,54 @@ def scan(columns: RankingColumns | None = None) -> int:
     return outcome
 
 
-def furthest_rank(rows: Sequence[RankingRow]) -> int:
-    """这一屏读到的**最大**名次；一个都读不出就 0。
+def progress_mark(rows: Sequence[RankingRow]) -> int:
+    """这一屏的进度指针：读得出来的名次的**中位数**。一个都读不出就 0。
 
-    用它当「滚动到底有没有推进」的进度指针，而不是「两屏 OCR 输出相不相等」。
+    用它当「滚动有没有推进」的判据，而不是「两屏 OCR 输出相不相等」。
 
     ⚠️ **相等那条几乎永远不成立。** 榜单上大量是中文玩家名（`探险12`、`资源32`），
     而名字列跑的是 `eng`——同一行连读两次就是两个不同的噪声串。于是
-    `scroll_once` 的 `EXHAUSTED` 一次都不会触发，循环只能撞次数上限收工，
-    而那时你分不清是读完了还是拖不动了（2026-08-15 实机 55 滚，一次都没触发）。
+    `scroll_once` 的 `EXHAUSTED` 一次都不会触发（2026-08-15 实机 55 滚，零次）。
 
-    名次是数字，噪声形态是「多一位少一位」，取最大值再要求**连续几次没长进**
-    （`SCROLL_STALL_CONFIRMATIONS`），比逐字节比字符串结实得多。
+    ⚠️ **取中位数，不取最大值。** 我先写的是 `max()`，实机 113 秒就自己判成
+    「到底了」——名次列会串出高位噪声（当场读到过 `[401]`、`[4781]`、`[1411]`，
+    而那一屏真实名次只到 20 左右）。串高一次，`max` 就被顶上去，此后真实推进
+    （60 → 70 → 80）永远超不过它，于是连续几次都算「没进展」而提前收工。
+    **那正是这条判据要防的事故，用 max 等于自己造了一个。**
+
+    中位数对两侧离群都免疫：一屏十二行里错一两个，中间那个不动。而真实推进
+    每滚约 8 名（实测），远大于中位数本身的抖动。
     """
-    ranks = [row.rank for row in rows if row.rank is not None]
-    return max(ranks) if ranks else 0
+    ranks = sorted(row.rank for row in rows if row.rank is not None)
+    return ranks[len(ranks) // 2] if ranks else 0
 
 
-def track_progress(furthest: int, stalled: int, reach: int) -> tuple[int, int, bool]:
-    """推进一步：吃「到目前为止最远的名次 / 已经停滞几次 / 这一屏读到多远」，
-    吐回新的三元组，最后一位是「可以收工了」。
+def track_progress(recent: Sequence[int], mark: int) -> tuple[tuple[int, ...], bool]:
+    """吃「最近几屏的进度指针」和这一屏的，吐回新窗口 + 「可以收工了」。
 
-    抽成纯函数只为一件事：**这条判据要能被测到**。埋在 `scan()` 的循环里时，
-    把 `SCROLL_STALL_CONFIRMATIONS` 写死成 1 是绿的——变异测试当场抓到过。
+    ⚠️⚠️ **这条判据到今天为止仍然不可靠，别拿它当收工的唯一依据。**
+
+    2026-08-15 实机连着假阳性四次，每次都是「列表明明在滚，判据说到底了」：
+
+        v1 两屏 OCR 逐字节相等   → 反过来：中文玩家名读成噪声，一次都不触发
+        v2 相邻两屏比最大名次     → 名次串出 [401]，指针被顶飞，113 秒判到底
+        v3 相邻两屏比中位数       → 真实推进约 8 名/滚，指针噪声同量级，信噪比约 1
+        v4 跨三屏比中位数（本版） → 榜首那几屏名次是 1–2 位数，OCR 读成
+                                   `(7, 14, 1, 7)`，跨窗口照样看不出推进
+
+    **根子是名次列 OCR 在榜首不可靠**，而不是用哪个统计量。三位数名次（`[237]`）
+    读得挺稳，一两位数（`[4]`、`[5]`）就串。在这上面叠统计量是治标。
+
+    所以调用方**必须另外带一个预算**（时间或滚动次数）兜底，见 `scan()`。
+    本函数只当一个提示：它说到底了，多半值得看一眼；它没说，不代表没到底。
+
+    真要解决，方向是换一个不依赖名次 OCR 的进度信号（比如两屏名字集合的
+    **模糊重合率**——滚动了就只剩几行重合，没滚就几乎全重合）。还没做。
     """
-    if reach > furthest:
-        return reach, 0, False
-    stalled += 1
-    return furthest, stalled, stalled >= SCROLL_STALL_CONFIRMATIONS
+    window = (*recent, mark)[-(SCROLL_STALL_CONFIRMATIONS + 1) :]
+    if len(window) <= SCROLL_STALL_CONFIRMATIONS:
+        return window, False
+    return window, mark <= window[0]
 
 
 def keep_screens(
@@ -305,7 +324,7 @@ def _read_cell(cell: Any, ocr: Any) -> str:
 
 __all__ = [
     "RankingColumns",
-    "furthest_rank",
+    "progress_mark",
     "is_self_row",
     "keep_screens",
     "main",

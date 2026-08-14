@@ -17,14 +17,13 @@ from evo_helper.game.ranking_ui import (
     ROW_FIRST_Y,
     ROW_PITCH_PX,
     SCORE_COLUMN,
-    SCROLL_STALL_CONFIRMATIONS,
     SELF_ROW_BOTTOM_Y,
 )
 from evo_helper.tools.ranking_scan import (
-    furthest_rank,
     is_self_row,
     keep_screens,
     parse_score,
+    progress_mark,
     rows_from_image,
     targets_from_rows,
     track_progress,
@@ -260,7 +259,7 @@ def test_a_disconnect_before_the_first_screen_keeps_nothing() -> None:
 # -- 滚到底了没有 --------------------------------------------------------------
 
 
-def test_progress_is_measured_by_the_furthest_rank_not_by_string_equality() -> None:
+def test_progress_is_measured_by_the_progress_mark_not_by_string_equality() -> None:
     """⚠️ **「两屏 OCR 完全相等」这条实机上一次都不会触发。**
 
     榜单上大量是中文玩家名（`探险12`、`资源32`），而名字列跑的是 `eng`——
@@ -273,30 +272,64 @@ def test_progress_is_measured_by_the_furthest_rank_not_by_string_equality() -> N
     noisy_b = [RankingRow(237, "= -. _ ~", None, None), RankingRow(249, "?7", None, None)]
 
     assert list(noisy_a) != list(noisy_b)  # 字符串比：看着「变了」
-    assert furthest_rank(noisy_a) == furthest_rank(noisy_b) == 249  # 名次比：没往前走
+    assert progress_mark(noisy_a) == progress_mark(noisy_b) == 249  # 名次比：没往前走
+
+
+def test_one_wild_rank_misread_must_not_freeze_the_progress_marker() -> None:
+    """⚠️⚠️ **这条是我自己造的事故的墓碑。**
+
+    进度指针先写的是 `max()`。实机 2026-08-15：名次列串出 `[401]`（那一屏真实
+    名次只到 20 左右），`max` 被顶到 401，此后真实推进永远超不过它，
+    **113 秒就判成「到底了」收工**——正是这条判据本该防住的那种事故。
+
+    取中位数：一屏十二行里错一两个，中间那个不动。
+    """
+    real = [RankingRow(rank, "x", None, None) for rank in range(14, 26)]
+    with_noise = [*real[:-1], RankingRow(401, "串了", None, None)]
+
+    assert max(r.rank or 0 for r in with_noise) == 401  # max 被顶飞
+    assert progress_mark(with_noise) == progress_mark(real)  # 中位数纹丝不动
 
 
 def test_a_screen_with_no_readable_rank_reports_no_progress() -> None:
     """一个名次都读不出来时返回 0——那不构成「又往前了」，只会累计停滞次数。"""
-    assert furthest_rank([RankingRow(None, "noise", None, None)]) == 0
-    assert furthest_rank([]) == 0
+    assert progress_mark([RankingRow(None, "noise", None, None)]) == 0
+    assert progress_mark([]) == 0
 
 
-def test_one_stalled_drag_is_not_enough_to_call_it_finished() -> None:
-    """⚠️ 卡顿时单次拖动没生效是常态（2026-08-15 有游戏活动，实测就很卡）。
-    1 次就判到底，会把**半截榜单当成完整榜单**收工，而且日志上看着一切正常。
+def test_progress_is_compared_across_a_window_not_against_the_previous_screen() -> None:
+    """跨窗口比而不是逐屏比：三屏的信号约 24 名，而指针噪声不变。
+
+    下面这串指针每屏都在抖（+8 / −3 / +9 / −2），逐屏比会判成停滞两次，
+    跨窗口比一次都不判。
+
+    ⚠️ **但这条判据整体仍不可靠**，实机连着假阳性四次（见 `track_progress`
+    的注释）。调用方必须另外带预算兜底，别拿它当收工的唯一依据。
     """
-    furthest, stalled, done = track_progress(furthest=249, stalled=0, reach=249)
+    window: tuple[int, ...] = ()
+    verdicts = []
+    for mark in (100, 108, 105, 114, 112, 121):
+        window, done = track_progress(window, mark)
+        verdicts.append(done)
 
-    assert (furthest, stalled, done) == (249, 1, False)
-
-
-def test_it_gives_up_after_enough_confirmations() -> None:
-    """攒够了才收工——次数由 `SCROLL_STALL_CONFIRMATIONS` 定，不是写死的。"""
-    assert track_progress(249, SCROLL_STALL_CONFIRMATIONS - 1, 249)[2] is True
-    assert track_progress(249, SCROLL_STALL_CONFIRMATIONS - 2, 249)[2] is False
+    assert verdicts == [False] * 6
 
 
-def test_any_progress_at_all_clears_the_stall_counter() -> None:
-    """卡顿是间歇的：停了两次又走了一次，不该接着按停滞累计。"""
-    assert track_progress(furthest=249, stalled=2, reach=257) == (257, 0, False)
+def test_a_board_that_really_stopped_moving_is_called() -> None:
+    """真到底了：指针不再往前，攒够一个窗口就收工。"""
+    window: tuple[int, ...] = ()
+    for mark in (700, 700, 700):
+        window, done = track_progress(window, mark)
+        assert not done, "窗口还没攒满就不许判"
+
+    _window, done = track_progress(window, 700)
+
+    assert done
+
+
+def test_a_half_scrolled_board_is_never_called_finished_early() -> None:
+    """⚠️ 窗口没攒满一律不判——这条挡住「刚开榜就说读完了」。"""
+    window: tuple[int, ...] = ()
+    for mark in (10, 10):
+        window, done = track_progress(window, mark)
+        assert not done
