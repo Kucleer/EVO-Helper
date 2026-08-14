@@ -128,3 +128,116 @@ def test_an_attack_without_a_report_yet_shows_pending(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "待战报" in response.text
     assert "战损 我 0" not in response.text
+
+
+# -- 侦察发：它等的不是战报 ----------------------------------------------------
+
+
+def _table_body(html: str) -> str:
+    """只取 `<tbody>` 里那段。
+
+    整页搜中文会命中顶上那三个下拉框里的选项——「待战报」正是其中之一。
+    不收窄的话，「表格里没有待战报」这条断言在**修好之前也是绿的**。
+    """
+    start = html.find("<tbody")
+    end = html.find("</tbody>", start)
+    assert start != -1 and end != -1, "页面上没有表格体，这条用例的前提就不成立"
+    return html[start:end]
+
+
+def _scout_client(tmp_path: Path, *, with_report: bool) -> TestClient:
+    """一发**侦察**派遣，外加可选的一份侦察报告。
+
+    与上面那个 `_client` 的区别只有两处：`mission_kind` 是 `SCOUT`，
+    回来的是 `ScoutReport` 而不是 `BattleReport`——而这两处正是这一格出错的地方。
+    """
+    from evo_helper.domain.records import MISSION_KIND_SCOUT, ScoutReport
+
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'scout-logs.db'}")
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    service = PersistentApplicationService(factory, now_utc=lambda: DISPATCHED)
+    plan = service.create_plan(
+        name="海盗侦察",
+        enabled=True,
+        window_start=time(8),
+        window_end=time(20),
+        ranges=(ScanRangeView(Coordinate(2, 137, 1), TARGET, ORIGIN, "侦察", "探测器:1", 0),),
+    )
+    run_id = seed_run_instance(
+        factory, plan_id=plan.id, idempotency_key="scout-log-0001", created_at_utc=DISPATCHED
+    )
+    repository = SqlAlchemyRepository(factory)
+    intent = AttackIntent(
+        intent_id=uuid4(),
+        run_id=run_id,
+        origin=ORIGIN,
+        target=TARGET,
+        preset=FleetPresetRef(name="侦察", signature="探测器:1"),
+        cycle_start_utc=CYCLE,
+        created_at_utc=DISPATCHED - timedelta(minutes=1),
+        target_kind=TARGET_KIND_PIRATE,
+    )
+    repository.save_attack_intent(intent)
+    repository.save_dispatch(
+        AttackDispatch(
+            dispatch_id=uuid4(),
+            intent_id=intent.intent_id,
+            dispatched_at_utc=DISPATCHED,
+            accepted=True,
+            mission_kind=MISSION_KIND_SCOUT,
+        )
+    )
+    if with_report:
+        repository.append_scout_report(
+            ScoutReport(
+                report_id=uuid4(),
+                reported_at_utc=DISPATCHED + timedelta(minutes=2),
+                raw_time_text="09/08/2026 03:57:00",
+                origin=ORIGIN,
+                target=TARGET,
+            )
+        )
+    return TestClient(create_persistent_app(factory))
+
+
+def test_a_scout_leg_never_waits_for_a_battle_report(tmp_path: Path) -> None:
+    """**侦察发永远不该显示「待战报」。**
+
+    实机 2026-08-13 通宵：111 发侦察在这一页上全部挂着「待战报」，而侦察根本不
+    产生战报——它产出的是侦察报告，走 `scout_reports` 那张表。更刺眼的是其中不少
+    早就把攻击带出去了：攻击都打完了，它的侦察还显示「待战报」。
+
+    用户为此连提了两次（第二次写的是「多次仍然未修复」）。之前几次改的都是
+    **情报中心**那一侧——`storage.intel._battle_result` 里那条 `SCOUT → NONE`
+    早就写对了，而攻击日志是另一条渲染路径，从来没跟上。
+    """
+    # ⚠️ 只看表格体。整页搜「待战报」会命中顶上那个「战果」下拉框里的选项，
+    # 于是这条断言在**修好之前也是绿的**——它测的是下拉框存不存在，不是那一格。
+    rows = _table_body(_scout_client(tmp_path, with_report=True).get("/logs").text)
+
+    assert "待战报" not in rows
+    assert "侦察已回" in rows
+
+
+def test_a_scout_leg_still_shows_that_its_report_has_not_come_back(tmp_path: Path) -> None:
+    """没有这条对照，「一律显示侦察已回」也能让上面那条变绿。
+
+    而「报告还没回来」是有用的信息：它说明这个坐标还没轮到判定，不是判完不打。
+    """
+    rows = _table_body(_scout_client(tmp_path, with_report=False).get("/logs").text)
+
+    assert "待侦察报告" in rows
+    assert "侦察已回" not in rows
+
+
+def test_the_log_tells_a_scout_leg_from_an_attack_leg(tmp_path: Path) -> None:
+    """用户口径 2026-08-14：「预设中的侦查和攻击需要标记不同颜色」。
+
+    两种发次在这一页混排，而它们等的东西完全不同——分不出来就没法读战果那一列。
+    """
+    scout = _scout_client(tmp_path, with_report=True).get("/logs").text
+    attack = _client(tmp_path, with_report=True).get("/logs").text
+
+    assert "kind-scout" in scout and "kind-attack" not in scout
+    assert "kind-attack" in attack and "kind-scout" not in attack
