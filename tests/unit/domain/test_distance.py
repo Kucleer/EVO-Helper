@@ -2,27 +2,106 @@
 
 from __future__ import annotations
 
-from evo_helper.domain.distance import distance_key, nearest_first, within
+from evo_helper.domain.distance import distance_key, galaxy_gap, nearest_first, within
 from evo_helper.domain.models import Coordinate
 
 HOME = Coordinate(2, 137, 18)
 
 
+# -- 银河是一个环 --------------------------------------------------------------
+
+
+def test_the_far_side_of_the_ring_is_close() -> None:
+    """⚠️ **这条是实机量出来的，不是推的。**
+
+    同一套编组（速度 14.520 / 100%）从 **2** 系出发，简报页上的飞行时间：
+
+        目标 3 系   3752 秒     线性差 1   环形差 1
+        目标 9 系   5305 秒     线性差 7   环形差 2
+        目标 8 系   6497 秒     线性差 6   环形差 3
+
+    三个点全部落在 `3750 × √环形差` 上（误差 2 秒）。换成线性差就崩掉：
+    9 系会被算成 9922 秒，比实测多出 **4617 秒**。
+    """
+    assert galaxy_gap(9, 2) == 2
+    assert galaxy_gap(8, 2) == 3
+    assert galaxy_gap(3, 2) == 1
+
+
+def test_the_two_ways_round_meet_at_the_same_place() -> None:
+    """⚠️ **这条是判别性证据，不是又一个拟合点。**
+
+    从 2 系出发，`2→6` 正着走 4 步、`2→7` 倒着走 4 步（`2→1→9→8→7`）。
+
+        线性差是 4 和 5   → 预言两者时间**不同**
+        环形差都是 4      → 预言两者时间**一模一样**
+
+    实测（用户反复核对三遍）：`2时5分2秒 = 7502 秒`、气体 `869.88K`，
+    **两者完全一致**。两个模型在这里给出相反的预言，而实测选了环形。
+
+    9 个银河是奇数，所以「两条路等长」只在环形差 4 这一处发生——
+    这也是为什么它能当判据：别的距离上两个模型只是数值不同，
+    这里是**定性**不同。
+    """
+    assert galaxy_gap(6, 2) == galaxy_gap(7, 2) == 4
+    assert distance_key(Coordinate(6, 1, 1), HOME)[0] == distance_key(Coordinate(7, 1, 1), HOME)[0]
+
+
+def test_the_ring_does_not_care_which_way_you_came() -> None:
+    """绕过去和绕回来一样远。距离是对称的，环也不例外。"""
+    assert galaxy_gap(9, 2) == galaxy_gap(2, 9)
+
+
+def test_nothing_is_more_than_half_the_ring_away() -> None:
+    """9 个银河，最远 4 步——绕过半圈就该往回走了。
+
+    这条同时钉住「别把 `total` 写成 8 或 10」：写错的话最远距离会变成 4 或 5，
+    而且**只在环的另一半上错**，近处的目标看上去一切正常。
+    """
+    assert max(galaxy_gap(target, 1) for target in range(1, 10)) == 4
+    assert galaxy_gap(6, 1) == 4  # 顺着 5 步，倒着 4 步
+    assert galaxy_gap(1, 1) == 0
+
+
+def test_the_system_number_is_deliberately_not_a_ring() -> None:
+    """⚠️ **银河成环不代表恒星系也成环，而这个赌注是不对称的。**
+
+    从 2:137 看 2:499：直的减法是 362，若成环则是 `499-362 = 137`。
+    差得很远，而**没有量过**。
+
+    - 猜它成环、其实不成 → 把 362 当成 137，**以为很近其实很远**，舰队一去不回。
+    - 猜它不成环、其实成环 → 近目标被排到后面，少打几发。
+
+    所以这里故意用直的减法。要改的话先去量：从 2:137 出发比 `2:499` 和 `2:275`
+    （若成环则两者近似等距）。**别凭「银河成环所以恒星系也成环」就动手。**
+    """
+    assert distance_key(Coordinate(2, 499, 1), HOME)[1] == 362
+
+
+def test_the_ring_changes_which_galaxy_is_second_nearest() -> None:
+    """**这就是写成减法的代价**：不报错，只是一夜的航线全排错。
+
+    从 2 系看，9 系是第二近的银河（环形 2 步），而 5 系是第三近（3 步）。
+    用 `abs` 的话，9 系（差 7）会被排到 5 系（差 3）后面。
+    """
+    targets = [Coordinate(5, 1, 1), Coordinate(9, 1, 1), Coordinate(3, 1, 1)]
+
+    assert [item.galaxy for item in nearest_first(targets, HOME)] == [3, 9, 5]
+
+
 def test_the_galaxy_outranks_the_system() -> None:
     """**实机数据（同一套编组，速度 14.520）：**
 
-        Δ银河 0   2:499:18（系差 362）   1969 秒
-        Δ银河 1   3:303:18（系差 166）   3752 秒
-        Δ银河 2   银河 4                5305 秒
-        Δ银河 3   银河 5                6497 秒
+        2:499:18   同银河、系差 362      1969 秒
+        3:303:18   环形差 1、系差 166    3752 秒
 
     跨一个银河比同银河内最远的那一头还贵近一倍，所以银河这一位永远压过恒星系。
     这条钉住那个余量：同银河最远端也要排在隔壁银河最近端**前面**。
 
-    后三个点还落在同一条**只含 Δ银河**的曲线上（`≈3750×√Δ银河`，外推误差 0.4 秒），
-    也就是说跨银河时恒星系号根本不影响时间——详见 `domain.distance` 模块头。
-    那条结论不改变这里的排序，但它说明第二段 `|Δ恒星系|` 对**跨银河**目标
-    只是并列打破，不是距离。
+    跨银河的三个点还落在一条**只含环形银河距离**的曲线上（`≈3750×√环形差`，
+    误差 2 秒），而它们的恒星系号各不相同——也就是说跨银河时恒星系号根本不影响
+    时间（详见 `domain.distance` 模块头）。这不改变这里的排序，但它说明第二段
+    `|Δ恒星系|` 对**跨银河**目标只是并列打破，不是距离。
     """
     far_same_galaxy = Coordinate(2, 499, 18)
     near_next_galaxy = Coordinate(3, 137, 18)
