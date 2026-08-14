@@ -17,13 +17,17 @@ from evo_helper.game.ranking_ui import (
     ROW_FIRST_Y,
     ROW_PITCH_PX,
     SCORE_COLUMN,
-    SELF_ROW_Y,
+    SCROLL_STALL_CONFIRMATIONS,
+    SELF_ROW_BOTTOM_Y,
 )
 from evo_helper.tools.ranking_scan import (
+    furthest_rank,
+    is_self_row,
     keep_screens,
     parse_score,
     rows_from_image,
     targets_from_rows,
+    track_progress,
 )
 
 NOW = datetime(2026, 8, 14, tzinfo=UTC)
@@ -108,17 +112,42 @@ def test_a_row_whose_name_is_unreadable_is_dropped_without_a_placeholder() -> No
     assert [row.name for row in rows] == ["halo"]
 
 
-def test_the_self_row_is_never_read_as_a_board_row() -> None:
-    """⚠️ **自己那一行钉死在 y=837，不随滚动移动。**
-
-    实机确认就是 `[34] Kucleer`。当成榜单行的话，每滚一屏它都原样出现一次：
-    既会重复入库，又会让「拖了一下内容没变」这条到底判据变迟钝。
-    """
-    self_index = round((SELF_ROW_Y - ROW_FIRST_Y) / ROW_PITCH_PX)
+def test_the_bottom_pinned_self_row_is_outside_the_read_window() -> None:
+    """自己那一行**贴底**那一档，靠 `RANKING_LIST_MAX_Y` 就挡住了。"""
+    self_index = round((SELF_ROW_BOTTOM_Y - ROW_FIRST_Y) / ROW_PITCH_PX)
     rows, image = _read({0: ("[1]", "halo", "115.9M"), self_index: ("[34]", "Kucleer", "13.12M")})
 
     assert [row.name for row in rows] == ["halo"]
-    assert all(bottom <= SELF_ROW_Y for _l, _t, _r, bottom in image.crops)
+    assert all(bottom <= SELF_ROW_BOTTOM_Y for _l, _t, _r, bottom in image.crops)
+
+
+def test_the_self_row_sticks_to_the_top_once_you_scroll_past_yourself() -> None:
+    """⚠️⚠️ **这条推翻了「自己那一行钉在 y=837」。**
+
+    2026-08-15 实机：滚过自己名次之后，`[44] Kucleer` **跳到了列表最上面**
+    （y≈254，也就是 `ROW_FIRST_Y`）。而那正是「首行变没变」这条到底判据看的地方
+    ——于是每滚一屏首行都读成自己，判据被骗成「一直没动」，我因此误判过
+    「榜单滚不动」（其实一直在滚，55 滚推进了 600 多名）。
+
+    所以剔除必须**按名字**：按 y 排不掉它，它换个位置继续混进来。
+    """
+    screen = {0: ("[44]", "Kucleer", "1.56M"), 1: ("[237]", "bot_4_155_13", "7.55K")}
+
+    without_name = rows_from_image(_Image(screen), _Ocr())
+    with_name = rows_from_image(_Image(screen), _Ocr(), player_name="Kucleer")
+
+    assert [row.name for row in without_name] == ["Kucleer", "bot_4_155_13"]
+    assert [row.name for row in with_name] == ["bot_4_155_13"]
+
+
+def test_the_self_row_is_matched_through_the_ocr_noise_glued_to_it() -> None:
+    """实机读到过 `', Kucleer'`、`'| Kucleer'`、`': Kucleer'`——名字那一格前面
+    常粘上一点噪声。用相等去比就漏了，所以用**包含**、且忽略大小写。
+    """
+    assert is_self_row(", Kucleer", "Kucleer")
+    assert is_self_row("| kucleer", "Kucleer")
+    assert not is_self_row("bot_4_155_13", "Kucleer")
+    assert not is_self_row("Kucleer", "")  # 没配名字就不剔，宁可多读不要错剔
 
 
 # -- 配方（实机换来的那一条） --------------------------------------------------
@@ -226,3 +255,48 @@ def test_a_disconnect_keeps_everything_except_the_last_screen() -> None:
 def test_a_disconnect_before_the_first_screen_keeps_nothing() -> None:
     """一屏都没采到就断了，不该崩在「丢掉最后一屏」上。"""
     assert keep_screens([], off_page=True) == []
+
+
+# -- 滚到底了没有 --------------------------------------------------------------
+
+
+def test_progress_is_measured_by_the_furthest_rank_not_by_string_equality() -> None:
+    """⚠️ **「两屏 OCR 完全相等」这条实机上一次都不会触发。**
+
+    榜单上大量是中文玩家名（`探险12`、`资源32`），而名字列跑的是 `eng`——
+    同一行连读两次就是两个不同的噪声串。2026-08-15 实机滚了 55 次，
+    `scroll_once` 的 `EXHAUSTED` 一次都没触发。
+
+    名次是数字，拿「最大名次有没有往前走」当进度指针才结实。
+    """
+    noisy_a = [RankingRow(237, "=- ,, _ -", None, None), RankingRow(249, "??", None, None)]
+    noisy_b = [RankingRow(237, "= -. _ ~", None, None), RankingRow(249, "?7", None, None)]
+
+    assert list(noisy_a) != list(noisy_b)  # 字符串比：看着「变了」
+    assert furthest_rank(noisy_a) == furthest_rank(noisy_b) == 249  # 名次比：没往前走
+
+
+def test_a_screen_with_no_readable_rank_reports_no_progress() -> None:
+    """一个名次都读不出来时返回 0——那不构成「又往前了」，只会累计停滞次数。"""
+    assert furthest_rank([RankingRow(None, "noise", None, None)]) == 0
+    assert furthest_rank([]) == 0
+
+
+def test_one_stalled_drag_is_not_enough_to_call_it_finished() -> None:
+    """⚠️ 卡顿时单次拖动没生效是常态（2026-08-15 有游戏活动，实测就很卡）。
+    1 次就判到底，会把**半截榜单当成完整榜单**收工，而且日志上看着一切正常。
+    """
+    furthest, stalled, done = track_progress(furthest=249, stalled=0, reach=249)
+
+    assert (furthest, stalled, done) == (249, 1, False)
+
+
+def test_it_gives_up_after_enough_confirmations() -> None:
+    """攒够了才收工——次数由 `SCROLL_STALL_CONFIRMATIONS` 定，不是写死的。"""
+    assert track_progress(249, SCROLL_STALL_CONFIRMATIONS - 1, 249)[2] is True
+    assert track_progress(249, SCROLL_STALL_CONFIRMATIONS - 2, 249)[2] is False
+
+
+def test_any_progress_at_all_clears_the_stall_counter() -> None:
+    """卡顿是间歇的：停了两次又走了一次，不该接着按停滞累计。"""
+    assert track_progress(furthest=249, stalled=2, reach=257) == (257, 0, False)

@@ -32,6 +32,7 @@ from evo_helper.game.ranking_ui import (
     ROW_FIRST_Y,
     ROW_PITCH_PX,
     SCORE_COLUMN,
+    SCROLL_STALL_CONFIRMATIONS,
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
@@ -57,8 +58,21 @@ def parse_score(text: str) -> float | None:
     return value * {"K": 1_000.0, "M": 1_000_000.0, None: 1.0}[match.group(2)]
 
 
+def is_self_row(name: str, player_name: str) -> bool:
+    """这一行是不是**自己**那一行。
+
+    ⚠️ **按名字判，不能按 y 判。** 那一行是吸附的：滚过自己名次之前贴在列表底部
+    （y=837），滚过之后跳到**顶部**（y≈254）——而顶部正是「首行变没变」这条
+    到底判据看的地方。2026-08-15 实机就是被它骗成「一直没滚动」的。
+
+    用**包含**而不是相等：名字那一格前面常粘上一点噪声（实机读到过
+    `', Kucleer'`、`'| Kucleer'`、`': Kucleer'`）。大小写也放宽。
+    """
+    return bool(player_name) and player_name.casefold() in (name or "").casefold()
+
+
 def rows_from_image(
-    image: Any, ocr: Any, columns: RankingColumns | None = None
+    image: Any, ocr: Any, columns: RankingColumns | None = None, *, player_name: str = ""
 ) -> list[RankingRow]:
     """按实机标定的列边界逐格 OCR；**名字读不出来**的一行才丢掉。
 
@@ -66,6 +80,9 @@ def rows_from_image(
     而 2026-08-14 实机第一屏就打脸：**榜首前三名没有名次数字，是奖章图标**，
     于是最强的三行会被整个扔掉。名次是校验和（`repair_ranks` 能从邻居补），
     名字才是这一层唯一的产物——它反解出坐标，决定舰队飞去哪。
+
+    ⚠️ **自己那一行要按名字剔掉**（见 `is_self_row`）——它是吸附的，
+    `RANKING_LIST_MAX_Y` 只挡得住它贴底那一档。
 
     ⚠️ **裁剪半高比行距的一半窄。** 星球地表的 `TOTAL CREWS` / `COMMAND OFFICERS`
     透过半透明面板落在 x 769–949（正压在名字列上），y 恰好在两行之间：
@@ -82,7 +99,7 @@ def rows_from_image(
         top = round(center - ROW_CROP_HALF_HEIGHT)
         bottom = round(center + ROW_CROP_HALF_HEIGHT)
         name = _read_cell(image.crop((columns.name[0], top, columns.name[1], bottom)), ocr)
-        if not name:
+        if not name or is_self_row(name, player_name):
             index += 1
             continue
         rank_box = (columns.rank[0], top, columns.rank[1], bottom)
@@ -141,8 +158,10 @@ def scan(columns: RankingColumns | None = None) -> int:
     driver = LiveDriver()  # 默认 False：此工具没有派舰队能力。
     ocr = pytesseract
 
+    player_name = Settings().player_name
+
     def read_rows() -> list[RankingRow]:
-        return rows_from_image(driver.capture(), ocr, columns)
+        return rows_from_image(driver.capture(), ocr, columns, player_name=player_name)
 
     nav = RankingNavigator(
         driver=SlowDragDriver(driver),
@@ -159,6 +178,8 @@ def scan(columns: RankingColumns | None = None) -> int:
     outcome = 0
     try:
         previous_top = initial[0].name if initial else ""
+        furthest = furthest_rank(initial)
+        stalled = 0
         scrolls = 0
         while True:
             step = nav.scroll_once()
@@ -178,6 +199,10 @@ def scan(columns: RankingColumns | None = None) -> int:
             )
             previous_top = top
             screens.append(targets_from_rows(rows, observed_at=datetime.now(UTC)))
+            furthest, stalled, done = track_progress(furthest, stalled, furthest_rank(rows))
+            if done:
+                print(f"连续 {stalled} 次最大名次没往前走（仍是 {furthest}）：到底了")
+                break
             if step.outcome is ScrollOutcome.EXHAUSTED:
                 break
     finally:
@@ -194,6 +219,36 @@ def scan(columns: RankingColumns | None = None) -> int:
     repository.save_ranking_targets(collected)
     print(f"军事榜采集{'（中途离页）' if outcome else '完成'}：写入 {len(collected)} 条榜单目标")
     return outcome
+
+
+def furthest_rank(rows: Sequence[RankingRow]) -> int:
+    """这一屏读到的**最大**名次；一个都读不出就 0。
+
+    用它当「滚动到底有没有推进」的进度指针，而不是「两屏 OCR 输出相不相等」。
+
+    ⚠️ **相等那条几乎永远不成立。** 榜单上大量是中文玩家名（`探险12`、`资源32`），
+    而名字列跑的是 `eng`——同一行连读两次就是两个不同的噪声串。于是
+    `scroll_once` 的 `EXHAUSTED` 一次都不会触发，循环只能撞次数上限收工，
+    而那时你分不清是读完了还是拖不动了（2026-08-15 实机 55 滚，一次都没触发）。
+
+    名次是数字，噪声形态是「多一位少一位」，取最大值再要求**连续几次没长进**
+    （`SCROLL_STALL_CONFIRMATIONS`），比逐字节比字符串结实得多。
+    """
+    ranks = [row.rank for row in rows if row.rank is not None]
+    return max(ranks) if ranks else 0
+
+
+def track_progress(furthest: int, stalled: int, reach: int) -> tuple[int, int, bool]:
+    """推进一步：吃「到目前为止最远的名次 / 已经停滞几次 / 这一屏读到多远」，
+    吐回新的三元组，最后一位是「可以收工了」。
+
+    抽成纯函数只为一件事：**这条判据要能被测到**。埋在 `scan()` 的循环里时，
+    把 `SCROLL_STALL_CONFIRMATIONS` 写死成 1 是绿的——变异测试当场抓到过。
+    """
+    if reach > furthest:
+        return reach, 0, False
+    stalled += 1
+    return furthest, stalled, stalled >= SCROLL_STALL_CONFIRMATIONS
 
 
 def keep_screens(
@@ -250,11 +305,14 @@ def _read_cell(cell: Any, ocr: Any) -> str:
 
 __all__ = [
     "RankingColumns",
+    "furthest_rank",
+    "is_self_row",
     "keep_screens",
     "main",
     "parse_score",
     "rows_from_image",
     "targets_from_rows",
+    "track_progress",
 ]
 
 

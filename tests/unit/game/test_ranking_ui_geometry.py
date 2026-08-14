@@ -32,7 +32,7 @@ from evo_helper.game.ranking_ui import (
     SCROLL_FROM_Y,
     SCROLL_TO_Y,
     SCROLL_X,
-    SELF_ROW_Y,
+    SELF_ROW_BOTTOM_Y,
 )
 
 #: 拖完导航条之后，五个标签的中心 x（实机量）。
@@ -118,7 +118,7 @@ def test_the_pinned_self_row_is_below_everything_the_reader_is_told_to_read() ->
     把它读进榜单，它会每滚一屏重复出现一次，还会让「拖了一下内容没变」这条
     到底判据变迟钝。所以读数的下界必须卡在它上面。
     """
-    assert ROW_LAST_Y < RANKING_LIST_MAX_Y < SELF_ROW_Y
+    assert ROW_LAST_Y < RANKING_LIST_MAX_Y < SELF_ROW_BOTTOM_Y
 
 
 def test_the_row_pitch_matches_the_two_ends_that_were_measured() -> None:
