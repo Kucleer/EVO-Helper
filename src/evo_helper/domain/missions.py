@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from evo_helper.domain.distance import system_gap
 from evo_helper.domain.models import Coordinate
 
 # 故意不从 scan_priority 导入：那边只是转手 import，没有再导出，
@@ -43,17 +44,34 @@ class MissionParamError(ValueError):
 # 「除主星以外的任务一律派不出去」，而那正是这一版要解决的问题。
 
 
+def wrap_system(system: int) -> int:
+    """把任意整数绕回 `[1, SYSTEMS_PER_GALAXY]`。恒星系首尾相接（见 `domain.distance`）。"""
+    return (system - 1) % SYSTEMS_PER_GALAXY + 1
+
+
 def pirate_systems(origin: Coordinate, radius: int) -> tuple[tuple[int, int], ...]:
     """从主星向外排的恒星系清单，由近到远。
 
     等距时小的在前：排序必须是确定的，否则「上一轮打到哪了」无从谈起。
-    越界的系号钳制到 `[1, SYSTEMS_PER_GALAXY]`——半径填大了应当是「到边为止」。
+
+    ⚠️ **半径是绕着环量的，不是在 `[1, 499]` 上截断的。**
+    恒星系首尾相接（实测见 `domain.distance` 模块头：从 2:137 打 `2:499` 只要
+    1969 秒，比 `2:287` 的 2042 秒还快——环上它只有 137 步而不是 362 步）。
+
+    原先这里是 `max(1, s-r)` / `min(499, s+r)`，于是主星靠边时**半径会被悄悄砍掉一截**：
+    从 2:2 半径 5 只给出 7 个系（1–7），而环上应该是 11 个（496–499 与 1–7）。
+    少掉的那 4 个不会报错、日志里也看不出来，只是永远不去打。
+
+    半径大到超过半圈（249）时自然覆盖整个银河——环上没有「边」可以钳。
     """
     if radius < 1:
         raise MissionParamError(f"半径要大于 0（收到 {radius}）")
-    low = max(1, origin.system - radius)
-    high = min(SYSTEMS_PER_GALAXY, origin.system + radius)
-    ordered = sorted(range(low, high + 1), key=lambda system: (abs(system - origin.system), system))
+    within_radius = [
+        system
+        for system in range(1, SYSTEMS_PER_GALAXY + 1)
+        if system_gap(system, origin.system) <= radius
+    ]
+    ordered = sorted(within_radius, key=lambda system: (system_gap(system, origin.system), system))
     return tuple((origin.galaxy, system) for system in ordered)
 
 
