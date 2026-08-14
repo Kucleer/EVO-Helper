@@ -97,6 +97,8 @@ def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]
     loop._goto_planet_surface = lambda: (events.append("切地表"), reachable)[1]
     loop._dump_frame = lambda name, roi=None: events.append(f"存图:{name}")
     loop._open_mail = lambda: events.append("开信箱")
+    # 拖回顶部另有专文（`test_mailbox_scroll_to_top.py`）。
+    loop._scroll_mail_list_to_top = lambda: None
     loop._close_mail = lambda: events.append("关信箱")
     loop._settle = lambda predicate, **_kwargs: True
     loop._on_mail_list = lambda: True

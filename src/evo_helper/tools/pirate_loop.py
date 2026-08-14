@@ -53,6 +53,12 @@ from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate, FleetPresetRef
+from evo_helper.domain.pirate_round import (
+    PHASE_LABELS,
+    PirateAction,
+    PiratePhase,
+    action_for,
+)
 from evo_helper.domain.planet_switch import switch_needed
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -76,7 +82,7 @@ from evo_helper.game.system_navigator import (
     crop_reader,
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
-from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin, say
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
@@ -309,8 +315,25 @@ MAIL_OPEN_WAIT_S = 2.4
 #: 从详情页退回列表之后等这么久。
 MAIL_BACK_WAIT_S = 2.0
 
-#: 读之前把列表拖回顶部。面板会夹住，多拖一次无害，少拖一次就可能从半截邮件读起。
-MAIL_SCROLL_TO_TOP_DRAGS = 3
+#: 读之前把列表拖回顶部，**最多**拖这么多次。
+#:
+#: ⚠️ **这原先是个写死的 3，而 3 是错的。** 一次慢拖走 `PANEL_DRAG_FROM_Y -
+#: PANEL_DRAG_TO_Y` = 400px ≈ 4.6 行，3 次约 14 行；而一趟对账要往下翻
+#: `RECONCILE_MAX_PAGES` = 8 屏 ≈ 32 行。**每一趟净往下沉约 18 行**，而列表会
+#: 记住上次滚到哪。信箱本身有 600 封（用户实测），永远沉不到底。
+#:
+#: 2026-08-13 那一夜的账：UTC 19:51–23:01 派了 17 发 BBB，`battle_reports`
+#: 一行都没有。现场图 `var/logs/dump-mail-detail-unrendered-053043.png`
+#: （本地 05:30 = **21:30 UTC**）上，列表最上面那几行是 16:42–17:02 的侦察报告
+#: ——**比墙钟旧四个半钟头**；同一张图上二级角标写着「战斗 10」未读，正好等于
+#: 那时已经落地的 10 发攻击。也就是说战报就躺在列表顶上，而扫描窗口停在
+#: 四个半小时之前，七趟信箱一次都没够到过它。
+#:
+#: 所以停止条件不能是「拖了几次」，只能是**拖不动了**（判据与 `_scan_mail_rows`
+#: 里那条「还是那几封」、`domain.planet_switch.list_exhausted` 同一条）。
+#: 这个数只是兜底上限：40 次 ≈ 186 行，够把一夜攒下的位移拖回去，
+#: 而且保证一定会停。
+MAIL_SCROLL_TO_TOP_MAX_DRAGS = 40
 
 #: 面板标题（那块金属牌上的大字），用来认出「现在是哪个面板」。
 #: 邮件列表是「邮箱」，报告详情页是「消息」——两者都是大字，读得很干净。
@@ -696,6 +719,10 @@ class PirateLoop:
         #: 上一轮把游戏停在哪颗星球上不可知）。这就是「一轮只切一次」的记忆，
         #: 判据在 `domain.planet_switch.switch_needed`。
         self._current_planet: Coordinate | None = None
+        #: 今天（游戏内 UTC 日）每个海盗目标走到哪一步了。`None` = 还没查过。
+        #: 缓存的是**一整趟里都不该变**的那部分（今天已经派过什么、报告回了没），
+        #: 每写进新的侦察报告就 `refresh=True` 重取一次，见 `_daily_progress`。
+        self._daily: dict[Coordinate, PirateProgress] | None = None
 
     # -- 读屏 ---------------------------------------------------------------
 
@@ -1167,7 +1194,8 @@ class PirateLoop:
         03:46）三次都倒在这里，而每次都已经先派出 4 发侦察，报告读不到就白飞。
 
         拖回顶部同样不能省：列表会记住上次滚到哪，不拖回去第 0 行可能是一封只露
-        半截的邮件——读出来是空主题，而画面看着完全正常。
+        半截的邮件——读出来是空主题，而画面看着完全正常。**而「拖几次算到顶」
+        不能猜**，理由整段在 `_scroll_mail_list_to_top`。
         """
         self._reset_to_known_screen()
         if not self._goto_planet_surface():
@@ -1176,8 +1204,39 @@ class PirateLoop:
             self._say_mail_badge_reads()
             raise RuntimeError("切不到自己星球地表，读不了信箱；安全停止")
         self._open_mail()
-        for _ in range(MAIL_SCROLL_TO_TOP_DRAGS):
+        self._scroll_mail_list_to_top()
+
+    def _scroll_mail_list_to_top(self) -> None:
+        """把邮件列表拖回真正的顶部：**拖到拖不动为止**，不是拖固定次数。
+
+        ⚠️ **这是 2026-08-13 那夜「17 发攻击 0 份战报」的正因。** 原先是无条件
+        拖 3 次（≈14 行），而一趟对账要往下翻 8 屏（≈32 行），列表又记着上次
+        滚到哪——每趟净沉约 18 行，信箱 600 封，永远沉不到底。现场图
+        `dump-mail-detail-unrendered-053043.png` 拍到的就是结果：21:30 UTC 时
+        列表最上面是 16:42–17:02 的侦察报告，而同一屏的角标写着「战斗 10」未读。
+        战报一直躺在列表顶上，扫描窗口停在四个半小时之前。
+
+        判据是「拖了一下还是那几封」，与 `_scan_mail_rows` 里判「翻到底了」
+        用的是同一条（也与 `domain.planet_switch.list_exhausted` 同形）：
+        **比行身份，不比位置**——慢拖带惯性，位置每次都差几个像素。
+
+        多付的代价是每次拖之前读一屏主题（一次截图 + 六次窄 ROI OCR ≈ 1–2 秒）。
+        到顶之后的稳态是 7–8 次，约 25 秒一趟；换回来的是这一趟真的能看见
+        今天的战报。读不出行（全空）时**不当成到顶**：那是 OCR 没读出来，
+        照拖不误，最坏走满上限。
+        """
+        previous: list[tuple[str, str]] | None = None
+        for drag in range(MAIL_SCROLL_TO_TOP_MAX_DRAGS):
+            identities = [row.identity for row in self._mail_list_rows()]
+            if identities and identities == previous:
+                if drag > 1:
+                    say(f"  列表往上拖了 {drag} 次才到顶（上一趟停在很深的地方）")
+                return
+            previous = identities
             slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
+        # 走满上限说明列表比 40 次拖动还深，或者主题一直读不出来。两种都要说出来：
+        # 这一趟看到的「最上面几行」不是信箱最上面几行，收不到战报是**必然**的。
+        say(f"  往上拖满 {MAIL_SCROLL_TO_TOP_MAX_DRAGS} 次仍没到顶；这一趟看到的不是信箱最新的几封")
 
     def _scan_mail_rows(
         self,
@@ -1330,6 +1389,12 @@ class PirateLoop:
                     continue
                 opened += 1
                 scan.opened = opened
+                # ⚠️ **开封的那些行原先一个字都不打印**，只有被跳过的行有日志——
+                # 正好是不需要的那一半。2026-08-13 复盘时，「那 59 封开的到底是
+                # 什么」在证据上是个黑洞：日志里 239 条主题全是跳过的行，
+                # 而「VS 块读不出来」那 53 次连主题都没留下。
+                when = row.raw_time_text or "时间读不出"
+                say(f"  第 {row.index} 行开封（{when} {row.subject!r}）")
                 if self._open_mail_row(row, visit):
                     collected = True
             # 不再开封之后还翻不翻，取决于**有没有人在数数**：
@@ -2393,6 +2458,49 @@ class PirateLoop:
             say(f"这一轮到此为止：{exhausted}")
         return self._outcome
 
+    # -- 当日去重 -----------------------------------------------------------
+
+    def _daily_progress(self, *, refresh: bool = False) -> dict[Coordinate, PirateProgress]:
+        """今天（游戏内 UTC 日）每个海盗目标走到哪一步了，按目标坐标查。
+
+        日界走 `domain.scheduler.quota_day_start_utc`，**不许自己写
+        `replace(hour=0)`**——那个函数的注释写了为什么（落在本地时刻上就悄悄
+        变成本地日历天，两者只在一天里的某几个钟头对得上）。
+
+        `scout_not_before` 也传当日起点：昨天那份侦察报告说的是昨天那批舰队，
+        拿它判「今天该不该打」就是照着过期情报派舰队（理由整段在
+        `repository.pirate_progress`）。控制台那一侧不传，两者口径本来就不同。
+        """
+        if refresh or self._daily is None:
+            repository, _run_id = self._ensure_run()
+            day_start = quota_day_start_utc(datetime.now(UTC))
+            self._daily = {
+                row.target: row
+                for row in repository.pirate_progress(since=day_start, scout_not_before=day_start)
+            }
+        return self._daily
+
+    def _action_for(self, coordinate: Coordinate) -> PirateAction:
+        """这一趟该对这个坐标做什么。判据整段在 `domain.pirate_round.action_for`。
+
+        ⚠️ **这就是那条去重的落点。** 判据（七态 → 动作）2026-08-11 就写好了，
+        但只有控制台在读它；`_find_pirates` / `_decide_and_attack` 一次都没问过，
+        于是每一轮都当作今天什么都没做过。2026-08-13 通宵的账：侦察 111 发打在
+        54 个坐标上（2:137:1~4 各 5 发），攻击只有 12 发。
+
+        今天完全没动过的坐标库里根本没有行，那就是 `NEEDS_SCOUT`——写成显式的
+        默认值而不是让 `dict.get` 返回 None 再各处判空。
+        """
+        row = self._daily_progress().get(coordinate)
+        if row is None:
+            return action_for(PiratePhase.NEEDS_SCOUT, scout_count=0)
+        return action_for(row.phase, scout_count=row.scout_count)
+
+    def _phase_note(self, coordinate: Coordinate) -> str:
+        """日志里那个态怎么念。查不到行就是今天还没动过。"""
+        row = self._daily_progress().get(coordinate)
+        return PHASE_LABELS[PiratePhase.NEEDS_SCOUT if row is None else row.phase]
+
     def _sweep(self) -> None:
         for galaxy, system in self._options.systems:
             say(f"恒星系 {galaxy}:{system}")
@@ -2407,6 +2515,10 @@ class PirateLoop:
             # 一趟信箱把这一系的报告都读回来，再逐个判定。
             # 只给 `--attack` 不给 `--scout` 时，用的就是信箱里已有的那几封。
             reports = self.collect_scout_reports(pirates)
+            # ⚠️ **读完信箱必须重取一次当日进度。** 刚才那一趟把新的侦察报告写进了
+            # `scout_reports`，而缓存里那份还是进信箱之前的：不重取的话，本轮刚回来
+            # 的报告要等到下一轮才被看见，「待侦察报告」会一直挂着，攻击永远慢一拍。
+            self._daily_progress(refresh=True)
             for coordinate in pirates:
                 self._decide_and_attack(coordinate, reports.get(coordinate))
 
@@ -2445,6 +2557,9 @@ class PirateLoop:
         就照常走下一位；坐标核对不过是导航漂了，`_goto_checked` 会自愈一次，
         自愈完还不过就**记一笔 refused**——不记的话它长得和「这一位没有海盗」
         一模一样，而后者是最常见的正常结果，整轮一发没派也看不出异常。
+
+        ⚠️ **侦察派不派要先问今天的账**（`_action_for`）。原先这里是无条件派：
+        只要认出是海盗就发一发，于是同样四个坐标每一轮各挨一发。
         """
         pirates: list[Coordinate] = []
         scouted = 0
@@ -2459,8 +2574,17 @@ class PirateLoop:
                 say(f"  {coordinate} 不是海盗")
                 continue
             say(f"  {coordinate} 敌对海盗")
-            pirates.append(coordinate)
             self._outcome.pirates.append(coordinate)
+            action = self._action_for(coordinate)
+            if action is PirateAction.DONE:
+                # 今天这个坐标已经有结论了。**连 `pirates` 都不进**：进了的话
+                # `_sweep` 还要为它翻一趟信箱、再走一次判定，而结论不会变。
+                say(f"    今天已经{self._phase_note(coordinate)}；这一天不再碰它")
+                continue
+            pirates.append(coordinate)
+            if action is not PirateAction.SCOUT:
+                say(f"    今天已侦察过（{self._phase_note(coordinate)}）；不重复侦察")
+                continue
             # 站在这颗星球上就把侦察发掉。`scout()` 抛 RoundExhausted 时直接往上
             # 传到 `run()`：那是「资源耗尽、这一轮到此为止」，不是失败。
             if self._options.scout and self.scout(coordinate):
@@ -2474,15 +2598,43 @@ class PirateLoop:
         time.sleep(SCOUT_REPORT_WAIT_S)
 
     def _decide_and_attack(self, coordinate: Coordinate, reading: Any) -> None:
+        """按今天的账决定这一趟对它做什么。`reading` 是刚翻信箱读到的那份（可能没有）。
+
+        ⚠️ **库先于 `reading`。** 今天那份侦察报告只要已经落库，判定就从库里来——
+        `reading` 只是同一份报告的另一条路径，而库那条还额外知道「今天已经打过了」。
+        用户口径（2026-08-13）：今天攻击过的坐标不侦查也不攻击；今天侦查过的直接
+        用今天那份报告的结论。
+
+        `PirateAction.ATTACK` 那一档是**直接打，不重新侦察**：走到这一档说明今天
+        那份报告已经判为「打」，再派一发侦察只是把配额烧掉一发再得出同一个结论。
+        """
         from evo_helper.vision.scout_reports import VERDICT_ATTACK
 
+        action = self._action_for(coordinate)
+        if action is PirateAction.ATTACK:
+            say(f"  {coordinate} 今天那份侦察报告判为「打」；直接攻击，不重新侦察")
+            self._attack_checked(coordinate)
+            return
+        if action is not PirateAction.SCOUT:
+            # `DONE`（今天已有结论）与 `WAIT`（侦察发/攻击发还在路上）在这里的
+            # 处置一样：不打。⚠️ **`WAIT` 尤其不能漏。** `AWAITING_ATTACK_REPORT`
+            # 也是 `WAIT`，漏掉它就会对同一个坐标再打一发——刚才那一发的战报
+            # 还没回来，谁都不知道已经打过了，配额一次烧两份。
+            say(f"  {coordinate} 今天已经{self._phase_note(coordinate)}；这一趟不打")
+            return
         if reading is None:
+            # 走到这里是「今天库里没有这个坐标的任何派遣」——`--attack` 不给
+            # `--scout` 时的常态，判定只能来自刚翻到的那份报告。
             say(f"  {coordinate} 读不到侦察报告；跳过")
             self._outcome.refused.append((coordinate, "读不到侦察报告"))
             return
         say(f"  {coordinate} 判定 {reading.verdict}：{reading.trigger_ships}")
         if reading.verdict != VERDICT_ATTACK:
             return
+        self._attack_checked(coordinate)
+
+    def _attack_checked(self, coordinate: Coordinate) -> None:
+        """核一遍面板再打。两条判定路径共用，别再各写一份。"""
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             self._outcome.refused.append((coordinate, "攻击前面板认不出"))
             return

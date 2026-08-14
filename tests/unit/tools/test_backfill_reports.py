@@ -92,6 +92,8 @@ def _loop(
     loop._dump_frame = lambda name, roi=None: None
     loop._say_mail_badge_reads = lambda: None
     loop._open_mail = lambda: None
+    # 拖回顶部另有专文（`test_mailbox_scroll_to_top.py`）；不打桩会吃掉 `screens`。
+    loop._scroll_mail_list_to_top = lambda: None
     loop._close_mail = lambda: None
     loop._settle = lambda predicate, **_kwargs: True
     loop._on_mail_list = lambda: True

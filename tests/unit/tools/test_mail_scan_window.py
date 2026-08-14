@@ -93,6 +93,9 @@ def _loop(pages: list[list[MailRow]]) -> tuple[Any, list[str], list[MailRow]]:
     loop._goto_planet_surface = lambda: True
     loop._dump_frame = lambda name, roi=None: events.append(f"存图:{name}")
     loop._open_mail = lambda: events.append("开信箱")
+    # 拖回顶部是另一件事，另有专文（`test_mailbox_scroll_to_top.py`）。不打桩的话
+    # 它会把 `pages` 里的几屏当成「拖回顶部」的读数吃掉。
+    loop._scroll_mail_list_to_top = lambda: events.append("拖回顶部")
     loop._close_mail = lambda: events.append("关信箱")
     loop._settle = lambda predicate, **_kwargs: True
     loop._on_mail_list = lambda: True

@@ -136,6 +136,11 @@ class PirateProgress:
     verdict: str | None
     #: 拿来算 `verdict` 的那份侦察报告的报告时刻；没有报告就是 None。
     scout_reported_at_utc: datetime | None
+    #: 窗口内针对它真的派出去（且被游戏接受）的**侦察**发数。
+    #: 活链路拿它判「`SCOUT_UNREADABLE` 这一档今天补过没有」
+    #: （`domain.pirate_round.action_for`）——只有 `scouted` 这个布尔的话，
+    #: 「补一次为限」和「无限补」在数据上长得一模一样。
+    scout_count: int
     #: 本轮针对它真的派出去（且被游戏接受）的攻击发数。
     attack_count: int
     #: 其中已经收到战报的发数。`attack_count > 0 and attack_reports == attack_count`
@@ -152,7 +157,7 @@ def _coordinate_sort_key(coordinate: Coordinate) -> tuple[int, int, int]:
 def _pirate_progress_for(
     target: Coordinate,
     *,
-    scouted: bool,
+    scout_count: int,
     scout: ScoutReport | None,
     attacks: tuple[AttackFact, ...],
     latest_attack_at_utc: datetime | None,
@@ -160,9 +165,10 @@ def _pirate_progress_for(
     verdict = verdict_of_record(scout) if scout is not None else None
     return PirateProgress(
         target=target,
-        phase=phase_for(scouted=scouted, verdict=verdict, attacks=attacks),
+        phase=phase_for(scouted=scout_count > 0, verdict=verdict, attacks=attacks),
         verdict=verdict,
         scout_reported_at_utc=scout.reported_at_utc if scout is not None else None,
+        scout_count=scout_count,
         attack_count=len(attacks),
         attack_reports=sum(1 for item in attacks if item.has_report),
         latest_attack_at_utc=latest_attack_at_utc,
@@ -1346,9 +1352,16 @@ class SqlAlchemyRepository:
             ]
 
     def pirate_progress(
-        self, *, since: datetime, until: datetime | None = None
+        self,
+        *,
+        since: datetime,
+        until: datetime | None = None,
+        scout_not_before: datetime | None = None,
     ) -> list[PirateProgress]:
-        """一段时间内每个海盗目标走到哪一步了，供控制台显示。
+        """一段时间内每个海盗目标走到哪一步了。
+
+        两类调用方，口径差一个参数：控制台要显示（不传 `scout_not_before`），
+        活链路要据此决定派不派（`tools.pirate_loop` 传当日 UTC 00:00）。
 
         窗口 `[since, until)` 落在**意图创建时刻**上，与 `daily_attack_status`
         和 `count_dispatches_since` 同口径：一天就是游戏内那一天（UTC+0）。
@@ -1366,6 +1379,14 @@ class SqlAlchemyRepository:
         按窗口筛那一发会永远显示成「待侦察报告」。取该目标**不晚于 `until`**
         的最近一份，晚于窗口的不算——否则今天的报告会去解释昨天那一发。
 
+        ⚠️ **`scout_not_before` 是给活链路的下界，控制台不要传。** 上一段那条
+        「按目标取最近一份」只在**显示**上是对的：显示要解释窗口里那一发，
+        而活链路要拿这份报告去决定今天打不打。海盗每天刷新，昨天那份报告说的是
+        昨天那批舰队——用它判「待触发攻击」就是照着过期情报把舰队扔出去。
+        实际会撞上：2:137:1~4 天天侦察，库里永远躺着昨天那份；今天的侦察发刚出去、
+        报告还没回的那十几分钟，不设下界的话这四个坐标全会显示成「待触发攻击」。
+        传了下界，这段时间它们老老实实是「待侦察报告」。
+
         ⚠️ **只认 `accepted` 的派遣。** 被游戏拒掉的那一发没有舰队飞出去，
         也就永远不会有战报；算进来就是一个永久的「已触发攻击 · 待战报」。
         判据与 `bot_dispatch_facts` / `pending_reports_for_kind` 同源。
@@ -1373,6 +1394,8 @@ class SqlAlchemyRepository:
         _require_utc(since, "since")
         if until is not None:
             _require_utc(until, "until")
+        if scout_not_before is not None:
+            _require_utc(scout_not_before, "scout_not_before")
 
         created = orm.AttackIntentRow.created_at_utc
         in_window: ColumnElement[bool] = (
@@ -1405,23 +1428,25 @@ class SqlAlchemyRepository:
                 .order_by(orm.AttackDispatchRow.dispatched_at_utc)
             ).all()
 
-            scouted: set[Coordinate] = set()
+            scout_counts: dict[Coordinate, int] = {}
             attacks: dict[Coordinate, list[AttackFact]] = {}
             latest_attack: dict[Coordinate, datetime] = {}
             for galaxy, system, position, mission_kind, dispatched_at, report_id in rows:
                 target = Coordinate(galaxy, system, position)
                 if mission_kind == MISSION_KIND_SCOUT:
-                    scouted.add(target)
+                    scout_counts[target] = scout_counts.get(target, 0) + 1
                     continue
                 attacks.setdefault(target, []).append(AttackFact(has_report=report_id is not None))
                 latest_attack[target] = dispatched_at
 
-            targets = sorted(scouted | set(attacks), key=_coordinate_sort_key)
+            targets = sorted(set(scout_counts) | set(attacks), key=_coordinate_sort_key)
             return [
                 _pirate_progress_for(
                     target,
-                    scouted=target in scouted,
-                    scout=self._latest_scout_report(session, target, until=until),
+                    scout_count=scout_counts.get(target, 0),
+                    scout=self._latest_scout_report(
+                        session, target, until=until, not_before=scout_not_before
+                    ),
                     attacks=tuple(attacks.get(target, ())),
                     latest_attack_at_utc=latest_attack.get(target),
                 )
@@ -1430,9 +1455,13 @@ class SqlAlchemyRepository:
 
     @staticmethod
     def _latest_scout_report(
-        session: Session, target: Coordinate, *, until: datetime | None
+        session: Session,
+        target: Coordinate,
+        *,
+        until: datetime | None,
+        not_before: datetime | None = None,
     ) -> ScoutReport | None:
-        """该目标不晚于 `until` 的最近一份侦察报告；一份都没有就 None。"""
+        """该目标落在 `[not_before, until)` 里的最近一份侦察报告；一份都没有就 None。"""
         statement = (
             select(orm.ScoutReportRow)
             .where(
@@ -1445,6 +1474,8 @@ class SqlAlchemyRepository:
         )
         if until is not None:
             statement = statement.where(orm.ScoutReportRow.reported_at_utc < until)
+        if not_before is not None:
+            statement = statement.where(orm.ScoutReportRow.reported_at_utc >= not_before)
         row = session.scalars(statement).first()
         if row is None:
             return None

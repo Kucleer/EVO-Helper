@@ -135,10 +135,73 @@ PHASE_LABELS: dict[PiratePhase, str] = {
 }
 
 
+class PirateAction(Enum):
+    """看到某个态之后，活链路这一趟该对这个坐标做什么。
+
+    态是「走到哪了」，动作是「现在做什么」——分成两个类型而不是让链路直接
+    `if phase is ...` 一路判下来，是因为**同一个态在不同的侦察发数下动作不同**
+    （见 `SCOUT_UNREADABLE`），而链路里散着的一串 `if` 藏不住这条规则。
+    """
+
+    #: 派一发侦察。
+    SCOUT = "SCOUT"
+    #: 直接攻击，**不重新侦察**：今天那份侦察报告已经判为「打」。
+    ATTACK = "ATTACK"
+    #: 这一趟什么都不做，但今天还没完——舰队/报告还在路上，下一趟再来。
+    WAIT = "WAIT"
+    #: 今天到此为止，不侦察也不攻击。
+    DONE = "DONE"
+
+
+#: 同一个坐标一天最多派几发侦察。
+#:
+#: 用户口径（2026-08-13）：海盗刷新是当日内（游戏内 UTC+0），所以今天侦查过的
+#: 坐标**直接用今天那份报告的结论**，不重复侦查。唯一的例外是
+#: `SCOUT_UNREADABLE`——报告回来了但四格舰船数没读全，算不出该不该打；那一档
+#: 允许当天再补一次，也就是每坐标每天最多 **2** 发。
+#:
+#: 为什么例外只给这一档：`NO_ATTACK` 是「四格都读全了、都 ≤ 1」，结论是确定的，
+#: 再侦察一次只会得到同一个结论；而 `UNREADABLE` 的下一次读可能就读全了。
+#: 这两件事的区别正是 `PiratePhase` 分出第四态的全部理由（见模块头）。
+#:
+#: 为什么补一次就封顶：2026-08-13 通宵实机 111 发侦察打在 54 个坐标上
+#: （2:137:1~4 各 5 发），攻击只有 12 发——配额全烧在重复侦察上。ROI 落空这类
+#: 毛病是**系统性**的（库里 98 份报告里「收割者」一格一份都没读出来），补第三、
+#: 第四次读到的还是同一个空格子，只是把配额再烧一遍。
+MAX_SCOUTS_PER_DAY = 2
+
+
+def action_for(phase: PiratePhase, *, scout_count: int) -> PirateAction:
+    """今天走到 `phase`、今天已经派了 `scout_count` 发侦察，这一趟该做什么。
+
+    `scout_count` 只在 `SCOUT_UNREADABLE` 那一档参与判定，其余档它是多余的；
+    仍旧要求传，是为了让调用方拿不到发数时**答不上来**，而不是默默按 0 算——
+    按 0 算的那条路正是「每轮都当作没侦察过」，也就是要修的这个毛病本身。
+    """
+    if scout_count < 0:
+        raise ValueError(f"今天派出去的侦察发数不能是负的：{scout_count}")
+    if phase is PiratePhase.NEEDS_SCOUT:
+        return PirateAction.SCOUT
+    if phase is PiratePhase.AWAITING_SCOUT_REPORT:
+        return PirateAction.WAIT
+    if phase is PiratePhase.NEEDS_ATTACK:
+        return PirateAction.ATTACK
+    if phase is PiratePhase.AWAITING_ATTACK_REPORT:
+        return PirateAction.WAIT
+    if phase is PiratePhase.SCOUT_UNREADABLE:
+        return PirateAction.SCOUT if scout_count < MAX_SCOUTS_PER_DAY else PirateAction.DONE
+    if phase in (PiratePhase.NO_ATTACK, PiratePhase.ATTACK_DONE):
+        return PirateAction.DONE
+    raise ValueError(f"未知的海盗态：{phase!r}")
+
+
 __all__ = [
+    "MAX_SCOUTS_PER_DAY",
     "PHASE_LABELS",
     "AttackFact",
+    "PirateAction",
     "PiratePhase",
+    "action_for",
     "phase_for",
     "phase_of",
 ]
