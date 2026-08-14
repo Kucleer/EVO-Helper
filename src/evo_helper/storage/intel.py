@@ -20,6 +20,21 @@ implementations of the same rule.
 
 页面上必须把这条口径写出来（`intel.html` 的快速过滤那一栏），不然用户会以为
 筛的是「历史上出现过」。
+
+**这张表只装 bot 目标，海盗一行都不进**（用户口径 2026-08-14）。
+
+理由是**海盗每 24 小时刷新一次**：今天侦察到「这颗星球上有 70 艘深空吞噬者」，
+明天那支舰队连同那个海盗一起没了。而情报中心是**长期台账**——谁占着、舰队多少、
+上次打是什么时候——台账里每一行都默认「它明天还是这样」。把一批第二天就作废的行
+混进来，用户每次都得先分辨哪些还算数，而这正是台账要替他省掉的事。
+
+海盗**不是不记**：每一发侦察 / 攻击仍然在攻击日志里。那一页一行是**一次派遣**，
+是流水不是台账——流水本来就钉着时刻，24 小时刷新对它没有妨碍。
+
+收在哪里见 `SqlAlchemyIntelRepository._rows_in_span`（行）与 `preset_names`
+（「预设」下拉框的候选值）。**必须收在数据这一侧**：只在模板里跳过的话，
+页面上的「共 N 条」、页码、以及快速过滤的候选值仍然按含海盗的那个集合算，
+于是总数和看得见的行数对不上，而翻到后面几页全是空的。
 """
 
 from __future__ import annotations
@@ -131,6 +146,9 @@ class IntelRow:
     match_confidence: float | None
     review_status: str | None
     #: `bot` 还是 `pirate`（`domain.records.TARGET_KIND_*`）。列表按它上色。
+    #:
+    #: 海盗被收掉之后（见模块头）这里实际上只会是 `bot`，但字段留着：它是
+    #: `_rows_in_span` 收人时用的那条判据本身，页面上的「类型」那一列也照它渲染。
     kind: str = TARGET_KIND_BOT
     #: 最近一次派遣的预设名 / 派遣结果 / 战果。见模块开头的口径说明。
     preset_name: str | None = None
@@ -144,6 +162,10 @@ class IntelRow:
     #:
     #: ⚠️ 这**不是舰队快照**，所以它不喂 `ConditionGroup`：那里只有四个判定舰种，
     #: 当成对方全部家当去算「舰队总数」会凭空缩水一个数量级。
+    #:
+    #: 侦察只对海盗做，而海盗已经不在这张表里（见模块头），所以这两格现在几乎总是
+    #: 空的。取数与序列化那条路留着不动：一颗扫出来的 bot 身上要是挂了侦察报告，
+    #: 它仍然要显示那一份，而「`None` 不是 0」这条规矩一旦从路上拆掉就再也补不回来。
     scout_at: datetime | None = None
     scout_ships: dict[str, int | None] = field(default_factory=dict)
 
@@ -165,9 +187,10 @@ class IntelRow:
     def intel_at(self) -> datetime | None:
         """这一行最近一次「知道了点什么」的时刻：战报或侦察报告，取晚的那个。
 
-        海盗目标一份战报都没有（海盗战报不写逐舰种、侦察报告更不是战报），
-        只按 `snapshot_at` 排的话它们全沉到底，而「刚侦察完的海盗」恰恰是
-        最该顶在前面的一批。
+        原先是为海盗写的：它们一份战报都没有，只按 `snapshot_at` 排会整批沉底。
+        海盗离场之后（见模块头）绝大多数行的 `scout_at` 都是空的，这个取大值也就
+        退化成 `snapshot_at`——但列名写的是「最新情报时间」，它就得说得出侦察那一份，
+        否则一颗身上挂着侦察报告的 bot 会显示成「暂无情报」。
         """
         moments = [moment for moment in (self.snapshot_at, self.scout_at) if moment is not None]
         return max(moments) if moments else None
@@ -253,12 +276,24 @@ class SqlAlchemyIntelRepository:
         return _paginate(rows, cursor=query.cursor, limit=query.limit)
 
     def _rows_in_span(self, session: Session, span: CoordinateRange | None) -> list[IntelRow]:
-        """span 内的每一个**目标星球**一行——bot 与海盗都算。
+        """span 内的每一个**目标星球**一行——**海盗在最后一步被收掉**。
 
         海盗不在 `bot_targets` 里：那张表由坐标扫描写，而海盗是在星系视图上认出来
-        的。只列 `bot_targets` 的话，情报中心里一个海盗都没有，于是侦察报告读到的
-        四个判定舰种**永远显示不出来**——这正是用户报的那条。所以候选集是三者的并集：
-        bot 目标、有过海盗派遣的坐标、有过侦察报告的坐标。
+        的。所以候选集仍然是三者的并集：bot 目标、有过海盗派遣的坐标、有过侦察报告
+        的坐标——并集照旧取全，收在**类型**这一步（海盗 24 小时刷新、留不成台账，
+        理由见模块头）。
+
+        为什么不干脆把海盗从并集里摘掉：
+
+        - 谁是海盗只有 `_kind_of` 说了算。摘一次等于把同一条判据写第二份，将来两份
+          各自漂移；而「bot 目标身上却挂着一份侦察报告」那种行，也只有 `_kind_of`
+          分得清（它判成 bot——`bot_targets` 是正面证据）。
+        - 并集里多出来的那几十个坐标**不多花一次查询**：`attempts` 与 `scouts` 本来
+          就要取（bot 行的预设 / 结果 / 战果全在 `attempts` 里），并集只是把已经在手
+          的字典拼一下。
+
+        收在这里而不是更靠外的地方：`search()` 的计数与分页都发生在这之后，
+        所以「共 N 条」、页码和看得见的行数说的是同一批行。
         """
         targets = self._bot_targets(session, span)
         attempts = self._latest_attempts(session, span)
@@ -273,7 +308,7 @@ class SqlAlchemyIntelRepository:
                 if attempt.target_kind == TARGET_KIND_PIRATE
             }
         )
-        return [
+        rows = [
             _build_row(
                 coordinate,
                 targets.get(coordinate),
@@ -283,6 +318,9 @@ class SqlAlchemyIntelRepository:
             )
             for coordinate in coordinates
         ]
+        # 海盗不进这张表（理由见方法头与模块头）。整个筛选只有这一条判据，
+        # 别在别处再补一次——两处过滤就意味着有一天两处会不一致。
+        return [row for row in rows if row.kind != TARGET_KIND_PIRATE]
 
     def _bot_targets(
         self, session: Session, span: CoordinateRange | None
@@ -449,16 +487,25 @@ class SqlAlchemyIntelRepository:
         }
 
     def preset_names(self) -> list[str]:
-        """派遣里出现过的预设名，供「预设」快速过滤的下拉框用。
+        """**bot 派遣**里出现过的预设名，供「预设」快速过滤的下拉框用。
 
         取自 `attack_intents` 而不是写死一张表：预设是用户在游戏里配的
         （探路 / AAA / BBB / CCC / 侦察……），写死就意味着新加一个预设之后，
         这一页会安静地筛不到它。
+
+        只取 `target_kind = bot` 的那些：这张表里已经没有海盗了（见模块头），
+        海盗专用的预设（实机上「侦察」那 522 发全是海盗）留在下拉框里，就是留一个
+        **选下去必然是空页**的选项——那比没有这个选项更糟：用户会以为侦察记录被弄丢
+        了，而它们一直在攻击日志里。
         """
         with self._session_factory() as session:
             return sorted(
                 name
-                for name in session.scalars(select(orm.AttackIntentRow.preset_name).distinct())
+                for name in session.scalars(
+                    select(orm.AttackIntentRow.preset_name)
+                    .where(orm.AttackIntentRow.target_kind == TARGET_KIND_BOT)
+                    .distinct()
+                )
                 if name
             )
 
@@ -673,10 +720,18 @@ def _kind_of(
 ) -> str:
     """派遣写下的 `target_kind` 最有分量：那是真打出去的那一发自己记的。
 
-    没派过就退回「有侦察报告 = 海盗」（侦察只对海盗做），再退回 bot。
+    没派过就看 `bot_targets` 里有没有这一行——那是坐标扫描认出来的 bot 星球，
+    是**正面证据**；两样都没有才退回「有侦察报告 = 海盗」这条**推断**
+    （侦察只对海盗做）。
+
+    ⚠️ 这个顺序不能反。类型现在决定**这一行进不进这张表**（海盗不进，见模块头），
+    所以把一颗扫出来的 bot 因为身上多了一份侦察报告判成海盗，等于从台账里删掉
+    一行——从前判错只是 chip 上错了个色，现在是丢数据。
     """
     if attempt is not None:
         return attempt.target_kind
+    if target is not None:
+        return TARGET_KIND_BOT
     if scout is not None:
         return TARGET_KIND_PIRATE
     return TARGET_KIND_BOT
@@ -756,8 +811,9 @@ def _sorted(rows: list[IntelRow], sort: str) -> list[IntelRow]:
             rows, key=lambda r: ((r.total if r.total is not None else 1 << 30), _pack(r.coordinate))
         )
     if sort == SORT_SNAPSHOT_DESC:
-        # `intel_at` 而不是 `snapshot_at`：海盗行没有战报、只有侦察报告，
-        # 按后者排会把刚侦察完的海盗全部沉到底。
+        # `intel_at` 而不是 `snapshot_at`：一行的「情报」也可能只是一份侦察报告。
+        # 海盗离场后这两者对绝大多数行是同一个值（见 `IntelRow.intel_at`），
+        # 但排序键与列名要说的是同一件事。
         return sorted(
             rows,
             key=lambda r: (
