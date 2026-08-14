@@ -91,6 +91,14 @@ PRESET_DRAG_WAIT_S = 1.2
 #: 拆得更碎（比如三字名）时字距仍是十几像素，而预设之间永远隔着大半个格子。
 PRESET_WORD_GAP_PX = 40
 
+#: 一屏读到空清单时，最多重读几次、每次之间等多久。
+#:
+#: 预设条**不可能真的是空的**（理由见 `PresetPicker.read_names_confirming`），
+#: 所以空结果只能是这一帧没读出来。3 次 × 0.6 秒 ≈ 多花 1.2 秒，而它挡住的是
+#: 「整发放弃」——实机 2026-08-13 那一夜为这件事白跑了约两小时。
+PRESET_READ_ATTEMPTS = 3
+PRESET_REREAD_WAIT_S = 0.6
+
 
 class PresetDriver(Protocol):
     def click(self, x: int, y: int, *, label: str = ...) -> None: ...
@@ -114,6 +122,34 @@ class PresetPicker:
     driver: PresetDriver
     read_names: Callable[[], Sequence[tuple[int, str]]]
 
+    def read_names_confirming(self) -> Sequence[tuple[int, str]]:
+        """读这一屏的预设名，**空结果要重读几次再认**。
+
+        ⚠️ **预设条不可能真的是空的。** 它至少有一个预设在视野里——用户的舰队
+        预设是他自己在游戏里维护的，一个都没有的话这整条链路根本无从谈起。
+        所以「这一屏读到 0 个名字」只可能是**这一帧没读出来**（拖动动画还没停、
+        或者 OCR 失手），绝不是「这一段没有预设」。
+
+        实机 2026-08-13 通宵，这一条把整夜毁了：预设顺序是 AAA / 探路 / BBB / CCC
+        （用户 2026-08-14 确认），而 `pick('BBB')` 逐屏读到的是
+
+            [['AAA', '探路'], [], ['ccc'], ['ccc']]
+
+        第 2 屏正是 BBB 那一屏，读成了空、被当成「这儿没有」，于是往右拖过头，
+        再看到两屏相同的 ccc 就判「到右端了」，抛 `PresetNotFound`。
+        **这样白跑了 145 次，每次约 50 秒，合计约 2 小时**——「18 分钟才派出
+        第一发」「四轮一发没派」全是它。
+
+        与 `vision.scan_reading.read_panel_confirming`、`game.session_keeper.observe`
+        同一条规矩：会动的画面上，单帧的空结果是抛硬币，不是证据。
+        """
+        for _attempt in range(PRESET_READ_ATTEMPTS):
+            names = list(self.read_names())
+            if names:
+                return names
+            self.driver.wait(PRESET_REREAD_WAIT_S)
+        return []
+
     def expand(self) -> None:
         self.driver.click(*PRESET_TOGGLE, label="预设条")
         self.driver.wait(PRESET_OPEN_WAIT_S)
@@ -126,7 +162,7 @@ class PresetPicker:
 
         两处用它：找之前定起点，以及**放弃之前把条还原成左端**（见 `pick`）。
         """
-        seen = list(self.read_names())
+        seen = list(self.read_names_confirming())
         for _attempt in range(max_drags):
             self.driver.drag(
                 PRESET_DRAG_TO_X,
@@ -136,7 +172,7 @@ class PresetPicker:
                 label="预设条左移",
             )
             self.driver.wait(PRESET_DRAG_WAIT_S)
-            current = list(self.read_names())
+            current = list(self.read_names_confirming())
             if _names_of(current) == _names_of(seen):
                 return current
             seen = current
@@ -156,7 +192,7 @@ class PresetPicker:
             label="预设条右移",
         )
         self.driver.wait(PRESET_DRAG_WAIT_S)
-        return list(self.read_names())
+        return list(self.read_names_confirming())
 
     def pick(self, name: str) -> int:
         """展开、拖到左端、再一屏一屏往右找，点中名叫 `name` 的那个预设，返回其中心 x。
@@ -248,8 +284,16 @@ def _clickable_hit(runs: Sequence[tuple[int, str]], name: str) -> int | None:
     放宽（右边就是第二个预设的数量列，看着很像该放宽），保存按钮立刻就进了候选池，
     而那时唯一还站着的就是这道闸。所以**不要因为「测试构造不出真实场景」删掉它**。
     """
+    # ⚠️ **忽略大小写。** 实机 2026-08-13 的日志里 `CCC` 有 118 次被读成 `ccc`
+    # （逐屏清单 `[['AAA','探路'], [], ['ccc'], ['ccc']]`），只有 1 次读对。
+    # 大小写敏感的匹配意味着：哪天用户把某个任务配成 CCC，这条链路会一发都派不出去，
+    # 而报出来的是「预设条上找不到 'CCC'」——看上去像游戏里没有这个预设。
+    #
+    # 放宽的代价是「aaa」会匹配上「AAA」，而预设名是用户自己起的、就那么几个，
+    # 大小写撞名不构成风险；漏匹配的代价则是整条链路停摆。
+    wanted = name.casefold()
     for x, text in sorted(runs):  # 命中多个只可能是同名出现两次，取最左那个。
-        if name not in text:
+        if wanted not in text.casefold():
             continue
         if PRESET_SAVE_BUTTON_KEYWORD in text:
             continue
