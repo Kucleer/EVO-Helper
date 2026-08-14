@@ -51,6 +51,7 @@ from typing import Any, Protocol
 
 from evo_helper.domain.text import snap_to_vocabulary
 from evo_helper.game.ranking_ui import (
+    CLOSE_ATTEMPTS,
     DRAG_PRESS_HOLD_S,
     DRAG_RELEASE_HOLD_S,
     DRAG_STEPS,
@@ -286,13 +287,28 @@ class RankingNavigator[RowT]:
         拖之后同一个像素上坐着的是**「太空舱」**（拖完中心在 830，差 10px），
         而 `pirate_ui` 里写着那个东西点开是材料仓库、还会把整条导航条盖住。
         把条留在右段就交回控制权，等于给下一条链路埋了一颗雷。
-        同一条规矩 `preset_picker.pick` 的收尾里已经写过一遍。
 
-        判据是回读：还原之后标签行**读得出东西**，而且里面**没有「排名」**。
+        ⚠️ **点完 ✕ 必须先回读确认关掉了，才准拖。** 实机 2026-08-15 撞到过：
+        第一次点 ✕ 没生效（上一个进程被杀时把鼠标左键按着留下了，那之后第一次
+        点击的 mouseDown 是空操作），而代码不回读就往下拖——`NAV_BAR_Y = 862`
+        落在**还开着的面板内部**，把榜单又滚了两行，然后回读必然失败。
+
+        判据是现成的：面板盖住标签行（实测），所以**标签行读得出东西就等于面板
+        已经关了**。读不出来就再点一次 ✕，而不是硬着头皮往下拖。
+
+        最后的还原判据同样是回读：标签行读得出东西，而且里面**没有「排名」**。
         读不出来就如实返回 False——「读到 0 个标签」永远不算证据（模块头第 1 条）。
         """
-        self.driver.click(*RANKING_CLOSE, label="关闭排行榜")
-        self.driver.wait(NAV_DRAG_WAIT_S)
+        for attempt in range(CLOSE_ATTEMPTS):
+            self.driver.click(*RANKING_CLOSE, label="关闭排行榜")
+            self.driver.wait(NAV_DRAG_WAIT_S)
+            if self._labels_confirming():
+                break
+            self.say(f"  点了 {attempt + 1} 次 ✕，标签行仍读不出来：面板还开着，再点一次")
+        else:
+            self.say("  面板关不掉；**不拖导航条**——那一拖会落在面板里，白拖还会滚乱榜单")
+            return False
+
         self._slow_drag(NAV_DRAG_TO_X, NAV_BAR_Y, NAV_DRAG_FROM_X, NAV_BAR_Y, label="导航条右移")
         self.driver.wait(NAV_DRAG_WAIT_S)
         runs = merged_labels(self._labels_confirming())

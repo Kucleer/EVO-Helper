@@ -60,6 +60,66 @@ def parse_score(text: str) -> float | None:
     return value * {"K": 1_000.0, "M": 1_000_000.0, None: 1.0}[match.group(2)]
 
 
+def release_stuck_mouse(driver: LiveDriver) -> None:
+    """开工前先松一次鼠标左键。**没按着也松一下，无害。**
+
+    ⚠️ 上一个进程要是被 `Stop-Process` / 任务管理器杀掉的（挂机整夜必然发生：
+    断线重启、用户 Ctrl+C、机器休眠），`SlowDragDriver.release()` 不会跑，
+    **左键就那么按着留下来了**。实测 2026-08-15 撞到过：那之后第一次 `click()`
+    的 mouseDown 成了空操作、mouseUp 被游戏当成松手而不是点击，于是「点 ✕ 关面板」
+    没生效，紧接着那一拖落在还开着的面板里，把列表又滚了两行。
+
+    代价还不止于游戏：键按着交还给用户时，整个桌面都在拖东西。
+
+    所以每趟开工先无条件松一次。这比「记得判断上一趟是怎么结束的」可靠。
+    """
+    driver._gui.mouseUp()  # noqa: SLF001 - 与 SlowDragDriver 同一个理由
+
+
+def ensure_in_game(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> bool:
+    """确认画面在游戏里；掉回入口页就点一次「进入」。返回「现在在游戏里」。
+
+    ⚠️ **挂机整夜必须有这一步。** 会话闲置会掉回入口页（实测 2026-08-15 闲置四
+    小时就掉了），而 `open_military_ranking` 在那种画面上只会抛 `RankingNotReached`
+    ——外面的 bat 于是每两分钟重试一次，一整夜空转，什么都采不到。
+
+    ⚠️ **空结果不是证据。** 入口页有淡入动画，那一帧读「进入」会读到空串
+    （实测撞到过）。所以逐次重读，读到了才点；八次都读不出来就如实返回 False，
+    **绝不朝着一个认不出的画面盲点**。
+    """
+    from evo_helper.game.ranking_nav import merged_labels, nav_label_words
+    from evo_helper.tools.scan_coordinates import (
+        ENTRY_BUTTON_ROI,
+        ENTRY_BUTTON_TEXT,
+        ENTRY_UPSCALE,
+        make_ocr,
+    )
+
+    read = make_ocr()
+    seen: list[str] = []
+    for _ in range(attempts):
+        if len(merged_labels(nav_label_words(driver.capture(), ocr))) >= 4:
+            return True
+        text = read(driver.capture().crop(ENTRY_BUTTON_ROI), digits=False, upscale=ENTRY_UPSCALE)
+        seen.append(text)
+        if ENTRY_BUTTON_TEXT in text:
+            left, top, right, bottom = ENTRY_BUTTON_ROI
+            driver.click((left + right) // 2, (top + bottom) // 2, label=ENTRY_BUTTON_TEXT)
+            break
+        driver.wait(1.0)
+    else:
+        print(f"认不出入口页也不在游戏里，不点；逐次读到 {seen}")
+        return False
+
+    # 登录要时间。实测 2026-08-15（有游戏活动、卡顿）用了 111 秒。
+    for _ in range(40):
+        driver.wait(3.0)
+        if len(merged_labels(nav_label_words(driver.capture(), ocr))) >= 4:
+            return True
+    print("点完「进入」等了两分钟仍没进游戏")
+    return False
+
+
 def name_column_text(image: Any, ocr: Any, columns: RankingColumns | None = None) -> str:
     """把**整条名字列**一次读出来（多行）。翻真人段时只需要这一个。
 
@@ -178,6 +238,9 @@ def scan(
     pytesseract.pytesseract.tesseract_cmd = Settings().tesseract_path
     driver = LiveDriver()  # 默认 False：此工具没有派舰队能力。
     ocr = pytesseract
+    release_stuck_mouse(driver)
+    if not ensure_in_game(driver, ocr):
+        return 1
 
     player_name = Settings().player_name
 
@@ -376,8 +439,10 @@ __all__ = [
     "RankingColumns",
     "progress_mark",
     "is_self_row",
+    "ensure_in_game",
     "keep_screens",
     "name_column_text",
+    "release_stuck_mouse",
     "main",
     "parse_score",
     "rows_from_image",
