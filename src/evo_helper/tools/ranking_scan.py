@@ -27,6 +27,7 @@ from evo_helper.domain.records import RankingTarget
 from evo_helper.game.ranking_nav import RankingNavigator, ScrollOutcome, nav_label_words
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLLS,
+    DRY_SCREENS,
     NAME_COLUMN,
     RANK_COLUMN,
     RANKING_LIST_MAX_Y,
@@ -221,7 +222,7 @@ def scan(
     *,
     blind_scrolls: int = BLIND_SCROLLS,
     human_scrolls: int = 140,
-    bot_scrolls: int = 40,
+    bot_scrolls: int = 400,
 ) -> int:
     """跑一趟榜单采集。返回 0 = 正常到底，2 = 中途离页（多半断线）。
 
@@ -310,12 +311,17 @@ def scan(
                     break
                 rows = list(step.rows)
                 fresh = targets_from_rows(rows, observed_at=datetime.now(UTC))
-                # ⚠️ **停止判据建在 bot 名字上，不在名次上。** 名字是这一层唯一
-                # 读得准的东西；连着几屏一个新 bot 都没有，才算这一段跑完了。
+                # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
+                # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
+                # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
+                # 而 bot 段有四千多个。
+                #
+                # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
+                # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
                 print(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
-                if dry >= SCROLL_STALL_CONFIRMATIONS:
+                if dry >= DRY_SCREENS:
                     print(f"连续 {dry} 屏没有新 bot：这一段到头了")
                     break
     finally:

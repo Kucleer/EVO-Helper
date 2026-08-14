@@ -265,6 +265,16 @@ RANKS_PER_SCROLL_MEASURED = 8
 #: 直接跳过榜首那批军力最高的 bot。
 RANKS_PER_SCROLL_MAX = 12
 
+#: 采集段里连续几屏一个新 bot 都没有，才算这一段到头了。
+#:
+#: ⚠️ **不能复用 `SCROLL_STALL_CONFIRMATIONS`(3)。** 2026-08-15 实机用它当判据，
+#: 刚翻到 bot 区就当场触发——边界那几屏大半还是真人，本来就没几个新 bot，
+#: 于是一趟只写了 2 条，而 bot 段有四千多个。
+#:
+#: 取 12：bot 段里每屏期望约 8 个新的（实测），连着 12 屏一个都没有，
+#: 才是「真的到头了」而不是「正好走在稀疏的一段上」。
+DRY_SCREENS = 12
+
 #: 连续几次「最大名次没往前走」才算滚到底了。
 #:
 #: ⚠️ **不能只看「两屏 OCR 输出完全相等」**（`ranking_nav.scroll_once` 那条）。
@@ -315,6 +325,7 @@ __all__ = [
     "DRAG_PRESS_HOLD_S",
     "DRAG_RELEASE_HOLD_S",
     "DRAG_STEPS",
+    "DRY_SCREENS",
     "MILITARY_TAB",
     "NAV_BAR_Y",
     "NAV_DRAG_FROM_X",
