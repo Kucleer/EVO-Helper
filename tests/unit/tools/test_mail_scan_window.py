@@ -543,3 +543,49 @@ def test_the_trip_stops_when_a_drag_changes_nothing() -> None:
     assert scan.pages == 2
     assert loop._driver.clicks.count("打开邮件") == 1, "同一封不许开第二次"
     assert len(opened) == 1
+
+
+# -- 耗时打点：只观测，不改行为 ------------------------------------------------
+
+
+def test_the_step_timer_reports_every_lap_and_the_total() -> None:
+    """一行里要同时有总时长和各步——只有总数的话，知道「慢」却不知道慢在哪，
+    而这一层存在的全部理由就是把「45 秒花在哪」从猜变成量。
+    """
+    from evo_helper.tools.pirate_loop import StepTimer
+
+    said: list[str] = []
+    timer = StepTimer("2:1:1 攻击")
+    timer.lap("开面板")
+    timer.lap("翻预设条")
+
+    import evo_helper.tools.pirate_loop as module
+
+    original, module.say = module.say, said.append
+    try:
+        timer.say_total("派出")
+    finally:
+        module.say = original
+
+    assert len(said) == 1
+    assert "2:1:1 攻击" in said[0]
+    assert "（派出）" in said[0]
+    assert "开面板" in said[0] and "翻预设条" in said[0]
+
+
+def test_the_step_timer_never_goes_backwards() -> None:
+    """**用单调钟，不用墙钟。**
+
+    这几个数是拿来相减的，而墙钟会被 NTP 校时往回拨——拨一次就能拿到负耗时，
+    而负耗时在分解表上会把整晚的统计带偏。
+    """
+    import time as time_module
+
+    from evo_helper.tools.pirate_loop import StepTimer
+
+    timer = StepTimer("x")
+    timer.lap("a")
+
+    # 把墙钟往回拨一年也不该影响它。
+    assert timer._laps[0][1] >= 0
+    assert time_module.monotonic() >= timer._start

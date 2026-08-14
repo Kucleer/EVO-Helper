@@ -926,10 +926,15 @@ class PirateLoop:
 
         **只重试一次。** 无限重试会把整轮卡死在一个目标上，比跳过还糟。
         """
+        timer = StepTimer(f"{coordinate} 导航")
         self._navigator.goto(coordinate)
+        timer.lap("goto")
         check = self.check_target(coordinate)
+        timer.lap("核对面板")
         if check not in self.RETRY_CHECKS:
+            timer.say_total(check.name)
             return check
+        timer.say_total(f"{check.name}，要重试")
         say("  复位画面后重试一次")
         reconnected = self._ensure_session(force=True)
         self._reset_to_known_screen()
@@ -1114,13 +1119,17 @@ class PirateLoop:
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
         """
         wanted = preset or self._options.preset
+        timer = StepTimer(f"{coordinate} 攻击")
         self._driver.click(*self.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
+        timer.lap("开面板")
 
         picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
         try:
             picker.pick(wanted)
         except PresetNotFound as error:
+            timer.lap("翻预设条")
+            timer.say_total("没找到预设")
             say(f"  {error}；关掉面板，不打这一发")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
@@ -1134,11 +1143,13 @@ class PirateLoop:
             self._outcome.refused.append((coordinate, f"找不到预设 {wanted}"))
             return False
 
+        timer.lap("翻预设条")
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
         # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
         # 这里弹的是那种单按钮弹窗。**先认再走**，而且要在记意图之前。
         if not self._handle_dialog(coordinate):
+            timer.say_total("弹窗挡下")
             self._leave_dispatch_list()
             return False
         intent_id = self._record_intent(coordinate, preset=wanted)
@@ -1146,11 +1157,15 @@ class PirateLoop:
         # 挪到后面读，四次重试全会落空，飞行时间永久恒为 NULL——而且一声不响，
         # 看起来只是「一直在等」。
         flight = self._read_flight_time()
+        timer.lap("简报")
         if not self._launch(coordinate, "攻击"):
+            timer.say_total("点不出「出发」")
             self._leave_dispatch_list()
             return False
         self._record_dispatch(intent_id, flight)
         self._outcome.attacked.append(coordinate)
+        timer.lap("出发")
+        timer.say_total("派出")
         say(f"  已发动攻击 → {coordinate}（预设 {wanted}）")
         self._leave_dispatch_list()
         return True
@@ -2664,6 +2679,42 @@ def rematch_note(repository: Any, target: Coordinate, reported_at: datetime) -> 
 
 def _coordinate_order(coordinate: Coordinate) -> tuple[int, int, int]:
     return (coordinate.galaxy, coordinate.system, coordinate.position)
+
+
+class StepTimer:
+    """给一次派遣的各步计时，收工打一行。**只观测，一个行为都不改。**
+
+    起因（用户 2026-08-14）：实机上每个目标约 45 秒，而日志只在**目标边界**打点，
+    中间的导航、开面板、翻预设条、简报闸门一个时刻都没有——于是「45 秒花在哪」
+    根本切不开，只能靠猜。这一层就是把猜换成量。
+
+    ⚠️ **用 `time.monotonic()` 而不是墙钟。** 这几个数是拿来相减的，而墙钟会被
+    NTP 校时往回拨，拨一次就能拿到负的耗时。`say()` 行首那个时刻是给人对事件的，
+    两者用途不同，不要合并。
+
+    收工那一行长这样，方便事后 grep 出来做分解表：
+
+        [耗时] 2:112:19 攻击 共 46s（派出）：开面板 6s 翻预设条 21s 简报 15s 出发 4s
+
+    **每条出路都要打这一行**，包括失败的那几条：昨夜 145 次「找不到预设」正是
+    最贵的一档，只记成功的话，分解表上看到的会是一个被幸存者偏差洗过的数。
+    """
+
+    def __init__(self, what: str) -> None:
+        self._what = what
+        self._start = time.monotonic()
+        self._mark = self._start
+        self._laps: list[tuple[str, float]] = []
+
+    def lap(self, name: str) -> None:
+        now = time.monotonic()
+        self._laps.append((name, now - self._mark))
+        self._mark = now
+
+    def say_total(self, outcome: str) -> None:
+        total = time.monotonic() - self._start
+        parts = " ".join(f"{name} {secs:.0f}s" for name, secs in self._laps)
+        say(f"  [耗时] {self._what} 共 {total:.0f}s（{outcome}）：{parts}")
 
 
 def slow_drag(driver: LiveDriver, from_y: int, to_y: int, *, x: int = 960, steps: int = 12) -> None:
