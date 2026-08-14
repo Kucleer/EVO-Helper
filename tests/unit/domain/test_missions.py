@@ -18,6 +18,7 @@ from evo_helper.domain.missions import (
     pirate_command,
     pirate_systems,
     scan_command,
+    wrap_system,
 )
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scan_bounds import SYSTEMS_PER_GALAXY
@@ -30,18 +31,59 @@ def test_pirate_systems_are_ordered_nearest_first() -> None:
     assert systems == ((2, 137), (2, 136), (2, 138), (2, 135), (2, 139))
 
 
-def test_a_radius_past_the_edge_is_clamped_not_rejected() -> None:
-    """半径填大了应当是「到边为止」，不是「不许开始」。"""
-    systems = pirate_systems(Coordinate(2, 2, 1), radius=5)
+def test_a_radius_near_system_one_wraps_instead_of_being_clipped() -> None:
+    """⚠️ **恒星系成环，所以半径要绕回去，不是在 1 上截断。**
 
-    assert min(system for _galaxy, system in systems) == 1
+    原先这里是 `max(1, s - r)`，于是从 2:2 半径 5 只给出 7 个系（1–7）。
+    环上应该是 11 个：`496 497 498 499 · 1 2 3 4 5 6 7`。
+    少掉的那 4 个不报错、日志里也看不出来，只是**永远不去打**。
+
+    （实测依据见 `domain.distance` 模块头：从 2:137 打 2:499 只要 1969 秒，
+    比 2:287 的 2042 秒还快——环上它是 137 步，不是 362 步。）
+    """
+    systems = [system for _galaxy, system in pirate_systems(Coordinate(2, 2, 1), radius=5)]
+
+    assert len(systems) == 11
+    assert set(systems) == {496, 497, 498, 499, 1, 2, 3, 4, 5, 6, 7}
 
 
-def test_a_radius_past_the_upper_edge_is_clamped_too() -> None:
-    """下边界钳过不代表上边界也钳了——两头各是一次独立的 min/max。"""
-    systems = pirate_systems(Coordinate(2, 498, 1), radius=5)
+def test_a_radius_near_the_last_system_wraps_the_other_way() -> None:
+    """下边界绕过不代表上边界也绕了——原先那两头是各自独立的一次钳制。"""
+    systems = [system for _galaxy, system in pirate_systems(Coordinate(2, 498, 1), radius=5)]
 
-    assert max(system for _galaxy, system in systems) == SYSTEMS_PER_GALAXY
+    assert len(systems) == 11
+    assert set(systems) == {493, 494, 495, 496, 497, 498, 499, 1, 2, 3, 4}
+
+
+def test_the_wrapped_radius_is_still_ordered_nearest_first() -> None:
+    """绕回去的那些也要排在正确的位置上，不是缀在末尾。
+
+    从 2:2 看，499 和 4 都是 2 步——它们必须**挨在一起**，而不是让 499
+    因为数字大就掉到最后。等距时仍然小的在前。
+    """
+    systems = [system for _galaxy, system in pirate_systems(Coordinate(2, 2, 1), radius=3)]
+
+    assert systems == [2, 1, 3, 4, 499, 5, 498]
+
+
+def test_wrapping_lands_on_499_not_on_zero() -> None:
+    """⚠️ **环的接缝在 499↔1，而 `0` 不是一个恒星系号。**
+
+    `wrap_system` 少掉那个 `+1` 偏移的话，只有在结果正好是 499 的倍数时才露馅
+    ——别处都对得上，于是很容易漏过去。用户看到的是「2:0 – 2:8」这种范围回显。
+    """
+    assert wrap_system(0) == SYSTEMS_PER_GALAXY
+    assert wrap_system(SYSTEMS_PER_GALAXY) == SYSTEMS_PER_GALAXY
+    assert wrap_system(SYSTEMS_PER_GALAXY + 1) == 1
+    assert wrap_system(1) == 1
+    assert wrap_system(-1) == SYSTEMS_PER_GALAXY - 1
+
+
+def test_a_radius_past_half_the_ring_covers_the_galaxy() -> None:
+    """环上没有「边」可以钳，所以半径超过半圈就是整圈——填大了不该报错。"""
+    systems = pirate_systems(Coordinate(2, 137, 1), radius=SYSTEMS_PER_GALAXY)
+
+    assert len(systems) == SYSTEMS_PER_GALAXY
 
 
 def test_a_non_positive_radius_is_rejected() -> None:

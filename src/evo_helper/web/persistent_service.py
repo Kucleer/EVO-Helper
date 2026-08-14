@@ -26,8 +26,10 @@ from evo_helper.domain.missions import (
     MissionParamError,
     bot_targets_in_range,
     pirate_systems,
+    wrap_system,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
+from evo_helper.domain.scan_bounds import SYSTEMS_PER_GALAXY
 from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
@@ -1310,11 +1312,17 @@ class MissionConsoleService:
             systems = pirate_systems(origin, radius)
         except MissionParamError as exc:
             return f"参数不合格：{exc}"
-        # `pirate_systems` 按离主星的距离排，不是按系号排，所以取首尾要先排序。
-        numbers = sorted(system for _, system in systems)
+        # ⚠️ 首尾**不能**用 min/max：恒星系成环，半径跨过 499↔1 时
+        # min 是 1、max 是 499，显示出来就成了「整个银河」，而实际只有十几个系。
+        # 端点要按「主星 ± 半径」绕回来算。
+        if len(systems) >= SYSTEMS_PER_GALAXY:
+            return f"半径 {radius} · 整个 {origin.galaxy} 银河，{len(systems)} 个系"
+        low = wrap_system(origin.system - radius)
+        high = wrap_system(origin.system + radius)
+        wrapped = "（跨 499↔1）" if low > high else ""
         return (
-            f"半径 {radius} · {origin.galaxy}:{numbers[0]} – "
-            f"{origin.galaxy}:{numbers[-1]}，{len(numbers)} 个系"
+            f"半径 {radius} · {origin.galaxy}:{low} – "
+            f"{origin.galaxy}:{high}{wrapped}，{len(systems)} 个系"
         )
 
     def _bot_summary(self, params: dict[str, int]) -> str:
