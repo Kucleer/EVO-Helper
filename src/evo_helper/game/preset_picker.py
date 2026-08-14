@@ -68,6 +68,16 @@ from evo_helper.game.pirate_ui import (
 PRESET_NAME_ROI = (730, 684, 1000, 704)
 PRESET_NAME_UPSCALE = 3
 
+#: 金色掩膜那一档用的**宽** ROI：整条预设条都收进来。
+#:
+#: 上面那条把右界收到 1000，理由是「再往右是第二个预设的数量列，读进来只是噪声」。
+#: **那条理由在掩膜下不成立**：数量列是白字，按金色抠完根本不在图里。
+#:
+#: 而宽一点是必须的：实机 2026-08-15 量到，窄 ROI 里 `BBB` 的像素明明在
+#: （148 个黑点），tesseract 却读成空串——一张大片空白里只有一个孤零零的词时
+#: 它认不出来。把 `CCC` 一起收进来（238 个黑点）就一次读对。
+PRESET_NAME_ROI_WIDE = (730, 682, 1240, 706)
+
 #: 展开预设条后等它铺开。
 PRESET_OPEN_WAIT_S = 1.6
 
@@ -232,28 +242,63 @@ class PresetPicker:
         raise PresetNotFound(f"预设条上找不到 {name!r}；从左到右逐屏读到的是 {screens}")
 
 
+def gold_mask(crop: Any) -> Any:
+    """把金黄的预设名抠成**黑字白底**，背景一律刷白。
+
+    ⚠️ **灰度化在这一行上会瞎掉。** 实机 2026-08-15：预设条第 4 页上的 `BBB`
+    灰度读出来是空串（3×/4×/6×/8× 全空），而金色掩膜 3× 一次就读对。
+    原因是金字压在蓝底上，两者**亮度接近**——金 (255,200,0) 灰度约 193，
+    背景蓝约 79–150，滚到亮一点的那一段就没有对比度了。掩膜按 `r - b` 判，
+    与背景明暗无关。
+
+    这条判据 2026-08-15 那一夜代价很大：bot 链路整晚找不到 `BBB`，
+    一发都没派，而 `BBB` 就明明白白印在屏幕上。
+    """
+    from PIL import Image
+
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    source = list(rgb.getdata())
+    painted = [
+        0 if (red > 140 and green > 110 and red - blue > 60) else 255 for red, green, blue in source
+    ]
+    mask = Image.new("L", (width, height))
+    mask.putdata(painted)
+    return mask
+
+
 def name_words(image: Any, ocr: Any) -> list[tuple[int, str]]:
     """从一张整窗截图里读出预设名那一行的 `(中心 x, 文字)`。
 
     用词框而不是整行文本：要拿 x 去点。
+
+    ⚠️ **两档配方，读到就算。** 灰度那一档在预设条**某些滚动位置**上完全读不出来
+    （见 `gold_mask`），而它在别的位置上一直好用、也是中文预设名验过的那一档。
+    所以不是替换是加法：灰度先试，读空了再用金色掩膜兜。
     """
-    crop = image.crop(PRESET_NAME_ROI).convert("L")
-    grey = crop.resize(
-        (crop.width * PRESET_NAME_UPSCALE, crop.height * PRESET_NAME_UPSCALE),
-        _lanczos(image),
+    recipes = (
+        (PRESET_NAME_ROI, image.crop(PRESET_NAME_ROI).convert("L")),
+        (PRESET_NAME_ROI_WIDE, gold_mask(image.crop(PRESET_NAME_ROI_WIDE))),
     )
-    data = ocr.image_to_data(
-        grey, lang="chi_sim+eng", config="--psm 6", output_type=ocr.Output.DICT
-    )
-    words: list[tuple[int, str]] = []
-    for index, word in enumerate(data["text"]):
-        text = word.strip()
-        if not text:
-            continue
-        left = PRESET_NAME_ROI[0] + data["left"][index] // PRESET_NAME_UPSCALE
-        width = data["width"][index] // PRESET_NAME_UPSCALE
-        words.append((left + width // 2, text))
-    return words
+    for roi, prepared in recipes:
+        scaled = prepared.resize(
+            (prepared.width * PRESET_NAME_UPSCALE, prepared.height * PRESET_NAME_UPSCALE),
+            _lanczos(image),
+        )
+        data = ocr.image_to_data(
+            scaled, lang="chi_sim+eng", config="--psm 6", output_type=ocr.Output.DICT
+        )
+        words: list[tuple[int, str]] = []
+        for index, word in enumerate(data["text"]):
+            text = word.strip()
+            if not text:
+                continue
+            left = roi[0] + data["left"][index] // PRESET_NAME_UPSCALE
+            width = data["width"][index] // PRESET_NAME_UPSCALE
+            words.append((left + width // 2, text))
+        if words:
+            return words
+    return []
 
 
 def merged_names(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
@@ -315,6 +360,8 @@ def _names_of(entries: Sequence[tuple[int, str]]) -> list[str]:
 
 
 __all__ = [
+    "PRESET_NAME_ROI_WIDE",
+    "gold_mask",
     "PRESET_NAME_ROI",
     "PRESET_WORD_GAP_PX",
     "PresetNotFound",
