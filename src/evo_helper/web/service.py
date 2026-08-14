@@ -225,6 +225,25 @@ class AttackLogView:
     outcome: str | None = None
     attacker_losses: int | None = None
     defender_losses: int | None = None
+    #: 这一发是侦察还是攻击（`domain.records.MISSION_KIND_*`）。没派出去的意图
+    #: 没有这个字段，为 None。
+    #:
+    #: ⚠️ **不带它的话，这一页有两格是错的**，实机 2026-08-13 通宵之后用户连着
+    #: 提了两次：
+    #:
+    #: - 「战果」永远显示「待战报」。侦察发**不产生战报**（它产出的是侦察报告，
+    #:   走 `scout_reports` 那张表），而那一格问的是「有没有 `battle_reports`」，
+    #:   于是那一夜 111 发侦察全部永远挂着「待战报」。同一条规则
+    #:   `storage.intel._battle_result` 早就写对了，只是攻击日志这条渲染路径
+    #:   从来没跟上——之前几次「修好了」修的都是情报中心那一侧。
+    #: - 「预设」那格分不出侦察和攻击，两种发次长得一模一样。
+    mission_kind: str | None = None
+    #: 侦察发的报告回来了没有。**只对侦察发有意义**，攻击发恒为 False。
+    #:
+    #: 判据是「这个目标有没有一份不早于派出时刻的侦察报告」。侦察报告不认领派遣
+    #: （`ScoutReportRow` 没有 `dispatch_id`，理由写在那个类上），所以只能按
+    #: 目标 + 时间先后算，没法像战报那样精确到某一发。
+    scout_report_back: bool = False
 
 
 #: 攻击日志「结果」那一档的三个取值。键同 `storage.intel.DISPATCH_*`，

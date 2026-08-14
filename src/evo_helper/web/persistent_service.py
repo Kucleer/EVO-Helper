@@ -439,11 +439,26 @@ class PersistentApplicationService:
                     if outcome == RESULT_AWAITING
                     else orm.BattleReportRow.outcome == outcome
                 )
+            # 侦察报告回来了没有。**相关子查询而不是再加一个外连接**：一个目标
+            # 一天会有好几份侦察报告（`scout_reports` 不认领派遣，见那个类），
+            # 外连接会把同一发派遣乘成好几行，日志上就凭空多出几条没发生过的派遣。
+            scout_back = (
+                select(orm.ScoutReportRow.id)
+                .where(
+                    orm.ScoutReportRow.target_galaxy == orm.AttackIntentRow.target_galaxy,
+                    orm.ScoutReportRow.target_system == orm.AttackIntentRow.target_system,
+                    orm.ScoutReportRow.target_position == orm.AttackIntentRow.target_position,
+                    orm.ScoutReportRow.reported_at_utc >= orm.AttackDispatchRow.dispatched_at_utc,
+                )
+                .exists()
+            )
             rows = session.execute(
-                statement.order_by(
+                statement.add_columns(scout_back)
+                .order_by(
                     orm.AttackIntentRow.created_at_utc.desc(),
                     orm.AttackIntentRow.id.desc(),
-                ).limit(limit)
+                )
+                .limit(limit)
             ).all()
             return [
                 AttackLogView(
@@ -465,8 +480,10 @@ class PersistentApplicationService:
                     outcome=report.outcome if report else None,
                     attacker_losses=report.attacker_losses if report else None,
                     defender_losses=report.defender_losses if report else None,
+                    mission_kind=dispatch.mission_kind if dispatch else None,
+                    scout_report_back=bool(scouted),
                 )
-                for intent, dispatch, report in rows
+                for intent, dispatch, report, scouted in rows
             ]
 
     def attack_log_options(self) -> AttackLogOptions:
