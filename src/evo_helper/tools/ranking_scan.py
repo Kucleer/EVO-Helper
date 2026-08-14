@@ -253,6 +253,28 @@ def scan(
         read_labels=lambda: nav_label_words(driver.capture(), ocr),
         read_rows=read_rows,
     )
+    repository = SqlAlchemyRepository(
+        create_session_factory(create_database_engine(Settings().database_url))
+    )
+    written = 0
+
+    def persist(targets: Sequence[RankingTarget]) -> None:
+        """**逐屏落库**，不攒到最后一次性写。
+
+        ⚠️ 2026-08-15 实机：原先只在整趟跑完之后写一次，而一趟按预算要跑一个多
+        小时。中途被杀（用户 Ctrl+C、调度器抢占、断线）就**整趟全丢**——那一晚
+        跑了五十多屏、采到上百个 bot，库里一条都没有。
+
+        入库本身是幂等的（`bot_targets` 上有坐标唯一约束，重扫只更新），
+        所以逐屏写不会重复，只是多几次事务——而那点开销和丢一小时的数据比，
+        完全不值一提。
+        """
+        nonlocal written
+        if not targets:
+            return
+        repository.save_ranking_targets(targets)
+        written += len(targets)
+
     # ⚠️ **开榜放在 try 外面。** 它在读标签行那一步就可能失败，那时面板压根没开，
     # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
     # 那是这条链路的硬红线。放在外面就没有「记得判断开没开」这回事：
@@ -320,6 +342,7 @@ def scan(
                 # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
+                persist(fresh)
                 print(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
                 if dry >= DRY_SCREENS:
                     print(f"连续 {dry} 屏没有新 bot：这一段到头了")
@@ -328,12 +351,14 @@ def scan(
         if not nav.close():
             print("排行榜已关闭，但导航条还原未确认")
 
-    collected = keep_screens(screens, off_page=outcome == 2)
-    repository = SqlAlchemyRepository(
-        create_session_factory(create_database_engine(Settings().database_url))
+    # 离页时最后一屏是画面已经变了之后读的，可疑——但它**已经逐屏写进去了**。
+    # `keep_screens` 在这里只用来报数，不再决定写什么：真要把它撤回来得删行，
+    # 而删行比留一条可疑记录危险得多（那条记录带着 source='ranking'，本来就标着未验证）。
+    kept = keep_screens(screens, off_page=outcome == 2)
+    print(
+        f"军事榜采集{'（中途离页）' if outcome else '完成'}："
+        f"逐屏写入 {written} 条，其中末屏可疑 {written - len(kept)} 条"
     )
-    repository.save_ranking_targets(collected)
-    print(f"军事榜采集{'（中途离页）' if outcome else '完成'}：写入 {len(collected)} 条榜单目标")
     return outcome
 
 
