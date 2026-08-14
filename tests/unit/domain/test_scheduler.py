@@ -72,6 +72,7 @@ def task(
 PIRATE = task(MissionKind.PIRATE, task_id=1, priority=0)
 BOT = task(MissionKind.BOT, task_id=2, priority=1)
 SCAN = task(MissionKind.SCAN, task_id=3, priority=2)
+RANKING = task(MissionKind.RANKING, task_id=4, priority=3)
 
 #: 一个「什么都不挡」的任务事实：有一条空闲航线，本轮还剩目标。
 _BASE = TaskFacts(free_lines=1, targets_remaining=5)
@@ -361,6 +362,34 @@ def test_scanning_is_preempted_once_an_attack_task_has_work() -> None:
     decision = decide([PIRATE, SCAN], facts(), running=running, min_dwell=DWELL)
 
     assert decision == Decision(Action.PREEMPT, PIRATE)
+
+
+def test_the_ranking_scan_is_preempted_once_an_attack_task_has_work() -> None:
+    """⚠️⚠️ **今晚这套跑起来最要命的一条。**
+
+    军力榜采集和扫描一样是**填空隙**的（`GAP_FILLERS`），攻击到点了必须抢得回
+    鼠标。抢不回来的后果不是「慢一点」，是**整夜的攻击都被采集压着**——而采集
+    一趟要十几分钟，战报窗口只有几分钟。
+
+    变异测试当场抓到过：把抢占判断写回 `running.kind is MissionKind.SCAN`
+    （加军力榜之前那版）时，所有用例照样绿。
+    """
+    running = RunningProcess(
+        task_id=RANKING.task_id,
+        kind=MissionKind.RANKING,
+        started_at_utc=NOW - timedelta(seconds=90),
+    )
+
+    decision = decide([PIRATE, RANKING], facts(), running=running, min_dwell=DWELL)
+
+    assert decision == Decision(Action.PREEMPT, PIRATE)
+
+
+def test_the_ranking_scan_sorts_behind_every_attack_chain() -> None:
+    """填空隙的排最后，否则它会插到攻击前面去——而它一跑就是十几分钟。"""
+    decision = decide([RANKING, SCAN, BOT, PIRATE], facts(), running=None, min_dwell=DWELL)
+
+    assert decision == Decision(Action.START, PIRATE)
 
 
 def test_scanning_is_not_preempted_before_the_minimum_dwell() -> None:

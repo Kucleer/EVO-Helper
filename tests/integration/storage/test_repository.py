@@ -746,3 +746,38 @@ def test_a_dispatch_made_after_the_report_is_never_a_candidate(
     assert report is not None
     assert report.match_status == "UNMATCHED"
     assert report.dispatch_id is None
+
+
+def test_the_watchdog_sees_a_rescan_that_only_updates_existing_rows(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️⚠️ **拿行数当进展信号会把一条正在干活的链路当卡死杀掉。**
+
+    军力榜重扫同一批 bot 时只更新不新增（`bot_targets` 上有坐标唯一约束），
+    所以第二趟开始 `COUNT(*)` 就再也不动，而看门狗只会问「有没有变大」。
+
+    `ranking_written_at` 取的是**最近一次写入时刻**，所以只要写了任何一行就往前走。
+    变异测试当场抓到过这条：把 `_latest_epoch` 换成 `_count(BotTargetRow)` 时，
+    所有用例照样绿。
+    """
+    from evo_helper.application.mission_progress import SqlAlchemyMissionProgress
+
+    coordinate = Coordinate(4, 30, 12)
+    first = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 15, 2, 0, tzinfo=UTC)
+    progress = SqlAlchemyMissionProgress(session_factory)
+
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=first),)
+    )
+    after_first = progress.read()
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=27.1, military_score_at_utc=second),)
+    )
+    after_second = progress.read()
+
+    with session_factory() as session:
+        rows = session.scalars(select(BotTargetRow)).all()
+    assert len(rows) == 1, "第二趟只更新，没有新增——这正是行数信号会失效的原因"
+    assert after_second.ranking_written_at > after_first.ranking_written_at

@@ -201,12 +201,12 @@ def test_the_scheduler_starts_stopped(console: Console) -> None:
     assert body["started_at_utc"] is None
 
 
-def test_the_three_tasks_are_listed_in_priority_order(console: Console) -> None:
+def test_every_task_is_listed_in_priority_order(console: Console) -> None:
     body = console.get()
     tasks = body["tasks"]
     assert isinstance(tasks, list)
 
-    assert sorted(item["kind"] for item in tasks) == ["BOT", "PIRATE", "SCAN"]
+    assert sorted(item["kind"] for item in tasks) == ["BOT", "PIRATE", "RANKING", "SCAN"]
     priorities = [item["priority"] for item in tasks]
     assert priorities == sorted(priorities)
 
@@ -300,7 +300,8 @@ def test_the_scan_priority_cannot_be_written(console: Console) -> None:
     assert "扫描" in response.json()["detail"]
     tasks = console.get()["tasks"]
     assert isinstance(tasks, list)
-    assert tasks[-1]["kind"] == "SCAN"
+    # 填空隙的两种都结构性地排在最后，它们之间再按 priority（SCAN 2 < RANKING 3）。
+    assert [item["kind"] for item in tasks[-2:]] == ["SCAN", "RANKING"]
 
 
 def test_the_scan_row_can_still_be_switched_off(console: Console) -> None:

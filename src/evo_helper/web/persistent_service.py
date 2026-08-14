@@ -35,6 +35,7 @@ from evo_helper.domain.scheduler import (
     RunningProcess,
     TaskSnapshot,
     TaskStatus,
+    fills_gaps,
     scheduling_order,
     status_of,
 )
@@ -954,8 +955,9 @@ class MissionConsoleService:
             origin=origin,
             fleet_lines=fleet_lines,
         )
-        if kind is MissionKind.SCAN and priority is not None:
-            # 领域层的排序键已经把扫描结构性地钉在最后一位，所以收下这个值也
+        if fills_gaps(kind) and priority is not None:
+            # 领域层的排序键已经把填空隙的那几种（扫描 / 军力榜）结构性地钉在
+            # 最后，所以收下这个值也
             # 不会真的改变次序——正因为如此才必须拒绝：默默收下一个不起作用的
             # 写入，页面会显示成「排序已保存」，刷新后又弹回去，用户只能得出
             # 「这个控件坏了」。理由要说出口：扫描永远有活干，排在它后面的

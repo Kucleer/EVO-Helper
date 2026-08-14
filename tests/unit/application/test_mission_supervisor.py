@@ -268,5 +268,5 @@ def test_each_chain_writes_its_own_log() -> None:
     """三条链路混在一个文件里，出事时分不出是谁的输出。"""
     paths = {log_path_for(kind) for kind in MissionKind}
 
-    assert len(paths) == 3
+    assert len(paths) == len(MissionKind)
     assert log_path_for(MissionKind.PIRATE).name == "mission-pirate.log"

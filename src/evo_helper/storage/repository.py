@@ -69,6 +69,7 @@ _MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
     (MissionKind.PIRATE, "侦查+攻击海盗", False, 0, '{"radius": 10}'),
     (MissionKind.BOT, "扫描+攻击 bot", False, 1, "{}"),
     (MissionKind.SCAN, "扫描全星系 bot", True, 2, "{}"),
+    (MissionKind.RANKING, "扫描军力榜", True, 3, "{}"),
 )
 
 

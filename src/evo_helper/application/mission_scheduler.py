@@ -59,6 +59,7 @@ from evo_helper.domain.missions import (
     bot_targets_in_range,
     pirate_command,
     pirate_systems,
+    ranking_command,
     scan_command,
 )
 from evo_helper.domain.models import Coordinate
@@ -73,6 +74,7 @@ from evo_helper.domain.scheduler import (
     TaskFacts,
     TaskSnapshot,
     decide,
+    fills_gaps,
     free_lines_for,
     looks_like_an_environment_fault,
     quota_day_start_utc,
@@ -928,8 +930,9 @@ class MissionScheduler:
                 last_started_at_utc=starts.get(task.task_id),
                 last_failure_at_utc=self._last_failure_at.get(task.task_id),
             )
-            if not _participating(task) or task.kind is MissionKind.SCAN:
-                # 扫描不派遣、也没有完成态，剩下那几样对它恒为「没有」。
+            if not _participating(task) or fills_gaps(task.kind):
+                # 填空隙的那几种（扫描 / 军力榜）不派遣、也没有完成态，
+                # 剩下那几样对它们恒为「没有」。
                 per_task[task.task_id] = base
                 continue
             if task.origin not in inflight:
@@ -990,6 +993,9 @@ class MissionScheduler:
     def _reports_due(self, task: TaskSnapshot, now: datetime, grace: timedelta) -> bool:
         """这个任务有没有到期未收的战报。**只问它自己那颗出发星球派出去的那些。**
 
+        填空隙的那几种（扫描 / 军力榜）从不派遣，`_TARGET_KIND` 里也就没有它们
+        ——直接返回 False，而不是让 `_TARGET_KIND[task.kind]` 抛 KeyError。
+
         **`grace` 与 `max_age` 是两档完全不同的规则，不能互换也不能同值。**
         `grace` 管「飞行时间读到了」的那些：过了预计时间再等这么久还没战报就
         判缺失。`max_age` 管「读不到」的那些：`ReportWaitPlanner` 见到任何一条
@@ -997,6 +1003,8 @@ class MissionScheduler:
         永远「可收」又永远不被判缺失——调度器每个 tick 都去收一封永远不会到的
         战报，扫描永远抢不到空隙。
         """
+        if fills_gaps(task.kind):
+            return False
         pending = self._repository.pending_reports_for_kind(
             _TARGET_KIND[task.kind],
             now_utc=now,
@@ -1056,6 +1064,8 @@ class MissionScheduler:
         """
         if kind is MissionKind.SCAN:
             return scan_command()
+        if kind is MissionKind.RANKING:
+            return ranking_command()
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
