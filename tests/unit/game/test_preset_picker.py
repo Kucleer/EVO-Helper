@@ -435,3 +435,75 @@ def test_words_on_two_different_screens_are_never_merged_into_one_name() -> None
         picker.pick("探路")
 
     assert _preset_clicks(driver) == []
+
+
+# -- 空屏不是证据 --------------------------------------------------------------
+
+
+class _FlakyStrip(_Strip):
+    """和 `_Strip` 一样，但**头几次读某一屏会返回空**——模拟拖动动画没停 / OCR 失手。"""
+
+    def __init__(self, screens: list[Screen], *, blank_screen: int, blank_times: int) -> None:
+        super().__init__(screens)
+        self._blank_screen = blank_screen
+        self._left = blank_times
+        self.reads = 0
+
+    def read(self) -> Screen:
+        self.reads += 1
+        if self.at == self._blank_screen and self._left > 0:
+            self._left -= 1
+            return []
+        return super().read()
+
+
+def test_a_screen_that_reads_blank_is_read_again_instead_of_believed() -> None:
+    """**预设条不可能真的是空的**，所以空结果只能是这一帧没读出来。
+
+    实机 2026-08-13 通宵：预设顺序是 AAA / 探路 / BBB / CCC（用户 2026-08-14 确认），
+    而 `pick('BBB')` 逐屏读到的是
+
+        [['AAA', '探路'], [], ['ccc'], ['ccc']]
+
+    第 2 屏正是 BBB 那一屏，读成空、被当成「这儿没有」，于是拖过头，再看到两屏
+    相同的 ccc 就判「到右端了」。**这样白跑了 145 次，每次约 50 秒，约两小时**
+    ——「18 分钟才派出第一发」「四轮一发没派」全是它。
+    """
+    strip = _FlakyStrip(
+        [[(748, "AAA"), (985, "探路")], [(760, "BBB")], [(760, "CCC")]],
+        blank_screen=1,
+        blank_times=2,
+    )
+    driver = _Driver(strip)
+    picker = PresetPicker(driver=driver, read_names=strip.read)
+
+    picker.pick("BBB")
+
+    assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 BBB")]
+
+
+def test_a_strip_that_really_reads_blank_every_time_still_gives_up() -> None:
+    """重读是有限次的。没有这条对照，「一直重读」也能让上面那条变绿——
+    而那意味着一个真的读不出来的画面会把这一发卡死在原地。
+    """
+    strip = _FlakyStrip([[(748, "AAA")], [(760, "BBB")]], blank_screen=1, blank_times=999)
+    picker = PresetPicker(driver=_Driver(strip), read_names=strip.read)
+
+    with pytest.raises(PresetNotFound):
+        picker.pick("BBB")
+
+
+# -- 大小写 --------------------------------------------------------------------
+
+
+def test_a_name_the_ocr_lowercased_is_still_matched() -> None:
+    """实机 2026-08-13：`CCC` 有 118 次被读成 `ccc`，只有 1 次读对。
+
+    大小写敏感的匹配意味着：哪天把某个任务配成 CCC，这条链路一发都派不出去，
+    而报出来的是「预设条上找不到 'CCC'」——看上去像游戏里没有这个预设。
+    """
+    picker, driver, _strip = _picker([[(748, "AAA")], [(760, "ccc")]])
+
+    picker.pick("CCC")
+
+    assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 CCC")]
