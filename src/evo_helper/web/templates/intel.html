@@ -93,6 +93,26 @@
 
 <section class="panel" aria-labelledby="results-heading">
   <h2 id="results-heading">命中结果 <span class="muted" id="result-count"></span></h2>
+
+  {#
+    **这一页只列 bot，海盗一行都不进**（用户口径 2026-08-14）。
+
+    海盗每 24 小时刷新一次，所以「这颗星球上有什么舰队」对它根本不成立：今天侦察到的
+    数字，明天连同那个海盗一起没了。而这一页是**长期台账**（谁占着、舰队多少、上次打
+    是什么时候），每一行都默认「它明天还是这样」——混进一批第二天就作废的行，用户每次
+    都得先分辨哪些还算数。
+
+    海盗不是不记：每一发侦察 / 攻击都在攻击日志里，那一页一行是一次派遣，是流水不是
+    台账。所以这里给一条去攻击日志的路，而不是让用户以为记录丢了。
+
+    收在数据那一侧（`storage.intel`），不是在这里跳过：跳过的话下面的「共 N 条」、
+    页码、和上面三个下拉框的候选值仍然按含海盗的集合算，总数就和看得见的行数对不上。
+  #}
+  <p class="muted" style="font-size:12px;margin:-4px 0 8px">
+    只列 <strong>bot</strong> 目标。海盗每 24 小时刷新一次，留不成台账；
+    它的每一发在<a href="/logs">攻击日志</a>里。
+  </p>
+
   <div class="table-wrap">
     <table id="result-table">
       <thead><tr id="result-head"></tr></thead>

@@ -219,6 +219,39 @@ BATTLE_RESULT_GLYPHS: dict[str, str] = {
 }
 
 
+#: 发次类型（侦察 / 攻击）在攻击日志上的 chip 样式。
+#:
+#: 用户口径（2026-08-14）：「预设中的侦查和攻击需要标记不同颜色」。两种发次在
+#: 那一页混排，而它们的**下一步完全不同**——侦察等的是侦察报告、攻击等的是战报，
+#: 分不出来就没法读那一列（见 `SCOUT_RESULT_*`）。
+#:
+#: 色永远配一个字形和一个词（同 `STATUS_TONES` 的规矩）。
+MISSION_KIND_LABELS: dict[str, str] = {"SCOUT": "侦察", "ATTACK": "攻击"}
+MISSION_KIND_TONES: dict[str, str] = {"SCOUT": "kind-scout", "ATTACK": "kind-attack"}
+MISSION_KIND_GLYPHS: dict[str, str] = {"SCOUT": "◎", "ATTACK": "⚔"}
+
+
+#: 侦察发那一格的三档。**侦察发永远不该显示「待战报」。**
+#:
+#: 实机 2026-08-13 通宵：111 发侦察在攻击日志上全部挂着「待战报」，而侦察根本
+#: 不产生战报——它产出的是侦察报告，走 `scout_reports` 那张表。用户连提两次
+#: 「战果列状态没更新」，成因就是这一格问错了问题（详见
+#: `web.service.AttackLogView.mission_kind`）。
+#:
+#: 只分「回来了没有」两档，**不显示判定结论**：判定要拿四个舰种数现算
+#: （`domain.scout_verdict.verdict_of_record`），而那几个数在这一页上没有；
+#: 硬要显示就得把判定逻辑在这里再写一份，而两份判据迟早分家。想看判定去情报中心。
+SCOUT_RESULT_BACK = "SCOUT_BACK"
+SCOUT_RESULT_WAITING = "SCOUT_WAITING"
+
+SCOUT_RESULT_LABELS: dict[str, str] = {
+    SCOUT_RESULT_BACK: "侦察已回",
+    SCOUT_RESULT_WAITING: "待侦察报告",
+}
+SCOUT_RESULT_TONES: dict[str, str] = {SCOUT_RESULT_BACK: "ok", SCOUT_RESULT_WAITING: ""}
+SCOUT_RESULT_GLYPHS: dict[str, str] = {SCOUT_RESULT_BACK: "◉", SCOUT_RESULT_WAITING: "◌"}
+
+
 def missing_intel_labels() -> list[str]:
     """三张标签表里没有位置的取值。测试拿它当断言。
 
