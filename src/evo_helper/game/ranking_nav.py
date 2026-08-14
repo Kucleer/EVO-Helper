@@ -29,6 +29,12 @@
 「读到 0 行」直接当成「我不在榜单页上（或者还在加载）」——
 这是本层唯一一份「还在不在榜单上」的判据，也是断线能被认出来的原因。
 
+**一行长什么样，这一层不关心**（所以类型是参数化的 `RowT`，实机上就是
+`domain.ranking.RankingRow`）。它只对这些行做三件事：看空不空、
+跟上一屏比相等、交给 `on_military_board` 判。原样传出去而不是压成字符串，
+是为了让调用方拿到的就是它自己解析好的那份，不必为了配合本层再读一遍
+——那一遍是另一帧画面，两帧之间列表可能已经动过。
+
 ## 分步慢拖写在这一层
 
 **不 import `tools.pirate_loop.slow_drag`**：那是跨层依赖（`tools` 依赖 `game`，
@@ -117,7 +123,7 @@ class ScrollOutcome(Enum):
 
 
 @dataclass(frozen=True)
-class ScrollStep:
+class ScrollStep[RowT]:
     """滚一屏的结果：结局 + **拖完之后**这一屏读到的行。
 
     行一并交出来是为了让调用方不必再读一次——那一次重读既费一遍 OCR，
@@ -125,11 +131,11 @@ class ScrollStep:
     """
 
     outcome: ScrollOutcome
-    rows: tuple[str, ...]
+    rows: tuple[RowT, ...]
 
 
 @dataclass
-class RankingNavigator:
+class RankingNavigator[RowT]:
     """把画面带到军事排行榜上，并一屏一屏往下滚。
 
     三个回调都由调用方注入，**这一层不认识 OCR，测试里也就不需要假图片**
@@ -138,19 +144,20 @@ class RankingNavigator:
     - `read_labels`：底部导航标签行的 `(中心 x, 文字)` 词框。
       那个 x 就是待会儿要点的地方——所以必须是**这一屏**读出来的。
     - `read_rows`：当前这一屏的榜单行，**认不出的丢掉**（见模块头的契约）。
+      行是什么类型由调用方定，实机上是 `domain.ranking.RankingRow`。
     - `on_military_board`：这一屏读到的行是不是军事榜。判据在 `domain.ranking`
       （实机上的形状是「分数列全 0 就说明还在经济榜」），不在这里。
     """
 
     driver: RankingDriver
     read_labels: Callable[[], Sequence[tuple[int, str]]]
-    read_rows: Callable[[], Sequence[str]]
-    on_military_board: Callable[[Sequence[str]], bool]
+    read_rows: Callable[[], Sequence[RowT]]
+    on_military_board: Callable[[Sequence[RowT]], bool]
     say: Callable[[str], None] = print
 
     # -- 进榜单 -------------------------------------------------------------
 
-    def open_military_ranking(self) -> tuple[str, ...]:
+    def open_military_ranking(self) -> tuple[RowT, ...]:
         """走到军事排行榜，返回**回读确认过**的第一屏。
 
         每一步都先认出这一屏再点下一下；认不出就抛 `RankingNotReached`，不盲点。
@@ -166,7 +173,7 @@ class RankingNavigator:
             )
         return self._switch_to_military(rows)
 
-    def _switch_to_military(self, rows: tuple[str, ...]) -> tuple[str, ...]:
+    def _switch_to_military(self, rows: tuple[RowT, ...]) -> tuple[RowT, ...]:
         """确认这一屏是军事榜；不是就点「军事评分」，**点完再回读**。
 
         先读后点而不是先点后读：面板本来就停在军事榜时，多点那一下毫无必要，
@@ -233,7 +240,7 @@ class RankingNavigator:
 
     # -- 滚 -----------------------------------------------------------------
 
-    def scroll_once(self) -> ScrollStep:
+    def scroll_once(self) -> ScrollStep[RowT]:
         """往下滚一屏，如实说出「滚动生效了没有」。
 
         拖之前先读一次（而不是复用调用方手里的上一屏）：这既是「到底了没有」的
@@ -287,7 +294,7 @@ class RankingNavigator:
 
     # -- 读一屏（空结果重读） -----------------------------------------------
 
-    def _rows_confirming(self) -> tuple[str, ...]:
+    def _rows_confirming(self) -> tuple[RowT, ...]:
         """读这一屏的榜单行，**空结果要重读几次再认**。
 
         拖动中有加载动画（用户实机口径），那一帧读到的是半屏或全空。

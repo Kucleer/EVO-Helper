@@ -441,6 +441,41 @@ class TestLeavingTheBoard:
         assert navigator.close() is False
 
 
+class TestComposingWithTheParsingLayer:
+    def test_it_takes_the_rows_the_domain_layer_actually_produces(self) -> None:
+        """`read_rows` 交出来的就是 `domain.ranking.RankingRow`——不必为了迁就这一层压成字符串。
+
+        上面所有用例都喂字符串，看着像这一层认得「行」长什么样。它不认得：
+        它只做三件事（看空不空、跟上一屏比相等、交给 `on_military_board` 判），
+        所以行的类型是参数化的。这一条把两层真的接一次，免得类型上早就对不上
+        却要等实机才发现。
+
+        判据也是真的那一条：经济榜上 bot 全是 0 分，军事榜上有真实分数。
+        """
+        from evo_helper.domain.ranking import RankingRow, coordinate_of
+
+        economy = [
+            RankingRow(rank=1, name="bot_2_1_1", score=0.0, coordinate=coordinate_of("bot_2_1_1"))
+        ]
+        military = [
+            RankingRow(
+                rank=1, name="bot_4_30_12", score=29590.0, coordinate=coordinate_of("bot_4_30_12")
+            )
+        ]
+        game = _Game()
+        driver = _Driver(game)
+        navigator: RankingNavigator[RankingRow] = RankingNavigator(
+            driver=driver,  # type: ignore[arg-type]
+            read_labels=game.labels,
+            read_rows=lambda: list(military if game.tab == "military" else economy),
+            on_military_board=lambda rows: any(row.score for row in rows),
+            say=lambda _message: None,
+        )
+
+        assert navigator.open_military_ranking() == tuple(military)
+        assert driver.points.count(MILITARY_TAB) == 1
+
+
 class TestThePureHelpers:
     def test_characters_within_one_label_are_merged_and_centred(self) -> None:
         assert merged_labels([(1067, "排"), (1091, "名")]) == [(1079, "排名")]
