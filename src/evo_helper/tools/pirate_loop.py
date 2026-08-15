@@ -632,6 +632,11 @@ class LoopOptions:
     #: `attack_intents.origin_*`，战报认领正是靠「出发坐标 + 目标坐标 + 时间就近」
     #: 配对的。让 runner 自己去猜，等于两个任务的账可能记到同一颗星球上。
     origin: Coordinate | None = None
+    #: 是否在**这一轮开始前**读一次当日战报。默认关：调度器会因航线逐步
+    #: 释放而多次拉起 runner，若每个 runner 都进信箱，就会在攻击过程中反复
+    #: 翻战报。需要启动对账时由控制台的「启动战报补录」显式做一次；手工运行
+    #: 则传 ``--reconcile``。
+    reconcile_on_start: bool = False
 
 
 @dataclass
@@ -2466,7 +2471,7 @@ class PirateLoop:
         self._require_system_view("开工时切不到恒星系视图")
 
         try:
-            # ⚠️ **读信箱必须排在切星球前面，这个顺序是承重的。**
+            # ⚠️ **显式要求读信箱时，必须排在切星球前面。**
             # 信箱是账号级的，读它跟站在哪颗星球上毫无关系；而切星球是开工阶段
             # 最容易失手的一步（要认坐标、要拖列表、要回读）。
             #
@@ -2474,7 +2479,11 @@ class PirateLoop:
             # 一份战报都不入库**。而「预设舰队攻击后部分战报缺失、回读机制没入库」
             # 正是用户 2026-08-13 报的那个毛病——一个防记账错乱的功能，反过来
             # 成了战报缺失的新来源。切换失手只该挡住派遣，不该连带挡掉读战报。
-            self.reconcile_today()
+            # 调度器会在一条航线返航后再次拉起 runner。这里若无条件进信箱，
+            # 就会把「等舰队回来继续派」误做成「每次续跑都翻一遍战报」。启动
+            # 对账由控制台统一安排一次；runner 只在手工显式请求时才读。
+            if self._options.reconcile_on_start:
+                self.reconcile_today()
             if not self.ensure_origin_planet():
                 # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
                 # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
@@ -2944,6 +2953,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="出发星球（记账用）。调度器会传；手工跑不给则用 EVO_HELPER_ORIGIN",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="开工前只读一次当日战报；调度器续跑时默认不读",
+    )
     args = parser.parse_args(argv)
 
     import ctypes
@@ -2956,6 +2970,7 @@ def main(argv: list[str] | None = None) -> int:
         attack=args.attack,
         preset=args.preset,
         origin=args.origin,
+        reconcile_on_start=args.reconcile,
     )
     mode = "扫描" if not args.scout else ("侦察+攻击" if args.attack else "只侦察")
     listed = ", ".join(f"{galaxy}:{system}" for galaxy, system in options.systems)

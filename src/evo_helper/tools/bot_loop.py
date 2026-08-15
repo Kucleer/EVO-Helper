@@ -120,6 +120,9 @@ class BotOptions:
     origin: Coordinate | None = None
     #: 军力任务会逐目标带标题；缺项才是旧区域攻击的 BBB。绝不 OCR 校验预设内容。
     presets: dict[Coordinate, str] | None = None
+    #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
+    #: 航线返航后的续跑反复打开信箱。
+    reconcile_on_start: bool = False
 
 
 class BotLoop(PirateLoop):
@@ -156,6 +159,7 @@ class BotLoop(PirateLoop):
                 attack=options.attack,
                 preset=BOT_ATTACK_PRESET,
                 origin=options.origin,
+                reconcile_on_start=options.reconcile_on_start,
             ),
         )
         self._bot = options
@@ -432,6 +436,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="本轮起始时刻（ISO 8601，必须带时区）。调度器会传；手工跑不给则按当日 UTC 00:00 算",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
+    )
     args = parser.parse_args(argv)
 
     import ctypes
@@ -444,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         round_started_at=args.round_started_at,
         origin=args.origin,
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
+        reconcile_on_start=args.reconcile,
     )
     mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(

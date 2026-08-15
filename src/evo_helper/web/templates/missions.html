@@ -50,8 +50,9 @@
       页面这一处**必须跟着另外两个默认值一起改**：它不走 schema 默认，而是把
       复选框的值显式送出去。只改后端默认的话，点「开始」照样会先对账。
     #}
-    <label class="inline-label" for="start-reconcile" style="cursor:pointer">
-      <input type="checkbox" id="start-reconcile">先对账再跑任务（挂机时别勾）
+    <label class="inline-label" for="start-reconcile" style="cursor:pointer"
+           title="启用时仅在本次点击开始后补录一次；攻击续跑不会重复读信箱">
+      <input type="checkbox" id="start-reconcile">启动战报补录（可关闭）
     </label>
     <button class="btn primary small" type="button" id="btn-start">开始</button>
     <button class="btn small" type="button" id="btn-stop"
@@ -61,9 +62,8 @@
     点「开始」之后调度器常驻运行，自己决定什么时候起哪条链路，直到点「结束」。
     任何时刻最多一个子进程在点鼠标。控制台重启后一律停在「已停止」。
     <br>
-    「开始」会<b>先跑一趟战报对账</b>（海盗、bot 各一趟），读完信箱里应读未读的战报
-    再放行任务——不然已经打赢的目标会被当成还要再打，配额也会数少。
-    没有欠账时那一趟几十秒就走完（信箱单子一空就早停）。
+    勾选「启动战报补录」时，<b>本次开始只补录一趟</b>（海盗、bot 各一趟），读完信箱里
+    应读未读的战报再放行任务；关闭则全程不自动进入信箱。攻击中的航线续跑不再读战报。
   </p>
 </section>
 

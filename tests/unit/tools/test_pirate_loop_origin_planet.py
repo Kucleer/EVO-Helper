@@ -54,6 +54,7 @@ def _loop(
     *,
     result: SwitchResult = SwitchResult.SWITCHED,
     origin: Coordinate | None = SECOND,
+    reconcile_on_start: bool = False,
 ) -> tuple[Any, _FakeSwitcher, list[str]]:
     from evo_helper.game import game_window
 
@@ -63,7 +64,9 @@ def _loop(
     swept: list[str] = []
     switcher = _FakeSwitcher(result)
     loop = PirateLoop.__new__(PirateLoop)
-    loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=origin)
+    loop._options = LoopOptions(
+        systems=(), scout=False, attack=True, origin=origin, reconcile_on_start=reconcile_on_start
+    )
     loop._outcome = Outcome()
     loop._current_planet = None
     loop._navigator = _FakeNavigator()
@@ -87,7 +90,7 @@ class TestSwitchingOncePerRound:
         loop.run()
 
         assert switcher.asked == [SECOND]
-        assert swept == ["开工那一趟信箱", "扫目标"]
+        assert swept == ["扫目标"]
 
     def test_the_mailbox_is_read_before_the_switch_is_attempted(
         self, monkeypatch: pytest.MonkeyPatch
@@ -99,7 +102,7 @@ class TestSwitchingOncePerRound:
 
         这里钉的是**交错顺序**，光看两个清单各自的内容看不出来。
         """
-        loop, switcher, order = _loop(monkeypatch)
+        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
         loop.reconcile_today = lambda: order.append("信箱")
         loop._sweep = lambda: order.append("扫目标")
         switcher.switch_to = lambda target: (  # type: ignore[method-assign]
@@ -116,7 +119,7 @@ class TestSwitchingOncePerRound:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """恒星系底栏同一像素不是「行星」；必须先回地表。"""
-        loop, switcher, order = _loop(monkeypatch)
+        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
         loop._goto_planet_surface = lambda: (order.append("回地表"), True)[1]
         switcher.switch_to = lambda target: (  # type: ignore[method-assign]
             order.append("切星球"),
@@ -196,7 +199,7 @@ class TestRefusingToDispatchWhenTheSwitchFailed:
 
         outcome = loop.run()
 
-        assert swept == ["开工那一趟信箱"], "战报照读；只有扫目标那一步被挡住"
+        assert swept == [], "关闭启动补录时，切星球失败也不应打开信箱"
         assert outcome.attacked == []
         assert outcome.busy is not None
         assert "9:250:8" in outcome.busy
