@@ -364,3 +364,81 @@ def test_single_cells_are_still_read_as_one_line() -> None:
     rows_from_image(_Image({0: ("[1]", "halo", "115.9M")}), ocr)
 
     assert set(ocr.configs) == {"--psm 7"}
+
+
+# -- 降序异常必须丢，不能只打印 ------------------------------------------------
+
+
+def test_a_score_that_breaks_the_descending_order_is_dropped_not_stored() -> None:
+    """⚠️⚠️ **2026-08-15 的实账：只打印不丢，18 个错值进了库。**
+
+    库里 30 个 bot 的军力值飞到 10 万以上（最高 177 万），而每一个除以 100 都
+    精确落回正常区间（P95 是 19,730）——`17.73K` 读成 `1773K`，**丢小数点**，
+    不是随机偏差，是整整齐齐的两个数量级。
+
+    榜单按军力降序排，所以「比上一行大」一眼就认得出来，`descending_breaks`
+    当时也确实在报——可代码只 `print` 了一行就往下走。
+
+    丢的是**分数不是行**：坐标仍然是好的（那 30 个里有 2 个是坐标扫描验证过的）。
+    """
+    rows = [
+        RankingRow(639, "bot_4_30_12", 17_730.0, Coordinate(4, 30, 12)),
+        RankingRow(640, "bot_4_100_13", 1_773_000.0, Coordinate(4, 100, 13)),  # 丢了小数点
+        RankingRow(641, "bot_4_183_20", 17_000.0, Coordinate(4, 183, 20)),
+    ]
+
+    targets = targets_from_rows(rows, observed_at=NOW)
+
+    assert [t.coordinate for t in targets] == [c.coordinate for c in targets], "行不许丢"
+    assert len(targets) == 3
+    assert targets[1].military_score != 1_773_000.0, "破坏降序的读数不许原样入库"
+
+
+def test_a_dropped_score_is_refilled_from_its_neighbours_and_marked_estimated() -> None:
+    """丢完之后走插值——用上下两个好邻居补一个中点，并**标成估算**。
+
+    ⚠️ 标记必须看「丢完之后」那份，不是「读到的」那份：看后者的话，
+    被判据丢掉的行会伪装成实读，而它恰恰是最不可信的一条。
+    """
+    rows = [
+        RankingRow(639, "bot_4_30_12", 20_000.0, Coordinate(4, 30, 12)),
+        RankingRow(640, "bot_4_100_13", 999_999.0, Coordinate(4, 100, 13)),  # 错读
+        RankingRow(641, "bot_4_183_20", 10_000.0, Coordinate(4, 183, 20)),
+    ]
+
+    targets = targets_from_rows(rows, observed_at=NOW)
+
+    assert targets[1].military_score == 15_000.0  # 20000 与 10000 的中点
+    assert targets[1].military_score_estimated is True
+    assert targets[0].military_score_estimated is False
+
+
+def test_a_well_behaved_descending_screen_keeps_every_score() -> None:
+    """判据只挡爬升。正常的降序一屏一个都不许动。"""
+    rows = [
+        RankingRow(639, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(640, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
+        RankingRow(641, "bot_4_183_20", 28_510.0, Coordinate(4, 183, 20)),
+    ]
+
+    targets = targets_from_rows(rows, observed_at=NOW)
+
+    assert [t.military_score for t in targets] == [29_590.0, 28_730.0, 28_510.0]
+    assert not any(t.military_score_estimated for t in targets)
+
+
+def test_the_rank_is_carried_into_storage() -> None:
+    """⚠️ **名次是免费的校验和，存下来才复核得了。**
+
+    2026-08-15 那批错值查不下去，正因为名次没进库——事后没法再拿降序验一遍。
+    修好的名次（`repair_ranks` 从邻居补出来的那份）就是要存的那份。
+    """
+    rows = [
+        RankingRow(639, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(None, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),  # 名次读不出
+        RankingRow(641, "bot_4_183_20", 28_510.0, Coordinate(4, 183, 20)),
+    ]
+
+    targets = targets_from_rows(rows, observed_at=NOW)
+
+    assert [t.military_rank for t in targets] == [639, 640, 641]

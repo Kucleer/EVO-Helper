@@ -90,7 +90,9 @@ def disable(repository: SqlAlchemyRepository, kind: MissionKind) -> None:
     repository.update_mission_task(task_id(repository, kind), enabled=False)
 
 
-def add_bot_target(session_factory, coordinate: Coordinate) -> None:  # type: ignore[no-untyped-def]
+def add_bot_target(  # type: ignore[no-untyped-def]
+    session_factory, coordinate: Coordinate, *, military_score: float | None = None
+) -> None:
     with session_factory() as session:
         session.add(
             orm.BotTargetRow(
@@ -99,6 +101,7 @@ def add_bot_target(session_factory, coordinate: Coordinate) -> None:  # type: ig
                 system=coordinate.system,
                 position=coordinate.position,
                 is_bot=True,
+                military_score=military_score,
             )
         )
         session.commit()
@@ -1491,3 +1494,93 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
     scheduler.tick()
 
     assert repository.mission_runs(limit=1)[0].task_id == task_id(repository, MissionKind.BOT)
+
+
+# -- 军力优先那一支 ------------------------------------------------------------
+
+BOT_BY_MILITARY = '{"by_military": true, "top_n": 2}'
+
+
+def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """用户口径（2026-08-15）：「先取前 50 名，然后按距离排序，开始攻击」。
+
+    这里 `top_n=2`：`9000` 与 `8000` 进池，`100` 落选；而池内按距离排，
+    所以近的 2:140 排在远的 2:400 前面——**军力只决定谁进池，不决定池内次序**。
+    """
+    add_bot_target(session_factory, Coordinate(2, 400, 1), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=8_000.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    # ⚠️ 按位置取而不是按「像坐标」筛：`--origin 2:137:18` 也是三段坐标，
+    # 用形状过滤会把它一起捞进来（我第一版就是这么写错的）。
+    command = launcher.latest.command
+    targets = command[command.index("--targets") + 1 : command.index("--origin")]
+    assert targets == ["2:140:2", "2:400:1"]
+
+
+def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **军力优先那一支不过恒星系区间。**
+
+    军力榜是全宇宙的，而区间是给「区域攻击」那一支用的。两个一起用等于把
+    「打最强的」悄悄降级成「打这个区域里最强的」——而最强的那批本来就散落在
+    别的银河（实测：>100K 的那批横跨 3/5/6/7/8/9 系）。
+    """
+    add_bot_target(session_factory, Coordinate(7, 99, 7), military_score=9_000.0)
+    enable(
+        repository,
+        MissionKind.BOT,
+        params_json='{"by_military": true, "galaxy": 2, "first_system": 60, "last_system": 499}',
+    )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert "7:99:7" in launcher.latest.command
+
+
+def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **默认必须是老的区域攻击。**
+
+    悄悄换掉一条已经在跑的链路的选靶口径，比多一个开关危险得多——用户圈的
+    那个范围是他自己配的，而军力优先会把目标散到全宇宙。
+    """
+    add_bot_target(session_factory, Coordinate(7, 99, 7), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:150:3" in command
+    assert "7:99:7" not in command, "没开开关就不许跨出区间"
+
+
+def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """上限只挡「太强」，不挡「读不出来」——库里最多的正是没扫到过的那批。"""
+    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=None)
+    add_bot_target(session_factory, Coordinate(2, 141, 3), military_score=1_773_000.0)
+    enable(
+        repository,
+        MissionKind.BOT,
+        params_json='{"by_military": true, "top_n": 50, "max_score": 100000}',
+    )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:140:2" in command
+    assert "2:141:3" not in command

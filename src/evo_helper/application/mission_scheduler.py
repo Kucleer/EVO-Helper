@@ -80,6 +80,11 @@ from evo_helper.domain.scheduler import (
     quota_day_start_utc,
     tasks_failing_together,
 )
+from evo_helper.domain.target_order import (
+    TOP_BY_MILITARY,
+    ScoredTarget,
+    strongest_then_nearest,
+)
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -610,7 +615,7 @@ class MissionScheduler:
             if targets is None:
                 targets = self._bot_targets()
             try:
-                in_range = bot_targets_in_range(targets, **_bot_range(row.params_json))
+                in_range = self._bot_selection(row.params_json, self._origin_of(row))
             except MissionParamError:
                 continue
             for target in in_range:
@@ -1030,7 +1035,7 @@ class MissionScheduler:
         if row is None:
             return 0
         try:
-            targets = bot_targets_in_range(self._bot_targets(), **_bot_range(row.params_json))
+            targets = self._bot_selection(row.params_json, self._origin_of(row))
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
             return 0
@@ -1042,8 +1047,39 @@ class MissionScheduler:
         )
 
     def _bot_targets(self) -> list[Coordinate]:
+        return [target.coordinate for target in self._scored_bot_targets()]
+
+    def _bot_selection(self, params_json: str, origin: Coordinate) -> tuple[Coordinate, ...]:
+        """这个 bot 任务这一轮要打哪些坐标，**按什么顺序**。
+
+        ⚠️ **选靶口径只能有这一份。** 它被三处用到：算命令行、算「还剩几个没打」、
+        算页面上每个目标的态。三处各写一遍的话，最先分家的是「军力优先」那一支
+        ——实机 2026-08-15 就撞到了：命令行那处改了，而「还剩几个」那处仍然
+        走恒星系区间，于是军力参数里没有区间、抛 `MissionParamError`、
+        任务被当成没目标，**一发都不派而且不报错**。
+        """
+        if _bot_by_military(params_json):
+            return strongest_then_nearest(
+                self._scored_bot_targets(),
+                origin,
+                take=_bot_top_n(params_json),
+                max_score=_bot_max_score(params_json),
+            )
+        in_range = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
+        return nearest_first(in_range, origin)
+
+    def _scored_bot_targets(self) -> list[ScoredTarget]:
+        """已记录的 bot，**连军力值一起带出来**。
+
+        军力值可能是 None（那颗还没在榜单上见过），这是常态不是异常——
+        库里六千多行，昨晚一夜也只扫到一千多个有值的。`domain.target_order`
+        把 None 排在所有已知的后面，不当成 0 分。
+        """
         return [
-            Coordinate(row.galaxy, row.system, row.position)
+            ScoredTarget(
+                Coordinate(row.galaxy, row.system, row.position),
+                military_score=row.military_score,
+            )
             for row in self._repository.list_bot_targets()
         ]
 
@@ -1080,8 +1116,7 @@ class MissionScheduler:
         # 原先没有这一步，目标顺序就是库里的返回顺序（大致按坐标升序）。实机
         # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
         # 而一夜只走到第 121 系——后面那些永远轮不到。
-        targets = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
-        return bot_command(nearest_first(targets, origin), origin=origin)
+        return bot_command(self._bot_selection(params_json, origin), origin=origin)
 
 
 def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: int) -> TaskSnapshot:
@@ -1138,6 +1173,37 @@ def _int_param(data: dict[str, Any], name: str) -> int:
 
 def _pirate_radius(raw: str) -> int:
     return _int_param(_params(raw), "radius")
+
+
+def _bot_by_military(raw: str) -> bool:
+    """这个 bot 任务是不是走「军力优先」那一支。默认 False = 老的区域攻击。
+
+    默认关是刻意的：军力优先会把目标散到全宇宙，而区域攻击的范围是用户自己
+    圈的。悄悄换掉一条已经在跑的链路的选靶口径，比多一个开关危险得多。
+    """
+    return bool(_params(raw).get("by_military", False))
+
+
+def _bot_top_n(raw: str) -> int:
+    """军力优先时取前几名。默认 `TOP_BY_MILITARY`（用户口径：50）。"""
+    value = _params(raw).get("top_n")
+    return (
+        int(value)
+        if isinstance(value, int | float | str) and str(value).strip()
+        else TOP_BY_MILITARY
+    )
+
+
+def _bot_max_score(raw: str) -> float | None:
+    """军力上限，超过就不打。没配就是不设限。
+
+    用户 2026-08-14 要求过「军力确实要设置上限」——太强的目标不是当前预设
+    打得动的。留成可配而不是写死：上限取决于用的哪个预设，而预设是用户维护的。
+    """
+    value = _params(raw).get("max_score")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return float(value)
 
 
 def _bot_range(raw: str) -> dict[str, int]:

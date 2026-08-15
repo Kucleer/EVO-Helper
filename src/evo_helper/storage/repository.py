@@ -321,6 +321,7 @@ class SqlAlchemyRepository:
                             military_score=record.military_score,
                             military_score_at_utc=record.military_score_at_utc,
                             military_score_estimated=record.military_score_estimated,
+                            military_rank=record.military_rank,
                         )
                     )
                     continue
@@ -328,7 +329,38 @@ class SqlAlchemyRepository:
                 target.military_score = record.military_score
                 target.military_score_at_utc = record.military_score_at_utc
                 target.military_score_estimated = record.military_score_estimated
+                target.military_rank = record.military_rank
             session.commit()
+
+    def forget_implausible_military_scores(self, *, above: float) -> int:
+        """把高于 `above` 的军力值清成 `None`，返回清了几行。**只清分数，不删行。**
+
+        ⚠️ 这不是「清理数据」，是**撤回一批已知错误的读数**。
+
+        2026-08-15：库里 30 个 bot 的军力值在 10 万以上（最高 177 万），而每一个
+        除以 100 都精确落回正常区间（P95 是 19,730）——`17.73K` 读成 `1773K`，
+        丢小数点，整整齐齐两个数量级。第二条佐证：榜单按军力降序排，而真人段
+        第 488–500 名的分数已经是 0，排在它们后面的 bot 不可能有 45 万。
+
+        坐标是好的（那 30 个里有 2 个是坐标扫描验证过的真 bot），所以清的是
+        **分数**：`military_score`、`military_score_at_utc`、
+        `military_score_estimated` 一起归零位，等下一轮采集重新填。
+
+        `above` 必须显式传：这个阈值是看着分布定的，写死在代码里等于把一次性的
+        判断伪装成永久规则。
+        """
+        from evo_helper.storage import models as orm
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BotTargetRow).where(orm.BotTargetRow.military_score > above)
+            ).all()
+            for row in rows:
+                row.military_score = None
+                row.military_score_at_utc = None
+                row.military_score_estimated = False
+            session.commit()
+            return len(rows)
 
     def save_attack_intent(self, intent: object) -> None:
         record = _require_type(intent, AttackIntent, "attack intent")

@@ -124,6 +124,8 @@ class BotTargetRow(Base):
     military_score_estimated: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0"
     )
+    #: 榜单名次。只为事后能拿「降序」这条免费校验和复核军力值（见 domain.records）。
+    military_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class AttackIntentRow(Base):

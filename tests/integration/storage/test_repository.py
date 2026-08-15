@@ -781,3 +781,65 @@ def test_the_watchdog_sees_a_rescan_that_only_updates_existing_rows(
         rows = session.scalars(select(BotTargetRow)).all()
     assert len(rows) == 1, "第二趟只更新，没有新增——这正是行数信号会失效的原因"
     assert after_second.ranking_written_at > after_first.ranking_written_at
+
+
+def test_retracting_implausible_scores_keeps_the_coordinates(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **撤回的是读数，不是行。**
+
+    2026-08-15：30 个 bot 的军力值在 10 万以上（最高 177 万），每一个除以 100
+    都落回正常区间——丢小数点。而**坐标是好的**：那 30 个里有 2 个是坐标扫描
+    验证过的真 bot。所以清 `military_score` 三件套，留行、留 `is_bot`、留 source。
+
+    清完之后 `military_score_at_utc` 也要一起清：留着一个时刻却没有值，
+    等于说「这个时候读到过 None」——而真相是「那次读到的是错的，已撤回」。
+    """
+    keep, drop = Coordinate(4, 30, 12), Coordinate(4, 100, 13)
+    moment = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+    repository.save_ranking_targets(
+        (
+            RankingTarget(keep, military_score=17_730.0, military_score_at_utc=moment),
+            RankingTarget(
+                drop,
+                military_score=1_773_000.0,
+                military_score_at_utc=moment,
+                military_score_estimated=True,
+            ),
+        )
+    )
+
+    cleared = repository.forget_implausible_military_scores(above=100_000.0)
+
+    assert cleared == 1
+    with session_factory() as session:
+        rows = {
+            (row.galaxy, row.system, row.position): row
+            for row in session.scalars(select(BotTargetRow)).all()
+        }
+    assert len(rows) == 2, "行一个都不许删"
+    bad = rows[(drop.galaxy, drop.system, drop.position)]
+    assert bad.military_score is None
+    assert bad.military_score_at_utc is None
+    assert bad.military_score_estimated is False
+    assert bad.is_bot is True, "它仍然是个 bot，只是分数不可信"
+    good = rows[(keep.galaxy, keep.system, keep.position)]
+    assert good.military_score == 17_730.0, "阈值以下的一个都不许动"
+
+
+def test_the_rank_is_persisted_so_the_checksum_survives(session_factory, repository) -> None:
+    """名次是免费的校验和——2026-08-15 那批错值查不下去正因为它没进库。"""
+    repository.save_ranking_targets(
+        (
+            RankingTarget(
+                Coordinate(4, 30, 12),
+                military_score=17_730.0,
+                military_score_at_utc=datetime(2026, 8, 15, 1, 0, tzinfo=UTC),
+                military_rank=639,
+            ),
+        )
+    )
+
+    with session_factory() as session:
+        assert session.scalars(select(BotTargetRow)).one().military_rank == 639

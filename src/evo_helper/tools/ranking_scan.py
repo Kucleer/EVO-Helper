@@ -168,30 +168,40 @@ def rows_from_image(
 
 
 def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[RankingTarget]:
-    """修名次、报告降序异常、插分数，并保留分数是否估算的证据。"""
+    """修名次、**丢掉破坏降序的军力值**、插补空缺，并留下「这个数是估算的」的证据。
+
+    ⚠️ **降序异常必须丢，不能只打印。** 2026-08-15 那一夜的教训：库里 30 个 bot
+    的军力值飞到 10 万以上（最高 177 万），而每一个除以 100 都精确落回正常区间
+    （`17.73K` 读成 `1773K`）——**丢小数点**，不是随机偏差，是整整齐齐的两个数量级。
+
+    榜单按军力降序排，所以「比上一行大」一眼就认得出来，`descending_breaks`
+    当时也确实在报——**可我只打印了，没据此丢**。于是 18 个错值进了库，
+    又通过插值传染给相邻的 12 个。
+
+    丢的是**分数不是行**：坐标仍然是好的（那 30 个里有 2 个还是坐标扫描验证过的）。
+    丢完之后走插值，用上下两个好邻居补一个中点，并标成估算——
+    这正是 `interpolate_scores` 存在的意义。
+    """
     repaired = repair_ranks([row.rank for row in rows])
-    scores = [row.score for row in rows]
-    breaks = descending_breaks(scores)
-    if breaks:
-        print(f"军力值降序异常行: {breaks}")
-    filled = interpolate_scores(scores)
-    normalized = [
-        RankingRow(
-            rank=repaired[index],
-            name=row.name,
-            score=filled[index],
-            coordinate=row.coordinate,
-        )
-        for index, row in enumerate(rows)
-    ]
+    read = [row.score for row in rows]
+    trusted = list(read)
+    for index in descending_breaks(read):
+        trusted[index] = None
+    if len(read) != len(trusted) or any(a != b for a, b in zip(read, trusted, strict=True)):
+        dropped = [index for index, score in enumerate(trusted) if score is None and read[index]]
+        print(f"军力值破坏降序，丢掉这几行的分数（坐标保留）: {dropped}")
+    filled = interpolate_scores(trusted)
     return [
         RankingTarget(
             coordinate=row.coordinate,
-            military_score=row.score,
+            military_score=filled[index],
             military_score_at_utc=observed_at,
-            military_score_estimated=scores[index] is None and row.score is not None,
+            # **读到了但被降序判据丢掉**的那些，补回来的值同样是估算——
+            # 判据看的是 `trusted` 不是 `read`，否则被丢掉的行会伪装成实读。
+            military_score_estimated=trusted[index] is None and filled[index] is not None,
+            military_rank=repaired[index],
         )
-        for index, row in enumerate(normalized)
+        for index, row in enumerate(rows)
         if row.coordinate is not None
     ]
 
@@ -408,6 +418,13 @@ def keep_screens(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--forget-scores-above",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help="把高于这个值的军力值清成空（只清分数不删行），然后退出。用来撤回一批已知错读。",
+    )
     for name in ("rank", "name", "score"):
         parser.add_argument(
             f"--{name}-column", nargs=2, type=int, metavar=("LEFT", "RIGHT"), default=None
@@ -417,6 +434,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.forget_scores_above is not None:
+        repository = SqlAlchemyRepository(
+            create_session_factory(create_database_engine(Settings().database_url))
+        )
+        cleared = repository.forget_implausible_military_scores(above=args.forget_scores_above)
+        print(f"已把 {cleared} 行的军力值清空（高于 {args.forget_scores_above:,.0f}）；坐标保留")
+        return 0
     default = RankingColumns()
 
     def pair(raw: list[int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
