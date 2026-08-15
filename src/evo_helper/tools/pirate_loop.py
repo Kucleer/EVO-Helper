@@ -1144,6 +1144,9 @@ class PirateLoop:
             timer.lap("翻预设条")
             timer.say_total("没找到预设")
             say(f"  {error}；关掉面板，不打这一发")
+            # 预设名的 OCR 与拖动位置必须一起看；只留合并后的词表无法判断是
+            # 识别错了，还是预设条根本没有横向移动到 BBB / CCC 所在的卡片。
+            self._dump_frame("preset-not-found")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
             # 派遣面板开过之后导航栏里是什么已经不可知了，和 `_leave_dispatch_list`
