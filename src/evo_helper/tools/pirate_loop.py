@@ -823,6 +823,12 @@ class PirateLoop:
             )
             if any(COORDINATE_RE.search(text) for _y, text in words):
                 return words
+        # 空行会安全地挡住派遣，但不能只留下 ``[[]]``：实机上同一套配方在手工
+        # 截图里读得到三颗星球，运行时读空就说明画面时序或 tesseract 配置变了。
+        # 留下原图和每档读数，下一轮才能校准，而不是盲目重试。
+        self._dump_frame("planet-list-unreadable")
+        configured = getattr(pytesseract.pytesseract, "tesseract_cmd", "<unset>")
+        say(f"  行星列表坐标 OCR 全空；tesseract={configured!r}")
         return []
 
     def _fleet_origin_text(self) -> str:
