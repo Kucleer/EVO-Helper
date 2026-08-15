@@ -35,6 +35,17 @@ class _Driver:
     def wait(self, _seconds: float) -> None:
         pass
 
+    def capture(self) -> Any:
+        return _DumpImage()
+
+
+class _DumpImage:
+    width = 1
+    height = 1
+
+    def save(self, _path: Any) -> None:
+        pass
+
 
 class _Navigator:
     def invalidate(self) -> None:

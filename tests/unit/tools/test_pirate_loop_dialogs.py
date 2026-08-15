@@ -24,7 +24,7 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.game import pirate_ui
-from evo_helper.tools.pirate_loop import Outcome, PirateLoop, RoundExhausted
+from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, RoundExhausted
 
 TARGET = Coordinate(2, 137, 4)
 
@@ -128,6 +128,7 @@ def test_the_round_ends_cleanly_when_resources_run_out(monkeypatch: pytest.Monke
 
     loop = PirateLoop.__new__(PirateLoop)
     loop._outcome = Outcome()  # type: ignore[attr-defined]
+    loop._options = LoopOptions(systems=(), scout=False, attack=True)  # type: ignore[attr-defined]
     loop._navigator = type("N", (), {"ensure_system_view": lambda _s, _f: True})()  # type: ignore[attr-defined]
     loop._nav_labels = lambda: ""  # type: ignore[attr-defined, assignment]
     loop._reset_to_known_screen = lambda: None  # type: ignore[attr-defined, assignment]
