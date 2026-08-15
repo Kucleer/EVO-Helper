@@ -509,6 +509,27 @@ def test_a_name_the_ocr_lowercased_is_still_matched() -> None:
     assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 CCC")]
 
 
+def test_the_unambiguous_bbb_font_misread_is_recovered() -> None:
+    """实机截图中 BBB 处于「探路 / CCC」之间，却被读成 BEB。
+
+    首尾两个 B 都识别正确，只有中间的花体 B 被误读；这不是把任意近似名放宽，
+    而是只接受三次重复代码的受限误读。精确读到 BBB 时仍必须优先点精确项。
+    """
+    picker, driver, _strip = _picker(
+        [[(748, "AAA"), (985, "探路")], [(760, "BEB"), (990, "CCC")]]
+    )
+
+    assert picker.pick("BBB") == 760
+    assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 BBB")]
+
+
+def test_an_exact_name_beats_the_bbb_font_misread() -> None:
+    picker, driver, _strip = _picker([[(760, "BEB"), (900, "BBB")]])
+
+    assert picker.pick("BBB") == 900
+    assert _preset_clicks(driver) == [(900, PRESET_NAME_ROW_Y, "预设 BBB")]
+
+
 def test_gold_names_survive_a_background_that_defeats_greyscale() -> None:
     """⚠️⚠️ **灰度化在预设名这一行上会瞎掉，而这条 2026-08-15 那一夜代价很大。**
 
@@ -569,6 +590,21 @@ class _TwoShotOcr:
         return {"text": ["BBB"], "left": [540], "width": [69]}
 
 
+class _ComplementaryOcr:
+    """灰度只读到「探路」、金色掩膜才读到右侧 BBB 的同屏实机形状。"""
+
+    Output = type("Output", (), {"DICT": "dict"})
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def image_to_data(self, _image: object, **_kwargs: object) -> dict[str, list[object]]:
+        self.calls += 1
+        if self.calls == 1:
+            return {"text": ["探路"], "left": [540], "width": [90]}
+        return {"text": ["BBB"], "left": [450], "width": [69]}
+
+
 def test_an_empty_greyscale_reading_falls_through_to_the_mask() -> None:
     """⚠️ **这条钉的是「第二档真的存在」，不是掩膜本身好不好。**
 
@@ -590,8 +626,19 @@ def test_an_empty_greyscale_reading_falls_through_to_the_mask() -> None:
     assert [text for _x, text in words] == ["BBB"]
 
 
+def test_a_greyscale_hit_does_not_hide_bbb_in_the_gold_mask() -> None:
+    """BBB 位于探路和 CCC 之间时，读到左侧「探路」也不能提前结束 OCR。"""
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import name_words
+
+    words = name_words(Image.new("RGB", (1920, 917), (60, 150, 210)), _ComplementaryOcr())
+
+    assert [text for _x, text in words] == ["探路", "BBB"]
+
+
 def test_a_successful_greyscale_reading_does_not_pay_for_the_mask() -> None:
-    """灰度读到了就不必再抠一遍——掩膜是逐像素的，白花一次不划算。"""
+    """灰度读到左侧名称，也仍要读掩膜中的右侧 BBB。"""
     from PIL import Image
 
     from evo_helper.game.preset_picker import name_words
@@ -601,4 +648,4 @@ def test_a_successful_greyscale_reading_does_not_pay_for_the_mask() -> None:
 
     name_words(Image.new("RGB", (1920, 917), (60, 150, 210)), ocr)
 
-    assert ocr.calls == 2, "只该再调一次（也就是总共一次真正的读）"
+    assert ocr.calls == 3, "同一屏的两档 OCR 都必须跑，避免越过右侧 BBB"
