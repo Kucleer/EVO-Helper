@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -1702,6 +1702,8 @@ class SqlAlchemyRepository:
                 )
             if session.get(orm.SchedulerConfigRow, 1) is None:
                 session.add(orm.SchedulerConfigRow(id=1))
+            if session.get(orm.MilitaryAttackConfigRow, 1) is None:
+                session.add(orm.MilitaryAttackConfigRow(id=1))
             session.commit()
 
     def mission_tasks(self) -> list[orm.MissionTaskRow]:
@@ -1735,26 +1737,133 @@ class SqlAlchemyRepository:
                 ).all()
             )
 
+    def attack_planets(self) -> list[orm.AttackPlanetRow]:
+        """全局攻击出发星球，按页面显示编号排序。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.AttackPlanetRow).order_by(orm.AttackPlanetRow.sort_index)
+                ).all()
+            )
+
+    def attack_planet(self, planet_id: int) -> orm.AttackPlanetRow | None:
+        with self._session_factory() as session:
+            return session.get(orm.AttackPlanetRow, planet_id)
+
+    def create_attack_planet(self, coordinate: Coordinate) -> orm.AttackPlanetRow:
+        with self._session_factory() as session:
+            exists = session.scalar(
+                select(orm.AttackPlanetRow.id).where(
+                    orm.AttackPlanetRow.galaxy == coordinate.galaxy,
+                    orm.AttackPlanetRow.system == coordinate.system,
+                    orm.AttackPlanetRow.position == coordinate.position,
+                )
+            )
+            if exists is not None:
+                raise ValueError(f"星球 {coordinate} 已在配置列表中")
+            largest_index = session.scalar(select(func.max(orm.AttackPlanetRow.sort_index)))
+            next_index = int(largest_index or 0) + 1
+            row = orm.AttackPlanetRow(
+                sort_index=next_index,
+                galaxy=coordinate.galaxy,
+                system=coordinate.system,
+                position=coordinate.position,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def update_attack_planet(self, planet_id: int, coordinate: Coordinate) -> orm.AttackPlanetRow:
+        with self._session_factory() as session:
+            row = session.get(orm.AttackPlanetRow, planet_id)
+            if row is None:
+                raise ValueError(f"attack_planets 里没有 id={planet_id} 的星球")
+            duplicate = session.scalar(
+                select(orm.AttackPlanetRow.id).where(
+                    orm.AttackPlanetRow.id != planet_id,
+                    orm.AttackPlanetRow.galaxy == coordinate.galaxy,
+                    orm.AttackPlanetRow.system == coordinate.system,
+                    orm.AttackPlanetRow.position == coordinate.position,
+                )
+            )
+            if duplicate is not None:
+                raise ValueError(f"星球 {coordinate} 已在配置列表中")
+            row.galaxy, row.system, row.position = (
+                coordinate.galaxy,
+                coordinate.system,
+                coordinate.position,
+            )
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def delete_attack_planet(self, planet_id: int) -> None:
+        with self._session_factory() as session:
+            row = session.get(orm.AttackPlanetRow, planet_id)
+            if row is None:
+                raise ValueError(f"attack_planets 里没有 id={planet_id} 的星球")
+            used = session.scalar(
+                select(func.count())
+                .select_from(orm.MissionTaskOriginRow)
+                .where(orm.MissionTaskOriginRow.planet_id == planet_id)
+            )
+            if used:
+                raise ValueError("该星球正在被任务使用；先在任务中移除后再删除")
+            removed_index = row.sort_index
+            session.delete(row)
+            session.flush()
+            session.execute(
+                update(orm.AttackPlanetRow)
+                .where(orm.AttackPlanetRow.sort_index > removed_index)
+                .values(sort_index=orm.AttackPlanetRow.sort_index - 1)
+            )
+            session.commit()
+
+    def military_attack_config(self) -> orm.MilitaryAttackConfigRow:
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                raise ValueError("military_attack_config 还没初始化；先调 ensure_mission_rows()")
+            return row
+
+    def replace_military_attack_tiers(self, tiers_json: str) -> orm.MilitaryAttackConfigRow:
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                row = orm.MilitaryAttackConfigRow(id=1)
+                session.add(row)
+            row.tiers_json = tiers_json
+            session.commit()
+            session.refresh(row)
+            return row
+
     def replace_mission_task_origins(
-        self, task_id: int, origins: Sequence[tuple[Coordinate, int, bool]]
+        self, task_id: int, origins: Sequence[tuple[int, int, bool]]
     ) -> None:
         """整组替换多 origin 配置，保证页面保存的是一个原子快照。"""
         with self._session_factory() as session:
             _mission_task(session, task_id)
+            resolved = [session.get(orm.AttackPlanetRow, planet_id) for planet_id, _, _ in origins]
+            if any(planet is None for planet in resolved):
+                raise ValueError("所选星球不存在")
             session.query(orm.MissionTaskOriginRow).filter_by(task_id=task_id).delete()
-            session.add_all(
-                [
+            rows: list[orm.MissionTaskOriginRow] = []
+            for planet, (_, fleet_lines, enabled) in zip(resolved, origins, strict=True):
+                if planet is None:  # 已由上面的校验挡住；留给类型检查器的窄化。
+                    raise AssertionError("validated planet disappeared")
+                rows.append(
                     orm.MissionTaskOriginRow(
                         task_id=task_id,
-                        galaxy=origin.galaxy,
-                        system=origin.system,
-                        position=origin.position,
+                        planet_id=planet.id,
+                        galaxy=planet.galaxy,
+                        system=planet.system,
+                        position=planet.position,
                         fleet_lines=fleet_lines,
                         enabled=enabled,
                     )
-                    for origin, fleet_lines, enabled in origins
-                ]
-            )
+                )
+            session.add_all(rows)
             session.commit()
 
     def create_mission_task(

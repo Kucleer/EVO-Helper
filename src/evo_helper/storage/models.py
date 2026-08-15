@@ -445,11 +445,41 @@ class MissionTaskOriginRow(Base):
     task_id: Mapped[int] = mapped_column(
         ForeignKey("mission_tasks.id", ondelete="CASCADE"), index=True
     )
+    #: 全局星球配置的引用。旧记录迁移后会回填；坐标列保留为历史快照，避免
+    #: 升级中断时既有任务失去出发点。
+    planet_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attack_planets.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
     galaxy: Mapped[int] = mapped_column(Integer)
     system: Mapped[int] = mapped_column(Integer)
     position: Mapped[int] = mapped_column(Integer)
     fleet_lines: Mapped[int] = mapped_column(Integer)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class AttackPlanetRow(Base):
+    """可供攻击任务选择的出发星球。编号按 ``sort_index`` 从 1 连续显示。"""
+
+    __tablename__ = "attack_planets"
+    __table_args__ = (
+        UniqueConstraint("galaxy", "system", "position", name="uq_attack_planet_coordinate"),
+        UniqueConstraint("sort_index", name="uq_attack_planet_sort_index"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    sort_index: Mapped[int] = mapped_column(Integer)
+    galaxy: Mapped[int] = mapped_column(Integer)
+    system: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+
+
+class MilitaryAttackConfigRow(Base):
+    """军力攻击的全局档位方案；所有军力任务共享这一份。"""
+
+    __tablename__ = "military_attack_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    tiers_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
 
 class MissionRunRow(Base):

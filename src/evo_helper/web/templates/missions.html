@@ -164,8 +164,9 @@
     <span class="inline-label">新建 bot 攻击任务</span>
     <input type="text" id="new-task-name" placeholder="任务名，例如「2 号星 · 近系」"
            style="width:200px" aria-label="新任务的名字">
-    <input type="text" id="new-task-origin" placeholder="出发星球，留空=主星"
-           style="width:150px" aria-label="新任务的出发星球">
+    <select id="new-task-origin" aria-label="新任务的出发星球">
+      <option value="">选择星球（留空=全局主星）</option>
+    </select>
     <input type="number" id="new-task-lines" min="1" placeholder="航线"
            style="width:70px" aria-label="新任务的航线数">
     <button class="btn small" type="button" id="btn-new-task">新建</button>
@@ -374,14 +375,46 @@
     return cell;
   }
 
+  function populateTaskPlanetSelect(select, selected = '') {
+    const current = selected || select.value;
+    select.textContent = '';
+    const empty = document.createElement('option');
+    empty.value = ''; empty.textContent = '选择星球（留空=全局主星）';
+    select.append(empty);
+    let matched = !current;
+    for (const planet of attackPlanets) {
+      const coordinate = `${planet.galaxy}:${planet.system}:${planet.position}`;
+      const option = document.createElement('option');
+      option.value = coordinate;
+      option.textContent = `星球${planet.number} [${coordinate}]`;
+      if (coordinate === current) matched = true;
+      select.append(option);
+    }
+    if (!matched) {
+      const legacy = document.createElement('option');
+      legacy.value = current; legacy.textContent = `当前坐标 [${current}]（请在攻击配置页统一维护）`;
+      select.append(legacy);
+    }
+    select.value = current;
+  }
+
   function addMilitaryOrigin(list, origin = {}) {
     const line = document.createElement('div');
     line.className = 'military-origin-line';
     line.style.marginTop = '5px';
-    const coordinate = makeInput('military-origin-coordinate', {
-      type: 'text', placeholder: '星系:恒星系:位置', style: 'width:118px', 'aria-label': '军力攻击出发星球',
-    });
-    coordinate.value = origin.coordinate || '';
+    const planet = document.createElement('select');
+    planet.className = 'military-origin-planet';
+    planet.setAttribute('aria-label', '军力攻击出发星球');
+    const empty = document.createElement('option');
+    empty.value = ''; empty.textContent = attackPlanets.length ? '选择星球' : '请先到攻击配置新增星球';
+    planet.append(empty);
+    for (const item of attackPlanets) {
+      const option = document.createElement('option');
+      option.value = item.planet_id;
+      option.textContent = `星球${item.number} [${item.galaxy}:${item.system}:${item.position}]`;
+      planet.append(option);
+    }
+    planet.value = origin.planet_id ?? '';
     const fleetLines = makeInput('military-origin-lines', {
       type: 'number', min: 1, placeholder: '航线', style: 'width:58px', 'aria-label': '该出发星球的航线数',
     });
@@ -392,27 +425,7 @@
     remove.type = 'button';
     remove.className = 'btn small military-remove-origin';
     remove.textContent = '移除';
-    line.append(coordinate, document.createTextNode(' '), fleetLines, document.createTextNode(' '), enabled, remove);
-    list.append(line);
-  }
-
-  function addMilitaryTier(list, tier = {}) {
-    const line = document.createElement('div');
-    line.className = 'military-tier-line';
-    line.style.marginTop = '5px';
-    const minimum = makeInput('military-tier-minimum', {
-      type: 'number', min: 0, placeholder: '最低军力', style: 'width:88px', 'aria-label': '档位最低军力',
-    });
-    minimum.value = tier.min_score ?? '';
-    const preset = makeInput('military-tier-preset', {
-      type: 'text', placeholder: '预设标题', style: 'width:80px', 'aria-label': '游戏内预设标题',
-    });
-    preset.value = tier.preset || '';
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'btn small military-remove-tier';
-    remove.textContent = '移除';
-    line.append(minimum, document.createTextNode(' ≥ '), preset, remove);
+    line.append(planet, document.createTextNode(' '), fleetLines, document.createTextNode(' '), enabled, remove);
     list.append(line);
   }
 
@@ -424,7 +437,7 @@
     const enabled = toggle.checked;
     editor.hidden = !enabled;
     regional.hidden = enabled;
-    for (const input of editor.querySelectorAll('input')) input.disabled = locked;
+    for (const input of editor.querySelectorAll('input, select')) input.disabled = locked;
     for (const button of editor.querySelectorAll('button')) button.disabled = locked;
     toggle.disabled = locked;
   }
@@ -439,15 +452,13 @@
         if (origins.length) {
           for (const origin of origins) {
             addMilitaryOrigin(list, {
-              coordinate: `${origin.galaxy}:${origin.system}:${origin.position}`,
+              planet_id: origin.planet_id,
               fleet_lines: origin.fleet_lines,
               enabled: origin.enabled,
             });
           }
         } else {
-          // 旧任务还没存多 origin 时，页面要把它实际会用的回落值摆出来；否则
-          // 用户看不见自己正从哪颗星球出发，第一次保存也容易少配一颗。
-          addMilitaryOrigin(list, { coordinate: task.origin, fleet_lines: task.fleet_lines, enabled: true });
+          addMilitaryOrigin(list, { fleet_lines: task.fleet_lines, enabled: true });
         }
         setMilitaryVisible(row, latest && latest.config_locked === true);
       })
@@ -510,9 +521,11 @@
       dash.textContent = '— 不派遣';
       makeCell(row, dash);
     } else {
-      const origin = makeInput('mission-origin', {
-        type: 'text', style: 'width:110px', 'aria-label': '出发星球',
-      });
+      const origin = document.createElement('select');
+      origin.className = 'mission-origin';
+      origin.style.width = '175px';
+      origin.setAttribute('aria-label', '出发星球');
+      populateTaskPlanetSelect(origin);
       const lines = makeInput('mission-lines', {
         type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
       });
@@ -565,19 +578,12 @@
       addOrigin.type = 'button'; addOrigin.className = 'btn small military-add-origin'; addOrigin.textContent = '增加出发点';
       originHead.append(addOrigin);
       const origins = document.createElement('div'); origins.className = 'military-origin-list';
-      const tierHead = document.createElement('div');
-      tierHead.style.marginTop = '7px';
-      tierHead.append('军力档位（从高到低）　');
-      const addTier = document.createElement('button');
-      addTier.type = 'button'; addTier.className = 'btn small military-add-tier'; addTier.textContent = '增加档位';
-      tierHead.append(addTier);
-      const tiers = document.createElement('div'); tiers.className = 'military-tier-list';
       const save = document.createElement('button');
       save.type = 'button'; save.className = 'btn primary small military-save'; save.style.marginTop = '7px'; save.textContent = '保存军力方案';
       const note = document.createElement('div');
       note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
-      note.textContent = '每颗出发星球填自己的航线；档位按“军力 ≥ 最低值 → 游戏内预设标题”匹配。未填档位时全部使用 BBB。';
-      editor.append(settings, originHead, origins, tierHead, tiers, save, note);
+      note.textContent = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护，所有军力任务共用。';
+      editor.append(settings, originHead, origins, save, note);
       military.append(modeLabel, editor);
       params.append(military);
     }
@@ -644,6 +650,7 @@
 
   let latest = null;
   let latestBackfill = null;
+  let attackPlanets = [];
 
   function render(state) {
     latest = state;
@@ -701,7 +708,7 @@
       const checkbox = row.querySelector('.mission-enabled');
       checkbox.checked = task.enabled;
       checkbox.disabled = locked;
-      for (const input of row.querySelectorAll('input')) input.disabled = locked;
+      for (const input of row.querySelectorAll('input, select')) input.disabled = locked;
       checkbox.disabled = locked;
       // 删除只在这条链路还有别的任务时才给。每条链路至少留一行——删光了页面上
       // 就再也建不回来（海盗与扫描连「新建」的入口都没有）。后端也会拒，
@@ -759,7 +766,7 @@
         row.querySelector('.mission-name').value = task.label;
         // 扫描那一行没有这两个框（它不派遣），所以这里得先看有没有。
         const originInput = row.querySelector('.mission-origin');
-        if (originInput) originInput.value = task.origin || '';
+        if (originInput) populateTaskPlanetSelect(originInput, task.origin || '');
         const linesInput = row.querySelector('.mission-lines');
         if (linesInput) linesInput.value = task.fleet_lines || '';
       }
@@ -771,12 +778,6 @@
         row.querySelector('.military-top-n').value = task.params.top_n ?? 50;
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
         row.querySelector('.military-rescan-hours').value = task.params.rescan_after_hours ?? 6;
-        const tiers = row.querySelector('.military-tier-list');
-        tiers.textContent = '';
-        for (const tier of (Array.isArray(task.params.tiers) ? task.params.tiers : [])) {
-          addMilitaryTier(tiers, tier);
-        }
-        if (!tiers.childNodes.length) addMilitaryTier(tiers);
         loadMilitaryOrigins(task, row);
       }
       if (task.kind === 'BOT') setMilitaryVisible(row, locked);
@@ -854,7 +855,13 @@
   // ---- 读写 ---------------------------------------------------------------
 
   function refresh() {
-    return EVOHelper.get('/api/scheduler').then(render).catch(fail);
+    return Promise.all([EVOHelper.get('/api/scheduler'), EVOHelper.get('/api/attack-planets')])
+      .then(([state, planets]) => {
+        attackPlanets = planets;
+        populateTaskPlanetSelect(document.getElementById('new-task-origin'));
+        render(state);
+      })
+      .catch(fail);
   }
 
   function command(endpoint) {
@@ -963,25 +970,14 @@
       payload.max_score = Number(maximumText);
       if (!Number.isFinite(payload.max_score) || payload.max_score < 0) throw new Error('军力上限必须是非负数字');
     }
-    const tiers = [];
-    for (const line of row.querySelectorAll('.military-tier-line')) {
-      const minimumText = line.querySelector('.military-tier-minimum').value.trim();
-      const preset = line.querySelector('.military-tier-preset').value.trim();
-      if (!minimumText && !preset) continue;
-      const minimum = Number(minimumText);
-      if (!Number.isFinite(minimum) || minimum < 0 || !preset) {
-        throw new Error('每个军力档位都要填写非负最低军力和预设标题');
-      }
-      tiers.push({ min_score: minimum, preset });
-    }
-    tiers.sort((left, right) => right.min_score - left.min_score);
-    payload.tiers = tiers;
+    delete payload.tiers;
     const origins = [];
     for (const line of row.querySelectorAll('.military-origin-line')) {
-      const coordinate = line.querySelector('.military-origin-coordinate').value;
+      const planetId = Number(line.querySelector('.military-origin-planet').value);
       const fleetLines = Number(line.querySelector('.military-origin-lines').value);
+      if (!Number.isInteger(planetId) || planetId < 1) throw new Error('请选择配置页中的出发星球');
       if (!Number.isInteger(fleetLines) || fleetLines < 1) throw new Error('每个出发点的航线数至少为 1');
-      origins.push({ ...coordinatePayload(coordinate), fleet_lines: fleetLines,
+      origins.push({ planet_id: planetId, fleet_lines: fleetLines,
         enabled: line.querySelector('.military-origin-enabled').checked });
     }
     if (!origins.length) throw new Error('军力攻击至少需要一个启用的出发点');
@@ -1060,14 +1056,6 @@
     }
     if (event.target.closest('.military-remove-origin')) {
       event.target.closest('.military-origin-line').remove();
-      return;
-    }
-    if (event.target.closest('.military-add-tier')) {
-      addMilitaryTier(row.querySelector('.military-tier-list'));
-      return;
-    }
-    if (event.target.closest('.military-remove-tier')) {
-      event.target.closest('.military-tier-line').remove();
       return;
     }
     if (event.target.closest('.military-save')) {

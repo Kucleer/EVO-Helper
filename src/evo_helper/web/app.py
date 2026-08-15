@@ -58,6 +58,8 @@ from .display import (
 # 的签名注解要在定义时求值，FastAPI 也要拿到真实的类去解依赖。
 from .persistent_service import MissionConsoleService, PersistentApplicationService
 from .schemas import (
+    AttackPlanetIn,
+    AttackPlanetOut,
     BackfillOut,
     BackfillStartIn,
     BackfillSummaryOut,
@@ -72,6 +74,8 @@ from .schemas import (
     FleetEntryOut,
     FleetSnapshotOut,
     FrozenTaskOut,
+    MilitaryAttackConfigOut,
+    MilitaryTierIn,
     MissionOriginIn,
     MissionOriginOut,
     MissionTaskCreate,
@@ -95,6 +99,7 @@ from .service import (
     PLANET_KINDS,
     SHANGHAI,
     ApplicationService,
+    AttackPlanetView,
     BackfillView,
     BotTargetView,
     ConfigFreezeView,
@@ -104,6 +109,7 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     FrozenTaskView,
+    MilitaryAttackConfigView,
     MissionTaskView,
     NotFoundError,
     PlanPatchView,
@@ -588,6 +594,17 @@ def create_app(
             },
         )
 
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page(request: Request) -> Response:
+        """攻击档位与可选出发星球的统一配置页。"""
+        if getattr(request.app.state, "mission_console", None) is None:
+            return RedirectResponse("/missions", status_code=307)
+        return templates.TemplateResponse(
+            request=request,
+            name="settings.html",
+            context={"active": "settings"},
+        )
+
     @app.get("/intel", response_class=HTMLResponse)
     async def intel_page(request: Request) -> HTMLResponse:
         """情报中心的筛选数据走 /api/intel/*，扫描结果随页面一起渲染。"""
@@ -991,6 +1008,20 @@ def _backfill_out(view: BackfillView) -> BackfillOut:
     )
 
 
+def _attack_planet_out(view: AttackPlanetView) -> AttackPlanetOut:
+    return AttackPlanetOut(
+        planet_id=view.planet_id,
+        number=view.number,
+        galaxy=view.galaxy,
+        system=view.system,
+        position=view.position,
+    )
+
+
+def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttackConfigOut:
+    return MilitaryAttackConfigOut(tiers=[MilitaryTierIn(**tier) for tier in view.tiers])
+
+
 def _scheduler_out(view: SchedulerView) -> SchedulerOut:
     return SchedulerOut(
         running=view.running,
@@ -1035,6 +1066,60 @@ def register_mission_routes(app: FastAPI) -> None:
         console: MissionConsoleService = Depends(get_console),
     ) -> SchedulerOut:
         return _scheduler_out(console.scheduler_view())
+
+    @app.get("/api/attack-config", response_model=MilitaryAttackConfigOut)
+    def military_attack_config(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MilitaryAttackConfigOut:
+        return _military_attack_config_out(console.military_attack_config())
+
+    @app.put("/api/attack-config", response_model=MilitaryAttackConfigOut)
+    def replace_military_attack_config(
+        payload: MilitaryAttackConfigOut,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> MilitaryAttackConfigOut:
+        return _military_attack_config_out(
+            console.replace_military_attack_tiers(
+                tuple(item.model_dump() for item in payload.tiers)
+            )
+        )
+
+    @app.get("/api/attack-planets", response_model=list[AttackPlanetOut])
+    def attack_planets(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> list[AttackPlanetOut]:
+        return [_attack_planet_out(item) for item in console.attack_planets()]
+
+    @app.post("/api/attack-planets", response_model=AttackPlanetOut, status_code=201)
+    def create_attack_planet(
+        payload: AttackPlanetIn,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> AttackPlanetOut:
+        return _attack_planet_out(
+            console.create_attack_planet(
+                Coordinate(payload.galaxy, payload.system, payload.position)
+            )
+        )
+
+    @app.patch("/api/attack-planets/{planet_id}", response_model=AttackPlanetOut)
+    def update_attack_planet(
+        planet_id: int,
+        payload: AttackPlanetIn,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> AttackPlanetOut:
+        return _attack_planet_out(
+            console.update_attack_planet(
+                planet_id, Coordinate(payload.galaxy, payload.system, payload.position)
+            )
+        )
+
+    @app.delete("/api/attack-planets/{planet_id}", status_code=204)
+    def delete_attack_planet(
+        planet_id: int,
+        console: MissionConsoleService = Depends(get_console),
+    ) -> Response:
+        console.delete_attack_planet(planet_id)
+        return Response(status_code=204)
 
     @app.post("/api/scheduler/start", response_model=SchedulerOut)
     def scheduler_start(

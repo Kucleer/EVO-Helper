@@ -507,7 +507,10 @@ class MissionScheduler:
         if maximum is not None and maximum < 0:
             raise MissionParamError("max_score 不能小于 0")
         _bot_rescan_after_hours(params)
-        _bot_tiers(params)
+
+    def validate_military_tiers(self, tiers: list[dict[str, Any]]) -> tuple[MilitaryTier, ...]:
+        """校验全局攻击档位；任务参数不再携带档位。"""
+        return _bot_tiers({"tiers": tiers})
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -1174,11 +1177,16 @@ class MissionScheduler:
                 "军力候选池数据已过期（最旧读数 %s）；继续派遣，等待调度器空隙扫描",
                 stale_at,
             )
+        config = self._repository.military_attack_config()
+        try:
+            global_tiers = json.loads(config.tiers_json)
+        except json.JSONDecodeError as exc:  # pragma: no cover - 写侧已校验
+            raise MissionParamError("全局军力档位配置损坏") from exc
         return assign_by_capacity_and_distance(
             pool,
             origins,
             fallback_preset=BOT_ATTACK_PRESET,
-            tiers=_bot_tiers(params),
+            tiers=self.validate_military_tiers(global_tiers),
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
@@ -1198,11 +1206,20 @@ class MissionScheduler:
         """新表为空才回落旧单 origin，区域攻击永远不读新表。"""
         configured = self._repository.mission_task_origins(row.id)
         if configured:
-            return tuple(
-                AttackOrigin(Coordinate(item.galaxy, item.system, item.position), item.fleet_lines)
-                for item in configured
-                if item.enabled
-            )
+            origins: list[AttackOrigin] = []
+            for item in configured:
+                if not item.enabled:
+                    continue
+                planet = None
+                if item.planet_id is not None:
+                    planet = self._repository.attack_planet(item.planet_id)
+                coordinate = (
+                    Coordinate(item.galaxy, item.system, item.position)
+                    if planet is None
+                    else Coordinate(planet.galaxy, planet.system, planet.position)
+                )
+                origins.append(AttackOrigin(coordinate, item.fleet_lines))
+            return tuple(origins)
         config = self._repository.scheduler_config()
         return (AttackOrigin(self._origin_of(row), self._fleet_lines_of(row, config)),)
 

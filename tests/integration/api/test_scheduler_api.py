@@ -982,34 +982,63 @@ def test_the_row_summary_says_which_planet_and_how_many_lines(console: Console) 
     assert "2 条航线" in created["summary"]
 
 
-def test_a_military_bot_plan_accepts_tiers_and_multiple_origins(console: Console) -> None:
-    """控制台保存军力方案时，不该误走旧的区域攻击区间校验。"""
+def test_a_military_bot_plan_uses_global_tiers_and_selected_planets(console: Console) -> None:
+    """任务只保存军力范围与星球选择；档位统一落在攻击配置页。"""
     task_id = console.task_id("BOT")
     params = {
         "by_military": True,
         "top_n": 50,
         "max_score": 100_000,
         "rescan_after_hours": 6,
-        "tiers": [
-            {"min_score": 20_000, "preset": "CCC"},
-            {"min_score": 5_000, "preset": "BBB"},
-            {"min_score": 0, "preset": "AAA"},
-        ],
     }
+    first = console.client.post(
+        "/api/attack-planets", json={"galaxy": 2, "system": 137, "position": 18}
+    )
+    second = console.client.post(
+        "/api/attack-planets", json={"galaxy": 9, "system": 250, "position": 8}
+    )
+    config = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [
+                {"min_score": 20_000, "preset": "CCC"},
+                {"min_score": 5_000, "preset": "BBB"},
+                {"min_score": 0, "preset": "AAA"},
+            ]
+        },
+    )
 
     patched = console.client.patch(f"/api/missions/{task_id}", json={"params": params})
     origins = console.client.put(
         f"/api/missions/{task_id}/origins",
         json=[
-            {"galaxy": 2, "system": 137, "position": 18, "fleet_lines": 4, "enabled": True},
-            {"galaxy": 9, "system": 250, "position": 8, "fleet_lines": 2, "enabled": True},
+            {"planet_id": first.json()["planet_id"], "fleet_lines": 4, "enabled": True},
+            {"planet_id": second.json()["planet_id"], "fleet_lines": 2, "enabled": True},
         ],
     )
 
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert config.status_code == 200, config.text
     assert patched.status_code == 200, patched.text
     assert patched.json()["params"] == params
     assert origins.status_code == 200, origins.text
     assert origins.json() == [
-        {"galaxy": 2, "system": 137, "position": 18, "fleet_lines": 4, "enabled": True},
-        {"galaxy": 9, "system": 250, "position": 8, "fleet_lines": 2, "enabled": True},
+        {
+            "planet_id": first.json()["planet_id"],
+            "galaxy": 2,
+            "system": 137,
+            "position": 18,
+            "fleet_lines": 4,
+            "enabled": True,
+        },
+        {
+            "planet_id": second.json()["planet_id"],
+            "galaxy": 9,
+            "system": 250,
+            "position": 8,
+            "fleet_lines": 2,
+            "enabled": True,
+        },
     ]
+    assert config.json()["tiers"][0]["preset"] == "CCC"

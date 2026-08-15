@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}攻击配置 · EVO-Helper{% endblock %}
+{% block heading %}攻击配置{% endblock %}
+{% block content %}
+<section class="panel" aria-labelledby="tier-head">
+  <h2 id="tier-head">统一攻击档位</h2>
+  <p class="muted">所有“军力优先”任务共用这一份档位。按最低军力从高到低填写；未命中档位时使用 BBB。</p>
+  <div id="tier-list"></div>
+  <div class="filter-bar" style="margin-top:10px">
+    <button class="btn small" type="button" id="btn-add-tier">增加档位</button>
+    <button class="btn primary small" type="button" id="btn-save-tiers">保存统一档位</button>
+  </div>
+</section>
+
+<section class="panel" aria-labelledby="planet-head">
+  <h2 id="planet-head">出发星球</h2>
+  <p class="muted">按列表自动编号为星球1、星球2……任务里直接选择，例如“星球1 [2:137:18]”。被任务使用的星球不能删除。</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>编号</th><th>坐标</th><th>操作</th></tr></thead>
+      <tbody id="planet-list"></tbody>
+    </table>
+  </div>
+  <div class="filter-bar" style="margin-top:10px">
+    <input id="new-planet-coordinate" type="text" placeholder="星系:恒星系:位置" aria-label="新增出发星球坐标">
+    <button class="btn primary small" type="button" id="btn-add-planet">新增星球</button>
+  </div>
+</section>
+
+<p class="chip danger" id="settings-error" role="status" hidden></p>
+
+<script>
+(() => {
+  const tiers = document.getElementById('tier-list');
+  const planets = document.getElementById('planet-list');
+  const errorBox = document.getElementById('settings-error');
+  const coordinatePayload = (text) => {
+    const parts = text.trim().split(':').map(Number);
+    if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part) || part < 1)) {
+      throw new Error('坐标要写成 星系:恒星系:位置，例如 2:137:18');
+    }
+    return { galaxy: parts[0], system: parts[1], position: parts[2] };
+  };
+  const showError = (error = '') => { errorBox.textContent = error; errorBox.hidden = !error; };
+  const fail = (error) => showError(error.detail || error.message || String(error));
+
+  function addTier(tier = {}) {
+    const line = document.createElement('div');
+    line.className = 'filter-bar tier-line';
+    line.style.marginTop = '6px';
+    const minimum = document.createElement('input');
+    minimum.className = 'tier-minimum'; minimum.type = 'number'; minimum.min = '0';
+    minimum.placeholder = '最低军力'; minimum.value = tier.min_score ?? '';
+    const preset = document.createElement('input');
+    preset.className = 'tier-preset'; preset.type = 'text'; preset.placeholder = '游戏内预设标题';
+    preset.value = tier.preset || '';
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.className = 'btn small'; remove.textContent = '移除';
+    remove.onclick = () => line.remove();
+    line.append(minimum, document.createTextNode(' ≥ '), preset, remove);
+    tiers.append(line);
+  }
+
+  function renderPlanets(items) {
+    planets.textContent = '';
+    for (const planet of items) {
+      const row = document.createElement('tr');
+      const number = document.createElement('td'); number.textContent = `星球${planet.number}`;
+      const coordinate = document.createElement('td');
+      const input = document.createElement('input'); input.type = 'text'; input.value = `${planet.galaxy}:${planet.system}:${planet.position}`;
+      input.setAttribute('aria-label', `星球${planet.number}坐标`); coordinate.append(input);
+      const actions = document.createElement('td');
+      const save = document.createElement('button'); save.type = 'button'; save.className = 'btn small'; save.textContent = '保存';
+      save.onclick = () => { try { return EVOHelper.request('PATCH', `/api/attack-planets/${planet.planet_id}`, coordinatePayload(input.value)).then(refresh).catch(fail); } catch (error) { fail(error); } };
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn small'; remove.textContent = '删除';
+      remove.onclick = () => EVOHelper.del(`/api/attack-planets/${planet.planet_id}`).then(refresh).catch(fail);
+      actions.append(save, document.createTextNode(' '), remove); row.append(number, coordinate, actions); planets.append(row);
+    }
+  }
+
+  function refresh() {
+    showError('');
+    return Promise.all([EVOHelper.get('/api/attack-config'), EVOHelper.get('/api/attack-planets')])
+      .then(([config, list]) => { tiers.textContent = ''; for (const tier of config.tiers) addTier(tier); renderPlanets(list); })
+      .catch(fail);
+  }
+
+  document.getElementById('btn-add-tier').onclick = () => addTier();
+  document.getElementById('btn-save-tiers').onclick = () => {
+    try {
+      const payload = [];
+      for (const line of tiers.querySelectorAll('.tier-line')) {
+        const min = Number(line.querySelector('.tier-minimum').value);
+        const preset = line.querySelector('.tier-preset').value.trim();
+        if (!Number.isFinite(min) || min < 0 || !preset) throw new Error('每个档位都要填写非负最低军力和预设标题');
+        payload.push({ min_score: min, preset });
+      }
+      payload.sort((left, right) => right.min_score - left.min_score);
+      EVOHelper.request('PUT', '/api/attack-config', { tiers: payload }).then(refresh).catch(fail);
+    } catch (error) { fail(error); }
+  };
+  document.getElementById('btn-add-planet').onclick = () => {
+    try {
+      const input = document.getElementById('new-planet-coordinate');
+      EVOHelper.post('/api/attack-planets', coordinatePayload(input.value)).then(() => { input.value = ''; return refresh(); }).catch(fail);
+    } catch (error) { fail(error); }
+  };
+  refresh();
+})();
+</script>
+{% endblock %}

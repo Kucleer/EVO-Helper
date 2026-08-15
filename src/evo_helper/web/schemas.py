@@ -208,15 +208,40 @@ class MissionTaskCreate(BaseModel):
     fleet_lines: int | None = None
 
 
-class MissionOriginIn(CoordinateModel):
-    """军力任务的一颗出发星球；保存整组时由接口原子替换。"""
+class MissionOriginIn(BaseModel):
+    """军力任务选择配置页中的一颗出发星球；保存整组时原子替换。"""
 
+    model_config = ConfigDict(extra="forbid")
+
+    planet_id: int = Field(ge=1)
     fleet_lines: int = Field(ge=1)
     enabled: bool = True
 
 
-class MissionOriginOut(MissionOriginIn):
-    pass
+class MissionOriginOut(CoordinateModel):
+    planet_id: int | None = None
+    fleet_lines: int = Field(ge=1)
+    enabled: bool = True
+
+
+class AttackPlanetIn(CoordinateModel):
+    """全局攻击星球配置。"""
+
+
+class AttackPlanetOut(AttackPlanetIn):
+    planet_id: int
+    number: int
+
+
+class MilitaryTierIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_score: float = Field(ge=0)
+    preset: str = Field(min_length=1, max_length=120)
+
+
+class MilitaryAttackConfigOut(BaseModel):
+    tiers: list[MilitaryTierIn]
 
 
 class CurrentMissionOut(BaseModel):

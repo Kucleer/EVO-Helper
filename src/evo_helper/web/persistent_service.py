@@ -53,6 +53,7 @@ from .display import BACKFILL_KIND_LABELS, MISSION_LABELS, PARAM_LABELS
 from .service import (
     AttackLogOptions,
     AttackLogView,
+    AttackPlanetView,
     BackfillSummaryView,
     BackfillView,
     BotTargetView,
@@ -66,6 +67,7 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     FrozenTaskView,
+    MilitaryAttackConfigView,
     MissionOriginView,
     MissionRunView,
     MissionTaskView,
@@ -1015,16 +1017,22 @@ class MissionConsoleService:
     def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
         """额外 origin 为空时，调用方明确知道仍回落旧单 origin。"""
         self._row(task_id)
-        return tuple(
-            MissionOriginView(
-                galaxy=item.galaxy,
-                system=item.system,
-                position=item.position,
-                fleet_lines=item.fleet_lines,
-                enabled=item.enabled,
+        origins: list[MissionOriginView] = []
+        for item in self._repository.mission_task_origins(task_id):
+            planet = (
+                None if item.planet_id is None else self._repository.attack_planet(item.planet_id)
             )
-            for item in self._repository.mission_task_origins(task_id)
-        )
+            origins.append(
+                MissionOriginView(
+                    planet_id=item.planet_id,
+                    galaxy=item.galaxy if planet is None else planet.galaxy,
+                    system=item.system if planet is None else planet.system,
+                    position=item.position if planet is None else planet.position,
+                    fleet_lines=item.fleet_lines,
+                    enabled=item.enabled,
+                )
+            )
+        return tuple(origins)
 
     def replace_mission_origins(
         self, task_id: int, origins: tuple[MissionOriginView, ...]
@@ -1034,21 +1042,75 @@ class MissionConsoleService:
         if MissionKind(row.kind) is not MissionKind.BOT:
             raise ServiceError("只有 bot 攻击可以配置多个出发星球")
         self._refuse_while_running(row, enabled=None, priority=None, params=None)
-        coordinates = [(item.galaxy, item.system, item.position) for item in origins]
-        if len(set(coordinates)) != len(coordinates):
+        planet_ids = [item.planet_id for item in origins]
+        if any(planet_id is None for planet_id in planet_ids):
+            raise ServiceError("请选择配置页中的出发星球")
+        if len(set(planet_ids)) != len(planet_ids):
             raise ServiceError("同一颗出发星球只能配置一次")
-        self._repository.replace_mission_task_origins(
-            task_id,
-            tuple(
-                (
-                    Coordinate(item.galaxy, item.system, item.position),
-                    item.fleet_lines,
-                    item.enabled,
-                )
-                for item in origins
-            ),
-        )
+        resolved = []
+        for item in origins:
+            if item.planet_id is None:  # 上面的输入校验已挡住；供类型检查器窄化。
+                raise AssertionError("validated planet_id disappeared")
+            resolved.append((item.planet_id, item.fleet_lines, item.enabled))
+        self._repository.replace_mission_task_origins(task_id, tuple(resolved))
         return self.mission_origins(task_id)
+
+    def attack_planets(self) -> tuple[AttackPlanetView, ...]:
+        return tuple(
+            AttackPlanetView(
+                planet_id=row.id,
+                number=row.sort_index,
+                galaxy=row.galaxy,
+                system=row.system,
+                position=row.position,
+            )
+            for row in self._repository.attack_planets()
+        )
+
+    def create_attack_planet(self, coordinate: Coordinate) -> AttackPlanetView:
+        self._refuse_global_config_while_running()
+        try:
+            row = self._repository.create_attack_planet(coordinate)
+        except ValueError as exc:
+            raise ServiceError(str(exc)) from exc
+        return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
+
+    def update_attack_planet(self, planet_id: int, coordinate: Coordinate) -> AttackPlanetView:
+        self._refuse_global_config_while_running()
+        try:
+            row = self._repository.update_attack_planet(planet_id, coordinate)
+        except ValueError as exc:
+            raise ServiceError(str(exc)) from exc
+        return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
+
+    def delete_attack_planet(self, planet_id: int) -> None:
+        self._refuse_global_config_while_running()
+        try:
+            self._repository.delete_attack_planet(planet_id)
+        except ValueError as exc:
+            raise ServiceError(str(exc)) from exc
+
+    def military_attack_config(self) -> MilitaryAttackConfigView:
+        row = self._repository.military_attack_config()
+        try:
+            tiers = json.loads(row.tiers_json)
+        except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
+            raise ServiceError("全局军力档位配置损坏") from exc
+        return MilitaryAttackConfigView(tuple(tiers))
+
+    def replace_military_attack_tiers(
+        self, tiers: tuple[dict[str, Any], ...]
+    ) -> MilitaryAttackConfigView:
+        self._refuse_global_config_while_running()
+        normalized = [dict(tier) for tier in tiers]
+        try:
+            self._scheduler.validate_military_tiers(normalized)
+        except MissionParamError as exc:
+            raise ServiceError(str(exc)) from exc
+        row = self._repository.replace_military_attack_tiers(
+            json.dumps(normalized, ensure_ascii=False)
+        )
+        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
 
     def create_mission(
         self,
@@ -1123,13 +1185,17 @@ class MissionConsoleService:
 
     # -- 内部 ------------------------------------------------------------------
 
+    def _refuse_global_config_while_running(self) -> None:
+        if self._scheduler.config_locked:
+            raise ConflictError("调度器运行中，攻击配置已固化；点「结束」后可改")
+
     def _refuse_while_running(
         self,
         row: orm.MissionTaskRow,
         *,
         enabled: bool | None,
         priority: int | None,
-        params: dict[str, int] | None,
+        params: dict[str, object] | None,
         name: str | None = None,
         origin: str | None = None,
         fleet_lines: int | None = None,
@@ -1382,9 +1448,7 @@ class MissionConsoleService:
         """区间里有几个已记录的 bot。N=0 就禁止启用，所以 N 必须先看得见。"""
         if params.get("by_military") is True:
             top_n = params.get("top_n", 50)
-            tiers = params.get("tiers")
-            tier_text = "未配置档位（全部 BBB）" if not tiers else f"{len(tiers)} 个档位"
-            return f"军力前 {top_n} 名 · {tier_text} · 按出发点就近分配"
+            return f"军力前 {top_n} 名 · 统一档位 · 按出发点就近分配"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")

@@ -330,11 +330,26 @@ class MissionTaskView:
 
 @dataclass(frozen=True)
 class MissionOriginView:
+    planet_id: int | None
+    galaxy: int = 0
+    system: int = 0
+    position: int = 0
+    fleet_lines: int = 0
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class AttackPlanetView:
+    planet_id: int
+    number: int
     galaxy: int
     system: int
     position: int
-    fleet_lines: int
-    enabled: bool
+
+
+@dataclass(frozen=True)
+class MilitaryAttackConfigView:
+    tiers: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -863,6 +878,7 @@ class FakeApplicationService:
 __all__ = [
     "ATTACK_LOG_RESULTS",
     "ApplicationService",
+    "AttackPlanetView",
     "AttackLogOptions",
     "BackfillSummaryView",
     "BackfillView",
@@ -877,6 +893,7 @@ __all__ = [
     "FleetSnapshotView",
     "MissionRunView",
     "MissionTaskView",
+    "MilitaryAttackConfigView",
     "NotFoundError",
     "PlanPatchView",
     "RevisitView",
