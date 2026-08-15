@@ -64,6 +64,9 @@ from evo_helper.game.pirate_ui import (
 #: 安全退出，连预设选择都走不到。有限重读能等过动画，又不会卡死在真故障画面上。
 PLANET_LIST_READ_ATTEMPTS = 3
 PLANET_LIST_REREAD_WAIT_S = 0.6
+#: 一张行星列表的 OCR 绝不能无限占住攻击轮。超时一律当作本帧没读到；
+#: ``PlanetSwitcher`` 会按既有的确认策略重读，仍为空则安全地不点击。
+PLANET_LIST_OCR_TIMEOUT_S = 8.0
 
 
 class SwitchResult(Enum):
@@ -237,12 +240,18 @@ def coordinate_words(
     filters = {"lanczos": Image.Resampling.LANCZOS, "nearest": Image.Resampling.NEAREST}
     crop = image.crop(PLANET_LIST_COORD_ROI).convert("L")
     grey = crop.resize((crop.width * upscale, crop.height * upscale), filters[resample])
-    data = ocr.image_to_data(
-        grey,
-        lang="eng",
-        config=f"--psm 6 -c tessedit_char_whitelist={whitelist}",
-        output_type=ocr.Output.DICT,
-    )
+    try:
+        data = ocr.image_to_data(
+            grey,
+            lang="eng",
+            config=f"--psm 6 -c tessedit_char_whitelist={whitelist}",
+            output_type=ocr.Output.DICT,
+            timeout=PLANET_LIST_OCR_TIMEOUT_S,
+        )
+    except RuntimeError:
+        # pytesseract 在超时后抛 RuntimeError。这里不能把一次识别失手升级为
+        # 整个攻击进程卡死；空结果会沿用「重读 / 不盲点」这条安全路径。
+        return []
     words: list[tuple[int, str]] = []
     for index, word in enumerate(data["text"]):
         text = word.strip()

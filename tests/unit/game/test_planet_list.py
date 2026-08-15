@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
+from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult, coordinate_words
 
 HOME = Coordinate(2, 137, 18)
 SECOND = Coordinate(9, 250, 8)
@@ -228,6 +228,27 @@ class TestRefusingToGuess:
         switcher.switch_to(MISSING)
 
         assert CLOSE_OVERLAY in driver.points
+
+
+def test_coordinate_words_turns_an_ocr_timeout_into_a_safe_empty_read() -> None:
+    """实机 tesseract 卡住时不能让调度任务永远占用一条航线。"""
+    from PIL import Image
+
+    class _TimedOutOcr:
+        class Output:
+            DICT = "dict"
+
+        @staticmethod
+        def image_to_data(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("Tesseract process timeout")
+
+    assert coordinate_words(
+        Image.new("RGB", (1920, 1080)),
+        _TimedOutOcr(),
+        upscale=2,
+        resample="lanczos",
+        whitelist="0123456789:",
+    ) == []
 
 
 class TestDraggingThroughTheList:
