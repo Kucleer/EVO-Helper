@@ -1521,7 +1521,9 @@ def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # 
     # 用形状过滤会把它一起捞进来（我第一版就是这么写错的）。
     command = launcher.latest.command
     targets = command[command.index("--targets") + 1 : command.index("--origin")]
-    assert targets == ["2:140:2", "2:400:1"]
+    # 这组夹具只留一条空航线；军力 runner 会先取池中最近的那颗，并把实际使用的
+    # 预设记进命令行，不能再把 `=BBB` 当成坐标的一部分丢掉。
+    assert targets == ["2:140:2=BBB"]
 
 
 def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-def]
@@ -1543,7 +1545,7 @@ def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-
     scheduler.start()
     scheduler.tick()
 
-    assert "7:99:7" in launcher.latest.command
+    assert "7:99:7=BBB" in launcher.latest.command
 
 
 def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
@@ -1582,5 +1584,5 @@ def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: i
     scheduler.tick()
 
     command = launcher.latest.command
-    assert "2:140:2" in command
-    assert "2:141:3" not in command
+    assert "2:140:2=BBB" in command
+    assert not any(part.startswith("2:141:3") for part in command)

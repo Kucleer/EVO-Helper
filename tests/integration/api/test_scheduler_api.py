@@ -980,3 +980,36 @@ def test_the_row_summary_says_which_planet_and_how_many_lines(console: Console) 
 
     assert "2:137:18" in created["summary"]
     assert "2 条航线" in created["summary"]
+
+
+def test_a_military_bot_plan_accepts_tiers_and_multiple_origins(console: Console) -> None:
+    """控制台保存军力方案时，不该误走旧的区域攻击区间校验。"""
+    task_id = console.task_id("BOT")
+    params = {
+        "by_military": True,
+        "top_n": 50,
+        "max_score": 100_000,
+        "rescan_after_hours": 6,
+        "tiers": [
+            {"min_score": 20_000, "preset": "CCC"},
+            {"min_score": 5_000, "preset": "BBB"},
+            {"min_score": 0, "preset": "AAA"},
+        ],
+    }
+
+    patched = console.client.patch(f"/api/missions/{task_id}", json={"params": params})
+    origins = console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[
+            {"galaxy": 2, "system": 137, "position": 18, "fleet_lines": 4, "enabled": True},
+            {"galaxy": 9, "system": 250, "position": 8, "fleet_lines": 2, "enabled": True},
+        ],
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["params"] == params
+    assert origins.status_code == 200, origins.text
+    assert origins.json() == [
+        {"galaxy": 2, "system": 137, "position": 18, "fleet_lines": 4, "enabled": True},
+        {"galaxy": 9, "system": 250, "position": 8, "fleet_lines": 2, "enabled": True},
+    ]

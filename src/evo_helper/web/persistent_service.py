@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, delete, func, select
@@ -935,7 +936,7 @@ class MissionConsoleService:
         *,
         enabled: bool | None = None,
         priority: int | None = None,
-        params: dict[str, int] | None = None,
+        params: dict[str, object] | None = None,
         name: str | None = None,
         origin: str | None = None,
         fleet_lines: int | None = None,
@@ -983,7 +984,18 @@ class MissionConsoleService:
         # 先存一个空范围、再单独勾复选框，就绕过去了。只改 priority / 名字、
         # 或者要**关掉**它时不校验：参数填错了还关不掉，那就真的没退路了。
         if params is not None or enabled is True:
-            self._validate(kind, params_json or row.params_json, target_origin)
+            raw_params = params_json or row.params_json
+            try:
+                military = bool(json.loads(raw_params).get("by_military", False))
+            except (json.JSONDecodeError, AttributeError):
+                military = False
+            if kind is MissionKind.BOT and military:
+                try:
+                    self._scheduler.validate_military_params(raw_params)
+                except MissionParamError as exc:
+                    raise ServiceError(str(exc)) from exc
+            else:
+                self._validate(kind, raw_params, target_origin)
         # ⚠️ 这里原先还有一条 `elif origin is not None: self._check_origin(...)`：
         # 只改出发星球时单量那一项，因为「不是主星」当时会被临时闸门拒掉。
         # 闸门随「切换星球」实装删了（runner 开工会真的切过去），于是出发星球本身
@@ -1272,7 +1284,7 @@ class MissionConsoleService:
             ),
             restart_cooldown=timedelta(seconds=snapshot.config.restart_cooldown_seconds),
         )
-        params = _int_params(row.params_json)
+        params = _view_params(row.params_json)
         return MissionTaskView(
             task_id=task.task_id,
             kind=task.kind.value,
@@ -1326,7 +1338,7 @@ class MissionConsoleService:
             return f"还剩 {remaining} 个未完成"
         return "始终填空隙"
 
-    def _summary(self, task: TaskSnapshot, params: dict[str, int]) -> str:
+    def _summary(self, task: TaskSnapshot, params: dict[str, Any]) -> str:
         """参数与出发星球的人话回显。
 
         出发星球与航线数摆在最前面：多任务之后，「这一行到底从哪出发、能占几条」
@@ -1366,8 +1378,13 @@ class MissionConsoleService:
             f"{origin.galaxy}:{high}{wrapped}，{len(systems)} 个系"
         )
 
-    def _bot_summary(self, params: dict[str, int]) -> str:
+    def _bot_summary(self, params: dict[str, Any]) -> str:
         """区间里有几个已记录的 bot。N=0 就禁止启用，所以 N 必须先看得见。"""
+        if params.get("by_military") is True:
+            top_n = params.get("top_n", 50)
+            tiers = params.get("tiers")
+            tier_text = "未配置档位（全部 BBB）" if not tiers else f"{len(tiers)} 个档位"
+            return f"军力前 {top_n} 名 · {tier_text} · 按出发点就近分配"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -1585,6 +1602,17 @@ def _int_params(raw: str) -> dict[str, int]:
         for key, value in data.items()
         if isinstance(value, int) and not isinstance(value, bool)
     }
+
+
+def _view_params(raw: str) -> dict[str, Any]:
+    """页面回显完整的 JSON 参数；军力档位不是整数，不能被旧的摘要过滤掉。"""
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): value for key, value in data.items()}
 
 
 def _validate_lines(fleet_line_limit: int, reserved_lines: int) -> None:

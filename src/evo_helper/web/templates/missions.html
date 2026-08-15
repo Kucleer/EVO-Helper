@@ -374,6 +374,86 @@
     return cell;
   }
 
+  function addMilitaryOrigin(list, origin = {}) {
+    const line = document.createElement('div');
+    line.className = 'military-origin-line';
+    line.style.marginTop = '5px';
+    const coordinate = makeInput('military-origin-coordinate', {
+      type: 'text', placeholder: '星系:恒星系:位置', style: 'width:118px', 'aria-label': '军力攻击出发星球',
+    });
+    coordinate.value = origin.coordinate || '';
+    const fleetLines = makeInput('military-origin-lines', {
+      type: 'number', min: 1, placeholder: '航线', style: 'width:58px', 'aria-label': '该出发星球的航线数',
+    });
+    fleetLines.value = origin.fleet_lines ?? '';
+    const enabled = makeInput('military-origin-enabled', { type: 'checkbox', 'aria-label': '启用这个出发星球' });
+    enabled.checked = origin.enabled !== false;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn small military-remove-origin';
+    remove.textContent = '移除';
+    line.append(coordinate, document.createTextNode(' '), fleetLines, document.createTextNode(' '), enabled, remove);
+    list.append(line);
+  }
+
+  function addMilitaryTier(list, tier = {}) {
+    const line = document.createElement('div');
+    line.className = 'military-tier-line';
+    line.style.marginTop = '5px';
+    const minimum = makeInput('military-tier-minimum', {
+      type: 'number', min: 0, placeholder: '最低军力', style: 'width:88px', 'aria-label': '档位最低军力',
+    });
+    minimum.value = tier.min_score ?? '';
+    const preset = makeInput('military-tier-preset', {
+      type: 'text', placeholder: '预设标题', style: 'width:80px', 'aria-label': '游戏内预设标题',
+    });
+    preset.value = tier.preset || '';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn small military-remove-tier';
+    remove.textContent = '移除';
+    line.append(minimum, document.createTextNode(' ≥ '), preset, remove);
+    list.append(line);
+  }
+
+  function setMilitaryVisible(row, locked) {
+    const toggle = row.querySelector('.military-enabled');
+    const editor = row.querySelector('.military-editor');
+    const regional = row.querySelector('.regional-params');
+    if (!toggle || !editor || !regional) return;
+    const enabled = toggle.checked;
+    editor.hidden = !enabled;
+    regional.hidden = enabled;
+    for (const input of editor.querySelectorAll('input')) input.disabled = locked;
+    for (const button of editor.querySelectorAll('button')) button.disabled = locked;
+    toggle.disabled = locked;
+  }
+
+  function loadMilitaryOrigins(task, row) {
+    const list = row.querySelector('.military-origin-list');
+    if (!list || row.dataset.militaryOriginsLoaded) return;
+    row.dataset.militaryOriginsLoaded = '1';
+    EVOHelper.get(`/api/missions/${task.task_id}/origins`)
+      .then((origins) => {
+        list.textContent = '';
+        if (origins.length) {
+          for (const origin of origins) {
+            addMilitaryOrigin(list, {
+              coordinate: `${origin.galaxy}:${origin.system}:${origin.position}`,
+              fleet_lines: origin.fleet_lines,
+              enabled: origin.enabled,
+            });
+          }
+        } else {
+          // 旧任务还没存多 origin 时，页面要把它实际会用的回落值摆出来；否则
+          // 用户看不见自己正从哪颗星球出发，第一次保存也容易少配一颗。
+          addMilitaryOrigin(list, { coordinate: task.origin, fleet_lines: task.fleet_lines, enabled: true });
+        }
+        setMilitaryVisible(row, latest && latest.config_locked === true);
+      })
+      .catch(fail);
+  }
+
   function buildRow(task) {
     const isScan = task.kind === 'SCAN';
     const row = document.createElement('tr');
@@ -441,6 +521,8 @@
 
     // 参数框。
     const params = document.createElement('span');
+    const regional = document.createElement('span');
+    regional.className = 'regional-params';
     for (const field of PARAM_FIELDS[task.kind] || []) {
       const label = document.createElement('span');
       label.className = field.label === '–' ? 'dash' : 'inline-label';
@@ -450,13 +532,54 @@
         style: `width:${field.width}px`, 'aria-label': field.label,
       });
       input.dataset.param = field.key;
-      params.append(label, input);
+      regional.append(label, input);
     }
-    if (!params.childNodes.length) {
+    if (!regional.childNodes.length) {
       const dash = document.createElement('span');
       dash.className = 'muted';
       dash.textContent = '—';
-      params.append(dash);
+      regional.append(dash);
+    }
+    params.append(regional);
+    if (task.kind === 'BOT') {
+      const military = document.createElement('div');
+      military.className = 'military-config';
+      military.style.marginTop = '6px';
+      const modeLabel = document.createElement('label');
+      modeLabel.className = 'inline-label';
+      modeLabel.style.cursor = 'pointer';
+      const mode = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
+      modeLabel.append(mode, document.createTextNode(' 军力优先：前 N 名内按各出发点就近攻击'));
+      const editor = document.createElement('div');
+      editor.className = 'military-editor';
+      editor.style.marginTop = '7px';
+      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力候选数量' });
+      const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限' });
+      const rescan = makeInput('military-rescan-hours', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力榜重扫提示小时数' });
+      const settings = document.createElement('div');
+      settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　榜单超过 '), rescan, document.createTextNode(' 小时提示重扫'));
+      const originHead = document.createElement('div');
+      originHead.style.marginTop = '7px';
+      originHead.append('出发点 / 航线　');
+      const addOrigin = document.createElement('button');
+      addOrigin.type = 'button'; addOrigin.className = 'btn small military-add-origin'; addOrigin.textContent = '增加出发点';
+      originHead.append(addOrigin);
+      const origins = document.createElement('div'); origins.className = 'military-origin-list';
+      const tierHead = document.createElement('div');
+      tierHead.style.marginTop = '7px';
+      tierHead.append('军力档位（从高到低）　');
+      const addTier = document.createElement('button');
+      addTier.type = 'button'; addTier.className = 'btn small military-add-tier'; addTier.textContent = '增加档位';
+      tierHead.append(addTier);
+      const tiers = document.createElement('div'); tiers.className = 'military-tier-list';
+      const save = document.createElement('button');
+      save.type = 'button'; save.className = 'btn primary small military-save'; save.style.marginTop = '7px'; save.textContent = '保存军力方案';
+      const note = document.createElement('div');
+      note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
+      note.textContent = '每颗出发星球填自己的航线；档位按“军力 ≥ 最低值 → 游戏内预设标题”匹配。未填档位时全部使用 BBB。';
+      editor.append(settings, originHead, origins, tierHead, tiers, save, note);
+      military.append(modeLabel, editor);
+      params.append(military);
     }
     const summary = document.createElement('div');
     summary.className = 'muted mission-summary';
@@ -640,6 +763,23 @@
         const linesInput = row.querySelector('.mission-lines');
         if (linesInput) linesInput.value = task.fleet_lines || '';
       }
+
+      if (task.kind === 'BOT' && (!row.dataset.militaryPrimed || locked)) {
+        row.dataset.militaryPrimed = '1';
+        const mode = row.querySelector('.military-enabled');
+        mode.checked = task.params.by_military === true;
+        row.querySelector('.military-top-n').value = task.params.top_n ?? 50;
+        row.querySelector('.military-max-score').value = task.params.max_score ?? '';
+        row.querySelector('.military-rescan-hours').value = task.params.rescan_after_hours ?? 6;
+        const tiers = row.querySelector('.military-tier-list');
+        tiers.textContent = '';
+        for (const tier of (Array.isArray(task.params.tiers) ? task.params.tiers : [])) {
+          addMilitaryTier(tiers, tier);
+        }
+        if (!tiers.childNodes.length) addMilitaryTier(tiers);
+        loadMilitaryOrigins(task, row);
+      }
+      if (task.kind === 'BOT') setMilitaryVisible(row, locked);
     }
     tickClock();
   }
@@ -797,6 +937,62 @@
       .catch((error) => { fail(error); return refresh(); });
   }
 
+  function coordinatePayload(text) {
+    const parts = text.trim().split(':').map(Number);
+    if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) {
+      throw new Error(`出发点「${text}」应为 星系:恒星系:位置，例如 2:137:18`);
+    }
+    return { galaxy: parts[0], system: parts[1], position: parts[2] };
+  }
+
+  function saveMilitary(taskId, row) {
+    const task = latest.tasks.find((item) => String(item.task_id) === String(taskId));
+    if (!task) return;
+    const enabled = row.querySelector('.military-enabled').checked;
+    const payload = { ...task.params, by_military: enabled };
+    if (!enabled) return patch(taskId, payload);
+    const topN = Number(row.querySelector('.military-top-n').value);
+    const rescan = Number(row.querySelector('.military-rescan-hours').value);
+    const maximumText = row.querySelector('.military-max-score').value.trim();
+    if (!Number.isInteger(topN) || topN < 1) throw new Error('候选数量必须是大于 0 的整数');
+    if (!Number.isFinite(rescan) || rescan <= 0) throw new Error('重扫提示小时数必须大于 0');
+    payload.top_n = topN;
+    payload.rescan_after_hours = rescan;
+    if (maximumText === '') delete payload.max_score;
+    else {
+      payload.max_score = Number(maximumText);
+      if (!Number.isFinite(payload.max_score) || payload.max_score < 0) throw new Error('军力上限必须是非负数字');
+    }
+    const tiers = [];
+    for (const line of row.querySelectorAll('.military-tier-line')) {
+      const minimumText = line.querySelector('.military-tier-minimum').value.trim();
+      const preset = line.querySelector('.military-tier-preset').value.trim();
+      if (!minimumText && !preset) continue;
+      const minimum = Number(minimumText);
+      if (!Number.isFinite(minimum) || minimum < 0 || !preset) {
+        throw new Error('每个军力档位都要填写非负最低军力和预设标题');
+      }
+      tiers.push({ min_score: minimum, preset });
+    }
+    tiers.sort((left, right) => right.min_score - left.min_score);
+    payload.tiers = tiers;
+    const origins = [];
+    for (const line of row.querySelectorAll('.military-origin-line')) {
+      const coordinate = line.querySelector('.military-origin-coordinate').value;
+      const fleetLines = Number(line.querySelector('.military-origin-lines').value);
+      if (!Number.isInteger(fleetLines) || fleetLines < 1) throw new Error('每个出发点的航线数至少为 1');
+      origins.push({ ...coordinatePayload(coordinate), fleet_lines: fleetLines,
+        enabled: line.querySelector('.military-origin-enabled').checked });
+    }
+    if (!origins.length) throw new Error('军力攻击至少需要一个启用的出发点');
+    // 先写参数；失败时保留旧的多出发点配置，绝不把一份半截方案存进去。
+    showError('');
+    return EVOHelper.request('PATCH', `/api/missions/${taskId}`, { params: payload })
+      .then(() => EVOHelper.request('PUT', `/api/missions/${taskId}/origins`, origins))
+      .then(() => refresh())
+      .catch((error) => { fail(error); return refresh(); });
+  }
+
   for (const id of ['btn-stop', 'btn-force-kill']) {
     document.getElementById(id).onclick = (event) => command(event.currentTarget.dataset.endpoint);
   }
@@ -858,6 +1054,26 @@
     // 走的是和复选框同一个 PATCH：`enabled: true` 顺带清掉停用原因与失败计数，
     // 而参数不合格的任务照样会被 400 拦下（错误显示在下面那条红字里）。
     if (event.target.closest('.mission-revive')) patch(taskId, { enabled: true });
+    if (event.target.closest('.military-add-origin')) {
+      addMilitaryOrigin(row.querySelector('.military-origin-list'));
+      return;
+    }
+    if (event.target.closest('.military-remove-origin')) {
+      event.target.closest('.military-origin-line').remove();
+      return;
+    }
+    if (event.target.closest('.military-add-tier')) {
+      addMilitaryTier(row.querySelector('.military-tier-list'));
+      return;
+    }
+    if (event.target.closest('.military-remove-tier')) {
+      event.target.closest('.military-tier-line').remove();
+      return;
+    }
+    if (event.target.closest('.military-save')) {
+      try { saveMilitary(taskId, row); } catch (error) { fail(error); }
+      return;
+    }
     if (event.target.closest('.mission-delete')) {
       // 删掉的是用户自己配出来的东西，而且不可撤销（历史台账留着，配置不留）。
       if (!window.confirm(`删除任务「${row.querySelector('.mission-name').value}」？`)) return;
@@ -899,6 +1115,9 @@
         if (input.value.trim() !== '') params[input.dataset.param] = Number(input.value);
       }
       patch(taskId, { params });
+    }
+    if (event.target.matches('.military-enabled')) {
+      setMilitaryVisible(row, latest && latest.config_locked === true);
     }
   });
 

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange
@@ -309,7 +309,7 @@ class MissionTaskView:
     label: str
     enabled: bool
     priority: int
-    params: dict[str, int]
+    params: dict[str, Any]
     status: str
     detail: str
     #: 参数的人话回显：海盗半径实际覆盖到哪、bot 区间里有几个已记录目标。

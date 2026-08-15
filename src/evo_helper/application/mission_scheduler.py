@@ -491,6 +491,24 @@ class MissionScheduler:
         """
         return self._command_for(kind, params_json, origin)
 
+    def validate_military_params(self, params_json: str) -> None:
+        """只校验军力方案本身，不伪造一颗 origin 去组命令行。
+
+        多出发点由任务表配置，页面保存军力参数时它们可能正好还没一并落库；此时
+        调 ``command_for`` 会错误地走旧的区域攻击参数校验。这里与真正派遣共用
+        同一套解析器，专门给保存前校验使用。
+        """
+        params = _params(params_json)
+        if not _bot_by_military(params_json):
+            return
+        if _bot_top_n(params_json) < 1:
+            raise MissionParamError("top_n 必须至少为 1")
+        maximum = _bot_max_score(params_json)
+        if maximum is not None and maximum < 0:
+            raise MissionParamError("max_score 不能小于 0")
+        _bot_rescan_after_hours(params)
+        _bot_tiers(params)
+
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
 
