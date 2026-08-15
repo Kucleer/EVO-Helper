@@ -329,6 +329,15 @@ class MissionTaskView:
 
 
 @dataclass(frozen=True)
+class MissionOriginView:
+    galaxy: int
+    system: int
+    position: int
+    fleet_lines: int
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class CurrentMissionView:
     task_id: int
     kind: str

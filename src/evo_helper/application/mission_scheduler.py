@@ -50,8 +50,15 @@ from evo_helper.application.mission_supervisor import (
     RunningChild,
     StopReason,
 )
-from evo_helper.domain.bot_round import BotPhase, phase_of
+from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, phase_of
 from evo_helper.domain.distance import nearest_first
+from evo_helper.domain.military_attack import (
+    AssignedTarget,
+    AttackOrigin,
+    MilitaryTier,
+    assign_by_capacity_and_distance,
+    military_pool,
+)
 from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
@@ -760,7 +767,11 @@ class MissionScheduler:
             # 可记的派遣。
             return False
         try:
-            command = self._command_for(task.kind, row.params_json, task.origin)
+            command = (
+                self._military_command(row)
+                if task.kind is MissionKind.BOT and _bot_by_military(row.params_json)
+                else self._command_for(task.kind, row.params_json, task.origin)
+            )
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
             return False
@@ -940,6 +951,46 @@ class MissionScheduler:
                 # 剩下那几样对它们恒为「没有」。
                 per_task[task.task_id] = base
                 continue
+            row = self._repository.mission_task(task.task_id)
+            if (
+                task.kind is MissionKind.BOT
+                and row is not None
+                and _bot_by_military(row.params_json)
+            ):
+                origins = self._military_origins(row)
+                for item in origins:
+                    if item.coordinate not in inflight:
+                        inflight[item.coordinate] = self._repository.count_inflight(
+                            now_utc=now, origin=item.coordinate
+                        )
+                        next_free[item.coordinate] = self._repository.next_line_free_at(
+                            now_utc=now, origin=item.coordinate
+                        )
+                # 多 origin 的预算是每颗星球各自的预算，绝不再拿全局保留数把它们
+                # 合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
+                free = sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
+                last_dispatches = [
+                    self._repository.last_dispatch_at(
+                        _TARGET_KIND[task.kind], origin=item.coordinate
+                    )
+                    for item in origins
+                ]
+                free_moments: list[datetime] = []
+                for item in origins:
+                    moment = next_free[item.coordinate]
+                    if moment is not None:
+                        free_moments.append(moment)
+                per_task[task.task_id] = replace(
+                    base,
+                    free_lines=free,
+                    reports_due=self._reports_due(task, now, grace),
+                    targets_remaining=self._bot_remaining(task),
+                    last_dispatch_at_utc=max(
+                        (item for item in last_dispatches if item is not None), default=None
+                    ),
+                    next_line_free_at_utc=min(free_moments, default=None),
+                )
+                continue
             if task.origin not in inflight:
                 inflight[task.origin] = self._repository.count_inflight(
                     now_utc=now, origin=task.origin
@@ -1035,6 +1086,8 @@ class MissionScheduler:
         if row is None:
             return 0
         try:
+            if _bot_by_military(row.params_json):
+                return len(self._military_candidates(row))
             targets = self._bot_selection(row.params_json, self._origin_of(row))
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
@@ -1068,6 +1121,73 @@ class MissionScheduler:
         in_range = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
         return nearest_first(in_range, origin)
 
+    def _military_command(self, row: orm.MissionTaskRow) -> list[str]:
+        """只起一颗出发星球的一组目标，避免 runner 中途切星球留下半组状态。"""
+        assignments = self._military_assignments(row)
+        if not assignments:
+            raise MissionParamError("本轮没有可派遣的军力攻击目标")
+        first_origin = assignments[0].origin
+        group = [item for item in assignments if item.origin == first_origin]
+        return bot_command(
+            [item.coordinate for item in group],
+            origin=first_origin,
+            presets={item.coordinate: item.preset for item in group},
+        )
+
+    def _military_assignments(self, row: orm.MissionTaskRow) -> tuple[AssignedTarget, ...]:
+        """军力池先排除本轮已处理目标，否则前 N 打完会静默卡住。"""
+        params = _params(row.params_json)
+        candidates = self._military_candidates(row)
+        pool = military_pool(
+            candidates,
+            take=_bot_top_n(row.params_json),
+            maximum_score=_bot_max_score(row.params_json),
+        )
+        origins = self._military_origins(row)
+        if not origins:
+            raise MissionParamError("军力攻击没有启用的出发星球")
+        # 只看这次要打的候选池，整张榜里一条旧记录不该把新池子误报为陈旧。
+        scanned_at = [item.military_score_at_utc for item in pool if item.military_score_at_utc]
+        stale_at = min(scanned_at, default=None)
+        stale_after = timedelta(hours=_bot_rescan_after_hours(params))
+        if stale_at is not None and self._clock() - stale_at >= stale_after:
+            # 只记录，不阻塞派遣、更不能从这里启动 RANKING：两条链路会争同一只鼠标。
+            _LOGGER.info(
+                "军力候选池数据已过期（最旧读数 %s）；继续派遣，等待调度器空隙扫描",
+                stale_at,
+            )
+        return assign_by_capacity_and_distance(
+            pool,
+            origins,
+            fallback_preset=BOT_ATTACK_PRESET,
+            tiers=_bot_tiers(params),
+        )
+
+    def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
+        """只留下这一轮真正尚需攻击的 bot，防止前 N 打完后池子原地空转。"""
+        return [
+            target
+            for target in self._scored_bot_targets()
+            if phase_of(
+                self._repository.bot_dispatch_facts(
+                    target.coordinate, since=row.round_started_at_utc
+                )
+            )
+            is BotPhase.NEEDS_ATTACK
+        ]
+
+    def _military_origins(self, row: orm.MissionTaskRow) -> tuple[AttackOrigin, ...]:
+        """新表为空才回落旧单 origin，区域攻击永远不读新表。"""
+        configured = self._repository.mission_task_origins(row.id)
+        if configured:
+            return tuple(
+                AttackOrigin(Coordinate(item.galaxy, item.system, item.position), item.fleet_lines)
+                for item in configured
+                if item.enabled
+            )
+        config = self._repository.scheduler_config()
+        return (AttackOrigin(self._origin_of(row), self._fleet_lines_of(row, config)),)
+
     def _scored_bot_targets(self) -> list[ScoredTarget]:
         """已记录的 bot，**连军力值一起带出来**。
 
@@ -1079,6 +1199,7 @@ class MissionScheduler:
             ScoredTarget(
                 Coordinate(row.galaxy, row.system, row.position),
                 military_score=row.military_score,
+                military_score_at_utc=row.military_score_at_utc,
             )
             for row in self._repository.list_bot_targets()
         ]
@@ -1204,6 +1325,36 @@ def _bot_max_score(raw: str) -> float | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     return float(value)
+
+
+def _bot_rescan_after_hours(data: dict[str, Any]) -> float:
+    """仅提示军力池陈旧；默认六小时，但绝不以此阻塞派遣。"""
+    value = data.get("rescan_after_hours", 6)
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        raise MissionParamError("rescan_after_hours 必须是正数")
+    return float(value)
+
+
+def _bot_tiers(data: dict[str, Any]) -> tuple[MilitaryTier, ...]:
+    """解析用户明确配置的档位；空配置回落 BBB，绝不偷偷造阈值。"""
+    raw = data.get("tiers")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise MissionParamError("tiers 必须是数组")
+    tiers: list[MilitaryTier] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise MissionParamError("tiers 的每一项必须是对象")
+        minimum, preset = item.get("min_score"), item.get("preset")
+        if isinstance(minimum, bool) or not isinstance(minimum, int | float):
+            raise MissionParamError("tiers.min_score 必须是数字")
+        if not isinstance(preset, str) or not preset.strip():
+            raise MissionParamError("tiers.preset 必须是非空预设标题")
+        tiers.append(MilitaryTier(float(minimum), preset))
+    if tiers != sorted(tiers, key=lambda tier: tier.min_score, reverse=True):
+        raise MissionParamError("tiers 必须按 min_score 从高到低排列")
+    return tuple(tiers)
 
 
 def _bot_range(raw: str) -> dict[str, int]:

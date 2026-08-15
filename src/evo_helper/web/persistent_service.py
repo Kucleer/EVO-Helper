@@ -65,6 +65,7 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     FrozenTaskView,
+    MissionOriginView,
     MissionRunView,
     MissionTaskView,
     NotFoundError,
@@ -998,6 +999,44 @@ class MissionConsoleService:
             fleet_lines=fleet_lines,
         )
         return self._task_view_for(task_id)
+
+    def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
+        """额外 origin 为空时，调用方明确知道仍回落旧单 origin。"""
+        self._row(task_id)
+        return tuple(
+            MissionOriginView(
+                galaxy=item.galaxy,
+                system=item.system,
+                position=item.position,
+                fleet_lines=item.fleet_lines,
+                enabled=item.enabled,
+            )
+            for item in self._repository.mission_task_origins(task_id)
+        )
+
+    def replace_mission_origins(
+        self, task_id: int, origins: tuple[MissionOriginView, ...]
+    ) -> tuple[MissionOriginView, ...]:
+        """只允许 bot 设置多 origin，区域攻击不读、不写这张表。"""
+        row = self._row(task_id)
+        if MissionKind(row.kind) is not MissionKind.BOT:
+            raise ServiceError("只有 bot 攻击可以配置多个出发星球")
+        self._refuse_while_running(row, enabled=None, priority=None, params=None)
+        coordinates = [(item.galaxy, item.system, item.position) for item in origins]
+        if len(set(coordinates)) != len(coordinates):
+            raise ServiceError("同一颗出发星球只能配置一次")
+        self._repository.replace_mission_task_origins(
+            task_id,
+            tuple(
+                (
+                    Coordinate(item.galaxy, item.system, item.position),
+                    item.fleet_lines,
+                    item.enabled,
+                )
+                for item in origins
+            ),
+        )
+        return self.mission_origins(task_id)
 
     def create_mission(
         self,

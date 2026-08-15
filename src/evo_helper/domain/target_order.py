@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 from evo_helper.domain.distance import distance_key
 from evo_helper.domain.models import Coordinate
@@ -55,6 +56,8 @@ class ScoredTarget:
 
     coordinate: Coordinate
     military_score: float | None = None
+    #: 军力值读到的时刻；None 表示榜单从未见过，不伪造「新鲜」。
+    military_score_at_utc: datetime | None = None
 
 
 def strongest_first(targets: Iterable[ScoredTarget]) -> list[ScoredTarget]:

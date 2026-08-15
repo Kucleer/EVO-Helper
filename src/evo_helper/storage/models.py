@@ -429,6 +429,29 @@ class MissionTaskRow(Base):
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
+class MissionTaskOriginRow(Base):
+    """军力攻击任务的多颗出发星球。
+
+    单 origin 列不能搬走：区域攻击已经在用它们。新表只给军力攻击加并行来源，
+    为空时调度器才回落到旧列，保证已有任务的含义不变。
+    """
+
+    __tablename__ = "mission_task_origins"
+    __table_args__ = (
+        UniqueConstraint("task_id", "galaxy", "system", "position", name="uq_task_origin"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("mission_tasks.id", ondelete="CASCADE"), index=True
+    )
+    galaxy: Mapped[int] = mapped_column(Integer)
+    system: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+    fleet_lines: Mapped[int] = mapped_column(Integer)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class MissionRunRow(Base):
     """调度器每起一个子进程记一行。"""
 

@@ -8,7 +8,7 @@ bot 要完整坐标，海盗要恒星系。换算集中在这里，纯函数，
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from evo_helper.domain.distance import system_gap
 from evo_helper.domain.models import Coordinate
@@ -126,7 +126,12 @@ def pirate_command(systems: Sequence[tuple[int, int]], *, origin: Coordinate) ->
     )
 
 
-def bot_command(targets: Sequence[Coordinate], *, origin: Coordinate) -> list[str]:
+def bot_command(
+    targets: Sequence[Coordinate],
+    *,
+    origin: Coordinate,
+    presets: Mapping[Coordinate, str] | None = None,
+) -> list[str]:
     """bot 攻击命令行。
 
     同 `pirate_command`：`--attack` 是会真的派遣舰队的开关，必须原样出现在生成的
@@ -144,7 +149,14 @@ def bot_command(targets: Sequence[Coordinate], *, origin: Coordinate) -> list[st
     """
     if not targets:
         raise MissionParamError("该范围内没有已记录的 bot；先跑扫描")
-    listed = [f"{item.galaxy}:{item.system}:{item.position}" for item in targets]
+    # 同坐标把预设写进 argv，使命令台账能如实回放每一发用了哪个标题。
+    # 区域攻击不传映射，runner 仍使用既有 BBB，避免被军力逻辑影响。
+    listed = [
+        f"{item.galaxy}:{item.system}:{item.position}={presets[item]}"
+        if presets is not None and item in presets
+        else f"{item.galaxy}:{item.system}:{item.position}"
+        for item in targets
+    ]
     return _checked(
         [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed]
         + ["--origin", str(origin), "--attack"]

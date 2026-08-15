@@ -72,6 +72,8 @@ from .schemas import (
     FleetEntryOut,
     FleetSnapshotOut,
     FrozenTaskOut,
+    MissionOriginIn,
+    MissionOriginOut,
     MissionTaskCreate,
     MissionTaskOut,
     MissionTaskPatch,
@@ -1102,6 +1104,26 @@ def register_mission_routes(app: FastAPI) -> None:
                 fleet_lines=payload.fleet_lines,
             )
         )
+
+    @app.get("/api/missions/{task_id}/origins", response_model=list[MissionOriginOut])
+    def mission_origins(
+        task_id: int, console: MissionConsoleService = Depends(get_console)
+    ) -> list[MissionOriginOut]:
+        return [MissionOriginOut(**item.__dict__) for item in console.mission_origins(task_id)]
+
+    @app.put("/api/missions/{task_id}/origins", response_model=list[MissionOriginOut])
+    def replace_mission_origins(
+        task_id: int,
+        payload: list[MissionOriginIn],
+        console: MissionConsoleService = Depends(get_console),
+    ) -> list[MissionOriginOut]:
+        from evo_helper.web.service import MissionOriginView
+
+        origins = tuple(MissionOriginView(**item.model_dump()) for item in payload)
+        return [
+            MissionOriginOut(**item.__dict__)
+            for item in console.replace_mission_origins(task_id, origins)
+        ]
 
     @app.delete("/api/missions/{task_id}", status_code=204)
     def delete_mission(

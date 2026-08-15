@@ -1724,6 +1724,39 @@ class SqlAlchemyRepository:
         with self._session_factory() as session:
             return session.get(orm.MissionTaskRow, task_id)
 
+    def mission_task_origins(self, task_id: int) -> list[orm.MissionTaskOriginRow]:
+        """任务配置的额外出发星球；空列表不是异常，而是旧任务的回落信号。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.MissionTaskOriginRow)
+                    .where(orm.MissionTaskOriginRow.task_id == task_id)
+                    .order_by(orm.MissionTaskOriginRow.id)
+                ).all()
+            )
+
+    def replace_mission_task_origins(
+        self, task_id: int, origins: Sequence[tuple[Coordinate, int, bool]]
+    ) -> None:
+        """整组替换多 origin 配置，保证页面保存的是一个原子快照。"""
+        with self._session_factory() as session:
+            _mission_task(session, task_id)
+            session.query(orm.MissionTaskOriginRow).filter_by(task_id=task_id).delete()
+            session.add_all(
+                [
+                    orm.MissionTaskOriginRow(
+                        task_id=task_id,
+                        galaxy=origin.galaxy,
+                        system=origin.system,
+                        position=origin.position,
+                        fleet_lines=fleet_lines,
+                        enabled=enabled,
+                    )
+                    for origin, fleet_lines, enabled in origins
+                ]
+            )
+            session.commit()
+
     def create_mission_task(
         self,
         kind: MissionKind,
