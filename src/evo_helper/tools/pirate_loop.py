@@ -1137,7 +1137,9 @@ class PirateLoop:
         self._driver.wait(DISPATCH_WAIT_S)
         timer.lap("开面板")
 
-        picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
+        picker = PresetPicker(
+            driver=_PresetPickerDriver(self._driver), read_names=self._preset_names
+        )
         try:
             picker.pick(wanted)
         except PresetNotFound as error:
@@ -2785,6 +2787,44 @@ class _PlanetListDriver:
     def drag_vertical(self, x: int, from_y: int, to_y: int, *, label: str = "") -> None:
         del label  # 慢拖是分步的，`HumanInput` 那条带标签的路径走不通。
         slow_drag(self._driver, from_y, to_y, x=x)
+
+    def wait(self, seconds: float) -> None:
+        self._driver.wait(seconds)
+
+
+class _PresetPickerDriver:
+    """预设条专用的分步横拖。
+
+    ``LiveDriver.drag`` 是一步式 ``dragTo``；实机预设条会把它吞掉，始终停在
+    ``AAA / 探路``。这里复用行星列表慢拖的原则，但横向范围只落在预设条的安全
+    区（由 ``PresetPicker`` 的常量守住），不会触及右侧「保存」按钮。
+    """
+
+    def __init__(self, driver: LiveDriver) -> None:
+        self._driver = driver
+
+    def click(self, x: int, y: int, *, label: str = "") -> None:
+        self._driver.click(x, y, label=label)
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
+        del label
+        import random
+
+        self._driver.focus()
+        origin_x, origin_y = self._driver.origin()
+        gui = self._driver._gui  # noqa: SLF001 - 分步拖动需要原始鼠标控制。
+        gui.moveTo(origin_x + from_x, origin_y + from_y, random.uniform(0.2, 0.4))
+        gui.mouseDown()
+        time.sleep(random.uniform(0.10, 0.20))
+        for index in range(1, 13):
+            ratio = index / 12
+            gui.moveTo(
+                origin_x + int(from_x + (to_x - from_x) * ratio),
+                origin_y + from_y + random.randint(-1, 1),
+                random.uniform(0.02, 0.05),
+            )
+        time.sleep(random.uniform(0.12, 0.25))
+        gui.mouseUp()
 
     def wait(self, seconds: float) -> None:
         self._driver.wait(seconds)
