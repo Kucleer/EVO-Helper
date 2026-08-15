@@ -56,6 +56,38 @@ def test_assignment_uses_each_origin_capacity_instead_of_piling_on_nearest() -> 
     assert [item.origin for item in assigned].count(far) == 1
 
 
+def test_assignment_keeps_each_origin_on_its_nearby_targets() -> None:
+    """航线较少不能让 9 系反向抢走 2 系的近目标。"""
+    two = Coordinate(2, 137, 18)
+    nine = Coordinate(9, 250, 8)
+    targets = [
+        ScoredTarget(Coordinate(2, 150, 5), 93_050),
+        ScoredTarget(Coordinate(9, 271, 9), 93_430),
+        ScoredTarget(Coordinate(2, 16, 10), 53_450),
+        ScoredTarget(Coordinate(9, 317, 10), 41_046),
+        ScoredTarget(Coordinate(2, 3, 9), 93_630),
+        ScoredTarget(Coordinate(2, 131, 10), 20_190),
+    ]
+
+    assigned = assign_by_capacity_and_distance(
+        targets,
+        [AttackOrigin(two, 4), AttackOrigin(nine, 2)],
+        fallback_preset="BBB",
+    )
+
+    by_origin = {
+        origin: {item.coordinate for item in assigned if item.origin == origin}
+        for origin in (two, nine)
+    }
+    assert by_origin[two] == {
+        Coordinate(2, 150, 5),
+        Coordinate(2, 16, 10),
+        Coordinate(2, 3, 9),
+        Coordinate(2, 131, 10),
+    }
+    assert by_origin[nine] == {Coordinate(9, 271, 9), Coordinate(9, 317, 10)}
+
+
 def test_assignment_measures_system_distance_round_the_ring() -> None:
     """abs(137 - 499) 会把环形最近的目标误派给另一颗星球。"""
     left = Coordinate(2, 137, 18)

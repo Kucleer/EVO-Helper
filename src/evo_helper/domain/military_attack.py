@@ -69,25 +69,34 @@ def assign_by_capacity_and_distance(
 ) -> tuple[AssignedTarget, ...]:
     """把候选按航线预算分到星球，再在每组内按距离下发。
 
-    小预算先被填满，避免一颗星球的有限航线长期闲着；同一预算下才选距离最近的
-    星球。这是批次最早收尾的近似，而不是把所有最近目标堆到同一颗星球。
+    先在整个候选池中挑离任一可用出发星球最近的 ``(目标, origin)`` 配对；每配一
+    对就消耗那颗星球的一条航线。这样每颗星球优先拿自己附近的目标，而不会因为
+    它的航线数较少，反过来抢走另一颗星球的近目标。
+
+    航线预算仍是硬约束：一颗星球的航线用尽后不再参与配对；只要池中还有目标，
+    每个可用 origin 都会被填满。军力排序只负责形成候选池；池内的取舍以距离为先。
     """
     remaining = {
         origin.coordinate: origin.fleet_lines for origin in origins if origin.fleet_lines > 0
     }
     assigned: list[AssignedTarget] = []
-    for target in targets:
+    pending = list(enumerate(targets))
+    while pending:
         available = [origin for origin in origins if remaining.get(origin.coordinate, 0) > 0]
         if not available:
             break
-        origin = min(
-            available,
+        target_index, target, origin = min(
+            (
+                (target_index, target, origin)
+                for target_index, target in pending
+                for origin in available
+            ),
             key=lambda item: (
-                remaining[item.coordinate],
-                distance_key(target.coordinate, item.coordinate),
-                item.coordinate.galaxy,
-                item.coordinate.system,
-                item.coordinate.position,
+                distance_key(item[1].coordinate, item[2].coordinate),
+                item[0],
+                item[2].coordinate.galaxy,
+                item[2].coordinate.system,
+                item[2].coordinate.position,
             ),
         )
         tier = tier_for(target.military_score, tiers)
@@ -99,6 +108,7 @@ def assign_by_capacity_and_distance(
             )
         )
         remaining[origin.coordinate] -= 1
+        pending = [item for item in pending if item[0] != target_index]
     # runner 每次只能从一颗星球出发；这里排成连续组，不能为每个目标来回切星球。
     return tuple(
         sorted(
