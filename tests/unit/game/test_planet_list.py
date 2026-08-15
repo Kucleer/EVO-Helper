@@ -64,6 +64,21 @@ class _List:
         self.at = min(len(self.screens) - 1, self.at + 1)
 
 
+class _FlakyList(_List):
+    """指定次数把已有行读成空，模拟列表刚展开时的单帧 OCR 失手。"""
+
+    def __init__(self, screens: list[list[tuple[int, str]]], *, blank_times: int) -> None:
+        super().__init__(screens)
+        self._blank_times = blank_times
+
+    def read(self) -> list[tuple[int, str]]:
+        self.reads += 1
+        if self._blank_times > 0:
+            self._blank_times -= 1
+            return []
+        return list(self.screens[self.at])
+
+
 class _Driver:
     def __init__(self, planets: _List) -> None:
         self._planets = planets
@@ -174,6 +189,21 @@ class TestClickingOnlyTheGoToColumn:
 
 
 class TestRefusingToGuess:
+    def test_a_transiently_blank_list_is_read_again_before_giving_up(self) -> None:
+        """空读不是「没有星球」：否则两处出发点都会在预检时被安全跳过。"""
+        planets = _FlakyList([BASELINE], blank_times=2)
+        driver = _Driver(planets)
+        switcher = PlanetSwitcher(
+            driver=driver,  # type: ignore[arg-type]
+            read_rows=planets.read,
+            read_origin=lambda: "2:137:18",
+            say=lambda _message: None,
+        )
+
+        assert switcher.switch_to(HOME) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_1]
+        assert planets.reads >= 4  # 两次空读 + 找到 + 点击前回读
+
     def test_an_unreadable_screen_costs_zero_clicks_in_the_panel(self) -> None:
         """一行都认不出时**一次都不点**。
 

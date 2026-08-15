@@ -59,6 +59,12 @@ from evo_helper.game.pirate_ui import (
     PLANET_SWITCH_WAIT_S,
 )
 
+#: 刚展开/拖动完的列表偶尔会在一帧内 OCR 成空；列表本身不可能没有任何行。
+#: 这与预设条的空读同形：把它直接当成「目标不存在」会让本轮在切换出发星球前
+#: 安全退出，连预设选择都走不到。有限重读能等过动画，又不会卡死在真故障画面上。
+PLANET_LIST_READ_ATTEMPTS = 3
+PLANET_LIST_REREAD_WAIT_S = 0.6
+
 
 class SwitchResult(Enum):
     """一次切换的结局。
@@ -140,13 +146,13 @@ class PlanetSwitcher:
         每一轮都重读两次：第一次找，第二次是点击前的复核。复核对不上就当这一屏
         没有，继续拖——一次 OCR 抖动不该换来一次点击。
         """
-        rows = rows_from_words(self.read_rows())
+        rows = rows_from_words(self._read_rows_confirming())
         previous: Sequence[PlanetRow] | None = None
         for attempt in range(PLANET_LIST_MAX_DRAGS + 1):
             self.screens.append([row.text for row in rows])
             hit = find_row(rows, target)
             if hit is not None:
-                again = find_row(rows_from_words(self.read_rows()), target)
+                again = find_row(rows_from_words(self._read_rows_confirming()), target)
                 if again is not None and again.name_row_y == hit.name_row_y:
                     return again
                 self.say("  点击前复核对不上（这一行动了或者没读出来）；不点，接着拖")
@@ -157,8 +163,17 @@ class PlanetSwitcher:
             previous = rows
             if not self._drag_once(rows):
                 return None
-            rows = rows_from_words(self.read_rows())
+            rows = rows_from_words(self._read_rows_confirming())
         return None
+
+    def _read_rows_confirming(self) -> Sequence[tuple[int, str]]:
+        """空行不是列表为空的证据，重读几帧再交给定位逻辑。"""
+        for _attempt in range(PLANET_LIST_READ_ATTEMPTS):
+            words = self.read_rows()
+            if words:
+                return words
+            self.driver.wait(PLANET_LIST_REREAD_WAIT_S)
+        return ()
 
     def _drag_once(self, rows: Sequence[PlanetRow]) -> bool:
         """按住**这一屏最下面那一行的名字高度**往上拖一段；拖不动就返回 False。
