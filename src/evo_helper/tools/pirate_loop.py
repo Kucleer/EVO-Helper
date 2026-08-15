@@ -2424,6 +2424,13 @@ class PirateLoop:
         if not switch_needed(target, self._current_planet):
             return True
         say(f"出发星球：切到 {target}")
+        # ``NAV_PLANET`` 是**地表**底栏的「行星」按钮；在恒星系视图同一个
+        # 像素是别的入口，点下去不会出现坐标列表，OCR 只能安全地读成空。读完
+        # 邮箱后流程刻意回到恒星系视图，因此这里必须先回地表，再打开列表。
+        if not self._goto_planet_surface():
+            self._outcome.busy = "切出发星球前回不到星球地表"
+            say(f"  {self._outcome.busy}；这一轮一发都不派")
+            return False
         result = self.planet_switcher().switch_to(target)
         if result is not SwitchResult.SWITCHED:
             self._outcome.busy = f"切不到出发星球 {target}（{result.value}）"

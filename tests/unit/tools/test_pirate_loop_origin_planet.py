@@ -71,6 +71,7 @@ def _loop(
     loop._reset_to_known_screen = lambda: None
     loop._ensure_session = lambda **_k: False
     loop._require_system_view = lambda _what: None
+    loop._goto_planet_surface = lambda: True
     loop.planet_switcher = lambda **_k: switcher
     loop.reconcile_today = lambda: swept.append("开工那一趟信箱")
     loop._sweep = lambda: swept.append("扫目标")
@@ -110,6 +111,31 @@ class TestSwitchingOncePerRound:
         loop.run()
 
         assert order == ["信箱", "切星球", "扫目标"]
+
+    def test_switching_first_returns_to_planet_surface_for_the_planet_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """恒星系底栏同一像素不是「行星」；必须先回地表。"""
+        loop, switcher, order = _loop(monkeypatch)
+        loop._goto_planet_surface = lambda: (order.append("回地表"), True)[1]
+        switcher.switch_to = lambda target: (  # type: ignore[method-assign]
+            order.append("切星球"),
+            switcher.asked.append(target),
+            SwitchResult.SWITCHED,
+        )[-1]
+
+        assert loop.ensure_origin_planet() is True
+        assert order == ["回地表", "切星球"]
+
+    def test_refuses_to_open_the_planet_list_when_the_surface_cannot_be_reached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loop, switcher, _order = _loop(monkeypatch)
+        loop._goto_planet_surface = lambda: False
+
+        assert loop.ensure_origin_planet() is False
+        assert switcher.asked == []
+        assert loop._outcome.busy == "切出发星球前回不到星球地表"
 
     def test_several_targets_still_cost_exactly_one_switch(
         self, monkeypatch: pytest.MonkeyPatch
