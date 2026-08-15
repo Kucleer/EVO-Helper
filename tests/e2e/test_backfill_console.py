@@ -89,6 +89,23 @@ def test_the_page_has_a_manual_backfill_control(client: TestClient) -> None:
     assert 'id="backfill-since"' in html
 
 
+def test_scheduler_and_backfill_share_one_compact_row(client: TestClient) -> None:
+    """首屏优先留给任务表；两块控制入口并排，而说明收进提示图标。"""
+    html = client.get("/missions").text
+
+    assert '<div class="mission-control-grid">' in html
+    assert html.count('class="tip-icon"') >= 2
+
+
+def test_military_controls_are_rendered_in_their_table_columns(client: TestClient) -> None:
+    """军力模式属于任务本身，多出发点属于出发星球/航线，不能再塞进参数格。"""
+    body = _page_body(client.get("/missions").text)
+
+    assert "taskCell.append(modeLabel)" in body
+    assert "originCell.append(militaryOrigins)" in body
+    assert "settings.className = 'military-settings'" in body
+
+
 def test_both_chains_are_offered(client: TestClient) -> None:
     """两条链路的信箱主题不同，一趟只读得了一种——少一个选项就等于那条链路
     在页面上补不了。

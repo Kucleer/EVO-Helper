@@ -222,6 +222,32 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 
 .panel.compact { padding: 10px 12px; }
 
+/* 调度器与手动补录都是控制入口，放在同一行可把首屏高度还给任务表。
+   两格固定均分；窄屏时自然折为一列，避免把日期和按钮挤得无法操作。 */
+.mission-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mission-control-grid > :only-child { grid-column: 1 / -1; }
+
+.tip-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: help;
+  user-select: none;
+}
+
+.tip-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .visually-hidden {
   position: absolute;
   width: 1px; height: 1px;
@@ -326,6 +352,12 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
 #mission-rows tr[draggable="true"] { cursor: grab; }
 #mission-rows tr[draggable="true"]:active { cursor: grabbing; }
 
+.military-mode-toggle {
+  display: inline-block;
+  margin-top: 5px;
+  margin-bottom: 0;
+}
+
 .drag-handle { color: var(--text-faint); font-size: 15px; user-select: none; }
 
 /* ---- history dialog -------------------------------------------------- */
@@ -379,4 +411,8 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
   .sidenav .brand, .sidenav .group-label { display: none; }
   .sidenav a { border-left: none; border-bottom: 2px solid transparent; }
   .sidenav a[aria-current="page"] { border-bottom-color: var(--accent); }
+}
+
+@media (max-width: 860px) {
+  .mission-control-grid { grid-template-columns: 1fr; }
 }
