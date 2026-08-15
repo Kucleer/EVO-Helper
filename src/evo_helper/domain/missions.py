@@ -163,6 +163,25 @@ def bot_command(
     )
 
 
+def bot_reconcile_command() -> list[str]:
+    """只回收已到期的 bot 攻击战报，不切星球、更不派舰队。
+
+    调度器只有在 `ReportWaitPlanner` 判定报告到期时才起这条命令。把收信和
+    攻击续跑拆开，既能让 `AWAITING_ATTACK_REPORT` 推进，也不会在每次航线释放
+    后反复翻信箱。
+    """
+    return _checked(
+        [
+            _PYTHON,
+            "-u",
+            "-m",
+            "evo_helper.tools.bot_loop",
+            "--reconcile",
+            "--reconcile-only",
+        ]
+    )
+
+
 def _checked(command: list[str]) -> list[str]:
     # 用「每段长度 + 1 个分隔空格」估算，不用 subprocess.list2cmdline 的真实
     # 转义长度：前者恒比后者略大（偏保守，宁可提前拒绝），且 30000 到

@@ -14,6 +14,7 @@ from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
     bot_command,
+    bot_reconcile_command,
     bot_targets_in_range,
     pirate_command,
     pirate_systems,
@@ -156,6 +157,15 @@ def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
         "2:137:18",
         "--attack",
     ]
+
+
+def test_bot_report_reconciliation_has_no_targets_or_attack_capability() -> None:
+    """到期战报回收不能顺手变成一轮攻击。"""
+    command = bot_reconcile_command()
+
+    assert command[-2:] == ["--reconcile", "--reconcile-only"]
+    assert "--targets" not in command
+    assert "--attack" not in command
 
 
 def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:

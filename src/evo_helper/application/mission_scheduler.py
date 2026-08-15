@@ -63,6 +63,7 @@ from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
     bot_command,
+    bot_reconcile_command,
     bot_targets_in_range,
     pirate_command,
     pirate_systems,
@@ -594,7 +595,7 @@ class MissionScheduler:
         if not self._backfill.pending:
             return
         running = self._supervisor.running
-        if running is not None and running.kind is not MissionKind.SCAN:
+        if running is not None and not fills_gaps(running.kind):
             return
         before = self._measure_backfill()
         with self._lock:
@@ -602,7 +603,7 @@ class MissionScheduler:
                 return
             running = self._supervisor.running
             if running is not None:
-                if running.kind is not MissionKind.SCAN:
+                if not fills_gaps(running.kind):
                     return
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             self._backfill.launch_if_pending(before)
@@ -727,9 +728,9 @@ class MissionScheduler:
         )
         if decision.action is Action.IDLE or decision.task is None:
             return False
-        return self._act(decision)
+        return self._act(decision, reports_due=facts.of(decision.task).reports_due)
 
-    def _act(self, decision: Decision) -> bool:
+    def _act(self, decision: Decision, *, reports_due: bool) -> bool:
         """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
 
         上面那段读事实是在锁外跑的，因此进锁之后必须重新问两个问题——它们正是
@@ -765,15 +766,15 @@ class MissionScheduler:
                 return False
             running = self._supervisor.running
             if decision.action is Action.PREEMPT:
-                if running is None or running.kind is not MissionKind.SCAN:
+                if running is None or not fills_gaps(running.kind):
                     return False
-                # 只有扫描会被抢占（判据保证），它的游标持久化，随时可断。
+                # 填空隙任务都可被攻击抢占：扫描有持久化游标，军力榜逐屏落库。
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             elif running is not None:
                 return False
-            return not self._launch(decision.task)
+            return not self._launch(decision.task, reports_due=reports_due)
 
-    def _launch(self, task: TaskSnapshot) -> bool:
+    def _launch(self, task: TaskSnapshot, *, reports_due: bool = False) -> bool:
         """组命令行、起进程、记账。参数不合格则停用该任务并返回 False。
 
         调用方必须已经持有 `_lock`：这里会真的拉起一个去点鼠标的子进程。
@@ -789,7 +790,9 @@ class MissionScheduler:
             return False
         try:
             command = (
-                self._military_command(row)
+                bot_reconcile_command()
+                if task.kind is MissionKind.BOT and reports_due
+                else self._military_command(row)
                 if task.kind is MissionKind.BOT and _bot_by_military(row.params_json)
                 else self._command_for(task.kind, row.params_json, task.origin)
             )

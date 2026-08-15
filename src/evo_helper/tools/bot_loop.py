@@ -96,6 +96,7 @@ from evo_helper.tools.pirate_loop import (
 # `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
 # `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
 from evo_helper.tools.scan_coordinates import (
+    GameWindowNotForeground,
     LiveDriver,
     make_console_encoding_safe,
     make_ocr,
@@ -123,6 +124,8 @@ class BotOptions:
     #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
     #: 航线返航后的续跑反复打开信箱。
     reconcile_on_start: bool = False
+    #: 仅回收已到期战报；调度器用它避免攻击续跑时反复读信箱。
+    reconcile_only: bool = False
 
 
 class BotLoop(PirateLoop):
@@ -160,6 +163,7 @@ class BotLoop(PirateLoop):
                 preset=BOT_ATTACK_PRESET,
                 origin=options.origin,
                 reconcile_on_start=options.reconcile_on_start,
+                reconcile_only=options.reconcile_only,
             ),
         )
         self._bot = options
@@ -420,7 +424,7 @@ def parse_target_assignment(text: str) -> tuple[Coordinate, str | None]:
 def main(argv: list[str] | None = None) -> int:
     make_console_encoding_safe()  # 必须在 parse_args 之前，理由见那个函数
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
+    parser.add_argument("--targets", nargs="*", type=parse_target_assignment, default=())
     parser.add_argument(
         "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
     )
@@ -441,7 +445,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
     )
+    parser.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help="只回收战报，不切出发星球、不扫描目标、更不派舰队",
+    )
     args = parser.parse_args(argv)
+    if args.reconcile_only and not args.reconcile:
+        parser.error("--reconcile-only 必须与 --reconcile 一起使用")
+    if not args.targets and not args.reconcile_only:
+        parser.error("--targets 至少要给一个目标；仅回收战报请传 --reconcile-only")
 
     import ctypes
 
@@ -454,8 +467,9 @@ def main(argv: list[str] | None = None) -> int:
         origin=args.origin,
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
         reconcile_on_start=args.reconcile,
+        reconcile_only=args.reconcile_only,
     )
-    mode = "真打" if args.attack else "只认目标"
+    mode = "仅回收战报" if args.reconcile_only else ("真打" if args.attack else "只认目标")
     listed = ", ".join(
         f"{target}={(options.presets or {}).get(target, BOT_ATTACK_PRESET)}"
         for target in options.targets
@@ -464,7 +478,13 @@ def main(argv: list[str] | None = None) -> int:
 
     driver = LiveDriver(allow_actions=args.attack)
     driver.window()
-    outcome = BotLoop(driver, make_ocr(), options).run()
+    try:
+        outcome = BotLoop(driver, make_ocr(), options).run()
+    except GameWindowNotForeground as exc:
+        from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
+
+        say(f"{exc}；本轮跳过，等下一轮")
+        return EXIT_ENVIRONMENT_BUSY
     say(
         f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
         f"拦下 {len(outcome.refused)} 次"

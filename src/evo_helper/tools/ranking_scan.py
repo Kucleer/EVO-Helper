@@ -39,7 +39,7 @@ from evo_helper.game.ranking_ui import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.tools.scan_coordinates import LiveDriver, SlowDragDriver
+from evo_helper.tools.scan_coordinates import GameWindowNotForeground, LiveDriver, SlowDragDriver
 
 
 @dataclass(frozen=True)
@@ -230,7 +230,11 @@ def scan(
     ocr = pytesseract
     release_stuck_mouse(driver)
     if not ensure_in_game(driver, ocr):
-        return 1
+        # START / 登录页暂时没能回到游戏内时，不应让填空隙任务连续三次自停。
+        # 下一个调度周期会再走 SessionKeeper 的判据驱动入口序列。
+        from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
+
+        return EXIT_ENVIRONMENT_BUSY
 
     player_name = Settings().player_name
 
@@ -446,13 +450,19 @@ def main(argv: list[str] | None = None) -> int:
     def pair(raw: list[int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
         return (raw[0], raw[1]) if raw else fallback
 
-    return scan(
-        RankingColumns(
-            rank=pair(args.rank_column, default.rank),
-            name=pair(args.name_column, default.name),
-            score=pair(args.score_column, default.score),
+    try:
+        return scan(
+            RankingColumns(
+                rank=pair(args.rank_column, default.rank),
+                name=pair(args.name_column, default.name),
+                score=pair(args.score_column, default.score),
+            )
         )
-    )
+    except GameWindowNotForeground as exc:
+        from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
+
+        print(f"{exc}；本轮跳过，等下一轮")
+        return EXIT_ENVIRONMENT_BUSY
 
 
 def _rank_of(text: str) -> int | None:

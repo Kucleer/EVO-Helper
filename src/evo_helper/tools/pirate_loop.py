@@ -83,7 +83,13 @@ from evo_helper.game.system_navigator import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin, say
+from evo_helper.tools.scan_coordinates import (
+    GameWindowNotForeground,
+    LiveDriver,
+    make_ocr,
+    origin,
+    say,
+)
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
 # 所以可以在模块顶层导入；真正带可选依赖的 `vision.optional.*` 仍旧惰性导入。
@@ -637,6 +643,8 @@ class LoopOptions:
     #: 翻战报。需要启动对账时由控制台的「启动战报补录」显式做一次；手工运行
     #: 则传 ``--reconcile``。
     reconcile_on_start: bool = False
+    #: 只做开工前的信箱对账。用于到期战报的受控回收，绝不切出发星球或扫目标。
+    reconcile_only: bool = False
 
 
 @dataclass
@@ -2484,6 +2492,8 @@ class PirateLoop:
             # 对账由控制台统一安排一次；runner 只在手工显式请求时才读。
             if self._options.reconcile_on_start:
                 self.reconcile_today()
+            if self._options.reconcile_only:
+                return self._outcome
             if not self.ensure_origin_planet():
                 # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
                 # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
@@ -2980,7 +2990,11 @@ def main(argv: list[str] | None = None) -> int:
     driver = LiveDriver(allow_actions=args.scout or args.attack)
     driver.window()
     loop = PirateLoop(driver, make_ocr(), options)
-    outcome = loop.run()
+    try:
+        outcome = loop.run()
+    except GameWindowNotForeground as exc:
+        say(f"{exc}；本轮跳过，等下一轮")
+        return EXIT_ENVIRONMENT_BUSY
 
     say(
         f"完成：海盗 {len(outcome.pirates)} 个，侦察 {len(outcome.scouted)} 发，"

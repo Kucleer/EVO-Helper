@@ -72,6 +72,10 @@ GAP_LOG = Path("var/logs/scan-gaps.txt")
 ONE_BOT_PER_SYSTEM = True
 
 
+class GameWindowNotForeground(RuntimeError):
+    """游戏窗口暂时抢不到前台；这一轮应冷却重试，而不是记成扫描故障。"""
+
+
 def origin() -> Coordinate:
     """出发星球。默认值在 `domain.missions.ORIGIN`，换账号用 `EVO_HELPER_ORIGIN` 覆盖。
 
@@ -429,7 +433,7 @@ class LiveDriver:
             self._raise_to_front(handle)
             time.sleep(0.3 * (attempt + 1))
         if win32gui.GetForegroundWindow() != handle:
-            raise RuntimeError(
+            raise GameWindowNotForeground(
                 "游戏窗口抢不到前台（多半是用户正在用别的窗口）；停止而不是把点击打到别人窗口上"
             )
 
@@ -1164,14 +1168,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.status:
         return show_status()
-    return run_scan(
-        limit=args.limit,
-        debug_dir=args.debug_dir,
-        skip_scanned=not args.no_skip_scanned,
-        rescan_missing=args.rescan_missing,
-        recheck_suspicious=args.recheck_suspicious,
-        one_bot_per_system=not args.scan_full_systems,
-    )
+    try:
+        return run_scan(
+            limit=args.limit,
+            debug_dir=args.debug_dir,
+            skip_scanned=not args.no_skip_scanned,
+            rescan_missing=args.rescan_missing,
+            recheck_suspicious=args.recheck_suspicious,
+            one_bot_per_system=not args.scan_full_systems,
+        )
+    except GameWindowNotForeground as exc:
+        # 抢不到前台时绝不往别的窗口点；75 会让调度器冷却重试，且不累计三次故障。
+        from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
+
+        say(f"{exc}；本轮跳过，等下一轮")
+        return EXIT_ENVIRONMENT_BUSY
 
 
 if __name__ == "__main__":  # pragma: no cover

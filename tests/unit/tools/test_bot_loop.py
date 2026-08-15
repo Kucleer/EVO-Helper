@@ -56,6 +56,7 @@ def _run_with_phases(
     phases: dict[Coordinate, BotPhase],
     *,
     reconcile_on_start: bool = False,
+    reconcile_only: bool = False,
 ) -> list[str]:
     """跑一趟 `run()`，返回这一趟按顺序调了哪些动作。"""
     from evo_helper.game import game_window
@@ -66,13 +67,17 @@ def _run_with_phases(
     calls: list[str] = []
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(
-        targets=tuple(phases), attack=True, reconcile_on_start=reconcile_on_start
+        targets=tuple(phases),
+        attack=True,
+        reconcile_on_start=reconcile_on_start,
+        reconcile_only=reconcile_only,
     )
     loop._options = LoopOptions(
         systems=(),
         scout=False,
         attack=True,
         reconcile_on_start=reconcile_on_start,
+        reconcile_only=reconcile_only,
     )
     loop._outcome = Outcome()
     loop._navigator = _FakeNavigator()
@@ -152,6 +157,20 @@ def test_reports_are_read_only_when_explicitly_requested_before_the_phases_are_d
 
     assert calls == ["开工那一趟信箱", "说还在等战报", "打一发"]
     assert calls.count("开工那一趟信箱") == 1
+
+
+def test_reconcile_only_does_not_switch_planet_or_walk_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """到期战报回收只能读信箱，不能占用舰队派遣流程。"""
+    calls = _run_with_phases(
+        monkeypatch,
+        {TARGET: BotPhase.NEEDS_ATTACK},
+        reconcile_on_start=True,
+        reconcile_only=True,
+    )
+
+    assert calls == ["开工那一趟信箱"]
 
 
 def test_a_draw_only_costs_one_extra_shot_per_sweep(monkeypatch: pytest.MonkeyPatch) -> None:

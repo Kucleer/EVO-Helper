@@ -547,6 +547,35 @@ def test_an_old_unknown_flight_still_counts_as_work_until_max_age(  # type: igno
     assert launcher.kinds == [MissionKind.PIRATE]
 
 
+def test_a_due_bot_report_launches_a_reconcile_only_runner(  # type: ignore[no-untyped-def]
+    repository, launcher, clock, run_id, session_factory
+) -> None:
+    """没有可派目标时也必须能回收攻击战报，不能误停用 bot 任务。"""
+    target = Coordinate(2, 150, 3)
+    add_bot_target(session_factory, target)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=target,
+        dispatched_at=NOW - timedelta(hours=2),
+        preset_name=BOT_ATTACK_PRESET,
+    )
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    only_gap_filler(repository)
+    scheduler.start()
+
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert launcher.kinds == [MissionKind.BOT]
+    assert command[-2:] == ["--reconcile", "--reconcile-only"]
+    assert "--targets" not in command
+    assert task(repository, MissionKind.BOT).disabled_reason is None
+
+
 def test_a_dispatch_past_its_grace_period_stops_counting_as_work(  # type: ignore[no-untyped-def]
     repository, launcher, clock, run_id, session_factory
 ) -> None:
