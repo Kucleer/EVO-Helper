@@ -346,8 +346,15 @@ PANEL_TITLE_ROI = (890, 55, 1040, 95)
 MAIL_LIST_TITLE = "邮箱"
 MAIL_DETAIL_TITLE = "消息"
 
-#: 信箱与详情页左上角的返回/关闭键（同一个位置，语义随页面变）。
+#: 报告详情页左上角的返回键。
 MAIL_BACK = (750, 71)
+
+#: 邮箱**列表**左上角的 X。对账结束后必须点它离开列表；否则列表浮层会盖住
+#: 后续的行星列表，出发星球坐标列就只能 OCR 成空，攻击不会进入预设选择。
+#:
+#: 坐标目前与报告详情页的返回键相同，但语义不能共用：详情页点它是「返回列表」，
+#: 列表点它才是「关闭信箱」。分开命名能让收尾测试守住用户指定的这个动作。
+MAIL_LIST_CLOSE = (750, 71)
 
 #: 一趟信箱最多重进几次。
 #:
@@ -2186,17 +2193,17 @@ class PirateLoop:
         self._require_system_view("派出之后切不回恒星系视图")
 
     def _close_mail(self) -> None:
-        """回到恒星系视图。信箱是浮层，关掉之后还在自己星球的地表视图上。
+        """点邮箱列表左上角 X，再回到恒星系视图。
 
         ⚠️ 这里同样不再显式清导航缓存：进信箱要先切到地表视图，而
         `_goto_planet_surface` 与回来时的 `ensure_system_view` **换过视图就已经清了**。
         再补一次是空动作，理由见 `_leave_dispatch_list`。
         """
-        self._driver.click(*MAIL_BACK, label="关闭信箱")
+        self._driver.click(*MAIL_LIST_CLOSE, label="关闭邮箱列表（左上角X）")
         self._driver.wait(2.0)
         if self._on_mail_list():
             # 还在列表上说明刚才那一下退的是详情页，再退一层才关掉信箱。
-            self._driver.click(*MAIL_BACK, label="关闭信箱")
+            self._driver.click(*MAIL_LIST_CLOSE, label="关闭邮箱列表（左上角X）")
             self._driver.wait(2.0)
         self._require_system_view("读完邮件切不回恒星系视图")
 
