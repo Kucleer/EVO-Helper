@@ -242,13 +242,16 @@ def test_coordinate_words_turns_an_ocr_timeout_into_a_safe_empty_read() -> None:
         def image_to_data(*_args: object, **_kwargs: object) -> object:
             raise RuntimeError("Tesseract process timeout")
 
-    assert coordinate_words(
-        Image.new("RGB", (1920, 1080)),
-        _TimedOutOcr(),
-        upscale=2,
-        resample="lanczos",
-        whitelist="0123456789:",
-    ) == []
+    assert (
+        coordinate_words(
+            Image.new("RGB", (1920, 1080)),
+            _TimedOutOcr(),
+            upscale=2,
+            resample="lanczos",
+            whitelist="0123456789:",
+        )
+        == []
+    )
 
 
 class TestDraggingThroughTheList:

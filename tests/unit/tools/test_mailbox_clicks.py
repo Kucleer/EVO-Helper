@@ -76,6 +76,7 @@ def test_the_report_tab_is_actually_used() -> None:
 
 def test_reconciliation_closes_the_mail_list_with_its_top_left_x() -> None:
     """对账收尾必须退出列表，否则下一步打开行星列表会被旧浮层遮住。"""
+
     class Driver:
         def __init__(self) -> None:
             self.clicks: list[tuple[int, int, str]] = []
