@@ -166,10 +166,10 @@ def bot_command(
         else f"{item.galaxy}:{item.system}:{item.position}"
         for item in targets
     ]
-    command = (
-        [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed]
-        + ["--origin", str(origin)]
-    )
+    command = [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed] + [
+        "--origin",
+        str(origin),
+    ]
     if max_dispatches is not None:
         if max_dispatches < 1:
             raise MissionParamError("空闲航线不足，暂不启动 bot 攻击")

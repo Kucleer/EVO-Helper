@@ -159,8 +159,4 @@ def _global_galaxy_order(
     ordered = [galaxy for galaxy, _first, _last in segments]
     ordered.extend(galaxy_order)
     ordered.extend(range(1, total_galaxies + 1))
-    return tuple(
-        galaxy
-        for galaxy in dict.fromkeys(ordered)
-        if 1 <= galaxy <= total_galaxies
-    )
+    return tuple(galaxy for galaxy in dict.fromkeys(ordered) if 1 <= galaxy <= total_galaxies)

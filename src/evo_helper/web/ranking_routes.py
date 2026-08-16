@@ -8,7 +8,12 @@ from fastapi import APIRouter, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.ranking import PIRATE_POSITIONS, RankingRow, coordinate_of, is_bot_coordinate
+from evo_helper.domain.ranking import RankingRow, coordinate_of, is_bot_coordinate
+
+# 故意不从 `domain.ranking` 取 `PIRATE_POSITIONS`：那边只是为了自己用而转手 import，
+# 没有再导出，strict mypy 的 `no_implicit_reexport` 会拒绝。直接从定义它的模块取。
+# 同一条成例写在 `domain/missions.py` 的 import 段里。
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.storage.military_rankings import MilitaryRankingRepository
 
 

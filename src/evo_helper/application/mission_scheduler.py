@@ -852,9 +852,7 @@ class MissionScheduler:
             log_path=str(child.log_path),
         )
         if task.kind is MissionKind.RANKING:
-            self._military_ranking_batch_task_id = (
-                None if batch_task is None else batch_task.id
-            )
+            self._military_ranking_batch_task_id = None if batch_task is None else batch_task.id
         elif task.kind is MissionKind.BOT and task.task_id == self._military_ranking_batch_task_id:
             # 这一批已经真正交给带 --attack 的 runner，后续排程恢复常规优先级。
             self._military_ranking_batch_task_id = None

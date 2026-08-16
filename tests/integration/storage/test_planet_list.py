@@ -83,9 +83,7 @@ def test_pirate_positions_are_excluded_from_every_planet_list_count(service) -> 
 
 
 def test_owner_search_matches_bot_and_owner_names_case_insensitively(service) -> None:
-    bots = service.list_planets(
-        galaxy=None, kind="all", owner_query="BOT_2_", offset=0, limit=50
-    )
+    bots = service.list_planets(galaxy=None, kind="all", owner_query="BOT_2_", offset=0, limit=50)
     owned = service.list_planets(
         galaxy=None, kind="all", owner_query="lilgriffith", offset=0, limit=50
     )

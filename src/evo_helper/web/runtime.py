@@ -32,9 +32,7 @@ def create_runtime_app(
     # 旧版把每个 `bot_<g>_<s>_<position>` 都纳入候选；固定海盗位 1--4
     # 因而被错误固化。保留原始扫描/榜单记录，只撤销派遣候选资格。
     SqlAlchemyRepository(session_factory).clear_pirate_position_bot_candidates()
-    app = create_persistent_app(
-        session_factory, settings=actual_settings, local_token=local_token
-    )
+    app = create_persistent_app(session_factory, settings=actual_settings, local_token=local_token)
     app.state.database_engine = engine
     return app
 
