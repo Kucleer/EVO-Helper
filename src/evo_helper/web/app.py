@@ -615,6 +615,12 @@ def create_app(
             },
         )
 
+    @app.get("/rankings", response_class=HTMLResponse)
+    async def rankings_page(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request=request, name="rankings.html", context={"active": "rankings"}
+        )
+
     @app.get("/planets", response_class=HTMLResponse)
     async def planets_page(
         request: Request,
@@ -1195,6 +1201,7 @@ def create_persistent_app(
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
+    from .ranking_routes import register_ranking_routes
 
     # 主星在这里从 Settings 解析、往下注入：`domain` 不许 import `config`，
     # 所以 `domain.missions.ORIGIN` 只是默认值，真正的取值由这个组装点决定。
@@ -1242,6 +1249,7 @@ def create_persistent_app(
     # Intel search reads fleet snapshots straight from SQL, so it takes the
     # session factory rather than going through the application service.
     register_intel_routes(app, session_factory)
+    register_ranking_routes(app, session_factory)
     return app
 
 
