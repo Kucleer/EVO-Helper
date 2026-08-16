@@ -445,10 +445,63 @@ def suspicious_names(session_factory: Any) -> list[Coordinate]:
     return [Coordinate(row[0], row[1], row[2]) for row in rows if looks_like_mangled_bot(row[3])]
 
 
+#: 识别中文要用的语言包。缺了它整条链路会**安静地**跑一整夜。
+CHINESE_LANGUAGE = "chi_sim"
+
+
+def installed_ocr_languages(executable: Path) -> frozenset[str]:
+    """问 Tesseract 装了哪些语言包。问不出来就返回空集，由调用方决定怎么办。"""
+    import subprocess
+
+    try:
+        completed = subprocess.run(  # noqa: S603 - 路径来自本机配置，不是外部输入
+            [str(executable), "--list-langs"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    # 第一行是「List of available languages ...」，之后每行一个语言名。
+    lines = (completed.stdout or completed.stderr or "").splitlines()
+    return frozenset(line.strip() for line in lines[1:] if line.strip())
+
+
+def require_chinese_ocr() -> None:
+    """没装中文语言包就**当场停下**，不要带着这个残疾开工。
+
+    ⚠️ **2026-08-17 实机：这一条缺席，代价是一整夜。** 另一台机器的 Tesseract 只装了
+    `eng` / `osd`，于是画面上每一处中文都读成拉丁噪声：
+
+        导航条「行星 舰队 太空舱 商店 联盟」  →  '72 MB = oKSAtC(itéiaG EA'
+        入口页「进入」                        →  ''
+
+    而 `IN_GAME_MARKERS` 全是中文，于是**永远判不出「在游戏里」**，每一轮都一路掉到
+    最后去试 START、判 `unrecognised screen`、关窗重开 Chrome、再认不出——如此循环
+    一小时，环境故障计数打到 6/6 上限，而**全程没有任何一条日志说得出原因**。
+
+    判据的分辨力就在这里：英文那几屏它读得像模像样（`'member hitting you did I ?'`），
+    中文全是噪声——两者一对比就知道是语言包，不是坐标、不是窗口、不是掉线。
+
+    所以宁可开工即停：一条明确的错误好过一夜看不出所以然的空转。
+    """
+    executable = tesseract_path()
+    languages = installed_ocr_languages(executable)
+    if not languages or CHINESE_LANGUAGE in languages:
+        # 问不出来时放行：`--list-langs` 的输出格式不是契约，认不出就别拦路。
+        return
+    message = (
+        f"Tesseract 没装中文语言包（{CHINESE_LANGUAGE}）：{executable} 只有 "
+        f"{'/'.join(sorted(languages))}。画面上每一处中文都会读成噪声，"
+        f"链路会认不出「在游戏里」而空转。把 {CHINESE_LANGUAGE}.traineddata "
+        f"放进 tessdata 目录后重试。"
+    )
+    record_system_log("ERROR", "tools.scan_coordinates", message)
+    raise RuntimeError(message)
+
+
 def make_ocr() -> Any:
     import pytesseract
     from PIL import Image
 
+    require_chinese_ocr()
     pytesseract.pytesseract.tesseract_cmd = str(tesseract_path())
 
     filters = {"lanczos": Image.Resampling.LANCZOS, "nearest": Image.Resampling.NEAREST}
@@ -817,6 +870,87 @@ OBSERVE_FRAMES = 4
 #: 两帧之间隔多久。取 0.9s 是为了不和动画同频——固定短间隔有可能每次都踩在同一相位上。
 OBSERVE_FRAME_GAP_S = 0.9
 
+#: 认不出画面时，隔多久才肯再记一次**带图的**证据。
+#:
+#: ⚠️ **限流不是省空间，是防刷爆。** 2026-08-17 00:17--00:19 实机：认不出的状态
+#: 持续了一个多小时，光那两分钟就打了 25 条「START 三个配方都读不出来」——每 2 秒
+#: 一条。同样的频率往库里写缩略图，一小时就是上千张。
+#:
+#: 取 120s：runner 每轮存活通常只有几秒到几分钟，所以实际效果是**一轮最多一张**，
+#: 既够诊断又不会堆积。
+UNRECOGNISED_EVIDENCE_INTERVAL_S = 120.0
+
+#: 缩略图宽度。480 px 够看清「这是哪一屏、导航条在不在、浮层盖住了没有」，
+#: 一张 PNG 几十 KB，base64 之后仍在 `payload_json` 扛得住的量级。
+#: 原图 1920 宽存进库一张就近 2 MB，不合适。
+EVIDENCE_THUMBNAIL_WIDTH = 480
+
+#: 上一次记证据的时刻（`time.monotonic`）。进程级，重启即清零——这正好，
+#: 每一轮 runner 都值得留一张。
+_last_evidence_at: float | None = None
+
+
+def _thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
+    """整帧缩到 `width` 宽的 PNG，base64。失败返回空串——证据不许把链路弄死。"""
+    import base64
+    import io
+
+    try:
+        scaled = image
+        if image.width > width:
+            height = max(1, round(image.height * width / image.width))
+            scaled = image.resize((width, height))
+        buffer = io.BytesIO()
+        scaled.convert("RGB").save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001 - 见 docstring：诊断路径不许抛
+        return ""
+
+
+def record_unrecognised_screen(
+    image: Any, *, nav_text: str, entry_text: str, now: Callable[[], float] = time.monotonic
+) -> bool:
+    """把「这一屏认不出」的证据**连图一起**写进 `system_log`。返回是否真的写了。
+
+    ⚠️ **2026-08-17 的教训：只记结论不记证据，等于没记。** 那一夜日志里翻来覆去
+    只有一句 `unrecognised screen`，而真正的答案（导航条读到的是拉丁噪声 →
+    中文语言包没装）一个字都没留下。查了一个多小时，靠的是人肉在另一台机器上
+    手工跑探针把 OCR 读数打出来。
+
+    所以这里记三样，缺一不可：
+
+    - **画面尺寸**：一眼排除窗口没最大化 / 缩放不对 / 抓错窗口。
+    - **导航条与入口标题的 OCR 原文**：中文读成拉丁字母，就是语言包问题；
+      读成空，才是 ROI 落偏或者被浮层盖住。这两种的善后完全不同。
+    - **一张缩略图**：跨机排障时对方传图不方便（用户口径 2026-08-17），
+      图进库我这边直接查得到。
+
+    图存进 `payload_json` 而不是 `artifacts` 表：后者存的是**路径**，而路径只在
+    出事那台机器上有意义，跨机排障时等于没有。
+    """
+    global _last_evidence_at
+    moment = now()
+    if (
+        _last_evidence_at is not None
+        and moment - _last_evidence_at < UNRECOGNISED_EVIDENCE_INTERVAL_S
+    ):
+        return False
+    _last_evidence_at = moment
+    size = getattr(image, "size", None)
+    record_system_log(
+        "WARNING",
+        "tools.scan_coordinates",
+        f"画面认不出：尺寸 {size}；导航条读到 {nav_text!r}；入口标题读到 {entry_text!r}",
+        payload={
+            "capture_size": list(size) if size else None,
+            "nav_text": nav_text,
+            "entry_title_text": entry_text,
+            "thumbnail_png_base64": _thumbnail_base64(image),
+        },
+    )
+    return True
+
+
 #: 各种浮层左上角的关闭键。信箱、消息详情、飞行中列表、派遣面板共用这一个位置，
 #: 所以关浮层这件事不需要先认出是哪一种浮层（`pirate_loop.MAIL_BACK` 是同一个点）。
 OVERLAY_CLOSE_BUTTON = (750, 71)
@@ -929,7 +1063,18 @@ def make_session_keeper(
                 return state
             if attempt + 1 < OBSERVE_FRAMES:
                 sleep(OBSERVE_FRAME_GAP_S)
+        # 连 `OBSERVE_FRAMES` 帧都认不出，才留证据：中间那几帧本来就常是空帧
+        # （见上面的实测），逐帧都记等于把正常的过渡态也当成故障存图。
+        if last_evidence:
+            record_unrecognised_screen(
+                last_evidence["image"],
+                nav_text=last_evidence["nav_text"],
+                entry_text=last_evidence["entry_text"],
+            )
         return ScreenState.UNKNOWN
+
+    #: 最后一次「认不出」时手上的那一帧与它的读数，供 `observe` 收尾时留证据。
+    last_evidence: dict[str, Any] = {}
 
     def observe_once() -> ScreenState:
         image = driver.capture()
@@ -944,19 +1089,20 @@ def make_session_keeper(
         popup = disconnect_screen(image)
         if popup is not None:
             return popup
-        state = classify_screen(
-            ocr(image.crop(NAV_TEXT_ROI), digits=False, upscale=NAV_TEXT_UPSCALE)
-        )
+        nav_text = ocr(image.crop(NAV_TEXT_ROI), digits=False, upscale=NAV_TEXT_UPSCALE)
+        state = classify_screen(nav_text)
         if state is ScreenState.IN_GAME:
             return state
         # 顺序要紧：**先判入口页再判 START**。入口页浮在 START 页之上，
         # 底下那个 START 仍在画面里；反过来判就会在入口页上去点 START。
-        entry = classify_screen(
-            ocr(image.crop(ENTRY_TITLE_ROI), digits=False, upscale=ENTRY_UPSCALE)
-        )
+        entry_text = ocr(image.crop(ENTRY_TITLE_ROI), digits=False, upscale=ENTRY_UPSCALE)
+        entry = classify_screen(entry_text)
         if entry is ScreenState.ENTRY:
             return entry
-        return ScreenState.START if start_button(image) is not None else state
+        result = ScreenState.START if start_button(image) is not None else state
+        if result is ScreenState.UNKNOWN:
+            last_evidence.update(image=image, nav_text=nav_text, entry_text=entry_text)
+        return result
 
     def _locate_confirming(find: Callable[[Any], tuple[int, int] | None]) -> tuple[int, int] | None:
         """多取几帧再说「找不到」。**入口页和 START 页都在做动画。**
