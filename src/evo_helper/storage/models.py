@@ -269,6 +269,36 @@ class ScoutReportRow(Base):
     target_position: Mapped[int] = mapped_column(Integer)
 
 
+class PlanetScoutAlertRow(Base):
+    """Persisted security mail and its one-shot notification outcome."""
+
+    __tablename__ = "planet_scout_alerts"
+    __table_args__ = (
+        UniqueConstraint("fingerprint", name="uq_planet_scout_alerts_fingerprint"),
+        Index("ix_planet_scout_alerts_reported_at_utc", "reported_at_utc"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    #: sha256 of immutable game-mail evidence. It is the hard de-duplication key.
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reported_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    raw_time_text: Mapped[str] = mapped_column(String(64))
+    source_galaxy: Mapped[int] = mapped_column(Integer)
+    source_system: Mapped[int] = mapped_column(Integer)
+    source_position: Mapped[int] = mapped_column(Integer)
+    target_galaxy: Mapped[int] = mapped_column(Integer)
+    target_system: Mapped[int] = mapped_column(Integer)
+    target_position: Mapped[int] = mapped_column(Integer)
+    source_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    intercepted_probes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subject: Mapped[str] = mapped_column(String(255))
+    raw_body: Mapped[str] = mapped_column(Text)
+    #: SENT / FAILED / NOT_CONFIGURED. New rows begin PENDING only briefly.
+    delivery_status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+
 class ScoutTriggerShipRow(Base):
     """侦察报告里某一个判定舰种那一格。
 

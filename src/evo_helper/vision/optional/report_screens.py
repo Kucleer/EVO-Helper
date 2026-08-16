@@ -161,6 +161,10 @@ class ImageReportScreens:
         stamp = self._report_time()
         return f"{stamp}\n{wide}" if stamp is not None else wide
 
+    def security_message(self) -> str:
+        """安全提示邮件的正文；与战斗报告的 VS / 舰队区域完全不同。"""
+        return self._read(self._layout.security_message, OCR_PSM_COLUMN)
+
     def _report_time(self) -> str | None:
         """窄 ROI 读页眉时间：单行、纯英文、只认数字与分隔符。
 

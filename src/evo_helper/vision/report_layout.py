@@ -107,6 +107,8 @@ class ReportLayout:
     #: 单独裁出来、psm 7、纯数字白名单，五张现场图全部读对；顺带在两份更早的
     #: 海盗战报截图（另一个 ui_version）上也读对了。
     report_time: Region
+    #: 安全提示邮件的正文。此类邮件没有 VS / 舰队区，关键信息只在这块正文。
+    security_message: Region
     detail_versus: Region
     replay_versus: Region
     #: Tight single-line ROIs for the coordinates, read separately at psm 7.
@@ -143,6 +145,7 @@ LIVE_LAYOUT = ReportLayout(
     mail_visible_rows=6,
     report_header=Region(720, 125, 1200, 195),
     report_time=Region(1010, 126, 1205, 162),
+    security_message=Region(720, 205, 1205, 420),
     detail_versus=Region(720, 370, 1200, 460),
     replay_versus=Region(720, 150, 1200, 240),
     detail_attacker_coordinate=Region(760, 428, 900, 452),

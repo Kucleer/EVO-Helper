@@ -132,6 +132,9 @@ class ReportKind(Enum):
     ATTACK = "attack"
     PIRATE = "pirate"
     SCOUT = "scout"
+    #: 这是本方收到的安全提示，不是我方派出的侦察报告；不能进入侦察/攻击
+    #: 战报链路，更不能被拿来认领任何派遣。
+    PLANET_SCOUTED = "planet_scouted"
     SYSTEM = "system"
     UNKNOWN = "unknown"
 
@@ -247,6 +250,8 @@ def parse_report_timestamp(text: str, display_zone: tzinfo) -> datetime | None:
 def classify_report_subject(subject: str) -> ReportKind:
     """Classify a mail subject. Order matters: pirate is checked before attack."""
     text = subject.strip()
+    if "你的行星被侦察" in text:
+        return ReportKind.PLANET_SCOUTED
     if "海盗" in text:
         return ReportKind.PIRATE
     if "攻击报告" in text:
