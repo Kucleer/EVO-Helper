@@ -538,6 +538,167 @@ def test_a_refused_dispatch_is_not_a_dispatch(repository, run_id) -> None:  # ty
     assert repository.last_dispatch_at(TARGET_KIND_PIRATE, origin=HOME) is None
 
 
+# -- 人工清理航线占用 -----------------------------------------------------------
+#
+# 库里那两个钟都是**推算**（出发时刻 + 派出时读到的飞行时长 × 倍数）。舰队真回港
+# 了它们也不会自己改口，读不出飞行时间的那一档更是按 90 分钟的上界硬占——于是
+# 任务卡在「等航线」，而真实航线是空的。用户口径 2026-08-16：「时间到了，自然就
+# 释放了航线，我会手动 check 后清理。」
+
+
+def test_releasing_lines_frees_the_ones_still_out(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """按下清理之后，这一发不再计入在飞数。"""
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(repository, run_id, TARGET_KIND_BOT, position=51, dispatched_at=now)
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now)
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
+
+    assert repository.release_held_lines(now_utc=now) == 1
+
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
+
+
+def test_releasing_lines_keeps_the_return_clock_as_a_record(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**`line_free_at_utc` 一个字都不许改。**
+
+    那一列是观测：派出时读到的飞行时长推算出来的返航时刻。把它改写成「现在」
+    确实也能让这一发不再计入在飞数，但同时抹掉了「这一发飞了多久」——而
+    `domain.report_wait.vet_flight_time` 那道下限正是靠这批样本校准出来的
+    （生产库 209 发攻击里有 66 发落在 0–59 秒，是解析截断的残骸）。
+
+    所以放手写在另一列上，两句话各说各的：「舰队几点回来」与「人几点说它回来了」。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(repository, run_id, TARGET_KIND_BOT, position=52, dispatched_at=now)
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now)
+
+    repository.release_held_lines(now_utc=now)
+
+    row = _dispatch_row(repository, dispatch_id)
+    # 攻击发按 2× 算（打完还要飞回来）。
+    assert row.line_free_at_utc == now + timedelta(hours=2)
+    assert row.flight_seconds == 3600
+    assert row.line_released_at_utc == now
+
+
+def test_releasing_lines_also_lets_go_of_the_unknown_flight_time_ones(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """读不出飞行时间的那一档也要放开。
+
+    它按 `UNKNOWN_LINE_HOLD`（90 分钟）硬占，是实机上最容易把任务钉死在
+    「等航线」上的一批。只对有航线钟的那些生效的话，用户按下按钮会一点动静
+    都没有——而那正是他最需要这个按钮的时候。
+    """
+    now = datetime.now(UTC)
+    _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=53,
+        dispatched_at=now - timedelta(minutes=5),
+    )
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 1
+
+    assert repository.release_held_lines(now_utc=now) == 1
+
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
+
+
+def test_releasing_lines_silences_the_wait_for_a_line_alarm(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """闹钟也得跟着灭。
+
+    `next_line_free_at` 是调度器把「等航线」压住多久的锚点。放手之后它还答得
+    出一个两小时后的时刻，页面就会继续写「等航线」并把链路压到那时——那句话
+    既是假的，也正好是用户按这个按钮想消掉的东西。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(repository, run_id, TARGET_KIND_BOT, position=54, dispatched_at=now)
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now)
+    assert repository.next_line_free_at(now_utc=now, origin=HOME) == now + timedelta(hours=2)
+
+    repository.release_held_lines(now_utc=now)
+
+    assert repository.next_line_free_at(now_utc=now, origin=HOME) is None
+
+
+def test_releasing_lines_covers_every_planet(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """一下清干净所有出发星球。
+
+    航线上限按星球各一份，但这个按钮说的是「我刚在游戏里数过，航线都空着」——
+    那是对整个账号说的一句话。只清一颗星球等于让用户逐颗点，而漏点的那颗会
+    继续把任务钉在「等航线」上。
+    """
+    now = datetime.now(UTC)
+    for position, origin in ((55, HOME), (56, SECOND)):
+        dispatch_id = _dispatch(
+            repository, run_id, TARGET_KIND_BOT, position=position, dispatched_at=now, origin=origin
+        )
+        repository.record_flight_time(dispatch_id, timedelta(hours=1), now)
+
+    assert repository.release_held_lines(now_utc=now) == 2
+
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
+    assert repository.count_inflight(now_utc=now, origin=SECOND) == 0
+
+
+def test_releasing_lines_only_stamps_the_ones_still_holding(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """早就自然到点的、以及被游戏拒掉的，都不打这个戳。
+
+    打了的话，日后想问「哪些航线是人手动清掉的」，答案里会混进一整库跟这次
+    按钮毫无关系的派遣；被拒的那些更是压根没飞出去，没有航线可放。
+    """
+    now = datetime.now(UTC)
+    landed = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=57,
+        dispatched_at=now - timedelta(hours=5),
+    )
+    repository.record_flight_time(landed, timedelta(hours=1), now - timedelta(hours=5))
+    refused = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=58,
+        dispatched_at=now,
+        accepted=False,
+    )
+    repository.record_flight_time(refused, timedelta(hours=1), now)
+
+    assert repository.release_held_lines(now_utc=now) == 0
+
+    assert _dispatch_row(repository, landed).line_released_at_utc is None
+    assert _dispatch_row(repository, refused).line_released_at_utc is None
+
+
+def test_releasing_lines_twice_does_not_restamp(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """第二下没有可放的了，回执必须是 0。
+
+    重复计数会让页面对着一个什么都没做的按钮说「已放开 1 条」——用户据此以为
+    库里又攒出了一条占用。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(repository, run_id, TARGET_KIND_BOT, position=59, dispatched_at=now)
+    repository.record_flight_time(dispatch_id, timedelta(hours=1), now)
+
+    assert repository.release_held_lines(now_utc=now) == 1
+    assert repository.release_held_lines(now_utc=now + timedelta(minutes=1)) == 0
+
+    # 戳记停在第一次那一下，不被第二次覆盖。
+    assert _dispatch_row(repository, dispatch_id).line_released_at_utc == now
+
+
+def _dispatch_row(repository, dispatch_id):  # type: ignore[no-untyped-def]
+    """直接把那一行派遣捞出来。放手是否改写了别的列，只有这样才看得见。"""
+    from evo_helper.storage import models as orm
+
+    with repository._session_factory() as session:  # noqa: SLF001 - 测试直接读库
+        row = session.get(orm.AttackDispatchRow, dispatch_id)
+        assert row is not None
+        session.expunge(row)
+        return row
+
+
 def _attach_report(session_factory, dispatch_id, reported_at: datetime) -> None:  # type: ignore[no-untyped-def]
     """直接挂一份战报到指定派遣上。
 

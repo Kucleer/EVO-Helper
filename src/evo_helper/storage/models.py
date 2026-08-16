@@ -179,8 +179,20 @@ class AttackDispatchRow(Base):
     #: 战报在**抵达**时产生，航线要等舰队**飞回来**才释放。
     #: 拿战报那个钟去判航线，调度器会在航线其实还占着时就去派，撞上游戏的
     #: 「同时派遣的舰队数量已达上限。」。
-    #: 飞行时长读不到时同样为 NULL，NULL 不计入在飞数（宁可估高空闲航线）。
+    #: 飞行时长读不到时同样为 NULL，**NULL 照样占航线**，占到派出时刻 +
+    #: `domain.report_wait.UNKNOWN_LINE_HOLD` 为止（早先的「NULL 不计入在飞数」
+    #: 已被实机推翻，判据见 `storage.repository._still_holding_a_line`）。
     line_free_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: **人工放手的时刻**：用户在游戏里看过、确认这一发的舰队已经回港，于是在
+    #: 调度台上把这条航线占用清掉。非 NULL 就是「不管上面那个钟怎么说，这条
+    #: 航线现在是空的」。
+    #:
+    #: 为什么另起一列而不是去改 `line_free_at_utc`：那一列记的是**当时读到的
+    #: 飞行时长推算出来的返航时刻**，是一条观测记录。把它改写成「现在」，
+    #: 这一发究竟飞了多久就再也查不出来了，而飞行时长正是
+    #: `domain.report_wait.vet_flight_time` 那道下限赖以校准的样本。
+    #: 两列分开之后，「舰队几点回来」与「人几点说它回来了」各说各的话。
+    line_released_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: 这一发是攻击还是侦察（见 `domain.records.MISSION_KIND_*`）。
     #: **日配额只数 `ATTACK`**：侦察也是打向海盗的，不分开数的话一轮 4 发侦察
     #: 就吃掉 4 次攻击额度。**在飞数两者都数**：侦察一样占航线。
