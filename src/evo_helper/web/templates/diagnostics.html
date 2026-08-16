@@ -34,7 +34,7 @@
       <thead>
         <tr>
           <th scope="col">范围</th><th scope="col">原因</th><th scope="col">状态</th>
-          <th scope="col">坐标</th><th scope="col">请求时间 (UTC)</th>
+          <th scope="col">坐标</th><th scope="col">请求时间（UTC+8）</th>
         </tr>
       </thead>
       <tbody>
@@ -52,7 +52,8 @@
               {{ revisit.target_coordinate.galaxy }}:{{ revisit.target_coordinate.system }}:{{ revisit.target_coordinate.position }}
             {%- else -%}—{%- endif -%}
           </td>
-          <td>{{ revisit.requested_at_utc }}</td>
+          {# 只改显示。字段名仍是 `_utc`，库里与接口里存的、返回的也仍是 UTC。 #}
+          <td>{{ local_time(revisit.requested_at_utc) }}</td>
         </tr>
       {% else %}
         <tr><td colspan="5" class="muted">还没有复查请求。</td></tr>
@@ -68,14 +69,14 @@
     <table>
       <thead>
         <tr>
-          <th scope="col">时间 (UTC)</th><th scope="col">聚合</th>
+          <th scope="col">时间（UTC+8）</th><th scope="col">聚合</th>
           <th scope="col">事件</th><th scope="col">前</th><th scope="col">后</th>
         </tr>
       </thead>
       <tbody>
       {% for event in events %}
         <tr>
-          <td>{{ event.occurred_at_utc }}</td>
+          <td>{{ local_time(event.occurred_at_utc) }}</td>
           <td class="muted">{{ event.aggregate }}:{{ event.aggregate_id }}</td>
           <td>{{ event.event }}</td>
           <td class="muted">{{ event.from_state or "—" }}</td>

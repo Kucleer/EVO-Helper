@@ -167,7 +167,7 @@
   const OPERATORS = ['>', '>=', '<', '<=', '=', '!='];
   // 「最新情报时间」而不是「最新战报时间」：海盗行一份战报都没有，它那一格写的是
   // 侦察报告的时间。列名说的必须是它真正装着的东西。
-  const FIXED_COLUMNS = ['坐标', '类型', '名称', '最新情报时间', '舰队总数'];
+  const FIXED_COLUMNS = ['坐标', '类型', '名称', '最新情报时间（UTC+8）', '舰队总数'];
   // Only these ship types get their own list column; the rest live in the
   // detail dialog. A column per recorded type overflowed a laptop screen.
   // 这四个就是海盗侦察的判定舰种（`display.LIST_SHIP_COLUMNS`）。
@@ -190,7 +190,10 @@
 
   const el = (id) => document.getElementById(id);
   const root = el('condition-root');
-  const fmtTime = (value) => (value ? value.replace('T', ' ').slice(0, 19) : '—');
+  // 时刻一律按 UTC+8 显示，走 base.html 里那一份共用实现。原先是把接口给的 ISO
+  // 串截前 19 个字符，也就是**直接把 UTC 摆出来**，还不标时区——页面上的时刻和
+  // 墙上时钟差 8 小时，得每次心算。
+  const fmtTime = (value) => EVOHelper.localTime(value);
 
   // ---- condition builder ------------------------------------------------
 
@@ -489,9 +492,9 @@
     bar.style.marginBottom = '10px';
     const label = document.createElement('span');
     label.className = 'inline-label';
-    label.textContent = '快照';
+    label.textContent = '快照（UTC+8）';
     const picker = document.createElement('select');
-    picker.setAttribute('aria-label', '选择快照');
+    picker.setAttribute('aria-label', '选择快照，时刻按 UTC+8');
     ordered.forEach((entry, index) => {
       const suffix = index === 0 ? ' · 最新' : '';
       picker.add(new Option(`${fmtTime(entry.captured_at_utc)}${suffix}`, String(index)));

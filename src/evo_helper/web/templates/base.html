@@ -7,6 +7,43 @@
   <link rel="stylesheet" href="/static/console.css">
   <script>
     window.EVOHelper = {
+      //: 控制台上**所有**时刻一律按 UTC+8（用户的墙上时钟）显示。
+      //:
+      //: 与服务端的 `web.app.local_time()` 是同一口径、同一个字面格式
+      //: （`YYYY-MM-DD HH:MM:SS`）：同一个瞬时不该因为它是服务端渲染还是
+      //: 前端渲染就长得不一样。
+      //:
+      //: ⚠️ **这只是显示。** 库里存的、接口返回的一律仍是 UTC——`UTCDateTime`
+      //: 那套判据（`storage/database.py`）建立在「读出来是 aware 的 UTC」上，
+      //: 为了显示方便去改序列化，会把整个仓库的时间语义拆掉。
+      //:
+      //: 收在这里而不是每页各抄一份：抄第二份的那天，两处就开始分家。
+      LOCAL_ZONE: 'Asia/Shanghai',
+      LOCAL_ZONE_LABEL: 'UTC+8',
+      _localFormat: null,
+      localTime(value) {
+        if (value === null || value === undefined || value === '') return '—';
+        const raw = String(value);
+        // 时区后缀缺失时按 UTC 读。少了它，`new Date` 会按浏览器本地时区解释，
+        // 而本机就是 UTC+8——时刻会凭空差 8 小时（先减 8 再加 8 的双重换算）。
+        const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : `${raw}Z`;
+        const at = value instanceof Date ? value : new Date(stamped);
+        // 解析不出来就原样显示：显示一个读不懂的字符串，好过显示 `Invalid Date`
+        // 或者悄悄吞掉一个真实存在的时刻。
+        if (Number.isNaN(at.getTime())) return raw;
+        this._localFormat = this._localFormat || new Intl.DateTimeFormat('zh-CN', {
+          timeZone: this.LOCAL_ZONE,
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+          // `hourCycle` 而不是 `hour12: false`：后者在部分引擎上会把午夜渲染成
+          // 24 点，于是 00:30 变成 24:30，读起来像明天。
+          hourCycle: 'h23',
+        });
+        const parts = {};
+        for (const part of this._localFormat.formatToParts(at)) parts[part.type] = part.value;
+        return `${parts.year}-${parts.month}-${parts.day} `
+          + `${parts.hour}:${parts.minute}:${parts.second}`;
+      },
       async request(method, url, data) {
         const options = { method, headers: {} };
         if (data !== undefined) {

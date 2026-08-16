@@ -844,12 +844,10 @@
     }
     const chip = document.createElement('span');
     chip.className = 'chip ok';
-    // 时区后缀缺失时按 UTC 读（同 `elapsed`）：少了它，浏览器会按本地时区解释，
-    // 显示出来的固化时刻会凭空差 8 小时。
-    const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(freeze.frozen_at_utc)
-      ? freeze.frozen_at_utc
-      : `${freeze.frozen_at_utc}Z`;
-    chip.textContent = `本轮已固化 · ${new Date(stamped).toLocaleString()}`;
+    // 走共用的 `EVOHelper.localTime`（base.html）：它按 UTC+8 显示，也在时区后缀
+    // 缺失时按 UTC 读（同 `elapsed`）。原先用的 `toLocaleString()` 跟的是**浏览器**
+    // 的时区，换台机器看就换个时刻，而下面那张表写死了「现实 UTC+8」——两处对不上。
+    chip.textContent = `本轮已固化 · ${EVOHelper.localTime(freeze.frozen_at_utc)}（UTC+8）`;
     const lines = document.createElement('div');
     for (const task of freeze.tasks) {
       const line = document.createElement('div');

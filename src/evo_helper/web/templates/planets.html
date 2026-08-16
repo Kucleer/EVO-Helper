@@ -77,7 +77,7 @@
           <th scope="col">坐标</th>
           <th scope="col">归属</th>
           <th scope="col">类型</th>
-          <th scope="col">最近扫描 (UTC)</th>
+          <th scope="col">最近扫描（UTC+8）</th>
         </tr>
       </thead>
       <tbody>
@@ -100,7 +100,8 @@
               <span class="chip"><span class="glyph" aria-hidden="true">○</span>空位</span>
             {% endif %}
           </td>
-          <td class="muted">{{ row.last_scan_at or '—' }}</td>
+          {# `local_time` 自己处理 None（显示「—」），所以这里不再 `or '—'`。 #}
+          <td class="muted">{{ local_time(row.last_scan_at) }}</td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="muted">没有匹配的星球。换个银河系或类型试试。</td></tr>
