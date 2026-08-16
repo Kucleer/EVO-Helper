@@ -33,7 +33,13 @@ class TestScreenClassification:
         assert classify_screen("点击任意位置继续") is ScreenState.ENTRY
 
     def test_an_unrecognised_screen_is_not_guessed(self) -> None:
-        assert classify_screen("服务器维护中，请稍后再试") is ScreenState.UNKNOWN
+        """认不出就 UNKNOWN，然后停止——不猜。
+
+        ⚠️ 这里原先拿「服务器维护中，请稍后再试」当例子。2026-08-15 03:30 那一晚
+        它真的出现了，而且**把整晚堵死了**（详见下面维护那条）。所以它现在是
+        认得出的一档，例子换成了别的。这条本身仍然成立：没教过的画面不许猜。
+        """
+        assert classify_screen("加载时发生了意外错误，请重试。") is ScreenState.UNKNOWN
         assert classify_screen("") is ScreenState.UNKNOWN
 
 
@@ -608,3 +614,26 @@ class TestInGameMarkersSurviveOcr:
 
     def test_the_system_view_nav_is_still_recognised(self) -> None:
         assert classify_screen("银河系 恒星系 行星") is ScreenState.IN_GAME
+
+
+def test_a_maintenance_notice_is_recognised_before_anything_underneath_it() -> None:
+    """⚠️⚠️ **2026-08-15 03:30 实机：这一屏把整晚堵死了。**
+
+    服务器停机维护，游戏弹出一张公告**盖在 START 页上**。助手完全不认识它，
+    而 `START_ROI` 那个位置上坐着的是公告的「知道了」按钮——于是
+    `start_button` 一遍遍读到「知道了」、一遍遍判「读不出 START」，
+    bot 链路空转了二十分钟，一发都没派。
+
+    判据必须排在最前：公告是浮层，底下的 START 与导航条照样读得出来，
+    后判就会把一台**停机的服务器**认成「在 START 页上」，然后一路点下去。
+    这和掉线弹窗那条是同一个道理，这是它的第二个实例。
+    """
+    assert classify_screen("服务器维护") is ScreenState.MAINTENANCE
+    # 浮层底下透出来的字一起读到时，仍然要判成维护而不是 START / 在线。
+    assert classify_screen("服务器维护 START") is ScreenState.MAINTENANCE
+    assert classify_screen("服务器维护 商店 联盟") is ScreenState.MAINTENANCE
+
+
+def test_a_plain_start_screen_is_not_mistaken_for_maintenance() -> None:
+    """公告点掉之后回到的就是 START 页，误判会让助手反复去点一个不存在的按钮。"""
+    assert classify_screen("START") is ScreenState.START

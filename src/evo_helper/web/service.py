@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange
@@ -309,7 +309,7 @@ class MissionTaskView:
     label: str
     enabled: bool
     priority: int
-    params: dict[str, int]
+    params: dict[str, Any]
     status: str
     detail: str
     #: 参数的人话回显：海盗半径实际覆盖到哪、bot 区间里有几个已记录目标。
@@ -326,6 +326,30 @@ class MissionTaskView:
     #: ——两者显示成同一个数字的话，用户改了全局值之后会以为任务也跟着变了。
     origin_is_default: bool = True
     fleet_lines_is_default: bool = True
+
+
+@dataclass(frozen=True)
+class MissionOriginView:
+    planet_id: int | None
+    galaxy: int = 0
+    system: int = 0
+    position: int = 0
+    fleet_lines: int = 0
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class AttackPlanetView:
+    planet_id: int
+    number: int
+    galaxy: int
+    system: int
+    position: int
+
+
+@dataclass(frozen=True)
+class MilitaryAttackConfigView:
+    tiers: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -854,6 +878,7 @@ class FakeApplicationService:
 __all__ = [
     "ATTACK_LOG_RESULTS",
     "ApplicationService",
+    "AttackPlanetView",
     "AttackLogOptions",
     "BackfillSummaryView",
     "BackfillView",
@@ -868,6 +893,7 @@ __all__ = [
     "FleetSnapshotView",
     "MissionRunView",
     "MissionTaskView",
+    "MilitaryAttackConfigView",
     "NotFoundError",
     "PlanPatchView",
     "RevisitView",

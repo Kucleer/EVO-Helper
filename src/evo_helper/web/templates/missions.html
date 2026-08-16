@@ -50,8 +50,9 @@
       页面这一处**必须跟着另外两个默认值一起改**：它不走 schema 默认，而是把
       复选框的值显式送出去。只改后端默认的话，点「开始」照样会先对账。
     #}
-    <label class="inline-label" for="start-reconcile" style="cursor:pointer">
-      <input type="checkbox" id="start-reconcile">先对账再跑任务（挂机时别勾）
+    <label class="inline-label" for="start-reconcile" style="cursor:pointer"
+           title="启用时仅在本次点击开始后补录一次；攻击续跑不会重复读信箱">
+      <input type="checkbox" id="start-reconcile">启动战报补录（可关闭）
     </label>
     <button class="btn primary small" type="button" id="btn-start">开始</button>
     <button class="btn small" type="button" id="btn-stop"
@@ -61,9 +62,8 @@
     点「开始」之后调度器常驻运行，自己决定什么时候起哪条链路，直到点「结束」。
     任何时刻最多一个子进程在点鼠标。控制台重启后一律停在「已停止」。
     <br>
-    「开始」会<b>先跑一趟战报对账</b>（海盗、bot 各一趟），读完信箱里应读未读的战报
-    再放行任务——不然已经打赢的目标会被当成还要再打，配额也会数少。
-    没有欠账时那一趟几十秒就走完（信箱单子一空就早停）。
+    勾选「启动战报补录」时，<b>本次开始只补录一趟</b>（海盗、bot 各一趟），读完信箱里
+    应读未读的战报再放行任务；关闭则全程不自动进入信箱。攻击中的航线续跑不再读战报。
   </p>
 </section>
 
@@ -164,8 +164,9 @@
     <span class="inline-label">新建 bot 攻击任务</span>
     <input type="text" id="new-task-name" placeholder="任务名，例如「2 号星 · 近系」"
            style="width:200px" aria-label="新任务的名字">
-    <input type="text" id="new-task-origin" placeholder="出发星球，留空=主星"
-           style="width:150px" aria-label="新任务的出发星球">
+    <select id="new-task-origin" aria-label="新任务的出发星球">
+      <option value="">选择星球（留空=全局主星）</option>
+    </select>
     <input type="number" id="new-task-lines" min="1" placeholder="航线"
            style="width:70px" aria-label="新任务的航线数">
     <button class="btn small" type="button" id="btn-new-task">新建</button>
@@ -374,6 +375,96 @@
     return cell;
   }
 
+  function populateTaskPlanetSelect(select, selected = '') {
+    const current = selected || select.value;
+    select.textContent = '';
+    const empty = document.createElement('option');
+    empty.value = ''; empty.textContent = '选择星球（留空=全局主星）';
+    select.append(empty);
+    let matched = !current;
+    for (const planet of attackPlanets) {
+      const coordinate = `${planet.galaxy}:${planet.system}:${planet.position}`;
+      const option = document.createElement('option');
+      option.value = coordinate;
+      option.textContent = `星球${planet.number} [${coordinate}]`;
+      if (coordinate === current) matched = true;
+      select.append(option);
+    }
+    if (!matched) {
+      const legacy = document.createElement('option');
+      legacy.value = current; legacy.textContent = `当前坐标 [${current}]（请在攻击配置页统一维护）`;
+      select.append(legacy);
+    }
+    select.value = current;
+  }
+
+  function addMilitaryOrigin(list, origin = {}) {
+    const line = document.createElement('div');
+    line.className = 'military-origin-line';
+    line.style.marginTop = '5px';
+    const planet = document.createElement('select');
+    planet.className = 'military-origin-planet';
+    planet.setAttribute('aria-label', '军力攻击出发星球');
+    const empty = document.createElement('option');
+    empty.value = ''; empty.textContent = attackPlanets.length ? '选择星球' : '请先到攻击配置新增星球';
+    planet.append(empty);
+    for (const item of attackPlanets) {
+      const option = document.createElement('option');
+      option.value = item.planet_id;
+      option.textContent = `星球${item.number} [${item.galaxy}:${item.system}:${item.position}]`;
+      planet.append(option);
+    }
+    planet.value = origin.planet_id ?? '';
+    const fleetLines = makeInput('military-origin-lines', {
+      type: 'number', min: 1, placeholder: '航线', style: 'width:58px', 'aria-label': '该出发星球的航线数',
+    });
+    fleetLines.value = origin.fleet_lines ?? '';
+    const enabled = makeInput('military-origin-enabled', { type: 'checkbox', 'aria-label': '启用这个出发星球' });
+    enabled.checked = origin.enabled !== false;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn small military-remove-origin';
+    remove.textContent = '移除';
+    line.append(planet, document.createTextNode(' '), fleetLines, document.createTextNode(' '), enabled, remove);
+    list.append(line);
+  }
+
+  function setMilitaryVisible(row, locked) {
+    const toggle = row.querySelector('.military-enabled');
+    const editor = row.querySelector('.military-editor');
+    const regional = row.querySelector('.regional-params');
+    if (!toggle || !editor || !regional) return;
+    const enabled = toggle.checked;
+    editor.hidden = !enabled;
+    regional.hidden = enabled;
+    for (const input of editor.querySelectorAll('input, select')) input.disabled = locked;
+    for (const button of editor.querySelectorAll('button')) button.disabled = locked;
+    toggle.disabled = locked;
+  }
+
+  function loadMilitaryOrigins(task, row) {
+    const list = row.querySelector('.military-origin-list');
+    if (!list || row.dataset.militaryOriginsLoaded) return;
+    row.dataset.militaryOriginsLoaded = '1';
+    EVOHelper.get(`/api/missions/${task.task_id}/origins`)
+      .then((origins) => {
+        list.textContent = '';
+        if (origins.length) {
+          for (const origin of origins) {
+            addMilitaryOrigin(list, {
+              planet_id: origin.planet_id,
+              fleet_lines: origin.fleet_lines,
+              enabled: origin.enabled,
+            });
+          }
+        } else {
+          addMilitaryOrigin(list, { fleet_lines: task.fleet_lines, enabled: true });
+        }
+        setMilitaryVisible(row, latest && latest.config_locked === true);
+      })
+      .catch(fail);
+  }
+
   function buildRow(task) {
     const isScan = task.kind === 'SCAN';
     const row = document.createElement('tr');
@@ -430,9 +521,11 @@
       dash.textContent = '— 不派遣';
       makeCell(row, dash);
     } else {
-      const origin = makeInput('mission-origin', {
-        type: 'text', style: 'width:110px', 'aria-label': '出发星球',
-      });
+      const origin = document.createElement('select');
+      origin.className = 'mission-origin';
+      origin.style.width = '175px';
+      origin.setAttribute('aria-label', '出发星球');
+      populateTaskPlanetSelect(origin);
       const lines = makeInput('mission-lines', {
         type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
       });
@@ -441,6 +534,8 @@
 
     // 参数框。
     const params = document.createElement('span');
+    const regional = document.createElement('span');
+    regional.className = 'regional-params';
     for (const field of PARAM_FIELDS[task.kind] || []) {
       const label = document.createElement('span');
       label.className = field.label === '–' ? 'dash' : 'inline-label';
@@ -450,13 +545,47 @@
         style: `width:${field.width}px`, 'aria-label': field.label,
       });
       input.dataset.param = field.key;
-      params.append(label, input);
+      regional.append(label, input);
     }
-    if (!params.childNodes.length) {
+    if (!regional.childNodes.length) {
       const dash = document.createElement('span');
       dash.className = 'muted';
       dash.textContent = '—';
-      params.append(dash);
+      regional.append(dash);
+    }
+    params.append(regional);
+    if (task.kind === 'BOT') {
+      const military = document.createElement('div');
+      military.className = 'military-config';
+      military.style.marginTop = '6px';
+      const modeLabel = document.createElement('label');
+      modeLabel.className = 'inline-label';
+      modeLabel.style.cursor = 'pointer';
+      const mode = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
+      modeLabel.append(mode, document.createTextNode(' 军力优先：前 N 名内按各出发点就近攻击'));
+      const editor = document.createElement('div');
+      editor.className = 'military-editor';
+      editor.style.marginTop = '7px';
+      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力候选数量' });
+      const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限' });
+      const rescan = makeInput('military-rescan-hours', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力榜重扫提示小时数' });
+      const settings = document.createElement('div');
+      settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　榜单超过 '), rescan, document.createTextNode(' 小时提示重扫'));
+      const originHead = document.createElement('div');
+      originHead.style.marginTop = '7px';
+      originHead.append('出发点 / 航线　');
+      const addOrigin = document.createElement('button');
+      addOrigin.type = 'button'; addOrigin.className = 'btn small military-add-origin'; addOrigin.textContent = '增加出发点';
+      originHead.append(addOrigin);
+      const origins = document.createElement('div'); origins.className = 'military-origin-list';
+      const save = document.createElement('button');
+      save.type = 'button'; save.className = 'btn primary small military-save'; save.style.marginTop = '7px'; save.textContent = '保存军力方案';
+      const note = document.createElement('div');
+      note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
+      note.textContent = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护，所有军力任务共用。';
+      editor.append(settings, originHead, origins, save, note);
+      military.append(modeLabel, editor);
+      params.append(military);
     }
     const summary = document.createElement('div');
     summary.className = 'muted mission-summary';
@@ -521,6 +650,7 @@
 
   let latest = null;
   let latestBackfill = null;
+  let attackPlanets = [];
 
   function render(state) {
     latest = state;
@@ -578,7 +708,7 @@
       const checkbox = row.querySelector('.mission-enabled');
       checkbox.checked = task.enabled;
       checkbox.disabled = locked;
-      for (const input of row.querySelectorAll('input')) input.disabled = locked;
+      for (const input of row.querySelectorAll('input, select')) input.disabled = locked;
       checkbox.disabled = locked;
       // 删除只在这条链路还有别的任务时才给。每条链路至少留一行——删光了页面上
       // 就再也建不回来（海盗与扫描连「新建」的入口都没有）。后端也会拒，
@@ -636,10 +766,21 @@
         row.querySelector('.mission-name').value = task.label;
         // 扫描那一行没有这两个框（它不派遣），所以这里得先看有没有。
         const originInput = row.querySelector('.mission-origin');
-        if (originInput) originInput.value = task.origin || '';
+        if (originInput) populateTaskPlanetSelect(originInput, task.origin || '');
         const linesInput = row.querySelector('.mission-lines');
         if (linesInput) linesInput.value = task.fleet_lines || '';
       }
+
+      if (task.kind === 'BOT' && (!row.dataset.militaryPrimed || locked)) {
+        row.dataset.militaryPrimed = '1';
+        const mode = row.querySelector('.military-enabled');
+        mode.checked = task.params.by_military === true;
+        row.querySelector('.military-top-n').value = task.params.top_n ?? 50;
+        row.querySelector('.military-max-score').value = task.params.max_score ?? '';
+        row.querySelector('.military-rescan-hours').value = task.params.rescan_after_hours ?? 6;
+        loadMilitaryOrigins(task, row);
+      }
+      if (task.kind === 'BOT') setMilitaryVisible(row, locked);
     }
     tickClock();
   }
@@ -714,7 +855,13 @@
   // ---- 读写 ---------------------------------------------------------------
 
   function refresh() {
-    return EVOHelper.get('/api/scheduler').then(render).catch(fail);
+    return Promise.all([EVOHelper.get('/api/scheduler'), EVOHelper.get('/api/attack-planets')])
+      .then(([state, planets]) => {
+        attackPlanets = planets;
+        populateTaskPlanetSelect(document.getElementById('new-task-origin'));
+        render(state);
+      })
+      .catch(fail);
   }
 
   function command(endpoint) {
@@ -797,6 +944,51 @@
       .catch((error) => { fail(error); return refresh(); });
   }
 
+  function coordinatePayload(text) {
+    const parts = text.trim().split(':').map(Number);
+    if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) {
+      throw new Error(`出发点「${text}」应为 星系:恒星系:位置，例如 2:137:18`);
+    }
+    return { galaxy: parts[0], system: parts[1], position: parts[2] };
+  }
+
+  function saveMilitary(taskId, row) {
+    const task = latest.tasks.find((item) => String(item.task_id) === String(taskId));
+    if (!task) return;
+    const enabled = row.querySelector('.military-enabled').checked;
+    const payload = { ...task.params, by_military: enabled };
+    if (!enabled) return patch(taskId, payload);
+    const topN = Number(row.querySelector('.military-top-n').value);
+    const rescan = Number(row.querySelector('.military-rescan-hours').value);
+    const maximumText = row.querySelector('.military-max-score').value.trim();
+    if (!Number.isInteger(topN) || topN < 1) throw new Error('候选数量必须是大于 0 的整数');
+    if (!Number.isFinite(rescan) || rescan <= 0) throw new Error('重扫提示小时数必须大于 0');
+    payload.top_n = topN;
+    payload.rescan_after_hours = rescan;
+    if (maximumText === '') delete payload.max_score;
+    else {
+      payload.max_score = Number(maximumText);
+      if (!Number.isFinite(payload.max_score) || payload.max_score < 0) throw new Error('军力上限必须是非负数字');
+    }
+    delete payload.tiers;
+    const origins = [];
+    for (const line of row.querySelectorAll('.military-origin-line')) {
+      const planetId = Number(line.querySelector('.military-origin-planet').value);
+      const fleetLines = Number(line.querySelector('.military-origin-lines').value);
+      if (!Number.isInteger(planetId) || planetId < 1) throw new Error('请选择配置页中的出发星球');
+      if (!Number.isInteger(fleetLines) || fleetLines < 1) throw new Error('每个出发点的航线数至少为 1');
+      origins.push({ planet_id: planetId, fleet_lines: fleetLines,
+        enabled: line.querySelector('.military-origin-enabled').checked });
+    }
+    if (!origins.length) throw new Error('军力攻击至少需要一个启用的出发点');
+    // 先写参数；失败时保留旧的多出发点配置，绝不把一份半截方案存进去。
+    showError('');
+    return EVOHelper.request('PATCH', `/api/missions/${taskId}`, { params: payload })
+      .then(() => EVOHelper.request('PUT', `/api/missions/${taskId}/origins`, origins))
+      .then(() => refresh())
+      .catch((error) => { fail(error); return refresh(); });
+  }
+
   for (const id of ['btn-stop', 'btn-force-kill']) {
     document.getElementById(id).onclick = (event) => command(event.currentTarget.dataset.endpoint);
   }
@@ -858,6 +1050,18 @@
     // 走的是和复选框同一个 PATCH：`enabled: true` 顺带清掉停用原因与失败计数，
     // 而参数不合格的任务照样会被 400 拦下（错误显示在下面那条红字里）。
     if (event.target.closest('.mission-revive')) patch(taskId, { enabled: true });
+    if (event.target.closest('.military-add-origin')) {
+      addMilitaryOrigin(row.querySelector('.military-origin-list'));
+      return;
+    }
+    if (event.target.closest('.military-remove-origin')) {
+      event.target.closest('.military-origin-line').remove();
+      return;
+    }
+    if (event.target.closest('.military-save')) {
+      try { saveMilitary(taskId, row); } catch (error) { fail(error); }
+      return;
+    }
     if (event.target.closest('.mission-delete')) {
       // 删掉的是用户自己配出来的东西，而且不可撤销（历史台账留着，配置不留）。
       if (!window.confirm(`删除任务「${row.querySelector('.mission-name').value}」？`)) return;
@@ -899,6 +1103,9 @@
         if (input.value.trim() !== '') params[input.dataset.param] = Number(input.value);
       }
       patch(taskId, { params });
+    }
+    if (event.target.matches('.military-enabled')) {
+      setMilitaryVisible(row, latest && latest.config_locked === true);
     }
   });
 

@@ -118,6 +118,11 @@ class BotOptions:
     #: 多个 bot 任务的区别就在这一个参数上，让 runner 自己去猜，两个任务的账
     #: 会记到同一颗星球上。
     origin: Coordinate | None = None
+    #: 军力任务会逐目标带标题；缺项才是旧区域攻击的 BBB。绝不 OCR 校验预设内容。
+    presets: dict[Coordinate, str] | None = None
+    #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
+    #: 航线返航后的续跑反复打开信箱。
+    reconcile_on_start: bool = False
 
 
 class BotLoop(PirateLoop):
@@ -154,6 +159,7 @@ class BotLoop(PirateLoop):
                 attack=options.attack,
                 preset=BOT_ATTACK_PRESET,
                 origin=options.origin,
+                reconcile_on_start=options.reconcile_on_start,
             ),
         )
         self._bot = options
@@ -351,7 +357,8 @@ class BotLoop(PirateLoop):
         self._outcome.pirates.append(coordinate)
         if not self._bot.attack:
             return
-        self.attack(coordinate, preset=BOT_ATTACK_PRESET)
+        preset = (self._bot.presets or {}).get(coordinate, BOT_ATTACK_PRESET)
+        self.attack(coordinate, preset=preset)
 
     def _round_start(self) -> datetime:
         """本轮从何时算起。**绝不返回 None。**
@@ -399,10 +406,21 @@ def parse_target(text: str) -> Coordinate:
     return Coordinate(galaxy, system, position)
 
 
+def parse_target_assignment(text: str) -> tuple[Coordinate, str | None]:
+    """解析 ``坐标=预设标题``；不带等号保持旧 CLI 的 BBB 语义。"""
+    coordinate_text, separator, preset = text.partition("=")
+    coordinate = parse_target(coordinate_text)
+    if not separator:
+        return coordinate, None
+    if not preset.strip():
+        raise argparse.ArgumentTypeError("预设标题不能为空")
+    return coordinate, preset
+
+
 def main(argv: list[str] | None = None) -> int:
     make_console_encoding_safe()  # 必须在 parse_args 之前，理由见那个函数
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--targets", nargs="+", type=parse_target, required=True)
+    parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
     parser.add_argument(
         "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
     )
@@ -418,6 +436,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="本轮起始时刻（ISO 8601，必须带时区）。调度器会传；手工跑不给则按当日 UTC 00:00 算",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
+    )
     args = parser.parse_args(argv)
 
     import ctypes
@@ -425,14 +448,19 @@ def main(argv: list[str] | None = None) -> int:
     getattr(ctypes, "windll").shcore.SetProcessDpiAwareness(2)
 
     options = BotOptions(
-        targets=tuple(args.targets),
+        targets=tuple(item[0] for item in args.targets),
         attack=args.attack,
         round_started_at=args.round_started_at,
         origin=args.origin,
+        presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
+        reconcile_on_start=args.reconcile,
     )
     mode = "真打" if args.attack else "只认目标"
-    listed = ", ".join(str(target) for target in options.targets)
-    say(f"模式：{mode}；预设 {BOT_ATTACK_PRESET}；目标 {listed}")
+    listed = ", ".join(
+        f"{target}={(options.presets or {}).get(target, BOT_ATTACK_PRESET)}"
+        for target in options.targets
+    )
+    say(f"模式：{mode}；目标 {listed}")
 
     driver = LiveDriver(allow_actions=args.attack)
     driver.window()

@@ -117,6 +117,15 @@ class BotTargetRow(Base):
     last_attack_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_dispatch_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 坐标扫描已核验；排行榜只从名字反解，可能是合法但错误的 OCR 结果。
+    source: Mapped[str] = mapped_column(String(16), default="scan", server_default="scan")
+    military_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    military_score_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    military_score_estimated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
+    #: 榜单名次。只为事后能拿「降序」这条免费校验和复核军力值（见 domain.records）。
+    military_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class AttackIntentRow(Base):
@@ -481,6 +490,59 @@ class MissionTaskRow(Base):
     disabled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class MissionTaskOriginRow(Base):
+    """军力攻击任务的多颗出发星球。
+
+    单 origin 列不能搬走：区域攻击已经在用它们。新表只给军力攻击加并行来源，
+    为空时调度器才回落到旧列，保证已有任务的含义不变。
+    """
+
+    __tablename__ = "mission_task_origins"
+    __table_args__ = (
+        UniqueConstraint("task_id", "galaxy", "system", "position", name="uq_task_origin"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("mission_tasks.id", ondelete="CASCADE"), index=True
+    )
+    #: 全局星球配置的引用。旧记录迁移后会回填；坐标列保留为历史快照，避免
+    #: 升级中断时既有任务失去出发点。
+    planet_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attack_planets.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    galaxy: Mapped[int] = mapped_column(Integer)
+    system: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+    fleet_lines: Mapped[int] = mapped_column(Integer)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class AttackPlanetRow(Base):
+    """可供攻击任务选择的出发星球。编号按 ``sort_index`` 从 1 连续显示。"""
+
+    __tablename__ = "attack_planets"
+    __table_args__ = (
+        UniqueConstraint("galaxy", "system", "position", name="uq_attack_planet_coordinate"),
+        UniqueConstraint("sort_index", name="uq_attack_planet_sort_index"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    sort_index: Mapped[int] = mapped_column(Integer)
+    galaxy: Mapped[int] = mapped_column(Integer)
+    system: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+
+
+class MilitaryAttackConfigRow(Base):
+    """军力攻击的全局档位方案；所有军力任务共享这一份。"""
+
+    __tablename__ = "military_attack_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    tiers_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
 
 class MissionRunRow(Base):

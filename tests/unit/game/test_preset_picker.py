@@ -507,3 +507,145 @@ def test_a_name_the_ocr_lowercased_is_still_matched() -> None:
     picker.pick("CCC")
 
     assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 CCC")]
+
+
+def test_the_unambiguous_bbb_font_misread_is_recovered() -> None:
+    """实机截图中 BBB 处于「探路 / CCC」之间，却被读成 BEB。
+
+    首尾两个 B 都识别正确，只有中间的花体 B 被误读；这不是把任意近似名放宽，
+    而是只接受三次重复代码的受限误读。精确读到 BBB 时仍必须优先点精确项。
+    """
+    picker, driver, _strip = _picker(
+        [[(748, "AAA"), (985, "探路")], [(760, "BEB"), (990, "CCC")]]
+    )
+
+    assert picker.pick("BBB") == 760
+    assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 BBB")]
+
+
+def test_an_exact_name_beats_the_bbb_font_misread() -> None:
+    picker, driver, _strip = _picker([[(760, "BEB"), (900, "BBB")]])
+
+    assert picker.pick("BBB") == 900
+    assert _preset_clicks(driver) == [(900, PRESET_NAME_ROW_Y, "预设 BBB")]
+
+
+def test_gold_names_survive_a_background_that_defeats_greyscale() -> None:
+    """⚠️⚠️ **灰度化在预设名这一行上会瞎掉，而这条 2026-08-15 那一夜代价很大。**
+
+    bot 链路整晚找不到 `BBB`、一发都没派，而 `BBB` 就明明白白印在屏幕上——
+    实机量下来，预设条第 4 页上灰度读 `BBB` 是空串（3×/4×/6×/8× 全空）。
+
+    成因是**亮度**：金字 (255,200,0) 灰度约 193，而它压着的蓝底在那一段约 150，
+    两者太近。滚到暗一点的位置（第 1 页）灰度就好用——所以这不是「配方错了」，
+    是「配方只在一部分滚动位置上成立」。
+
+    金色掩膜按 `red - blue` 判，与背景明暗无关。
+    """
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import gold_mask
+
+    # 金字压在亮蓝底上：灰度差只有 40 出头，掩膜差是黑白分明。
+    gold, bright_blue = (255, 200, 0), (60, 150, 210)
+    crop = Image.new("RGB", (4, 2), bright_blue)
+    crop.putpixel((1, 1), gold)
+
+    mask = list(gold_mask(crop).getdata())
+
+    assert mask.count(0) == 1, "只有金色那一个像素该被抠成黑"
+    assert set(mask) == {0, 255}, "掩膜必须是纯黑白，不留灰度"
+
+
+def test_the_mask_ignores_the_white_quantity_columns_beside_the_names() -> None:
+    """宽 ROI 之所以安全，全靠掩膜把白字数量列滤掉。
+
+    窄 ROI（右界 1000）当初就是为了躲开那些数字，而掩膜下它们根本不在图里——
+    所以掩膜那一档可以放心用整条预设条，而那正是它读得出 `BBB` 的原因：
+    实机上窄 ROI 里 `BBB` 的像素在（148 个黑点），tesseract 却读成空串，
+    因为一张大片空白里只有一个孤零零的词它认不出来。
+    """
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import gold_mask
+
+    white_number, gold = (240, 240, 240), (255, 200, 0)
+    crop = Image.new("RGB", (2, 1), white_number)
+    crop.putpixel((1, 0), gold)
+
+    assert list(gold_mask(crop).getdata()) == [255, 0]
+
+
+class _TwoShotOcr:
+    """第一次读空、第二次给字。用来验「灰度读空之后真的还有第二档」。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.Output = type("Output", (), {"DICT": "dict"})
+
+    def image_to_data(self, _image: object, **_kwargs: object) -> dict[str, list[object]]:
+        self.calls += 1
+        if self.calls == 1:  # 灰度那一档：什么都没读到
+            return {"text": [""], "left": [0], "width": [0]}
+        return {"text": ["BBB"], "left": [540], "width": [69]}
+
+
+class _ComplementaryOcr:
+    """灰度只读到「探路」、金色掩膜才读到右侧 BBB 的同屏实机形状。"""
+
+    Output = type("Output", (), {"DICT": "dict"})
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def image_to_data(self, _image: object, **_kwargs: object) -> dict[str, list[object]]:
+        self.calls += 1
+        if self.calls == 1:
+            return {"text": ["探路"], "left": [540], "width": [90]}
+        return {"text": ["BBB"], "left": [450], "width": [69]}
+
+
+def test_an_empty_greyscale_reading_falls_through_to_the_mask() -> None:
+    """⚠️ **这条钉的是「第二档真的存在」，不是掩膜本身好不好。**
+
+    掩膜函数写对了、但 `name_words` 忘了调它——变异测试当场抓到过这个形状：
+    把那一档从配方表里删掉，所有单测掩膜的用例照样全绿。
+
+    而少了这一档的后果就是 2026-08-15 那一夜：bot 链路整晚找不到 `BBB`，
+    一发都没派。
+    """
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import name_words
+
+    ocr = _TwoShotOcr()
+
+    words = name_words(Image.new("RGB", (1920, 917), (60, 150, 210)), ocr)
+
+    assert ocr.calls == 2, "灰度读空之后必须再试一次掩膜"
+    assert [text for _x, text in words] == ["BBB"]
+
+
+def test_a_greyscale_hit_does_not_hide_bbb_in_the_gold_mask() -> None:
+    """BBB 位于探路和 CCC 之间时，读到左侧「探路」也不能提前结束 OCR。"""
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import name_words
+
+    words = name_words(Image.new("RGB", (1920, 917), (60, 150, 210)), _ComplementaryOcr())
+
+    assert [text for _x, text in words] == ["探路", "BBB"]
+
+
+def test_a_successful_greyscale_reading_does_not_pay_for_the_mask() -> None:
+    """灰度读到左侧名称，也仍要读掩膜中的右侧 BBB。"""
+    from PIL import Image
+
+    from evo_helper.game.preset_picker import name_words
+
+    ocr = _TwoShotOcr()
+    ocr.calls = 1  # 让第一次就返回有字的那一份
+
+    name_words(Image.new("RGB", (1920, 917), (60, 150, 210)), ocr)
+
+    assert ocr.calls == 3, "同一屏的两档 OCR 都必须跑，避免越过右侧 BBB"

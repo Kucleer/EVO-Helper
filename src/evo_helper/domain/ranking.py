@@ -114,6 +114,23 @@ def coordinate_of(name: str) -> Coordinate | None:
     return Coordinate(galaxy, system, position)
 
 
+def mentions_bot(text: str) -> bool:
+    """这段文字里有没有出现**一个 bot 名字的形状**（`bot_银河_恒星系_行星`）。
+
+    用途：翻过真人段时，把名字列整条读一次，问「到 bot 区了没有」。
+    到了才开始逐格细读三列——真人段一格都不用细读。
+
+    ⚠️ **不能用子串 `bot` 判。** 榜上有真人叫 `goodbot`（实机 2026-08-15 第 7 名），
+    还有 `Bot_1_1_1` 这种大小写变体。这里复用 `coordinate_of` 那条正则的形状：
+    要求 `bot` 后面跟三组数字，`goodbot` 不匹配。
+
+    ⚠️ 只看**形状**，不校验区间——区间校验是 `coordinate_of` 的事，
+    那一步会把 `bot_2_1121_7` 这种挡掉。这里宁可宽一点：判早了只是多读几屏，
+    判晚了会一直翻不到头。
+    """
+    return _BOT_NAME_RE.search(text or "") is not None
+
+
 def repair_ranks(ranks: Sequence[int | None]) -> list[int | None]:
     """按「逐行 +1」把读错的名次修回来。修不回来的留 None。
 
@@ -219,5 +236,6 @@ __all__ = [
     "coordinate_of",
     "descending_breaks",
     "interpolate_scores",
+    "mentions_bot",
     "repair_ranks",
 ]

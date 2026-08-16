@@ -16,6 +16,7 @@ import pytest
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase
 from evo_helper.domain.models import Coordinate
 from evo_helper.tools.bot_loop import BotLoop, BotOptions, parse_round_start, parse_target
+from evo_helper.tools.pirate_loop import LoopOptions
 
 TARGET = Coordinate(2, 137, 14)
 
@@ -51,7 +52,10 @@ class _FakeNavigator:
 
 
 def _run_with_phases(
-    monkeypatch: pytest.MonkeyPatch, phases: dict[Coordinate, BotPhase]
+    monkeypatch: pytest.MonkeyPatch,
+    phases: dict[Coordinate, BotPhase],
+    *,
+    reconcile_on_start: bool = False,
 ) -> list[str]:
     """跑一趟 `run()`，返回这一趟按顺序调了哪些动作。"""
     from evo_helper.game import game_window
@@ -61,7 +65,15 @@ def _run_with_phases(
 
     calls: list[str] = []
     loop = BotLoop.__new__(BotLoop)
-    loop._bot = BotOptions(targets=tuple(phases), attack=True)
+    loop._bot = BotOptions(
+        targets=tuple(phases), attack=True, reconcile_on_start=reconcile_on_start
+    )
+    loop._options = LoopOptions(
+        systems=(),
+        scout=False,
+        attack=True,
+        reconcile_on_start=reconcile_on_start,
+    )
     loop._outcome = Outcome()
     loop._navigator = _FakeNavigator()
     loop._reset_to_known_screen = lambda: None
@@ -71,7 +83,7 @@ def _run_with_phases(
     # 切出发星球要开浮层、OCR、回读派遣面板，那条链路自己有专门的用例
     # （`tests/unit/game/test_planet_list.py` 与 `test_pirate_loop_origin_planet.py`）。
     loop.ensure_origin_planet = lambda: True
-    # 开工那一趟信箱（读战报 + 数今天打了几发）要开库、要看屏，这里只记它跑过。
+    # 只有显式要求时才读一趟信箱；调度器续跑时不准进来。
     loop.reconcile_today = lambda: calls.append("开工那一趟信箱")
     loop._nav_labels = lambda: ""
     loop._phase_of = lambda coordinate: phases[coordinate]
@@ -103,18 +115,18 @@ def test_each_phase_routes_to_exactly_one_action(
     和一次配额，而画面上看不出异常。原先五个态里的两个探路态已经删掉，**不是留成
     死态**：留着的话这张参数表里会有两行永远走不到的分支，读的人会以为那条路还在。
 
-    等待态在这里不进信箱：战报由开工那一趟统一收（见下一条）。它在这里只剩下
+    等待态在这里不进信箱：战报由启动时显式补录统一收（见下一条）。它在这里只剩下
     一句话，而那句话要说准是「还没到点」还是「到点了却没翻到」。
 
     只有 `DONE` 什么都不做。
     """
-    assert _run_with_phase(monkeypatch, phase) == ["开工那一趟信箱", *expected]
+    assert _run_with_phase(monkeypatch, phase) == expected
 
 
-def test_reports_are_read_before_the_phases_are_decided(
+def test_reports_are_read_only_when_explicitly_requested_before_the_phases_are_decided(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """**本文件的重点。** 开工那一趟信箱排在分态之前，而且整轮只有那一趟。
+    """显式补录排在分态之前，而且整轮只有那一趟。
 
     用户口径（2026-08-11）：「任务启动先去读战报。」顺序不能反——反了的话，
     这一趟刚读回来的战报要等下一轮才作数，于是「平局就再打」也要晚一整个调度
@@ -135,6 +147,7 @@ def test_reports_are_read_before_the_phases_are_decided(
             TARGET: BotPhase.AWAITING_ATTACK_REPORT,
             other: BotPhase.NEEDS_ATTACK,
         },
+        reconcile_on_start=True,
     )
 
     assert calls == ["开工那一趟信箱", "说还在等战报", "打一发"]
@@ -178,6 +191,7 @@ def test_the_loop_dispatches_with_the_bot_attack_preset(monkeypatch: pytest.Monk
     presets: list[str | None] = []
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(targets=(TARGET,), attack=True)
+    loop._options = LoopOptions(systems=(), scout=False, attack=True)
     loop._outcome = Outcome()
     loop._goto_checked = lambda _c: TargetCheck.CONFIRMED
     loop.attack = lambda coordinate, *, preset=None: presets.append(preset) or True
@@ -254,6 +268,7 @@ def test_running_out_of_lines_ends_the_round_cleanly(monkeypatch: pytest.MonkeyP
 
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(targets=(TARGET,), attack=True)
+    loop._options = LoopOptions(systems=(), scout=False, attack=True)
     loop._outcome = Outcome()
     loop._navigator = _FakeNavigator()
     loop._reset_to_known_screen = lambda: None

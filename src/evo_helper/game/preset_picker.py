@@ -68,6 +68,16 @@ from evo_helper.game.pirate_ui import (
 PRESET_NAME_ROI = (730, 684, 1000, 704)
 PRESET_NAME_UPSCALE = 3
 
+#: 金色掩膜那一档用的**宽** ROI：整条预设条都收进来。
+#:
+#: 上面那条把右界收到 1000，理由是「再往右是第二个预设的数量列，读进来只是噪声」。
+#: **那条理由在掩膜下不成立**：数量列是白字，按金色抠完根本不在图里。
+#:
+#: 而宽一点是必须的：实机 2026-08-15 量到，窄 ROI 里 `BBB` 的像素明明在
+#: （148 个黑点），tesseract 却读成空串——一张大片空白里只有一个孤零零的词时
+#: 它认不出来。把 `CCC` 一起收进来（238 个黑点）就一次读对。
+PRESET_NAME_ROI_WIDE = (730, 682, 1240, 706)
+
 #: 展开预设条后等它铺开。
 PRESET_OPEN_WAIT_S = 1.6
 
@@ -232,28 +242,65 @@ class PresetPicker:
         raise PresetNotFound(f"预设条上找不到 {name!r}；从左到右逐屏读到的是 {screens}")
 
 
+def gold_mask(crop: Any) -> Any:
+    """把金黄的预设名抠成**黑字白底**，背景一律刷白。
+
+    ⚠️ **灰度化在这一行上会瞎掉。** 实机 2026-08-15：预设条第 4 页上的 `BBB`
+    灰度读出来是空串（3×/4×/6×/8× 全空），而金色掩膜 3× 一次就读对。
+    原因是金字压在蓝底上，两者**亮度接近**——金 (255,200,0) 灰度约 193，
+    背景蓝约 79–150，滚到亮一点的那一段就没有对比度了。掩膜按 `r - b` 判，
+    与背景明暗无关。
+
+    这条判据 2026-08-15 那一夜代价很大：bot 链路整晚找不到 `BBB`，
+    一发都没派，而 `BBB` 就明明白白印在屏幕上。
+    """
+    from PIL import Image
+
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    source = list(rgb.getdata())
+    painted = [
+        0 if (red > 140 and green > 110 and red - blue > 60) else 255 for red, green, blue in source
+    ]
+    mask = Image.new("L", (width, height))
+    mask.putdata(painted)
+    return mask
+
+
 def name_words(image: Any, ocr: Any) -> list[tuple[int, str]]:
     """从一张整窗截图里读出预设名那一行的 `(中心 x, 文字)`。
 
     用词框而不是整行文本：要拿 x 去点。
+
+    ⚠️ **两档配方，结果要合并，不能「读到一个就停」。** 灰度那一档在预设条
+    **某些滚动位置**上完全读不出来（见 `gold_mask`）；更隐蔽的是，同一屏的左半边
+    「探路」可以被灰度读到，右半边的 BBB 却读不到。若把「读到探路」当作成功就
+    提前返回，随后右拖时恰好越过 BBB，只剩 CCC——这正是实机截图所示的排列。
+
+    所以每屏都跑灰度与金色掩膜，将同名的重叠结果去重后交给调用方。多一次 OCR 的
+    成本远小于漏选预设；而每个词框的 x 仍只来自当前截图。
     """
-    crop = image.crop(PRESET_NAME_ROI).convert("L")
-    grey = crop.resize(
-        (crop.width * PRESET_NAME_UPSCALE, crop.height * PRESET_NAME_UPSCALE),
-        _lanczos(image),
-    )
-    data = ocr.image_to_data(
-        grey, lang="chi_sim+eng", config="--psm 6", output_type=ocr.Output.DICT
+    recipes = (
+        (PRESET_NAME_ROI, image.crop(PRESET_NAME_ROI).convert("L")),
+        (PRESET_NAME_ROI_WIDE, gold_mask(image.crop(PRESET_NAME_ROI_WIDE))),
     )
     words: list[tuple[int, str]] = []
-    for index, word in enumerate(data["text"]):
-        text = word.strip()
-        if not text:
-            continue
-        left = PRESET_NAME_ROI[0] + data["left"][index] // PRESET_NAME_UPSCALE
-        width = data["width"][index] // PRESET_NAME_UPSCALE
-        words.append((left + width // 2, text))
-    return words
+    for roi, prepared in recipes:
+        scaled = prepared.resize(
+            (prepared.width * PRESET_NAME_UPSCALE, prepared.height * PRESET_NAME_UPSCALE),
+            _lanczos(image),
+        )
+        data = ocr.image_to_data(
+            scaled, lang="chi_sim+eng", config="--psm 6", output_type=ocr.Output.DICT
+        )
+        for index, word in enumerate(data["text"]):
+            text = word.strip()
+            if not text:
+                continue
+            left = roi[0] + data["left"][index] // PRESET_NAME_UPSCALE
+            width = data["width"][index] // PRESET_NAME_UPSCALE
+            words.append((left + width // 2, text))
+    return _deduplicate_words(words)
 
 
 def merged_names(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
@@ -292,15 +339,48 @@ def _clickable_hit(runs: Sequence[tuple[int, str]], name: str) -> int | None:
     # 放宽的代价是「aaa」会匹配上「AAA」，而预设名是用户自己起的、就那么几个，
     # 大小写撞名不构成风险；漏匹配的代价则是整条链路停摆。
     wanted = name.casefold()
+    approximate: list[int] = []
     for x, text in sorted(runs):  # 命中多个只可能是同名出现两次，取最左那个。
-        if wanted not in text.casefold():
-            continue
         if PRESET_SAVE_BUTTON_KEYWORD in text:
             continue
         if x >= PRESET_SAFE_CLICK_MAX_X:
             continue
-        return x
-    return None
+        observed = text.casefold()
+        if wanted in observed:
+            return x
+        if _is_repeated_code_ocr_misread(wanted, observed):
+            approximate.append(x)
+    # 实机截图中的 BBB 会被 tesseract 稳定读为 BEB：首尾两个 B 都正确，仅中间
+    # 一个花体 B 被误判为 E。只对这种「目标本身是同一字母重复三次，且首尾精确
+    # 一致」的极窄形状放行，且始终让精确命中优先，避免把普通相近名称当成目标。
+    return approximate[0] if approximate else None
+
+
+def _deduplicate_words(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
+    """合并两档 OCR 的同名重叠词框，不让 `CCC` + `ccc` 被拼成一个假名字。"""
+    deduplicated: list[tuple[int, str]] = []
+    for x, text in entries:
+        normalized = text.casefold()
+        if any(
+            known.casefold() == normalized and abs(known_x - x) <= PRESET_WORD_GAP_PX
+            for known_x, known in deduplicated
+        ):
+            continue
+        deduplicated.append((x, text))
+    return deduplicated
+
+
+def _is_repeated_code_ocr_misread(wanted: str, observed: str) -> bool:
+    """仅修正 BBB -> BEB 这一类有两个边界字符作证的三字母误读。"""
+    return (
+        len(wanted) == len(observed) == 3
+        and wanted.isascii()
+        and wanted.isalpha()
+        and wanted[0] == wanted[1] == wanted[2]
+        and observed[0] == wanted[0]
+        and observed[2] == wanted[2]
+        and observed.isalpha()
+    )
 
 
 def _lanczos(image: Any) -> Any:
@@ -315,6 +395,8 @@ def _names_of(entries: Sequence[tuple[int, str]]) -> list[str]:
 
 
 __all__ = [
+    "PRESET_NAME_ROI_WIDE",
+    "gold_mask",
     "PRESET_NAME_ROI",
     "PRESET_WORD_GAP_PX",
     "PresetNotFound",

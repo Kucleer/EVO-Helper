@@ -68,6 +68,21 @@ class MissionKind(Enum):
     PIRATE = "PIRATE"
     BOT = "BOT"
     SCAN = "SCAN"
+    RANKING = "RANKING"
+
+
+#: **填空隙**的那几种任务：不派遣舰队、没有完成态、排最后、可被攻击抢占。
+#:
+#: 抽成集合而不是继续逐处写 `is MissionKind.SCAN`，是因为 2026-08-15 加军力榜
+#: 采集时发现那个判断在本模块里散着六处，语义完全一样。漏改任何一处的后果都是
+#: 静默的：漏在 `ready_to_run` 就永远不跑，漏在抢占判断就**攻击到点了也抢不过来**
+#: ——而那正是「间歇时间拿去扫描」这套设计唯一不能出错的地方。
+GAP_FILLERS = frozenset({MissionKind.SCAN, MissionKind.RANKING})
+
+
+def fills_gaps(kind: MissionKind) -> bool:
+    """这种任务是不是拿来填空隙的（见 `GAP_FILLERS`）。"""
+    return kind in GAP_FILLERS
 
 
 class Action(Enum):
@@ -342,7 +357,7 @@ def cooling_down(
     主星那个任务刚跑完，2 号星那个就得干等五分钟，而它俩占的根本不是同一份航线。
     """
     task_facts = facts.of(task)
-    if task.kind is MissionKind.SCAN:
+    if fills_gaps(task.kind):
         last_failure = task_facts.last_failure_at_utc
         return last_failure is not None and facts.now_utc - last_failure < restart_cooldown
     last_started = task_facts.last_started_at_utc
@@ -411,7 +426,7 @@ def waiting_for_a_line(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     一条只是在崩溃冷却里的扫描会被 `status_of` 说成「等航线」——一句用户照着
     去调航线数、调完也不会有任何变化的假话。
     """
-    if task.kind is MissionKind.SCAN:
+    if fills_gaps(task.kind):
         return False
     if not came_back_empty(task, facts):
         return False
@@ -456,8 +471,13 @@ def has_work(
     if cooling_down(task, facts, restart_cooldown=restart_cooldown):
         return False
 
-    if task.kind is MissionKind.SCAN:
-        # 扫描不派遣，因此不受航线约束，也没有完成态。它正是用来填空隙的。
+    # ⚠️ 这里**故意不写成 `fills_gaps(task.kind)`**，尽管语义完全一样。
+    # 函数调用挡住了 mypy 的类型收窄，末尾那个 `assert_never` 就失效了——而它
+    # 正是「加了新 MissionKind 却漏改分支」唯一的把关（漏掉的后果是新链路
+    # 静默套用 BOT 的判据）。写成显式的 `is ... or ... is ...`，收窄才成立。
+    # 代价是加第三种填空隙任务时这里要跟着改一次，而 `assert_never` 会当场提醒。
+    if task.kind is MissionKind.SCAN or task.kind is MissionKind.RANKING:
+        # 扫描/军力榜都不派遣，因此不受航线约束，也没有完成态。它们正是用来填空隙的。
         return True
 
     can_dispatch = facts.of(task).free_lines > 0 and not waiting_for_a_line(task, facts)
@@ -490,7 +510,7 @@ def scheduling_order(task: TaskSnapshot) -> tuple[bool, int]:
     抽成具名函数是为了让页面的展示次序和 `decide()` 的调度次序共用同一把尺子：
     两处各写一遍，就会出现「页面上排第一、实际最后才跑」。
     """
-    return (task.kind is MissionKind.SCAN, task.priority)
+    return (fills_gaps(task.kind), task.priority)
 
 
 def status_of(
@@ -558,14 +578,15 @@ def decide(
     )
 
     if running is not None:
-        # 抢占只有一条规则：只有扫描会被打断。攻击轮中途杀掉可能正停在派遣面板上。
+        # 抢占只有一条规则：只有填空隙的那几种（扫描 / 军力榜）会被打断。
+        # 攻击轮中途杀掉可能正停在派遣面板上。
         if (
-            running.kind is MissionKind.SCAN
+            fills_gaps(running.kind)
             and wanted is not None
-            # 上面的排序键已经让 SCAN 结构性地排最后，`wanted` 理论上不可能
-            # 再是 SCAN——这一条在逻辑上恒真，留着是零成本的双保险，防的是
+            # 上面的排序键已经让填空隙的那几种结构性地排最后，`wanted` 理论上
+            # 不可能再是它们——这一条在逻辑上恒真，留着是零成本的双保险，防的是
             # 排序键将来被改动却没人第一时间注意到。
-            and wanted.kind is not MissionKind.SCAN
+            and not fills_gaps(wanted.kind)
             and facts.now_utc - running.started_at_utc >= min_dwell
         ):
             return Decision(Action.PREEMPT, wanted)

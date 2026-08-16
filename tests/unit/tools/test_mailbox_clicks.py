@@ -27,7 +27,7 @@ ALLOWED_MAIL_CLICK_LABELS = frozenset(
         "打开邮件",
         "返回",
         "关闭面板",
-        "关闭信箱",
+        "关闭邮箱列表（左上角X）",
     }
 )
 
@@ -72,6 +72,29 @@ def test_the_report_tab_is_actually_used() -> None:
     """
     source = inspect.getsource(pirate_loop.PirateLoop._open_mail)
     assert "报告标签" in _click_labels(source)
+
+
+def test_reconciliation_closes_the_mail_list_with_its_top_left_x() -> None:
+    """对账收尾必须退出列表，否则下一步打开行星列表会被旧浮层遮住。"""
+    class Driver:
+        def __init__(self) -> None:
+            self.clicks: list[tuple[int, int, str]] = []
+
+        def click(self, x: int, y: int, *, label: str = "") -> None:
+            self.clicks.append((x, y, label))
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    driver = Driver()
+    loop._driver = driver  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: False  # type: ignore[attr-defined, assignment]
+    loop._require_system_view = lambda _reason: None  # type: ignore[attr-defined, assignment]
+
+    loop._close_mail()
+
+    assert driver.clicks == [(750, 71, "关闭邮箱列表（左上角X）")]
 
 
 def test_the_allow_list_has_no_filter_sounding_entries() -> None:

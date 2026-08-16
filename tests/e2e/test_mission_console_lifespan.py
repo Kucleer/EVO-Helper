@@ -56,7 +56,7 @@ def build(tmp_path: Path):  # type: ignore[no-untyped-def]
     return factory, SqlAlchemyRepository(factory)
 
 
-def test_startup_seeds_the_three_chains(tmp_path: Path) -> None:
+def test_startup_seeds_every_chain(tmp_path: Path) -> None:
     """迁移里没有 `bulk_insert`，少一行只会让那条链路凭空消失在调度台上。"""
     factory, repository = build(tmp_path)
     app = create_persistent_app(factory, local_token="t")
@@ -64,7 +64,12 @@ def test_startup_seeds_the_three_chains(tmp_path: Path) -> None:
     with TestClient(app):
         pass
 
-    assert sorted(row.kind for row in repository.mission_tasks()) == ["BOT", "PIRATE", "SCAN"]
+    assert sorted(row.kind for row in repository.mission_tasks()) == [
+        "BOT",
+        "PIRATE",
+        "RANKING",
+        "SCAN",
+    ]
 
 
 def test_startup_marks_orphans_without_shooting_at_a_recycled_pid(tmp_path: Path) -> None:

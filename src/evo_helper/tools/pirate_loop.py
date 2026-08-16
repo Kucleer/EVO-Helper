@@ -346,8 +346,15 @@ PANEL_TITLE_ROI = (890, 55, 1040, 95)
 MAIL_LIST_TITLE = "邮箱"
 MAIL_DETAIL_TITLE = "消息"
 
-#: 信箱与详情页左上角的返回/关闭键（同一个位置，语义随页面变）。
+#: 报告详情页左上角的返回键。
 MAIL_BACK = (750, 71)
+
+#: 邮箱**列表**左上角的 X。对账结束后必须点它离开列表；否则列表浮层会盖住
+#: 后续的行星列表，出发星球坐标列就只能 OCR 成空，攻击不会进入预设选择。
+#:
+#: 坐标目前与报告详情页的返回键相同，但语义不能共用：详情页点它是「返回列表」，
+#: 列表点它才是「关闭信箱」。分开命名能让收尾测试守住用户指定的这个动作。
+MAIL_LIST_CLOSE = (750, 71)
 
 #: 一趟信箱最多重进几次。
 #:
@@ -626,6 +633,11 @@ class LoopOptions:
     #: `attack_intents.origin_*`，战报认领正是靠「出发坐标 + 目标坐标 + 时间就近」
     #: 配对的。让 runner 自己去猜，等于两个任务的账可能记到同一颗星球上。
     origin: Coordinate | None = None
+    #: 是否在**这一轮开始前**读一次当日战报。默认关：调度器会因航线逐步
+    #: 释放而多次拉起 runner，若每个 runner 都进信箱，就会在攻击过程中反复
+    #: 翻战报。需要启动对账时由控制台的「启动战报补录」显式做一次；手工运行
+    #: 则传 ``--reconcile``。
+    reconcile_on_start: bool = False
 
 
 @dataclass
@@ -817,6 +829,12 @@ class PirateLoop:
             )
             if any(COORDINATE_RE.search(text) for _y, text in words):
                 return words
+        # 空行会安全地挡住派遣，但不能只留下 ``[[]]``：实机上同一套配方在手工
+        # 截图里读得到三颗星球，运行时读空就说明画面时序或 tesseract 配置变了。
+        # 留下原图和每档读数，下一轮才能校准，而不是盲目重试。
+        self._dump_frame("planet-list-unreadable")
+        configured = getattr(pytesseract.pytesseract, "tesseract_cmd", "<unset>")
+        say(f"  行星列表坐标 OCR 全空；tesseract={configured!r}")
         return []
 
     def _fleet_origin_text(self) -> str:
@@ -1125,13 +1143,18 @@ class PirateLoop:
         self._driver.wait(DISPATCH_WAIT_S)
         timer.lap("开面板")
 
-        picker = PresetPicker(driver=self._driver, read_names=self._preset_names)
+        picker = PresetPicker(
+            driver=_PresetPickerDriver(self._driver), read_names=self._preset_names
+        )
         try:
             picker.pick(wanted)
         except PresetNotFound as error:
             timer.lap("翻预设条")
             timer.say_total("没找到预设")
             say(f"  {error}；关掉面板，不打这一发")
+            # 预设名的 OCR 与拖动位置必须一起看；只留合并后的词表无法判断是
+            # 识别错了，还是预设条根本没有横向移动到 BBB / CCC 所在的卡片。
+            self._dump_frame("preset-not-found")
             self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
             self._driver.wait(DISPATCH_WAIT_S)
             # 派遣面板开过之后导航栏里是什么已经不可知了，和 `_leave_dispatch_list`
@@ -2242,17 +2265,17 @@ class PirateLoop:
         self._require_system_view("派出之后切不回恒星系视图")
 
     def _close_mail(self) -> None:
-        """回到恒星系视图。信箱是浮层，关掉之后还在自己星球的地表视图上。
+        """点邮箱列表左上角 X，再回到恒星系视图。
 
         ⚠️ 这里同样不再显式清导航缓存：进信箱要先切到地表视图，而
         `_goto_planet_surface` 与回来时的 `ensure_system_view` **换过视图就已经清了**。
         再补一次是空动作，理由见 `_leave_dispatch_list`。
         """
-        self._driver.click(*MAIL_BACK, label="关闭信箱")
+        self._driver.click(*MAIL_LIST_CLOSE, label="关闭邮箱列表（左上角X）")
         self._driver.wait(2.0)
         if self._on_mail_list():
             # 还在列表上说明刚才那一下退的是详情页，再退一层才关掉信箱。
-            self._driver.click(*MAIL_BACK, label="关闭信箱")
+            self._driver.click(*MAIL_LIST_CLOSE, label="关闭邮箱列表（左上角X）")
             self._driver.wait(2.0)
         self._require_system_view("读完邮件切不回恒星系视图")
 
@@ -2467,6 +2490,13 @@ class PirateLoop:
         if not switch_needed(target, self._current_planet):
             return True
         say(f"出发星球：切到 {target}")
+        # ``NAV_PLANET`` 是**地表**底栏的「行星」按钮；在恒星系视图同一个
+        # 像素是别的入口，点下去不会出现坐标列表，OCR 只能安全地读成空。读完
+        # 邮箱后流程刻意回到恒星系视图，因此这里必须先回地表，再打开列表。
+        if not self._goto_planet_surface():
+            self._outcome.busy = "切出发星球前回不到星球地表"
+            say(f"  {self._outcome.busy}；这一轮一发都不派")
+            return False
         result = self.planet_switcher().switch_to(target)
         if result is not SwitchResult.SWITCHED:
             self._outcome.busy = f"切不到出发星球 {target}（{result.value}）"
@@ -2497,7 +2527,7 @@ class PirateLoop:
         self._require_system_view("开工时切不到恒星系视图")
 
         try:
-            # ⚠️ **读信箱必须排在切星球前面，这个顺序是承重的。**
+            # ⚠️ **显式要求读信箱时，必须排在切星球前面。**
             # 信箱是账号级的，读它跟站在哪颗星球上毫无关系；而切星球是开工阶段
             # 最容易失手的一步（要认坐标、要拖列表、要回读）。
             #
@@ -2505,7 +2535,11 @@ class PirateLoop:
             # 一份战报都不入库**。而「预设舰队攻击后部分战报缺失、回读机制没入库」
             # 正是用户 2026-08-13 报的那个毛病——一个防记账错乱的功能，反过来
             # 成了战报缺失的新来源。切换失手只该挡住派遣，不该连带挡掉读战报。
-            self.reconcile_today()
+            # 调度器会在一条航线返航后再次拉起 runner。这里若无条件进信箱，
+            # 就会把「等舰队回来继续派」误做成「每次续跑都翻一遍战报」。启动
+            # 对账由控制台统一安排一次；runner 只在手工显式请求时才读。
+            if self._options.reconcile_on_start:
+                self.reconcile_today()
             if not self.ensure_origin_planet():
                 # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
                 # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
@@ -2823,6 +2857,44 @@ class _PlanetListDriver:
         self._driver.wait(seconds)
 
 
+class _PresetPickerDriver:
+    """预设条专用的分步横拖。
+
+    ``LiveDriver.drag`` 是一步式 ``dragTo``；实机预设条会把它吞掉，始终停在
+    ``AAA / 探路``。这里复用行星列表慢拖的原则，但横向范围只落在预设条的安全
+    区（由 ``PresetPicker`` 的常量守住），不会触及右侧「保存」按钮。
+    """
+
+    def __init__(self, driver: LiveDriver) -> None:
+        self._driver = driver
+
+    def click(self, x: int, y: int, *, label: str = "") -> None:
+        self._driver.click(x, y, label=label)
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
+        del label
+        import random
+
+        self._driver.focus()
+        origin_x, origin_y = self._driver.origin()
+        gui = self._driver._gui  # noqa: SLF001 - 分步拖动需要原始鼠标控制。
+        gui.moveTo(origin_x + from_x, origin_y + from_y, random.uniform(0.2, 0.4))
+        gui.mouseDown()
+        time.sleep(random.uniform(0.10, 0.20))
+        for index in range(1, 13):
+            ratio = index / 12
+            gui.moveTo(
+                origin_x + int(from_x + (to_x - from_x) * ratio),
+                origin_y + from_y + random.randint(-1, 1),
+                random.uniform(0.02, 0.05),
+            )
+        time.sleep(random.uniform(0.12, 0.25))
+        gui.mouseUp()
+
+    def wait(self, seconds: float) -> None:
+        self._driver.wait(seconds)
+
+
 def _preset_signature(name: str) -> str:
     """预设签名就是标题本身。
 
@@ -2937,6 +3009,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="出发星球（记账用）。调度器会传；手工跑不给则用 EVO_HELPER_ORIGIN",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="开工前只读一次当日战报；调度器续跑时默认不读",
+    )
     args = parser.parse_args(argv)
 
     import ctypes
@@ -2949,6 +3026,7 @@ def main(argv: list[str] | None = None) -> int:
         attack=args.attack,
         preset=args.preset,
         origin=args.origin,
+        reconcile_on_start=args.reconcile,
     )
     mode = "扫描" if not args.scout else ("侦察+攻击" if args.attack else "只侦察")
     listed = ", ".join(f"{galaxy}:{system}" for galaxy, system in options.systems)

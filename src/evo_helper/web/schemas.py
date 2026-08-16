@@ -1,6 +1,7 @@
 """Pydantic request/response models for the local HTTP API."""
 
 from datetime import date, datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -158,7 +159,7 @@ class MissionTaskOut(BaseModel):
     label: str
     enabled: bool
     priority: int
-    params: dict[str, int]
+    params: dict[str, Any]
     #: `运行中` / `待命` / `等航线` / `冷却中` / `配额用尽` / `已完成` /
     #: `已停用` / `未启用`，由 `domain.scheduler.status_of` 判定。
     status: str
@@ -186,7 +187,7 @@ class MissionTaskPatch(BaseModel):
     #: 海盗 `{"radius": N}`、bot `{"galaxy": G, "first_system": A, "last_system": B}`。
     #: 只收整数：`{"radius": true}` 这种会被当成半径 1，悄悄打出一圈不是用户
     #: 想要的范围。
-    params: dict[str, int] | None = None
+    params: dict[str, Any] | None = None
     name: str | None = None
     #: 出发星球，`星系:恒星系:位置`。
     #: **空串是一个动作**：把它退回「用全局主星」。它和 `None`（这次不动它）
@@ -205,6 +206,42 @@ class MissionTaskCreate(BaseModel):
     #: 留空表示跟着全局值走。
     origin: str | None = None
     fleet_lines: int | None = None
+
+
+class MissionOriginIn(BaseModel):
+    """军力任务选择配置页中的一颗出发星球；保存整组时原子替换。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    planet_id: int = Field(ge=1)
+    fleet_lines: int = Field(ge=1)
+    enabled: bool = True
+
+
+class MissionOriginOut(CoordinateModel):
+    planet_id: int | None = None
+    fleet_lines: int = Field(ge=1)
+    enabled: bool = True
+
+
+class AttackPlanetIn(CoordinateModel):
+    """全局攻击星球配置。"""
+
+
+class AttackPlanetOut(AttackPlanetIn):
+    planet_id: int
+    number: int
+
+
+class MilitaryTierIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_score: float = Field(ge=0)
+    preset: str = Field(min_length=1, max_length=120)
+
+
+class MilitaryAttackConfigOut(BaseModel):
+    tiers: list[MilitaryTierIn]
 
 
 class CurrentMissionOut(BaseModel):
