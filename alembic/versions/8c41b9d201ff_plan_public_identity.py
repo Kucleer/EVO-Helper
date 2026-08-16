@@ -25,10 +25,16 @@ def upgrade() -> None:
     with op.batch_alter_table("scan_plans") as batch:
         batch.add_column(sa.Column("public_id", sa.Uuid(), nullable=True))
         batch.add_column(sa.Column("updated_at_utc", sa.DateTime(), nullable=True))
-    op.execute(
-        "UPDATE scan_plans SET public_id = lower(hex(randomblob(16))), "
-        "updated_at_utc = created_at_utc WHERE public_id IS NULL"
-    )
+    # ⚠️ 补 UUID 的写法按方言分流。原来只有 SQLite 的 `randomblob(16)`，
+    # 2026-08-16 切 PostgreSQL 时整条升级链在这里断掉：那个函数在 PG 上不存在，
+    # 而且**空库也过不去**——语句解析阶段就报 `UndefinedFunction`，轮不到「影响 0 行」。
+    #
+    # PG 13 起 `gen_random_uuid()` 是内置的，不用装 pgcrypto。
+    if op.get_bind().dialect.name == "postgresql":
+        backfill = "UPDATE scan_plans SET public_id = gen_random_uuid(), "
+    else:
+        backfill = "UPDATE scan_plans SET public_id = lower(hex(randomblob(16))), "
+    op.execute(backfill + "updated_at_utc = created_at_utc WHERE public_id IS NULL")
     with op.batch_alter_table("scan_plans") as batch:
         batch.alter_column("public_id", nullable=False)
         batch.alter_column("updated_at_utc", nullable=False)

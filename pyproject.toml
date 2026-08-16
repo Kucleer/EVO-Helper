@@ -42,6 +42,18 @@ live = [
   "pyautogui>=0.9.54,<1",
   "pywin32>=306",
 ]
+# PostgreSQL 驱动。`EVO_HELPER_DATABASE_URL` 指向 `postgresql+psycopg://` 时必须装，
+# 否则控制台在 `create_database_engine()` 就倒在 `ModuleNotFoundError: psycopg`。
+#
+# 走 `[binary]`（预编译轮子）而不是源码版：源码版要 libpq 和编译器，Windows 上装不上。
+#
+# 单开一组、不进主依赖：CI 与只跑测试的机器用临时 SQLite 库，装它纯属浪费；
+# 而挂机那台机器 `uv sync` 时**必须**带上 `--extra db`——2026-08-16 切 PG 时
+# psycopg 只是手动装在 venv 里、没进 `uv.lock`，任何一次 `uv sync` 都会把它清掉，
+# 而清掉之后的症状是控制台起不来，不是「数据库连不上」这种一眼能认的报错。
+db = [
+  "psycopg[binary]>=3.2,<4",
+]
 # YOLO 单独一组：它拖 torch，几百 MB，而且只有 `vision/optional/yolo.py` 用得上，
 # 实机链路一次都不碰。放在 vision 里会让 `uv sync --extra vision` 因为下载它超时
 # 而整组装不上——实机就是这么卡住的。
