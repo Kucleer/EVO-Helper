@@ -119,8 +119,10 @@ def is_bot_coordinate(coordinate: Coordinate | None) -> TypeGuard[Coordinate]:
     """军力榜反解出的坐标是否可能是 bot。
 
     每个恒星系的 1--4 号位是游戏固定生成的海盗，不是可由军力榜驱动的
-    bot 攻击目标。名字即使形如 ``bot_2_137_1``，也只保留为榜单原始记录，
-    不能成为 bot 候选或派舰队依据。
+    bot 攻击目标。名字即使形如 ``bot_2_137_1``，也不能成为 bot 候选或派舰队依据。
+
+    ⚠️ 这里曾写着「只保留为榜单原始记录」。用户口径（2026-08-16）推翻了它：
+    海盗行**连榜单快照都不进**，见 `storage.military_rankings.append_snapshot`。
     """
     return coordinate is not None and coordinate.position not in PIRATE_POSITIONS
 
