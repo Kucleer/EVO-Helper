@@ -166,6 +166,26 @@ class ScoutReport:
 
 
 @dataclass(frozen=True)
+class PlanetScoutAlert:
+    """我方行星被其他玩家侦察时的安全邮件证据。
+
+    它既不是攻击战报，也不是我方发出的侦察报告；独立保存才不会改变派遣
+    认领、配额和目标扫描的任何结论。邮件指纹在持久化层计算并受唯一约束保护，
+    因此同一封信即使被后续战报扫描再次读到，也不会重复通知。
+    """
+
+    alert_id: UUID
+    reported_at_utc: datetime
+    raw_time_text: str
+    source: Coordinate
+    target: Coordinate
+    subject: str
+    raw_body: str
+    source_name: str | None = None
+    intercepted_probes: int | None = None
+
+
+@dataclass(frozen=True)
 class StateEvent:
     aggregate_type: str
     aggregate_id: UUID

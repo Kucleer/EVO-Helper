@@ -56,6 +56,36 @@ class Settings(BaseSettings):
     #: 海盗巡航范围全都从它算起。
     origin: str = str(ORIGIN)
 
+    # -- 邮件安全告警 ---------------------------------------------------------
+
+    #: 收到「你的行星被侦察」邮件时的通知收件人。留空时仍会把告警落库，
+    #: 但不会尝试联网投递。
+    alert_email_to: str | None = None
+    #: SMTP 参数使用邮箱服务商的**客户端授权码**，不是网页登录密码。
+    smtp_host: str | None = None
+    smtp_port: int = 465
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_use_ssl: bool = True
+    smtp_from: str | None = None
+
+    @property
+    def smtp_ready(self) -> bool:
+        """是否具备一次性投递告警所需的完整 SMTP 配置。
+
+        不在这里校验网络或登录：启动服务时因邮箱暂时不可用而失败，会把原本
+        本地可用的调度台一起拖垮。真正发送时才报出可见的失败原因。
+        """
+        return all(
+            (
+                self.alert_email_to,
+                self.smtp_host,
+                self.smtp_username,
+                self.smtp_password,
+                self.smtp_from or self.smtp_username,
+            )
+        )
+
     @property
     def origin_coordinate(self) -> Coordinate:
         """把 `origin` 解析成坐标；格式不对就当场报错。

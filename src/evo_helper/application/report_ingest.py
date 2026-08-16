@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from evo_helper.domain.records import (
     BattleReport,
     FleetSnapshotEntry,
+    PlanetScoutAlert,
     ScoutReport,
     ScoutTriggerShip,
     UiObservation,
@@ -15,6 +16,7 @@ from evo_helper.domain.records import (
 from evo_helper.vision.live_reports import LiveBattleReport
 from evo_helper.vision.models import FleetLine
 from evo_helper.vision.pirate_reports import PirateReportReading
+from evo_helper.vision.planet_scout_alert import PlanetScoutAlertReading
 from evo_helper.vision.scout_reports import PirateScoutReading
 
 # The repository and Web service filter snapshots on these exact strings.
@@ -122,6 +124,21 @@ def to_scout_report(reading: PirateScoutReading, *, report_id: UUID) -> ScoutRep
         origin=reading.origin,
         target=reading.target,
         trigger_ships=tuple(entries),
+    )
+
+
+def to_planet_scout_alert(reading: PlanetScoutAlertReading, *, alert_id: UUID) -> PlanetScoutAlert:
+    """Map a parsed foreign-reconnaissance mail into immutable local evidence."""
+    return PlanetScoutAlert(
+        alert_id=alert_id,
+        reported_at_utc=reading.reported_at_utc,
+        raw_time_text=reading.raw_time_text,
+        source=reading.source,
+        target=reading.target,
+        subject=reading.subject,
+        raw_body=reading.raw_body,
+        source_name=reading.source_name,
+        intercepted_probes=reading.intercepted_probes,
     )
 
 

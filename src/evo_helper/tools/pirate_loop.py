@@ -484,7 +484,7 @@ class MailRow:
         """
         return (self.subject, self.raw_time_text or "")
 
-    def may_be(self, wanted: ReportKind) -> bool:
+    def may_be(self, wanted: ReportKind | Sequence[ReportKind]) -> bool:
         """这一行**值不值得打开**。
 
         只有主题明确读成了别的类型才跳过；读不出、认不出（`UNKNOWN`）一律照开。
@@ -494,7 +494,8 @@ class MailRow:
         坐标 / 报告开头那行「已对 [x:y:z] 完成侦察」），主题只用来排掉**明摆着
         不是**的那些——实机上那恰恰是最多的一类：一整屏的攻击报告。
         """
-        return self.kind is wanted or self.kind is ReportKind.UNKNOWN
+        kinds = (wanted,) if isinstance(wanted, ReportKind) else tuple(wanted)
+        return self.kind in kinds or self.kind is ReportKind.UNKNOWN
 
     def is_older_than(self, moment: datetime | None) -> bool:
         """这一行是不是已经比 `moment` 还旧。**时间读不出来时一律返回 False。**
@@ -1256,7 +1257,7 @@ class PirateLoop:
     def _scan_mail_rows(
         self,
         *,
-        wanted: ReportKind,
+        wanted: ReportKind | Sequence[ReportKind],
         label: str,
         visit: Callable[[MailRow, Any], bool],
         not_before: datetime | None = None,
@@ -1493,6 +1494,9 @@ class PirateLoop:
         remaining = set(wanted)
 
         def visit(row: MailRow, header: Any) -> bool:
+            if row.kind is ReportKind.PLANET_SCOUTED:
+                self._ingest_planet_scout_alert(row, header)
+                return False
             # 舰种清单在详情页下半屏，要拖到底才看得到；VS 那一段则在拖之前读。
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
@@ -1521,8 +1525,8 @@ class PirateLoop:
         # 只给 `--attack` 不给 `--scout` 时用的是信箱里**已有**的那几封，
         # 它们比开工时刻早，早停会把它们全部挡在外面。
         self._scan_mail_rows(
-            wanted=ReportKind.SCOUT,
-            label="侦察报告",
+            wanted=(ReportKind.SCOUT, ReportKind.PLANET_SCOUTED),
+            label="侦察报告或安全告警",
             visit=visit,
             not_before=self._started_at if self._options.scout else None,
         )
@@ -1548,6 +1552,45 @@ class PirateLoop:
             return False
         repository.append_scout_report(to_scout_report(reading, report_id=uuid4()))
         return True
+
+    def _ingest_planet_scout_alert(self, row: MailRow, page: Any) -> None:
+        """Persist and notify a foreign-reconnaissance mail exactly once.
+
+        This method is only reached from an existing attack/scout mailbox scan;
+        it neither opens the mailbox itself nor schedules a poll.  Persisting
+        before SMTP means a restarted process cannot resend a mail already
+        accepted by the provider.
+        """
+        from evo_helper.application.alert_email import deliver_planet_scout_alert
+        from evo_helper.application.report_ingest import to_planet_scout_alert
+        from evo_helper.vision.planet_scout_alert import (
+            PlanetScoutAlertUnreadable,
+            read_planet_scout_alert,
+        )
+
+        try:
+            reading = read_planet_scout_alert(page, subject=row.subject)
+        except PlanetScoutAlertUnreadable as error:
+            say(f"  第 {row.index} 行安全告警读不完整：{error}")
+            return
+        alert = to_planet_scout_alert(reading, alert_id=uuid4())
+        repository, _run_id = self._ensure_run()
+        if not repository.append_planet_scout_alert(alert):
+            say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录，不重复推送）")
+            return
+        delivery = deliver_planet_scout_alert(Settings(), alert)
+        repository.record_planet_scout_alert_delivery(
+            alert.alert_id,
+            status=delivery.status,
+            error=delivery.error,
+            delivered_at_utc=delivery.delivered_at_utc,
+        )
+        if delivery.status == "SENT":
+            say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录并发送邮件）")
+        elif delivery.status == "NOT_CONFIGURED":
+            say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录；SMTP 未配置）")
+        else:
+            say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录；邮件发送失败）")
 
     def prepare_for_mailbox(self) -> None:
         """开工前的两步：校几何、查会话。与 `run()` 开头同序、同理由。
@@ -1769,6 +1812,9 @@ class PirateLoop:
         tally = BackfillTally(due_before=len(self._due_dispatches(datetime.now(UTC))))
 
         def visit(row: MailRow, page: Any) -> bool:
+            if row.kind is ReportKind.PLANET_SCOUTED:
+                self._ingest_planet_scout_alert(row, page)
+                return False
             outcome = self._ingest_report(row, page)
             if outcome is not ReportIngest.UNREADABLE:
                 tally.read += 1
@@ -1779,8 +1825,8 @@ class PirateLoop:
             return self._stop_after_known()
 
         tally.scan = self._scan_mail_rows(
-            wanted=self.RECONCILE_KIND,
-            label=self.REPORT_LABEL,
+            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED),
+            label=f"{self.REPORT_LABEL}或安全告警",
             visit=visit,
             not_before=not_before,
             max_pages=max_pages,
@@ -1949,10 +1995,20 @@ class PirateLoop:
         一个没人能解释的值，而它正是「今日 X/32」显示的东西。
         """
         tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
+
+        def visit(row: MailRow, page: Any) -> bool:
+            if row.kind is ReportKind.PLANET_SCOUTED:
+                self._ingest_planet_scout_alert(row, page)
+                return False
+            # Keep the existing early-stop invariant for already persisted
+            # battle reports: alert handling must not turn every task start
+            # into a run of eight redundant detail reads.
+            return self._ingest_report_row(row, page)
+
         self._scan_mail_rows(
-            wanted=self.RECONCILE_KIND,
-            label=self.REPORT_LABEL,
-            visit=self._ingest_report_row,
+            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED),
+            label=f"{self.REPORT_LABEL}或安全告警",
+            visit=visit,
             not_before=self._report_floor(day_start, now=now),
             max_pages=RECONCILE_MAX_PAGES,
             observe=tally,

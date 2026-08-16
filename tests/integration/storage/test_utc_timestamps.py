@@ -57,6 +57,8 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "mission_tasks.quota_exhausted_until_utc",
         "mission_tasks.round_started_at_utc",
         "mission_tasks.updated_at_utc",
+        "planet_scout_alerts.delivered_at_utc",
+        "planet_scout_alerts.reported_at_utc",
         "run_instances.created_at_utc",
         "run_instances.drained_at_utc",
         "run_instances.finished_at_utc",
@@ -70,6 +72,16 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "target_revisits.executed_at_utc",
         "target_revisits.requested_at_utc",
         "ui_observations.observed_at_utc",
+    }
+)
+
+#: `planet_scout_alerts` is created after the one-off b6 migration.  Its DDL
+#: already uses `UTCDateTime`, so asking that historical migration to alter a
+#: table which did not exist yet would be both impossible and misleading.
+POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
+    {
+        "planet_scout_alerts.delivered_at_utc",
+        "planet_scout_alerts.reported_at_utc",
     }
 )
 
@@ -120,7 +132,7 @@ def test_the_migration_covers_every_timestamp_column() -> None:
     migration = _load_migration("b6e0a4f21c98_timestamps_with_timezone")
     covered = {f"{table}.{column}" for table, column, _ in migration._COLUMNS}
 
-    assert covered == EXPECTED_TIMESTAMP_COLUMNS
+    assert covered == EXPECTED_TIMESTAMP_COLUMNS - POST_TIMESTAMP_MIGRATION_COLUMNS
 
 
 def _load_migration(name: str) -> ModuleType:

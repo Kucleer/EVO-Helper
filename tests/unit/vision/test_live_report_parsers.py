@@ -100,6 +100,10 @@ class TestReportSubject:
         assert kind is ReportKind.UNKNOWN
         assert not kind.is_dispatch_matchable
 
+    def test_planet_scouted_mail_is_not_an_outbound_scout_report(self) -> None:
+        assert classify_report_subject("你的行星被侦察") is ReportKind.PLANET_SCOUTED
+        assert not ReportKind.PLANET_SCOUTED.is_dispatch_matchable
+
 
 class TestFleetColumn:
     def test_parses_whitespace_separated_name_and_count(self) -> None:

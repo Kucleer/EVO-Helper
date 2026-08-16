@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select
@@ -26,6 +27,7 @@ from evo_helper.domain.records import (
     BattleReport,
     CoordinateScan,
     FleetDiff,
+    PlanetScoutAlert,
     ReportHistoryEntry,
     ScoutReport,
     ScoutTriggerShip,
@@ -73,6 +75,19 @@ _MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
 
 class StorageConflictError(ValueError):
     """Raised when an append would violate a uniqueness or close-once rule."""
+
+
+def _planet_scout_alert_fingerprint(record: PlanetScoutAlert) -> str:
+    """Stable, whitespace-insensitive key for one game security mail."""
+    body = " ".join(record.raw_body.split())
+    values = (
+        record.raw_time_text,
+        str(record.source),
+        str(record.target),
+        record.subject.strip(),
+        body,
+    )
+    return sha256("\x1f".join(values).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -511,6 +526,67 @@ class SqlAlchemyRepository:
                 )
             session.commit()
         return True
+
+    # -- 安全邮件 ------------------------------------------------------------
+
+    def append_planet_scout_alert(self, alert: object) -> bool:
+        """Persist one planet-scout alert, returning False when it was already seen.
+
+        The unique fingerprint is intentionally broader than timestamp alone:
+        game mail can contain multiple probes in the same second, while a
+        different OCR reading must never overwrite the original evidence.
+        """
+        record = _require_type(alert, PlanetScoutAlert, "planet scout alert")
+        _require_utc(record.reported_at_utc, "reported_at_utc")
+        fingerprint = _planet_scout_alert_fingerprint(record)
+        with self._session_factory() as session:
+            exists = session.scalar(
+                select(orm.PlanetScoutAlertRow.id).where(
+                    orm.PlanetScoutAlertRow.fingerprint == fingerprint
+                )
+            )
+            if exists is not None:
+                return False
+            session.add(
+                orm.PlanetScoutAlertRow(
+                    id=record.alert_id,
+                    fingerprint=fingerprint,
+                    reported_at_utc=record.reported_at_utc,
+                    raw_time_text=record.raw_time_text,
+                    source_galaxy=record.source.galaxy,
+                    source_system=record.source.system,
+                    source_position=record.source.position,
+                    target_galaxy=record.target.galaxy,
+                    target_system=record.target.system,
+                    target_position=record.target.position,
+                    source_name=record.source_name,
+                    intercepted_probes=record.intercepted_probes,
+                    subject=record.subject,
+                    raw_body=record.raw_body,
+                )
+            )
+            session.commit()
+        return True
+
+    def record_planet_scout_alert_delivery(
+        self,
+        alert_id: UUID,
+        *,
+        status: str,
+        error: str | None = None,
+        delivered_at_utc: datetime | None = None,
+    ) -> None:
+        """Record the first delivery result; this never schedules a retry."""
+        if delivered_at_utc is not None:
+            _require_utc(delivered_at_utc, "delivered_at_utc")
+        with self._session_factory() as session:
+            row = session.get(orm.PlanetScoutAlertRow, alert_id)
+            if row is None:
+                raise KeyError(f"unknown planet scout alert {alert_id}")
+            row.delivery_status = status
+            row.delivery_error = error
+            row.delivered_at_utc = delivered_at_utc
+            session.commit()
 
     def list_scout_reports(
         self,
