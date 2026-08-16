@@ -83,6 +83,7 @@ from evo_helper.game.system_navigator import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
+from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin, say
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
@@ -3001,6 +3002,8 @@ def parse_system(text: str) -> tuple[int, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
+    install_runner_system_log()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--systems", nargs="+", type=parse_system, required=True)
     parser.add_argument("--scout", action="store_true", help="真的派侦察出去")

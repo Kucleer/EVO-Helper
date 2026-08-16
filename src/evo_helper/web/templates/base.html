@@ -55,6 +55,10 @@
     {# 「运行详情」已关闭：它操作的是更早的 run_instances/scan_plans 那条路径，
        起停与记账都由任务中心（常驻调度器 + mission_runs）接手了。 #}
     <a href="/logs" {% if active == 'logs' %}aria-current="page"{% endif %}>攻击日志</a>
+    {# 「系统日志」是脚本自己的诊断输出（`system_log` 表），和上面那条「攻击日志」
+       不是一回事——那一页一行是一发打出去的舰队。跨机查看靠的就是这一页：
+       实机在另一台机器上跑，它的 print 只落在那台机器的本地文件里。 #}
+    <a href="/system-log" {% if active == 'system-log' %}aria-current="page"{% endif %}>系统日志</a>
     <a href="/diagnostics" {% if active == 'diagnostics' %}aria-current="page"{% endif %}>诊断</a>
   </nav>
   <div class="main">

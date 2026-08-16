@@ -41,7 +41,8 @@ from evo_helper.game.ranking_ui import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.tools.scan_coordinates import LiveDriver, SlowDragDriver
+from evo_helper.tools.runner_logging import install_runner_system_log
+from evo_helper.tools.scan_coordinates import LiveDriver, SlowDragDriver, say
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ def ensure_in_game(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> bool:
     if outcome is None:
         return True
     if not outcome.ready:
-        print(f"进不去游戏：{outcome.state.value} — {outcome.detail}")
+        say(f"进不去游戏：{outcome.state.value} — {outcome.detail}")
     return bool(outcome.ready)
 
 
@@ -191,7 +192,7 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
         trusted[index] = None
     if len(read) != len(trusted) or any(a != b for a, b in zip(read, trusted, strict=True)):
         dropped = [index for index, score in enumerate(trusted) if score is None and read[index]]
-        print(f"军力值破坏降序，丢掉这几行的分数（坐标保留）: {dropped}")
+        say(f"军力值破坏降序，丢掉这几行的分数（坐标保留）: {dropped}")
     filled = interpolate_scores(trusted)
     return [
         RankingTarget(
@@ -261,6 +262,9 @@ def scan(
         driver=SlowDragDriver(driver),
         read_labels=lambda: nav_label_words(driver.capture(), ocr),
         read_rows=read_rows,
+        # 把导航条那 8 条输出也接到同一个出口上；不注入的话它们只走 `print`，
+        # 既没有时刻也进不了 `system_log`。
+        say=say,
     )
     repository = SqlAlchemyRepository(
         create_session_factory(create_database_engine(Settings().database_url))
@@ -315,12 +319,12 @@ def scan(
             nav.scroll_blind()
         scrolled = blind_scrolls
         if blind_scrolls:
-            print(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
+            say(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
 
         marker = name_column_text(driver.capture(), ocr, columns)
         while not mentions_bot(marker):
             if scrolled >= human_scrolls:
-                print(f"翻满 {human_scrolls} 屏仍没见到 bot；本轮到此为止")
+                say(f"翻满 {human_scrolls} 屏仍没见到 bot；本轮到此为止")
                 outcome = 2
                 break
             nav.scroll_blind()
@@ -329,13 +333,13 @@ def scan(
             if not marker:
                 # 整条名字列一个字都读不出来 = 已经不在榜单页上（多半断线）。
                 # 这同时是「只在刚确认过的画面上按下手指」那条不变式的把关点。
-                print(f"翻真人段第 {scrolled} 屏之后名字列全空；已离页")
+                say(f"翻真人段第 {scrolled} 屏之后名字列全空；已离页")
                 outcome = 2
                 break
             if scrolled % 10 == 0:
-                print(f"  翻真人段 {scrolled} 屏…")
+                say(f"  翻真人段 {scrolled} 屏…")
         else:
-            print(f"翻了 {scrolled} 屏到达 bot 区")
+            say(f"翻了 {scrolled} 屏到达 bot 区")
 
         # -- 第二段：细读三列 ------------------------------------------------
         if outcome == 0:
@@ -343,12 +347,12 @@ def scan(
             first, reached_limit = collect(targets_from_rows(rows, observed_at=datetime.now(UTC)))
             screens.append(first)
             if reached_limit:
-                print(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
+                say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
             dry = 0
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 step = nav.scroll_once()
                 if step.outcome is ScrollOutcome.OFF_PAGE:
-                    print(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
+                    say(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
                     outcome = 2
                     break
                 rows = list(step.rows)
@@ -364,22 +368,22 @@ def scan(
                 # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
-                print(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
+                say(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
                 if reached_limit:
-                    print(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
+                    say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
                     break
                 if dry >= DRY_SCREENS:
-                    print(f"连续 {dry} 屏没有新 bot：这一段到头了")
+                    say(f"连续 {dry} 屏没有新 bot：这一段到头了")
                     break
     finally:
         if not nav.close():
-            print("排行榜已关闭，但导航条还原未确认")
+            say("排行榜已关闭，但导航条还原未确认")
 
     # 离页时最后一屏是画面已经变了之后读的，可疑——但它**已经逐屏写进去了**。
     # `keep_screens` 在这里只用来报数，不再决定写什么：真要把它撤回来得删行，
     # 而删行比留一条可疑记录危险得多（那条记录带着 source='ranking'，本来就标着未验证）。
     kept = keep_screens(screens, off_page=outcome == 2)
-    print(
+    say(
         f"军事榜采集{'（中途离页）' if outcome else '完成'}："
         f"逐屏写入 {written} 条，其中末屏可疑 {written - len(kept)} 条"
     )
@@ -475,13 +479,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
+    install_runner_system_log()
     args = build_parser().parse_args(argv)
     if args.forget_scores_above is not None:
         repository = SqlAlchemyRepository(
             create_session_factory(create_database_engine(Settings().database_url))
         )
         cleared = repository.forget_implausible_military_scores(above=args.forget_scores_above)
-        print(f"已把 {cleared} 行的军力值清空（高于 {args.forget_scores_above:,.0f}）；坐标保留")
+        say(f"已把 {cleared} 行的军力值清空（高于 {args.forget_scores_above:,.0f}）；坐标保留")
         return 0
     default = RankingColumns()
 
