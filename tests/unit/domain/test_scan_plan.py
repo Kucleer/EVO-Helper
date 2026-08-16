@@ -12,7 +12,7 @@ from evo_helper.domain.scan_plan import (
     planned_segments,
     total_coordinates,
 )
-from evo_helper.domain.scan_priority import ScanSegment
+from evo_helper.domain.scan_priority import ScanSegment, scan_segments
 
 TINY = (ScanSegment(2, 1, 2), ScanSegment(1, 1, 1))
 NARROW = ScanBounds(first_position=5, position_limit=6)
@@ -40,6 +40,42 @@ def test_default_plan_covers_every_galaxy_exactly_once() -> None:
 
 def test_default_plan_totals_the_whole_universe() -> None:
     assert total_coordinates() == 4491 * 16
+
+
+def test_configured_planets_are_scanned_in_list_order_from_their_centres() -> None:
+    """星球列表是用户配置的顺序，不能再被银河系编号或系统号重新排序。"""
+    segments = scan_segments(
+        priority_planets=(Coordinate(9, 250, 8), Coordinate(2, 137, 18)),
+        priority_radius=2,
+    )
+    assert [(part.galaxy, part.first_system, part.last_system) for part in segments[:10]] == [
+        (9, 250, 250),
+        (9, 249, 249),
+        (9, 251, 251),
+        (9, 248, 248),
+        (9, 252, 252),
+        (2, 137, 137),
+        (2, 136, 136),
+        (2, 138, 138),
+        (2, 135, 135),
+        (2, 139, 139),
+    ]
+
+
+def test_configured_planet_windows_do_not_duplicate_overlapping_systems() -> None:
+    segments = scan_segments(
+        priority_planets=(Coordinate(2, 10, 1), Coordinate(2, 11, 1)),
+        priority_radius=1,
+        total_galaxies=2,
+        systems_per_galaxy=20,
+    )
+    systems = [
+        (part.galaxy, system)
+        for part in segments
+        for system in range(part.first_system, part.last_system + 1)
+    ]
+    assert systems[:4] == [(2, 10), (2, 9), (2, 11), (2, 12)]
+    assert len(systems) == len(set(systems)) == 40
 
 
 def test_segment_bounds_use_the_position_window() -> None:
