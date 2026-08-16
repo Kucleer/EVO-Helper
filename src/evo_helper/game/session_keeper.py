@@ -71,6 +71,20 @@ DEAD_SESSION_MARKERS: tuple[str, ...] = ("无法重新连接",)
 #: 在一条独立的横栏里，读得稳。
 MAINTENANCE_MARKERS: tuple[str, ...] = ("服务器维护", "服务器维")
 
+#: 入口页**独有**的记号。
+#:
+#: ⚠️ 入口页和 START 页在文字上是互相污染的：START 页的背景里印着淡淡的
+#: `ETERNAL VOID`，而入口页底下又透着淡淡的 `START`。所以任何一边只靠「对方也有
+#: 的那个词」都判不准，先后顺序换来换去只是把错判从一边挪到另一边。
+#:
+#: 出路是**先判只有入口页才有的东西**：语言选择页上的「进入」按钮，和它下面那句
+#: 「点击任意位置继续」。这两个 START 页上都没有。判完它们再判 START，最后才把
+#: `ETERNAL VOID` 当弱证据兜底。
+ENTRY_MARKERS: tuple[str, ...] = ("进入", "点击任意位置继续")
+
+#: 弱证据：START 页背景里也有它，所以只能排在判完 START 之后。
+ENTRY_WEAK_MARKERS: tuple[str, ...] = ("ETERNAL VOID",)
+
 #: 关窗重开的次数上限，以及配额的滚动周期。
 #:
 #: **上限跟重开本身一样重要。** 服务端维护时每次巡检都会撞到这一屏，没有上限
@@ -121,7 +135,10 @@ def classify_screen(text: str) -> ScreenState:
       一遍遍等不到入口页，最后报「会话不可用」，而它其实只需要重开一次窗口。
     - **再判掉线**：掉线弹窗底下的导航条仍在画面里，后判会读出「商店/联盟」
       并给出 IN_GAME，于是助手在一个死会话上一路点下去，全程不报错。
-    - **然后判 START**：START 页的背景里也印着淡淡的 ETERNAL VOID。
+    - **入口页独有的记号排在 START 之前**：见 `ENTRY_MARKERS` 的说明——两屏在文字上
+      互相污染，只有「进入」「点击任意位置继续」是入口页独占的。
+    - **然后判 START**，最后才用 `ETERNAL VOID` 这个弱证据兜底：START 页的背景里
+      也印着它。
     """
     haystack = text or ""
     # 维护公告排在最前：它是浮层，底下的 START / 导航条照样读得出来，
@@ -133,9 +150,12 @@ def classify_screen(text: str) -> ScreenState:
         return ScreenState.DEAD_SESSION
     if any(marker in haystack for marker in DISCONNECT_MARKERS):
         return ScreenState.DISCONNECTED
+    # 入口页独有的记号排在 START 之前，理由见 `ENTRY_MARKERS`。
+    if any(marker in haystack for marker in ENTRY_MARKERS):
+        return ScreenState.ENTRY
     if "START" in haystack.upper():
         return ScreenState.START
-    if "ETERNAL VOID" in haystack.upper() or "点击任意位置继续" in haystack:
+    if any(marker in haystack.upper() for marker in ENTRY_WEAK_MARKERS):
         return ScreenState.ENTRY
     if any(marker in haystack for marker in IN_GAME_MARKERS):
         return ScreenState.IN_GAME
