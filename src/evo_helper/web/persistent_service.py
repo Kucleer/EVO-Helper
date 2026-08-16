@@ -262,12 +262,22 @@ class PersistentApplicationService:
                 "bot": 0,
                 "owned": 0,
             }
-            for is_bot, owner, count in session.execute(
-                select(counted.c.is_bot, counted.c.latest_owner_name, func.count())
+            # ⚠️ 分组键是「有没有主」这个布尔量，SELECT 里也必须是同一个表达式。
+            # 原来 SELECT 的是主名本身、GROUP BY 的是 `IS NULL`：SQLite 容忍选一个
+            # 没进 GROUP BY 的列，PostgreSQL 直接 `GroupingError`——2026-08-16 切库
+            # 之后 /planets 整页 500 就是这里，而其余页面全都正常，很容易看歪。
+            #
+            # 换成布尔量顺带修掉一处口径分歧：`_planet_kind_clause("owned")` 用的是
+            # `IS NOT NULL`，而 `planet_kind()` 看的是真值，主名为空串时两边会算成
+            # 不同的类（列表数得出来、分类计数却 KeyError）。
+            owner_missing = counted.c.latest_owner_name.is_(None).label("owner_missing")
+            for is_bot, missing, count in session.execute(
+                select(counted.c.is_bot, owner_missing, func.count())
                 .select_from(counted)
-                .group_by(counted.c.is_bot, counted.c.latest_owner_name.is_(None))
+                .group_by(counted.c.is_bot, owner_missing)
             ):
-                kind_counts[planet_kind(owner, bool(is_bot))] += int(count)
+                # 分类只关心主名有没有，这里的占位串只为把「有主」传给唯一那份实现。
+                kind_counts[planet_kind(None if missing else "?", bool(is_bot))] += int(count)
             kind_counts["all"] = sum(kind_counts.values())
 
             filtered = base
