@@ -2237,14 +2237,19 @@ class SqlAlchemyRepository:
         pid: int | None,
         started_at_utc: datetime,
         log_path: str,
+        run_id: UUID | None = None,
     ) -> UUID:
         """起了一个子进程，记一行。返回的 id 用来在它结束时回填。
 
         `task_id` 是必填的关键字参数（可以显式给 None）：同一 `kind` 现在可以有多个
         任务，而重启冷却按任务算——漏记就等于让那个任务永远没有冷却记录。
+
+        `run_id` 可以由调用方先定好：子进程要在**起之前**就通过环境变量拿到本轮
+        的 id，才能把自己的 `system_log` 行挂到这一轮上（见
+        `infrastructure.system_log.child_environment`）。不传就照旧自己生成。
         """
         _require_utc(started_at_utc, "started_at_utc")
-        run_id = uuid4()
+        run_id = run_id or uuid4()
         with self._session_factory() as session:
             session.add(
                 orm.MissionRunRow(

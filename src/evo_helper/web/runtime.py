@@ -15,6 +15,8 @@ from fastapi import FastAPI
 
 from alembic import command
 from evo_helper.config import Settings
+from evo_helper.infrastructure.system_log import attach_system_log_handler
+from evo_helper.infrastructure.system_log_db import install_database_system_log, purge_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -29,6 +31,19 @@ def create_runtime_app(
     _upgrade_database(actual_settings.database_url)
     engine = create_database_engine(actual_settings.database_url)
     session_factory = create_session_factory(engine)
+    # 系统日志：出口 + 标准库桥 + 保留期清理，三件都只在**真实进程**里做。
+    #
+    # ⚠️ 装在这里而不是 `create_persistent_app` 里：那个工厂是测试建 app 的入口，
+    # 在它里面起后台线程、连库、改全局 logger，会让每一个 web 测试都带上一份
+    # 进程级副作用。
+    install_database_system_log(session_factory)
+    # 控制台进程**从来没调过** `configure_logging()`，所以 `evo_helper` 这棵 logger
+    # 一个 handler 都没有：`mission_scheduler` 的两条 `_LOGGER.info`、
+    # `vision.live_reports` 的 info 此前哪儿都到不了，连本机控制台都没有。
+    attach_system_log_handler()
+    # 保留期清理挂在启动上：这是本进程唯一一个「每次开机跑一次」的现成时机，
+    # 而这张表按设计只增不改，攒着不清迟早把库撑大。
+    purge_system_log(session_factory, retention_days=actual_settings.system_log_retention_days)
     # 旧版把每个 `bot_<g>_<s>_<position>` 都纳入候选；固定海盗位 1--4
     # 因而被错误固化。保留原始扫描/榜单记录，只撤销派遣候选资格。
     SqlAlchemyRepository(session_factory).clear_pirate_position_bot_candidates()

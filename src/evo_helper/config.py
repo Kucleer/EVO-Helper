@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     #: 避开 8000/8080/8888 这类常规端口，减少与本机其他开发服务撞车。
     port: int = 8770
     database_url: str = "sqlite:///var/evo-helper.db"
+    #: `system_log` 保留多少天。控制台每次启动清一次早于这个期限的行。
+    #: 0 或负数表示**不清理**（不是「全删」——见 `infrastructure.system_log_db`）。
+    system_log_retention_days: int = 14
     #: In-game fleet preset used for scanning. Its signature is still
     #: verified before any dispatch; this only prefills the plan form.
     default_fleet_preset: str = DEFAULT_PRESET.name

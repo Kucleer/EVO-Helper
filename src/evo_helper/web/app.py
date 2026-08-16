@@ -415,6 +415,10 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["game_time"] = game_time
     templates.env.globals["local_time"] = local_time
+    # 放到 state 上，好让分文件的路由模块（`system_log_routes`）渲染同一套模板，
+    # 而不是各自再建一个 `Jinja2Templates`——那样 `tojson` 的中文设置之类的
+    # 环境配置会在两处各写一遍，迟早只改一处。
+    app.state.templates = templates
 
     def get_service(request: Request) -> ApplicationService:
         return cast(ApplicationService, request.app.state.service)
@@ -1320,6 +1324,7 @@ def create_persistent_app(
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
     from .ranking_routes import register_ranking_routes
+    from .system_log_routes import register_system_log_routes
 
     # 主星在这里从 Settings 解析、往下注入：`domain` 不许 import `config`，
     # 所以 `domain.missions.ORIGIN` 只是默认值，真正的取值由这个组装点决定。
@@ -1368,6 +1373,7 @@ def create_persistent_app(
     # session factory rather than going through the application service.
     register_intel_routes(app, session_factory)
     register_ranking_routes(app, session_factory)
+    register_system_log_routes(app, session_factory)
     return app
 
 

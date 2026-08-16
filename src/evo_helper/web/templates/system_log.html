@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}系统日志 · EVO-Helper{% endblock %}
+{% block heading %}系统日志{% endblock %}
+
+{#
+  ⚠️ 这一页不是「攻击日志」（`/logs`）。那一页一行是一发打出去的舰队，
+  这一页一行是脚本自己说的一句话。
+
+  筛选与翻页全部走 URL 查询参数，页面本身不带 JS：每种视图都有自己的链接，
+  行数由服务端决定，页面永远说得出「当前筛选共多少条」。
+#}
+{% block content %}
+
+<section class="panel" aria-labelledby="system-log-filters">
+  <h2 id="system-log-filters">筛选</h2>
+
+  <form method="get" action="/system-log" class="filter-bar">
+    <label class="inline-label" for="level">级别</label>
+    <select id="level" name="level">
+      <option value="">全部级别</option>
+      {% for value in levels %}
+        <option value="{{ value }}" {% if level_value == value %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="host">机器</label>
+    <select id="host" name="host">
+      <option value="">全部机器</option>
+      {% for value in page.hosts %}
+        <option value="{{ value }}" {% if host_value == value %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="source">来源</label>
+    <select id="source" name="source">
+      <option value="">全部来源</option>
+      {% for value in page.sources %}
+        <option value="{{ value }}" {% if source_value == value %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="mission_kind">链路</label>
+    <select id="mission_kind" name="mission_kind">
+      <option value="">全部链路</option>
+      {% for value in mission_kinds %}
+        <option value="{{ value }}" {% if mission_kind_value == value %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="limit">每页</label>
+    <select id="limit" name="limit">
+      {% for size in page_sizes %}
+        <option value="{{ size }}" {% if page.limit == size %}selected{% endif %}>{{ size }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="inline-label" for="since">起 (UTC)</label>
+    <input id="since" name="since" type="datetime-local" value="{{ since_value }}">
+
+    <label class="inline-label" for="until">止 (UTC)</label>
+    <input id="until" name="until" type="datetime-local" value="{{ until_value }}">
+
+    <label class="inline-label" for="q">关键字</label>
+    <input id="q" name="q" value="{{ q_value }}" placeholder="正文或 payload">
+
+    <label class="inline-label" for="run_id">轮次</label>
+    <input id="run_id" name="run_id" value="{{ run_id_value }}" placeholder="mission_runs.id">
+
+    <button type="submit">应用</button>
+    <a href="/system-log" class="muted" style="font-size:12px">重置</a>
+  </form>
+
+  {% for note in ignored %}
+    <p class="error" role="alert" style="margin:8px 0 0">{{ note }}</p>
+  {% endfor %}
+
+  <p class="muted" style="font-size:12px;margin:8px 0 0">
+    {% if page.total %}
+      当前筛选共 <strong>{{ page.total }}</strong> 条，正在看第
+      {{ page.offset + 1 }}–{{ page.offset + page.rows | length }} 条（新的在上）。
+    {% else %}
+      当前筛选没有匹配的日志。
+    {% endif %}
+    <br>
+    时刻是<strong>产生时刻</strong>（UTC），不是入库时刻——入库走后台批量刷盘，会晚几百毫秒。
+    这一页与「攻击日志」不是一回事：那一页一行是一发打出去的舰队。
+  </p>
+</section>
+
+<section class="panel" aria-labelledby="system-log-rows">
+  <h2 id="system-log-rows">日志</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">时刻 (UTC)</th>
+          <th scope="col">级别</th>
+          <th scope="col">机器</th>
+          <th scope="col">PID</th>
+          <th scope="col">来源</th>
+          <th scope="col">链路</th>
+          <th scope="col">正文</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in page.rows %}
+        <tr>
+          <td class="muted">{{ row.logged_at_utc.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td>
+            {% if row.level == 'ERROR' %}
+              <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>ERROR</span>
+            {% elif row.level == 'WARNING' %}
+              <span class="chip warn"><span class="glyph" aria-hidden="true">◆</span>WARN</span>
+            {% elif row.level == 'DEBUG' %}
+              <span class="chip"><span class="glyph" aria-hidden="true">○</span>DEBUG</span>
+            {% else %}
+              <span class="chip ok"><span class="glyph" aria-hidden="true">●</span>INFO</span>
+            {% endif %}
+          </td>
+          <td>{{ row.host }}</td>
+          <td class="muted">{{ row.pid }}</td>
+          <td>{{ row.source }}</td>
+          <td class="muted">
+            {{ row.mission_kind or '—' }}{% if row.task_id %} #{{ row.task_id }}{% endif %}
+          </td>
+          <td>
+            {{ row.message }}
+            {% if row.payload_json and row.payload_json != '{}' %}
+              <br><span class="muted" style="font-size:12px">{{ row.payload_json }}</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">没有匹配的日志。放宽筛选，或者确认那台机器上的 runner 真的跑起来了。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if prev_url or next_url %}
+    <div class="filter-bar" style="margin:10px 0 0">
+      {% if prev_url %}<a href="{{ prev_url }}">← 上一页</a>{% endif %}
+      <span class="spacer"></span>
+      {% if next_url %}<a href="{{ next_url }}">下一页 →</a>{% endif %}
+    </div>
+  {% endif %}
+</section>
+
+{% endblock %}

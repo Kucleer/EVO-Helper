@@ -95,6 +95,7 @@ from evo_helper.tools.pirate_loop import (
 
 # `say` 从**定义它的**模块导入。`pirate_loop` 只是转手，而 strict mypy 的
 # `no_implicit_reexport` 不认转手——从那边导会报 does not explicitly export。
+from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
     make_console_encoding_safe,
@@ -427,6 +428,8 @@ def parse_target_assignment(text: str) -> tuple[Coordinate, str | None]:
 
 def main(argv: list[str] | None = None) -> int:
     make_console_encoding_safe()  # 必须在 parse_args 之前，理由见那个函数
+    # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
+    install_runner_system_log()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
     parser.add_argument(
