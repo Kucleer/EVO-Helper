@@ -13,6 +13,7 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    is_bot_coordinate,
     mentions_bot,
     repair_ranks,
 )
@@ -41,6 +42,13 @@ LIVE_NAMES = [
 def test_a_bot_name_yields_its_coordinate() -> None:
     """名字直接编码坐标，这是整张榜最值钱的一点。"""
     assert coordinate_of("bot_4_30_12") == Coordinate(4, 30, 12)
+
+
+def test_pirate_positions_are_never_military_bot_candidates() -> None:
+    """1--4 号位是海盗，即使排行榜名称长得像 bot 也不能派军力舰队。"""
+    assert not is_bot_coordinate(coordinate_of("bot_2_137_1"))
+    assert not is_bot_coordinate(coordinate_of("bot_9_250_4"))
+    assert is_bot_coordinate(coordinate_of("bot_9_250_5"))
 
 
 def test_every_name_on_the_live_screen_resolves() -> None:
@@ -166,6 +174,15 @@ def test_bots_are_told_apart_by_name_not_by_rank() -> None:
     ]
 
     assert [row.name for row in bot_rows(rows)] == ["bot_4_30_12"]
+
+
+def test_bot_rows_excludes_fixed_pirate_positions() -> None:
+    rows = [
+        RankingRow(639, "bot_2_137_1", 30.0, Coordinate(2, 137, 1)),
+        RankingRow(640, "bot_2_137_5", 29.0, Coordinate(2, 137, 5)),
+    ]
+
+    assert [row.name for row in bot_rows(rows)] == ["bot_2_137_5"]
 
 
 def test_there_is_no_single_screen_test_for_which_board_this_is() -> None:

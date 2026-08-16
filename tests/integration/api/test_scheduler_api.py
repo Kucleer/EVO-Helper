@@ -229,7 +229,7 @@ def test_the_pirate_row_echoes_the_systems_its_radius_covers(console: Console) -
 
 def test_the_bot_row_echoes_how_many_bots_the_range_holds(console: Console) -> None:
     """N=0 就禁止启用，所以 N 必须先看得见。"""
-    _seed_bot(console.repository, Coordinate(2, 150, 4))
+    _seed_bot(console.repository, Coordinate(2, 150, 5))
     console.patch(
         "BOT",
         {"params": {"galaxy": 2, "first_system": 100, "last_system": 200}},
@@ -325,7 +325,7 @@ def test_a_bot_range_with_no_recorded_bots_is_refused(console: Console) -> None:
 
 
 def test_enabling_a_bot_range_that_holds_bots_is_accepted(console: Console) -> None:
-    _seed_bot(console.repository, Coordinate(2, 150, 4))
+    _seed_bot(console.repository, Coordinate(2, 150, 5))
 
     response = console.patch(
         "BOT",

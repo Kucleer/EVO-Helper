@@ -70,6 +70,7 @@ from evo_helper.domain.missions import (
     scan_command,
 )
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.ranking import is_bot_coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
 from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
 from evo_helper.domain.scheduler import (
@@ -259,6 +260,9 @@ class MissionScheduler:
         #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够 ``top_n`` 后反过来
         #: 也必须先启动该任务，再交还普通优先级排序。
         self._military_ranking_batch_task_id: int | None = None
+        # 点「开始」后军力任务只使用这一份档位；运行中修改全局配置不会让
+        # 固化记录与实际派遣分家。停掉后才允许下一轮取新配置。
+        self._active_military_tiers_json: str | None = None
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -371,12 +375,17 @@ class MissionScheduler:
         # 时刻会和页面上那块秒表的起点差一点，而事后翻账正是拿这两个对时间线。
         tasks = self._repository.mission_tasks()
         config = self._repository.scheduler_config()
+        military_tiers_json = self._repository.military_attack_config().tiers_json
+        rematched = self._repository.rematch_unlinked_reports()
+        if rematched:
+            _LOGGER.info("启动调度前补认 %s 份既有战报，攻击日志已同步战果", rematched)
         now = self._clock()
         with self._lock:
             if self._enabled:
                 return
             self._started_at_utc = now
             self._enabled = True
+            self._active_military_tiers_json = military_tiers_json
             freeze = freeze_now(
                 [
                     FrozenTask(
@@ -397,6 +406,7 @@ class MissionScheduler:
                     if _known(row.kind)
                 ],
                 frozen_at_utc=now,
+                military_tiers_json=military_tiers_json,
             )
         # 落账在锁外：写文件的耗时没有上界（磁盘、杀毒软件），而它对
         # 「任何时刻最多一个子进程」这条不变量毫无影响。
@@ -424,6 +434,7 @@ class MissionScheduler:
         with self._lock:
             self._enabled = False
             self._started_at_utc = None
+            self._active_military_tiers_json = None
             self._finish(self._supervisor.stop(StopReason.USER))
 
     def shutdown(self) -> None:
@@ -436,6 +447,7 @@ class MissionScheduler:
         with self._lock:
             self._enabled = False
             self._started_at_utc = None
+            self._active_military_tiers_json = None
             self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
             self._backfill.cancel(self._measure_backfill)
 
@@ -733,7 +745,7 @@ class MissionScheduler:
         if batch_decision is not None:
             if batch_decision.action is Action.IDLE:
                 return False
-            return self._act(batch_decision)
+            return self._act(batch_decision, facts)
         decision = decide(
             snapshots,
             facts,
@@ -751,9 +763,9 @@ class MissionScheduler:
         )
         if decision.action is Action.IDLE or decision.task is None:
             return False
-        return self._act(decision)
+        return self._act(decision, facts)
 
-    def _act(self, decision: Decision) -> bool:
+    def _act(self, decision: Decision, facts: SchedulerFacts) -> bool:
         """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
 
         上面那段读事实是在锁外跑的，因此进锁之后必须重新问两个问题——它们正是
@@ -795,9 +807,9 @@ class MissionScheduler:
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             elif running is not None:
                 return False
-            return not self._launch(decision.task)
+            return not self._launch(decision.task, facts.of(decision.task))
 
-    def _launch(self, task: TaskSnapshot) -> bool:
+    def _launch(self, task: TaskSnapshot, facts: TaskFacts) -> bool:
         """组命令行、起进程、记账。参数不合格则停用该任务并返回 False。
 
         调用方必须已经持有 `_lock`：这里会真的拉起一个去点鼠标的子进程。
@@ -818,7 +830,13 @@ class MissionScheduler:
                     bot_limit=None if batch_task is None else _bot_top_n(batch_task.params_json)
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
-                command = self._military_command(row)
+                command = self._military_command(row, max_dispatches=facts.free_lines)
+            elif task.kind is MissionKind.BOT:
+                command = self._bot_command(
+                    row.params_json,
+                    task.origin,
+                    max_dispatches=facts.free_lines,
+                )
             else:
                 command = self._command_for(task.kind, row.params_json, task.origin)
         except MissionParamError as exc:
@@ -1231,17 +1249,35 @@ class MissionScheduler:
         in_range = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
         return nearest_first(in_range, origin)
 
-    def _military_command(self, row: orm.MissionTaskRow) -> list[str]:
+    def _military_command(
+        self, row: orm.MissionTaskRow, *, max_dispatches: int | None = None
+    ) -> list[str]:
         """只起一颗出发星球的一组目标，避免 runner 中途切星球留下半组状态。"""
         assignments = self._military_assignments(row)
         if not assignments:
             raise MissionParamError("本轮没有可派遣的军力攻击目标")
         first_origin = assignments[0].origin
         group = [item for item in assignments if item.origin == first_origin]
+        first_origin_lines = next(
+            item.fleet_lines
+            for item in self._military_origins(row)
+            if item.coordinate == first_origin
+        )
+        first_origin_free = max(
+            0,
+            first_origin_lines
+            - self._repository.count_inflight(now_utc=self._clock(), origin=first_origin),
+        )
         return bot_command(
             [item.coordinate for item in group],
             origin=first_origin,
             presets={item.coordinate: item.preset for item in group},
+            # `facts.free_lines` 是所有出发点之和；runner 一次只会使用第一颗，
+            # 所以这里重新按真实在飞数收窄，绝不把另一颗星球的余量借过来。
+            max_dispatches=min(
+                max_dispatches if max_dispatches is not None else len(group),
+                first_origin_free,
+            ),
         )
 
     def _military_assignments(self, row: orm.MissionTaskRow) -> tuple[AssignedTarget, ...]:
@@ -1266,9 +1302,11 @@ class MissionScheduler:
                 "军力候选池数据已过期（最旧读数 %s）；继续派遣，等待调度器空隙扫描",
                 stale_at,
             )
-        config = self._repository.military_attack_config()
         try:
-            global_tiers = json.loads(config.tiers_json)
+            tiers_json = self._active_military_tiers_json
+            if tiers_json is None:
+                tiers_json = self._repository.military_attack_config().tiers_json
+            global_tiers = json.loads(tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧已校验
             raise MissionParamError("全局军力档位配置损坏") from exc
         return assign_by_capacity_and_distance(
@@ -1335,6 +1373,7 @@ class MissionScheduler:
                 military_score_at_utc=row.military_score_at_utc,
             )
             for row in self._repository.list_bot_targets()
+            if is_bot_coordinate(Coordinate(row.galaxy, row.system, row.position))
         ]
 
     # -- 参数换算 --------------------------------------------------------------
@@ -1370,7 +1409,21 @@ class MissionScheduler:
         # 原先没有这一步，目标顺序就是库里的返回顺序（大致按坐标升序）。实机
         # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
         # 而一夜只走到第 121 系——后面那些永远轮不到。
-        return bot_command(self._bot_selection(params_json, origin), origin=origin)
+        return self._bot_command(params_json, origin)
+
+    def _bot_command(
+        self, params_json: str, origin: Coordinate, *, max_dispatches: int | None = None
+    ) -> list[str]:
+        """组 bot runner 命令，并把当前可用航线变成真实的派遣预算。
+
+        候选清单可以大于航线数：runner 依旧按距离顺序读取，达到预算后立即退出；
+        等任一攻击的 ``飞行时间 × 2`` 返航后，下一轮才会继续后面的目标。
+        """
+        return bot_command(
+            self._bot_selection(params_json, origin),
+            origin=origin,
+            max_dispatches=max_dispatches,
+        )
 
 
 def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: int) -> TaskSnapshot:

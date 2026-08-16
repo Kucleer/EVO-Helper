@@ -210,6 +210,9 @@
         <tr>
           <td class="coord">{{ local_time(freeze.frozen_at_utc) }}</td>
           <td>
+            {% if freeze.military_tiers_label %}
+              <div class="muted" style="font-size:11px">{{ freeze.military_tiers_label }}</div>
+            {% endif %}
             {% for task in freeze.tasks %}
               <div class="muted" style="font-size:11px">
                 {{ task.label }} · {{ '参与' if task.enabled else '未参与' }} · {{ task.summary }}
@@ -836,6 +839,13 @@
         `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`
         + ` · 出发 ${origin} · 航线 ${fleetLines}`;
       lines.append(line);
+    }
+    if (freeze.military_tiers_label) {
+      const tierLine = document.createElement('div');
+      tierLine.className = 'muted';
+      tierLine.style.fontSize = '11px';
+      tierLine.textContent = freeze.military_tiers_label;
+      lines.append(tierLine);
     }
     const changed = document.createElement('div');
     changed.className = 'muted';

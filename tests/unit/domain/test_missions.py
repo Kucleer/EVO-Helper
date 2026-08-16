@@ -169,6 +169,16 @@ def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
     ]
 
 
+def test_bot_command_can_limit_real_dispatches_to_free_lines() -> None:
+    command = bot_command(
+        (Coordinate(2, 137, 14), Coordinate(2, 137, 15)),
+        origin=ORIGIN,
+        max_dispatches=2,
+    )
+
+    assert command[-3:] == ["--max-dispatches", "2", "--attack"]
+
+
 def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:
     """Windows CreateProcess 有 32767 字符上限。
 

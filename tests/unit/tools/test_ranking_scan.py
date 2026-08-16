@@ -235,6 +235,18 @@ def test_only_rows_that_resolve_to_a_coordinate_are_stored() -> None:
     assert [t.coordinate for t in targets] == [Coordinate(4, 30, 12)]
 
 
+def test_fixed_pirate_positions_are_not_written_as_ranking_targets() -> None:
+    targets = targets_from_rows(
+        [
+            RankingRow(639, "bot_2_137_1", 12.0, Coordinate(2, 137, 1)),
+            RankingRow(640, "bot_2_137_5", 11.0, Coordinate(2, 137, 5)),
+        ],
+        observed_at=NOW,
+    )
+
+    assert [target.coordinate for target in targets] == [Coordinate(2, 137, 5)]
+
+
 def test_batch_limit_counts_unique_bots_and_stops_exactly_at_the_limit() -> None:
     first = _target("first")
     second = RankingTarget(

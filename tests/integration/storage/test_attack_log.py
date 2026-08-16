@@ -147,6 +147,7 @@ def test_the_battle_result_reaches_the_log(tmp_path: Path) -> None:
     (entry,) = service.list_attack_log(50)
 
     assert entry.outcome == OUTCOME_VICTORY
+    assert entry.report_received is True
     assert (entry.attacker_losses, entry.defender_losses) == (0, 783)
 
 
@@ -167,6 +168,7 @@ def test_an_attack_still_in_flight_has_no_result_yet(tmp_path: Path) -> None:
     (entry,) = service.list_attack_log(50)
 
     assert entry.outcome is None
+    assert entry.report_received is False
     assert entry.attacker_losses is None
 
 

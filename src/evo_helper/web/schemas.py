@@ -259,7 +259,7 @@ class FrozenTaskOut(BaseModel):
     label: str
     enabled: bool
     priority: int
-    params: dict[str, int]
+    params: dict[str, Any]
     #: 只从固化的那份参数算出来的人话回显：`半径 8`、`2:100 – 2:200`。
     summary: str
     #: 当时的出发星球与航线数，同样只从记录里取。旧记录没有这两项，
@@ -271,6 +271,7 @@ class FrozenTaskOut(BaseModel):
 class ConfigFreezeOut(BaseModel):
     frozen_at_utc: datetime
     tasks: list[FrozenTaskOut]
+    military_tiers_label: str = ""
     #: 与上一次「开始」相比改了什么。空表示没改；`["首次记录"]` 表示没得比。
     changes: list[str]
 

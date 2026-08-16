@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, false, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -32,7 +32,7 @@ from evo_helper.domain.missions import (
     wrap_system,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
-from evo_helper.domain.scan_bounds import SYSTEMS_PER_GALAXY
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS, SYSTEMS_PER_GALAXY
 from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
@@ -228,7 +228,15 @@ class PersistentApplicationService:
                 if (view := self._report_view(session, coordinate, report))
             ]
 
-    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+    def list_planets(
+        self,
+        *,
+        galaxy: int | None,
+        kind: str,
+        owner_query: str | None = None,
+        offset: int,
+        limit: int,
+    ) -> PlanetPage:
         """按银河系与类型筛选星球，**在 SQL 里筛、在 SQL 里数**。
 
         全量扫完是 71,856 颗星球。把它们全查出来再在 Python 里过滤，既慢又会诱使
@@ -236,7 +244,16 @@ class PersistentApplicationService:
         「扫描停在 2:32」的假象的。
         """
         with self._session_factory() as session:
-            base = select(orm.BotTargetRow)
+            # 空位仍是扫描证据，但不是「星球列表」的一员；否则一次全星系扫描会
+            # 让 4,000+ 个空位淹没 bot / 有主星球，并把总数误读为可用目标数。
+            identified = select(orm.BotTargetRow).where(
+                or_(
+                    orm.BotTargetRow.is_bot.is_(True),
+                    orm.BotTargetRow.latest_owner_name.is_not(None),
+                ),
+                orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+            )
+            base = identified
             if galaxy is not None:
                 base = base.where(orm.BotTargetRow.galaxy == galaxy)
 
@@ -244,7 +261,6 @@ class PersistentApplicationService:
             kind_counts = {
                 "bot": 0,
                 "owned": 0,
-                "free": 0,
             }
             for is_bot, owner, count in session.execute(
                 select(counted.c.is_bot, counted.c.latest_owner_name, func.count())
@@ -258,6 +274,10 @@ class PersistentApplicationService:
             clause = _planet_kind_clause(kind)
             if clause is not None:
                 filtered = filtered.where(clause)
+            if owner_query and owner_query.strip():
+                filtered = filtered.where(
+                    orm.BotTargetRow.latest_owner_name.ilike(f"%{owner_query.strip()}%")
+                )
 
             total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
             rows = session.scalars(
@@ -270,12 +290,14 @@ class PersistentApplicationService:
                 .limit(limit)
             ).all()
 
+            identified_counted = identified.subquery()
             galaxy_counts = {
                 int(g): int(count)
                 for g, count in session.execute(
-                    select(orm.BotTargetRow.galaxy, func.count())
-                    .group_by(orm.BotTargetRow.galaxy)
-                    .order_by(orm.BotTargetRow.galaxy)
+                    select(identified_counted.c.galaxy, func.count())
+                    .select_from(identified_counted)
+                    .group_by(identified_counted.c.galaxy)
+                    .order_by(identified_counted.c.galaxy)
                 )
             }
 
@@ -491,6 +513,7 @@ class PersistentApplicationService:
                     accepted=dispatch.accepted if dispatch else None,
                     expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
                     outcome=report.outcome if report else None,
+                    report_received=report is not None,
                     attacker_losses=report.attacker_losses if report else None,
                     defender_losses=report.defender_losses if report else None,
                     mission_kind=dispatch.mission_kind if dispatch else None,
@@ -1355,6 +1378,7 @@ class MissionConsoleService:
                 for task in record.tasks
                 if task.kind.value in MISSION_LABELS
             ),
+            military_tiers_label=_frozen_tiers_label(record.military_tiers_json),
             changes=_describe_changes(previous, record),
         )
 
@@ -1602,7 +1626,7 @@ def _backfill_label(kind: str | None) -> str:
 
 
 def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
-    params = _int_params(task.params_json)
+    params = _view_params(task.params_json)
     kind = task.kind
     return FrozenTaskView(
         kind=kind.value,
@@ -1616,7 +1640,7 @@ def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
     )
 
 
-def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
+def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
     """固化的那份参数念成人话。
 
     **只用记录里的数字，不查库。** `MissionConsoleService._summary` 会去问
@@ -1627,6 +1651,13 @@ def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
         radius = params.get("radius")
         return "未设置半径" if radius is None else f"半径 {radius}"
     if kind is MissionKind.BOT:
+        if params.get("by_military") is True:
+            top_n = params.get("top_n")
+            return (
+                "军力攻击（统一档位）"
+                if not isinstance(top_n, int) or isinstance(top_n, bool)
+                else f"军力前 {top_n} 名（统一档位）"
+            )
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -1634,6 +1665,30 @@ def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
             return "未设置系号区间"
         return f"{galaxy}:{first} – {galaxy}:{last}"
     return "不吃参数"
+
+
+def _frozen_tiers_label(raw: str) -> str:
+    """只从固化 JSON 读出人话档位，坏旧值不影响整张调度台。"""
+    try:
+        tiers = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(tiers, list):
+        return ""
+    parts: list[str] = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        score, preset = tier.get("min_score"), tier.get("preset")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, int | float)
+            or not isinstance(preset, str)
+            or not preset.strip()
+        ):
+            continue
+        parts.append(f"{preset.strip()} ≥ {score:g}")
+    return "统一档位：" + " · ".join(parts) if parts else ""
 
 
 def _describe_changes(
@@ -1791,7 +1846,8 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
             orm.BotTargetRow.latest_owner_name.is_not(None),
         )
     if kind == "free":
-        return orm.BotTargetRow.latest_owner_name.is_(None)
+        # 兼容直接调 service 的旧调用，但绝不把空位重新放进页面统计。
+        return false()
     return None
 
 

@@ -17,6 +17,7 @@ from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
+from evo_helper.domain.ranking import is_bot_coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
     MISSION_KIND_SCOUT,
@@ -43,6 +44,7 @@ from evo_helper.domain.report_wait import (
     line_free_at,
     vet_flight_time,
 )
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
@@ -323,6 +325,10 @@ class SqlAlchemyRepository:
         """
         with self._session_factory() as session:
             for record in targets:
+                # `targets_from_rows` 已过滤一次；仓储层再守一道，避免以后新的
+                # 导入入口绕过解析层，把固定海盗位写成军力 bot。
+                if not is_bot_coordinate(record.coordinate):
+                    continue
                 _require_utc(record.military_score_at_utc, "military_score_at_utc")
                 target = _bot_target_for(session, record.coordinate)
                 if target is None:
@@ -346,6 +352,29 @@ class SqlAlchemyRepository:
                 target.military_score_estimated = record.military_score_estimated
                 target.military_rank = record.military_rank
             session.commit()
+
+    def clear_pirate_position_bot_candidates(self) -> int:
+        """撤销 1--4 号位误写成 bot 的候选，保留坐标扫描原始记录。
+
+        这些行的 ``BotTargetRow`` 是派遣候选的派生索引；清掉它的 bot/军力
+        标记不会删除 ``coordinate_scans``、攻击意图或排行榜快照。位置 1--4
+        本来就不会出现在后续坐标扫描计划中，因此此操作可安全且幂等地在启动时执行。
+        """
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BotTargetRow).where(
+                    orm.BotTargetRow.is_bot,
+                    orm.BotTargetRow.position.in_(PIRATE_POSITIONS),
+                )
+            ).all()
+            for row in rows:
+                row.is_bot = False
+                row.military_score = None
+                row.military_score_at_utc = None
+                row.military_score_estimated = False
+                row.military_rank = None
+            session.commit()
+            return len(rows)
 
     def forget_implausible_military_scores(self, *, above: float) -> int:
         """把高于 `above` 的军力值清成 `None`，返回清了几行。**只清分数，不删行。**
@@ -532,6 +561,44 @@ class SqlAlchemyRepository:
                     origin=origin,
                     target=target,
                     reported_at=row.reported_at_utc,
+                )
+            session.commit()
+        return matched
+
+    def rematch_unlinked_reports(self, *, limit: int = 500) -> int:
+        """重试认领库中尚未挂到派遣的战报，返回本次补上的数量。
+
+        战报可能早于修复后的匹配规则写入；之后信箱去重会阻止它再次入库，
+        因而不能指望下一次读邮件自然修好。这里只复用 `_link_dispatch` 的
+        唯一候选规则，绝不按最近时间强行猜测归属。
+        """
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        matched = 0
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BattleReportRow)
+                .where(orm.BattleReportRow.dispatch_id.is_(None))
+                .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id)
+                .limit(limit)
+            ).all()
+            for row in rows:
+                matched += int(
+                    _link_dispatch(
+                        session,
+                        row,
+                        origin=Coordinate(
+                            row.attacker_origin_galaxy,
+                            row.attacker_origin_system,
+                            row.attacker_origin_position,
+                        ),
+                        target=Coordinate(
+                            row.defender_target_galaxy,
+                            row.defender_target_system,
+                            row.defender_target_position,
+                        ),
+                        reported_at=row.reported_at_utc,
+                    )
                 )
             session.commit()
         return matched

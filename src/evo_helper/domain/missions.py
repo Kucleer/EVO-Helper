@@ -139,6 +139,7 @@ def bot_command(
     *,
     origin: Coordinate,
     presets: Mapping[Coordinate, str] | None = None,
+    max_dispatches: int | None = None,
 ) -> list[str]:
     """bot 攻击命令行。
 
@@ -165,10 +166,17 @@ def bot_command(
         else f"{item.galaxy}:{item.system}:{item.position}"
         for item in targets
     ]
-    return _checked(
+    command = (
         [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed]
-        + ["--origin", str(origin), "--attack"]
+        + ["--origin", str(origin)]
     )
+    if max_dispatches is not None:
+        if max_dispatches < 1:
+            raise MissionParamError("空闲航线不足，暂不启动 bot 攻击")
+        command += ["--max-dispatches", str(max_dispatches)]
+    # `--attack` 历来在末尾；保留这一约定，既让运行台账可直接肉眼识别，也不破坏
+    # 依赖该稳定 argv 形状的现有调用方。
+    return _checked(command + ["--attack"])
 
 
 def _checked(command: list[str]) -> list[str]:

@@ -21,6 +21,7 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    is_bot_coordinate,
     mentions_bot,
     repair_ranks,
 )
@@ -203,7 +204,7 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
             military_rank=repaired[index],
         )
         for index, row in enumerate(rows)
-        if row.coordinate is not None
+        if is_bot_coordinate(row.coordinate)
     ]
 
 

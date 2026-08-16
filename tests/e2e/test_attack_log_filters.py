@@ -187,4 +187,6 @@ def test_switching_event_kind_keeps_the_chosen_date(tmp_path: Path) -> None:
 
     body = client.get("/logs", params={"date": "2026-08-09"}).text
 
-    assert "kind=pirate&amp;date=2026-08-09" in body
+    # 事件类型改为下拉框；日期仍作为同一个 GET 表单的隐藏字段保留。
+    assert 'id="log-kind" name="kind"' in body
+    assert 'name="date" value="2026-08-09"' in body

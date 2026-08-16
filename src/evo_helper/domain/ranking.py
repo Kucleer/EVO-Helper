@@ -50,9 +50,10 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import TypeGuard
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.scan_bounds import SYSTEMS_PER_GALAXY, TOTAL_GALAXIES
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS, SYSTEMS_PER_GALAXY, TOTAL_GALAXIES
 
 #: 行星位号的上界。`domain.scan_bounds` 只定义了银河数与每银河的恒星系数，
 #: 位号上界散落在扫描计划里，这里显式写出来当校验用。
@@ -112,6 +113,16 @@ def coordinate_of(name: str) -> Coordinate | None:
     if not 1 <= position <= POSITIONS_PER_SYSTEM:
         return None
     return Coordinate(galaxy, system, position)
+
+
+def is_bot_coordinate(coordinate: Coordinate | None) -> TypeGuard[Coordinate]:
+    """军力榜反解出的坐标是否可能是 bot。
+
+    每个恒星系的 1--4 号位是游戏固定生成的海盗，不是可由军力榜驱动的
+    bot 攻击目标。名字即使形如 ``bot_2_137_1``，也只保留为榜单原始记录，
+    不能成为 bot 候选或派舰队依据。
+    """
+    return coordinate is not None and coordinate.position not in PIRATE_POSITIONS
 
 
 def mentions_bot(text: str) -> bool:
@@ -226,7 +237,7 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
     判据不是名次也不是分数，而是**名字反解得出坐标**——名次会随玩家增减往后挪，
     而写死「639 之后是 bot」在下一次刷新之后就是错的。
     """
-    return [row for row in rows if row.coordinate is not None]
+    return [row for row in rows if is_bot_coordinate(row.coordinate)]
 
 
 __all__ = [
@@ -236,6 +247,7 @@ __all__ = [
     "coordinate_of",
     "descending_breaks",
     "interpolate_scores",
+    "is_bot_coordinate",
     "mentions_bot",
     "repair_ranks",
 ]

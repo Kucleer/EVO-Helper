@@ -33,6 +33,9 @@
       {% endfor %}
     </select>
 
+    <label class="inline-label" for="owner">归属</label>
+    <input id="owner" name="owner" value="{{ page.owner_query or '' }}" placeholder="归属名称 / bot 名称">
+
     <label class="inline-label" for="limit">每页</label>
     <select id="limit" name="limit">
       {% for size in page_sizes %}
@@ -45,14 +48,23 @@
   </form>
 
   <p class="muted" style="font-size:12px;margin:8px 0 0">
+    {% if page.galaxy %}
+      {{ page.galaxy }} 系已识别 {{ page.kind_counts.get('all', 0) }} 颗
+      （bot {{ page.kind_counts.get('bot', 0) }} + 有主 {{ page.kind_counts.get('owned', 0) }}；空位与海盗 1–4 位不计入）。
+    {% else %}
+      全部已识别 {{ page.kind_counts.get('all', 0) }} 颗
+      （bot {{ page.kind_counts.get('bot', 0) }} + 有主 {{ page.kind_counts.get('owned', 0) }}；空位与海盗 1–4 位不计入）。
+    {% endif %}
+    <br>
     {% if page.total %}
       当前筛选共 <strong>{{ page.total }}</strong> 颗，正在看第
       {{ page.offset + 1 }}–{{ page.offset + page.rows | length }} 颗。
     {% else %}
       当前筛选没有匹配的星球。
     {% endif %}
+    {% if page.owner_query %}<br>归属搜索：<strong>{{ page.owner_query }}</strong>。{% endif %}
     {# 这句只在还没动过类型筛选时说，否则会变成一句与当前视图矛盾的噪声。 #}
-    {% if page.kind == default_kind %}默认只看 bot——全量扫描里绝大多数坐标是空位。{% endif %}
+    {% if page.kind == default_kind %}默认只看 bot。{% endif %}
   </p>
 </section>
 

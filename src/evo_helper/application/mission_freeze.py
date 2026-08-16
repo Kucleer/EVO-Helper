@@ -73,6 +73,8 @@ class MissionConfigFreeze:
 
     frozen_at_utc: datetime
     tasks: tuple[FrozenTask, ...]
+    #: 本轮实际使用的统一军力档位。旧记录没有该字段，空串表示当时未记录。
+    military_tiers_json: str = ""
 
     def task(self, kind: MissionKind) -> FrozenTask | None:
         """这条链路当时的**第一个**任务。库里缺行时为 None。
@@ -99,6 +101,7 @@ class MissionConfigFreeze:
                 }
                 for task in self.tasks
             ],
+            "military_tiers_json": self.military_tiers_json,
         }
         return json.dumps(payload, ensure_ascii=False)
 
@@ -134,13 +137,19 @@ class MissionConfigFreeze:
         if not isinstance(raw_tasks, list):
             return None
         tasks = [task for item in raw_tasks if (task := _task(item)) is not None]
-        return cls(frozen_at_utc=moment, tasks=tuple(tasks))
+        tiers = data.get("military_tiers_json")
+        return cls(
+            frozen_at_utc=moment,
+            tasks=tuple(tasks),
+            military_tiers_json=tiers if isinstance(tiers, str) else "",
+        )
 
 
 def freeze_now(
     tasks: Sequence[FrozenTask],
     *,
     frozen_at_utc: datetime,
+    military_tiers_json: str = "",
 ) -> MissionConfigFreeze:
     """把当下这几个任务的配置封成一条记录。
 
@@ -164,6 +173,7 @@ def freeze_now(
                 key=lambda task: (order[task.kind], -1 if task.task_id is None else task.task_id),
             )
         ),
+        military_tiers_json=military_tiers_json,
     )
 
 
