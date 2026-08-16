@@ -228,6 +228,22 @@ def test_many_dispatch_facts_match_the_single_target_query(repository, run_id) -
     }
 
 
+def test_attacked_bot_targets_since_only_includes_accepted_recent_attacks(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    _intent(repository, run_id, created_at=NOW - timedelta(hours=23), target=TARGET)
+    _intent(repository, run_id, created_at=NOW - timedelta(hours=25), target=OTHER_TARGET)
+    _intent(
+        repository,
+        run_id,
+        created_at=NOW - timedelta(hours=1),
+        target=OTHER_TARGET,
+        accepted=False,
+    )
+
+    assert repository.attacked_bot_targets_since(NOW - timedelta(hours=24)) == {TARGET}
+
+
 # -- 翻信箱要的两个时刻 ------------------------------------------------------
 
 

@@ -1204,17 +1204,25 @@ class MissionScheduler:
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
-        """只留下这一轮真正尚需攻击的 bot，防止前 N 打完后池子原地空转。"""
+        """取前 N 名前，先排除本轮与近 24 小时已攻击的 bot。
+
+        若先拿前 N 再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
+        空集，较低排名、从未攻击的目标永远轮不到。排除必须在 ``military_pool``
+        的前面，随后再由距离给各出发星球分配。
+        """
         targets = self._scored_bot_targets()
+        now = self._clock()
         facts_by_target = self._repository.bot_dispatch_facts_many(
             [target.coordinate for target in targets],
             since=row.round_started_at_utc,
-            now_utc=self._clock(),
+            now_utc=now,
         )
+        attacked_last_day = self._repository.attacked_bot_targets_since(now - timedelta(hours=24))
         return [
             target
             for target in targets
-            if phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
+            if target.coordinate not in attacked_last_day
+            and phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
         ]
 
     def _military_origins(self, row: orm.MissionTaskRow) -> tuple[AttackOrigin, ...]:

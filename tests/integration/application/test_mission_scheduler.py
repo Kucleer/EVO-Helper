@@ -1548,6 +1548,32 @@ def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-
     assert "7:99:7=BBB" in launcher.latest.command
 
 
+def test_military_pool_skips_targets_attacked_within_the_last_24_hours(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """24 小时过滤发生在取前 N 名之前，不能让已打过的强目标反复占住候选池。"""
+    already_attacked = Coordinate(2, 140, 2)
+    still_available = Coordinate(2, 141, 3)
+    add_bot_target(session_factory, already_attacked, military_score=9_000.0)
+    add_bot_target(session_factory, still_available, military_score=8_000.0)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=already_attacked,
+        dispatched_at=NOW - timedelta(hours=23),
+        flight=timedelta(minutes=1),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:3=BBB" in command
+    assert not any(part.startswith("2:140:2") for part in command)
+
+
 def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:

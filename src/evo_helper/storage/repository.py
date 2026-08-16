@@ -1561,6 +1561,36 @@ class SqlAlchemyRepository:
                     )
         return result
 
+    def attacked_bot_targets_since(self, since: datetime) -> set[Coordinate]:
+        """已被接受的 bot 攻击目标，按真实派出时刻筛选。
+
+        军力攻击的候选池按用户口径在取前 N 名之前排除过去 24 小时已经攻击过的
+        坐标。只认 ``accepted`` 的攻击发：游戏拒绝的派遣没有舰队飞出去，既不该
+        占航线，也不能把目标静默地从一天的候选池里删掉。
+        """
+        since = _require_utc(since, "since")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                )
+                .select_from(orm.AttackIntentRow)
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dispatched_at_utc >= since,
+                )
+                .distinct()
+            ).all()
+        return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
+
     def pirate_progress(
         self,
         *,
