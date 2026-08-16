@@ -83,6 +83,7 @@ from evo_helper.domain.scheduler import (
     decide,
     fills_gaps,
     free_lines_for,
+    has_work,
     looks_like_an_environment_fault,
     quota_day_start_utc,
     tasks_failing_together,
@@ -254,6 +255,10 @@ class MissionScheduler:
         # Web 层短缓存用它辨认后台 tick 已经更新状态。它是纯内存值，控制台重启
         # 时会随调度器对象一同重置。
         self._view_generation = 0
+        #: 军力榜正在为哪个 bot 攻击任务采一批目标。榜单一旦开始采这一批，
+        #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够 ``top_n`` 后反过来
+        #: 也必须先启动该任务，再交还普通优先级排序。
+        self._military_ranking_batch_task_id: int | None = None
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -724,6 +729,11 @@ class MissionScheduler:
         snapshots = self._snapshots(tasks, config)
         facts = self._facts(snapshots, config, now)
         running = self._supervisor.running
+        batch_decision = self._military_batch_decision(snapshots, facts, running)
+        if batch_decision is not None:
+            if batch_decision.action is Action.IDLE:
+                return False
+            return self._act(batch_decision)
         decision = decide(
             snapshots,
             facts,
@@ -802,11 +812,15 @@ class MissionScheduler:
             # 可记的派遣。
             return False
         try:
-            command = (
-                self._military_command(row)
-                if task.kind is MissionKind.BOT and _bot_by_military(row.params_json)
-                else self._command_for(task.kind, row.params_json, task.origin)
-            )
+            batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
+            if task.kind is MissionKind.RANKING:
+                command = ranking_command(
+                    bot_limit=None if batch_task is None else _bot_top_n(batch_task.params_json)
+                )
+            elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
+                command = self._military_command(row)
+            else:
+                command = self._command_for(task.kind, row.params_json, task.origin)
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
             return False
@@ -819,6 +833,13 @@ class MissionScheduler:
             started_at_utc=child.started_at_utc,
             log_path=str(child.log_path),
         )
+        if task.kind is MissionKind.RANKING:
+            self._military_ranking_batch_task_id = (
+                None if batch_task is None else batch_task.id
+            )
+        elif task.kind is MissionKind.BOT and task.task_id == self._military_ranking_batch_task_id:
+            # 这一批已经真正交给带 --attack 的 runner，后续排程恢复常规优先级。
+            self._military_ranking_batch_task_id = None
         return True
 
     def _finish(self, exited: MissionExit | None) -> None:
@@ -833,6 +854,13 @@ class MissionScheduler:
                 exit_code=exited.exit_code,
                 stopped_by=exited.stopped_by.value,
             )
+        if (
+            exited.kind is MissionKind.RANKING
+            and self._military_ranking_batch_task_id is not None
+            and (exited.stopped_by is not StopReason.SELF or exited.exit_code != 0)
+        ):
+            # 没采满就失败/被用户停止的榜单不能假装是一批可攻击目标。
+            self._military_ranking_batch_task_id = None
         if exited.stopped_by is StopReason.SELF and exited.exit_code == 0:
             # 跑完一轮。「连续」是连续，成功过一次就重新数。
             self._last_failure_at.pop(exited.task_id, None)
@@ -1133,6 +1161,53 @@ class MissionScheduler:
         return sum(
             1 for target in targets if phase_of(facts_by_target[target]) is not BotPhase.DONE
         )
+
+    def _military_batch_task(self) -> orm.MissionTaskRow | None:
+        """本次军事榜采集要服务的军力 bot 任务；同优先级时按任务 id 稳定排序。"""
+        candidates = [
+            row
+            for row in self._repository.mission_tasks()
+            if row.kind == MissionKind.BOT.value
+            and row.enabled
+            and row.disabled_reason is None
+            and _bot_by_military(row.params_json)
+        ]
+        return min(candidates, key=lambda row: (row.priority, row.id), default=None)
+
+    def _military_batch_decision(
+        self,
+        snapshots: Sequence[TaskSnapshot],
+        facts: SchedulerFacts,
+        running: RunningChild | None,
+    ) -> Decision | None:
+        """军力榜采集与对应攻击之间的不可插队边界。
+
+        ``RANKING`` 写到第一屏时，普通 `decide()` 会立刻发现 bot 有候选，按
+        「攻击可抢占填空隙」的通用规则把榜单打断。这一批就永远采不满配置的
+        100 个。批次状态在这里把两阶段连起来，但仍由同一个调度器启动两个
+        独立进程，不让 BOT 自己起榜单进程。
+        """
+        task_id = self._military_ranking_batch_task_id
+        if task_id is None:
+            return None
+        if running is not None:
+            return Decision(Action.IDLE)
+        task = next((item for item in snapshots if item.task_id == task_id), None)
+        row = self._repository.mission_task(task_id)
+        if (
+            task is None
+            or row is None
+            or not task.enabled
+            or task.disabled_reason is not None
+            or not _bot_by_military(row.params_json)
+        ):
+            self._military_ranking_batch_task_id = None
+            return None
+        if has_work(task, facts):
+            return Decision(Action.START, task)
+        # 空榜、全在 24 小时排除期或当前没有航线时，不能永远扣住别的任务。
+        self._military_ranking_batch_task_id = None
+        return None
 
     def _bot_targets(self) -> list[Coordinate]:
         return [target.coordinate for target in self._scored_bot_targets()]

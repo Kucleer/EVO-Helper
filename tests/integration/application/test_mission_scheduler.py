@@ -1501,6 +1501,32 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
 BOT_BY_MILITARY = '{"by_military": true, "top_n": 2}'
 
 
+def test_military_ranking_batch_finishes_before_its_bot_attack_is_started(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """榜单刚写出一屏候选时不能被抢；采满后 bot 也不能让给下一条任务。"""
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository, MissionKind.RANKING)
+    scheduler.start()
+
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.RANKING]
+    assert launcher.latest.command[-2:] == ["--bot-limit", "2"]
+
+    # 榜单采集尚未结束，即便第一屏已写出了候选，也必须继续采到配置的 2 个。
+    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=9_000.0)
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.RANKING]
+
+    launcher.latest.exit_code = 0
+    add_bot_target(session_factory, Coordinate(2, 141, 3), military_score=8_000.0)
+    enable(repository, MissionKind.PIRATE, params_json='{"radius": 10}', priority=-1)
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.RANKING, MissionKind.BOT]
+    assert "2:140:2=BBB" in launcher.latest.command
+
+
 def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:

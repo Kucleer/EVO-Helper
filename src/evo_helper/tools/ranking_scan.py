@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from evo_helper.config import Settings
+from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import (
     RankingRow,
     coordinate_of,
@@ -206,12 +207,28 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
     ]
 
 
+def take_batch_targets(
+    targets: Sequence[RankingTarget], *, seen: set[Coordinate], limit: int | None
+) -> list[RankingTarget]:
+    """从一屏中取本批尚未见过的目标，且绝不超过配置数量。"""
+    picked: list[RankingTarget] = []
+    for target in targets:
+        if target.coordinate in seen:
+            continue
+        if limit is not None and len(seen) >= limit:
+            break
+        seen.add(target.coordinate)
+        picked.append(target)
+    return picked
+
+
 def scan(
     columns: RankingColumns | None = None,
     *,
     blind_scrolls: int = BLIND_SCROLLS,
     human_scrolls: int = 140,
     bot_scrolls: int = 400,
+    bot_limit: int | None = None,
 ) -> int:
     """跑一趟榜单采集。返回 0 = 正常到底，2 = 中途离页（多半断线）。
 
@@ -224,6 +241,8 @@ def scan(
     """
     import pytesseract
 
+    if bot_limit is not None and bot_limit < 1:
+        raise ValueError("bot_limit must be at least 1")
     columns = columns or RankingColumns()
     pytesseract.pytesseract.tesseract_cmd = Settings().tesseract_path
     driver = LiveDriver()  # 默认 False：此工具没有派舰队能力。
@@ -246,6 +265,7 @@ def scan(
         create_session_factory(create_database_engine(Settings().database_url))
     )
     written = 0
+    collected: set[Coordinate] = set()
 
     def persist(targets: Sequence[RankingTarget]) -> None:
         """**逐屏落库**，不攒到最后一次性写。
@@ -263,6 +283,13 @@ def scan(
             return
         repository.save_ranking_targets(targets)
         written += len(targets)
+
+    def collect(targets: Sequence[RankingTarget]) -> tuple[list[RankingTarget], bool]:
+        """只保留本批前 N 个不同 bot；相邻滚屏的重叠行不重复计数。"""
+        picked = take_batch_targets(targets, seen=collected, limit=bot_limit)
+        persist(picked)
+        reached = bot_limit is not None and len(collected) >= bot_limit
+        return picked, reached
 
     # ⚠️ **开榜放在 try 外面。** 它在读标签行那一步就可能失败，那时面板压根没开，
     # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
@@ -312,16 +339,21 @@ def scan(
         # -- 第二段：细读三列 ------------------------------------------------
         if outcome == 0:
             rows = read_rows()
-            screens.append(targets_from_rows(rows, observed_at=datetime.now(UTC)))
+            first, reached_limit = collect(targets_from_rows(rows, observed_at=datetime.now(UTC)))
+            screens.append(first)
+            if reached_limit:
+                print(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
             dry = 0
-            for extra in range(1, bot_scrolls + 1):
+            for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 step = nav.scroll_once()
                 if step.outcome is ScrollOutcome.OFF_PAGE:
                     print(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
                     outcome = 2
                     break
                 rows = list(step.rows)
-                fresh = targets_from_rows(rows, observed_at=datetime.now(UTC))
+                fresh, reached_limit = collect(
+                    targets_from_rows(rows, observed_at=datetime.now(UTC))
+                )
                 # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
                 # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
                 # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
@@ -331,8 +363,10 @@ def scan(
                 # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
-                persist(fresh)
                 print(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
+                if reached_limit:
+                    print(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
+                    break
                 if dry >= DRY_SCREENS:
                     print(f"连续 {dry} 屏没有新 bot：这一段到头了")
                     break
@@ -425,6 +459,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SCORE",
         help="把高于这个值的军力值清成空（只清分数不删行），然后退出。用来撤回一批已知错读。",
     )
+    parser.add_argument(
+        "--bot-limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="最多采集 N 个不同 bot，供一轮军力攻击使用",
+    )
     for name in ("rank", "name", "score"):
         parser.add_argument(
             f"--{name}-column", nargs=2, type=int, metavar=("LEFT", "RIGHT"), default=None
@@ -451,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
             rank=pair(args.rank_column, default.rank),
             name=pair(args.name_column, default.name),
             score=pair(args.score_column, default.score),
-        )
+        ),
+        bot_limit=args.bot_limit,
     )
 
 
@@ -481,6 +523,7 @@ __all__ = [
     "parse_score",
     "rows_from_image",
     "targets_from_rows",
+    "take_batch_targets",
     "track_progress",
 ]
 

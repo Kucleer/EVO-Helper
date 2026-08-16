@@ -17,6 +17,7 @@ from evo_helper.domain.missions import (
     bot_targets_in_range,
     pirate_command,
     pirate_systems,
+    ranking_command,
     scan_command,
     wrap_system,
 )
@@ -118,6 +119,16 @@ def test_an_empty_target_set_is_rejected_before_a_process_is_started() -> None:
 
 def test_scan_command_is_the_full_argv() -> None:
     assert scan_command()[1:] == ["-u", "-m", "evo_helper.tools.scan_coordinates"]
+
+
+def test_military_ranking_command_can_stop_at_the_attack_batch_size() -> None:
+    assert ranking_command(bot_limit=100)[1:] == [
+        "-u",
+        "-m",
+        "evo_helper.tools.ranking_scan",
+        "--bot-limit",
+        "100",
+    ]
 
 
 def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:

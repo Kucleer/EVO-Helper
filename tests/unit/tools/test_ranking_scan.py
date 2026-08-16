@@ -26,6 +26,7 @@ from evo_helper.tools.ranking_scan import (
     parse_score,
     progress_mark,
     rows_from_image,
+    take_batch_targets,
     targets_from_rows,
     track_progress,
 )
@@ -232,6 +233,25 @@ def test_only_rows_that_resolve_to_a_coordinate_are_stored() -> None:
     )
 
     assert [t.coordinate for t in targets] == [Coordinate(4, 30, 12)]
+
+
+def test_batch_limit_counts_unique_bots_and_stops_exactly_at_the_limit() -> None:
+    first = _target("first")
+    second = RankingTarget(
+        coordinate=Coordinate(4, 31, 12), military_score=1.0, military_score_at_utc=NOW
+    )
+    third = RankingTarget(
+        coordinate=Coordinate(4, 32, 12), military_score=1.0, military_score_at_utc=NOW
+    )
+    seen: set[Coordinate] = set()
+
+    picked = take_batch_targets([first, first, second, third], seen=seen, limit=2)
+
+    assert [target.coordinate for target in picked] == [
+        Coordinate(4, 30, 12),
+        Coordinate(4, 31, 12),
+    ]
+    assert seen == {Coordinate(4, 30, 12), Coordinate(4, 31, 12)}
 
 
 # -- 断线 ----------------------------------------------------------------------
