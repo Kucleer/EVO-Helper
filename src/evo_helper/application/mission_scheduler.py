@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from evo_helper.application.backfill import (
     BACKFILL_KINDS,
@@ -94,6 +94,7 @@ from evo_helper.domain.target_order import (
     ScoredTarget,
     strongest_then_nearest,
 )
+from evo_helper.infrastructure.system_log import child_environment
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -842,7 +843,12 @@ class MissionScheduler:
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
             return False
-        child = self._supervisor.start(task.kind, command, task_id=task.task_id, name=task.name)
+        # 本轮的 id 要在**起子进程之前**定下来：runner 靠环境变量认领它，
+        # 好把自己写进 `system_log` 的每一行都挂到这一轮上。起完再生成就晚了，
+        # 那台机器上的日志会全部落成「不属于任何一轮」。
+        run_id = uuid4()
+        with child_environment(run_id=run_id, task_id=task.task_id, mission_kind=task.kind.value):
+            child = self._supervisor.start(task.kind, command, task_id=task.task_id, name=task.name)
         self._run_id = self._repository.begin_mission_run(
             task.kind,
             task_id=task.task_id,
@@ -850,6 +856,7 @@ class MissionScheduler:
             pid=child.pid,
             started_at_utc=child.started_at_utc,
             log_path=str(child.log_path),
+            run_id=run_id,
         )
         if task.kind is MissionKind.RANKING:
             self._military_ranking_batch_task_id = None if batch_task is None else batch_task.id

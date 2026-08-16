@@ -32,8 +32,10 @@ from evo_helper.domain.records import CoordinateScan
 from evo_helper.domain.scan_bounds import ScanBounds
 from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments, total_coordinates
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
+from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.vision.scan_reading import (
     COORD_WHITELIST,
     PlanetPanel,
@@ -105,11 +107,35 @@ def say(message: str) -> None:
 
     OCR 的输出本来就什么字符都可能有，所以这里按当前流的编码兜一层：
     编不出来的字换成替代符，宁可丢一个字符也不能丢一个进程。
+
+    **同一行还会进 `system_log` 表（双写）。** 实机跑在一台机器上、人常在另一台
+    机器上看控制台，本机 cmd 窗口与 `var/logs/mission-*.log` 换台机器就看不见了。
+    入库走的是有界队列 + 后台线程（`infrastructure.system_log`），调用方不等
+    网络往返；没装出口时那一句是空操作。**它排在 `print` 之后**：控制台那份是
+    保底的一份，不该因为日志出口出问题而少打一行。
     """
     line = f"{datetime.now().strftime('%H:%M:%S')} {message}"
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
     print(safe, flush=True)
+    record_system_log("INFO", _caller_source(), message)
+
+
+def _caller_source() -> str:
+    """`say()` 的调用方模块名，去掉 `evo_helper.` 前缀。
+
+    从调用栈里取而不是让每个调用点自己传：`say` 有 136 个调用点（pirate_loop 80、
+    scan_coordinates 33、bot_loop 14、backfill_reports 等 9），改签名等于全改一遍，
+    而漏掉任何一个都会让那一条日志的 `source` 说谎。
+
+    取不到就回落到本模块名——`sys._getframe` 是 CPython 的实现细节，而
+    「日志少一个准确的来源」远好过「日志出口把 runner 弄死」。
+    """
+    try:
+        name = sys._getframe(2).f_globals.get("__name__", __name__)
+    except (AttributeError, ValueError):  # pragma: no cover - 非 CPython 才走到
+        name = __name__
+    return str(name).removeprefix("evo_helper.")[:64]
 
 
 def make_console_encoding_safe() -> None:
@@ -1251,6 +1277,8 @@ def show_status() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
+    install_runner_system_log()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None, help="本次最多入库多少个坐标")
     parser.add_argument("--status", action="store_true", help="只看计划与游标，不动游戏")

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Float,
     ForeignKey,
@@ -630,3 +631,70 @@ class DailyReconciliationRow(Base):
     #: 舰队全回来之后那个数会永远停在最高水位，回读出来的「还在等」全是假的。
     awaiting_reports: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     reconciled_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
+class SystemLogRow(Base):
+    """实机脚本与控制台的诊断输出，集中一行一条。
+
+    **为什么要有这张表**：实机跑在一台机器上，人常在另一台机器上看控制台。
+    `print` 只落在跑实机那台的 cmd 窗口和它本地的 `var/logs/mission-*.log` 里，
+    换台机器完全看不到。数据库是**额外的一份**（双写），不取代任何现有输出——
+    库连不上的时候，本机那份仍然是全的。
+
+    **刻意没有 `seq` 列。** 写入是同一个进程 FIFO 排队、后台线程按序批量刷盘，
+    所以同一进程内 `id` 递增就是发生顺序，再加一列序号只是在每条日志上多摊一次
+    写入成本，而这条链路一轮（海盗半小时）就有几千条。跨进程的先后由
+    `logged_at_utc` 回答——那是**产生时刻**，不是入库时刻，正是为了让批量刷盘
+    与网络抖动不改变时间线。
+
+    `payload_json` 用 `Text` 存 JSON 而不是 `JSONB`：测试跑 SQLite，生产才是
+    PostgreSQL，同 `mission_tasks.params_json` 的先例。
+    """
+
+    __tablename__ = "system_log"
+    __table_args__ = (
+        # 主视图：按时刻倒序翻页。带上 `id` 是因为同一毫秒里能有好几条，
+        # 只按时刻排的话翻页会在边界上重复或漏掉行。
+        Index("ix_system_log_logged_at_id", "logged_at_utc", "id"),
+        Index("ix_system_log_run_id_id", "run_id", "id"),
+        Index("ix_system_log_host_logged_at", "host", "logged_at_utc"),
+        Index("ix_system_log_level_logged_at", "level", "logged_at_utc"),
+    )
+
+    #: ⚠️ `with_variant(Integer, "sqlite")` **不是可选的**。实测（2026-08-16）：
+    #: 纯 `BigInteger` 主键在 SQLite 上建出来是 `BIGINT`，而 SQLite 只把写成
+    #: `INTEGER PRIMARY KEY` 的列当 rowid 别名——插入不带 id 当场
+    #: `IntegrityError: NOT NULL constraint failed`，自增根本不发生。
+    #: 加了变体之后：SQLite 上是 `INTEGER`（自增可用），PostgreSQL 上仍是
+    #: `BIGSERIAL`。量大不用 UUID，就是为了这一列能便宜地既当主键又当顺序号。
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    #: **产生时刻**，不是入库时刻。批量刷盘会把入库推后几百毫秒到几秒，
+    #: 而这一列是所有「那一刻发生了什么」的判据。
+    logged_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: `DEBUG` / `INFO` / `WARNING` / `ERROR`。
+    level: Mapped[str] = mapped_column(String(8))
+    #: 产生它的模块，如 `tools.bot_loop`。
+    source: Mapped[str] = mapped_column(String(64))
+    #: 机器名。跨机查看的刚需——两台机器的日志混在一张表里，没有它就分不出
+    #: 「实机那台没动静」和「我这台没在跑」。
+    host: Mapped[str] = mapped_column(String(64))
+    #: 同一台机器上可以并存多个 runner（调度器起的那个 + 手工直跑的），
+    #: 光靠 host 分不开。
+    pid: Mapped[int] = mapped_column(Integer)
+    #: 属于哪一轮。**可空**：手工直跑不属于任何一轮，控制台自己的日志同理。
+    #:
+    #: ⚠️ 外键**不带 `ondelete="CASCADE"`**：日志是事后翻账用的，一轮记录被清掉
+    #: 不该顺手把「那一轮到底发生了什么」也一起删了。
+    run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("mission_runs.id"), nullable=True, index=False
+    )
+    #: 冗余一份任务号，任务被删掉之后仍然查得到——同 `mission_runs.task_id`
+    #: 的先例（见那一列的注释），同样不加外键。
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: `pirate` / `bot` / `scan` / `ranking`。
+    mission_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    message: Mapped[str] = mapped_column(Text)
+    #: 坐标、预设名、耗时、异常栈之类的结构化附加信息。
+    payload_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")

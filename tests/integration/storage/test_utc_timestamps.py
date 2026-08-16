@@ -71,20 +71,22 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "scan_plans.updated_at_utc",
         "scout_reports.reported_at_utc",
         "state_events.occurred_at_utc",
+        "system_log.logged_at_utc",
         "target_revisits.executed_at_utc",
         "target_revisits.requested_at_utc",
         "ui_observations.observed_at_utc",
     }
 )
 
-#: `planet_scout_alerts` is created after the one-off b6 migration.  Its DDL
-#: already uses `UTCDateTime`, so asking that historical migration to alter a
-#: table which did not exist yet would be both impossible and misleading.
+#: 这几张表是在一次性的 b6 迁移**之后**才建的，建表 DDL 本身就已经写了
+#: `DateTime(timezone=True)`。要求那条历史迁移去 alter 一张当时还不存在的表，
+#: 既做不到也会把「迁移清单必须与模型一一对应」这条判据讲错。
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",
+        "system_log.logged_at_utc",
     }
 )
 
