@@ -515,9 +515,7 @@ def test_the_unambiguous_bbb_font_misread_is_recovered() -> None:
     首尾两个 B 都识别正确，只有中间的花体 B 被误读；这不是把任意近似名放宽，
     而是只接受三次重复代码的受限误读。精确读到 BBB 时仍必须优先点精确项。
     """
-    picker, driver, _strip = _picker(
-        [[(748, "AAA"), (985, "探路")], [(760, "BEB"), (990, "CCC")]]
-    )
+    picker, driver, _strip = _picker([[(748, "AAA"), (985, "探路")], [(760, "BEB"), (990, "CCC")]])
 
     assert picker.pick("BBB") == 760
     assert _preset_clicks(driver) == [(760, PRESET_NAME_ROW_Y, "预设 BBB")]

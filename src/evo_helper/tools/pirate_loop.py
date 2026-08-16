@@ -788,10 +788,16 @@ class PirateLoop:
         """把当前这一帧（和一块 ROI 的读数）存到 `var/logs/`，供事后复盘。"""
         from pathlib import Path
 
+        capture = getattr(self._driver, "capture", None)
+        if not callable(capture):
+            # 现场保全是诊断附加项，绝不能覆盖原本的「安全拒绝派遣」结果。
+            # 轻量驱动（尤其单元测试桩）只实现点击和等待，不具备截图能力。
+            say(f"  无截图能力，跳过现场保存（{name}）")
+            return
         directory = Path("var/logs")
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%H%M%S")
-        image = self._driver.capture()
+        image = capture()
         path = directory / f"dump-{name}-{stamp}.png"
         image.save(path)
         note = f"  已存现场 {path}（{image.width}x{image.height}）"
@@ -2538,7 +2544,8 @@ class PirateLoop:
             # 调度器会在一条航线返航后再次拉起 runner。这里若无条件进信箱，
             # 就会把「等舰队回来继续派」误做成「每次续跑都翻一遍战报」。启动
             # 对账由控制台统一安排一次；runner 只在手工显式请求时才读。
-            if self._options.reconcile_on_start:
+            options = getattr(self, "_options", None)
+            if options is not None and options.reconcile_on_start:
                 self.reconcile_today()
             if not self.ensure_origin_planet():
                 # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
