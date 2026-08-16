@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import RankingRow
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 
 from . import models as orm
 
@@ -66,6 +67,7 @@ class MilitaryRankingRepository:
         score_max: float | None = None,
         galaxy: int | None = None,
         bot_only: bool = False,
+        kind: str = "all",
         query: str | None = None,
         offset: int = 0,
         limit: int = 100,
@@ -91,8 +93,21 @@ class MilitaryRankingRepository:
                 statement = statement.where(orm.MilitaryRankingEntryRow.score <= score_max)
             if galaxy is not None:
                 statement = statement.where(orm.MilitaryRankingEntryRow.galaxy == galaxy)
-            if bot_only:
-                statement = statement.where(orm.MilitaryRankingEntryRow.galaxy.is_not(None))
+            # `bot_only` 保留给旧 API 调用；新的页面用单一下拉枚举，不再把
+            # 海盗（固定 1–4 位）误当成 bot。
+            effective_kind = "bot" if bot_only else kind
+            if effective_kind == "bot":
+                statement = statement.where(
+                    orm.MilitaryRankingEntryRow.galaxy.is_not(None),
+                    orm.MilitaryRankingEntryRow.position.not_in(PIRATE_POSITIONS),
+                )
+            elif effective_kind == "pirate":
+                statement = statement.where(
+                    orm.MilitaryRankingEntryRow.galaxy.is_not(None),
+                    orm.MilitaryRankingEntryRow.position.in_(PIRATE_POSITIONS),
+                )
+            elif effective_kind == "player":
+                statement = statement.where(orm.MilitaryRankingEntryRow.galaxy.is_(None))
             if query and query.strip():
                 statement = statement.where(
                     orm.MilitaryRankingEntryRow.player_name.contains(query.strip())

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
+from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, false, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -30,7 +32,7 @@ from evo_helper.domain.missions import (
     wrap_system,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
-from evo_helper.domain.scan_bounds import SYSTEMS_PER_GALAXY
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS, SYSTEMS_PER_GALAXY
 from evo_helper.domain.scheduler import (
     MissionKind,
     RunningProcess,
@@ -83,6 +85,10 @@ from .service import (
     StateEventView,
     planet_kind,
 )
+
+# 页面（2 秒）与悬浮台（1 秒）会同时读取同一份重快照。这个缓存只合并瞬时并发
+# 请求，不把运行状态长期藏起来；写操作会主动失效。
+SCHEDULER_VIEW_TTL_S = 0.75
 
 
 class PersistentApplicationService:
@@ -222,7 +228,15 @@ class PersistentApplicationService:
                 if (view := self._report_view(session, coordinate, report))
             ]
 
-    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+    def list_planets(
+        self,
+        *,
+        galaxy: int | None,
+        kind: str,
+        owner_query: str | None = None,
+        offset: int,
+        limit: int,
+    ) -> PlanetPage:
         """按银河系与类型筛选星球，**在 SQL 里筛、在 SQL 里数**。
 
         全量扫完是 71,856 颗星球。把它们全查出来再在 Python 里过滤，既慢又会诱使
@@ -230,7 +244,16 @@ class PersistentApplicationService:
         「扫描停在 2:32」的假象的。
         """
         with self._session_factory() as session:
-            base = select(orm.BotTargetRow)
+            # 空位仍是扫描证据，但不是「星球列表」的一员；否则一次全星系扫描会
+            # 让 4,000+ 个空位淹没 bot / 有主星球，并把总数误读为可用目标数。
+            identified = select(orm.BotTargetRow).where(
+                or_(
+                    orm.BotTargetRow.is_bot.is_(True),
+                    orm.BotTargetRow.latest_owner_name.is_not(None),
+                ),
+                orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+            )
+            base = identified
             if galaxy is not None:
                 base = base.where(orm.BotTargetRow.galaxy == galaxy)
 
@@ -238,7 +261,6 @@ class PersistentApplicationService:
             kind_counts = {
                 "bot": 0,
                 "owned": 0,
-                "free": 0,
             }
             for is_bot, owner, count in session.execute(
                 select(counted.c.is_bot, counted.c.latest_owner_name, func.count())
@@ -252,6 +274,10 @@ class PersistentApplicationService:
             clause = _planet_kind_clause(kind)
             if clause is not None:
                 filtered = filtered.where(clause)
+            if owner_query and owner_query.strip():
+                filtered = filtered.where(
+                    orm.BotTargetRow.latest_owner_name.ilike(f"%{owner_query.strip()}%")
+                )
 
             total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
             rows = session.scalars(
@@ -264,12 +290,14 @@ class PersistentApplicationService:
                 .limit(limit)
             ).all()
 
+            identified_counted = identified.subquery()
             galaxy_counts = {
                 int(g): int(count)
                 for g, count in session.execute(
-                    select(orm.BotTargetRow.galaxy, func.count())
-                    .group_by(orm.BotTargetRow.galaxy)
-                    .order_by(orm.BotTargetRow.galaxy)
+                    select(identified_counted.c.galaxy, func.count())
+                    .select_from(identified_counted)
+                    .group_by(identified_counted.c.galaxy)
+                    .order_by(identified_counted.c.galaxy)
                 )
             }
 
@@ -485,6 +513,7 @@ class PersistentApplicationService:
                     accepted=dispatch.accepted if dispatch else None,
                     expected_report_at_utc=dispatch.expected_report_at_utc if dispatch else None,
                     outcome=report.outcome if report else None,
+                    report_received=report is not None,
                     attacker_losses=report.attacker_losses if report else None,
                     defender_losses=report.defender_losses if report else None,
                     mission_kind=dispatch.mission_kind if dispatch else None,
@@ -740,14 +769,82 @@ class MissionConsoleService:
     一回事」——那种错静默、且只有在舰队白飞一趟之后才看得见。
     """
 
-    def __init__(self, repository: SqlAlchemyRepository, scheduler: MissionScheduler) -> None:
+    def __init__(
+        self,
+        repository: SqlAlchemyRepository,
+        scheduler: MissionScheduler,
+        *,
+        monotonic_clock: Callable[[], float] = monotonic,
+        scheduler_view_ttl_s: float = SCHEDULER_VIEW_TTL_S,
+    ) -> None:
         self._repository = repository
         self._scheduler = scheduler
+        self._monotonic = monotonic_clock
+        self._scheduler_view_ttl_s = scheduler_view_ttl_s
+        self._scheduler_view_lock = threading.Lock()
+        self._scheduler_view_cached: SchedulerView | None = None
+        self._scheduler_view_cached_at = float("-inf")
+        self._scheduler_view_generation = -1
+        self._scheduler_view_task_signature: tuple[object, ...] | None = None
 
     # -- 读 --------------------------------------------------------------------
 
     def scheduler_view(self) -> SchedulerView:
-        return self._view(self._scheduler.snapshot())
+        """取调度快照的短 TTL 单飞缓存。
+
+        快照会计算每个任务的随行事实；多个浏览器轮询刚好重叠时，后到的请求在
+        这把小锁里复用先到者的结果，避免同时对 SQLite 发起同一轮重查询。锁只包
+        这条读路径，起停仍由 ``MissionScheduler`` 自己的锁负责。
+        """
+        # 这条小查询既不会进入逐目标判态，也不读战报；它只避免任务被后台或其他
+        # 请求线程改过时，TTL 内仍回旧行。真正昂贵的 `_facts()` 只在缓存失效时跑。
+        task_signature = self._mission_task_signature()
+        generation = self._scheduler.view_generation
+        with self._scheduler_view_lock:
+            now = self._monotonic()
+            cached = self._scheduler_view_cached
+            if (
+                cached is not None
+                and now - self._scheduler_view_cached_at < self._scheduler_view_ttl_s
+                and generation == self._scheduler_view_generation
+                and task_signature == self._scheduler_view_task_signature
+            ):
+                return cached
+            view = self._view(self._scheduler.snapshot())
+            self._scheduler_view_cached = view
+            self._scheduler_view_cached_at = now
+            self._scheduler_view_generation = self._scheduler.view_generation
+            self._scheduler_view_task_signature = self._mission_task_signature()
+            return view
+
+    def _invalidate_scheduler_view(self) -> None:
+        with self._scheduler_view_lock:
+            self._scheduler_view_cached = None
+            self._scheduler_view_cached_at = float("-inf")
+            self._scheduler_view_generation = -1
+            self._scheduler_view_task_signature = None
+
+    def _mission_task_signature(self) -> tuple[object, ...]:
+        """只读任务行的轻量版本号，补上调度器内存版本覆盖不到的直接写库。"""
+        return tuple(
+            (
+                row.id,
+                row.enabled,
+                row.priority,
+                row.name,
+                row.params_json,
+                row.origin_galaxy,
+                row.origin_system,
+                row.origin_position,
+                row.fleet_lines,
+                row.round_started_at_utc,
+                row.quota_exhausted_until_utc,
+                row.consecutive_failures,
+                row.disabled_reason,
+                row.updated_at_utc,
+            )
+            for row in self._repository.mission_tasks()
+        )
 
     def recent_runs(self, *, limit: int = 50) -> list[MissionRunView]:
         """`mission_runs` 的近况，新的在前。
@@ -795,10 +892,12 @@ class MissionConsoleService:
                 "补录期间不能启动调度器；等它跑完，或先点「取消补录」"
             )
         self._scheduler.start(reconcile=reconcile)
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     def stop_scheduler(self) -> SchedulerView:
         self._scheduler.stop()
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     # -- 战报补录 --------------------------------------------------------------
@@ -847,11 +946,13 @@ class MissionConsoleService:
             )
         except BackfillBusyError as exc:
             raise ConflictError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def cancel_backfill(self) -> BackfillView:
         """「取消补录」：排队中的撤掉，跑着的杀掉，之后立刻放行任务。"""
         self._scheduler.cancel_backfill()
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def resume_after_backfill(self) -> BackfillView:
@@ -861,6 +962,7 @@ class MissionConsoleService:
         放行之前看一眼「认领上了几发、几个 bot 目标不用再打了」。
         """
         self._scheduler.acknowledge_backfill()
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def _backfill_view(self) -> BackfillView:
@@ -928,6 +1030,7 @@ class MissionConsoleService:
         杀一个不认识的进程**——pid 会被系统回收复用，那一枪可能打在别人身上。
         """
         self._scheduler.force_kill()
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     # -- 改 --------------------------------------------------------------------
@@ -1012,6 +1115,7 @@ class MissionConsoleService:
             clear_origin=clear_origin,
             fleet_lines=fleet_lines,
         )
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
@@ -1053,6 +1157,7 @@ class MissionConsoleService:
                 raise AssertionError("validated planet_id disappeared")
             resolved.append((item.planet_id, item.fleet_lines, item.enabled))
         self._repository.replace_mission_task_origins(task_id, tuple(resolved))
+        self._invalidate_scheduler_view()
         return self.mission_origins(task_id)
 
     def attack_planets(self) -> tuple[AttackPlanetView, ...]:
@@ -1073,6 +1178,7 @@ class MissionConsoleService:
             row = self._repository.create_attack_planet(coordinate)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
 
     def update_attack_planet(self, planet_id: int, coordinate: Coordinate) -> AttackPlanetView:
@@ -1081,6 +1187,7 @@ class MissionConsoleService:
             row = self._repository.update_attack_planet(planet_id, coordinate)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
 
     def delete_attack_planet(self, planet_id: int) -> None:
@@ -1089,6 +1196,7 @@ class MissionConsoleService:
             self._repository.delete_attack_planet(planet_id)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
 
     def military_attack_config(self) -> MilitaryAttackConfigView:
         row = self._repository.military_attack_config()
@@ -1110,6 +1218,7 @@ class MissionConsoleService:
         row = self._repository.replace_military_attack_tiers(
             json.dumps(normalized, ensure_ascii=False)
         )
+        self._invalidate_scheduler_view()
         return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
 
     def create_mission(
@@ -1155,6 +1264,7 @@ class MissionConsoleService:
             fleet_lines=fleet_lines,
             now_utc=self._scheduler.now_utc(),
         )
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     def delete_mission(self, task_id: int) -> None:
@@ -1167,6 +1277,7 @@ class MissionConsoleService:
             label = MISSION_LABELS.get(row.kind, row.kind)
             raise ServiceError(f"「{label}」只剩这一个任务了，删不得；不想让它跑就取消勾选")
         self._repository.delete_mission_task(task_id)
+        self._invalidate_scheduler_view()
 
     def restart_bot_round(self, task_id: int) -> MissionTaskView:
         """「重开一轮」：把这个任务的 `round_started_at_utc` 推到当前。
@@ -1181,6 +1292,7 @@ class MissionConsoleService:
         if row.kind != MissionKind.BOT.value:
             raise ServiceError("只有 bot 攻击有「一轮」这个概念")
         self._scheduler.begin_bot_round(task_id)
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     # -- 内部 ------------------------------------------------------------------
@@ -1266,6 +1378,7 @@ class MissionConsoleService:
                 for task in record.tasks
                 if task.kind.value in MISSION_LABELS
             ),
+            military_tiers_label=_frozen_tiers_label(record.military_tiers_json),
             changes=_describe_changes(previous, record),
         )
 
@@ -1513,7 +1626,7 @@ def _backfill_label(kind: str | None) -> str:
 
 
 def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
-    params = _int_params(task.params_json)
+    params = _view_params(task.params_json)
     kind = task.kind
     return FrozenTaskView(
         kind=kind.value,
@@ -1527,7 +1640,7 @@ def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
     )
 
 
-def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
+def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
     """固化的那份参数念成人话。
 
     **只用记录里的数字，不查库。** `MissionConsoleService._summary` 会去问
@@ -1538,6 +1651,13 @@ def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
         radius = params.get("radius")
         return "未设置半径" if radius is None else f"半径 {radius}"
     if kind is MissionKind.BOT:
+        if params.get("by_military") is True:
+            top_n = params.get("top_n")
+            return (
+                "军力攻击（统一档位）"
+                if not isinstance(top_n, int) or isinstance(top_n, bool)
+                else f"军力前 {top_n} 名（统一档位）"
+            )
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -1545,6 +1665,30 @@ def _frozen_summary(kind: MissionKind, params: dict[str, int]) -> str:
             return "未设置系号区间"
         return f"{galaxy}:{first} – {galaxy}:{last}"
     return "不吃参数"
+
+
+def _frozen_tiers_label(raw: str) -> str:
+    """只从固化 JSON 读出人话档位，坏旧值不影响整张调度台。"""
+    try:
+        tiers = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(tiers, list):
+        return ""
+    parts: list[str] = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        score, preset = tier.get("min_score"), tier.get("preset")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, int | float)
+            or not isinstance(preset, str)
+            or not preset.strip()
+        ):
+            continue
+        parts.append(f"{preset.strip()} ≥ {score:g}")
+    return "统一档位：" + " · ".join(parts) if parts else ""
 
 
 def _describe_changes(
@@ -1702,7 +1846,8 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
             orm.BotTargetRow.latest_owner_name.is_not(None),
         )
     if kind == "free":
-        return orm.BotTargetRow.latest_owner_name.is_(None)
+        # 兼容直接调 service 的旧调用，但绝不把空位重新放进页面统计。
+        return false()
     return None
 
 

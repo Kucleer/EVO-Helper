@@ -8,7 +8,7 @@ from fastapi import APIRouter, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.ranking import RankingRow, coordinate_of
+from evo_helper.domain.ranking import PIRATE_POSITIONS, RankingRow, coordinate_of, is_bot_coordinate
 from evo_helper.storage.military_rankings import MilitaryRankingRepository
 
 
@@ -48,6 +48,7 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
         score_max: float | None = Query(default=None, ge=0),
         galaxy: int | None = Query(default=None, ge=1, le=9),
         bot_only: bool = False,
+        kind: str = Query(default="all", pattern="^(all|bot|pirate|player)$"),
         q: str | None = None,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
@@ -59,6 +60,7 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
             score_max=score_max,
             galaxy=galaxy,
             bot_only=bot_only,
+            kind=kind,
             query=q,
             offset=offset,
             limit=limit,
@@ -73,7 +75,17 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
                     "name": row.name,
                     "score": row.score,
                     "coordinate": None if row.coordinate is None else str(row.coordinate),
-                    "is_bot": row.coordinate is not None,
+                    "is_bot": is_bot_coordinate(row.coordinate),
+                    "kind": (
+                        "bot"
+                        if is_bot_coordinate(row.coordinate)
+                        else "pirate"
+                        if (
+                            row.coordinate is not None
+                            and row.coordinate.position in PIRATE_POSITIONS
+                        )
+                        else "player"
+                    ),
                 }
                 for row in page.rows
             ],

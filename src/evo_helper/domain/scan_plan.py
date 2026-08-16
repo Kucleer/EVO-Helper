@@ -39,10 +39,15 @@ def planned_segments(
     *,
     segments: Sequence[ScanSegment] | None = None,
     bounds: ScanBounds | None = None,
+    priority_planets: Sequence[Coordinate] = (),
 ) -> tuple[tuple[ScanSegment, Coordinate, Coordinate], ...]:
     """分段连同各自的首尾坐标，按扫描优先级排好。"""
     window = bounds or ScanBounds()
-    ordered = tuple(segments) if segments is not None else scan_segments()
+    ordered = (
+        tuple(segments)
+        if segments is not None
+        else scan_segments(priority_planets=priority_planets)
+    )
     return tuple((seg, *segment_bounds(seg, window)) for seg in ordered)
 
 
@@ -51,11 +56,14 @@ def iter_scan_coordinates(
     segments: Sequence[ScanSegment] | None = None,
     bounds: ScanBounds | None = None,
     after: Coordinate | None = None,
+    priority_planets: Sequence[Coordinate] = (),
 ) -> Iterator[Coordinate]:
     """按计划顺序产出待扫坐标；给了 `after` 就从它之后接着扫。"""
     window = bounds or ScanBounds()
     resumed = after is None
-    for segment, _start, _end in planned_segments(segments=segments, bounds=window):
+    for segment, _start, _end in planned_segments(
+        segments=segments, bounds=window, priority_planets=priority_planets
+    ):
         for system in range(segment.first_system, segment.last_system + 1):
             for position in range(window.first_position, window.position_limit + 1):
                 coordinate = Coordinate(segment.galaxy, system, position)
@@ -71,10 +79,13 @@ def total_coordinates(
     *,
     segments: Sequence[ScanSegment] | None = None,
     bounds: ScanBounds | None = None,
+    priority_planets: Sequence[Coordinate] = (),
 ) -> int:
     """计划覆盖的坐标总数。用乘法算，不展开迭代器。"""
     window = bounds or ScanBounds()
     return sum(
         segment.system_count * window.positions_per_system
-        for segment, _start, _end in planned_segments(segments=segments, bounds=window)
+        for segment, _start, _end in planned_segments(
+            segments=segments, bounds=window, priority_planets=priority_planets
+        )
     )

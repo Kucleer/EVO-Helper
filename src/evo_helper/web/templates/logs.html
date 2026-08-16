@@ -9,24 +9,6 @@
 <section class="panel compact" aria-labelledby="log-filter">
   <h2 id="log-filter" class="visually-hidden">筛选</h2>
   {#
-    事件类型这一排是**链接**，选中态由 `.btn.primary`（强调色）表示。
-    所以这里刻意**不给它们上 bot / 海盗那两种色**：那两种色本身也在强调色附近，
-    上了之后「这一档被选中了」和「这一档是 bot」会用同一种色说两件事，选中态
-    就废了。改为只带上和表格里同一个字形（▣ / ☠）——筛选和结果对得上，
-    而且不跟选中态抢信号。
-  #}
-  <div class="filter-bar">
-    <span class="inline-label">事件类型</span>
-    <a class="btn small {{ 'primary' if kind == 'all' else '' }}" href="{{ kind_url('all') }}">全部</a>
-    {% for value, label in kind_labels.items() %}
-      <a class="btn small {{ 'primary' if kind == value else '' }}" href="{{ kind_url(value) }}">
-        <span class="glyph" aria-hidden="true">{{ kind_glyphs.get(value, '•') }}</span> {{ label }}</a>
-    {% endfor %}
-    <span class="spacer"></span>
-    <span class="muted">最多显示最近 {{ limit }} 条</span>
-  </div>
-
-  {#
     快速筛选：预设 / 结果 / 战果，就是表头上那三列。
 
     **一行就是一次派遣，所以按这一行自己的值筛**——不套情报中心那套「按最近
@@ -37,10 +19,16 @@
     预设会得到空页，而空页读起来就是「那个预设没打过」。
   #}
   <form class="filter-bar" method="get" action="/logs">
-    <input type="hidden" name="kind" value="{{ kind }}">
     <input type="hidden" name="date" value="{{ day_value }}">
     <input type="hidden" name="target_start" value="{{ target_start_value }}">
     <input type="hidden" name="target_end" value="{{ target_end_value }}">
+    <label class="inline-label" for="log-kind">事件类型</label>
+    <select id="log-kind" name="kind">
+      <option value="all" {% if kind == 'all' %}selected{% endif %}>全部</option>
+      {% for value, label in kind_labels.items() %}
+        <option value="{{ value }}" {% if kind == value %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
     <label class="inline-label" for="log-preset">预设</label>
     <select id="log-preset" name="preset">
       {# 候选值从库里现有的取：预设是用户自己在游戏里维护的，写死就会漏掉新建的。 #}
@@ -197,7 +185,11 @@
             {% elif entry.outcome is none %}
               {# 还没战报是常态，不是一种要上色的状态——每行都挂个黄 chip 只会
                  让真正读到胜负的那几行不显眼。下拉框里它叫「待战报」，同一个词。 #}
-              <span class="muted">{{ result_labels.get('AWAITING', '待战报') }}</span>
+              {% if entry.report_received %}
+                <span class="chip warn"><span class="glyph" aria-hidden="true">!</span>战报已收 · 战果未识别</span>
+              {% else %}
+                <span class="muted">{{ result_labels.get('AWAITING', '待战报') }}</span>
+              {% endif %}
             {% else %}
               {# 按读到的原文分档。**不能拿「不是 VICTORY 就是负」兜底**：
                  库里存的是画面原文，将来多一档（平局）会被静默显示成败仗。

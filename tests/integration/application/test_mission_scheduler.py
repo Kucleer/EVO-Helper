@@ -362,16 +362,16 @@ def test_the_pirate_command_carries_the_systems_the_radius_covers(  # type: igno
 def test_the_bot_command_only_carries_targets_inside_the_range(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
-    add_bot_target(session_factory, Coordinate(2, 900, 4))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
+    add_bot_target(session_factory, Coordinate(2, 900, 6))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
     command = launcher.latest.command
-    assert "2:150:3" in command
-    assert "2:900:4" not in command
+    assert "2:150:5" in command
+    assert "2:900:6" not in command
     # `--attack` 是「真的动鼠标派舰队」的意思，漏掉不报错、看着一切正常，
     # 代价是这一轮一发都没打。⚠️ `--probe` / `--tier-thresholds` 必须**不在**：
     # runner 已经不认识它们，多传一个就是 `SystemExit(2)`，而调度器只看得到
@@ -888,7 +888,7 @@ def test_a_target_that_got_its_attack_report_no_longer_counts_as_remaining(  # t
     repository, launcher, clock, run_id, session_factory
 ) -> None:
     """范围内每个目标都收到**攻击发**的战报，这一轮就算走完了。"""
-    target = Coordinate(2, 150, 3)
+    target = Coordinate(2, 150, 5)
     add_bot_target(session_factory, target)
     dispatch_id = dispatch(
         repository,
@@ -919,7 +919,7 @@ def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type:
     """
     from evo_helper.domain.battle_outcome import OUTCOME_DRAW
 
-    target = Coordinate(2, 150, 3)
+    target = Coordinate(2, 150, 5)
     add_bot_target(session_factory, target)
     dispatch_id = dispatch(
         repository,
@@ -1362,7 +1362,7 @@ def test_each_bot_task_gets_the_lines_of_its_own_planet(  # type: ignore[no-unty
     ⚠️ 两个任务的航线数**故意不同**（5 与 2）：填成一样的话，把出发星球那道
     过滤整个删掉也未必露馅。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     main = task_id(repository, MissionKind.BOT)
     repository.update_mission_task(main, fleet_lines=5)
@@ -1375,7 +1375,7 @@ def test_each_bot_task_gets_the_lines_of_its_own_planet(  # type: ignore[no-unty
             repository,
             run_id,
             TARGET_KIND_BOT,
-            target=Coordinate(2, 150, 3),
+            target=Coordinate(2, 150, 5),
             dispatched_at=moment,
             flight=timedelta(hours=1),
         )
@@ -1392,7 +1392,7 @@ def test_two_bot_tasks_on_the_same_planet_share_that_planets_lines(  # type: ign
     只有这一条成立，「按星球各一份」才不是「谁也不管谁」——同一颗星球上两个
     任务抢的确实是同一批位子。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     main = task_id(repository, MissionKind.BOT)
     repository.update_mission_task(main, fleet_lines=3)
@@ -1402,7 +1402,7 @@ def test_two_bot_tasks_on_the_same_planet_share_that_planets_lines(  # type: ign
         repository,
         run_id,
         TARGET_KIND_BOT,
-        target=Coordinate(2, 150, 3),
+        target=Coordinate(2, 150, 5),
         dispatched_at=NOW - timedelta(minutes=5),
         flight=timedelta(hours=1),
     )
@@ -1419,7 +1419,7 @@ def test_a_second_bot_task_keeps_its_own_round(  # type: ignore[no-untyped-def]
     两个 bot 任务各打各的范围，一起推等于把另一个还没打完的那一轮也归零：
     它已经收到的战报会被当成上一轮的，目标全部重来。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     main = task_id(repository, MissionKind.BOT)
     second = _second_bot_task(repository)
@@ -1445,7 +1445,7 @@ def test_a_task_on_another_planet_is_now_dispatched_with_its_own_origin(  # type
     所以现在要钉的是：**任务照常起得来，而且 `--origin` 带的是它自己那颗**。
     退回到「拒掉」的话，多出发星球这整件事就等于没做。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     only_gap_filler(repository)
     disable(repository, MissionKind.BOT)
     second = _second_bot_task(repository)
@@ -1469,7 +1469,7 @@ def test_the_bot_command_carries_the_task_origin(  # type: ignore[no-untyped-def
     `attack_intents` 的出发坐标可能是同一颗——而多任务的整个记账就建立在
     这一个坐标上。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     only_gap_filler(repository)
     scheduler.start()
@@ -1487,7 +1487,7 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
     只记 `kind` 的话，两个 bot 任务的历史混成一片，而重启冷却正是按任务算的
     ——认不出人就等于那个任务永远没有冷却记录。
     """
-    add_bot_target(session_factory, Coordinate(2, 150, 3))
+    add_bot_target(session_factory, Coordinate(2, 150, 5))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     only_gap_filler(repository)
     scheduler.start()
@@ -1501,6 +1501,32 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
 BOT_BY_MILITARY = '{"by_military": true, "top_n": 2}'
 
 
+def test_military_ranking_batch_finishes_before_its_bot_attack_is_started(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """榜单刚写出一屏候选时不能被抢；采满后 bot 也不能让给下一条任务。"""
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository, MissionKind.RANKING)
+    scheduler.start()
+
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.RANKING]
+    assert launcher.latest.command[-2:] == ["--bot-limit", "2"]
+
+    # 榜单采集尚未结束，即便第一屏已写出了候选，也必须继续采到配置的 2 个。
+    add_bot_target(session_factory, Coordinate(2, 140, 5), military_score=9_000.0)
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.RANKING]
+
+    launcher.latest.exit_code = 0
+    add_bot_target(session_factory, Coordinate(2, 141, 6), military_score=8_000.0)
+    enable(repository, MissionKind.PIRATE, params_json='{"radius": 10}', priority=-1)
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.RANKING, MissionKind.BOT]
+    assert "2:140:5=BBB" in launcher.latest.command
+
+
 def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
@@ -1509,9 +1535,9 @@ def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # 
     这里 `top_n=2`：`9000` 与 `8000` 进池，`100` 落选；而池内按距离排，
     所以近的 2:140 排在远的 2:400 前面——**军力只决定谁进池，不决定池内次序**。
     """
-    add_bot_target(session_factory, Coordinate(2, 400, 1), military_score=9_000.0)
-    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=8_000.0)
-    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 140, 6), military_score=8_000.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 7), military_score=100.0)
     enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
     only_gap_filler(repository)
     scheduler.start()
@@ -1523,7 +1549,24 @@ def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # 
     targets = command[command.index("--targets") + 1 : command.index("--origin")]
     # 这组夹具只留一条空航线；军力 runner 会先取池中最近的那颗，并把实际使用的
     # 预设记进命令行，不能再把 `=BBB` 当成坐标的一部分丢掉。
-    assert targets == ["2:140:2=BBB"]
+    assert targets == ["2:140:6=BBB"]
+
+
+def test_military_attack_never_selects_fixed_pirate_positions(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """旧数据即便还标着 bot，1--4 号位也必须在派遣前被硬拦住。"""
+    add_bot_target(session_factory, Coordinate(2, 140, 1), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 141, 5), military_score=8_000.0)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:5=BBB" in command
+    assert not any(part.startswith("2:140:1") for part in command)
 
 
 def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-def]
@@ -1548,6 +1591,32 @@ def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-
     assert "7:99:7=BBB" in launcher.latest.command
 
 
+def test_military_pool_skips_targets_attacked_within_the_last_24_hours(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """24 小时过滤发生在取前 N 名之前，不能让已打过的强目标反复占住候选池。"""
+    already_attacked = Coordinate(2, 140, 5)
+    still_available = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, already_attacked, military_score=9_000.0)
+    add_bot_target(session_factory, still_available, military_score=8_000.0)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=already_attacked,
+        dispatched_at=NOW - timedelta(hours=23),
+        flight=timedelta(minutes=1),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command)
+
+
 def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
@@ -1557,14 +1626,14 @@ def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[n
     那个范围是他自己配的，而军力优先会把目标散到全宇宙。
     """
     add_bot_target(session_factory, Coordinate(7, 99, 7), military_score=9_000.0)
-    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 5), military_score=100.0)
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
     only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
     command = launcher.latest.command
-    assert "2:150:3" in command
+    assert "2:150:5" in command
     assert "7:99:7" not in command, "没开开关就不许跨出区间"
 
 
@@ -1572,8 +1641,8 @@ def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: i
     scheduler, repository, launcher, session_factory
 ) -> None:
     """上限只挡「太强」，不挡「读不出来」——库里最多的正是没扫到过的那批。"""
-    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=None)
-    add_bot_target(session_factory, Coordinate(2, 141, 3), military_score=1_773_000.0)
+    add_bot_target(session_factory, Coordinate(2, 140, 5), military_score=None)
+    add_bot_target(session_factory, Coordinate(2, 141, 6), military_score=1_773_000.0)
     enable(
         repository,
         MissionKind.BOT,
@@ -1584,5 +1653,5 @@ def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: i
     scheduler.tick()
 
     command = launcher.latest.command
-    assert "2:140:2=BBB" in command
-    assert not any(part.startswith("2:141:3") for part in command)
+    assert "2:140:5=BBB" in command
+    assert not any(part.startswith("2:141:6") for part in command)

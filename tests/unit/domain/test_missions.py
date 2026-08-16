@@ -17,6 +17,7 @@ from evo_helper.domain.missions import (
     bot_targets_in_range,
     pirate_command,
     pirate_systems,
+    ranking_command,
     scan_command,
     wrap_system,
 )
@@ -120,6 +121,16 @@ def test_scan_command_is_the_full_argv() -> None:
     assert scan_command()[1:] == ["-u", "-m", "evo_helper.tools.scan_coordinates"]
 
 
+def test_military_ranking_command_can_stop_at_the_attack_batch_size() -> None:
+    assert ranking_command(bot_limit=100)[1:] == [
+        "-u",
+        "-m",
+        "evo_helper.tools.ranking_scan",
+        "--bot-limit",
+        "100",
+    ]
+
+
 def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:
     """`--scout --attack` 是真的动鼠标派舰队的开关，必须整条对比，不能只挑几个子串。
 
@@ -156,6 +167,16 @@ def test_bot_command_is_the_full_argv_including_the_action_flags() -> None:
         "2:137:18",
         "--attack",
     ]
+
+
+def test_bot_command_can_limit_real_dispatches_to_free_lines() -> None:
+    command = bot_command(
+        (Coordinate(2, 137, 14), Coordinate(2, 137, 15)),
+        origin=ORIGIN,
+        max_dispatches=2,
+    )
+
+    assert command[-3:] == ["--max-dispatches", "2", "--attack"]
 
 
 def test_an_over_long_command_line_is_rejected_rather_than_truncated() -> None:

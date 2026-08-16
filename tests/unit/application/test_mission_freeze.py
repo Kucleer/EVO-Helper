@@ -86,6 +86,22 @@ def test_a_record_survives_a_console_restart(tmp_path: Path) -> None:
     assert task.enabled is True
 
 
+def test_military_tiers_are_preserved_with_the_task_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "freezes.jsonl"
+    MissionFreezeLog(path).append(
+        freeze_now(
+            [_task(MissionKind.BOT, params='{"by_military": true, "top_n": 100}')],
+            frozen_at_utc=NOW,
+            military_tiers_json='[{"name": "BBB", "minimum_score": 100}]',
+        )
+    )
+
+    record = MissionFreezeLog(path).latest()
+
+    assert record is not None
+    assert record.military_tiers_json == '[{"name": "BBB", "minimum_score": 100}]'
+
+
 def test_records_are_appended_not_overwritten(tmp_path: Path) -> None:
     """一次「开始」一行。覆盖写的话，「改了什么」就永远只剩最后一次。"""
     path = tmp_path / "freezes.jsonl"

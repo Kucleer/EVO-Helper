@@ -106,6 +106,20 @@ def test_the_page_offers_start_and_stop(client: TestClient) -> None:
     assert "/api/scheduler/stop" in html
 
 
+def test_the_missions_controls_stay_compact_and_keep_military_origins_in_dispatch(
+    client: TestClient,
+) -> None:
+    """顶部说明不能再挤掉任务表，军力开关与多出发点也不能回流到参数列。"""
+    body = _page_body(client.get("/missions").text)
+
+    assert 'class="missions-control-grid' in body
+    assert 'class="tips"' in body
+    assert "taskCell.append(modeLabel)" in body
+    assert "militaryDispatch.className = 'military-dispatch'" in body
+    assert "params.append(settings)" in body
+    assert "editor.append(settings, originHead" not in body
+
+
 def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
     """扫描恒在最后一位，页面上就不能给它一个能拖的把手。
 
@@ -169,6 +183,44 @@ def test_the_status_area_polls_instead_of_reloading_the_page(client: TestClient)
     assert "/api/scheduler" in body
     assert "setInterval" in body
     assert "location.reload" not in body
+
+
+def test_the_page_waits_for_a_poll_before_scheduling_another(client: TestClient) -> None:
+    """慢的调度快照不能被固定间隔的下一次 GET 叠加。"""
+    body = _page_body(client.get("/missions").text)
+
+    assert "function scheduleNextPoll()" in body
+    assert "poll().finally(() => window.setTimeout(scheduleNextPoll, 2000))" in body
+    assert "setInterval(refresh, 2000)" not in body
+    assert "setInterval(refreshBackfill, 2000)" not in body
+
+
+def test_the_scheduler_view_short_cache_coalesces_concurrent_readers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """页面与悬浮台同时问状态时，只计算一份重快照。"""
+    console = client.app.state.mission_console
+    scheduler = client.app.state.mission_scheduler
+    console._invalidate_scheduler_view()  # noqa: SLF001 - precisely the cache under test
+    now = [10.0]
+    calls = 0
+    original_snapshot = scheduler.snapshot
+
+    def counted_snapshot():  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return original_snapshot()
+
+    monkeypatch.setattr(console, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(scheduler, "snapshot", counted_snapshot)
+
+    console.scheduler_view()
+    console.scheduler_view()
+    assert calls == 1
+
+    now[0] += 1.0
+    console.scheduler_view()
+    assert calls == 2
 
 
 def test_the_page_shows_what_the_api_refused(client: TestClient) -> None:
