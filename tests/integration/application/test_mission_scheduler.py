@@ -31,7 +31,12 @@ from evo_helper.domain.records import (
     FleetPresetRef,
 )
 from evo_helper.domain.report_wait import MAX_REPORT_AGE
-from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, RESTART_COOLDOWN, MissionKind
+from evo_helper.domain.scheduler import (
+    EXIT_ENVIRONMENT_BUSY,
+    GAP_FILLERS,
+    RESTART_COOLDOWN,
+    MissionKind,
+)
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -69,11 +74,25 @@ def enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object
     repository.update_mission_task(task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
 
 
+def only_gap_filler(repository: SqlAlchemyRepository, kept: MissionKind | None = None) -> None:
+    """把填空隙的那几种（扫描 / 军力榜）全关掉，只留 `kept`。
+
+    2026-08-15 加军力榜之前，填空隙的只有扫描一种，所以这些用例里到处写着
+    `disable(repository, MissionKind.SCAN)`。加了第二种之后那样写就不够了——
+    另一种会顶上来把空隙填掉，于是「只该起一次」的断言看到两次。
+    """
+    for kind in GAP_FILLERS:
+        if kind is not kept:
+            disable(repository, kind)
+
+
 def disable(repository: SqlAlchemyRepository, kind: MissionKind) -> None:
     repository.update_mission_task(task_id(repository, kind), enabled=False)
 
 
-def add_bot_target(session_factory, coordinate: Coordinate) -> None:  # type: ignore[no-untyped-def]
+def add_bot_target(  # type: ignore[no-untyped-def]
+    session_factory, coordinate: Coordinate, *, military_score: float | None = None
+) -> None:
     with session_factory() as session:
         session.add(
             orm.BotTargetRow(
@@ -82,6 +101,7 @@ def add_bot_target(session_factory, coordinate: Coordinate) -> None:  # type: ig
                 system=coordinate.system,
                 position=coordinate.position,
                 is_bot=True,
+                military_score=military_score,
             )
         )
         session.commit()
@@ -345,7 +365,7 @@ def test_the_bot_command_only_carries_targets_inside_the_range(  # type: ignore[
     add_bot_target(session_factory, Coordinate(2, 150, 3))
     add_bot_target(session_factory, Coordinate(2, 900, 4))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
@@ -563,7 +583,7 @@ def test_a_chain_that_just_ran_waits_out_the_cooldown(  # type: ignore[no-untype
 ) -> None:
     """runner 扑空退出后立刻再起一次，几十秒的导航全白费，还占着鼠标。"""
     enable(repository, MissionKind.PIRATE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
     launcher.latest.exit_code = 0
@@ -628,7 +648,7 @@ def test_a_round_that_dispatched_nothing_does_not_restart_while_a_fleet_is_out( 
     scheduler.prepare()
     set_config(session_factory, fleet_line_limit=6)
     enable(repository, MissionKind.PIRATE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     _scout_still_out(
         repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
     )
@@ -659,7 +679,7 @@ def test_the_chain_restarts_once_a_line_actually_frees_up(  # type: ignore[no-un
     scheduler.prepare()
     set_config(session_factory, fleet_line_limit=6)
     enable(repository, MissionKind.PIRATE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     _scout_still_out(
         repository, run_id, dispatched_at=NOW - timedelta(minutes=10), flight=timedelta(minutes=25)
     )
@@ -682,7 +702,7 @@ def test_three_consecutive_crashes_disable_the_chain(  # type: ignore[no-untyped
 ) -> None:
     """没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。"""
     enable(repository, MissionKind.PIRATE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
 
     for index in range(MAX_CONSECUTIVE_FAILURES):
@@ -727,6 +747,7 @@ def test_a_burst_of_scan_crashes_does_not_disable_the_chain(  # type: ignore[no-
 
     冷却之后它一趟只起得来一次，所以这 43 秒里只该有一次失败记录。
     """
+    only_gap_filler(repository, MissionKind.SCAN)
     disable(repository, MissionKind.PIRATE)
     disable(repository, MissionKind.BOT)
     scheduler.start()
@@ -748,6 +769,7 @@ def test_a_scan_that_keeps_crashing_for_ten_minutes_still_gets_disabled(  # type
     """**冷却是节流，不是豁免。** 真坏了还得数到三，否则调度循环会在一个坏掉的
     任务上满速空转——而扫描没有别的闸门拦着它。
     """
+    only_gap_filler(repository, MissionKind.SCAN)
     disable(repository, MissionKind.PIRATE)
     disable(repository, MissionKind.BOT)
     scheduler.start()
@@ -768,6 +790,7 @@ def test_the_environment_busy_code_never_reaches_the_failure_counter(  # type: i
 
     但它照样要吃冷却：用户正在用别的窗口，十几秒后再起一次还是抢不到前台。
     """
+    only_gap_filler(repository, MissionKind.SCAN)
     disable(repository, MissionKind.PIRATE)
     disable(repository, MissionKind.BOT)
     scheduler.start()
@@ -913,7 +936,7 @@ def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type:
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
 
     scheduler.tick()
@@ -995,13 +1018,13 @@ def test_a_row_left_open_by_a_dead_console_is_closed_on_the_next_start(  # type:
     assert repository.open_mission_runs() == []
 
 
-def test_prepare_seeds_the_three_chains_and_the_config(repository, launcher, clock) -> None:  # type: ignore[no-untyped-def]
+def test_prepare_seeds_every_chain_and_the_config(repository, launcher, clock) -> None:  # type: ignore[no-untyped-def]
     """迁移里没有 `bulk_insert`，这几行得有人保证存在。"""
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
 
     scheduler.prepare()
 
-    assert len(repository.mission_tasks()) == 3
+    assert len(repository.mission_tasks()) == len(MissionKind)
     assert repository.scheduler_config().pirate_daily_quota == 32
 
 
@@ -1100,7 +1123,7 @@ def test_a_stalled_round_is_charged_as_a_failure(  # type: ignore[no-untyped-def
     """
     scheduler, _counts = _watched(repository, launcher, clock)
     enable(repository, MissionKind.PIRATE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
@@ -1190,7 +1213,7 @@ def test_a_chain_failing_on_its_own_is_still_charged(  # type: ignore[no-untyped
     """
     enable(repository, MissionKind.PIRATE)
     disable(repository, MissionKind.BOT)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
 
     for index in range(MAX_CONSECUTIVE_FAILURES):
@@ -1263,6 +1286,7 @@ def test_one_clean_round_hands_the_whole_exemption_budget_back(  # type: ignore[
     那一刻之前的几次豁免各自成立，不该再占着谁的额度——否则一台偶尔掉一次线的
     机器，跑上几天照样会把额度耗光，然后又回到「环境一抖就停用一条链路」。
     """
+    only_gap_filler(repository, MissionKind.SCAN)
     enable(repository, MissionKind.PIRATE)
     disable(repository, MissionKind.BOT)
     scheduler.start()
@@ -1422,7 +1446,7 @@ def test_a_task_on_another_planet_is_now_dispatched_with_its_own_origin(  # type
     退回到「拒掉」的话，多出发星球这整件事就等于没做。
     """
     add_bot_target(session_factory, Coordinate(2, 150, 3))
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     disable(repository, MissionKind.BOT)
     second = _second_bot_task(repository)
     scheduler.start()
@@ -1447,7 +1471,7 @@ def test_the_bot_command_carries_the_task_origin(  # type: ignore[no-untyped-def
     """
     add_bot_target(session_factory, Coordinate(2, 150, 3))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
@@ -1465,8 +1489,100 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
     """
     add_bot_target(session_factory, Coordinate(2, 150, 3))
     enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
-    disable(repository, MissionKind.SCAN)
+    only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
     assert repository.mission_runs(limit=1)[0].task_id == task_id(repository, MissionKind.BOT)
+
+
+# -- 军力优先那一支 ------------------------------------------------------------
+
+BOT_BY_MILITARY = '{"by_military": true, "top_n": 2}'
+
+
+def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """用户口径（2026-08-15）：「先取前 50 名，然后按距离排序，开始攻击」。
+
+    这里 `top_n=2`：`9000` 与 `8000` 进池，`100` 落选；而池内按距离排，
+    所以近的 2:140 排在远的 2:400 前面——**军力只决定谁进池，不决定池内次序**。
+    """
+    add_bot_target(session_factory, Coordinate(2, 400, 1), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=8_000.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    # ⚠️ 按位置取而不是按「像坐标」筛：`--origin 2:137:18` 也是三段坐标，
+    # 用形状过滤会把它一起捞进来（我第一版就是这么写错的）。
+    command = launcher.latest.command
+    targets = command[command.index("--targets") + 1 : command.index("--origin")]
+    # 这组夹具只留一条空航线；军力 runner 会先取池中最近的那颗，并把实际使用的
+    # 预设记进命令行，不能再把 `=BBB` 当成坐标的一部分丢掉。
+    assert targets == ["2:140:2=BBB"]
+
+
+def test_the_military_pool_ignores_the_system_range(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **军力优先那一支不过恒星系区间。**
+
+    军力榜是全宇宙的，而区间是给「区域攻击」那一支用的。两个一起用等于把
+    「打最强的」悄悄降级成「打这个区域里最强的」——而最强的那批本来就散落在
+    别的银河（实测：>100K 的那批横跨 3/5/6/7/8/9 系）。
+    """
+    add_bot_target(session_factory, Coordinate(7, 99, 7), military_score=9_000.0)
+    enable(
+        repository,
+        MissionKind.BOT,
+        params_json='{"by_military": true, "galaxy": 2, "first_system": 60, "last_system": 499}',
+    )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert "7:99:7=BBB" in launcher.latest.command
+
+
+def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **默认必须是老的区域攻击。**
+
+    悄悄换掉一条已经在跑的链路的选靶口径，比多一个开关危险得多——用户圈的
+    那个范围是他自己配的，而军力优先会把目标散到全宇宙。
+    """
+    add_bot_target(session_factory, Coordinate(7, 99, 7), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 150, 3), military_score=100.0)
+    enable(repository, MissionKind.BOT, params_json=BOT_RANGE)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:150:3" in command
+    assert "7:99:7" not in command, "没开开关就不许跨出区间"
+
+
+def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """上限只挡「太强」，不挡「读不出来」——库里最多的正是没扫到过的那批。"""
+    add_bot_target(session_factory, Coordinate(2, 140, 2), military_score=None)
+    add_bot_target(session_factory, Coordinate(2, 141, 3), military_score=1_773_000.0)
+    enable(
+        repository,
+        MissionKind.BOT,
+        params_json='{"by_military": true, "top_n": 50, "max_score": 100000}',
+    )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:140:2=BBB" in command
+    assert not any(part.startswith("2:141:3") for part in command)

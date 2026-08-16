@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -28,6 +28,7 @@ from evo_helper.domain.records import (
     CoordinateScan,
     FleetDiff,
     PlanetScoutAlert,
+    RankingTarget,
     ReportHistoryEntry,
     ScoutReport,
     ScoutTriggerShip,
@@ -70,6 +71,7 @@ _MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
     (MissionKind.PIRATE, "侦查+攻击海盗", False, 0, '{"radius": 10}'),
     (MissionKind.BOT, "扫描+攻击 bot", False, 1, "{}"),
     (MissionKind.SCAN, "扫描全星系 bot", True, 2, "{}"),
+    (MissionKind.RANKING, "扫描军力榜", True, 3, "{}"),
 )
 
 
@@ -302,13 +304,78 @@ class SqlAlchemyRepository:
                         is_bot=record.is_bot,
                         latest_owner_name=record.owner_name,
                         last_scanned_at_utc=record.scanned_at_utc,
+                        source="scan",
                     )
                 )
             else:
                 target.latest_owner_name = record.owner_name
                 target.last_scanned_at_utc = record.scanned_at_utc
                 target.is_bot = record.is_bot or target.is_bot
+                # 实机逐坐标读过的证据比排行榜名字反解强，不能被后者降级。
+                target.source = "scan"
             session.commit()
+
+    def save_ranking_targets(self, targets: Sequence[RankingTarget]) -> None:
+        """把军事榜上的 bot 与分数写进星球列表。
+
+        新发现的坐标标为 ``ranking``，而已由坐标扫描核验过的行保留 ``scan``。
+        军力值为 None 时原样保存，绝不以 0 代替；插值所得的值也必须同时标估算。
+        """
+        with self._session_factory() as session:
+            for record in targets:
+                _require_utc(record.military_score_at_utc, "military_score_at_utc")
+                target = _bot_target_for(session, record.coordinate)
+                if target is None:
+                    session.add(
+                        orm.BotTargetRow(
+                            galaxy=record.coordinate.galaxy,
+                            system=record.coordinate.system,
+                            position=record.coordinate.position,
+                            is_bot=True,
+                            source="ranking",
+                            military_score=record.military_score,
+                            military_score_at_utc=record.military_score_at_utc,
+                            military_score_estimated=record.military_score_estimated,
+                            military_rank=record.military_rank,
+                        )
+                    )
+                    continue
+                target.is_bot = True
+                target.military_score = record.military_score
+                target.military_score_at_utc = record.military_score_at_utc
+                target.military_score_estimated = record.military_score_estimated
+                target.military_rank = record.military_rank
+            session.commit()
+
+    def forget_implausible_military_scores(self, *, above: float) -> int:
+        """把高于 `above` 的军力值清成 `None`，返回清了几行。**只清分数，不删行。**
+
+        ⚠️ 这不是「清理数据」，是**撤回一批已知错误的读数**。
+
+        2026-08-15：库里 30 个 bot 的军力值在 10 万以上（最高 177 万），而每一个
+        除以 100 都精确落回正常区间（P95 是 19,730）——`17.73K` 读成 `1773K`，
+        丢小数点，整整齐齐两个数量级。第二条佐证：榜单按军力降序排，而真人段
+        第 488–500 名的分数已经是 0，排在它们后面的 bot 不可能有 45 万。
+
+        坐标是好的（那 30 个里有 2 个是坐标扫描验证过的真 bot），所以清的是
+        **分数**：`military_score`、`military_score_at_utc`、
+        `military_score_estimated` 一起归零位，等下一轮采集重新填。
+
+        `above` 必须显式传：这个阈值是看着分布定的，写死在代码里等于把一次性的
+        判断伪装成永久规则。
+        """
+        from evo_helper.storage import models as orm
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BotTargetRow).where(orm.BotTargetRow.military_score > above)
+            ).all()
+            for row in rows:
+                row.military_score = None
+                row.military_score_at_utc = None
+                row.military_score_estimated = False
+            session.commit()
+            return len(rows)
 
     def save_attack_intent(self, intent: object) -> None:
         record = _require_type(intent, AttackIntent, "attack intent")
@@ -1711,6 +1778,8 @@ class SqlAlchemyRepository:
                 )
             if session.get(orm.SchedulerConfigRow, 1) is None:
                 session.add(orm.SchedulerConfigRow(id=1))
+            if session.get(orm.MilitaryAttackConfigRow, 1) is None:
+                session.add(orm.MilitaryAttackConfigRow(id=1))
             session.commit()
 
     def mission_tasks(self) -> list[orm.MissionTaskRow]:
@@ -1732,6 +1801,146 @@ class SqlAlchemyRepository:
         """按 id 取一个任务。没有这一行时返回 None，由调用方决定说什么。"""
         with self._session_factory() as session:
             return session.get(orm.MissionTaskRow, task_id)
+
+    def mission_task_origins(self, task_id: int) -> list[orm.MissionTaskOriginRow]:
+        """任务配置的额外出发星球；空列表不是异常，而是旧任务的回落信号。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.MissionTaskOriginRow)
+                    .where(orm.MissionTaskOriginRow.task_id == task_id)
+                    .order_by(orm.MissionTaskOriginRow.id)
+                ).all()
+            )
+
+    def attack_planets(self) -> list[orm.AttackPlanetRow]:
+        """全局攻击出发星球，按页面显示编号排序。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.AttackPlanetRow).order_by(orm.AttackPlanetRow.sort_index)
+                ).all()
+            )
+
+    def attack_planet(self, planet_id: int) -> orm.AttackPlanetRow | None:
+        with self._session_factory() as session:
+            return session.get(orm.AttackPlanetRow, planet_id)
+
+    def create_attack_planet(self, coordinate: Coordinate) -> orm.AttackPlanetRow:
+        with self._session_factory() as session:
+            exists = session.scalar(
+                select(orm.AttackPlanetRow.id).where(
+                    orm.AttackPlanetRow.galaxy == coordinate.galaxy,
+                    orm.AttackPlanetRow.system == coordinate.system,
+                    orm.AttackPlanetRow.position == coordinate.position,
+                )
+            )
+            if exists is not None:
+                raise ValueError(f"星球 {coordinate} 已在配置列表中")
+            largest_index = session.scalar(select(func.max(orm.AttackPlanetRow.sort_index)))
+            next_index = int(largest_index or 0) + 1
+            row = orm.AttackPlanetRow(
+                sort_index=next_index,
+                galaxy=coordinate.galaxy,
+                system=coordinate.system,
+                position=coordinate.position,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def update_attack_planet(self, planet_id: int, coordinate: Coordinate) -> orm.AttackPlanetRow:
+        with self._session_factory() as session:
+            row = session.get(orm.AttackPlanetRow, planet_id)
+            if row is None:
+                raise ValueError(f"attack_planets 里没有 id={planet_id} 的星球")
+            duplicate = session.scalar(
+                select(orm.AttackPlanetRow.id).where(
+                    orm.AttackPlanetRow.id != planet_id,
+                    orm.AttackPlanetRow.galaxy == coordinate.galaxy,
+                    orm.AttackPlanetRow.system == coordinate.system,
+                    orm.AttackPlanetRow.position == coordinate.position,
+                )
+            )
+            if duplicate is not None:
+                raise ValueError(f"星球 {coordinate} 已在配置列表中")
+            row.galaxy, row.system, row.position = (
+                coordinate.galaxy,
+                coordinate.system,
+                coordinate.position,
+            )
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def delete_attack_planet(self, planet_id: int) -> None:
+        with self._session_factory() as session:
+            row = session.get(orm.AttackPlanetRow, planet_id)
+            if row is None:
+                raise ValueError(f"attack_planets 里没有 id={planet_id} 的星球")
+            used = session.scalar(
+                select(func.count())
+                .select_from(orm.MissionTaskOriginRow)
+                .where(orm.MissionTaskOriginRow.planet_id == planet_id)
+            )
+            if used:
+                raise ValueError("该星球正在被任务使用；先在任务中移除后再删除")
+            removed_index = row.sort_index
+            session.delete(row)
+            session.flush()
+            session.execute(
+                update(orm.AttackPlanetRow)
+                .where(orm.AttackPlanetRow.sort_index > removed_index)
+                .values(sort_index=orm.AttackPlanetRow.sort_index - 1)
+            )
+            session.commit()
+
+    def military_attack_config(self) -> orm.MilitaryAttackConfigRow:
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                raise ValueError("military_attack_config 还没初始化；先调 ensure_mission_rows()")
+            return row
+
+    def replace_military_attack_tiers(self, tiers_json: str) -> orm.MilitaryAttackConfigRow:
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                row = orm.MilitaryAttackConfigRow(id=1)
+                session.add(row)
+            row.tiers_json = tiers_json
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def replace_mission_task_origins(
+        self, task_id: int, origins: Sequence[tuple[int, int, bool]]
+    ) -> None:
+        """整组替换多 origin 配置，保证页面保存的是一个原子快照。"""
+        with self._session_factory() as session:
+            _mission_task(session, task_id)
+            resolved = [session.get(orm.AttackPlanetRow, planet_id) for planet_id, _, _ in origins]
+            if any(planet is None for planet in resolved):
+                raise ValueError("所选星球不存在")
+            session.query(orm.MissionTaskOriginRow).filter_by(task_id=task_id).delete()
+            rows: list[orm.MissionTaskOriginRow] = []
+            for planet, (_, fleet_lines, enabled) in zip(resolved, origins, strict=True):
+                if planet is None:  # 已由上面的校验挡住；留给类型检查器的窄化。
+                    raise AssertionError("validated planet disappeared")
+                rows.append(
+                    orm.MissionTaskOriginRow(
+                        task_id=task_id,
+                        planet_id=planet.id,
+                        galaxy=planet.galaxy,
+                        system=planet.system,
+                        position=planet.position,
+                        fleet_lines=fleet_lines,
+                        enabled=enabled,
+                    )
+                )
+            session.add_all(rows)
+            session.commit()
 
     def create_mission_task(
         self,

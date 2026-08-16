@@ -16,6 +16,7 @@ from evo_helper.domain.records import (
     BattleReport,
     CoordinateScan,
     FleetSnapshotEntry,
+    RankingTarget,
     StateEvent,
     TargetRevisit,
 )
@@ -261,6 +262,98 @@ def test_save_scan_rejects_naive_timestamp(repository, session_factory) -> None:
     )
     with pytest.raises(ValueError, match="timezone-aware"):
         repository.save_scan(scan)
+
+
+def test_save_ranking_targets_marks_new_coordinates_and_preserves_scan_source(
+    session_factory,
+    repository,
+) -> None:
+    ranked = Coordinate(4, 30, 12)
+    scanned = Coordinate(4, 100, 13)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    _plan_id, run_id = _seed_run(session_factory)
+    repository.save_scan(
+        CoordinateScan(run_id=run_id, coordinate=scanned, scanned_at_utc=moment, is_bot=True)
+    )
+
+    repository.save_ranking_targets(
+        (
+            RankingTarget(ranked, military_score=None, military_score_at_utc=moment),
+            RankingTarget(
+                scanned,
+                military_score=28.5,
+                military_score_at_utc=moment,
+                military_score_estimated=True,
+            ),
+        )
+    )
+
+    with session_factory() as session:
+        rows = session.scalars(select(BotTargetRow).order_by(BotTargetRow.system)).all()
+    assert [(row.source, row.military_score, row.military_score_estimated) for row in rows] == [
+        ("ranking", None, False),
+        ("scan", 28.5, True),
+    ]
+
+
+def test_a_scan_upgrades_a_coordinate_the_ranking_only_guessed(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **榜单发现的坐标是「未验证」，逐坐标扫过之后必须升级成 scan。**
+
+    榜单里名字是坐标的唯一来源，而区间校验挡不住「合法但错」
+    （`bot_2_121_7` 读成 `bot_2_127_7` 完全合法）。所以两种来源必须分得清。
+
+    这条钉的是**更新已有行**那条分支：先由榜单建行、再被扫描核实。
+    漏掉的话，一个真的扫过的坐标会一直挂着 `ranking`，事后分不清哪些验过。
+    """
+    coordinate = Coordinate(4, 30, 12)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    _plan_id, run_id = _seed_run(session_factory)
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=moment),)
+    )
+
+    repository.save_scan(
+        CoordinateScan(run_id=run_id, coordinate=coordinate, scanned_at_utc=moment, is_bot=True)
+    )
+
+    with session_factory() as session:
+        row = session.scalars(select(BotTargetRow)).one()
+    assert row.source == "scan"
+    assert row.military_score == 28.5  # 升级来源不该抹掉榜单读到的军力值
+
+
+def test_an_unreadable_score_overwrites_an_existing_one_with_none_not_zero(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **`None` 不是 `0`。** 0 分在这个榜上有含义（经济榜的 bot 就是 0），
+    把「这次没读出来」写成 0 就是造一条假数据，而分档正是按这个数切的。
+
+    这条钉的是**更新已有行**那条分支：上一轮读到了、这一轮没读到。
+    """
+    coordinate = Coordinate(4, 30, 12)
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=moment),)
+    )
+
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=None, military_score_at_utc=moment),)
+    )
+
+    with session_factory() as session:
+        row = session.scalars(select(BotTargetRow)).one()
+    assert row.military_score is None
+
+
+def test_save_ranking_targets_rejects_naive_timestamp(repository) -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repository.save_ranking_targets(
+            (RankingTarget(Coordinate(4, 30, 12), 29.59, datetime(2026, 8, 14, 1, 0)),)
+        )
 
 
 def test_duplicate_attack_intent_rejected_but_forced_revisit_allowed(
@@ -653,3 +746,100 @@ def test_a_dispatch_made_after_the_report_is_never_a_candidate(
     assert report is not None
     assert report.match_status == "UNMATCHED"
     assert report.dispatch_id is None
+
+
+def test_the_watchdog_sees_a_rescan_that_only_updates_existing_rows(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️⚠️ **拿行数当进展信号会把一条正在干活的链路当卡死杀掉。**
+
+    军力榜重扫同一批 bot 时只更新不新增（`bot_targets` 上有坐标唯一约束），
+    所以第二趟开始 `COUNT(*)` 就再也不动，而看门狗只会问「有没有变大」。
+
+    `ranking_written_at` 取的是**最近一次写入时刻**，所以只要写了任何一行就往前走。
+    变异测试当场抓到过这条：把 `_latest_epoch` 换成 `_count(BotTargetRow)` 时，
+    所有用例照样绿。
+    """
+    from evo_helper.application.mission_progress import SqlAlchemyMissionProgress
+
+    coordinate = Coordinate(4, 30, 12)
+    first = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 15, 2, 0, tzinfo=UTC)
+    progress = SqlAlchemyMissionProgress(session_factory)
+
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=28.5, military_score_at_utc=first),)
+    )
+    after_first = progress.read()
+    repository.save_ranking_targets(
+        (RankingTarget(coordinate, military_score=27.1, military_score_at_utc=second),)
+    )
+    after_second = progress.read()
+
+    with session_factory() as session:
+        rows = session.scalars(select(BotTargetRow)).all()
+    assert len(rows) == 1, "第二趟只更新，没有新增——这正是行数信号会失效的原因"
+    assert after_second.ranking_written_at > after_first.ranking_written_at
+
+
+def test_retracting_implausible_scores_keeps_the_coordinates(
+    session_factory,
+    repository,
+) -> None:
+    """⚠️ **撤回的是读数，不是行。**
+
+    2026-08-15：30 个 bot 的军力值在 10 万以上（最高 177 万），每一个除以 100
+    都落回正常区间——丢小数点。而**坐标是好的**：那 30 个里有 2 个是坐标扫描
+    验证过的真 bot。所以清 `military_score` 三件套，留行、留 `is_bot`、留 source。
+
+    清完之后 `military_score_at_utc` 也要一起清：留着一个时刻却没有值，
+    等于说「这个时候读到过 None」——而真相是「那次读到的是错的，已撤回」。
+    """
+    keep, drop = Coordinate(4, 30, 12), Coordinate(4, 100, 13)
+    moment = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+    repository.save_ranking_targets(
+        (
+            RankingTarget(keep, military_score=17_730.0, military_score_at_utc=moment),
+            RankingTarget(
+                drop,
+                military_score=1_773_000.0,
+                military_score_at_utc=moment,
+                military_score_estimated=True,
+            ),
+        )
+    )
+
+    cleared = repository.forget_implausible_military_scores(above=100_000.0)
+
+    assert cleared == 1
+    with session_factory() as session:
+        rows = {
+            (row.galaxy, row.system, row.position): row
+            for row in session.scalars(select(BotTargetRow)).all()
+        }
+    assert len(rows) == 2, "行一个都不许删"
+    bad = rows[(drop.galaxy, drop.system, drop.position)]
+    assert bad.military_score is None
+    assert bad.military_score_at_utc is None
+    assert bad.military_score_estimated is False
+    assert bad.is_bot is True, "它仍然是个 bot，只是分数不可信"
+    good = rows[(keep.galaxy, keep.system, keep.position)]
+    assert good.military_score == 17_730.0, "阈值以下的一个都不许动"
+
+
+def test_the_rank_is_persisted_so_the_checksum_survives(session_factory, repository) -> None:
+    """名次是免费的校验和——2026-08-15 那批错值查不下去正因为它没进库。"""
+    repository.save_ranking_targets(
+        (
+            RankingTarget(
+                Coordinate(4, 30, 12),
+                military_score=17_730.0,
+                military_score_at_utc=datetime(2026, 8, 15, 1, 0, tzinfo=UTC),
+                military_rank=639,
+            ),
+        )
+    )
+
+    with session_factory() as session:
+        assert session.scalars(select(BotTargetRow)).one().military_rank == 639

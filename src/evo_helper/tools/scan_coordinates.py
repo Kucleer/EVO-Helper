@@ -636,6 +636,29 @@ START_ROI = (820, 745, 1100, 830)
 START_UPSCALE = 3
 START_THRESHOLD = 180
 
+#: 认 START 的**配方阶梯**：逐个试，读到 `START` 就算，一个都读不到才返回 None。
+#:
+#: ⚠️ **2026-08-15 凌晨这条把整晚堵死了。** 会话掉回 START 页，而
+#: `START_THRESHOLD = 180` 在那一屏上**把字二值化没了**（读到空串），于是
+#: `click_start` 抛「要点 START 时却读不到」，补录失败，而失败的补录反过来
+#: 堵住调度器——一个任务都起不来，整夜空转。
+#:
+#: 在那张真图上量到的：
+#:
+#:     现行 ROI + 阈值 180   ''          ← 坏的就是它
+#:     现行 ROI + 阈值 160   'START'
+#:     紧 ROI  + 不二值化    'START'
+#:     紧 ROI  + 阈值 140    'START'
+#:
+#: **不直接把 180 改成 160**：只有一张样本，而 180 当初是为某种渲染调出来的，
+#: 换掉可能把那一档弄坏。阶梯则是加法——旧配方仍排第一，读不到才往下走。
+#: 同一条道理：空结果不是证据（`preset_picker.read_names_confirming` 那条）。
+START_RECIPES: tuple[tuple[tuple[int, int, int, int], int, int | None], ...] = (
+    (START_ROI, START_UPSCALE, START_THRESHOLD),
+    (START_ROI, START_UPSCALE, 160),
+    ((845, 755, 1075, 815), 3, None),
+)
+
 #: 入口页（语言选择页）的标题与「进入」按钮。两处都读得很干净，不需要二值化。
 #: 掉线弹窗的正文行与那个绿色 ✓（截图 client 空间，实机量于 2026-08-09）。
 #:
@@ -648,6 +671,16 @@ START_THRESHOLD = 180
 DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
+
+#: 服务器维护公告：标题横栏与「知道了」按钮。实机 2026-08-15 03:30 量的
+#: （`var/logs/rankv/B0-dialog.png`）。
+#:
+#: 标题**不能**和掉线弹窗共用 `DISCONNECT_TEXT_ROI`：那块 ROI 在 y=440–500，
+#: 而公告在那个位置上是正文（整段话，OCR 出来碎）。标题「服务器维护」在
+#: y=295–325 一条独立横栏里，读得稳。
+MAINTENANCE_TEXT_ROI = (750, 295, 1170, 325)
+MAINTENANCE_BUTTON = (958, 783)
+MAINTENANCE_UPSCALE = 3
 
 #: 判定当前是哪一屏时最多取几帧。入口页在做明暗动画，实测约一半的帧什么都读不出
 #: （见 `observe` 的注释）。4 帧足够：实测空帧与好帧大致交替，连着 4 帧全空的概率
@@ -691,17 +724,20 @@ def make_session_keeper(
     from evo_helper.game.session_keeper import ScreenState, SessionKeeper, classify_screen
 
     def start_button(image: Any) -> tuple[int, int] | None:
-        """在 START 横条里定位按钮；读不到就返回 None（于是不点）。"""
-        text = ocr(
-            image.crop(START_ROI),
-            digits=False,
-            upscale=START_UPSCALE,
-            threshold=START_THRESHOLD,
-        )
-        if "START" not in text.upper():
-            return None
-        left, top, right, bottom = START_ROI
-        return ((left + right) // 2, (top + bottom) // 2)
+        """在 START 横条里定位按钮；**逐个配方试**，全读不到才返回 None（于是不点）。
+
+        阶梯的理由见 `START_RECIPES`：单一配方在 2026-08-15 凌晨读空，
+        把整晚堵死了。
+        """
+        seen: list[str] = []
+        for roi, upscale, threshold in START_RECIPES:
+            text = ocr(image.crop(roi), digits=False, upscale=upscale, threshold=threshold)
+            seen.append(text)
+            if "START" in text.upper():
+                left, top, right, bottom = START_ROI
+                return ((left + right) // 2, (top + bottom) // 2)
+        say(f"  START 三个配方都读不出来：{seen}")
+        return None
 
     def entry_button(image: Any) -> tuple[int, int] | None:
         """在入口页上定位「进入」；读不到就返回 None（于是不点）。"""
@@ -722,6 +758,24 @@ def make_session_keeper(
         if state in (ScreenState.DISCONNECTED, ScreenState.DEAD_SESSION):
             return state
         return None
+
+    def maintenance_notice(image: Any) -> ScreenState | None:
+        """服务器维护公告在不在。不是就返回 None。
+
+        ⚠️ **2026-08-15 03:30 实机：这一屏把整晚堵死了。** 服务器停机维护，
+        公告盖在 START 页上，而 `START_ROI` 那个位置上坐着的是公告的「知道了」
+        ——`start_button` 于是一遍遍读到「知道了」、一遍遍判「读不出 START」，
+        bot 链路空转了二十分钟，一发都没派。
+        """
+        text = ocr(image.crop(MAINTENANCE_TEXT_ROI), digits=False, upscale=MAINTENANCE_UPSCALE)
+        return ScreenState.MAINTENANCE if classify_screen(text) is ScreenState.MAINTENANCE else None
+
+    def dismiss_notice() -> None:
+        # 同 `dismiss_disconnect`：**先回读确认公告真的在**，再点。
+        # 认不出就停止，而不是朝固定坐标乱点。
+        if maintenance_notice(driver.capture()) is not ScreenState.MAINTENANCE:
+            raise RuntimeError("要关维护公告时却读不到标题；停止而不是往固定坐标乱点")
+        driver.click(*MAINTENANCE_BUTTON, label="知道了")
 
     def observe() -> ScreenState:
         """多取几帧再下结论。**单帧在会动的页面上是抛硬币。**
@@ -755,6 +809,11 @@ def make_session_keeper(
         # **掉线要排在导航条之前判。** 弹窗是浮层，底下的导航条还在画面上，
         # 「商店/联盟」照样读得出来——先判导航条就会把死会话认成在线，
         # 之后每一步点击都石沉大海，而且全程不报错。实机上确认过这一屏。
+        # ⚠️ 维护公告排在最前，理由同下面掉线那一段：它是浮层，底下的 START
+        # 与导航条照样读得出来，后判就会把一台停机的服务器认成「在 START 页上」。
+        notice = maintenance_notice(image)
+        if notice is not None:
+            return notice
         popup = disconnect_screen(image)
         if popup is not None:
             return popup
@@ -823,6 +882,7 @@ def make_session_keeper(
         click_entry=click_entry,
         click_start=click_start,
         dismiss_disconnect=dismiss_disconnect,
+        dismiss_notice=dismiss_notice,
         restart_window=restart_window or restart_game_window_now,
         log=say,
         clock=clock,

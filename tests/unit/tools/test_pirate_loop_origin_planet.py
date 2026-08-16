@@ -54,6 +54,7 @@ def _loop(
     *,
     result: SwitchResult = SwitchResult.SWITCHED,
     origin: Coordinate | None = SECOND,
+    reconcile_on_start: bool = False,
 ) -> tuple[Any, _FakeSwitcher, list[str]]:
     from evo_helper.game import game_window
 
@@ -63,7 +64,9 @@ def _loop(
     swept: list[str] = []
     switcher = _FakeSwitcher(result)
     loop = PirateLoop.__new__(PirateLoop)
-    loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=origin)
+    loop._options = LoopOptions(
+        systems=(), scout=False, attack=True, origin=origin, reconcile_on_start=reconcile_on_start
+    )
     loop._outcome = Outcome()
     loop._current_planet = None
     loop._navigator = _FakeNavigator()
@@ -71,6 +74,7 @@ def _loop(
     loop._reset_to_known_screen = lambda: None
     loop._ensure_session = lambda **_k: False
     loop._require_system_view = lambda _what: None
+    loop._goto_planet_surface = lambda: True
     loop.planet_switcher = lambda **_k: switcher
     loop.reconcile_today = lambda: swept.append("开工那一趟信箱")
     loop._sweep = lambda: swept.append("扫目标")
@@ -86,7 +90,7 @@ class TestSwitchingOncePerRound:
         loop.run()
 
         assert switcher.asked == [SECOND]
-        assert swept == ["开工那一趟信箱", "扫目标"]
+        assert swept == ["扫目标"]
 
     def test_the_mailbox_is_read_before_the_switch_is_attempted(
         self, monkeypatch: pytest.MonkeyPatch
@@ -98,7 +102,7 @@ class TestSwitchingOncePerRound:
 
         这里钉的是**交错顺序**，光看两个清单各自的内容看不出来。
         """
-        loop, switcher, order = _loop(monkeypatch)
+        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
         loop.reconcile_today = lambda: order.append("信箱")
         loop._sweep = lambda: order.append("扫目标")
         switcher.switch_to = lambda target: (  # type: ignore[method-assign]
@@ -110,6 +114,31 @@ class TestSwitchingOncePerRound:
         loop.run()
 
         assert order == ["信箱", "切星球", "扫目标"]
+
+    def test_switching_first_returns_to_planet_surface_for_the_planet_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """恒星系底栏同一像素不是「行星」；必须先回地表。"""
+        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
+        loop._goto_planet_surface = lambda: (order.append("回地表"), True)[1]
+        switcher.switch_to = lambda target: (  # type: ignore[method-assign]
+            order.append("切星球"),
+            switcher.asked.append(target),
+            SwitchResult.SWITCHED,
+        )[-1]
+
+        assert loop.ensure_origin_planet() is True
+        assert order == ["回地表", "切星球"]
+
+    def test_refuses_to_open_the_planet_list_when_the_surface_cannot_be_reached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loop, switcher, _order = _loop(monkeypatch)
+        loop._goto_planet_surface = lambda: False
+
+        assert loop.ensure_origin_planet() is False
+        assert switcher.asked == []
+        assert loop._outcome.busy == "切出发星球前回不到星球地表"
 
     def test_several_targets_still_cost_exactly_one_switch(
         self, monkeypatch: pytest.MonkeyPatch
@@ -170,7 +199,7 @@ class TestRefusingToDispatchWhenTheSwitchFailed:
 
         outcome = loop.run()
 
-        assert swept == ["开工那一趟信箱"], "战报照读；只有扫目标那一步被挡住"
+        assert swept == [], "关闭启动补录时，切星球失败也不应打开信箱"
         assert outcome.attacked == []
         assert outcome.busy is not None
         assert "9:250:8" in outcome.busy

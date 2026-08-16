@@ -66,12 +66,22 @@ PROGRESS_POLL_INTERVAL = timedelta(seconds=30)
 
 @dataclass(frozen=True)
 class ProgressReading:
-    """四张产出表各有多少行。**只用来和上一次比大小，绝对值没有意义。**"""
+    """各条链路的产出量。**只用来和上一次比大小，绝对值没有意义。**"""
 
     dispatches: int
     battle_reports: int
     scout_reports: int
     coordinate_scans: int
+    #: 最近一次写入军力值的时刻（epoch 秒）。
+    #:
+    #: ⚠️ **这一个不是行数，是时刻，而且必须是。** 军力榜重扫同一批 bot 时
+    #: 只更新不新增（`bot_targets` 上有坐标唯一约束），拿 `COUNT(*)` 当信号的话，
+    #: 第二趟开始计数就再也不动——看门狗会把一条正在好好干活的链路当成卡死杀掉。
+    #: 时刻则是只要写了任何一行就会往前走。
+    #:
+    #: 默认 0 的含义是「从来没写过」。给默认值只为了让既有测试不必逐个补参数；
+    #: 生产路径（`SqlAlchemyMissionProgress.read`）永远显式传，有测试钉住。
+    ranking_written_at: int = 0
 
     def for_kind(self, kind: MissionKind) -> tuple[int, ...]:
         """这条链路的进展由哪几个数字说了算。
@@ -86,6 +96,8 @@ class ProgressReading:
         - `BOT`：探路发与攻击发同样记 `attack_dispatches`，战报同理；
           它不侦察，`scout_reports` 与它无关。
         - `SCAN`：只产 `coordinate_scans`，它压根不派遣。
+        - `RANKING`：只往 `bot_targets` 写军力值，同样不派遣。它的信号是
+          **时刻**不是行数，理由见 `ranking_written_at`。
         """
         if kind is MissionKind.PIRATE:
             return (self.dispatches, self.battle_reports, self.scout_reports)
@@ -93,6 +105,8 @@ class ProgressReading:
             return (self.dispatches, self.battle_reports)
         if kind is MissionKind.SCAN:
             return (self.coordinate_scans,)
+        if kind is MissionKind.RANKING:
+            return (self.ranking_written_at,)
         # 穷举到这里说明 MissionKind 加了新成员却没人补分支——新链路静默套用
         # 别人的进展判据，等于给它配了一个永远不会响的看门狗。
         assert_never(kind)
@@ -105,7 +119,7 @@ class MissionProgress(Protocol):
 
 
 class SqlAlchemyMissionProgress:
-    """真的去数。**只读，四个 `COUNT(*)`，一个字都不写。**
+    """真的去数。**只读，四个 `COUNT(*)` 加一个 `MAX()`，一个字都不写。**
 
     自带 session 工厂而不是走 `SqlAlchemyRepository`，与
     `application.bindings`、`storage.intel` 同一个形状：这四个计数是看门狗
@@ -122,11 +136,18 @@ class SqlAlchemyMissionProgress:
                 battle_reports=_count(session, orm.BattleReportRow),
                 scout_reports=_count(session, orm.ScoutReportRow),
                 coordinate_scans=_count(session, orm.CoordinateScanRow),
+                ranking_written_at=_latest_epoch(session),
             )
 
 
 def _count(session: Session, model: type[Base]) -> int:
     return session.scalar(select(func.count()).select_from(model)) or 0
+
+
+def _latest_epoch(session: Session) -> int:
+    """最近一次写入军力值的时刻，取整秒。一行都没有就 0。"""
+    latest = session.scalar(select(func.max(orm.BotTargetRow.military_score_at_utc)))
+    return int(latest.timestamp()) if latest is not None else 0
 
 
 class StallWatchdog:

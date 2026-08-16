@@ -162,7 +162,6 @@ def _navigator(
         driver=driver,  # type: ignore[arg-type]
         read_labels=read_labels or game.labels,
         read_rows=read_rows or game.rows,
-        on_military_board=_looks_military,
         say=lambda _message: None,
     )
     return navigator, driver
@@ -315,13 +314,22 @@ class TestConfirmingTheMilitaryBoard:
 
         assert driver.points.count(MILITARY_TAB) == 1
 
-    def test_the_military_tab_is_not_clicked_when_the_board_is_already_military(self) -> None:
-        """先认出这一屏再动手：已经在军事榜上就不必再点一下。"""
+    def test_the_military_tab_is_clicked_even_when_already_on_it(self) -> None:
+        """⚠️ **无条件点一次，不先判断。**
+
+        面板打开时停在**经济评分**（用户 2026-08-14 实测），而页签是**幂等的按钮、
+        不是开关**——已经在军事榜上再点一次不会切回去。所以用户的口径是
+        「你不用管现在是什么，你需要看什么，就点什么切换」。
+
+        这条同时否掉了原先那版「先认出这一屏，已经在军事榜上就不点」：
+        那需要一个「这一屏是不是军事榜」的单屏判据，而**那个判据不存在**
+        （见 `tests/unit/domain/test_ranking.py` 里的负面结论）。
+        """
         navigator, driver = _navigator(_Game(tab="military"))
 
         navigator.open_military_ranking()
 
-        assert MILITARY_TAB not in driver.points
+        assert driver.points.count(MILITARY_TAB) == 1
 
     def test_the_economy_tab_is_never_clicked(self) -> None:
         """⚠️ 经济榜上 bot 全是 0 分、按坐标顺序排——完全是另一套数据。"""
@@ -337,13 +345,17 @@ class TestConfirmingTheMilitaryBoard:
 
         assert navigator.open_military_ranking() == MILITARY_1
 
-    def test_it_refuses_when_the_readback_never_says_military(self) -> None:
-        """点过了证明不了切对了。回读一直说不是，就抛，别接着往下采。"""
-        navigator, driver = _navigator(_Game(tab="economy", tab_works=False))
+    def test_it_refuses_when_the_board_goes_blank_after_the_switch(self) -> None:
+        """⚠️ 回读回答的是**另一个**问题。
+
+        它不再判「我在哪个页签上」（那判不出来），而是判「我还在不在排行榜面板上」
+        ——点完之后一行都读不出来 = 断线或面板没了，这时候要抛，别接着往下采。
+        """
+        navigator, driver = _navigator(_Game(tab="economy"), read_rows=lambda: [])
 
         with pytest.raises(RankingNotReached):
             navigator.open_military_ranking()
-        assert driver.points.count(MILITARY_TAB) <= 2
+        assert driver.points.count(MILITARY_TAB) <= 1
 
     def test_a_panel_with_no_readable_row_is_refused_without_touching_the_tab(self) -> None:
         """点开之后一行都读不出来 = 面板没开出来（或者掉线）。这时点页签就是乱点。"""
@@ -446,11 +458,8 @@ class TestComposingWithTheParsingLayer:
         """`read_rows` 交出来的就是 `domain.ranking.RankingRow`——不必为了迁就这一层压成字符串。
 
         上面所有用例都喂字符串，看着像这一层认得「行」长什么样。它不认得：
-        它只做三件事（看空不空、跟上一屏比相等、交给 `on_military_board` 判），
-        所以行的类型是参数化的。这一条把两层真的接一次，免得类型上早就对不上
-        却要等实机才发现。
-
-        判据也是真的那一条：经济榜上 bot 全是 0 分，军事榜上有真实分数。
+        它只做两件事（看空不空、跟上一屏比相等），所以行的类型是参数化的。
+        这一条把两层真的接一次，免得类型上早就对不上却要等实机才发现。
         """
         from evo_helper.domain.ranking import RankingRow, coordinate_of
 
@@ -468,7 +477,6 @@ class TestComposingWithTheParsingLayer:
             driver=driver,  # type: ignore[arg-type]
             read_labels=game.labels,
             read_rows=lambda: list(military if game.tab == "military" else economy),
-            on_military_board=lambda rows: any(row.score for row in rows),
             say=lambda _message: None,
         )
 

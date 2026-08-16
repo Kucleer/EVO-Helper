@@ -601,6 +601,7 @@ def test_the_round_ends_as_a_failure_instead_of_sweeping(monkeypatch: pytest.Mon
     进来，那一趟目标循环只会把上一轮的判断重复一遍。
     """
     loop, _repository, _opened = _loop([])
+    loop._options.reconcile_on_start = True
     swept: list[int] = []
     loop._sweep = lambda: swept.append(1)
     loop.reconcile_today = lambda: (_ for _ in ()).throw(MailboxUnreachable("翻不了信箱"))

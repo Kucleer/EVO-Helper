@@ -46,6 +46,22 @@ class CoordinateScan:
 
 
 @dataclass(frozen=True)
+class RankingTarget:
+    """军事榜读出的 bot；坐标尚未经过逐坐标面板核验。"""
+
+    coordinate: Coordinate
+    military_score: float | None
+    military_score_at_utc: datetime
+    military_score_estimated: bool = False
+    #: 榜单上的名次。**免费的校验和，存下来才复核得了。**
+    #:
+    #: 2026-08-15 的教训：军力值有 30 个飞到 10 万以上（丢小数点，`17.73K`
+    #: 读成 `1773K`，整整齐齐放大 100 倍）。榜单按军力降序排，所以「比上一行大」
+    #: 一眼就能认出来——可名次没存，事后就再也没法拿降序验一遍。
+    military_rank: int | None = None
+
+
+@dataclass(frozen=True)
 class AttackIntent:
     intent_id: UUID
     run_id: UUID

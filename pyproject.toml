@@ -21,6 +21,9 @@ dependencies = [
 dev = [
   "httpx>=0.27,<1",
   "mypy>=1.11,<2",
+  # Unit tests build synthetic screenshots.  Keep Pillow here as well as in
+  # ``vision``: CI intentionally installs only ``.[dev]``.
+  "pillow>=10,<12",
   "pytest>=8.3,<9",
   "ruff>=0.6,<1",
 ]

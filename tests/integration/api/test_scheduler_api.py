@@ -201,12 +201,12 @@ def test_the_scheduler_starts_stopped(console: Console) -> None:
     assert body["started_at_utc"] is None
 
 
-def test_the_three_tasks_are_listed_in_priority_order(console: Console) -> None:
+def test_every_task_is_listed_in_priority_order(console: Console) -> None:
     body = console.get()
     tasks = body["tasks"]
     assert isinstance(tasks, list)
 
-    assert sorted(item["kind"] for item in tasks) == ["BOT", "PIRATE", "SCAN"]
+    assert sorted(item["kind"] for item in tasks) == ["BOT", "PIRATE", "RANKING", "SCAN"]
     priorities = [item["priority"] for item in tasks]
     assert priorities == sorted(priorities)
 
@@ -300,7 +300,8 @@ def test_the_scan_priority_cannot_be_written(console: Console) -> None:
     assert "扫描" in response.json()["detail"]
     tasks = console.get()["tasks"]
     assert isinstance(tasks, list)
-    assert tasks[-1]["kind"] == "SCAN"
+    # 填空隙的两种都结构性地排在最后，它们之间再按 priority（SCAN 2 < RANKING 3）。
+    assert [item["kind"] for item in tasks[-2:]] == ["SCAN", "RANKING"]
 
 
 def test_the_scan_row_can_still_be_switched_off(console: Console) -> None:
@@ -979,3 +980,65 @@ def test_the_row_summary_says_which_planet_and_how_many_lines(console: Console) 
 
     assert "2:137:18" in created["summary"]
     assert "2 条航线" in created["summary"]
+
+
+def test_a_military_bot_plan_uses_global_tiers_and_selected_planets(console: Console) -> None:
+    """任务只保存军力范围与星球选择；档位统一落在攻击配置页。"""
+    task_id = console.task_id("BOT")
+    params = {
+        "by_military": True,
+        "top_n": 50,
+        "max_score": 100_000,
+        "rescan_after_hours": 6,
+    }
+    first = console.client.post(
+        "/api/attack-planets", json={"galaxy": 2, "system": 137, "position": 18}
+    )
+    second = console.client.post(
+        "/api/attack-planets", json={"galaxy": 9, "system": 250, "position": 8}
+    )
+    config = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [
+                {"min_score": 20_000, "preset": "CCC"},
+                {"min_score": 5_000, "preset": "BBB"},
+                {"min_score": 0, "preset": "AAA"},
+            ]
+        },
+    )
+
+    patched = console.client.patch(f"/api/missions/{task_id}", json={"params": params})
+    origins = console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[
+            {"planet_id": first.json()["planet_id"], "fleet_lines": 4, "enabled": True},
+            {"planet_id": second.json()["planet_id"], "fleet_lines": 2, "enabled": True},
+        ],
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert config.status_code == 200, config.text
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["params"] == params
+    assert origins.status_code == 200, origins.text
+    assert origins.json() == [
+        {
+            "planet_id": first.json()["planet_id"],
+            "galaxy": 2,
+            "system": 137,
+            "position": 18,
+            "fleet_lines": 4,
+            "enabled": True,
+        },
+        {
+            "planet_id": second.json()["planet_id"],
+            "galaxy": 9,
+            "system": 250,
+            "position": 8,
+            "fleet_lines": 2,
+            "enabled": True,
+        },
+    ]
+    assert config.json()["tiers"][0]["preset"] == "CCC"

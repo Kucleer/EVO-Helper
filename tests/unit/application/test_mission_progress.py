@@ -224,3 +224,34 @@ def test_the_counts_are_not_re_read_on_every_tick() -> None:
         watchdog.check(running, NOW + timedelta(seconds=second))
 
     assert counts.reads == reads_after_first_look
+
+
+def test_the_ranking_scan_reports_progress_by_time_not_by_row_count() -> None:
+    """⚠️⚠️ **拿行数当信号会把一条正在干活的链路当卡死杀掉。**
+
+    军力榜重扫同一批 bot 时只更新不新增（`bot_targets` 上有坐标唯一约束），
+    所以第二趟开始 `COUNT(*)` 就再也不动。看门狗看到「计数没变」就判卡死。
+
+    时刻则是只要写了任何一行就往前走。变异测试当场抓到过这条：把
+    `_latest_epoch` 换成 `_count(BotTargetRow)` 时，所有用例照样绿。
+    """
+    same_rows_later_write = ProgressReading(
+        dispatches=0,
+        battle_reports=0,
+        scout_reports=0,
+        coordinate_scans=0,
+        ranking_written_at=1_755_000_000,
+    )
+    earlier = ProgressReading(
+        dispatches=0,
+        battle_reports=0,
+        scout_reports=0,
+        coordinate_scans=0,
+        ranking_written_at=1_754_000_000,
+    )
+
+    assert same_rows_later_write.for_kind(MissionKind.RANKING) != earlier.for_kind(
+        MissionKind.RANKING
+    )
+    # 而其它链路的信号一个都没动——「谁产出的」必须说得清。
+    assert same_rows_later_write.for_kind(MissionKind.SCAN) == earlier.for_kind(MissionKind.SCAN)

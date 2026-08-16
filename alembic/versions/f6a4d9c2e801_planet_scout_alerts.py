@@ -1,7 +1,7 @@
 """planet_scout_alerts: persist foreign reconnaissance alerts and delivery state
 
 Revision ID: f6a4d9c2e801
-Revises: d2c4b8a71f39
+Revises: f6c3d2a1b4e8
 Create Date: 2026-08-16
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f6a4d9c2e801"
-down_revision: str | None = "d2c4b8a71f39"
+down_revision: str | None = "f6c3d2a1b4e8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

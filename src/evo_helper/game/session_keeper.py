@@ -60,6 +60,17 @@ DISCONNECT_MARKERS: tuple[str, ...] = ("连接已断开",)
 #: 窗口重开 Chrome——见 `SessionKeeper._restart_now`。
 DEAD_SESSION_MARKERS: tuple[str, ...] = ("无法重新连接",)
 
+#: 服务器维护公告的标题。
+#:
+#: ⚠️ **2026-08-15 03:30 实机：这一屏把整晚堵死了。** 服务器停机维护，游戏弹出
+#: 一张公告盖在 START 页上，而助手完全不认识它——`START_ROI` 那个位置上坐着的
+#: 是公告的「知道了」按钮，于是 `start_button` 一遍遍读到「知道了」、一遍遍
+#: 判「读不出 START」，bot 链路就那么空转了二十分钟。
+#:
+#: 判据用标题而不是正文：正文是整段话，OCR 出来碎；标题「服务器维护」四个字
+#: 在一条独立的横栏里，读得稳。
+MAINTENANCE_MARKERS: tuple[str, ...] = ("服务器维护", "服务器维")
+
 #: 关窗重开的次数上限，以及配额的滚动周期。
 #:
 #: **上限跟重开本身一样重要。** 服务端维护时每次巡检都会撞到这一屏，没有上限
@@ -93,6 +104,8 @@ class ScreenState(Enum):
     DEAD_SESSION = "dead_session"
     #: 加载转圈。
     LOADING = "loading"
+    #: 服务器维护公告，只有一个「知道了」。点掉它才能回到入口序列。
+    MAINTENANCE = "maintenance"
     #: 认不出——必须停止并保留证据。
     UNKNOWN = "unknown"
 
@@ -111,6 +124,11 @@ def classify_screen(text: str) -> ScreenState:
     - **然后判 START**：START 页的背景里也印着淡淡的 ETERNAL VOID。
     """
     haystack = text or ""
+    # 维护公告排在最前：它是浮层，底下的 START / 导航条照样读得出来，
+    # 后判就会把一台停机的服务器认成「在 START 页上」，然后一路点下去。
+    # 同一条道理写在下面掉线那一段里，这是它的第二个实例。
+    if any(marker in haystack for marker in MAINTENANCE_MARKERS):
+        return ScreenState.MAINTENANCE
     if any(marker in haystack for marker in DEAD_SESSION_MARKERS):
         return ScreenState.DEAD_SESSION
     if any(marker in haystack for marker in DISCONNECT_MARKERS):
@@ -145,6 +163,7 @@ class SessionKeeper:
         click_entry: Callable[[], None],
         click_start: Callable[[], None],
         dismiss_disconnect: Callable[[], None] | None = None,
+        dismiss_notice: Callable[[], None] | None = None,
         restart_window: Callable[[], None] | None = None,
         max_restarts: int = MAX_WINDOW_RESTARTS,
         restart_budget_window_s: float = RESTART_BUDGET_WINDOW_S,
@@ -157,6 +176,7 @@ class SessionKeeper:
         self._click_entry = click_entry
         self._click_start = click_start
         self._dismiss_disconnect = dismiss_disconnect
+        self._dismiss_notice = dismiss_notice
         # 关窗重开真的会动系统，所以它是**注入进来的**：测试注入假的，
         # 于是单元测试永远碰不到真窗口。默认 None = 不会重开，只会停下来报告。
         self._restart_window = restart_window
@@ -242,6 +262,20 @@ class SessionKeeper:
         不易的细节（固定等待不够、要轮询到出现 START），复制一份就等于把它们
         留在一份里、丢在另一份里。
         """
+        if state is ScreenState.MAINTENANCE:
+            if self._dismiss_notice is None:
+                return ReconnectOutcome(
+                    state, reconnected=False, detail="maintenance notice with no way to dismiss it"
+                )
+            self._dismiss_notice()
+            # 点掉之后回到入口序列的某一屏，具体哪一屏不假设——重新观察。
+            # ⚠️ **服务器可能还没起来**：维护中点掉公告只会回到 START，而 START
+            # 点下去登不进。那时下面的 `_wait_for_game` 会超时，如实报出去，
+            # 由调度器按失败处理并稍后重试——这正是我们要的，而不是死循环。
+            state = self._wait_for(
+                {ScreenState.ENTRY, ScreenState.START, ScreenState.IN_GAME}, ENTRY_TIMEOUT_S
+            )
+
         if state is ScreenState.DISCONNECTED:
             if self._dismiss_disconnect is None:
                 # 没给关闭动作就停在这里，而不是把掉线当成「认不出」——

@@ -13,6 +13,7 @@ from evo_helper.domain.ranking import (
     coordinate_of,
     descending_breaks,
     interpolate_scores,
+    mentions_bot,
     repair_ranks,
 )
 
@@ -165,3 +166,66 @@ def test_bots_are_told_apart_by_name_not_by_rank() -> None:
     ]
 
     assert [row.name for row in bot_rows(rows)] == ["bot_4_30_12"]
+
+
+def test_there_is_no_single_screen_test_for_which_board_this_is() -> None:
+    """⚠️ **这条是负面结论，记在这里免得有人再发明一遍。**
+
+    这里曾经有个 `is_military_board(rows)`，判据是「读到任何非零分数就算军事榜」。
+    实机 2026-08-14 当场证伪：两个页签的榜首十三行都是真人、分数都在 404.17M
+    这个量级，非零判据在**两边都返回 True**。
+
+    模块头那条「经济榜 bot 全是 0」只对**第 639 名之后**成立，而看到那一段
+    要先滚六十屏——开榜时用不上。
+
+    用户口径（2026-08-14）：「你不用管现在是什么，你需要看什么，就点什么切换」。
+    页签是幂等的按钮，不是开关，所以正确做法是**无条件点一次**「军事评分」
+    （见 `game.ranking_nav.RankingNavigator._switch_to_military`），
+    而不是先判断再点。
+    """
+    top_of_economy = [RankingRow(1, "unkn0wn", 404_170_000.0, None)]
+    top_of_military = [RankingRow(1, "unkn0wn", 404_170_000.0, None)]
+
+    assert all(row.score for row in top_of_economy)
+    assert all(row.score for row in top_of_military)
+    assert [r.score for r in top_of_economy] == [r.score for r in top_of_military]
+
+
+# -- 翻到 bot 区了没有 ----------------------------------------------------------
+
+
+def test_a_bot_shaped_name_anywhere_in_the_strip_counts() -> None:
+    """⚠️ 用户口径（2026-08-15）：「不停的滚屏，直到你识别到了 bot 关键字」。
+
+    翻真人段时把**整条名字列**读一次就够，不必逐格细读三列——那一段有 73 屏
+    （bot 从第 ~587 名才开始，实测 8 名/滚），细读是纯浪费。
+    """
+    strip = """探险12
+资源32
+bot_4_155_13
+探险19"""
+
+    assert mentions_bot(strip)
+
+
+def test_a_human_called_goodbot_does_not_count() -> None:
+    """⚠️ **不能用子串 `bot` 判。** 实机 2026-08-15 第 7 名就是真人 `goodbot`，
+    而它在开榜第一屏上——用子串判的话，一屏都还没翻就宣布「到 bot 区了」。
+    """
+    assert not mentions_bot("[7] goodbot UNSE 76.66M")
+    assert not mentions_bot("Rambo42088")
+
+
+def test_the_shape_survives_the_ocr_variants_seen_live() -> None:
+    """实机读到过大小写变体和空格分隔符，都要认得。"""
+    assert mentions_bot("Bot_1_1_1")
+    assert mentions_bot("bot 8 352 15")
+
+
+def test_the_range_check_is_not_this_functions_job() -> None:
+    """只看形状，不校验区间——区间是 `coordinate_of` 的事。
+
+    这里宁可宽：判早了只多读几屏，判晚了会一直翻不到头。
+    """
+    assert mentions_bot("bot_2_1121_7")  # 1121 越界，但形状对
+    assert coordinate_of("bot_2_1121_7") is None  # 真正的把关在这儿

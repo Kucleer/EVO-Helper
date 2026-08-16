@@ -42,6 +42,7 @@ def test_the_tasks_are_ordered_by_kind_not_by_priority() -> None:
     看起来像是三条链路全改了，而实际只改了优先级那一项。
     """
     freeze = _freeze(
+        _task(MissionKind.RANKING, priority=7),
         _task(MissionKind.SCAN, priority=9),
         _task(MissionKind.BOT, priority=0),
         _task(MissionKind.PIRATE, priority=5),
