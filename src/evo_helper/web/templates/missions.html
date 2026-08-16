@@ -27,8 +27,14 @@
   </div>
 </section>
 
-<section class="panel compact" aria-labelledby="sched-head">
-  <h2 id="sched-head">调度器</h2>
+<div class="missions-control-grid{% if not backfill_enabled %} single{% endif %}">
+<section class="panel compact missions-control" aria-labelledby="sched-head">
+  <div class="missions-control-head">
+    <h2 id="sched-head">调度器</h2>
+    <span class="tips" tabindex="0" role="img"
+          aria-label="调度器说明"
+          title="点开始后调度器常驻运行并按任务优先级派遣；任一时刻最多一个子进程操作游戏窗口。控制台重启后会停在已停止。勾选启动战报补录时，仅本次开始前补录一趟；关闭则攻击续跑不会进入信箱。">ⓘ</span>
+  </div>
   <div class="filter-bar">
     <span class="inline-label">状态</span>
     <span class="chip" id="sched-state"><span class="glyph" aria-hidden="true">■</span>已停止</span>
@@ -58,13 +64,6 @@
     <button class="btn small" type="button" id="btn-stop"
             data-endpoint="/api/scheduler/stop">结束</button>
   </div>
-  <p class="muted" style="margin:8px 0 0;font-size:12px">
-    点「开始」之后调度器常驻运行，自己决定什么时候起哪条链路，直到点「结束」。
-    任何时刻最多一个子进程在点鼠标。控制台重启后一律停在「已停止」。
-    <br>
-    勾选「启动战报补录」时，<b>本次开始只补录一趟</b>（海盗、bot 各一趟），读完信箱里
-    应读未读的战报再放行任务；关闭则全程不自动进入信箱。攻击中的航线续跑不再读战报。
-  </p>
 </section>
 
 {#
@@ -77,8 +76,13 @@
   期间一个任务都不起。
 #}
 {% if backfill_enabled %}
-<section class="panel" aria-labelledby="backfill-head">
-  <h2 id="backfill-head">战报补录</h2>
+<section class="panel compact missions-control" aria-labelledby="backfill-head">
+  <div class="missions-control-head">
+    <h2 id="backfill-head">战报补录</h2>
+    <span class="tips" tabindex="0" role="img"
+          aria-label="战报补录说明"
+          title="补录只读邮件：不删邮件、不领奖励、不派遣舰队。它会独占游戏窗口并暂停任务；完成后请查看结果，再点继续任务。">ⓘ</span>
+  </div>
   <div class="filter-bar">
     <span class="inline-label">状态</span>
     <span class="chip" id="backfill-phase">
@@ -128,13 +132,9 @@
     进度来源——「点了没反应」正是这一块要防的。
   #}
   <pre id="backfill-log" class="log-tail" hidden aria-label="补录日志的最后几十行"></pre>
-  <p class="muted" style="margin:8px 0 0;font-size:12px">
-    只读：不删邮件、不领奖励、不派遣舰队。补录期间<b>一个任务都不起</b>；
-    跑完不自动放行，看过上面那几个数再点「继续任务」。
-    完整日志在 <span class="coord" id="backfill-log-path">var/logs/backfill-*.log</span>。
-  </p>
 </section>
 {% endif %}
+</div>
 
 <section class="panel" aria-labelledby="tasks-head">
   <h2 id="tasks-head">任务</h2>
@@ -210,6 +210,9 @@
         <tr>
           <td class="coord">{{ local_time(freeze.frozen_at_utc) }}</td>
           <td>
+            {% if freeze.military_tiers_label %}
+              <div class="muted" style="font-size:11px">{{ freeze.military_tiers_label }}</div>
+            {% endif %}
             {% for task in freeze.tasks %}
               <div class="muted" style="font-size:11px">
                 {{ task.label }} · {{ '参与' if task.enabled else '未参与' }} · {{ task.summary }}
@@ -431,14 +434,19 @@
 
   function setMilitaryVisible(row, locked) {
     const toggle = row.querySelector('.military-enabled');
-    const editor = row.querySelector('.military-editor');
+    const settings = row.querySelector('.military-settings');
     const regional = row.querySelector('.regional-params');
-    if (!toggle || !editor || !regional) return;
+    const standardDispatch = row.querySelector('.mission-standard-dispatch');
+    const militaryDispatch = row.querySelector('.military-dispatch');
+    if (!toggle || !settings || !regional || !standardDispatch || !militaryDispatch) return;
     const enabled = toggle.checked;
-    editor.hidden = !enabled;
+    settings.hidden = !enabled;
     regional.hidden = enabled;
-    for (const input of editor.querySelectorAll('input, select')) input.disabled = locked;
-    for (const button of editor.querySelectorAll('button')) button.disabled = locked;
+    standardDispatch.hidden = enabled;
+    militaryDispatch.hidden = !enabled;
+    for (const input of settings.querySelectorAll('input, select')) input.disabled = locked;
+    for (const input of militaryDispatch.querySelectorAll('input, select')) input.disabled = locked;
+    for (const button of militaryDispatch.querySelectorAll('button')) button.disabled = locked;
     toggle.disabled = locked;
   }
 
@@ -505,7 +513,15 @@
       // 悄无声息地全流失。只想跑扫描的话，取消另外两个复选框。
       kindLine.textContent += ' · 始终填空隙 · 不参与排序（它永远有活干，排它后面的永远轮不到）';
     }
-    makeCell(row, name, kindLine);
+    const taskCell = makeCell(row, name, kindLine);
+    if (task.kind === 'BOT') {
+      const modeLabel = document.createElement('label');
+      modeLabel.className = 'inline-label military-toggle';
+      modeLabel.style.cursor = 'pointer';
+      const militaryToggle = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
+      modeLabel.append(militaryToggle, document.createTextNode(' 军力优先'));
+      taskCell.append(modeLabel);
+    }
 
     // 出发星球与航线数。**航线上限按星球各一份**，所以这两个必须成对出现在
     // 同一格里——只看到航线数会以为那是账号总额。
@@ -521,6 +537,10 @@
       dash.textContent = '— 不派遣';
       makeCell(row, dash);
     } else {
+      const dispatch = document.createElement('div');
+      dispatch.className = 'mission-dispatch';
+      const standardDispatch = document.createElement('div');
+      standardDispatch.className = 'mission-standard-dispatch';
       const origin = document.createElement('select');
       origin.className = 'mission-origin';
       origin.style.width = '175px';
@@ -529,7 +549,33 @@
       const lines = makeInput('mission-lines', {
         type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
       });
-      makeCell(row, origin, document.createTextNode(' '), lines, defaults);
+      standardDispatch.append(origin, document.createTextNode(' '), lines, defaults);
+      dispatch.append(standardDispatch);
+      if (task.kind === 'BOT') {
+        const militaryDispatch = document.createElement('div');
+        militaryDispatch.className = 'military-dispatch';
+        militaryDispatch.hidden = true;
+        const originHead = document.createElement('div');
+        originHead.append('出发点 / 航线　');
+        const addOrigin = document.createElement('button');
+        addOrigin.type = 'button';
+        addOrigin.className = 'btn small military-add-origin';
+        addOrigin.textContent = '增加出发点';
+        originHead.append(addOrigin);
+        const origins = document.createElement('div');
+        origins.className = 'military-origin-list';
+        const save = document.createElement('button');
+        save.type = 'button';
+        save.className = 'btn primary small military-save';
+        save.style.marginTop = '7px';
+        save.textContent = '保存军力方案';
+        const note = document.createElement('div');
+        note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
+        note.textContent = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
+        militaryDispatch.append(originHead, origins, save, note);
+        dispatch.append(militaryDispatch);
+      }
+      makeCell(row, dispatch);
     }
 
     // 参数框。
@@ -555,37 +601,13 @@
     }
     params.append(regional);
     if (task.kind === 'BOT') {
-      const military = document.createElement('div');
-      military.className = 'military-config';
-      military.style.marginTop = '6px';
-      const modeLabel = document.createElement('label');
-      modeLabel.className = 'inline-label';
-      modeLabel.style.cursor = 'pointer';
-      const mode = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
-      modeLabel.append(mode, document.createTextNode(' 军力优先：前 N 名内按各出发点就近攻击'));
-      const editor = document.createElement('div');
-      editor.className = 'military-editor';
-      editor.style.marginTop = '7px';
+      const settings = document.createElement('div');
+      settings.className = 'military-settings';
       const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力候选数量' });
       const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限' });
       const rescan = makeInput('military-rescan-hours', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力榜重扫提示小时数' });
-      const settings = document.createElement('div');
       settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　榜单超过 '), rescan, document.createTextNode(' 小时提示重扫'));
-      const originHead = document.createElement('div');
-      originHead.style.marginTop = '7px';
-      originHead.append('出发点 / 航线　');
-      const addOrigin = document.createElement('button');
-      addOrigin.type = 'button'; addOrigin.className = 'btn small military-add-origin'; addOrigin.textContent = '增加出发点';
-      originHead.append(addOrigin);
-      const origins = document.createElement('div'); origins.className = 'military-origin-list';
-      const save = document.createElement('button');
-      save.type = 'button'; save.className = 'btn primary small military-save'; save.style.marginTop = '7px'; save.textContent = '保存军力方案';
-      const note = document.createElement('div');
-      note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
-      note.textContent = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护，所有军力任务共用。';
-      editor.append(settings, originHead, origins, save, note);
-      military.append(modeLabel, editor);
-      params.append(military);
+      params.append(settings);
     }
     const summary = document.createElement('div');
     summary.className = 'muted mission-summary';
@@ -817,6 +839,13 @@
         `${task.label} · ${task.enabled ? '参与' : '未参与'} · ${task.summary}`
         + ` · 出发 ${origin} · 航线 ${fleetLines}`;
       lines.append(line);
+    }
+    if (freeze.military_tiers_label) {
+      const tierLine = document.createElement('div');
+      tierLine.className = 'muted';
+      tierLine.style.fontSize = '11px';
+      tierLine.textContent = freeze.military_tiers_label;
+      lines.append(tierLine);
     }
     const changed = document.createElement('div');
     changed.className = 'muted';
@@ -1150,13 +1179,18 @@
       .then(refresh);
   });
 
-  refresh();
-  refreshBackfill();
-  // 状态区单独轮询，**不刷整页**——刷整页会清掉用户正在输入的参数框。
-  setInterval(refresh, 2000);
-  // 补录跟着一起轮询：它最坏要跑十几分钟，日志尾巴要一直往前走，否则页面上
-  // 看起来就是「点了没反应」。
-  setInterval(refreshBackfill, 2000);
+  // 只有上一轮读完才排下一轮。固定间隔会在慢查询尚未返回时再叠一轮 GET；浏览器
+  // 取消旧请求也不会中断 FastAPI 的同步查库，最终把线程池与
+  // SQLite 一起堆满。补录状态紧跟在调度快照之后读，整个轮询链不重叠。
+  function poll() {
+    return refresh().then(refreshBackfill);
+  }
+
+  function scheduleNextPoll() {
+    poll().finally(() => window.setTimeout(scheduleNextPoll, 2000));
+  }
+
+  scheduleNextPoll();
   // 秒表本地走，免得只有轮询到了才跳一下。
   setInterval(tickClock, 1000);
 })();

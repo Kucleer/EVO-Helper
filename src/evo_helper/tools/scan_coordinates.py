@@ -147,23 +147,84 @@ def make_console_encoding_safe() -> None:
 # -- 计划与游标 ----------------------------------------------------------------
 
 
-def ensure_run(session_factory: Any) -> tuple[UUID, Coordinate | None]:
-    """找到（或建好）这次扫描的运行实例，返回它和它的游标。"""
+def configured_priority_planets(session_factory: Any) -> tuple[Coordinate, ...]:
+    """按星球列表顺序取扫描优先中心；没有配置时退回兼容的旧计划。"""
     from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    with session_factory() as session:
+        rows = session.scalars(
+            select(orm.AttackPlanetRow).order_by(orm.AttackPlanetRow.sort_index)
+        ).all()
+    return tuple(Coordinate(row.galaxy, row.system, row.position) for row in rows)
+
+
+def _range_specs(
+    priority_planets: tuple[Coordinate, ...], home: Coordinate
+) -> tuple[tuple[int, int, int, int, int, int, int, int, int, int], ...]:
+    """计划范围的可比较快照；范围变化时旧游标必须重新从优先区开始。"""
+    return tuple(
+        (
+            start.galaxy,
+            start.system,
+            start.position,
+            end.galaxy,
+            end.system,
+            end.position,
+            home.galaxy,
+            home.system,
+            home.position,
+            index,
+        )
+        for index, (_segment, start, end) in enumerate(
+            planned_segments(priority_planets=priority_planets)
+        )
+    )
+
+
+def _stored_range_specs(
+    ranges: list[Any],
+) -> tuple[tuple[int, int, int, int, int, int, int, int, int, int], ...]:
+    return tuple(
+        (
+            row.start_galaxy,
+            row.start_system,
+            row.start_position,
+            row.end_galaxy,
+            row.end_system,
+            row.end_position,
+            row.origin_galaxy,
+            row.origin_system,
+            row.origin_position,
+            row.priority,
+        )
+        for row in ranges
+    )
+
+
+def ensure_run(
+    session_factory: Any, *, priority_planets: tuple[Coordinate, ...] | None = None
+) -> tuple[UUID, Coordinate | None]:
+    """找到（或建好）扫描运行实例，并让持久化计划跟随星球列表。
+
+    旧版本的计划固定从 2 系开始。发现范围快照不一致时，范围和游标一起更新，
+    已确认坐标仍由 ``BotTargetRow`` 去重，所以不会因为重排而重复扫描。
+    """
+    from sqlalchemy import delete, select
 
     from evo_helper.storage import models as orm
 
     now = datetime.now(UTC)
     # 计划表要求出发星球非空。扫描本身用不到它——扫描不派遣。
     home = origin()
+    planets = (
+        priority_planets
+        if priority_planets is not None
+        else configured_priority_planets(session_factory)
+    )
+    wanted_ranges = _range_specs(planets, home)
     with session_factory() as session:
-        run = session.scalar(
-            select(orm.RunInstance).where(orm.RunInstance.idempotency_key == RUN_KEY)
-        )
-        if run is not None:
-            cursor = _cursor_of(run)
-            return run.id, cursor
-
         plan = session.scalar(select(orm.ScanPlan).where(orm.ScanPlan.name == PLAN_NAME))
         if plan is None:
             plan = orm.ScanPlan(
@@ -176,25 +237,61 @@ def ensure_run(session_factory: Any) -> tuple[UUID, Coordinate | None]:
             )
             session.add(plan)
             session.flush()
-            # 一段一行，priority 就是扫描顺序——仓储层按 priority 取下一个坐标。
-            for index, (_segment, start, end) in enumerate(planned_segments()):
+        existing_ranges = session.scalars(
+            select(orm.ScanRangeRow)
+            .where(orm.ScanRangeRow.plan_id == plan.id)
+            .order_by(orm.ScanRangeRow.priority, orm.ScanRangeRow.id)
+        ).all()
+        ranges_changed = _stored_range_specs(existing_ranges) != wanted_ranges
+        if ranges_changed:
+            session.execute(delete(orm.ScanRangeRow).where(orm.ScanRangeRow.plan_id == plan.id))
+            for spec in wanted_ranges:
+                (
+                    start_galaxy,
+                    start_system,
+                    start_position,
+                    end_galaxy,
+                    end_system,
+                    end_position,
+                    origin_galaxy,
+                    origin_system,
+                    origin_position,
+                    priority,
+                ) = spec
                 session.add(
                     orm.ScanRangeRow(
                         plan_id=plan.id,
-                        start_galaxy=start.galaxy,
-                        start_system=start.system,
-                        start_position=start.position,
-                        end_galaxy=end.galaxy,
-                        end_system=end.system,
-                        end_position=end.position,
-                        origin_galaxy=home.galaxy,
-                        origin_system=home.system,
-                        origin_position=home.position,
+                        start_galaxy=start_galaxy,
+                        start_system=start_system,
+                        start_position=start_position,
+                        end_galaxy=end_galaxy,
+                        end_system=end_system,
+                        end_position=end_position,
+                        origin_galaxy=origin_galaxy,
+                        origin_system=origin_system,
+                        origin_position=origin_position,
                         fleet_preset_name=PRESET_NAME,
                         fleet_preset_signature=PRESET_SIGNATURE,
-                        priority=index,
+                        priority=priority,
                     )
                 )
+            plan.updated_at_utc = now
+
+        run = session.scalar(
+            select(orm.RunInstance).where(orm.RunInstance.idempotency_key == RUN_KEY)
+        )
+        if run is not None:
+            if ranges_changed:
+                # 老游标指向旧顺序；保留已扫记录，重新从新的局部优先区取数。
+                run.cursor_galaxy = None
+                run.cursor_system = None
+                run.cursor_position = None
+                run.pending_galaxy = None
+                run.pending_system = None
+                run.pending_position = None
+            session.commit()
+            return run.id, _cursor_of(run)
+
         run = orm.RunInstance(
             plan_id=plan.id,
             idempotency_key=RUN_KEY,
@@ -271,7 +368,11 @@ def systems_with_bot(session_factory: Any) -> set[tuple[int, int]]:
 
 
 def missing_from_plan(
-    session_factory: Any, *, upto: Coordinate | None, one_bot_per_system: bool = ONE_BOT_PER_SYSTEM
+    session_factory: Any,
+    *,
+    upto: Coordinate | None,
+    one_bot_per_system: bool = ONE_BOT_PER_SYSTEM,
+    priority_planets: tuple[Coordinate, ...] = (),
 ) -> Iterator[Coordinate]:
     """计划里走到过、但库里没有的坐标。
 
@@ -285,7 +386,7 @@ def missing_from_plan(
         return
     done = already_scanned(session_factory)
     found = systems_with_bot(session_factory) if one_bot_per_system else set()
-    for coordinate in iter_scan_coordinates():
+    for coordinate in iter_scan_coordinates(priority_planets=priority_planets):
         if (coordinate.galaxy, coordinate.system) not in found and (
             coordinate.galaxy,
             coordinate.system,
@@ -967,7 +1068,8 @@ def run_scan(
 
     session_factory = create_session_factory(create_database_engine(Settings().database_url))
     repository = SqlAlchemyRepository(session_factory)
-    run_id, cursor = ensure_run(session_factory)
+    priority_planets = configured_priority_planets(session_factory)
+    run_id, cursor = ensure_run(session_factory, priority_planets=priority_planets)
     done = already_scanned(session_factory) if skip_scanned else set()
 
     say(f"运行实例 {run_id}")
@@ -1009,12 +1111,17 @@ def run_scan(
     elif rescan_missing:
         # 补缺口时游标已经在前面了，不能再往前推——推了会把还没扫的坐标当成扫过。
         pending = list(
-            missing_from_plan(session_factory, upto=cursor, one_bot_per_system=one_bot_per_system)
+            missing_from_plan(
+                session_factory,
+                upto=cursor,
+                one_bot_per_system=one_bot_per_system,
+                priority_planets=priority_planets,
+            )
         )
         say(f"补缺口模式：游标之前有 {len(pending)} 个坐标没入库")
         coordinates = iter(pending)
     else:
-        coordinates = _planned(cursor)
+        coordinates = _planned(cursor, priority_planets=priority_planets)
 
     # 每系一个 bot：已经找到的系整个跳过。补缺口那条路径用的是同一个判据。
     found_systems = (
@@ -1112,26 +1219,32 @@ def run_scan(
     return 0
 
 
-def _planned(cursor: Coordinate | None) -> Iterator[Coordinate]:
+def _planned(
+    cursor: Coordinate | None, *, priority_planets: tuple[Coordinate, ...] = ()
+) -> Iterator[Coordinate]:
     from evo_helper.domain.scan_plan import CursorNotInPlanError
 
     try:
-        yield from iter_scan_coordinates(after=cursor)
+        yield from iter_scan_coordinates(after=cursor, priority_planets=priority_planets)
     except CursorNotInPlanError as exc:  # pragma: no cover - 计划改过才会走到
         raise SystemExit(f"{exc}；请确认分段是否变更后再续扫") from exc
 
 
 def show_status() -> int:
     session_factory = create_session_factory(create_database_engine(Settings().database_url))
-    run_id, cursor = ensure_run(session_factory)
+    priority_planets = configured_priority_planets(session_factory)
+    run_id, cursor = ensure_run(session_factory, priority_planets=priority_planets)
     done = already_scanned(session_factory)
-    total = total_coordinates()
+    total = total_coordinates(priority_planets=priority_planets)
     bounds = ScanBounds()
     say(f"运行实例 {run_id}")
     say(f"计划总量 {total:,} 个坐标（每系 {bounds.positions_per_system} 位，跳过 1–4）")
     say(f"游标 {cursor if cursor is not None else '（尚未开始）'}")
     say(f"已确认坐标 {len(done):,}（{len(done) / total:.4%}）")
-    for index, (segment, start, end) in enumerate(planned_segments()):
+    if priority_planets:
+        say("优先星球：" + "、".join(map(str, priority_planets)) + "（各 ±100 系）")
+    ranges = planned_segments(priority_planets=priority_planets)
+    for index, (segment, start, end) in enumerate(ranges):
         span = f"{segment.galaxy}:{segment.first_system:03d}–{segment.last_system:03d}"
         say(f"  {index + 1:>2}. {span}  {start} → {end}")
     return 0

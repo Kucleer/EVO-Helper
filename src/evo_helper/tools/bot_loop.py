@@ -123,6 +123,9 @@ class BotOptions:
     #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
     #: 航线返航后的续跑反复打开信箱。
     reconcile_on_start: bool = False
+    #: 本进程最多真正派出多少发。调度器按当前出发星球的空闲航线数传入，避免
+    #: 盲目点到游戏的「航线已满」弹窗；手工运行不传则不设上限。
+    max_dispatches: int | None = None
 
 
 class BotLoop(PirateLoop):
@@ -303,11 +306,16 @@ class BotLoop(PirateLoop):
         一态**——每个目标在这个循环里只走一个分支，所以「平局再打一发」也是一趟
         一发，不会在同一趟里把配额一次烧光。
         """
+        dispatched = 0
         for coordinate in self._bot.targets:
+            if self._bot.max_dispatches is not None and dispatched >= self._bot.max_dispatches:
+                say(f"  已派出 {dispatched} 发，达到本轮空闲航线预算；其余目标留待返航后继续")
+                break
             phase = self._phase_of(coordinate)
             say(f"目标 {coordinate}（{phase.value}）")
             if phase is BotPhase.NEEDS_ATTACK:
-                self._attack_once(coordinate)
+                if self._attack_once(coordinate):
+                    dispatched += 1
             elif phase is BotPhase.AWAITING_ATTACK_REPORT:
                 self._say_still_waiting(coordinate)
             # `DONE` 无事可做。
@@ -344,7 +352,7 @@ class BotLoop(PirateLoop):
         repository, _run_id = self._ensure_run()
         return tuple(repository.bot_dispatch_facts(coordinate, since=self._round_start()))
 
-    def _attack_once(self, coordinate: Coordinate) -> None:
+    def _attack_once(self, coordinate: Coordinate) -> bool:
         """对这个坐标打一发 BBB。
 
         走到这里只有两种情形：本轮第一发，或者上一发打成了平局而配额还有剩
@@ -353,12 +361,12 @@ class BotLoop(PirateLoop):
         `phase_of` 一处。
         """
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
-            return
+            return False
         self._outcome.pirates.append(coordinate)
         if not self._bot.attack:
-            return
+            return False
         preset = (self._bot.presets or {}).get(coordinate, BOT_ATTACK_PRESET)
-        self.attack(coordinate, preset=preset)
+        return self.attack(coordinate, preset=preset)
 
     def _round_start(self) -> datetime:
         """本轮从何时算起。**绝不返回 None。**
@@ -441,7 +449,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
     )
+    parser.add_argument(
+        "--max-dispatches",
+        type=int,
+        default=None,
+        help="本进程最多实际派出多少发；调度器按该出发点空闲航线数传入",
+    )
     args = parser.parse_args(argv)
+    if args.max_dispatches is not None and args.max_dispatches < 1:
+        parser.error("--max-dispatches 必须至少为 1")
 
     import ctypes
 
@@ -454,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         origin=args.origin,
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
         reconcile_on_start=args.reconcile,
+        max_dispatches=args.max_dispatches,
     )
     mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(

@@ -483,14 +483,26 @@ def test_planets_page_filters_by_galaxy() -> None:
     assert "bot_3_1_5" not in body
 
 
-def test_planets_page_kind_filter_reaches_the_unowned_slots() -> None:
+def test_planets_page_searches_owner_names() -> None:
+    client, service = _make_client()
+    _seed_planets(service, MIXED)
+
+    body = client.get("/planets?kind=all&owner=lilgriffith").text
+
+    assert "LilGriffith" in body
+    assert "bot_2_1_5" not in body
+    assert 'name="owner" value="lilgriffith"' in body
+
+
+def test_planets_page_rejects_the_retired_free_slot_filter() -> None:
     client, service = _make_client()
     _seed_planets(service, MIXED)
 
     body = client.get("/planets?kind=free").text
 
-    assert "2:1:6" in body
-    assert "bot_2_1_5" not in body
+    # `free` 不再是星球列表类型，旧链接安全回落到默认的 bot 视图。
+    assert "2:1:6" not in body
+    assert "bot_2_1_5" in body
 
 
 def test_planets_page_reports_the_filtered_total_not_the_page_size() -> None:
@@ -532,7 +544,7 @@ def test_planets_page_drops_the_default_hint_once_a_filter_is_chosen() -> None:
     _seed_planets(service, MIXED)
 
     assert "默认只看 bot" in client.get("/planets").text
-    assert "默认只看 bot" not in client.get("/planets?kind=free").text
+    assert "默认只看 bot" not in client.get("/planets?kind=owned").text
 
 
 def test_planet_rows_link_to_the_coordinate_detail_page() -> None:

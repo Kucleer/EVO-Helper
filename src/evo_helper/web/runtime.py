@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from alembic import command
 from evo_helper.config import Settings
 from evo_helper.storage.database import create_database_engine, create_session_factory
+from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .app import create_persistent_app
 
@@ -27,9 +28,11 @@ def create_runtime_app(
     actual_settings = settings or Settings()
     _upgrade_database(actual_settings.database_url)
     engine = create_database_engine(actual_settings.database_url)
-    app = create_persistent_app(
-        create_session_factory(engine), settings=actual_settings, local_token=local_token
-    )
+    session_factory = create_session_factory(engine)
+    # 旧版把每个 `bot_<g>_<s>_<position>` 都纳入候选；固定海盗位 1--4
+    # 因而被错误固化。保留原始扫描/榜单记录，只撤销派遣候选资格。
+    SqlAlchemyRepository(session_factory).clear_pirate_position_bot_candidates()
+    app = create_persistent_app(session_factory, settings=actual_settings, local_token=local_token)
     app.state.database_engine = engine
     return app
 

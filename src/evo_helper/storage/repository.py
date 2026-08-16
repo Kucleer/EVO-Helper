@@ -17,6 +17,7 @@ from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
+from evo_helper.domain.ranking import is_bot_coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
     MISSION_KIND_SCOUT,
@@ -43,6 +44,7 @@ from evo_helper.domain.report_wait import (
     line_free_at,
     vet_flight_time,
 )
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
@@ -323,6 +325,10 @@ class SqlAlchemyRepository:
         """
         with self._session_factory() as session:
             for record in targets:
+                # `targets_from_rows` 已过滤一次；仓储层再守一道，避免以后新的
+                # 导入入口绕过解析层，把固定海盗位写成军力 bot。
+                if not is_bot_coordinate(record.coordinate):
+                    continue
                 _require_utc(record.military_score_at_utc, "military_score_at_utc")
                 target = _bot_target_for(session, record.coordinate)
                 if target is None:
@@ -346,6 +352,29 @@ class SqlAlchemyRepository:
                 target.military_score_estimated = record.military_score_estimated
                 target.military_rank = record.military_rank
             session.commit()
+
+    def clear_pirate_position_bot_candidates(self) -> int:
+        """撤销 1--4 号位误写成 bot 的候选，保留坐标扫描原始记录。
+
+        这些行的 ``BotTargetRow`` 是派遣候选的派生索引；清掉它的 bot/军力
+        标记不会删除 ``coordinate_scans``、攻击意图或排行榜快照。位置 1--4
+        本来就不会出现在后续坐标扫描计划中，因此此操作可安全且幂等地在启动时执行。
+        """
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BotTargetRow).where(
+                    orm.BotTargetRow.is_bot,
+                    orm.BotTargetRow.position.in_(PIRATE_POSITIONS),
+                )
+            ).all()
+            for row in rows:
+                row.is_bot = False
+                row.military_score = None
+                row.military_score_at_utc = None
+                row.military_score_estimated = False
+                row.military_rank = None
+            session.commit()
+            return len(rows)
 
     def forget_implausible_military_scores(self, *, above: float) -> int:
         """把高于 `above` 的军力值清成 `None`，返回清了几行。**只清分数，不删行。**
@@ -532,6 +561,44 @@ class SqlAlchemyRepository:
                     origin=origin,
                     target=target,
                     reported_at=row.reported_at_utc,
+                )
+            session.commit()
+        return matched
+
+    def rematch_unlinked_reports(self, *, limit: int = 500) -> int:
+        """重试认领库中尚未挂到派遣的战报，返回本次补上的数量。
+
+        战报可能早于修复后的匹配规则写入；之后信箱去重会阻止它再次入库，
+        因而不能指望下一次读邮件自然修好。这里只复用 `_link_dispatch` 的
+        唯一候选规则，绝不按最近时间强行猜测归属。
+        """
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        matched = 0
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BattleReportRow)
+                .where(orm.BattleReportRow.dispatch_id.is_(None))
+                .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id)
+                .limit(limit)
+            ).all()
+            for row in rows:
+                matched += int(
+                    _link_dispatch(
+                        session,
+                        row,
+                        origin=Coordinate(
+                            row.attacker_origin_galaxy,
+                            row.attacker_origin_system,
+                            row.attacker_origin_position,
+                        ),
+                        target=Coordinate(
+                            row.defender_target_galaxy,
+                            row.defender_target_system,
+                            row.defender_target_position,
+                        ),
+                        reported_at=row.reported_at_utc,
+                    )
                 )
             session.commit()
         return matched
@@ -1493,6 +1560,103 @@ class SqlAlchemyRepository:
                 DispatchFact(has_report=report_id is not None, outcome=outcome)
                 for report_id, outcome in session.execute(statement).all()
             ]
+
+    def bot_dispatch_facts_many(
+        self,
+        coordinates: Sequence[Coordinate],
+        *,
+        since: datetime | None,
+        now_utc: datetime | None = None,
+    ) -> dict[Coordinate, list[DispatchFact]]:
+        """一次读取多个 bot 目标的本轮派遣事实。
+
+        调度台算军力候选池时会看数千个 bot；逐坐标调用
+        :meth:`bot_dispatch_facts` 会变成数千条 SQLite 查询。这里沿用完全相同的
+        过滤与排序口径，但只扫一次实际存在的 bot 攻击派遣，再在内存中按坐标
+        分桶。刻意不把坐标列表展开成 SQL ``IN``：SQLite 的绑定变量上限会让几千
+        个目标在生产库直接报错，而攻击派遣行数远少于目标总数。
+        """
+        wanted = set(coordinates)
+        result: dict[Coordinate, list[DispatchFact]] = {coordinate: [] for coordinate in wanted}
+        if not wanted:
+            return result
+        give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
+        with self._session_factory() as session:
+            statement = (
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.BattleReportRow.id,
+                    orm.BattleReportRow.outcome,
+                )
+                .select_from(orm.AttackIntentRow)
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    or_(
+                        orm.BattleReportRow.id.is_not(None),
+                        orm.AttackDispatchRow.dispatched_at_utc > give_up_before,
+                    ),
+                )
+                .order_by(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackDispatchRow.id,
+                )
+            )
+            if since is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+                )
+            for galaxy, system, position, report_id, outcome in session.execute(statement).all():
+                coordinate = Coordinate(galaxy, system, position)
+                if coordinate in wanted:
+                    result[coordinate].append(
+                        DispatchFact(has_report=report_id is not None, outcome=outcome)
+                    )
+        return result
+
+    def attacked_bot_targets_since(self, since: datetime) -> set[Coordinate]:
+        """已被接受的 bot 攻击目标，按真实派出时刻筛选。
+
+        军力攻击的候选池按用户口径在取前 N 名之前排除过去 24 小时已经攻击过的
+        坐标。只认 ``accepted`` 的攻击发：游戏拒绝的派遣没有舰队飞出去，既不该
+        占航线，也不能把目标静默地从一天的候选池里删掉。
+        """
+        since = _require_utc(since, "since")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                )
+                .select_from(orm.AttackIntentRow)
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dispatched_at_utc >= since,
+                )
+                .distinct()
+            ).all()
+        return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
 
     def pirate_progress(
         self,

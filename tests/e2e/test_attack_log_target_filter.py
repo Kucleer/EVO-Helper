@@ -231,7 +231,10 @@ def test_switching_event_kind_keeps_the_chosen_target_range(tmp_path: Path) -> N
 
     body = client.get("/logs", params={"target_start": "2:130", "target_end": "2:140"}).text
 
-    assert "kind=pirate&amp;target_start=2%3A130&amp;target_end=2%3A140" in body
+    # 事件类型改为下拉框；坐标范围仍由同一个 GET 表单带上。
+    assert 'id="log-kind" name="kind"' in body
+    assert 'name="target_start" value="2:130"' in body
+    assert 'name="target_end" value="2:140"' in body
 
 
 def test_the_date_form_carries_the_target_range_along(tmp_path: Path) -> None:

@@ -128,12 +128,11 @@ DEFAULT_PLANET_PAGE_SIZE = 200
 MAX_PLANET_PAGE_SIZE = 1000
 PLANET_PAGE_SIZES = (50, 200, 500, 1000)
 
-#: 类型筛选的中文标签。`all` 不是一种星球，是「不过滤」。
+#: 类型筛选的中文标签。`all` 是所有已识别（非空位）星球。
 PLANET_KIND_LABELS = (
     ("bot", "仅 bot"),
     ("owned", "有主（非 bot）"),
-    ("free", "空位"),
-    ("all", "全部"),
+    ("all", "全部已识别"),
 )
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -645,6 +644,7 @@ def create_app(
         request: Request,
         galaxy: BlankableInt = None,
         kind: str = DEFAULT_PLANET_KIND,
+        owner: str | None = None,
         offset: BlankableInt = 0,
         limit: BlankableInt = DEFAULT_PLANET_PAGE_SIZE,
     ) -> HTMLResponse:
@@ -661,12 +661,21 @@ def create_app(
             max(DEFAULT_PLANET_PAGE_SIZE if limit is None else limit, 1), MAX_PLANET_PAGE_SIZE
         )
         offset = max(offset or 0, 0)
-        page = service.list_planets(galaxy=galaxy, kind=kind, offset=offset, limit=limit)
+        owner_query = owner.strip() if owner and owner.strip() else None
+        page = service.list_planets(
+            galaxy=galaxy,
+            kind=kind,
+            owner_query=owner_query,
+            offset=offset,
+            limit=limit,
+        )
 
         def page_url(new_offset: int) -> str:
             params = {"kind": kind, "limit": limit, "offset": new_offset}
             if galaxy is not None:
                 params["galaxy"] = galaxy
+            if owner_query is not None:
+                params["owner"] = owner_query
             return "/planets?" + urlencode(params)
 
         return templates.TemplateResponse(
@@ -682,6 +691,7 @@ def create_app(
                     galaxy_counts=page.galaxy_counts,
                     galaxy=galaxy,
                     kind=kind,
+                    owner_query=owner_query,
                 ),
                 "all_galaxies": list(range(1, TOTAL_GALAXIES + 1)),
                 "kind_labels": PLANET_KIND_LABELS,
@@ -980,6 +990,7 @@ def _config_freeze_out(freeze: ConfigFreezeView) -> ConfigFreezeOut:
     return ConfigFreezeOut(
         frozen_at_utc=freeze.frozen_at_utc,
         tasks=[_frozen_task_out(task) for task in freeze.tasks],
+        military_tiers_label=freeze.military_tiers_label,
         changes=list(freeze.changes),
     )
 

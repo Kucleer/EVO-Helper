@@ -222,6 +222,31 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 
 .panel.compact { padding: 10px 12px; }
 
+/* 任务页顶部的两个操作区只在需要时露出说明；把常驻说明折进提示图标，
+   让任务表尽量留在首屏。 */
+.missions-control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.missions-control-grid.single { grid-template-columns: minmax(0, 1fr); }
+.missions-control-grid .panel { margin: 0; }
+.missions-control-head { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
+.missions-control-head h2 { margin: 0; }
+.tips {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: help;
+}
+.tips:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .visually-hidden {
   position: absolute;
   width: 1px; height: 1px;
@@ -325,6 +350,13 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
 #mission-rows tr { cursor: default; }
 #mission-rows tr[draggable="true"] { cursor: grab; }
 #mission-rows tr[draggable="true"]:active { cursor: grabbing; }
+.mission-dispatch { min-width: 245px; }
+.military-toggle { display: block; margin-top: 5px; }
+.military-dispatch { margin-top: 2px; }
+
+@media (max-width: 1100px) {
+  .missions-control-grid { grid-template-columns: minmax(0, 1fr); }
+}
 
 .drag-handle { color: var(--text-faint); font-size: 15px; user-select: none; }
 

@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange
+from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -82,10 +83,12 @@ class PlanPatchView:
     ranges: tuple[ScanRangeView, ...] | None = None
 
 
-#: 星球列表的筛选类型。`all` 不是一种星球，是「不过滤」。
-PLANET_KINDS: tuple[str, ...] = ("bot", "owned", "free", "all")
+#: 星球列表只统计有信息价值的已识别星球。空位是扫描过程的事实，仍留在扫描
+#: 记录中，但不属于可攻击/可管理的星球清单，也不能把总数冲成几千。
+#: `all` 是「bot + 有主」，不是数据库中的所有坐标。
+PLANET_KINDS: tuple[str, ...] = ("bot", "owned", "all")
 
-#: 默认只看 bot：全量扫描里绝大多数坐标是空位，默认全展开没有信息量。
+#: 默认只看 bot。
 DEFAULT_PLANET_KIND = "bot"
 
 
@@ -125,7 +128,7 @@ class PlanetPage:
     limit: int
     #: 当前银河系筛选下各类型各多少，用来标注筛选器而不必再查一次。
     kind_counts: dict[str, int]
-    #: 每个银河系已扫过多少颗星球，用来填银河系下拉框。
+    #: 每个银河系已识别多少颗非空位星球，用来填银河系下拉框。
     galaxy_counts: dict[int, int]
 
     @property
@@ -223,6 +226,9 @@ class AttackLogView:
     #: 还在飞、或者战报还没收，三个都是 None——**不能拿 0 顶替**，
     #: 「零损失」和「还不知道」在日志上必须看得出区别。
     outcome: str | None = None
+    #: 是否已匹配到一份战报。与 `outcome` 分开，避免 OCR 没读出胜负时页面误称
+    #: 为「待战报」。
+    report_received: bool = False
     attacker_losses: int | None = None
     defender_losses: int | None = None
     #: 这一发是侦察还是攻击（`domain.records.MISSION_KIND_*`）。没派出去的意图
@@ -392,7 +398,7 @@ class FrozenTaskView:
     label: str
     enabled: bool
     priority: int
-    params: dict[str, int]
+    params: dict[str, Any]
     #: 参数的人话回显，**只从固化的那份参数算**，不查库：
     #: 「半径 8」「2:100 – 2:200」。查库算出来的是今天的库，不是当时的。
     summary: str
@@ -408,6 +414,8 @@ class ConfigFreezeView:
 
     frozen_at_utc: datetime
     tasks: tuple[FrozenTaskView, ...]
+    #: 统一军力档位也属于本轮配置；旧记录没有时为空。
+    military_tiers_label: str
     #: 与**上一次「开始」**相比改了什么，每条一句人话。空元组表示没改过；
     #: 头一条记录是 `("首次记录",)`——「没改过」和「没得比」不是一回事。
     changes: tuple[str, ...]
@@ -502,7 +510,13 @@ class ApplicationService(Protocol):
     def list_scans(self, limit: int = 500) -> list[CoordinateScanView]: ...
     def count_scans(self) -> int: ...
     def list_planets(
-        self, *, galaxy: int | None, kind: str, offset: int, limit: int
+        self,
+        *,
+        galaxy: int | None,
+        kind: str,
+        owner_query: str | None = None,
+        offset: int,
+        limit: int,
     ) -> PlanetPage: ...
     def get_history(self, coordinate: Coordinate) -> list[FleetSnapshotView]: ...
     def get_fleet_diff(self, coordinate: Coordinate) -> FleetDiffView | None: ...
@@ -673,10 +687,22 @@ class FakeApplicationService:
         with self._lock:
             return len(self._scans)
 
-    def list_planets(self, *, galaxy: int | None, kind: str, offset: int, limit: int) -> PlanetPage:
+    def list_planets(
+        self,
+        *,
+        galaxy: int | None,
+        kind: str,
+        owner_query: str | None = None,
+        offset: int,
+        limit: int,
+    ) -> PlanetPage:
         with self._lock:
             planets = sorted(
-                self._planets,
+                (
+                    row
+                    for row in self._planets
+                    if row.kind != "free" and row.coordinate.position not in PIRATE_POSITIONS
+                ),
                 key=lambda r: (r.coordinate.galaxy, r.coordinate.system, r.coordinate.position),
             )
         galaxy_counts: dict[int, int] = {}
@@ -687,7 +713,13 @@ class FakeApplicationService:
         for row in in_galaxy:
             kind_counts[row.kind] += 1
         kind_counts["all"] = len(in_galaxy)
-        matched = [r for r in in_galaxy if kind == "all" or r.kind == kind]
+        query = (owner_query or "").strip().casefold()
+        matched = [
+            row
+            for row in in_galaxy
+            if (kind == "all" or row.kind == kind)
+            and (not query or query in (row.owner_name or "").casefold())
+        ]
         return PlanetPage(
             rows=tuple(matched[offset : offset + limit]),
             total=len(matched),

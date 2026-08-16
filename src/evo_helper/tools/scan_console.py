@@ -34,7 +34,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Protocol, cast
@@ -227,6 +227,9 @@ class SchedulerClient:
     token: str
     opener: Opener = _urlopen
     timeout_s: float = REQUEST_TIMEOUT_S
+    # 当前轮询器只有一个工作线程；这把锁仍留在客户端边界上，防止以后从快捷键或
+    # 其他窗口直接复用同一客户端时把慢的 GET 与下一次轮询 / POST 叠起来。
+    _request_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def fetch(self) -> SchedulerSnapshot | None:
         """要一份状态。任何拿不到、看不懂的情况都返回 None（= 这一轮没答案）。
@@ -255,12 +258,15 @@ class SchedulerClient:
         return CommandResult.OK
 
     def _call(self, method: str, path: str) -> bytes:
-        request = Request(f"{self.base_url}{path}", method=method)  # noqa: S310 - 地址本模块拼
-        # 悬浮窗是本机进程、不是浏览器，**没有 Origin 可言**，所以写请求只能走
-        # 令牌那条路。令牌与服务端同源同解（`web.security.default_local_token`），
-        # 两边各读一次同一个环境变量，不需要任何握手。
-        request.add_header("X-Evo-Helper-Token", self.token)
-        return self.opener(request, self.timeout_s)
+        # 必须等上一条请求返回，才允许下一次轮询或快捷键请求出发。否则服务端即使
+        # 已经超时，旧的同步查询仍会继续占 SQLite 连接，叠加的轮询只会放大拥堵。
+        with self._request_lock:
+            request = Request(f"{self.base_url}{path}", method=method)  # noqa: S310 - 地址本模块拼
+            # 悬浮窗是本机进程、不是浏览器，**没有 Origin 可言**，所以写请求只能走
+            # 令牌那条路。令牌与服务端同源同解（`web.security.default_local_token`），
+            # 两边各读一次同一个环境变量，不需要任何握手。
+            request.add_header("X-Evo-Helper-Token", self.token)
+            return self.opener(request, self.timeout_s)
 
 
 # -- 后台轮询 ------------------------------------------------------------------

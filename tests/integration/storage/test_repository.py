@@ -356,6 +356,40 @@ def test_save_ranking_targets_rejects_naive_timestamp(repository) -> None:
         )
 
 
+def test_pirate_positions_are_never_saved_or_left_as_bot_candidates(
+    repository, session_factory
+) -> None:
+    moment = datetime(2026, 8, 14, 1, 0, tzinfo=UTC)
+    repository.save_ranking_targets(
+        (
+            RankingTarget(Coordinate(2, 137, 1), 29.59, moment),
+            RankingTarget(Coordinate(2, 137, 5), 28.5, moment),
+        )
+    )
+    with session_factory() as session:
+        session.add(
+            BotTargetRow(
+                galaxy=2,
+                system=138,
+                position=2,
+                is_bot=True,
+                source="ranking",
+                military_score=27.0,
+                military_score_at_utc=moment,
+            )
+        )
+        session.commit()
+
+    assert repository.clear_pirate_position_bot_candidates() == 1
+
+    with session_factory() as session:
+        rows = session.scalars(select(BotTargetRow).order_by(BotTargetRow.position)).all()
+    assert [(row.position, row.is_bot, row.military_score) for row in rows] == [
+        (2, False, None),
+        (5, True, 28.5),
+    ]
+
+
 def test_duplicate_attack_intent_rejected_but_forced_revisit_allowed(
     session_factory,
     repository,

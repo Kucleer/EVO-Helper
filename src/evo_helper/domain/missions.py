@@ -93,17 +93,25 @@ def scan_command() -> list[str]:
     return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.scan_coordinates"])
 
 
-def ranking_command() -> list[str]:
+def ranking_command(*, bot_limit: int | None = None) -> list[str]:
     """军力榜采集命令行。**不吃参数，也没有 `--attack`。**
 
     这条链路只导航、只读、只入库——`LiveDriver()` 用默认的 `allow_actions=False`，
     结构上就没有派舰队的能力。列边界之类的都已经实机标定进 `game.ranking_ui`，
     命令行上留的覆盖参数是给调试用的，正常跑不传。
 
+    ``bot_limit`` 是军力攻击批次所需的榜单目标数。传入时采够这一批就收工，
+    让调度器立即转去攻击，而不是继续把整张榜翻完。
+
     它和 `scan_command` 同属**填空隙**那一档（`domain.scheduler.GAP_FILLERS`）：
     不占航线、没有完成态、排最后、攻击到点了随时可以把它抢占掉。
     """
-    return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.ranking_scan"])
+    command = [_PYTHON, "-u", "-m", "evo_helper.tools.ranking_scan"]
+    if bot_limit is not None:
+        if bot_limit < 1:
+            raise MissionParamError("军力榜采集数量必须至少为 1")
+        command.extend(["--bot-limit", str(bot_limit)])
+    return _checked(command)
 
 
 def pirate_command(systems: Sequence[tuple[int, int]], *, origin: Coordinate) -> list[str]:
@@ -131,6 +139,7 @@ def bot_command(
     *,
     origin: Coordinate,
     presets: Mapping[Coordinate, str] | None = None,
+    max_dispatches: int | None = None,
 ) -> list[str]:
     """bot 攻击命令行。
 
@@ -157,10 +166,17 @@ def bot_command(
         else f"{item.galaxy}:{item.system}:{item.position}"
         for item in targets
     ]
-    return _checked(
-        [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed]
-        + ["--origin", str(origin), "--attack"]
-    )
+    command = [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed] + [
+        "--origin",
+        str(origin),
+    ]
+    if max_dispatches is not None:
+        if max_dispatches < 1:
+            raise MissionParamError("空闲航线不足，暂不启动 bot 攻击")
+        command += ["--max-dispatches", str(max_dispatches)]
+    # `--attack` 历来在末尾；保留这一约定，既让运行台账可直接肉眼识别，也不破坏
+    # 依赖该稳定 argv 形状的现有调用方。
+    return _checked(command + ["--attack"])
 
 
 def _checked(command: list[str]) -> list[str]:
