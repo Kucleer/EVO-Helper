@@ -8,12 +8,7 @@ from fastapi import APIRouter, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.ranking import RankingRow, coordinate_of, is_bot_coordinate
-
-# 故意不从 `domain.ranking` 取 `PIRATE_POSITIONS`：那边只是为了自己用而转手 import，
-# 没有再导出，strict mypy 的 `no_implicit_reexport` 会拒绝。直接从定义它的模块取。
-# 同一条成例写在 `domain/missions.py` 的 import 段里。
-from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
+from evo_helper.domain.ranking import RankingRow, coordinate_of
 from evo_helper.storage.military_rankings import MilitaryRankingRepository
 
 
@@ -62,33 +57,36 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
         return {"snapshot_id": str(snapshot_id)}
 
     @router.get("")
-    async def latest(
+    async def board(
         rank_min: int | None = Query(default=None, ge=1),
         rank_max: int | None = Query(default=None, ge=1),
         score_min: float | None = Query(default=None, ge=0),
         score_max: float | None = Query(default=None, ge=0),
         galaxy: int | None = Query(default=None, ge=1, le=9),
-        bot_only: bool = False,
-        kind: str = Query(default="all", pattern="^(all|bot|pirate|player)$"),
         q: str | None = None,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict[str, object]:
-        page = repository.latest(
+        """当前军力榜。**读 `bot_targets`，不读快照表。**
+
+        快照表没有活着的写入方，页面读它等于永远显示迁移播种时那一份（详见
+        `storage.military_rankings` 的模块头）。这里读的是扫描逐屏写进去的实时数据，
+        每行自带自己的读取时刻。
+
+        没有 `kind` / `bot_only` 参数：这张榜按构造只可能有 bot。
+        """
+        page = repository.live_board(
             rank_min=rank_min,
             rank_max=rank_max,
             score_min=score_min,
             score_max=score_max,
             galaxy=galaxy,
-            bot_only=bot_only,
-            kind=kind,
             query=q,
             offset=offset,
             limit=limit,
         )
         return {
-            "snapshot_id": None if page.snapshot_id is None else str(page.snapshot_id),
-            "captured_at_utc": page.captured_at_utc,
+            "refreshed_at_utc": page.refreshed_at_utc,
             "total": page.total,
             "rows": [
                 {
@@ -97,18 +95,10 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
                     "score": row.score,
                     # 行级的「这条数据是什么时候读到的」。页面上按 UTC+8 显示。
                     "observed_at_utc": row.observed_at_utc,
-                    "coordinate": None if row.coordinate is None else str(row.coordinate),
-                    "is_bot": is_bot_coordinate(row.coordinate),
-                    "kind": (
-                        "bot"
-                        if is_bot_coordinate(row.coordinate)
-                        else "pirate"
-                        if (
-                            row.coordinate is not None
-                            and row.coordinate.position in PIRATE_POSITIONS
-                        )
-                        else "player"
-                    ),
+                    "coordinate": str(row.coordinate),
+                    # 插值补出来的军力值必须标出来，不能和实读的长得一样。
+                    "estimated": row.estimated,
+                    "source": row.source,
                 }
                 for row in page.rows
             ],

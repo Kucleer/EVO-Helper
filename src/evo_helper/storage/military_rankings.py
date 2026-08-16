@@ -1,12 +1,31 @@
-"""Persistence and latest-snapshot filtering for military ranking rows."""
+"""军力榜的读写。
+
+## 两个数据源，用途不同
+
+| | `military_ranking_*`（快照） | `bot_targets`（实时） |
+|---|---|---|
+| 谁写 | 只有 `POST /api/military-rankings/snapshots` | `ranking_scan` 每读一屏就写 |
+| 页面读哪个 | ~~曾经是它~~ | **现在是它** |
+
+⚠️ **`/rankings` 页面曾经读快照表，而那张表没有活着的写入方。** 2026-08-16 查明：
+`ranking_scan.persist()` 写的是 `bot_targets`（`save_ranking_targets`），全仓没有任何
+代码调用过那个 POST 接口，所以库里唯一那份快照是迁移 `fa1c3d4e5f67` 从
+`bot_targets` 播种出来的——页面自那一刻起就**再没变过**，而扫描一直在正常采数。
+现象是「榜单看起来有数据、但永远是老的」，比整页报错难发现得多。
+
+于是页面改读 `bot_targets`：那里每一行本来就带着自己的 `military_score_at_utc`，
+正是用户要的「每条数据的更新时间」，而且是**逐屏**的真实读取时刻，不是整趟一个值。
+快照表保留给 POST 接口当历史归档，不再是页面的数据源。
+"""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
@@ -15,6 +34,9 @@ from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 
 from . import models as orm
 
+#: 搜索框里能写成坐标的两种形状：`bot_2_137_5` 与 `2:137:5`，允许只给到恒星系。
+_COORDINATE_QUERY_RE = re.compile(r"^(?:bot[_\s]+)?(\d+)[:_\s]+(\d+)(?:[:_\s]+(\d+))?$", re.I)
+
 
 @dataclass(frozen=True)
 class MilitaryRankingPage:
@@ -22,6 +44,31 @@ class MilitaryRankingPage:
     captured_at_utc: datetime | None
     rows: tuple[RankingRow, ...]
     total: int
+
+
+@dataclass(frozen=True)
+class MilitaryBoardRow:
+    """榜单上的一行，来自 `bot_targets` 的实时状态。"""
+
+    rank: int | None
+    name: str
+    score: float
+    coordinate: Coordinate
+    #: **这一行是什么时候读到的。** 逐屏采集，所以同一榜上不同行的时刻可以差一小时。
+    observed_at_utc: datetime | None
+    #: 军力值是插值补出来的，不是实读。页面必须把它标出来——这个仓库有一条硬规矩：
+    #: 猜出来的数不许长得像量出来的。
+    estimated: bool
+    #: `scan` = 坐标扫描核验过；`ranking` = 只从榜单名字反解，可能是合法但错误的 OCR。
+    source: str
+
+
+@dataclass(frozen=True)
+class MilitaryBoardPage:
+    rows: tuple[MilitaryBoardRow, ...]
+    total: int
+    #: 整张榜最近一次采到数据的时刻（不受筛选影响），给页面顶部那句话用。
+    refreshed_at_utc: datetime | None
 
 
 class MilitaryRankingRepository:
@@ -178,6 +225,128 @@ class MilitaryRankingRepository:
             ),
             len(rows),
         )
+
+    def live_board(
+        self,
+        *,
+        rank_min: int | None = None,
+        rank_max: int | None = None,
+        score_min: float | None = None,
+        score_max: float | None = None,
+        galaxy: int | None = None,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> MilitaryBoardPage:
+        """从 `bot_targets` 读当前榜单。**在 SQL 里筛、在 SQL 里数、在 SQL 里翻页。**
+
+        没有 `kind` 参数，因为这张榜按构造只可能有 bot：`ranking_scan` 写库前先过
+        `is_bot_coordinate`，海盗（1--4 位）和真人（名字反解不出坐标）根本进不来。
+        2026-08-16 实测 1,721 条有军力值的行里，`is_bot=false` 0 条、海盗位 0 条。
+        留一个永远返回空集的下拉框只会让人以为筛坏了。
+
+        `rank_min` / `rank_max` 走 `military_rank`，而**那一列大多是空的**（实测
+        1,721 行里只有 140 行有名次）——榜单名次只在少数几趟里读全过。用它筛会把
+        绝大多数行滤掉，这是数据现状，不是 bug。
+        """
+        with self._session_factory() as session:
+            base = select(orm.BotTargetRow).where(
+                orm.BotTargetRow.military_score.is_not(None),
+                orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+            )
+            filtered = self._narrow_board(
+                base,
+                rank_min=rank_min,
+                rank_max=rank_max,
+                score_min=score_min,
+                score_max=score_max,
+                galaxy=galaxy,
+                query=query,
+            )
+            total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
+            rows = session.scalars(
+                filtered.order_by(
+                    orm.BotTargetRow.military_score.desc(),
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                )
+                .offset(max(offset, 0))
+                .limit(limit)
+            ).all()
+            # 顶部那句「数据更新时间」说的是整张榜最近一次采集，所以不带筛选条件。
+            refreshed = session.scalar(
+                select(func.max(orm.BotTargetRow.military_score_at_utc)).where(
+                    orm.BotTargetRow.military_score.is_not(None),
+                    orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+                )
+            )
+        return MilitaryBoardPage(
+            rows=tuple(
+                MilitaryBoardRow(
+                    rank=row.military_rank,
+                    # ⚠️ **名称从坐标推，不读 `latest_owner_name`。** 那一列是坐标扫描
+                    # OCR 出来的，实测存在错读：库里 2:3:9 这一行的名字存成了
+                    # `bot_2_3_3`。坐标是这一行经过核验的身份，名字不是。
+                    name=f"bot_{row.galaxy}_{row.system}_{row.position}",
+                    score=float(row.military_score or 0.0),
+                    coordinate=Coordinate(row.galaxy, row.system, row.position),
+                    observed_at_utc=row.military_score_at_utc,
+                    estimated=bool(row.military_score_estimated),
+                    source=row.source,
+                )
+                for row in rows
+            ),
+            total=total,
+            refreshed_at_utc=refreshed,
+        )
+
+    @staticmethod
+    def _narrow_board(
+        statement: Select[tuple[orm.BotTargetRow]],
+        *,
+        rank_min: int | None,
+        rank_max: int | None,
+        score_min: float | None,
+        score_max: float | None,
+        galaxy: int | None,
+        query: str | None,
+    ) -> Select[tuple[orm.BotTargetRow]]:
+        if rank_min is not None:
+            statement = statement.where(orm.BotTargetRow.military_rank >= rank_min)
+        if rank_max is not None:
+            statement = statement.where(orm.BotTargetRow.military_rank <= rank_max)
+        if score_min is not None:
+            statement = statement.where(orm.BotTargetRow.military_score >= score_min)
+        if score_max is not None:
+            statement = statement.where(orm.BotTargetRow.military_score <= score_max)
+        if galaxy is not None:
+            statement = statement.where(orm.BotTargetRow.galaxy == galaxy)
+        return _narrow_by_query(statement, query)
+
+
+def _narrow_by_query(
+    statement: Select[tuple[orm.BotTargetRow]], query: str | None
+) -> Select[tuple[orm.BotTargetRow]]:
+    """搜索框：先当坐标解，解不出再按名字模糊匹配。
+
+    名称是从坐标推出来的（见 `live_board`），库里没有这一列可供 `LIKE`，所以
+    `bot_2_137_5` 这种输入必须走坐标解析才找得到——这也正是搜索框最常见的用法。
+    允许只给到恒星系（`2:137`），那时不限位号。
+    """
+    text = (query or "").strip()
+    if not text:
+        return statement
+    match = _COORDINATE_QUERY_RE.match(text)
+    if match is None:
+        return statement.where(orm.BotTargetRow.latest_owner_name.ilike(f"%{text}%"))
+    galaxy, system, position = match.groups()
+    statement = statement.where(
+        orm.BotTargetRow.galaxy == int(galaxy), orm.BotTargetRow.system == int(system)
+    )
+    if position is not None:
+        statement = statement.where(orm.BotTargetRow.position == int(position))
+    return statement
 
 
 def _required_coordinate_part(value: int | None) -> int:
