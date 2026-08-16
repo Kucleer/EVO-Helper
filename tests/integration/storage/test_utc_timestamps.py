@@ -60,6 +60,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "mission_tasks.updated_at_utc",
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
+        "military_ranking_entries.observed_at_utc",
         "military_ranking_snapshots.captured_at_utc",
         "run_instances.created_at_utc",
         "run_instances.drained_at_utc",
@@ -85,6 +86,7 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",
+        "military_ranking_entries.observed_at_utc",
     }
 )
 

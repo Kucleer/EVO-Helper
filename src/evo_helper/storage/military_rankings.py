@@ -42,6 +42,19 @@ class MilitaryRankingRepository:
 
         丢在入库口而不是在页面上过滤：过滤只是眼不见，下一次扫描又会写回来。
         真人行（坐标反解不出来、`coordinate is None`）不受影响——这里只挡海盗位。
+
+        ## 每行自己的读取时刻
+
+        用户口径（2026-08-16）：「军力榜我需要的是每条数据的更新时间」。所以
+        `RankingRow.observed_at_utc` 会**逐行**写进 `observed_at_utc` 列；调用方
+        没给的行回落到本次快照的 `captured_at_utc`。
+
+        ⚠️ **回落用的是快照时刻，不是 `datetime.now()`。** 那个字段要回答的是
+        「这个军力值是什么时候读到的」，而不是「这批行是什么时候插进库的」。
+        入库可能发生在读完之后很久（补录、离线导入、重放一份历史 payload），
+        写 `now()` 会让一条三天前读到的数据显示成刚刚更新——恰好把这个字段
+        存在的意义反过来。回落到快照时刻至少仍是一个真实的读取时刻，只是精度
+        退到整趟而已。
         """
         if captured_at_utc.tzinfo is None:
             raise ValueError("captured_at_utc must be timezone-aware")
@@ -62,6 +75,9 @@ class MilitaryRankingRepository:
             session.flush()
             for ordinal, row in enumerate(rows):
                 coordinate = row.coordinate
+                observed_at = row.observed_at_utc or captured_at_utc
+                if observed_at.tzinfo is None:
+                    raise ValueError("observed_at_utc must be timezone-aware")
                 session.add(
                     orm.MilitaryRankingEntryRow(
                         snapshot_id=snapshot_id,
@@ -72,6 +88,7 @@ class MilitaryRankingRepository:
                         galaxy=None if coordinate is None else coordinate.galaxy,
                         system=None if coordinate is None else coordinate.system,
                         position=None if coordinate is None else coordinate.position,
+                        observed_at_utc=observed_at,
                     )
                 )
             session.commit()
@@ -155,6 +172,7 @@ class MilitaryRankingRepository:
                             _required_coordinate_part(row.position),
                         )
                     ),
+                    observed_at_utc=row.observed_at_utc,
                 )
                 for row in rows[offset : offset + limit]
             ),

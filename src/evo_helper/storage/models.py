@@ -435,6 +435,18 @@ class MilitaryRankingEntryRow(Base):
     galaxy: Mapped[int | None] = mapped_column(Integer, nullable=True)
     system: Mapped[int | None] = mapped_column(Integer, nullable=True)
     position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: **这一行是什么时候读到的**，行级而不是快照级。用户口径（2026-08-16）：
+    #: 「军力榜我需要的是每条数据的更新时间」。
+    #:
+    #: 快照的 `captured_at_utc` 回答不了这个问题：一趟读榜要滚几十屏，逐屏之间
+    #: 差得开，而快照只有一个时刻。写入口在为空时回落到快照时刻（见
+    #: `military_rankings.append_snapshot`），所以这一列**永远非空**——
+    #: 页面上不必再处理「这行没有时间」这种状态。
+    #:
+    #: ⚠️ **故意不建索引。** 现在没有任何查询按它筛或排（`latest()` 先锁定
+    #: 快照、再按 `rank`/`ordinal` 排），而这张表是一次写入上千行的追加表，
+    #: 白建的索引只是往每次入库上加成本。真要按时间查历史时再补。
+    observed_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
 class MissionTaskRow(Base):

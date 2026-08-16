@@ -21,6 +21,11 @@ class RankingEntryIn(BaseModel):
     rank: int | None = Field(default=None, ge=1)
     name: str = Field(min_length=1, max_length=128)
     score: float | None = Field(default=None, ge=0)
+    #: 这一行**是什么时候读到的**。逐屏采集的调用方应当逐行给出自己那一屏的
+    #: 截屏时刻；不给则回落到整个快照的 `captured_at_utc`（见
+    #: `storage.military_rankings.append_snapshot`）。留成可选是为了不废掉
+    #: 已有的「整榜一次 POST」用法。
+    observed_at_utc: datetime | None = None
 
 
 class RankingSnapshotIn(BaseModel):
@@ -36,9 +41,20 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
     async def append_snapshot(payload: RankingSnapshotIn) -> dict[str, str]:
         if payload.captured_at_utc.tzinfo is None:
             raise ValueError("captured_at_utc must include a timezone")
+        for row in payload.rows:
+            if row.observed_at_utc is not None and row.observed_at_utc.tzinfo is None:
+                raise ValueError("observed_at_utc must include a timezone")
         snapshot_id = repository.append_snapshot(
             [
-                RankingRow(row.rank, row.name, row.score, coordinate_of(row.name))
+                RankingRow(
+                    row.rank,
+                    row.name,
+                    row.score,
+                    coordinate_of(row.name),
+                    observed_at_utc=(
+                        None if row.observed_at_utc is None else row.observed_at_utc.astimezone(UTC)
+                    ),
+                )
                 for row in payload.rows
             ],
             captured_at_utc=payload.captured_at_utc.astimezone(UTC),
@@ -79,6 +95,8 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
                     "rank": row.rank,
                     "name": row.name,
                     "score": row.score,
+                    # 行级的「这条数据是什么时候读到的」。页面上按 UTC+8 显示。
+                    "observed_at_utc": row.observed_at_utc,
                     "coordinate": None if row.coordinate is None else str(row.coordinate),
                     "is_bot": is_bot_coordinate(row.coordinate),
                     "kind": (
