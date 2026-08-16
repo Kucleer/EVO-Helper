@@ -26,7 +26,14 @@ Run the persistent local management service after installing dependencies:
 evo-web
 ```
 
-Startup applies the bundled SQLite migrations and binds only to `127.0.0.1`.
+Startup applies the bundled migrations to whatever `EVO_HELPER_DATABASE_URL` points at —
+SQLite by default, PostgreSQL in the live deployment (install the `db` extra for the driver;
+see [`docs/部署到挂机机器.md`](docs/部署到挂机机器.md)).
+
+The service binds `0.0.0.0:8770` by default so other devices on the LAN can open the console —
+a deliberate choice, and the reason it is only fit for a trusted network. Set
+`EVO_HELPER_HOST=127.0.0.1` to keep it on this machine, and set `EVO_HELPER_WEB_TOKEN`
+before letting another machine drive it.
 
 ### Planet reconnaissance email alerts
 
@@ -41,5 +48,4 @@ To enable one-shot SMTP notification, copy the commented values from
 never the web-login password. If SMTP is not configured, alerts are still saved
 locally and marked `NOT_CONFIGURED`; they are not retried automatically.
 
-The future web service must bind only to `127.0.0.1`. Opening the UI never starts a run; each run
-requires an explicit, idempotent user action.
+Opening the UI never starts a run; each run requires an explicit, idempotent user action.

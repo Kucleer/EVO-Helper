@@ -1,5 +1,14 @@
 # 从 SQLite 换到 Postgres：完整方案
 
+> **状态：已执行完（2026-08-16）。** 目标库 PostgreSQL 18.6 跑在个人机上，
+> `alembic_version` = `fa1c3d4e5f67`，与 SQLite 源库、与代码里的 head 三者一致；
+> 26 张表 **18,848 行**逐表核对行数一致（`tools/migrate_sqlite_to_pg.py --verify-only`）。
+> 源库 `var/evo-helper.db` 与切换前的快照 `var/evo-helper.before-pg-20260816-2024.db`
+> 都留着，回退就是把 `EVO_HELPER_DATABASE_URL` 改回去。
+>
+> 下面保留原方案全文（判断依据仍然有效），执行中与原计划不一致的地方标了「实际」。
+> 装机步骤看 [`部署到挂机机器.md`](部署到挂机机器.md)，这份只讲迁移本身。
+
 **场景**（用户 2026-08-11）：两台机器。工作机有 AI 工具、做开发调试、不能 24 小时开；
 个人机常开、用来挂机、但缺环境。目标是个人机跑实机，工作机随时看到实时数据。
 
@@ -70,14 +79,14 @@ naive 列配 naive 绑定前后自洽。我说的「读出来变成 naive」不�
 ### 0. 前置：个人机装环境（与 Postgres 无关，先做）
 
 ```
-uv sync --extra vision --extra live
+uv sync --extra vision --extra live --extra db --extra dev
 ```
 
 `uv.lock` 已进版本管理（PR #64），装出来和工作机一致。另外三处按机器改，都有环境变量：
 
 - `EVO_HELPER_TESSERACT_PATH`
 - `EVO_HELPER_CHROME_PATH`
-- 页面 DPR（见 `config.py`）
+- `EVO_HELPER_DEVICE_SCALE_FACTOR`（页面 DPR，见 `config.py`；**不是** `EVO_HELPER_DPR`）
 
 ### 1. 加驱动依赖
 
@@ -88,6 +97,11 @@ db = ["psycopg[binary]>=3.2,<4"]
 ```
 
 单开一组而不是塞进主依赖：工作机不挂机时不需要它，CI 也不需要。
+
+**实际**：切库那天（2026-08-16）psycopg 只是手动 `pip install` 进了 venv，
+这一组**没加**、也就没进 `uv.lock`——库连得上，但下一次 `uv sync` 就会把驱动卸掉，
+而症状是控制台起不来。已补上（`pyproject.toml` 的 `db` 组 + `uv lock`）。
+装依赖时**必须**带 `--extra db`，`uv sync` 会卸掉不在参数里的组。
 
 ### 2. 装 Postgres 到**个人机**（那台常开的）
 
@@ -107,9 +121,15 @@ Postgres 只监听那个虚拟网卡。这个项目的控制台默认绑 `0.0.0.
 EVO_HELPER_DATABASE_URL=... .venv/Scripts/python.exe -m alembic upgrade head
 ```
 
-⚠️ **这一步现在会挂。** 迁移 `8c41b9d201ff` 用了 `lower(hex(randomblob(16)))`，
-那是 SQLite 专有函数，Postgres 上不存在。迁库之前必须先处理它——改成方言无关的写法，
-或者给它加一个按方言分支的实现。**这是 PG 迁移眼下唯一已知的硬拦路虎**（PR #104 顺带查出来的）。
+~~⚠️ **这一步现在会挂。**~~ 迁移 `8c41b9d201ff` 用了 `lower(hex(randomblob(16)))`，
+那是 SQLite 专有函数，Postgres 上不存在。**这是 PG 迁移唯一已知的硬拦路虎**
+（PR #104 顺带查出来的）。
+
+**实际（2026-08-16 已修）**：改成按方言分流，PG 走内置的 `gen_random_uuid()`
+（PG 13 起自带，不用装 pgcrypto），SQLite 那支原样保留。
+
+⚠️ 它**空库也过不去**：`randomblob` 在 PG 上是语句解析阶段就报 `UndefinedFunction`，
+轮不到「表是空的、影响 0 行」把它救回来。所以不能指望「反正新库没数据」绕过去。
 
 ⚠️ 从**空库**跑全套迁移，不要从 SQLite 抄结构。迁移里那几处 `batch_alter_table`
 在 Postgres 上照样能跑（它是 SQLite 的补丁，在 PG 上退化成普通 `ALTER`）。
@@ -138,6 +158,30 @@ state_events / ui_observations / artifacts / intel_filters / target_revisits
 
 ⚠️ 搬之前先 `VACUUM INTO` 出一份 SQLite 快照，**对快照搬**，别对正在被写的库搬。
 
+**实际**：脚本落成 [`tools/migrate_sqlite_to_pg.py`](../tools/migrate_sqlite_to_pg.py)。
+与上面这段计划的两处不同，都是执行时发现更稳妥的：
+
+- **表序不手写**，用 `Base.metadata.sorted_tables`（SQLAlchemy 按外键算好的拓扑序）。
+  手写的清单会跟着新表漂——上面那张图就已经缺了 `attack_planets`、
+  `military_ranking_snapshots` / `_entries`、`mission_task_origins`、`planet_scout_alerts`。
+- **走 core 的 `insert(table)` 而不是 ORM 对象**，每一列照样经过它自己那个
+  `TypeDecorator`（`Uuid` / `Boolean` / `UTCDateTime` 的转换全在里面），但不用为
+  每张表找对应的 ORM 类。
+
+另外补了计划里没写、而漏了会在**迁移之后**才发作的一步：**校准自增序列**。
+PG 的 identity 计数器不会因为你插了指定 id 就前进，不 `setval` 的话迁完第一次新增
+就撞主键冲突——那时旧库已经不用了。
+
+用法（`--verify-only` 一个字都不写，只逐表比行数）：
+
+```
+.venv\Scripts\python.exe tools/migrate_sqlite_to_pg.py ^
+    --source sqlite:///var/evo-helper.db ^
+    --target postgresql+psycopg://用户:密码@主机:5432/库名 --verify-only
+```
+
+目标表非空就跳过那张表，所以重跑安全。
+
 ### 5. 验证（缺一不可）
 
 1. **逐表行数一致**
@@ -148,6 +192,18 @@ state_events / ui_observations / artifacts / intel_filters / target_revisits
 4. **控制台起得来**，攻击日志 / 情报中心 / 任务中心三页都能开，数据对得上
 5. **实机跑一轮**只读的（`pirate_loop --systems 2:137`，不带 `--scout --attack`），
    确认开工对账、读战报、写库整条通
+
+**实际（2026-08-16，工作机上核对）**：
+
+| 验证项 | 结果 |
+|---|---|
+| 逐表行数 | 26 张表 **18,848 行**全部一致（`--verify-only`） |
+| `alembic_version` | 两边都是 `fa1c3d4e5f67`，与代码 head 一致 |
+| 时刻抽样 | `attack_dispatches` 最近 5 条，`dispatched_at_utc` 两边**同一时刻同一微秒**；顺带核了 `id`（UUID）与 `accepted`（布尔）也逐个相等 |
+| 列类型 | 31 个 UUID 列是原生 `uuid`（不是文本）、38 个时刻列是 `timestamptz`、11 个布尔列是真布尔（不是 0/1）——正是第一节担心的那三处 |
+| 自增序列 | 7 张整数主键表的序列都已推过当前最大值（不校准的话迁完第一次新增就撞主键） |
+| `pytest tests -q` | 2124 passed |
+| 控制台 / 实机一轮 | **未做**——要在个人机上做，见 `部署到挂机机器.md` 第七节 |
 
 ### 6. 切换与回退
 
