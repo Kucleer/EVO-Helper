@@ -29,8 +29,27 @@ class MilitaryRankingRepository:
         self._session_factory = session_factory
 
     def append_snapshot(self, rows: list[RankingRow], *, captured_at_utc: datetime) -> UUID:
+        """把一次读榜的结果落库。**海盗行在这里就丢掉，不进库。**
+
+        用户口径（2026-08-16）：「军力榜需要删除类型是 pirate 的数据，这是海盗不是
+        bot」。1--4 号位是游戏固定生成的海盗，名字虽然也长成 `bot_7_495_1`，但它
+        不是 bot 攻击的目标——`is_bot_coordinate` 早就把它挡在目标池外，所以它在
+        榜里唯一的作用就是虚增行数、把 `kind` 筛选和「已扫多少 bot」一起算歪。
+
+        ⚠️ **不能靠军力值把它认出来。** 2026-08-16 实测：海盗 100 行 avg 7,581、
+        max 43,260；bot 1,705 行 avg 7,830、max 93,920——两者分布基本重合，海盗
+        既不是榜首也不是异常值。唯一可靠的判据是位号。
+
+        丢在入库口而不是在页面上过滤：过滤只是眼不见，下一次扫描又会写回来。
+        真人行（坐标反解不出来、`coordinate is None`）不受影响——这里只挡海盗位。
+        """
         if captured_at_utc.tzinfo is None:
             raise ValueError("captured_at_utc must be timezone-aware")
+        rows = [
+            row
+            for row in rows
+            if row.coordinate is None or row.coordinate.position not in PIRATE_POSITIONS
+        ]
         snapshot_id = uuid4()
         with self._session_factory() as session:
             session.add(
