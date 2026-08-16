@@ -176,6 +176,10 @@ class MissionTaskOut(BaseModel):
     #: 这两样是不是还跟着全局值走（也就是任务自己没填过）。
     origin_is_default: bool = True
     fleet_lines_is_default: bool = True
+    #: 定时开启 / 定时关闭的时刻，**UTC**（页面自己换算成 UTC+8 显示）。
+    #: 没配就是 None，含义是「这一端不限」。
+    enabled_from_utc: datetime | None = None
+    enabled_until_utc: datetime | None = None
 
 
 class MissionTaskPatch(BaseModel):
@@ -194,6 +198,15 @@ class MissionTaskPatch(BaseModel):
     #: 必须分得开，否则任何一次只改优先级的 PATCH 都会顺手把出发星球抹掉。
     origin: str | None = None
     fleet_lines: int | None = None
+    #: 定时开启 / 定时关闭的时刻，ISO 8601，**必须带时区**（页面送的是
+    #: `…+08:00`，服务端存 UTC）。不带时区的话「几点」这件事就没有答案，
+    #: 服务端替它猜一个只会在 UTC+8 与 UTC 之间差出 8 小时。
+    #:
+    #: **空串是一个动作**：把这一端退回「不限」。它和 `None`（这次不动它）
+    #: 必须分得开，同 `origin`——否则任何一次只改优先级的 PATCH 都会顺手
+    #: 把定时窗口抹掉。两端各有各的空串，清一端不影响另一端。
+    enabled_from: str | None = None
+    enabled_until: str | None = None
 
 
 class MissionTaskCreate(BaseModel):

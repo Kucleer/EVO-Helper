@@ -2175,6 +2175,10 @@ class SqlAlchemyRepository:
         origin: Coordinate | None = None,
         clear_origin: bool = False,
         fleet_lines: int | None = None,
+        enabled_from_utc: datetime | None = None,
+        clear_enabled_from: bool = False,
+        enabled_until_utc: datetime | None = None,
+        clear_enabled_until: bool = False,
     ) -> None:
         """页面上改开关、拖顺序、编参数、改名字、改出发星球与航线数，走这一个入口。
 
@@ -2184,6 +2188,13 @@ class SqlAlchemyRepository:
         `clear_origin=True` 是**把出发星球退回「用全局主星」**这一个动作的专用开关。
         它必须和「这次不动它」分得开：两者都只能写成 `origin=None`，合成一个的话，
         任何一次只改优先级的 PATCH 都会顺手把出发星球抹掉。
+
+        `clear_enabled_from` / `clear_enabled_until` 同理，是「**把这一端退回不限**」
+        的专用开关。定时窗口的两端各要一个：合成一个的话，只清开启时刻会连关闭
+        时刻一起抹掉，而那是一个「本以为到点会停、结果一直跑下去」的错。
+
+        ⚠️ **这里也不许拿定时列去写 `enabled`。** 那一列只由用户那个复选框写；
+        两者是「与」的关系，判据在 `domain.scheduler.within_schedule_window`。
 
         改任何一样都清掉 `disabled_reason`：自动停用是对**旧配置**下的判定，
         用户既然动手改了，就该给它一次重新开始的机会——否则参数填错一次，
@@ -2207,6 +2218,16 @@ class SqlAlchemyRepository:
                 row.origin_galaxy = origin.galaxy
                 row.origin_system = origin.system
                 row.origin_position = origin.position
+            if clear_enabled_from:
+                row.enabled_from_utc = None
+            elif enabled_from_utc is not None:
+                _require_utc(enabled_from_utc, "enabled_from_utc")
+                row.enabled_from_utc = enabled_from_utc
+            if clear_enabled_until:
+                row.enabled_until_utc = None
+            elif enabled_until_utc is not None:
+                _require_utc(enabled_until_utc, "enabled_until_utc")
+                row.enabled_until_utc = enabled_until_utc
             row.disabled_reason = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
