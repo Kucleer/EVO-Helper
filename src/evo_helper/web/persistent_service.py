@@ -69,6 +69,7 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     FrozenTaskView,
+    LineReleaseView,
     MilitaryAttackConfigView,
     MissionOriginView,
     MissionRunView,
@@ -1304,6 +1305,30 @@ class MissionConsoleService:
         self._scheduler.begin_bot_round(task_id)
         self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
+
+    def release_attack_lines(self) -> LineReleaseView:
+        """「清理航线占用」：把此刻还记在库里的航线占用一次放开。
+
+        用户口径 2026-08-16：「时间到了，自然就释放了航线，我会手动 check 后
+        清理。」库里那两个钟都是**推算**（出发时刻 + 读到的飞行时长 × 倍数），
+        真实舰队早就回港了它们也不会自己改口；读不到飞行时间的那一档更是按
+        90 分钟的上界硬占。这个按钮就是把「我刚在游戏里数过」这条观测喂进去。
+
+        **调度器跑着的时候照样让点。** 它不是配置（固化记录里没有这一项），
+        而且这一下最想解的正是「调度器正在运行、任务却卡在等航线」那个局面——
+        拒掉它，用户只剩「结束、清理、再开始」这条路。
+
+        ⚠️ **这一下之后调度器会当真去派舰队。** 页面上那个按钮因此带二次确认，
+        文案里写明会烧燃料；后端不再加一道自己的闸门——真实航线数只有用户
+        看得见，服务端拦不出任何有意义的东西，只会拦掉正当的那一下。
+        （权威闸门仍在 runner 的 `LineCapacityGate`：真撞上限它会看屏认出来。）
+        """
+        now = self._scheduler.now_utc()
+        released = self._repository.release_held_lines(now_utc=now)
+        # 快照缓存里存着「还占着几条」的旧答案，TTL 内不失效的话，用户点完刷新
+        # 看到的还是「等航线」——那会让他再点一次。
+        self._invalidate_scheduler_view()
+        return LineReleaseView(released=released, released_at_utc=now)
 
     # -- 内部 ------------------------------------------------------------------
 

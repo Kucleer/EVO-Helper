@@ -40,6 +40,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.dispatched_at_utc",
         "attack_dispatches.expected_report_at_utc",
         "attack_dispatches.line_free_at_utc",
+        "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
         "battle_reports.reported_at_utc",
@@ -82,8 +83,14 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
 #: 这几张表是在一次性的 b6 迁移**之后**才建的，建表 DDL 本身就已经写了
 #: `DateTime(timezone=True)`。要求那条历史迁移去 alter 一张当时还不存在的表，
 #: 既做不到也会把「迁移清单必须与模型一一对应」这条判据讲错。
+#:
+#: `attack_dispatches.line_released_at_utc` 是同一回事的列版本：表是老的，
+#: 列是 b6 之后加的，由它自己那条迁移（`a9d5f31c0e77`）按方言建成
+#: `TIMESTAMPTZ`。往 b6 的清单里补它，会让那条历史迁移在**已经升过级的**库上
+#: 去 alter 一列当时还不存在的列。
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
+        "attack_dispatches.line_released_at_utc",
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",

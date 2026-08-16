@@ -19,6 +19,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,6 +29,12 @@ from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFre
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import (
+    TARGET_KIND_BOT,
+    AttackDispatch,
+    AttackIntent,
+    FleetPresetRef,
+)
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
@@ -187,6 +194,100 @@ def console(tmp_path: Path) -> Iterator[Console]:
     )
     with TestClient(app, headers={"X-Evo-Helper-Token": TOKEN}) as client:
         yield Console(client, repository, scheduler, launcher, clock, freeze_log, backfill_launcher)
+
+
+# -- 手动清理航线占用 -----------------------------------------------------------
+#
+# 库里的航线占用是**推算**出来的（出发时刻 + 派出时读到的飞行时长 × 倍数），
+# 舰队真回港了它也不会自己改口。用户口径 2026-08-16：「时间到了，自然就释放了
+# 航线，我会手动 check 后清理。」
+
+
+def _seed_inflight(console: Console, *, origin: Coordinate, position: int) -> None:
+    """往库里放一支「还在外面没回来」的舰队。
+
+    走真实的 `save_attack_intent` / `save_dispatch` / `record_flight_time`，
+    不直接拼 ORM 行：航线占用是由这三步共同算出来的，绕开它们等于让这几条用例
+    去验一份自己捏出来的状态。
+    """
+    with console.repository._session_factory() as session:  # noqa: SLF001 - 测试直接落库
+        plan = orm.ScanPlan(name=f"lines-{position}", created_at_utc=NOW)
+        session.add(plan)
+        session.flush()
+        run = orm.RunInstance(
+            plan_id=plan.id,
+            idempotency_key=f"lines-{position}",
+            state="SCANNING",
+            created_at_utc=NOW,
+        )
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    intent_id = uuid4()
+    console.repository.save_attack_intent(
+        AttackIntent(
+            intent_id=intent_id,
+            run_id=run_id,
+            origin=origin,
+            target=Coordinate(2, 137, position),
+            preset=FleetPresetRef(name="AAA", signature="sig"),
+            cycle_start_utc=NOW,
+            created_at_utc=NOW,
+            target_kind=TARGET_KIND_BOT,
+        )
+    )
+    dispatch_id = uuid4()
+    console.repository.save_dispatch(
+        AttackDispatch(
+            dispatch_id=dispatch_id,
+            intent_id=intent_id,
+            dispatched_at_utc=NOW,
+            accepted=True,
+        )
+    )
+    # 攻击发按 2× 算：这一发要到 NOW + 2 小时才自然放手。
+    console.repository.record_flight_time(dispatch_id, timedelta(hours=1), NOW)
+
+
+def test_releasing_the_lines_frees_them_and_says_how_many(console: Console) -> None:
+    """点一下「清理航线占用」，占用真的没了，回执给出放开的条数。
+
+    条数要报出来：这个按钮唯一的可见后果是若干个任务从「等航线」变回「待命」，
+    而那要等下一轮轮询才看得见。中间这段空白里，这个数字是用户判断
+    「点到了没有」的唯一凭据。
+    """
+    home = Coordinate(2, 137, 18)
+    _seed_inflight(console, origin=home, position=71)
+    _seed_inflight(console, origin=home, position=72)
+    assert console.repository.count_inflight(now_utc=NOW, origin=home) == 2
+
+    response = console.client.post("/api/attack-lines/release")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["released"] == 2
+    assert console.repository.count_inflight(now_utc=NOW, origin=home) == 0
+
+
+def test_releasing_the_lines_needs_the_token_or_a_same_origin_request(console: Console) -> None:
+    """**没有凭据的请求必须被拒，而且一条航线都不许放开。**
+
+    这一下的后果是真实舰队出港、烧真实燃料，它绝不该是写接口里唯一敞着的那个。
+
+    断言不止看 403：光看状态码的话，一个「先放手再拒」的实现照样是绿的。
+
+    ⚠️ 这里靠**请求级的错误令牌**盖掉 `console` 那个客户端头上带的正确令牌
+    （httpx 同名头按请求覆盖），同时不带 `Origin`——两条放行路径一起断掉。
+    """
+    home = Coordinate(2, 137, 18)
+    _seed_inflight(console, origin=home, position=73)
+
+    response = console.client.post(
+        "/api/attack-lines/release", headers={"X-Evo-Helper-Token": "wrong-token"}
+    )
+
+    assert response.status_code == 403, response.text
+    assert console.repository.count_inflight(now_utc=NOW, origin=home) == 1
 
 
 # -- 读 -------------------------------------------------------------------------
