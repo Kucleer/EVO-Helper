@@ -1494,6 +1494,73 @@ class SqlAlchemyRepository:
                 for report_id, outcome in session.execute(statement).all()
             ]
 
+    def bot_dispatch_facts_many(
+        self,
+        coordinates: Sequence[Coordinate],
+        *,
+        since: datetime | None,
+        now_utc: datetime | None = None,
+    ) -> dict[Coordinate, list[DispatchFact]]:
+        """一次读取多个 bot 目标的本轮派遣事实。
+
+        调度台算军力候选池时会看数千个 bot；逐坐标调用
+        :meth:`bot_dispatch_facts` 会变成数千条 SQLite 查询。这里沿用完全相同的
+        过滤与排序口径，但只扫一次实际存在的 bot 攻击派遣，再在内存中按坐标
+        分桶。刻意不把坐标列表展开成 SQL ``IN``：SQLite 的绑定变量上限会让几千
+        个目标在生产库直接报错，而攻击派遣行数远少于目标总数。
+        """
+        wanted = set(coordinates)
+        result: dict[Coordinate, list[DispatchFact]] = {coordinate: [] for coordinate in wanted}
+        if not wanted:
+            return result
+        give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
+        with self._session_factory() as session:
+            statement = (
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.BattleReportRow.id,
+                    orm.BattleReportRow.outcome,
+                )
+                .select_from(orm.AttackIntentRow)
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .outerjoin(
+                    orm.BattleReportRow,
+                    orm.BattleReportRow.dispatch_id == orm.AttackDispatchRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    or_(
+                        orm.BattleReportRow.id.is_not(None),
+                        orm.AttackDispatchRow.dispatched_at_utc > give_up_before,
+                    ),
+                )
+                .order_by(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackDispatchRow.id,
+                )
+            )
+            if since is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
+                )
+            for galaxy, system, position, report_id, outcome in session.execute(statement).all():
+                coordinate = Coordinate(galaxy, system, position)
+                if coordinate in wanted:
+                    result[coordinate].append(
+                        DispatchFact(has_report=report_id is not None, outcome=outcome)
+                    )
+        return result
+
     def pirate_progress(
         self,
         *,

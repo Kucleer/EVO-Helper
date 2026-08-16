@@ -251,6 +251,9 @@ class MissionScheduler:
         #:
         #: 可重入锁：`stop()` 与 `tick()` 内部都会再调 `_finish()`。
         self._lock = threading.RLock()
+        # Web 层短缓存用它辨认后台 tick 已经更新状态。它是纯内存值，控制台重启
+        # 时会随调度器对象一同重置。
+        self._view_generation = 0
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -296,6 +299,12 @@ class MissionScheduler:
         `web.persistent_service.MissionConsoleService.patch_mission`。
         """
         return self._enabled or self._supervisor.running is not None
+
+    @property
+    def view_generation(self) -> int:
+        """后台调度状态的内存版本，供只读快照缓存快速判失效。"""
+        with self._lock:
+            return self._view_generation
 
     def config_freezes(self) -> tuple[MissionConfigFreeze, ...]:
         """历次「开始」固化下来的配置，旧的在前。页面上那张历史表读它。"""
@@ -449,8 +458,7 @@ class MissionScheduler:
         下一步据以行动的是同一份事实。
 
         **查库在锁外。** 每 2 秒一次的状态轮询没有任何理由把用户的「结束」堵在
-        后面——一次 `_facts()` 要按 bot 目标逐个问库（实测 0.32 秒），两个客户端
-        一起轮询就够把那把锁占满。锁里只剩几个字段的读取。
+        后面；bot 阶段由仓储批量读取，锁里只剩几个字段的读取。
         """
         tasks = self._repository.mission_tasks()
         config = self._repository.scheduler_config()
@@ -525,19 +533,25 @@ class MissionScheduler:
         用户完全可以在调度器停着的时候点一次补录，而那时也得有人去起它、去收
         它的退出码。
         """
-        with self._lock:
-            self._finish(self._supervisor.poll())
-        # 锁外：收到退出码那一次要量两个 `COUNT(*)` 外加逐个 bot 目标问库。
-        self._backfill.poll(self._measure_backfill)
-        self._advance_backfill()
-        if not self._enabled:
-            return
-        self._cut_off_a_stalled_round()
-        # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
-        # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
-        for _ in range(len(MissionKind)):
-            if not self._step():
+        try:
+            with self._lock:
+                self._finish(self._supervisor.poll())
+            # 锁外：收到退出码那一次要量两个 `COUNT(*)` 外加批量 bot 阶段查询。
+            self._backfill.poll(self._measure_backfill)
+            self._advance_backfill()
+            if not self._enabled:
                 return
+            self._cut_off_a_stalled_round()
+            # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
+            # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
+            for _ in range(len(MissionKind)):
+                if not self._step():
+                    return
+        finally:
+            # `return` 分支也要前进版本：runner 或补录刚结束时，TTL 内的下一次
+            # 读取不能复用它开始前那份快照。
+            with self._lock:
+                self._view_generation += 1
 
     # -- 手动战报补录 ----------------------------------------------------------
     #
@@ -646,11 +660,11 @@ class MissionScheduler:
                 in_range = self._bot_selection(row.params_json, self._origin_of(row))
             except MissionParamError:
                 continue
+            facts_by_target = self._repository.bot_dispatch_facts_many(
+                in_range, since=row.round_started_at_utc, now_utc=now
+            )
             for target in in_range:
-                facts = self._repository.bot_dispatch_facts(
-                    target, since=row.round_started_at_utc, now_utc=now
-                )
-                phases[(row.id, str(target))] = phase_of(facts).name
+                phases[(row.id, str(target))] = phase_of(facts_by_target[target]).name
         return phases
 
     # -- 跑着不动 --------------------------------------------------------------
@@ -1113,11 +1127,11 @@ class MissionScheduler:
         except MissionParamError as exc:
             self._repository.disable_mission_task(task.task_id, str(exc))
             return 0
+        facts_by_target = self._repository.bot_dispatch_facts_many(
+            targets, since=row.round_started_at_utc, now_utc=self._clock()
+        )
         return sum(
-            1
-            for target in targets
-            if phase_of(self._repository.bot_dispatch_facts(target, since=row.round_started_at_utc))
-            is not BotPhase.DONE
+            1 for target in targets if phase_of(facts_by_target[target]) is not BotPhase.DONE
         )
 
     def _bot_targets(self) -> list[Coordinate]:
@@ -1191,15 +1205,16 @@ class MissionScheduler:
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
         """只留下这一轮真正尚需攻击的 bot，防止前 N 打完后池子原地空转。"""
+        targets = self._scored_bot_targets()
+        facts_by_target = self._repository.bot_dispatch_facts_many(
+            [target.coordinate for target in targets],
+            since=row.round_started_at_utc,
+            now_utc=self._clock(),
+        )
         return [
             target
-            for target in self._scored_bot_targets()
-            if phase_of(
-                self._repository.bot_dispatch_facts(
-                    target.coordinate, since=row.round_started_at_utc
-                )
-            )
-            is BotPhase.NEEDS_ATTACK
+            for target in targets
+            if phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
         ]
 
     def _military_origins(self, row: orm.MissionTaskRow) -> tuple[AttackOrigin, ...]:

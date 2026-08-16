@@ -25,6 +25,7 @@ from evo_helper.domain.records import (
 )
 
 TARGET = Coordinate(2, 137, 14)
+OTHER_TARGET = Coordinate(2, 137, 15)
 
 #: 本轮起点。所有测试都拿它当 `since`，和 runner 传的是同一个东西。
 ROUND_START = datetime(2026, 8, 9, tzinfo=UTC)
@@ -212,6 +213,21 @@ def test_a_lost_report_frees_the_target_to_be_attacked_again(repository, run_id)
     assert phase_of(facts) is BotPhase.NEEDS_ATTACK
 
 
+def test_many_dispatch_facts_match_the_single_target_query(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """军力候选池一次量几千个坐标时，批量查询不能改变任一目标的判态口径。"""
+    _intent(repository, run_id, created_at=ROUND_START, target=TARGET)
+    _intent(repository, run_id, created_at=ROUND_START + timedelta(minutes=1), target=OTHER_TARGET)
+
+    batch = repository.bot_dispatch_facts_many(
+        [TARGET, OTHER_TARGET], since=ROUND_START, now_utc=NOW
+    )
+
+    assert batch == {
+        TARGET: repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW),
+        OTHER_TARGET: repository.bot_dispatch_facts(OTHER_TARGET, since=ROUND_START, now_utc=NOW),
+    }
+
+
 # -- 翻信箱要的两个时刻 ------------------------------------------------------
 
 
@@ -295,8 +311,9 @@ def _intent(  # type: ignore[no-untyped-def]
     has_report: bool = False,
     outcome: str | None = None,
     mission_kind: str = MISSION_KIND_ATTACK,
+    target: Coordinate = TARGET,
 ):
-    """一条针对 `TARGET` 的意图 + 它的派遣（+ 可选的战报）。"""
+    """一条针对 ``target`` 的意图 + 它的派遣（+ 可选的战报）。"""
     intent_id = uuid4()
     dispatch_id = uuid4()
     repository.save_attack_intent(
@@ -304,7 +321,7 @@ def _intent(  # type: ignore[no-untyped-def]
             intent_id=intent_id,
             run_id=run_id,
             origin=Coordinate(2, 137, 18),
-            target=TARGET,
+            target=target,
             preset=FleetPresetRef(name=preset, signature="sig"),
             # `save_attack_intent` 按 (target, cycle_start, forced_revisit) 去重，
             # 所以同一个目标的多条意图必须给不同的 cycle_start。

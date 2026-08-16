@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
+from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -83,6 +85,10 @@ from .service import (
     StateEventView,
     planet_kind,
 )
+
+# 页面（2 秒）与悬浮台（1 秒）会同时读取同一份重快照。这个缓存只合并瞬时并发
+# 请求，不把运行状态长期藏起来；写操作会主动失效。
+SCHEDULER_VIEW_TTL_S = 0.75
 
 
 class PersistentApplicationService:
@@ -740,14 +746,82 @@ class MissionConsoleService:
     一回事」——那种错静默、且只有在舰队白飞一趟之后才看得见。
     """
 
-    def __init__(self, repository: SqlAlchemyRepository, scheduler: MissionScheduler) -> None:
+    def __init__(
+        self,
+        repository: SqlAlchemyRepository,
+        scheduler: MissionScheduler,
+        *,
+        monotonic_clock: Callable[[], float] = monotonic,
+        scheduler_view_ttl_s: float = SCHEDULER_VIEW_TTL_S,
+    ) -> None:
         self._repository = repository
         self._scheduler = scheduler
+        self._monotonic = monotonic_clock
+        self._scheduler_view_ttl_s = scheduler_view_ttl_s
+        self._scheduler_view_lock = threading.Lock()
+        self._scheduler_view_cached: SchedulerView | None = None
+        self._scheduler_view_cached_at = float("-inf")
+        self._scheduler_view_generation = -1
+        self._scheduler_view_task_signature: tuple[object, ...] | None = None
 
     # -- 读 --------------------------------------------------------------------
 
     def scheduler_view(self) -> SchedulerView:
-        return self._view(self._scheduler.snapshot())
+        """取调度快照的短 TTL 单飞缓存。
+
+        快照会计算每个任务的随行事实；多个浏览器轮询刚好重叠时，后到的请求在
+        这把小锁里复用先到者的结果，避免同时对 SQLite 发起同一轮重查询。锁只包
+        这条读路径，起停仍由 ``MissionScheduler`` 自己的锁负责。
+        """
+        # 这条小查询既不会进入逐目标判态，也不读战报；它只避免任务被后台或其他
+        # 请求线程改过时，TTL 内仍回旧行。真正昂贵的 `_facts()` 只在缓存失效时跑。
+        task_signature = self._mission_task_signature()
+        generation = self._scheduler.view_generation
+        with self._scheduler_view_lock:
+            now = self._monotonic()
+            cached = self._scheduler_view_cached
+            if (
+                cached is not None
+                and now - self._scheduler_view_cached_at < self._scheduler_view_ttl_s
+                and generation == self._scheduler_view_generation
+                and task_signature == self._scheduler_view_task_signature
+            ):
+                return cached
+            view = self._view(self._scheduler.snapshot())
+            self._scheduler_view_cached = view
+            self._scheduler_view_cached_at = now
+            self._scheduler_view_generation = self._scheduler.view_generation
+            self._scheduler_view_task_signature = self._mission_task_signature()
+            return view
+
+    def _invalidate_scheduler_view(self) -> None:
+        with self._scheduler_view_lock:
+            self._scheduler_view_cached = None
+            self._scheduler_view_cached_at = float("-inf")
+            self._scheduler_view_generation = -1
+            self._scheduler_view_task_signature = None
+
+    def _mission_task_signature(self) -> tuple[object, ...]:
+        """只读任务行的轻量版本号，补上调度器内存版本覆盖不到的直接写库。"""
+        return tuple(
+            (
+                row.id,
+                row.enabled,
+                row.priority,
+                row.name,
+                row.params_json,
+                row.origin_galaxy,
+                row.origin_system,
+                row.origin_position,
+                row.fleet_lines,
+                row.round_started_at_utc,
+                row.quota_exhausted_until_utc,
+                row.consecutive_failures,
+                row.disabled_reason,
+                row.updated_at_utc,
+            )
+            for row in self._repository.mission_tasks()
+        )
 
     def recent_runs(self, *, limit: int = 50) -> list[MissionRunView]:
         """`mission_runs` 的近况，新的在前。
@@ -795,10 +869,12 @@ class MissionConsoleService:
                 "补录期间不能启动调度器；等它跑完，或先点「取消补录」"
             )
         self._scheduler.start(reconcile=reconcile)
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     def stop_scheduler(self) -> SchedulerView:
         self._scheduler.stop()
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     # -- 战报补录 --------------------------------------------------------------
@@ -847,11 +923,13 @@ class MissionConsoleService:
             )
         except BackfillBusyError as exc:
             raise ConflictError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def cancel_backfill(self) -> BackfillView:
         """「取消补录」：排队中的撤掉，跑着的杀掉，之后立刻放行任务。"""
         self._scheduler.cancel_backfill()
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def resume_after_backfill(self) -> BackfillView:
@@ -861,6 +939,7 @@ class MissionConsoleService:
         放行之前看一眼「认领上了几发、几个 bot 目标不用再打了」。
         """
         self._scheduler.acknowledge_backfill()
+        self._invalidate_scheduler_view()
         return self._backfill_view()
 
     def _backfill_view(self) -> BackfillView:
@@ -928,6 +1007,7 @@ class MissionConsoleService:
         杀一个不认识的进程**——pid 会被系统回收复用，那一枪可能打在别人身上。
         """
         self._scheduler.force_kill()
+        self._invalidate_scheduler_view()
         return self.scheduler_view()
 
     # -- 改 --------------------------------------------------------------------
@@ -1012,6 +1092,7 @@ class MissionConsoleService:
             clear_origin=clear_origin,
             fleet_lines=fleet_lines,
         )
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
@@ -1053,6 +1134,7 @@ class MissionConsoleService:
                 raise AssertionError("validated planet_id disappeared")
             resolved.append((item.planet_id, item.fleet_lines, item.enabled))
         self._repository.replace_mission_task_origins(task_id, tuple(resolved))
+        self._invalidate_scheduler_view()
         return self.mission_origins(task_id)
 
     def attack_planets(self) -> tuple[AttackPlanetView, ...]:
@@ -1073,6 +1155,7 @@ class MissionConsoleService:
             row = self._repository.create_attack_planet(coordinate)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
 
     def update_attack_planet(self, planet_id: int, coordinate: Coordinate) -> AttackPlanetView:
@@ -1081,6 +1164,7 @@ class MissionConsoleService:
             row = self._repository.update_attack_planet(planet_id, coordinate)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
         return AttackPlanetView(row.id, row.sort_index, row.galaxy, row.system, row.position)
 
     def delete_attack_planet(self, planet_id: int) -> None:
@@ -1089,6 +1173,7 @@ class MissionConsoleService:
             self._repository.delete_attack_planet(planet_id)
         except ValueError as exc:
             raise ServiceError(str(exc)) from exc
+        self._invalidate_scheduler_view()
 
     def military_attack_config(self) -> MilitaryAttackConfigView:
         row = self._repository.military_attack_config()
@@ -1110,6 +1195,7 @@ class MissionConsoleService:
         row = self._repository.replace_military_attack_tiers(
             json.dumps(normalized, ensure_ascii=False)
         )
+        self._invalidate_scheduler_view()
         return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
 
     def create_mission(
@@ -1155,6 +1241,7 @@ class MissionConsoleService:
             fleet_lines=fleet_lines,
             now_utc=self._scheduler.now_utc(),
         )
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     def delete_mission(self, task_id: int) -> None:
@@ -1167,6 +1254,7 @@ class MissionConsoleService:
             label = MISSION_LABELS.get(row.kind, row.kind)
             raise ServiceError(f"「{label}」只剩这一个任务了，删不得；不想让它跑就取消勾选")
         self._repository.delete_mission_task(task_id)
+        self._invalidate_scheduler_view()
 
     def restart_bot_round(self, task_id: int) -> MissionTaskView:
         """「重开一轮」：把这个任务的 `round_started_at_utc` 推到当前。
@@ -1181,6 +1269,7 @@ class MissionConsoleService:
         if row.kind != MissionKind.BOT.value:
             raise ServiceError("只有 bot 攻击有「一轮」这个概念")
         self._scheduler.begin_bot_round(task_id)
+        self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
     # -- 内部 ------------------------------------------------------------------
