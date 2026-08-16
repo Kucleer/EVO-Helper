@@ -50,6 +50,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TypeGuard
 
 from evo_helper.domain.models import Coordinate
@@ -86,6 +87,17 @@ class RankingRow:
     name: str
     score: float | None
     coordinate: Coordinate | None
+    #: **这一行是什么时候读到的**（aware UTC）。用户口径（2026-08-16）：
+    #: 「军力榜我需要的是每条数据的更新时间」。
+    #:
+    #: ⚠️ **不是「什么时候入的库」。** 一趟读榜要滚几十屏、跑一个多小时，
+    #: 榜首那一屏和末尾那一屏之间差得远。整趟共用一个快照时刻等于把这个差值
+    #: 抹掉，而它恰恰是「这个军力值还新不新」唯一的判据。
+    #:
+    #: 留成可空且带默认值：OCR 那一层（`rows_from_image`）只负责认字，
+    #: 读取时刻由调用方在自己的循环里给——它才知道这一屏是什么时候截的。
+    #: 落库时为空则回落到快照时刻，见 `storage.military_rankings.append_snapshot`。
+    observed_at_utc: datetime | None = None
 
 
 def coordinate_of(name: str) -> Coordinate | None:
