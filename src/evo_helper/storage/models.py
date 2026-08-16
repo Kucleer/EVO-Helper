@@ -395,6 +395,39 @@ class IntelFilterRow(Base):
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
+class MilitaryRankingSnapshotRow(Base):
+    """One completed read of the in-game military-score ranking."""
+
+    __tablename__ = "military_ranking_snapshots"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    captured_at_utc: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MilitaryRankingEntryRow(Base):
+    """A ranking line retained with its snapshot so score changes stay auditable."""
+
+    __tablename__ = "military_ranking_entries"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "ordinal", name="uq_military_ranking_snapshot_ordinal"),
+        Index("ix_military_ranking_entries_rank", "rank"),
+        Index("ix_military_ranking_entries_coordinate", "galaxy", "system", "position"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    snapshot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("military_ranking_snapshots.id"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    player_name: Mapped[str] = mapped_column(String(128))
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    galaxy: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    system: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class MissionTaskRow(Base):
     """一个任务一行。优先级由用户在页面上拖出来。
 

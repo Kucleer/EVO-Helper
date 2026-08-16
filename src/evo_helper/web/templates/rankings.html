@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}军力榜 · EVO-Helper{% endblock %}
+{% block heading %}军力榜{% endblock %}
+{% block content %}
+<section class="panel compact"><div class="filter-bar">
+  <input id="q" placeholder="名称 / bot 坐标" aria-label="名称">
+  <input id="rank-min" type="number" min="1" placeholder="最低名次" aria-label="最低名次">
+  <input id="rank-max" type="number" min="1" placeholder="最高名次" aria-label="最高名次">
+  <input id="score-min" type="number" min="0" placeholder="最低军力" aria-label="最低军力">
+  <input id="score-max" type="number" min="0" placeholder="最高军力" aria-label="最高军力">
+  <input id="galaxy" type="number" min="1" max="9" placeholder="银河系" aria-label="银河系">
+  <label><input id="bot-only" type="checkbox"> 仅 bot</label>
+  <button class="btn primary small" id="search">筛选</button>
+</div><p class="muted" id="meta">尚无已持久化的军力榜快照。</p></section>
+<section class="panel"><table><thead><tr><th>名次</th><th>名称</th><th>军力值</th><th>坐标</th><th>类型</th></tr></thead><tbody id="rows"></tbody></table></section>
+<script>
+const e=(x)=>document.getElementById(x), val=(x)=>e(x).value.trim();
+async function search(){const p=new URLSearchParams(); for(const [key,id] of [['q','q'],['rank_min','rank-min'],['rank_max','rank-max'],['score_min','score-min'],['score_max','score-max'],['galaxy','galaxy']]) if(val(id))p.set(key,val(id)); if(e('bot-only').checked)p.set('bot_only','true'); const data=await EVOHelper.get('/api/military-rankings?'+p); e('meta').textContent=data.captured_at_utc?`快照 ${data.captured_at_utc.replace('T',' ').slice(0,19)} · 命中 ${data.total} 条`:'尚无已持久化的军力榜快照。'; e('rows').innerHTML=data.rows.map(r=>`<tr><td>${r.rank??'—'}</td><td>${r.name}</td><td>${r.score??'—'}</td><td>${r.coordinate??'—'}</td><td>${r.is_bot?'bot':'玩家'}</td></tr>`).join('');} e('search').onclick=search; search();
+</script>
+{% endblock %}
