@@ -5,16 +5,16 @@ bot 那条链路要的是两样东西：「这一发的战报回来了没有」�
 是对着回放页量的），要拿到它得点开「查看战斗回放」——那个按钮至今没有标定过的
 点击坐标，一份报告还要多花两三秒 OCR。所以这条读法只看详情页。
 
-胜负是**算**出来的（用户口径 2026-08-11，判据在 `domain.battle_outcome`）：
-剩余 = 单位 − 损失单位，本方剩余 0 判负、对方被全歼判胜、两边都有船判平。
-画面上那行 `VICTORY` / `FAIL` 大字只做交叉校验，没有推翻算式的资格。
+胜负**以画面横幅为准**（用户口径 2026-08-17：「游戏算法更新，剩余舰艇算法已经
+不准了，可以读 victory」）；横幅读不出来才回落到「剩余 = 单位 − 损失单位」那套
+算式（`domain.battle_outcome`）。仲裁见 `vision.pirate_reports.decide_outcome`。
 
 这里守三件事：
 
 1. **不读的东西必须是空的，不能顶替。** 「没读明细」和「对方一艘船都没有」
    在下游长得一模一样，而后者会直接进情报中心。
-2. **算不出胜负就留空**，尤其不许让横幅在这时顶上来。四个数缺一个就判不出，
-   而「损失单位」要拖到底才读得到，所以缺席是常态。
+2. **两条路都定不出胜负才留空。** 横幅顶得上就用横幅，顶不上就用算式；
+   都不成才是 None——绝不猜一档。
 3. **该守的判据一条都不能因为「只读一屏」而放松。** 主题、时间、VS 块两边全，
    任一不成立就整份拒收——挂错目标比没有战报坏得多。
 """
@@ -158,27 +158,36 @@ class TestWhatItDeliberatelyLeavesEmpty:
         assert report.attacker_units is None  # type: ignore[attr-defined]
         assert report.defender_units is None  # type: ignore[attr-defined]
 
-    def test_an_uncomputable_outcome_is_not_turned_into_a_defeat(self) -> None:
-        """⚠️ 「没算出胜负」和「打输了」在下游完全不同：后者会进攻击日志的战果列。
+    def test_an_undecidable_outcome_is_not_turned_into_a_defeat(self) -> None:
+        """⚠️ 「没定出胜负」和「打输了」在下游完全不同：后者会进攻击日志的战果列。
 
-        没拖到底就没有战损，没有战损就算不出胜负——这是**常态**，不是异常路径。
-        画面上的 `FAIL` 大字**不许**在这时顶上来：用户明确说了不看游戏内的提示。
+        这里横幅是噪声、战损也没拖到，两条路都不成——就留空，不猜一档。
         """
-        assert _read(banner="FAIL").outcome is None  # type: ignore[attr-defined]
-        assert _read(banner="VICTORY", losses=("30", "")).outcome is None  # type: ignore[attr-defined]
+        assert _read(banner="- a").outcome is None  # type: ignore[attr-defined]
+        assert _read(banner="Z ?", losses=("30", "")).outcome is None  # type: ignore[attr-defined]
 
-    def test_the_banner_never_overrides_the_arithmetic(self) -> None:
-        """两者打架时以算式为准（横幅只留 warning）。
+    def test_a_readable_banner_no_longer_needs_the_losses_at_all(self) -> None:
+        """⚠️ 这是本次换判据最实在的一处收益。
 
-        这里横幅写着 `VICTORY`，而我方 100 全损、对方 5360 一艘没掉——判 `FAIL`。
+        没拖到底就没有战损，算式一律给 None——2026-08-11 那版于是让攻击日志的
+        战果列永远空着。横幅升回第一判据之后，那一屏自己就给得出战果。
+        """
+        assert _read(banner="FAIL").outcome == "FAIL"  # type: ignore[attr-defined]
+        assert _read(banner="VICTORY", losses=("30", "")).outcome == "VICTORY"  # type: ignore[attr-defined]
+
+    def test_the_banner_overrides_the_arithmetic(self) -> None:
+        """两者打架时**以横幅为准**（用户口径 2026-08-17），算式只留 warning。
+
+        这里横幅写着 `VICTORY`，而我方 100 全损、对方 5360 一艘没掉（算式判 `FAIL`）。
+        生产日志 2026-08-17 18:20:17 见过的正是这个形状。
         """
         report = _read(banner="VICTORY", units=("100", "5.36K"), losses=("100", "0"))
 
-        assert report.outcome == "FAIL"  # type: ignore[attr-defined]
+        assert report.outcome == "VICTORY"  # type: ignore[attr-defined]
 
     def test_a_screens_object_without_a_banner_reader_still_reads(self) -> None:
-        """横幅是增强项：提供不了的取字面实现照样能读出一份完整战报，
-        而且**胜负照样算得出来**——它本来就不看横幅。
+        """横幅取字面是增强项：提供不了的实现照样能读出一份完整战报，
+        **胜负回落到算式**，而且不刷 warning——那是结构性缺席，不是读失败。
 
         与 `unit_totals` 同一个 getattr 路子：写进协议会打断所有既有实现。
         """
@@ -229,10 +238,11 @@ class TestTheScrolledScreen:
 
         assert (report.attacker_losses, report.defender_losses) == (1, 0)  # type: ignore[attr-defined]
 
-    def test_the_two_screens_together_produce_the_verdict(self) -> None:
-        """这就是实机上那条路：第一屏出身份与「单位」，第二屏出战损，然后算。
+    def test_the_two_screens_together_still_agree_with_the_banner(self) -> None:
+        """实机上那条路：第一屏出身份、「单位」与横幅，第二屏出战损。
 
-        我方 1 艘全损 → 剩余 0 → `FAIL`，与那五张探路战报的横幅一致。
+        我方 1 艘全损 → 算式判 `FAIL`，与那五张探路战报的横幅一致；两条路一致时
+        走哪条都一样，也不该留任何日志。
         """
         report = _read(bottom=DetailScreens(losses=("1", "0")), units=("1", "319"))
 
@@ -242,8 +252,8 @@ class TestTheScrolledScreen:
         """⚠️ **拖到底之后横幅已经滚出可视区了。**
 
         实测那一屏的同一个 ROI 读作 `'Z ?'`（`var/logs/pir1-bottom.png`）。
-        横幅只做交叉校验，而校验取的必须是**没拖过那一屏**的读数——拿滚过之后
-        那段画面里的噪声去校验，只会刷出一串假 warning。
+        横幅是第一判据，取的必须是**没拖过那一屏**的读数——这里第二屏摆了个
+        `VICTORY`，只有取错屏才会跟着它走。
         """
         report = _read(
             bottom=DetailScreens(losses=("1", "0"), banner="VICTORY"),
@@ -255,11 +265,12 @@ class TestTheScrolledScreen:
 
     def test_the_bottom_screen_is_optional(self) -> None:
         """不给第二屏也要能读——`read_report` 与离线入库那条路都不拖。
-        读不到就诚实地空着，不因为「少了一屏」而整份拒收。"""
+        「单位」读不到就诚实地空着，不因为「少了一屏」而整份拒收；
+        而战果照旧由第一屏的横幅给出。"""
         report = _read(units=("", ""))
 
         assert report.defender_units is None  # type: ignore[attr-defined]
-        assert report.outcome is None  # type: ignore[attr-defined]
+        assert report.outcome == "FAIL"  # type: ignore[attr-defined]
 
 
 class TestFailClosed:

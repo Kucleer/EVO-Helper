@@ -55,9 +55,11 @@ def to_battle_report(live: LiveBattleReport, *, report_id: UUID) -> BattleReport
         # Section 3 forbids one label for the whole chain, so the replay
         # version is recorded separately by ui_observations_for().
         ui_version=live.ui_versions.get("battle_detail_ui_version"),
-        # 战果与战损一起落库。`outcome` 是**按剩余舰艇数算出来的**
-        # （`domain.battle_outcome`），算不出时是 None——**不能填 `FAIL` 顶替**，
-        # 那会在攻击日志的战果列上凭空造出一场败仗（见 `BattleReport.outcome`）。
+        # 战果与战损一起落库。`outcome` **优先来自画面横幅**，横幅读不出来才回落到
+        # 按剩余舰艇数算的结果（用户口径 2026-08-17，仲裁见
+        # `vision.pirate_reports.decide_outcome`）；两条都不成时是 None——
+        # **不能填 `FAIL` 顶替**，那会在攻击日志的战果列上凭空造出一场败仗
+        # （见 `BattleReport.outcome`）。
         # 战损那两个数既是页面上「战损 我 X · 敌 Y」的来源，也是算式的输入之一，
         # 落库之后才能回头核「当初凭什么判成这个结果」。
         outcome=live.outcome,

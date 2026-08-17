@@ -261,14 +261,14 @@ class _DetailScreens:
         return self._banner
 
 
-# -- 胜负是算出来的，「单位」与「损失单位」是它的输入 ------------------------
+# -- 战果以横幅为准，剩余舰艇数是兜底 ----------------------------------------
 
 
-def test_the_computed_outcome_reaches_the_stored_report() -> None:
+def test_the_outcome_reaches_the_stored_report() -> None:
     """攻击日志的战果列就取这一个字段（`web.service.AttackLogView.outcome`）。
 
-    这里第二屏给出「我方 1 艘全损、对方 319 一艘没掉」——我方剩余 0 → `FAIL`，
-    正是那五张探路战报的实际形状。
+    第一屏的横幅读作 `FAIL`，第二屏的四个数也给出 `FAIL`（我方 1 艘全损）——
+    两条路一致，正是那五张探路战报的实际形状。战损照旧一起落库。
     """
     repository = _Repository()
     bottom = _DetailScreens(A, units=("1", "319"), losses=("1", "0"))
@@ -282,37 +282,57 @@ def test_the_computed_outcome_reaches_the_stored_report() -> None:
     )
 
 
-def test_a_wiped_out_defender_is_a_victory() -> None:
+def test_a_victory_banner_reaches_the_stored_report() -> None:
+    """横幅写 `VICTORY` 就存 `VICTORY`——哪怕四个数是齐的。"""
     repository = _Repository()
     bottom = _DetailScreens(A, units=("100", "783"), losses=("0", "783"))
 
-    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(
+        A, _DetailScreens(A, units=("", ""), banner="VICTORY")
+    )
 
     assert repository.appended[0].outcome == "VICTORY"
 
 
-def test_both_sides_surviving_is_a_draw() -> None:
-    """**平局这一档不需要样本**——没人见过平局的横幅，但它算得出来。"""
+def test_both_sides_surviving_is_a_draw_when_the_banner_cannot_be_read() -> None:
+    """**平局这一档没有横幅样本**，只会从兜底算式里出来。
+
+    第一屏的横幅给一段实拍上真读到过的噪声，于是回落到四个数：两边都还有船。
+    """
     repository = _Repository()
     bottom = _DetailScreens(A, units=("100", "783"), losses=("30", "200"))
 
-    _ingesting_loop(repository, bottom)._ingest_battle_report(A, _DetailScreens(A, units=("", "")))
+    _ingesting_loop(repository, bottom)._ingest_battle_report(
+        A, _DetailScreens(A, units=("", ""), banner="- a")
+    )
 
     assert repository.appended[0].outcome == "DRAW"
 
 
-def test_an_uncomputable_outcome_stores_nothing_rather_than_a_defeat() -> None:
-    """⚠️ 本文件最要紧的一条：**「没算出胜负」不能长成「打输了」。**
+def test_an_undecidable_outcome_stores_nothing_rather_than_a_defeat() -> None:
+    """⚠️ 本文件最要紧的一条：**「没定出胜负」不能长成「打输了」。**
 
-    没拖到底就没有战损，没有战损就算不出胜负——这是常态。而画面上那行 `FAIL`
-    大字**不许**在这时顶上来（用户口径 2026-08-11：不看游戏内的提示）：
-    真顶上去，攻击日志就会出现一场根本没核过的败仗，和真败仗在页面上一模一样。
+    横幅是噪声、战损又没拖到，两条路都不成——就存 None。真顶一档上去，
+    攻击日志会出现一场根本没核过的败仗，和真败仗在页面上一模一样。
+    """
+    repository = _Repository()
+
+    _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A, banner="Z ?"))
+
+    assert repository.appended[0].outcome is None
+
+
+def test_a_readable_banner_alone_is_enough_without_the_second_screen() -> None:
+    """⚠️ 换判据最实在的一处收益：不拖第二屏也有战果。
+
+    没拖到底就没有战损，算式一律给 None——2026-08-11 那版于是让这一格永远空着。
     """
     repository = _Repository()
 
     _ingesting_loop(repository)._ingest_battle_report(A, _DetailScreens(A, banner="FAIL"))
 
-    assert repository.appended[0].outcome is None
+    assert repository.appended[0].outcome == "FAIL"
+    assert repository.appended[0].attacker_losses is None
 
 
 def test_the_units_come_from_the_scrolled_screen_when_the_first_one_has_none() -> None:

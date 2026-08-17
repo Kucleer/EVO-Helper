@@ -13,13 +13,12 @@
 为什么要两屏：未滚动时「损失单位」那一行正好被面板下沿切掉，读出来的是半行字；
 而拖到底之后 `VICTORY` 横幅又滚出了可视区。两样东西不在同一屏上。
 
-⚠️ **胜负不再从横幅读，改成按剩余舰艇数算**（用户口径 2026-08-11，判据在
-`domain.battle_outcome`）：剩余 = 单位 − 损失单位，本方剩余 0 判负、对方被全歼
-判胜、两边都有船判平。横幅仍然读，但只当交叉校验——两边都算得出而结论不一致时
-留一条 warning，判据以算出来的为准。
+⚠️ **胜负以横幅为准**（用户口径 2026-08-17：「游戏算法更新，剩余舰艇算法已经
+不准了，可以读 victory」）。横幅读不出来才回落到按剩余舰艇数算
+（`domain.battle_outcome`）。仲裁与日志都在 `decide_outcome` 里。
 
-这也改了「整份拒收」的判据：从前是**横幅读不出**就拒，现在是**算不出胜负**就拒。
-四个数缺一个都算不出，而这条记录的全部内容就是胜负与战损，缺了没有存的价值。
+「整份拒收」的判据跟着变成**两条路都定不出胜负**才拒——这条记录的全部内容就是
+胜负与战损，缺了没有存的价值；但只要横幅读得出来，四个数缺几个都不影响。
 
 **拖到底是可标定的姿势**：实测同一份报告拖 280px 与拖 520px 落点完全一致
 （面板夹到底了），所以「损失单位」相对「战斗详情」横幅的偏移是固定的，
@@ -73,9 +72,11 @@ OUTCOME_ROI = Region(800, 232, 1130, 292)
 #: 这行大字是半透明的、压在星空背景上，实测会掉字母（`VICTORV`）。
 #: 不能放得更宽：容差一旦超过一半词长，四字母的那两档就和别的四字母噪声分不开了。
 #:
-#: 横幅现在只是交叉校验（判据见 `domain.battle_outcome`），所以吸错的后果从
-#: 「记错一场战果」降成「多一条 warning」。容差仍不放松：一条会误报的校验，
-#: 用不了几次就没人再看它了。
+#: ⚠️ 2026-08-17 起横幅是**第一判据**（见 `decide_outcome`），吸错的后果重新变回
+#: 「库里记错一场战果」。这更是不放松容差的理由：宁可吸不上、回落到算式，
+#: 也不要把一段噪声吸成 `FAIL`。
+#:
+#: **这不是偏好项**：取值由 OCR 读出的字形与词表长度决定，调了就是错。
 def _tolerance(label: str) -> int:
     return max(1, round(len(label) / 3))
 
@@ -134,32 +135,66 @@ def parse_outcome(raw: str) -> str | None:
 
     只取字母：OCR 会在大字周围带出星空的碎点（`VICTORY .`）。
 
-    ⚠️ **这不再是判据。** 胜负按剩余舰艇数算（`domain.battle_outcome`）；
-    这个函数的产物只喂给 `cross_check_banner`。
+    ⚠️ **这是第一判据**（用户口径 2026-08-17）。贴不上时由 `decide_outcome`
+    回落到按剩余舰艇数算的结果——贴错比贴不上坏得多，所以容差不许放松。
     """
     letters = "".join(char for char in raw.upper() if char.isalpha())
     return snap_to_vocabulary(letters, OUTCOME_LABELS, max_distance=OUTCOME_TOLERANCE)
 
 
-def cross_check_banner(computed: str | None, banner_text: str, *, where: str) -> None:
-    """算出来的胜负与画面上那行大字对不上时留一条 warning。
+def decide_outcome(banner_text: str | None, computed: str | None, *, where: str) -> str | None:
+    """定这一仗算赢算输：**以画面横幅为准**，横幅读不出来才回落到算式。
 
-    **只记不改。** 用户明确说了不看游戏内的提示，所以横幅没有推翻算式的资格；
-    但两者都读得出来还不一致，说明其中一条链路坏了——那正是值得有人看一眼的事。
+    用户口径（2026-08-17）：
 
-    两边任一为空就什么都不说：bot 战报的「损失单位」要拖到底才读得到，缺席是常态，
-    为常态刷 warning 等于把这条校验变成噪声，用不了几次就没人再看它了。
+    > 游戏算法更新，剩余舰艇算法已经不准了，可以读 victory
+
+    所以优先级和 2026-08-11 那版**正好相反**：横幅是游戏自己给的结论，
+    「剩余 = 单位 − 损失单位」推出来的那个降级成参考。
+
+    ## 这不是配置项
+
+    「以横幅为准」由游戏的战斗结算算法决定，不由用户的处境决定：没有哪种场景下
+    「宁可信一套已知不准的算术」会让结果更合用，只会让它更错。所以硬编码，
+    不留开关（仓库口径：改这个值会让结果变「错」的，就是常量而不是旋钮）。
+
+    ## 三条出路，每条都留得下痕迹
+
+    1. 横幅读得出、和算式打架 → 用横幅，留 warning（说清两边各是什么、原文是什么）。
+    2. 横幅读不出、算式算得出 → **回落**，留 warning 说明这一条是回落来的。
+       不许静默：回落值现在是「已知会不准」的那一套，日后核账要认得出哪些是它。
+    3. 两条都不成 → 返回 None。**绝不猜**，也绝不拿另一档顶替——
+       「没定出胜负」和「打输了」在下游完全不同（见 `domain.records.BattleReport`）。
+
+    `banner_text` 传 `None` 表示**这一屏根本没有横幅取字面**（离线入库、旧截图、
+    以及没实现 `outcome_banner` 的取字面对象），这是结构性缺席、不是读失败，
+    所以静默回落、不刷 warning。传 `""` 或噪声才算「读了但读不出」。
+
+    日志频率：这三条都**每份战报最多一条**，不在 tick 循环里，不用限流。
+
+    两边一致时什么都不说：那是常态，为常态刷日志等于把这几条变成噪声。
     """
-    banner = parse_outcome(banner_text)
-    if computed is None or banner is None or computed == banner:
-        return
-    logger.warning(
-        "%s：按剩余舰艇数算出 %s，画面横幅却读作 %s（原文 %r）；以算出来的为准",
-        where,
-        computed,
-        banner,
-        banner_text.strip(),
-    )
+    banner = parse_outcome(banner_text) if banner_text is not None else None
+    if banner is not None:
+        if computed is not None and computed != banner:
+            logger.warning(
+                "%s：画面横幅读作 %s（原文 %r），按剩余舰艇数算出的却是 %s；"
+                "以横幅为准（游戏算法更新后剩余舰艇数已不可信，用户口径 2026-08-17）",
+                where,
+                banner,
+                banner_text.strip() if banner_text is not None else "",
+                computed,
+            )
+        return banner
+    if banner_text is not None and computed is not None:
+        logger.warning(
+            "%s：画面横幅读不出战果（原文 %r），回落到按剩余舰艇数算出的 %s；"
+            "这一条是回落来的，剩余舰艇数在游戏算法更新后已不保证准确",
+            where,
+            banner_text.strip(),
+            computed,
+        )
+    return computed
 
 
 def read_pirate_report(
@@ -194,18 +229,19 @@ def read_pirate_report(
         raise PirateReportUnreadable("读不出战损总数")
 
     units = _totals(detail.unit_totals())
-    # 胜负按剩余舰艇数算（用户口径 2026-08-11），横幅只做交叉校验。
-    outcome = outcome_from_totals(
+    # 胜负**以横幅为准**（用户口径 2026-08-17），算出来的只当横幅读不出来时的兜底。
+    computed = outcome_from_totals(
         attacker_units=units[0] if units is not None else None,
         attacker_losses=losses[0],
         defender_units=units[1] if units is not None else None,
         defender_losses=losses[1],
     )
+    outcome = decide_outcome(detail.outcome_banner(), computed, where=f"海盗战报 {raw_time}")
     if outcome is None:
         raise PirateReportUnreadable(
-            "算不出胜负：「单位」与「损失单位」四个数缺了至少一个（剩余 = 单位 − 损失单位）"
+            "定不出胜负：画面横幅读不出战果，按剩余舰艇数也算不出来"
+            "（「单位」与「损失单位」四个数缺了至少一个）"
         )
-    cross_check_banner(outcome, detail.outcome_banner(), where=f"海盗战报 {raw_time}")
 
     return PirateReportReading(
         raw_time_text=raw_time,
@@ -274,7 +310,7 @@ __all__ = [
     "OUTCOME_VICTORY",
     "PirateReportReading",
     "PirateReportUnreadable",
-    "cross_check_banner",
+    "decide_outcome",
     "parse_outcome",
     "read_pirate_report",
 ]
