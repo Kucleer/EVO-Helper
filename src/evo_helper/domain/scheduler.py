@@ -180,18 +180,21 @@ class TaskStatus(Enum):
     BEFORE_WINDOW = "未到开启时间"
     #: 配了关闭时刻，而现在已经过了。
     AFTER_WINDOW = "已过关闭时间"
-    #: 仅军力优先：候选池里一个能打的目标都没有，而原因是**军力分数过期**。
+    #: 仅军力优先：候选还在，却**一个有军力读数的都没有**——军力榜还没扫到它们。
+    #:
+    #: ⚠️ **措辞 2026-08-18 换过一次，从「军力数据已过期」改成「未采集」。**
+    #: 那一版里超期的目标会被整批滤掉，所以「一个能打的都没有」确实可能是超期
+    #: 造成的。这一版超期不再挡任何目标（选靶交给时间池，见
+    #: `domain.target_order` 的模块头），于是这个状态**只剩一个成因**：候选全都
+    #: 从没上过军力榜。仍然写「已过期」的话，用户会去把有效期调长——而那一格
+    #: 现在什么都不挡，调完照样一个不派。
     #:
     #: ⚠️ **这一档以前被「已完成」盖住了，而那句话是反的。** 军力优先模式下
-    #: `targets_remaining` 数的是「这一轮真能打的目标数」，新鲜度闸门
-    #: （2026-08-17）把全部超期的目标滤掉之后这个数就是 0，于是 `bot_round_complete`
-    #: 为真，页面上写「已完成」——听起来是这一轮顺利跑完了，实际是**数据过期、
-    #: 一个都打不了**。用户会因此不去做真正该做的两件事：等军力榜扫一轮，
-    #: 或者把有效期调长。
-    #:
-    #: 所以它必须排在 `bot_round_complete` **之前**：两者同时成立时，
-    #: 「为什么一个都没有」比「一个都没有」有用得多。
-    STALE_MILITARY_SCORES = "军力数据已过期"
+    #: `targets_remaining` 数的是「这一轮真能打的目标数」，一个能打的都没有时它
+    #: 就是 0，于是 `bot_round_complete` 为真、页面上写「已完成」——听起来是这一轮
+    #: 顺利跑完了，实际是**一个都打不了**。所以它必须排在 `bot_round_complete`
+    #: **之前**：两者同时成立时，「为什么一个都没有」比「一个都没有」有用得多。
+    MISSING_MILITARY_SCORES = "军力数据未采集"
 
 
 @dataclass(frozen=True)
@@ -258,16 +261,20 @@ class TaskFacts:
     reports_due: bool = False
     #: 仅 BOT：本轮范围内还有几个目标没走完流程。
     targets_remaining: int = 0
-    #: 仅军力优先：`targets_remaining` 归零**是不是因为分数过期**。
+    #: 仅军力优先：`targets_remaining` 归零**是不是因为候选一个军力读数都没有**。
     #:
     #: ⚠️ **它只用来说清原因，不参与任何调度判据。** 军力优先模式下
-    #: `targets_remaining` 数的是「这一轮真能打的目标数」，所以「全部超期」和
-    #: 「全都打完了」在那个数上长得一模一样（都是 0），而页面会把前者显示成
-    #: 「已完成」——一句听起来顺利、实际相反的话。
+    #: `targets_remaining` 数的是「这一轮真能打的目标数」，所以「军力榜还没扫到
+    #: 它们」和「全都打完了」在那个数上长得一模一样（都是 0），而页面会把前者
+    #: 显示成「已完成」——一句听起来顺利、实际相反的话。
+    #:
+    #: 2026-08-18 之前它叫 `scores_are_stale`、成因是「分数全部超期」。超期现在
+    #: 不再挡目标（见 `domain.target_order`），那个成因随之消失，剩下的唯一成因
+    #: 就是「从没上过军力榜」——名字跟着改，否则页面会指着一个不存在的原因。
     #:
     #: 判定放在 `application` 那层（它才看得见候选池里各行的读取时刻），
     #: 这里只收结论。
-    scores_are_stale: bool = False
+    scores_are_missing: bool = False
     #: 上一次**启动**的时刻（不是上一次结束）。冷却按启动算：一个刚起来就秒退的
     #: runner，正是最该被节流的那种。事实来自 `mission_runs` 里该任务的最大
     #: `started_at_utc`，这一层不去查库。
@@ -690,12 +697,12 @@ def status_of(
         return TaskStatus.AFTER_WINDOW
     if task.kind is MissionKind.PIRATE and pirate_quota_exhausted(facts):
         return TaskStatus.QUOTA_EXHAUSTED
-    # ⚠️ **超期要排在「已完成」之前。** 军力优先模式下两者在 `targets_remaining`
-    # 上长得一模一样（都是 0），而「已完成」听起来是这一轮顺利跑完了，实际是
-    # 一个都打不了。说反了的代价是用户不去做真正该做的两件事：等军力榜扫一轮，
-    # 或者把有效期调长。
-    if task.kind is MissionKind.BOT and facts.of(task).scores_are_stale:
-        return TaskStatus.STALE_MILITARY_SCORES
+    # ⚠️ **「没有军力读数」要排在「已完成」之前。** 军力优先模式下两者在
+    # `targets_remaining` 上长得一模一样（都是 0），而「已完成」听起来是这一轮
+    # 顺利跑完了，实际是一个都打不了。说反了的代价是用户不去做真正该做的那件事：
+    # 等军力榜扫一轮。
+    if task.kind is MissionKind.BOT and facts.of(task).scores_are_missing:
+        return TaskStatus.MISSING_MILITARY_SCORES
     if task.kind is MissionKind.BOT and bot_round_complete(task, facts):
         return TaskStatus.DONE
     # 「等航线」排在「冷却中」前面：两者同时成立时，等航线是那个更长、也更该让

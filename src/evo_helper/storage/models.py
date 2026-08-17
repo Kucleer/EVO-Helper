@@ -749,6 +749,17 @@ class MilitaryAttackConfigRow(Base):
     #: 想多榨几轮就调小，已知 bot 多、想摊得更开就调大。
     bot_revisit_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    #: 军力时间池：按军力读数时间倒序取前几个进池。**空 = 500。**
+    #:
+    #: 旋钮而非标定常量：它回答「用多新的军力数据」，取值取决于用户当下的处境
+    #: （周一刷新日想只看最新的就调小，觉得可选面太窄就调大），没有唯一正确答案。
+    #: 它与「军力截断」（任务参数 `top_n`，「只打多强的」）**各管一件事，刻意分开**
+    #: ——合成一个数的话，想放宽数据新鲜度就只能连带把攻击面一起放宽。
+    #:
+    #: 放在这张全局表而不是 `mission_tasks.params_json`：军力榜是全宇宙一份，
+    #: 「用多新的数据」是这一份数据的属性，不属于某一个攻击任务。
+    military_time_pool: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
 
 class MissionRunRow(Base):
     """调度器每起一个子进程记一行。"""

@@ -164,39 +164,42 @@ def test_a_finished_bot_round_says_done_not_waiting() -> None:
     assert status(MissionKind.BOT, targets_remaining=0) is TaskStatus.DONE
 
 
-def test_stale_military_scores_are_not_dressed_up_as_a_finished_round() -> None:
-    """⚠️ 本组的核心判据：**「分数全过期」不许显示成「已完成」。**
+def test_missing_military_scores_are_not_dressed_up_as_a_finished_round() -> None:
+    """⚠️ 本组的核心判据：**「一个军力读数都没有」不许显示成「已完成」。**
 
-    军力优先模式下这两件事在 `targets_remaining` 上长得一模一样（都是 0）——
-    新鲜度闸门把超期的目标全滤掉之后，「一个都打不了」和「全都打完了」在那个数
-    上无从分辨。而「已完成」听起来是这一轮顺利跑完了，实际正相反：目标一个没少，
-    只是军力数据放旧了。
+    ⚠️ **成因 2026-08-18 换过一次。** 这条用例从前叫
+    `test_stale_military_scores_…`，钉的是「分数全过期」那一档：那一版超期的目标
+    会被整批滤掉，所以「全过期」确实能让 `targets_remaining` 归零。这一版超期不再
+    挡任何目标（选靶交给时间池，见 `domain.target_order`），那个成因随之消失，
+    剩下的唯一成因是**候选全都从没上过军力榜**——判据与文案跟着改，否则页面会
+    指着一个不存在的原因，用户照它去把有效期调长，调完照样一发不派。
 
-    说反了的代价是具体的：用户不会去做真正该做的两件事（等军力榜扫一轮、
-    或者把有效期调长），而会去按「已完成」的意思重开一轮——重开之后候选池还是
-    那批超期目标，于是立刻又「已完成」。
+    判据本身没变，也不该变：两件事在 `targets_remaining` 上长得一模一样（都是 0），
+    而「已完成」听起来是这一轮顺利跑完了，实际是一个都打不了。说反了的代价是
+    用户不会去做真正该做的那件事（等军力榜扫一轮），而会去重开一轮——重开之后
+    候选池还是那批没读数的目标，于是立刻又「已完成」。
     """
     assert (
-        status(MissionKind.BOT, targets_remaining=0, scores_are_stale=True)
-        is TaskStatus.STALE_MILITARY_SCORES
+        status(MissionKind.BOT, targets_remaining=0, scores_are_missing=True)
+        is TaskStatus.MISSING_MILITARY_SCORES
     )
 
 
 def test_a_genuinely_finished_round_still_says_done() -> None:
     """反向那一半：真打完了就得说「已完成」。
 
-    少了这条，一个「把 `bot_round_complete` 整个删掉、一律报过期」的改动会全绿。
+    少了这条，一个「把 `bot_round_complete` 整个删掉、一律报没有数据」的改动会全绿。
     """
-    assert status(MissionKind.BOT, targets_remaining=0, scores_are_stale=False) is TaskStatus.DONE
+    assert status(MissionKind.BOT, targets_remaining=0, scores_are_missing=False) is TaskStatus.DONE
 
 
-def test_stale_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
+def test_missing_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
     """还有能打的目标时，这一档一个字都不该说——那时它是「待命」。
 
-    新鲜度这件事只在**它是不动的原因**时才值得占那一句话。候选池里还剩几个能打的，
-    却写着「军力数据已过期」，用户会去等一轮根本不需要等的扫描。
+    军力数据这件事只在**它是不动的原因**时才值得占那一句话。候选池里还剩几个能打的，
+    却写着「军力数据未采集」，用户会去等一轮根本不需要等的扫描。
     """
-    assert status(MissionKind.BOT, targets_remaining=3, scores_are_stale=True) is TaskStatus.READY
+    assert status(MissionKind.BOT, targets_remaining=3, scores_are_missing=True) is TaskStatus.READY
 
 
 def test_no_free_lines_reads_as_waiting_for_lines() -> None:

@@ -6,12 +6,10 @@ from evo_helper.domain.military_attack import (
     AttackOrigin,
     MilitaryTier,
     assign_by_capacity_and_distance,
-    military_pool,
     tier_for,
-    top_up_with_unrated,
 )
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.target_order import ScoredTarget
+from evo_helper.domain.target_order import ScoredTarget, strongest_within
 
 
 def _target(system: int, score: float | None) -> ScoredTarget:
@@ -19,11 +17,16 @@ def _target(system: int, score: float | None) -> ScoredTarget:
 
 
 def test_pool_drops_over_cap_but_keeps_unknown_score() -> None:
-    """None 不是 0，也不能因上限被静默扔掉。"""
-    pool = military_pool(
+    """None 不是 0，也不能因上限被静默扔掉。
+
+    军力截断那一刀现在住在 `domain.target_order.strongest_within`；这条用例跟着
+    搬过去指同一个判据，因为它守的是「上限只挡太强，不挡读不出来」，
+    而那条规矩和它住在哪个模块无关。
+    """
+    pool = strongest_within(
         [_target(140, 30_000), _target(141, None), _target(142, 1_000)],
         take=50,
-        maximum_score=20_000,
+        max_score=20_000,
     )
 
     assert [item.coordinate.system for item in pool] == [142, 141]
@@ -116,70 +119,28 @@ def test_results_are_grouped_by_origin_for_one_switch_per_runner() -> None:
     assert [item.origin for item in assigned] == sorted(item.origin for item in assigned)
 
 
-# -- 没有分数的目标怎么补位 ----------------------------------------------------
+# -- 没有分数的目标不再补位（2026-08-18）--------------------------------------
 #
-# 用户口径（2026-08-17）：「目前的 bot 的军事能力不存在太强这个可能性……已知周一
-# 刷新当日 bot 的最高战力只有 70 多 K」。所以「没有分数」这一档打起来毫无风险，
-# 它只是排不了序——于是它不参与按军力取前 N，只在主力没取满时按距离补。
+# ⚠️ **这一节从前有五条用例，钉的是 `top_up_with_unrated`：主力（有分数的）不满
+# 前 N 时，用没有军力分数的目标按距离补齐。整个函数连同那五条一起没了。**
+#
+# 不是「顺手删掉」：用户 2026-08-18 决定**从未上过军力榜的目标不再攻击**，那五条
+# 用例钉的判据（补位怎么挑、补几个、排在哪）在新规格下一条都不成立——它们钉的是
+# 一段不该再发生的行为。原来的理由是一句错话（「没被榜单扫到过的正是库里最多的
+# 一批」，那个数把非 bot 的行也算进了分母；实测 628 个，占 bot 总数 3604 的
+# 17.4%），整段善后写在 `domain.military_attack` 的模块头上。
+#
+# 接替它们的是 `tests/unit/domain/test_target_order.py` 里
+# `test_a_target_that_never_made_the_board_is_out` 那一条：**没有军力读数的目标
+# 一个都进不了池**。那是新规格下唯一还该被钉住的事。
 
 HOME = Coordinate(2, 137, 18)
 
 
-def test_the_unrated_only_fill_the_seats_the_rated_left_empty() -> None:
-    """⚠️ **主力优先：先按军力取满前 N，剩下的空位才轮到补位。**
+def test_the_cut_never_reorders_what_it_kept() -> None:
+    """截断只截，不重排——池内那点次序留给第 5 步（按距离）去定。"""
+    kept = strongest_within(
+        [_target(400, 9_000), _target(141, 8_000), _target(140, 100)], take=2, max_score=None
+    )
 
-    混排的话，没有分数的那些会占掉前 N 的名额（`strongest_first` 把 None 排在
-    最后，但排最后**也是占位**），于是「军力优先」在补位多的夜里退化成「随便打」。
-    """
-    rated = military_pool([_target(140, 9_000), _target(141, 8_000)], take=3, maximum_score=None)
-    unrated = [_target(200, None), _target(300, None)]
-
-    pool = top_up_with_unrated(rated, unrated, [HOME], take=3)
-
-    assert [item.coordinate.system for item in pool] == [140, 141, 200]
-
-
-def test_a_full_pool_of_rated_targets_takes_no_filler() -> None:
-    """主力就把前 N 占满时，一个补位都不许挤进来。"""
-    rated = military_pool([_target(140, 9_000), _target(141, 8_000)], take=2, maximum_score=None)
-
-    pool = top_up_with_unrated(rated, [_target(200, None)], [HOME], take=2)
-
-    assert [item.coordinate.system for item in pool] == [140, 141]
-
-
-def test_the_filler_is_ordered_by_distance_not_by_anything_else() -> None:
-    """补位之间没有「更值得打」的依据，唯一还剩的可比量是路程。
-
-    ⚠️ 距离必须是**环形**的（`distance_key`）：从 2:137 看 `2:499` 只有 137 步，
-    而线性减法会算成 362，于是真正最近的那个被排到后面。
-    """
-    unrated = [_target(300, None), _target(499, None), _target(140, None)]
-
-    pool = top_up_with_unrated((), unrated, [HOME], take=2)
-
-    assert [item.coordinate.system for item in pool] == [140, 499]
-
-
-def test_the_filler_measures_distance_to_the_nearest_origin() -> None:
-    """多出发点时只按其中一颗算，等于替另一颗做主，所以取**到最近那颗**的距离。
-
-    `2:139` 离第一颗出发点 2 步、离第二颗 261 步；`2:401` 反过来，离第二颗只有 1 步。
-    只按第一颗量的话排出来是 `[139, 401]`——而真正近的是 `401`。
-    """
-    first = Coordinate(2, 137, 18)
-    second = Coordinate(2, 400, 18)
-    unrated = [_target(139, None), _target(401, None)]
-
-    pool = top_up_with_unrated((), unrated, [first, second], take=2)
-
-    assert [item.coordinate.system for item in pool] == [401, 139]
-
-
-def test_the_filler_never_reorders_the_rated_ones() -> None:
-    """补位接在主力后面，主力那一段的次序一个字不动。"""
-    rated = (_target(400, 9_000), _target(141, 8_000))
-
-    pool = top_up_with_unrated(rated, [_target(140, None)], [HOME], take=5)
-
-    assert [item.coordinate.system for item in pool] == [400, 141, 140]
+    assert [item.coordinate.system for item in kept] == [400, 141]

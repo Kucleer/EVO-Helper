@@ -676,26 +676,32 @@
     if (task.kind === 'BOT') {
       const settings = document.createElement('div');
       settings.className = 'military-settings';
-      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力候选数量' });
+      // ⚠️ 这一格是**军力截断**，不是「候选数量」：后面按距离重排，所以军力只在
+      // 这一刀生效一次。填成 ≥ 时间池里的目标数就完全失效——2026-08-18 之前它被
+      // 填成 500 而可用候选只有 591，等于军力压根没参与选靶。
+      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力截断（取前几名）', title: '在「军力时间池」里按军力取前几名。调小=只打最强的，代价是可选距离变差；调大=军力优先被稀释，填成 ≥ 池内目标数就完全失效' });
       // ⚠️ 这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
       // 最高战力只有 70 多 K，离打不动还很远），留着是为了哪天 bot 变强。
       // 别以为页面上填了它就在挡什么。
       const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限', title: '实测 bot 最高战力约 70K，这个上限目前挡不掉任何目标；留着备用' });
-      // ⚠️ 这一格从前叫「榜单超过 N 小时提示重扫」，那时它真的只是提示：日志记一句，
-      // 照样拿旧分数派遣。现在它是硬判据（分数过期的目标不进排序），所以文案跟着
-      // 改成「有效期」。改名不是措辞问题——2026-08-17 实机就是因为「日志说的不是
-      // 实话」才让一份 3.6 小时前的读数派了出去。
-      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '分数超过这个时长的目标本轮跳过（不是提示，是硬判据）；从没读到过分数的不受影响，按距离补位' });
-      settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　军力分数有效期 '), maxAge, document.createTextNode(' 小时'));
+      // ⚠️ 这一格的语义换过两次，文案必须跟着走：
+      // ① 最早叫「榜单超过 N 小时提示重扫」，真的只是提示；
+      // ② 2026-08-17 改成硬判据（超期的整批跳过）——那一版更糟，「一个新鲜分数都
+      //    没有」的夜里军力完全不参与选靶，实机连续停摆 2.5 小时；
+      // ③ 2026-08-18 起选靶交给「军力时间池」（攻击配置页），这一格**不挡任何目标**，
+      //    只用来说「选中的这批分数已经超期多久」。
+      // 同一个数字在页面上和判据里说两件事，正是前两次事故共同的形状。
+      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数超期提示（小时）', title: '只是提示：日志和页面据此说「这批分数已超期多久」，不会挡掉任何目标。真正决定「用多新的数据」的是攻击配置页上的「军力时间池」' });
+      settings.append('军力截断 前 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　分数超期提示 '), maxAge, document.createTextNode(' 小时'));
       params.append(settings);
-      // 用户要手动调这个数（主要是周一 bot 刷新日），所以那两条约束必须看得见：
-      // ① 有效期一旦卡在「一轮扫描时长」附近，能通过筛选的恰恰是这一批里军力最低的
-      //    那些（榜单按军力降序扫，先读到的读数最旧），「军力优先」就被抵消掉了；
-      // ② 它只管有分数的那些，免得用户以为调紧它会让助手少打。
+      // 用户要手动调这两个数，所以最容易搞反的三件事必须看得见：
+      // ① 截断是一刀，不是排序（后面按距离重排）；填满了等于没截；
+      // ② 时间池不在这一行上，在攻击配置页；
+      // ③ 有效期已经不挡目标了，调它不会让助手少打或多打。
       const advice = document.createElement('div');
       advice.className = 'muted';
       advice.style.fontSize = '11px';
-      advice.textContent = '实测一轮军力榜扫描约 60 分钟（1000 个 · 8.7–16.3 个/分）；有效期取一轮时长的约 2 倍，卡在一轮时长附近会只剩低军力目标可打。只影响有分数的目标：从没读到过分数的不参与排序，主力不够时按距离补位。';
+      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 按读数时间取「军力时间池」（攻击配置页）→ ④ 在池内按军力截断前 N 名 → ⑤ 按距离由近到远出击。军力只在第 ④ 步生效一次，填成 ≥ 池内目标数就完全失效。「分数超期提示」不挡任何目标，只影响日志措辞。';
       params.append(advice);
     }
     const summary = document.createElement('div');
@@ -915,7 +921,8 @@
         row.dataset.militaryPrimed = '1';
         const mode = row.querySelector('.military-enabled');
         mode.checked = task.params.by_military === true;
-        row.querySelector('.military-top-n').value = task.params.top_n ?? 50;
+        // 没配过时显示后端的默认值（`domain.target_order.TOP_BY_MILITARY`）。
+        row.querySelector('.military-top-n').value = task.params.top_n ?? 100;
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
         // 旧任务的 params_json 里还存着从前那个键，回显要认得出来，
         // 否则页面会把用户配好的数显示成默认值，保存一次就真的改掉了。
@@ -1108,8 +1115,8 @@
     const topN = Number(row.querySelector('.military-top-n').value);
     const maxAge = Number(row.querySelector('.military-score-max-age').value);
     const maximumText = row.querySelector('.military-max-score').value.trim();
-    if (!Number.isInteger(topN) || topN < 1) throw new Error('候选数量必须是大于 0 的整数');
-    if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error('军力分数有效期（小时）必须大于 0');
+    if (!Number.isInteger(topN) || topN < 1) throw new Error('军力截断必须是大于 0 的整数');
+    if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error('分数超期提示（小时）必须大于 0');
     payload.top_n = topN;
     payload.score_max_age_hours = maxAge;
     // 存下来的那一份只留新名字，免得两个键各存一个数、以后谁也说不清听哪个。

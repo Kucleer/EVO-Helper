@@ -278,6 +278,12 @@ class MilitaryAttackConfigOut(BaseModel):
     reconcile_cooldown_minutes: int | None = None
     #: 同一个 bot 坐标多久之内不重复打（小时）。**`None` = 留空 = 默认 24。**
     bot_revisit_hours: int | None = None
+    #: 军力时间池：按军力读数时间倒序取前几个进池。**`None` = 留空 = 默认 500。**
+    #:
+    #: 与任务参数里的「军力截断」（`top_n`）各管一件事：这个数管「用多新的数据」，
+    #: 那个数管「只打多强的」。范围同样由
+    #: `MissionScheduler.validate_military_time_pool` 判，这里只认「是不是整数」。
+    military_time_pool: int | None = None
 
 
 class CurrentMissionOut(BaseModel):

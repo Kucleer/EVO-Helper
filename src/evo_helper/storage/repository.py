@@ -2257,6 +2257,7 @@ class SqlAlchemyRepository:
         unknown_line_hold_minutes: int | None = None,
         reconcile_cooldown_minutes: int | None = None,
         bot_revisit_hours: int | None = None,
+        military_time_pool: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
@@ -2275,6 +2276,7 @@ class SqlAlchemyRepository:
             row.unknown_line_hold_minutes = unknown_line_hold_minutes
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
             row.bot_revisit_hours = bot_revisit_hours
+            row.military_time_pool = military_time_pool
             session.commit()
             session.refresh(row)
             return row
