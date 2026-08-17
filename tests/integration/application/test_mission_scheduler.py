@@ -1822,6 +1822,60 @@ def test_a_target_whose_score_expired_is_not_attacked(  # type: ignore[no-untype
     assert not any(part.startswith("2:140:5") for part in command)
 
 
+def test_a_pool_that_is_entirely_stale_says_so_instead_of_saying_it_finished(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **全池超期时，事实里要写明「原因是过期」，不能只留一个 0。**
+
+    这是本轮那句错话的来源：军力优先这一支的 `targets_remaining` 数的是「这一轮
+    真能打的个数」，新鲜度闸门把超期的全滤掉之后它就是 0，于是
+    `bot_round_complete` 为真，页面写「已完成」——一句听起来顺利、实际相反的话。
+
+    这里两个目标都超期（3 小时 > 配的 2 小时），一个都派不出去，而这时用户该做的
+    是等军力榜扫一轮或者把有效期调长，**不是**照着「已完成」去重开一轮。
+
+    判据落在事实上而不是页面文案上：文案的次序由
+    `tests/unit/domain/test_scheduler_status.py` 那一组守，两边合起来才是完整的。
+    """
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    bot = task_id(repository, MissionKind.BOT)
+    for coordinate in (Coordinate(2, 140, 5), Coordinate(2, 141, 6)):
+        add_bot_target(
+            session_factory,
+            coordinate,
+            military_score=9_000.0,
+            scanned_at=NOW - timedelta(hours=3),
+        )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    facts = scheduler.snapshot().facts.per_task[bot]
+    assert launcher.spawned == [], "全都超期还派出去了，那是另一个 bug"
+    assert facts.targets_remaining == 0
+    assert facts.scores_are_stale, "只剩一个 0，页面就只能把它读成「已完成」"
+
+
+def test_an_empty_pool_is_not_dressed_up_as_stale_data(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """反向那一半：候选池本来就空（真打完了）时，不许说成「数据过期」。
+
+    少了这条，一个「`usable == 0` 就报过期」的实现会全绿，而那会把每一个正常
+    跑完的轮次都说成数据有问题——用户于是永远等不到「已完成」，也就永远不知道
+    该重开一轮。
+    """
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    bot = task_id(repository, MissionKind.BOT)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    facts = scheduler.snapshot().facts.per_task[bot]
+    assert facts.targets_remaining == 0
+    assert not facts.scores_are_stale
+
+
 def test_the_old_parameter_name_still_sets_the_window(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:

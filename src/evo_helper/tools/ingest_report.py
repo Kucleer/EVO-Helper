@@ -83,7 +83,9 @@ class _CapturedScreens:
 
     def outcome_banner(self) -> str:
         # 胜负横幅同样只在详情页上；回放页那一屏顶部是 VS 块。
-        # 现在只做交叉校验，判据是 `domain.battle_outcome` 那条算式。
+        # ⚠️ 它是**第一判据**（用户口径 2026-08-17），读不出来才回落到
+        # `domain.battle_outcome` 那条算式——所以喂进来的详情页必须是
+        # **没拖过**的那一张，拖到底之后横幅已经滚出可视区。
         return self._detail.outcome_banner()
 
 

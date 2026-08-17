@@ -220,3 +220,62 @@ def test_rematching_never_invents_a_dispatch(repository, run_id) -> None:  # typ
     with repository._session_factory() as session:  # noqa: SLF001 - 直接数行
         assert session.query(orm.AttackDispatchRow).count() == 0
     assert _row(repository, report_id).match_status == "UNMATCHED"
+
+
+# -- 只读地问「库里那一行认领上了吗」 ----------------------------------------
+
+
+def test_report_claims_at_names_the_row_and_the_leg_it_claimed(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **本节的重点。** 去重挡下一封时，要能说出被挡下的是哪一行、它认了谁。
+
+    实机（生产库 2026-08-17）：日志只有一句「这份战报已经在库里；不重复入库」，
+    而攻击日志页上 4:480:6 还挂着「待战报」——看上去自相矛盾。库里那一行的
+    `match_status` 才是答案，而当时没有任何一条路把它说出来。
+    """
+    attack_id = _dispatch(repository, run_id, at=ATTACK_AT)
+    report_id = _append(repository)
+
+    (claim,) = repository.report_claims_at(TARGET, REPORTED_AT)
+
+    assert claim.report_id == report_id
+    assert claim.match_status == "MATCHED"
+    assert claim.dispatch_id == attack_id
+    # 派出时刻一并带出来：排障要对的是它与页面上那一行对不对得上，
+    # 光有 UUID 还得再查一次库。
+    assert claim.dispatched_at_utc == ATTACK_AT
+
+
+def test_report_claims_at_shows_an_unclaimed_row_as_such(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """没认领上的那一行要看得出来——**这才是 4:480:6 那天的真实形状**。
+
+    战报在库里、却不属于页面上任何一发派遣，于是它的战果永远不会出现在攻击
+    日志的战果列上。这不是矛盾，是两次不同的攻击；说不出这一句就只能靠猜。
+    """
+    _append(repository)
+
+    (claim,) = repository.report_claims_at(TARGET, REPORTED_AT)
+
+    assert claim.match_status == "UNMATCHED"
+    assert claim.dispatch_id is None
+    assert claim.dispatched_at_utc is None
+
+
+def test_report_claims_at_writes_nothing(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 这条路**只读**。与 `rematch_report_at` 分家正是为了这一点：
+
+    排障可以随便问，不必担心问一次就改一次库。
+    """
+    _dispatch(repository, run_id, at=SCOUT_AT, mission=MISSION_KIND_SCOUT, preset="侦察")
+    report_id = _append(repository)
+    before = _row(repository, report_id).match_status
+
+    repository.report_claims_at(TARGET, REPORTED_AT)
+
+    assert _row(repository, report_id).match_status == before
+
+
+def test_report_claims_at_is_empty_for_a_moment_nothing_was_stored_at(repository) -> None:  # type: ignore[no-untyped-def]
+    """键上没有行就返回空——调用方据此说「查不到」，而不是编一句话出来。"""
+    _append(repository)
+
+    assert repository.report_claims_at(TARGET, REPORTED_AT + timedelta(seconds=1)) == ()
