@@ -147,6 +147,13 @@
           <th scope="col">任务</th>
           <th scope="col">出发星球 / 航线</th>
           <th scope="col">参数</th>
+          {#
+            标题上把时区写死。页面别处的时间列也都按 Asia/Shanghai 渲染，
+            但这两个是**输入**框——用户填进去的那串数字到底按哪个时区解释，
+            不写出来就只能靠猜，猜错正好差 8 小时。
+            （「战报补录」那个日期控件标的是 UTC，是特例，别拿它类比。）
+          #}
+          <th scope="col">定时开关（UTC+8）</th>
           <th scope="col">状态</th>
         </tr>
       </thead>
@@ -207,6 +214,8 @@
   <p class="muted" id="mission-hint" style="margin:8px 0 0;font-size:12px">
     改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。
     航线数是**这颗出发星球上**这个任务能占几条——上限按星球各一份，不是账号共享。
+    定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、
+    也不打断正在跑的那一轮。
   </p>
 </section>
 
@@ -341,7 +350,9 @@
   // 挡不住直接打接口的，只拒不置灰则要用户改完才发现。
   const LOCKED_HINT = '调度器运行中，任务配置已固化，不可修改；点「结束」后可改。'
     + '被自动停用的链路仍可点「恢复」。';
-  const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。';
+  const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。'
+    + '定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、'
+    + '也不打断正在跑的那一轮。';
 
   const rows = document.getElementById('mission-rows');
   const errorBox = document.getElementById('mission-error');
@@ -393,6 +404,36 @@
       if (value !== undefined && value !== null) input.setAttribute(key, value);
     }
     return input;
+  }
+
+  // ---- 定时窗口的时区换算 ---------------------------------------------------
+  //
+  // 库里存 UTC，页面**输入和显示都按 UTC+8**（控件标题上写着）。换算集中在这两个
+  // 函数里，两边互为逆运算。
+  //
+  // 直接加减 8 小时而不是走 `toLocaleString` 再解析：UTC+8 没有夏令时，偏移量
+  // 恒定，而 `toLocaleString` 的输出格式各浏览器不一致，再解析回去是给自己挖坑。
+  const UTC8_MS = 8 * 3600 * 1000;
+
+  function toWindowInput(iso) {
+    // 时区后缀缺失时按 UTC 读（同 `elapsed`）：少了它浏览器会按本机时区解释，
+    // 而本机正是 UTC+8——回显出来的时刻会比库里存的早 8 小时，而且看着很正常。
+    if (!iso) return '';
+    const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`;
+    const ms = Date.parse(stamped);
+    if (Number.isNaN(ms)) return '';
+    // `toISOString()` 给的是 UTC 的墙上时钟；先把时刻推 8 小时，取到的那串
+    // 数字就正好是 UTC+8 的墙上时钟，也就是 `datetime-local` 要的格式。
+    return new Date(ms + UTC8_MS).toISOString().slice(0, 16);
+  }
+
+  function fromWindowInput(value) {
+    // 空串在接口上是一个**动作**：把这一端退回「不限」。
+    const text = (value || '').trim();
+    if (text === '') return '';
+    // 显式带上 `+08:00`。不带偏移量的话服务端会 400——这是有意的，
+    // 一个没有时区的时刻在这条链路上必然差 8 小时，且不会报任何错。
+    return `${text.slice(0, 16)}:00+08:00`;
   }
 
   function makeCell(row, ...nodes) {
@@ -639,6 +680,33 @@
     summary.textContent = '…';
     makeCell(row, params, summary);
 
+    // 定时开关。**留空 = 这一端不限**，两端都留空就是完全按现在的样子跑。
+    //
+    // 它和「参与调度」那个复选框是**与**的关系，不是同一件事的两种写法：复选框
+    // 是用户的意志（勾掉就是不想跑），定时窗口只是在它之上再加一道时间闸门。
+    // 到点绝不去改那个复选框——改了的话，用户手动开的会被悄悄关掉，而且事后
+    // 分不清是谁关的。
+    const window_ = document.createElement('div');
+    window_.className = 'mission-window';
+    for (const [className, label] of [['mission-enabled-from', '开启'], ['mission-enabled-until', '关闭']]) {
+      const line = document.createElement('div');
+      const text = document.createElement('span');
+      text.className = 'inline-label';
+      text.textContent = label;
+      const input = makeInput(className, {
+        type: 'datetime-local', style: 'width:180px', 'aria-label': `${label}时间（UTC+8）`,
+      });
+      line.append(text, input);
+      window_.append(line);
+    }
+    const windowNote = document.createElement('div');
+    windowNote.className = 'muted';
+    windowNote.style.fontSize = '11px';
+    // 「不抢停」必须写在页面上：用户看到关闭时刻已过而任务还在跑，不写清楚
+    // 就只能理解成「定时没生效」，然后去点强制结束。
+    windowNote.textContent = '留空=不限；到点只挡新的一轮，正在跑的不打断';
+    makeCell(row, window_, windowNote);
+
     // 状态。
     const chip = document.createElement('span');
     chip.className = 'chip mission-status';
@@ -815,6 +883,8 @@
         if (originInput) populateTaskPlanetSelect(originInput, task.origin || '');
         const linesInput = row.querySelector('.mission-lines');
         if (linesInput) linesInput.value = task.fleet_lines || '';
+        row.querySelector('.mission-enabled-from').value = toWindowInput(task.enabled_from_utc);
+        row.querySelector('.mission-enabled-until').value = toWindowInput(task.enabled_until_utc);
       }
 
       if (task.kind === 'BOT' && (!row.dataset.militaryPrimed || locked)) {
@@ -1165,6 +1235,17 @@
       // 空框不往上送：清空航线数目前没有对应的动作（后端的 null 表示「不动它」），
       // 送 0 上去会被 400 拦下，而那条错在用户眼里是「删了个数字就报错」。
       if (value !== '') patch(taskId, { fleet_lines: Number(value) });
+      return;
+    }
+    // 定时窗口。两端各存各的，**清空一端不影响另一端**——合起来送的话，
+    // 只清开启时刻会把关闭时刻一起抹掉，那是一个「本以为到点会停、结果一直跑
+    // 下去」的错。空串在接口上就是「退回不限」，所以这里不像航线数那样拦着不送。
+    if (event.target.matches('.mission-enabled-from')) {
+      patch(taskId, { enabled_from: fromWindowInput(event.target.value) });
+      return;
+    }
+    if (event.target.matches('.mission-enabled-until')) {
+      patch(taskId, { enabled_until: fromWindowInput(event.target.value) });
       return;
     }
     if (event.target.matches('.mission-param')) {

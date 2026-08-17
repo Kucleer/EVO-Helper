@@ -37,7 +37,7 @@ PARAM_LABELS: dict[str, str] = {
 }
 
 
-#: 八档状态各自的 chip 色调与字形。
+#: 每一档状态各自的 chip 色调与字形。
 #:
 #: 键是 `TaskStatus` 的**每一个**成员，一个都不许缺——调度台按状态上色，
 #: 少一格就意味着有两档被当成了同一件事，而恰恰是「未启用 / 待命」与
@@ -56,6 +56,10 @@ STATUS_TONES: dict[str, str] = {
     TaskStatus.DONE.value: "ok",
     TaskStatus.DISABLED.value: "danger",
     TaskStatus.OFF.value: "",
+    # 定时窗口这两档和「未启用」同色：它们同样是「用户自己配成不跑」，
+    # 不是故障也不是警告。区别全靠那句话本身和字形。
+    TaskStatus.BEFORE_WINDOW.value: "",
+    TaskStatus.AFTER_WINDOW.value: "",
 }
 
 STATUS_GLYPHS: dict[str, str] = {
@@ -67,6 +71,9 @@ STATUS_GLYPHS: dict[str, str] = {
     TaskStatus.DONE.value: "★",
     TaskStatus.DISABLED.value: "✕",
     TaskStatus.OFF.value: "○",
+    # 沙漏的两个方向：还没到 = 沙子在上，已经过 = 沙子在下。
+    TaskStatus.BEFORE_WINDOW.value: "⧗",
+    TaskStatus.AFTER_WINDOW.value: "⧖",
 }
 
 
