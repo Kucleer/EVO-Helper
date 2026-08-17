@@ -57,8 +57,6 @@ from evo_helper.domain.military_attack import (
     AttackOrigin,
     MilitaryTier,
     assign_by_capacity_and_distance,
-    military_pool,
-    top_up_with_unrated,
 )
 from evo_helper.domain.missions import (
     ORIGIN,
@@ -107,11 +105,14 @@ from evo_helper.domain.scheduler import (
 )
 from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
+    DEFAULT_TIME_POOL,
     TOP_BY_MILITARY,
-    FreshnessSplit,
     ScoredTarget,
-    split_by_freshness,
+    newest_readings_first,
+    score_is_fresh,
     strongest_then_nearest,
+    strongest_within,
+    with_a_military_reading,
 )
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -211,68 +212,79 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True)
 class MilitaryPoolReading:
-    """军力候选池这一次数出来的账：**能打的有几个、被新鲜度跳过了几个**。
+    """军力候选池这一次的账：**五步流水线每一步之后各剩多少，以及选中的这批有多旧**。
 
     做成一个结构而不是只返回一个列表，是因为日志得说实话。原先那句
     「军力候选池数据已过期（最旧读数 …）」既不说这一轮还剩多少能打，也不说被跳过
     的是哪一批——实机 2026-08-17 就是被它误导的：它报的「最旧读数」是三天前的
     某一条，而正要打的那个目标超期 3.6 小时，日志里一个字都没提。
+
+    ⚠️ **它把整条选靶算一遍并把结果留下来**，选靶不许在别处再算第二份：
+    「命令行按一份口径算、页面按另一份显示」这种分家 2026-08-15 已经撞过一次，
+    症状是**一发都不派而且不报错**。
     """
 
-    #: 三堆：主力（有分数且新鲜）、补位（没有分数）、跳过（有分数但过期）。
-    split: FreshnessSplit
-    #: 这一次用的有效期，写进日志好让用户对得上自己配的那个数。
+    #: 第 1 步之后：排除近 24 小时打过的与本轮走完的，剩下的全部候选。
+    candidates: tuple[ScoredTarget, ...]
+    #: 第 2 步之后：其中**有军力读数**的那些（分数与读取时刻都在）。
+    with_readings: tuple[ScoredTarget, ...]
+    #: 第 3 步之后：按读数时间倒序取的**时间池**。
+    time_pool: tuple[ScoredTarget, ...]
+    #: 第 4 步之后：时间池里按军力截断出来的那一批，也就是**这一轮真的要打的**。
+    selected: tuple[ScoredTarget, ...]
+    #: 这一次用的时间池大小与军力截断，写进日志好让用户对得上自己配的那两个数。
+    time_pool_size: int
+    take: int
+    #: 这一次用的「分数算不算新」的门槛。**它不挡任何目标**，只用来算 `stale`。
     max_age: timedelta
-
-    @property
-    def rated(self) -> tuple[ScoredTarget, ...]:
-        return self.split.rated
-
-    @property
-    def unrated(self) -> tuple[ScoredTarget, ...]:
-        return self.split.unrated
-
-    @property
-    def usable(self) -> int:
-        """这一轮真的可以打的个数：**主力 + 补位**。
-
-        ⚠️ 补位必须算进来。不算的话，一个「全库都没有分数」的正常夜晚会被判成
-        「没活干」，而那些目标打起来毫无风险（实测最高战力只有 70 多 K，离打不动
-        还很远），只是排不了序而已。
-        """
-        return len(self.split.rated) + len(self.split.unrated)
+    #: 算这一次账的时刻。
+    now: datetime
 
     @property
     def attackable(self) -> int:
-        """过新鲜度闸门**之前**还剩多少个（已排除近 24 小时打过的与本轮走完的）。"""
-        return self.usable + len(self.split.expired)
+        """第 1 步之后还剩多少个。"""
+        return len(self.candidates)
 
     @property
-    def skipped(self) -> int:
-        return len(self.split.expired)
+    def usable(self) -> int:
+        """这一轮**还有多少个能打**：有军力读数的候选数（第 2 步之后）。
 
-    @property
-    def all_stale(self) -> bool:
-        """一个能打的都没有，**而且原因是分数过期**。
+        ⚠️ **数的是全库还能打的总数，不是「这一轮选中了几个」。** 后者恒等于
+        军力截断那个数（默认 100），拿它当「还剩几个」会让页面上那个数几乎不动。
+        页面据此判「有没有活干」（`domain.scheduler.bot_round_complete`），
+        而「还有能打的」正是这个量。
 
-        ⚠️ 它专门用来把两件在 `usable` 上长得一模一样的事分开：
-        「这一轮的目标全打完了」和「目标都还在，只是分数超期被闸门滤掉了」——
-        两边 `usable` 都是 0，而页面把前者写作「已完成」。第二种被那句话盖住时，
-        用户看到的是一句听起来顺利的话，于是不会去做真正该做的两件事：
-        等军力榜扫一轮，或者把有效期调长。
-
-        判据要求 `skipped > 0`，不能只看 `usable == 0`：候选池本来就空（真打完了、
-        或者全在重复攻击间隔里）时 `skipped` 也是 0，那一档不该冒充「数据过期」。
+        ⚠️ **没有军力读数的不算在内**（用户 2026-08-18 决定，理由见
+        `domain.target_order`）。它们不再参与攻击，算进来等于说「还有活干」，
+        而实际一个都派不出去。
         """
-        return self.usable == 0 and self.skipped > 0
+        return len(self.with_readings)
 
     @property
-    def oldest_skipped_at(self) -> datetime | None:
-        """被跳过的那批里最旧的那条读数。"""
+    def dropped_unrated(self) -> int:
+        """第 2 步剔掉了几个：从没上过军力榜、或说不清什么时候读的。"""
+        return self.attackable - self.usable
+
+    @property
+    def stale(self) -> int:
+        """**选中的这批**里有几个分数已经超期。
+
+        ⚠️ **这是提示信号，不是判据**：这几个照样会被打出去。它只回答
+        「今晚这一批是照着多旧的军力数据挑的」，让人事后能解释「为什么打的是这几个」。
+        """
+        return sum(
+            1
+            for target in self.selected
+            if not score_is_fresh(target, now=self.now, max_age=self.max_age)
+        )
+
+    @property
+    def oldest_selected_at(self) -> datetime | None:
+        """选中的这批里最旧的那条读数。"""
         return min(
             (
                 target.military_score_at_utc
-                for target in self.split.expired
+                for target in self.selected
                 if target.military_score_at_utc is not None
             ),
             default=None,
@@ -280,10 +292,16 @@ class MilitaryPoolReading:
 
     @property
     def starved(self) -> bool:
-        """有候选，却一个能打的都没有——也就是**全都是「有分数但过期」那一档**。
+        """有候选，却一个有军力读数的都没有——**军力榜还没扫到它们**。
 
         ⚠️ **和「一个候选都没有」必须分开。** 后者是完全正常的一档（已知 bot 全在
-        24 小时冷却里或还在飞），拿它去报「军力榜扫描跟不上」是句假话。
+        24 小时冷却里或还在飞），拿它去报「军力榜没跟上」是句假话。
+
+        ⚠️ **2026-08-18 之前这个判据是空转的。** 那时 `usable = 有读数的 + 没读数的`,
+        而库里从来都有没读数的行（实测 628 个），所以它恒为假：那条 WARNING
+        在生产库里一次都没响过，`MISSING_MILITARY_SCORES` 那个页面状态也基本
+        显示不出来。没有读数的目标退出攻击之后，这个判据才第一次有了真的含义
+        ——「军力榜还没扫过（或者刚清过一次坏读数），此刻一个都派不出去」。
         """
         return self.attackable > 0 and self.usable == 0
 
@@ -795,6 +813,10 @@ class MissionScheduler:
         """校验攻击配置页上那个「同一个 bot 多久之内不重复打」。留空返回 `None`。"""
         return _bot_revisit_hours(value)
 
+    def validate_military_time_pool(self, value: object) -> int | None:
+        """校验攻击配置页上那个「军力时间池」。留空返回 `None` = 默认 500。"""
+        return _military_time_pool(value)
+
     def unknown_line_hold(self) -> timedelta:
         """飞行时间读不到时，一条航线占多久。**读侧的唯一入口。**
 
@@ -838,6 +860,25 @@ class MissionScheduler:
             detail="飞行时间读不到的派遣按这个时长占航线",
         )
         return hold
+
+    def _military_time_pool(self) -> int:
+        """时间池大小：按读数时间倒序取前几个。**留空 = `DEFAULT_TIME_POOL`（500）。**
+
+        它与军力截断（任务参数里的 `top_n`）各管一件事：这个数管「用多新的军力
+        数据」，那个数管「只打多强的」。两件事必须分开配，理由写在
+        `domain.target_order.DEFAULT_TIME_POOL` 上。
+        """
+        size = self._knob("military_time_pool")
+        if size is None:
+            return DEFAULT_TIME_POOL
+        record_knob_override(
+            "military_time_pool",
+            source=__name__,
+            effective=size,
+            default=DEFAULT_TIME_POOL,
+            detail="按军力读数时间倒序取这么多个进时间池，军力截断在这一池之内生效",
+        )
+        return size
 
     def _bot_revisit_window(self) -> timedelta:
         """同一个 bot 坐标多久之内不重复打。"""
@@ -1301,16 +1342,20 @@ class MissionScheduler:
     ) -> None:
         """池子连着一段时间一个能打的都筛不出来时，往 `system_log` 写一条 WARNING。
 
-        **为什么非有这条不可。** 新鲜度闸门把「候选全都顶着过期分数」变成了
-        「此刻没活干」，那是对的——调度器会去跑军力榜扫描。但如果扫描本身跟不上
-        有效期（扫得太慢、榜单读不出来、或者用户把有效期调得比一轮扫描还短），
-        这个状态会一直维持，而页面上只有一句不痛不痒的状态：**攻击悄悄停摆一整夜，
-        没人知道。**
+        **为什么非有这条不可。** 「候选一个军力读数都没有」会落成「此刻没活干」，
+        那是对的——调度器会去跑军力榜扫描。但如果扫描本身跑不起来（扫得太慢、
+        榜单页读不出来、军力榜任务被停用），这个状态会一直维持，而页面上只有一句
+        不痛不痒的状态：**攻击悄悄停摆一整夜，没人知道。**
 
-        ⚠️ 这一档现在**只可能由「有分数但过期」造成**：没有分数的目标走补位池，
-        照样能打（`MilitaryPoolReading.usable`）。所以措辞说的是「分数全都过期」，
-        不能再写成笼统的「读不到数据」——后者会把一个全库都没扫过的正常夜晚
-        也说成故障。
+        ⚠️ 这一档 2026-08-18 起**只可能由「从没上过军力榜」造成**：超期的分数不再
+        挡任何目标（选靶交给时间池），所以措辞也跟着从「分数全都过期、扫描跟不上
+        有效期」改成「一个军力读数都没有、军力榜还没扫到它们」。
+        **不改的话这条警告会指着一个不存在的原因**，而用户照它去把有效期调长，
+        调完照样一发不派。
+
+        ⚠️ 顺带记一笔：**这条警告在 2026-08-18 之前一次都没响过。** 那时
+        `usable = 有读数的 + 没读数的`，而库里从来都有没读数的行（实测 628 个），
+        `starved` 恒为假。没有读数的目标退出攻击之后它才第一次有真的含义。
 
         写在 `_step` 里而不是 `_military_pool_reading` 里，因为后者页面线程也会走
         （`snapshot` → `_facts`），按它计数等于把页面轮询算成调度轮次。
@@ -1336,28 +1381,21 @@ class MissionScheduler:
                 continue
             self._stale_pool_warned_at[task_id] = now
             task = by_id.get(task_id)
-            hours = reading.max_age.total_seconds() / 3600
             record_system_log(
                 "WARNING",
                 "application.mission_scheduler",
                 f"「{task.name if task else task_id}」的军力候选池已连续 "
                 f"{rounds} 轮（自 {since:%Y-%m-%d %H:%M} UTC 起）"
-                f"筛不出能打的目标：{reading.attackable} 个候选的军力分数全部过期，"
-                f"军力榜扫描可能跟不上 {hours:.1f} 小时的有效期。"
-                f"攻击已停在这里，请确认扫描是否还在跑、或把有效期放宽",
+                f"筛不出能打的目标：{reading.attackable} 个候选一个军力读数都没有，"
+                f"军力榜还没扫到它们。攻击已停在这里，请确认军力榜扫描是否还在跑",
                 payload={
                     "task_id": task_id,
                     "mission_kind": MissionKind.BOT.value,
                     "attackable": reading.attackable,
-                    "usable": 0,
-                    "score_max_age_hours": hours,
+                    "with_readings": 0,
+                    "dropped_unrated": reading.dropped_unrated,
                     "starved_since_utc": since.isoformat(),
                     "starved_rounds": rounds,
-                    "oldest_skipped_at_utc": (
-                        None
-                        if reading.oldest_skipped_at is None
-                        else reading.oldest_skipped_at.isoformat()
-                    ),
                 },
                 logged_at_utc=now,
             )
@@ -1712,12 +1750,12 @@ class MissionScheduler:
                     moment = next_free[item.coordinate]
                     if moment is not None:
                         free_moments.append(moment)
-                # ⚠️ 这里算的是**这一轮真的能打的**那几个（主力 + 补位），不含
-                # 「有分数但过期」那一堆。军力优先这一支的「有没有活干」就是这个数
-                # （`domain.scheduler.bot_round_complete`），于是「候选全都顶着过期
-                # 分数」自然落成「此刻没活干」，调度器会去跑军力榜扫描把池子刷新
-                # ——而**不是**抛异常。抛出去的话 `_launch` 会把任务停用，用户不点
-                # 「恢复」它就永远不跑，比拿旧数据打糟得多（见 `MissionIdle`）。
+                # ⚠️ 这里算的是**还有多少个能打**（有军力读数的候选数），不是
+                # 「这一轮选中了几个」——后者恒等于军力截断那个数。军力优先这一支的
+                # 「有没有活干」就是这个数（`domain.scheduler.bot_round_complete`），
+                # 于是「候选一个军力读数都没有」自然落成「此刻没活干」，调度器会去跑
+                # 军力榜扫描把池子刷新——而**不是**抛异常。抛出去的话 `_launch` 会把
+                # 任务停用，用户不点「恢复」它就永远不跑（见 `MissionIdle`）。
                 reading = self._military_pool_reading(row)
                 readings[task.task_id] = reading
                 per_task[task.task_id] = replace(
@@ -1725,7 +1763,7 @@ class MissionScheduler:
                     free_lines=free,
                     reports_due=self._reports_due(task, now, grace),
                     targets_remaining=reading.usable,
-                    scores_are_stale=reading.all_stale,
+                    scores_are_missing=reading.starved,
                     last_dispatch_at_utc=max(
                         (item for item in last_dispatches if item is not None), default=None
                     ),
@@ -1831,8 +1869,8 @@ class MissionScheduler:
             return 0
         try:
             if _bot_by_military(row.params_json):
-                # 只数这一轮真能打的（主力 + 补位）：军力优先这一支「有没有活干」
-                # 就是这个数。
+                # 只数还有多少个能打（有军力读数的候选）：军力优先这一支
+                # 「有没有活干」就是这个数。
                 return self._military_pool_reading(row).usable
             targets = self._bot_selection(row.params_json, self._origin_of(row))
         except MissionParamError as exc:
@@ -1910,6 +1948,7 @@ class MissionScheduler:
             return strongest_then_nearest(
                 self._scored_bot_targets(),
                 origin,
+                time_pool=self._military_time_pool(),
                 take=_bot_top_n(params_json),
                 max_score=_bot_max_score(params_json),
             )
@@ -1960,54 +1999,32 @@ class MissionScheduler:
         )
 
     def _military_assignments(self, row: orm.MissionTaskRow) -> tuple[AssignedTarget, ...]:
-        """军力池先排除本轮已处理目标，否则前 N 打完会静默卡住。
-
-        ⚠️ **四步的先后是判据的一部分，不能重排**：
+        """这一轮打谁、从哪出发。**五步的先后是判据的一部分，不能重排。**
 
         1. 排除近 24 小时打过的与本轮已走完的（`_military_candidates`）；
-        2. 按分数的新鲜度分成主力 / 补位 / 跳过（`_military_pool_reading`）；
-        3. **主力**按军力取前 N（`military_pool`）；
-        4. 前 N 没取满时，**补位**按距离补齐（`top_up_with_unrated`）。
+        2. 只留有军力读数的（`with_a_military_reading`）；
+        3. 按读数时间倒序取**时间池**（`newest_readings_first`）；
+        4. 时间池里按军力**截断**（`strongest_within`）；
+        5. 按距离分给各出发星球、由近到远出击（`assign_by_capacity_and_distance`）。
 
-        第 2 步必须在第 3 步之前：反过来的话，前 N 里若大半超期，这一轮实际可打的
-        就只剩零星几个，而用户配的「候选 500 名」在页面上看不出任何差别。
+        前四步在 `_military_pool_reading` 里一次算完，这里只取结果——**选靶口径
+        只能有这一份**。每一步的理由写在 `domain.target_order` 的模块头上，
+        这里只重复最容易搞反的两条：
 
-        第 4 步必须在第 3 步**之后**、且不参与第 3 步的排序：补位没有分数，混进
-        `strongest_first` 会让它们占掉前 N 的名额，于是「军力优先」在补位多的夜里
-        退化成「随便打」。两条理由都写在 `domain.military_attack.top_up_with_unrated`
-        与 `domain.target_order.split_by_freshness` 上。
+        - 第 1 步必须在最前，否则首批刚好都打过时候选池会缩成空集；
+        - 第 4 步是**截断**不是排序，因为第 5 步按距离重排会把排序结果整个抹掉。
         """
         reading = self._military_pool_reading(row)
         origins = self._military_origins(row)
         if not origins:
             raise MissionParamError("军力攻击没有启用的出发星球")
-        take = _bot_top_n(row.params_json)
-        pool = top_up_with_unrated(
-            military_pool(
-                reading.rated,
-                take=take,
-                maximum_score=_bot_max_score(row.params_json),
-            ),
-            reading.unrated,
-            [item.coordinate for item in origins],
-            take=take,
-        )
-        # 说实话的那一句：这一轮**还剩多少能打**、补位补了几个，而不是
-        # 「整池里最旧的那条是哪年的」。
+        # 说实话的那一句：**每一步之后各剩多少**，让人只靠库里的日志就能复盘
+        # 「为什么打的是这几个」。落库不落文件——实机跑在另一台机器上。
         #
         # ⚠️ 仍然**不从这里启动 RANKING**：两条链路会争同一只鼠标。刷新交给调度器
-        # 的填空隙机制。变的只是「顶着假分数的不再拿来排序」，那一只鼠标都不多占。
-        if reading.skipped:
-            _LOGGER.info(
-                "军力候选池：%d 个候选中 %d 个分数在 %.1f 小时内，"
-                "%d 个从未读到分数（按距离补位），%d 个分数已过期并跳过（最旧 %s）",
-                reading.attackable,
-                len(reading.rated),
-                reading.max_age.total_seconds() / 3600,
-                len(reading.unrated),
-                reading.skipped,
-                reading.oldest_skipped_at,
-            )
+        # 的填空隙机制。
+        self._log_the_military_pipeline(row, reading)
+        pool = reading.selected
         try:
             tiers_json = self._active_military_tiers_json
             if tiers_json is None:
@@ -2023,28 +2040,82 @@ class MissionScheduler:
         )
 
     def _military_pool_reading(self, row: orm.MissionTaskRow) -> MilitaryPoolReading:
-        """这一轮的候选池账目：**按分数的新鲜度分三堆，并数清楚跳过了多少**。
+        """把选靶的前四步**一次算完**，每一步的中间结果都留着。
 
-        这道闸门刻意放在**取前 N 名之前**（`_military_assignments` 里那段注释写了
-        为什么），所以它住在这里而不是 `military_pool` 后面。
+        ⚠️ **选靶只能在这里算一次。** 页面上的「还剩几个」、日志里的每一步余量、
+        真正下发的那批目标，全都从这一份结果里取。三处各算一遍的话，最先分家的
+        是「军力优先」那一支——2026-08-15 撞过一次，症状是一发都不派而且不报错。
 
-        ⚠️ **跳过的只有「有分数但过期」那一堆。** 完全没有分数的进补位池——它们
-        不参与按军力排序，挤不掉任何人，判据与理由在
-        `domain.target_order.split_by_freshness` 上。
+        ⚠️ **有效期（`max_age`）在这里不挡任何目标**，只是随手记下来，好让日志
+        说清「选中的这批分数已经超期多久」。理由整段写在 `domain.target_order`
+        的模块头第 3 步上：当过滤器用的那一版，在「一个新鲜分数都没有」的夜里
+        会把军力整个踢出选靶（2026-08-17 实机连续 2.5 小时）。
         """
-        max_age = _bot_score_max_age(_params(row.params_json))
+        params = _params(row.params_json)
+        max_age = _bot_score_max_age(params)
+        time_pool_size = self._military_time_pool()
+        take = _bot_top_n(row.params_json)
+        candidates = self._military_candidates(row)
+        with_readings = with_a_military_reading(candidates)
+        time_pool = newest_readings_first(with_readings, take=time_pool_size)
+        selected = strongest_within(time_pool, take=take, max_score=_bot_max_score(row.params_json))
         return MilitaryPoolReading(
-            split=split_by_freshness(
-                self._military_candidates(row), now=self._clock(), max_age=max_age
-            ),
+            candidates=tuple(candidates),
+            with_readings=tuple(with_readings),
+            time_pool=time_pool,
+            selected=selected,
+            time_pool_size=time_pool_size,
+            take=take,
             max_age=max_age,
+            now=self._clock(),
+        )
+
+    def _log_the_military_pipeline(
+        self, row: orm.MissionTaskRow, reading: MilitaryPoolReading
+    ) -> None:
+        """把这一轮选靶的**每一步余量**写进 `system_log`。
+
+        判据不是「有没有打日志」，而是**出事时能不能只靠库里的日志复盘
+        「为什么打的是这几个」**。所以四个数一个都不能省：剔除后 / 有读数 /
+        时间池 / 军力截断——少任何一个，读日志的人就分不清是「没候选」「没读数」
+        还是「被截断挡在外面」，而这三种的善后完全不同。
+
+        ⚠️ **不限流**：这个函数只在真的要组一次出击命令时走（`_military_assignments`
+        ← `_military_command`），一轮一条，不是每 tick 一条。反过来说也别把它挪到
+        `_facts` 里去——那里页面轮询也会走，一夜就是几万行。
+        """
+        oldest = reading.oldest_selected_at
+        record_system_log(
+            "INFO",
+            "application.mission_scheduler",
+            f"军力候选池：排除近 24 小时打过的之后剩 {reading.attackable} 个，"
+            f"其中 {reading.usable} 个有军力读数（{reading.dropped_unrated} 个从未上榜，不参与）；"
+            f"按读数时间取时间池前 {reading.time_pool_size} 个 → {len(reading.time_pool)} 个；"
+            f"再按军力截断前 {reading.take} 个 → {len(reading.selected)} 个，"
+            f"其中 {reading.stale} 个分数已超过 {reading.max_age.total_seconds() / 3600:.1f} 小时"
+            f"（最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}）",
+            payload={
+                "task_id": row.id,
+                "mission_kind": MissionKind.BOT.value,
+                "attackable": reading.attackable,
+                "with_readings": reading.usable,
+                "dropped_unrated": reading.dropped_unrated,
+                "time_pool_size": reading.time_pool_size,
+                "time_pool": len(reading.time_pool),
+                "take": reading.take,
+                "selected": len(reading.selected),
+                "stale_selected": reading.stale,
+                "score_max_age_hours": reading.max_age.total_seconds() / 3600,
+                "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
+            },
+            logged_at_utc=reading.now,
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
-        """取前 N 名前，先排除本轮与「重复攻击间隔」之内已攻击的 bot。
+        """**第 1 步，必须在最前**：排除本轮与「重复攻击间隔」之内已攻击的 bot。
 
         若先拿前 N 再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
-        空集，较低排名、从未攻击的目标永远轮不到。排除必须在 ``military_pool``
+        空集，较低排名、从未攻击的目标永远轮不到。排除必须在时间池与军力截断
         的前面，随后再由距离给各出发星球分配。
 
         间隔默认 24 小时（用户口径 2026-08-15），可在攻击配置页上改——
@@ -2551,6 +2622,34 @@ def _bot_revisit_hours(value: object) -> int | None:
     return hours
 
 
+def _military_time_pool(value: object) -> int | None:
+    """时间池大小：按军力读数时间倒序取前几个。**留空 = `DEFAULT_TIME_POOL`（500）。**
+
+    ## 一条边界
+
+    **至少 1。** 0 等于时间池是空的，于是军力截断在空池上取前 N——这一轮一发都
+    派不出去，而页面上只会显示「暂无可打目标」。它不是「关掉这一步」，只是把整条
+    链路静静掐死，所以当场拒掉。
+
+    ## ⚠️ **不设上界**，但代价是真的
+
+    填成大于等于「有军力读数的候选数」时，这一步就完全不截了——所有有读数的目标
+    都进池，军力截断随之在整张表上生效。那不是错，只是「用多新的数据」这件事没人
+    管了：军力最高的那些恰恰读数最旧（榜单按军力降序扫），池子越大，选出来的
+    越可能是照着一份很旧的军力挑的。这句话留在页面上说，这里不拦——同
+    `_blind_scrolls`，一个观测量不该当成硬闸门。
+    """
+    size = _optional_int(value, label="军力时间池")
+    if size is None:
+        return None
+    if size < 1:
+        raise MissionParamError(
+            "军力时间池至少是 1：填 0 等于时间池为空、军力截断在空池上取前 N，"
+            "这一轮一发都派不出去，而页面上只会显示「暂无可打目标」。要用默认值就留空。"
+        )
+    return size
+
+
 def _report_scan_hours(value: object) -> int | None:
     """对账那一趟翻信箱最多往回读几个小时。**留空 = 用默认的 6 小时。**
 
@@ -2605,7 +2704,12 @@ def _bot_by_military(raw: str) -> bool:
 
 
 def _bot_top_n(raw: str) -> int:
-    """军力优先时取前几名。默认 `TOP_BY_MILITARY`（用户口径：50）。"""
+    """**军力截断**：在时间池里按军力取前几个。默认 `TOP_BY_MILITARY`（用户口径：100）。
+
+    ⚠️ **它是一道截断，不是一次排序。** 后面按距离重排会把排序结果整个抹掉，
+    所以军力只在这里生效一次；填成 ≥ 时间池里的目标数就完全失效
+    （2026-08-18 之前它被填成 500 而可用候选只有 591，正是这个状态）。
+    """
     value = _params(raw).get("top_n")
     return (
         int(value)
@@ -2632,17 +2736,21 @@ _LEGACY_SCORE_MAX_AGE_KEY = "rescan_after_hours"
 
 
 def _bot_score_max_age(data: dict[str, Any]) -> timedelta:
-    """军力**分数**的有效期。**它现在是硬判据，分数过期的目标一律不打。**
+    """军力分数「算不算新」的门槛。**2026-08-18 起它是提示信号，不挡任何目标。**
 
-    ⚠️ **名字换过一次，别按旧名字理解它。** 它原先叫 `rescan_after_hours`，
-    界面上写着「榜单超过 N 小时提示重扫」——那时它确实只是提示：日志里记一句，
-    然后照样拿旧读数派遣。实机 2026-08-17 就栽在这上面：用户设的是 1 小时，
-    而 `4:293:6` 顶着 3.6 小时前的读数被打了出去。现在它决定一个**分数**还能不能
-    用来排序（`domain.target_order.score_is_fresh`），文案与字段名必须跟着变，
-    否则同一个数字在页面上和判据里说的是两件事。
+    ⚠️ **语义换过两次，别按任何一个旧名字理解它。**
 
-    ⚠️ **它管不到没有分数的目标。** 那些走补位池，照打不误——理由（旧分数害的是
-    排序，不是战果）在 `domain.target_order` 的模块头上。
+    - 最早叫 `rescan_after_hours`，页面上写「榜单超过 N 小时提示重扫」，真的只是
+      提示：日志记一句，照样拿旧读数派遣。实机 2026-08-17 栽在这上面——用户设的
+      是 1 小时，而 `4:293:6` 顶着 3.6 小时前的读数被打了出去。
+    - 2026-08-17 把它改成硬判据（分数过期的整批跳过）。**那一版更糟**：一个新鲜
+      分数都没有时，候选池退化成「军力完全不参与」，实机当晚连续 2.5 小时如此。
+    - 2026-08-18 起选靶交给**时间池**（按读数时间倒序取前 N，见
+      `domain.target_order`）。时间池永远拿得出最新的那批，哪怕全部超期，军力截断
+      照样成立。这个数只用来在日志和页面上说「选中的这批分数已经超期多久」。
+
+    ⚠️ **页面文案必须跟着它走。** 同一个数字在页面上和判据里说两件事，正是上面
+    那两次事故共同的形状。
 
     旧名字仍然读得出来（`_LEGACY_SCORE_MAX_AGE_KEY`）：生产库里已经存着一批带旧
     键的 `params_json`，读不出来就会静默回落到默认值，把用户配好的数悄悄改掉。

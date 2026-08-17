@@ -151,8 +151,9 @@ def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
     「范围内有没有 bot」是启用 bot 链路的硬前提，所以它必须来自真实的库，
     不能靠打桩——打桩的话，这条判据断了测试也不会红。
 
-    `military_score_at_utc` 给的是「刚读到」：军力优先那一支按它筛新鲜度，
-    留空的话这颗目标会被当成超期跳过，而那与用例本身要验的事情无关。
+    **军力分数和读取时刻两样都给**：用户 2026-08-18 决定，从没上过军力榜的目标
+    不再攻击（`domain.target_order.has_a_military_reading`），只给时刻不给分数的话
+    这颗目标压根进不了候选池，而那与用例本身要验的事情无关。
     """
     with repository._session_factory() as session:  # noqa: SLF001 - 测试直接落库
         session.add(
@@ -163,6 +164,7 @@ def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
                 is_bot=True,
                 latest_owner_name="bot",
                 last_scanned_at_utc=NOW,
+                military_score=9_000.0,
                 military_score_at_utc=NOW,
             )
         )
@@ -1438,6 +1440,9 @@ def test_saving_the_page_clears_a_knob_that_was_left_blank(console: Console) -> 
         # 0 = 取消排除，而候选池按军力降序排。
         ("bot_revisit_hours", 0),
         ("bot_revisit_hours", 169),
+        # 0 = 时间池为空、军力截断在空池上取前 N，这一轮一发都派不出去，
+        # 而页面上只会显示「暂无可打目标」。
+        ("military_time_pool", 0),
     ],
 )
 def test_impossible_pacing_knobs_are_refused_by_the_api(
@@ -1462,6 +1467,7 @@ _ALL_KNOBS = {
     "unknown_line_hold_minutes": 45,
     "reconcile_cooldown_minutes": 0,
     "bot_revisit_hours": 6,
+    "military_time_pool": 300,
 }
 
 
