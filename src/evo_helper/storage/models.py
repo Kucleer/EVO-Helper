@@ -699,6 +699,16 @@ class MilitaryAttackConfigRow(Base):
     #: 放在这张全局表而不是 `mission_tasks.params_json`：用户口径（2026-08-17）
     #: 是「盲拖数量需在攻击配置页可配置」，而这一页存的就是全局的那几项。
     blind_scrolls: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    #: 对账那一趟翻信箱最多往回读几个**小时**
+    #: （`tools.pirate_loop.PirateLoop.backfill_reports` 的 routine 那一档）。
+    #:
+    #: **可空，空 = 用代码里的默认值 `domain.report_wait.MAX_REPORT_AGE`（6 小时）**，
+    #: 理由同上面那一列：不写 `server_default`，「没配」与「配了 6」才分得开。
+    #:
+    #: 放在这张全局表而不是任务参数：用户口径（2026-08-17）是「这个参数改为可配置，
+    #: 这样遇到活动我可以灵活调整」，而对账那一趟是两条链路（海盗 / bot）共用的，
+    #: 挂在某一个任务上等于另一条链路配不着。
+    report_scan_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     # -- 行为旋钮（2026-08-17「该不该可配置」审计）--------------------------------
     #

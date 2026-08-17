@@ -1,7 +1,7 @@
 """make the line-hold, reconcile-cooldown and bot-revisit thresholds configurable
 
 Revision ID: d1a7f30c94e6
-Revises: c4e8b2f70a15
+Revises: a7d4e91c05b3
 Create Date: 2026-08-17
 """
 
@@ -14,7 +14,10 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d1a7f30c94e6"
-down_revision: str | None = "c4e8b2f70a15"
+#: 接在 `a7d4e91c05b3`（#167 的 `report_scan_hours`）后面，不是它俩共同的父节点
+#: `c4e8b2f70a15`——两条都往 `military_attack_config` 加列，并排挂在同一个父节点上
+#: 会变成两个 head，`alembic upgrade head` 直接报「Multiple head revisions」。
+down_revision: str | None = "a7d4e91c05b3"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

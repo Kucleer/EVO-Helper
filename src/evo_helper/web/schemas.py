@@ -261,6 +261,12 @@ class MilitaryAttackConfigOut(BaseModel):
     #: `MissionScheduler.validate_blind_scrolls` 判，和调度器启动时用的是同一把
     #: 尺子——两边分家的结果是页面收下了、实机跑起来不是那个数。
     blind_scrolls: int | None = None
+    #: 对账那一趟翻信箱最多往回读几个小时。**`None` = 留空 = 默认 6 小时。**
+    #:
+    #: 同上一项：这里只认「是不是整数」，范围由
+    #: `MissionScheduler.validate_report_scan_hours` 判——两边分家的结果是页面收下
+    #: 了、实机跑起来不是那个数。
+    report_scan_hours: int | None = None
     #: 读不到飞行时间时，一条航线占多久（分钟）。**`None` = 留空 = 默认 90。**
     #:
     #: 与 `blind_scrolls` 同一条规矩：这里只认「是不是整数」，范围由

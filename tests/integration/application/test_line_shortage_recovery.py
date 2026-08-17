@@ -169,10 +169,16 @@ def test_a_task_disabled_for_lack_of_lines_stays_disabled_while_the_lines_are_fu
 
     ⚠️ **日志那条断言才是真正有牙的那半。** 一个「等 N 分钟就放出来」的实现放它
     出来之后，同一个 tick 里 `_step` 会立刻拿同样的事实把它再停用一次，于是
-    库里那两列看起来一直没变过——churn 只有在日志里留得下痕迹。恢复一次写一条，
-    所以一条都不该有。
+    库里那两列看起来一直没变过——churn 只有在日志里留得下痕迹。恢复一次写一条、
+    停用一次也写一条（`_disable_task`），所以 churn 会在这里留下**两条**，
+    而正确的实现一条都不留。
+
+    夹具那一下停用本身是一次真的跃迁，它写的那一条要先清掉：这里数的是
+    「停用之后又发生了什么」，不是「一共写过几条」。
     """
     disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    recorded.messages.clear()
+    recorded.payloads.clear()
 
     for minutes in range(0, 40, 5):
         clock.now = NOW + timedelta(minutes=minutes)

@@ -1310,6 +1310,7 @@ class MissionConsoleService:
         tiers: tuple[dict[str, Any], ...],
         *,
         blind_scrolls: object = None,
+        report_scan_hours: object = None,
         unknown_line_hold_minutes: object = None,
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
@@ -1327,6 +1328,7 @@ class MissionConsoleService:
         try:
             self._scheduler.validate_military_tiers(normalized)
             scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
+            hours = self._scheduler.validate_report_scan_hours(report_scan_hours)
             hold = self._scheduler.validate_unknown_line_hold_minutes(unknown_line_hold_minutes)
             cooldown = self._scheduler.validate_reconcile_cooldown_minutes(
                 reconcile_cooldown_minutes
@@ -1337,6 +1339,7 @@ class MissionConsoleService:
         row = self._repository.replace_military_attack_tiers(
             json.dumps(normalized, ensure_ascii=False),
             blind_scrolls=scrolls,
+            report_scan_hours=hours,
             unknown_line_hold_minutes=hold,
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
@@ -2093,12 +2096,17 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
 def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
     """全局攻击配置行上那几个行为旋钮，原样搬进视图。
 
-    抽成一处是因为读侧与写侧都要组同一份：各写一遍的话，日后加第四个旋钮时
+    抽成一处是因为读侧与写侧都要组同一份：各写一遍的话，日后再加一个旋钮时
     必然有一侧漏掉——而漏掉之后页面只是**显示成留空**，看起来完全正常，
     用户以为配置没保存上，再填一遍。
+
+    ⚠️ **加新旋钮时这里和 `tests/integration/api/test_scheduler_api._ALL_KNOBS`
+    要一起加。** 这一页被好几个并行的 PR 各加各的字段，而合并时漏掉一边的症状
+    正是这个字典少一个键——那之后那个配置项就静默失效了。
     """
     return {
         "blind_scrolls": row.blind_scrolls,
+        "report_scan_hours": row.report_scan_hours,
         "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,

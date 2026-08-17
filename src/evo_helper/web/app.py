@@ -33,7 +33,12 @@ from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_sp
 from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.reconcile_cooldown import RECONCILE_COOLDOWN
 from evo_helper.domain.records import TARGET_KIND_LABELS
-from evo_helper.domain.report_wait import MAX_REPORT_AGE, UNKNOWN_LINE_HOLD
+from evo_helper.domain.report_wait import (
+    DEFAULT_REPORT_SCAN_FLOOR,
+    MAX_REPORT_AGE,
+    REPORT_SCAN_HOURS_MAX,
+    UNKNOWN_LINE_HOLD,
+)
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -631,6 +636,11 @@ def create_app(
                 "blind_scrolls_max": BLIND_SCROLLS_MAX,
                 "blind_scroll_samples": BLIND_SCROLL_SAMPLES,
                 "blind_scroll_margin": BLIND_SCROLL_MARGIN,
+                # 同理，翻信箱那个默认值也从 `domain.report_wait` 传进来：页面上
+                # 那句「留空 = N 小时」是用户判断「填多少」的唯一依据，手抄一遍
+                # 之后调常量页面不跟。
+                "report_scan_hours_default": int(DEFAULT_REPORT_SCAN_FLOOR.total_seconds() // 3600),
+                "report_scan_hours_max": REPORT_SCAN_HOURS_MAX,
                 "line_hold_default": int(UNKNOWN_LINE_HOLD.total_seconds() // 60),
                 "line_hold_max": int(MAX_REPORT_AGE.total_seconds() // 60) - 1,
                 "reconcile_cooldown_default": int(RECONCILE_COOLDOWN.total_seconds() // 60),
@@ -1108,6 +1118,7 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
     return MilitaryAttackConfigOut(
         tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
         blind_scrolls=view.blind_scrolls,
+        report_scan_hours=view.report_scan_hours,
         unknown_line_hold_minutes=view.unknown_line_hold_minutes,
         reconcile_cooldown_minutes=view.reconcile_cooldown_minutes,
         bot_revisit_hours=view.bot_revisit_hours,
@@ -1174,6 +1185,7 @@ def register_mission_routes(app: FastAPI) -> None:
             console.replace_military_attack_tiers(
                 tuple(item.model_dump() for item in payload.tiers),
                 blind_scrolls=payload.blind_scrolls,
+                report_scan_hours=payload.report_scan_hours,
                 unknown_line_hold_minutes=payload.unknown_line_hold_minutes,
                 reconcile_cooldown_minutes=payload.reconcile_cooldown_minutes,
                 bot_revisit_hours=payload.bot_revisit_hours,

@@ -79,6 +79,31 @@
   </div>
 </section>
 
+<section class="panel" aria-labelledby="scan-head">
+  <h2 id="scan-head">对账翻信箱时长</h2>
+  <p class="muted">
+    每次点「开始」都会先翻一趟信箱把战报读回来。这个数是那一趟<strong>最多往回读多久</strong>——
+    信箱按时间倒序，翻到第一封比它还旧的邮件就收工。
+    <strong>留空 = {{ report_scan_hours_default }} 小时</strong>：再往下翻到的战报，
+    对应的派遣早就过了助手「还在等战报」的窗口，读回来不改变任何一条调度判据。
+  </p>
+  <p class="muted">
+    <strong>调小</strong>＝翻得少、快，<strong>活动期间信箱里堆着几百封无关战报时就调它</strong>；
+    但战报比这个时间还旧就<strong>翻不到了</strong>。
+    <strong>调大</strong>＝能翻到更旧的，代价是活动期间会一屏屏翻过大量无关邮件。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>要救很久以前的历史战报，用「手动补录」而不是把这个数调大</strong>——
+    手动补录（<code>--exhaustive</code>）<strong>不受这个下限约束</strong>，翻到你选的起始日期为止。
+    上限 {{ report_scan_hours_max }} 小时。
+  </p>
+  <div class="filter-bar" style="margin-top:10px">
+    <input id="report-scan-hours" type="number" min="1" max="{{ report_scan_hours_max }}" step="1"
+           placeholder="留空 = {{ report_scan_hours_default }} 小时" aria-label="对账翻信箱时长（小时）">
+    <button class="btn primary small" type="button" id="btn-save-scan">保存翻信箱时长</button>
+  </div>
+</section>
+
 <section class="panel" aria-labelledby="planet-head">
   <h2 id="planet-head">出发星球</h2>
   <p class="muted">按列表自动编号为星球1、星球2……任务里直接选择，例如“星球1 [2:137:18]”。被任务使用的星球不能删除。</p>
@@ -101,7 +126,11 @@
   const tiers = document.getElementById('tier-list');
   const planets = document.getElementById('planet-list');
   const blindScrolls = document.getElementById('blind-scrolls');
+  const reportScanHours = document.getElementById('report-scan-hours');
   // 三个调度节奏旋钮。`payload` 里的键名就是 `PUT /api/attack-config` 的字段名。
+  //
+  // 「对账翻信箱时长」**故意不并进这个数组**：它有自己那条前端下界（至少 1，
+  // 因为 0 等于一封都翻不到），并进来就得把那句专门的错误话术拆成通用的一句。
   const knobs = [
     { element: document.getElementById('line-hold'), key: 'unknown_line_hold_minutes', label: '航线占用时长' },
     { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
@@ -161,6 +190,7 @@
         // `?? ''` 而不是 `|| ''`：0 是合法取值（「一屏都别盲拖」），
         // `||` 会把它显示成空框，也就是显示成「自动标定」。
         blindScrolls.value = config.blind_scrolls ?? '';
+        reportScanHours.value = config.report_scan_hours ?? '';
         // 同上，一律 `??`：0 是合法取值（翻信箱冷却填 0 = 每轮都翻），
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
         for (const knob of knobs) knob.element.value = config[knob.key] ?? '';
@@ -186,7 +216,14 @@
       scrolls = Number(raw);
       if (!Number.isInteger(scrolls) || scrolls < 0) throw new Error('盲拖屏数要填非负整数；要自动标定就把它留空');
     }
-    const payload = { tiers: tierPayload, blind_scrolls: scrolls };
+    const rawHours = reportScanHours.value.trim();
+    let hours = null;
+    if (rawHours !== '') {
+      hours = Number(rawHours);
+      // 这里的 0 和盲拖那个 0 不一样：下界就是「此刻」，等于一封都翻不到。
+      if (!Number.isInteger(hours) || hours < 1) throw new Error('翻信箱时长要填至少 1 的整数小时；要用默认值就把它留空');
+    }
+    const payload = { tiers: tierPayload, blind_scrolls: scrolls, report_scan_hours: hours };
     for (const knob of knobs) {
       const text = knob.element.value.trim();
       if (text === '') { payload[knob.key] = null; continue; }
@@ -208,6 +245,7 @@
   document.getElementById('btn-add-tier').onclick = () => addTier();
   document.getElementById('btn-save-tiers').onclick = saveConfig;
   document.getElementById('btn-save-blind').onclick = saveConfig;
+  document.getElementById('btn-save-scan').onclick = saveConfig;
   document.getElementById('btn-save-knobs').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {
     try {

@@ -158,6 +158,28 @@ MAX_SESSION_BACKOFF = timedelta(minutes=8)
 #: 默认重试次数。超过就安全暂停，交回人工。
 DEFAULT_MAX_SESSION_ATTEMPTS = 8
 
+#: 对账那一趟翻信箱最多往回读多久（攻击配置页上留空时用的默认值）。
+#:
+#: **借 `MAX_REPORT_AGE` 是有实义的，不是图省事。** 那一趟的活是「把还在等的那几发
+#: 的战报读回来」，而「还在等」这件事本身就以 6 小时为界：`due_attack_dispatches`
+#: 与 `bot_dispatch_facts` 都按 `MAX_REPORT_AGE` 把更早的派遣剔掉，
+#: `storage.intel.RESULT_NO_REPORT` 也在那一刻就把它们判成「战报永远不会来了」。
+#: 所以对账再往下翻，翻到的都是**没有任何人还在等的**战报——它们不改变任何一条
+#: 调度判据。
+#:
+#: ⚠️ **这不是「6 小时以上的战报认领不上」。** 认领窗口是
+#: `dispatched_at_utc >= reported_at - MAX_REPORT_AGE`，相对**战报自己的时间戳**算，
+#: 隔多久读回来都认领得上（`tools.pirate_loop.backfill_reports` 上那条同款告警）。
+#: 救那些历史战报是 `--exhaustive` 手动补录的活，而补录**不受这个下限约束**。
+DEFAULT_REPORT_SCAN_FLOOR = MAX_REPORT_AGE
+
+#: 攻击配置页上那个框的硬上界（30 天）。
+#:
+#: **不是策略上界。** 超过 6 小时之后多读回来的战报没人还在等（见上），但用户可能
+#: 有别的用途，所以那条只在页面上提示、不拦。这个数拦的是**手滑与溢出**：
+#: `now - timedelta(hours=10**9)` 直接 `OverflowError`，把一趟对账变成 traceback。
+REPORT_SCAN_HOURS_MAX = 24 * 30
+
 
 def line_free_at(
     dispatched_at_utc: datetime,
