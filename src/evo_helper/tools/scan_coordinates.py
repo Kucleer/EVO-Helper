@@ -31,6 +31,8 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import CoordinateScan
 from evo_helper.domain.scan_bounds import ScanBounds
 from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments, total_coordinates
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, exit_code_for_environment_fault
+from evo_helper.game.game_window import ForegroundUnavailable
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -609,7 +611,11 @@ class LiveDriver:
             self._raise_to_front(handle)
             time.sleep(0.3 * (attempt + 1))
         if win32gui.GetForegroundWindow() != handle:
-            raise RuntimeError(
+            # ⚠️ **必须是 `ForegroundUnavailable` 而不是裸 `RuntimeError`。**
+            # 各 runner 的 `main()` 靠这个类型把本轮按 `EXIT_ENVIRONMENT_BUSY`
+            # 收场（`run_with_foreground_guard`）；换回裸 `RuntimeError` 就退回到
+            # 「抛穿 main、退出码 1、计进连续失败」，理由整段写在那个异常类上。
+            raise ForegroundUnavailable(
                 "游戏窗口抢不到前台（多半是用户正在用别的窗口）；停止而不是把点击打到别人窗口上"
             )
 
@@ -1222,6 +1228,44 @@ def restart_if_still_unusable(session: Any, keeper: Any) -> Any:
     return keeper.restart_and_reenter(f"会话不可用：{session.detail}")
 
 
+def exit_code_for_unusable_session(session: Any) -> int:
+    """恢复阶梯走到头仍然回不到游戏内：这一轮该拿什么退出码收场。
+
+    **判据是 `SessionKeeper` 的关窗重开配额**，理由整段在
+    `domain.scheduler.exit_code_for_environment_fault`。一句话：配额是滚动窗口内
+    有限的，所以「还有配额就报 75」这条判据必然有尽头——同一小时里最多三轮能这么
+    收场，第四轮起 `restart_and_reenter` 直接被拒、配额恒为 0、退回 1，
+    豁免照常攒，该停用的最终会停用。
+
+    ⚠️ **不许无条件报 75。** 这一档和「抢不到前台」不同：走到这里说明这一轮
+    已经关掉游戏窗口、重开过 Chrome 并且失败了。无条件豁免的话，调度器会每隔一个
+    冷却再起一轮、再吃一次配额、再什么都不推进，而**再没有任何东西会最终把它
+    停下来**——2026-08-17 那种故障就会从「26 分钟后被 6/6 豁免上限拦住」
+    变成整夜静默空转。
+    """
+    return exit_code_for_environment_fault(
+        recoverable=session is not None and session.restarts_left > 0
+    )
+
+
+def run_with_foreground_guard(body: Callable[[], int]) -> int:
+    """跑一趟 runner；抢不到前台时按 `EXIT_ENVIRONMENT_BUSY` 收场。
+
+    **无条件豁免，不看任何配额**，这一档和「会话恢复不了」正相反：抢不到前台
+    的那条路**什么都不做**（不关窗、不重开、一次点击都不发），纯粹让路等用户
+    不再用别的窗口。理由整段在 `game.game_window.ForegroundUnavailable`。
+
+    只 catch 这一个类型。`GameWindowError` 的其余成员（窗口拉不起来、尺寸调不到
+    标定值）**不在这一档**：那些不会因为用户放开鼠标就好。
+    """
+    try:
+        return body()
+    except ForegroundUnavailable as busy:
+        say(f"{busy}")
+        say(f"  这不算故障，本轮按「环境暂时不可用」收场（退出码 {EXIT_ENVIRONMENT_BUSY}）")
+        return EXIT_ENVIRONMENT_BUSY
+
+
 def run_scan(
     *,
     limit: int | None,
@@ -1265,8 +1309,9 @@ def run_scan(
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
     session = restart_if_still_unusable(session, keeper)
     if session is not None and not session.ready:
-        say(f"会话不可用：{session.detail}；安全停止")
-        return 1
+        code = exit_code_for_unusable_session(session)
+        say(f"会话不可用：{session.detail}；安全停止（退出码 {code}）")
+        return code
     if session is not None and session.reconnected:
         say("已重新登录")
 
@@ -1451,13 +1496,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.status:
         return show_status()
-    return run_scan(
-        limit=args.limit,
-        debug_dir=args.debug_dir,
-        skip_scanned=not args.no_skip_scanned,
-        rescan_missing=args.rescan_missing,
-        recheck_suspicious=args.recheck_suspicious,
-        one_bot_per_system=not args.scan_full_systems,
+    return run_with_foreground_guard(
+        lambda: run_scan(
+            limit=args.limit,
+            debug_dir=args.debug_dir,
+            skip_scanned=not args.no_skip_scanned,
+            rescan_missing=args.rescan_missing,
+            recheck_suspicious=args.recheck_suspicious,
+            one_bot_per_system=not args.scan_full_systems,
+        )
     )
 
 

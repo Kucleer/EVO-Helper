@@ -120,6 +120,26 @@ class ReportLayout:
     defender_column: ColumnBand
     #: ``(top, bottom)`` of the 参战战舰 rows, before any scrolling.
     participating_rows: tuple[int, int]
+    #: 存档用的整块面板 ROI（`storage.report_screenshots`）。
+    #:
+    #: 这一块不喂 OCR，它是给人看的：攻击日志上点开来确认「这一发到底打的是谁、
+    #: 打成了什么」。所以判据和上面那些窄 ROI 相反——**宁可多截一点，也别切掉数据**。
+    #:
+    #: 量于 2026-08-17，对着 `var/logs/vp-detail.png`（标定视口 1920×879 的未滚动
+    #: 详情页实拍）。面板内容的左右边界是 x 728 与 1195，这里取 700–1220 各留
+    #: 二十余像素余量；上下取 105–800，覆盖从面板顶栏（发件人 / 主题 / 报告时间，
+    #: 版面 `report_header` 是 125–195）一路到面板下沿（实拍约 770）。
+    #: 裁出来 520×695，WEBP q90 实测 38.8 KB。
+    #:
+    #: ⚠️ **必须在未滚动那一屏上裁。** 「战报」横幅、VS 块（双方名称与两侧坐标）
+    #: 只在这一屏上；拖到底之后它们滚出可视区（模块 `vision.pirate_reports` 的
+    #: 头部记着同一条）。代价是「损失单位」那一行在这一屏被面板下沿切掉半行——
+    #: 那是游戏自己的排版，不是 ROI 切的，两样东西本来就不在同一屏上。
+    #: 取舍按用户口径（2026-08-17）：这张图先要能认出**这是谁的战报**。
+    #:
+    #: 余量是刻意留的：面板高度会随内容变（舰队回收百分比、战斗详情行数），
+    #: 贴着量出来的边裁，换一份内容更长的战报就会切掉数据。
+    report_panel: Region
 
     def mail_row(self, index: int) -> Region:
         """Region of the ``index``-th visible mail row, counting from 0."""
@@ -155,6 +175,7 @@ LIVE_LAYOUT = ReportLayout(
     attacker_column=ColumnBand(720, 960),
     defender_column=ColumnBand(960, 1210),
     participating_rows=(405, 750),
+    report_panel=Region(700, 105, 1220, 800),
 )
 
 

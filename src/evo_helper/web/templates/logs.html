@@ -3,6 +3,7 @@
 {% block heading %}攻击日志{% endblock %}
 {% block topbar_extra %}
 <span class="chip"><span class="glyph" aria-hidden="true">🕗</span>游戏时间 UTC+0 · 现实时间 UTC+8</span>
+{% include "_auto_refresh.html" %}
 {% endblock %}
 {% block content %}
 
@@ -114,7 +115,12 @@
   {% endif %}
 </section>
 
-<section class="panel" aria-labelledby="log-table">
+{#
+  `data-refresh`：自动刷新只换这一块（见 `_auto_refresh.html`）。上面那三个
+  筛选表单**刻意不在里面**——那里有用户正在敲的坐标、正在选的下拉框，
+  每 15 秒替换一次等于没法用。筛选条件本身走 URL，重取时原样带着。
+#}
+<section class="panel" id="log-entries" data-refresh aria-labelledby="log-table">
   <h2 id="log-table">派遣记录 <span class="muted">（{{ entries | length }} 条）</span></h2>
   <div class="table-wrap">
     <table>
@@ -199,6 +205,20 @@
               <div class="muted" style="font-size:11px">
                 战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}
                 · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}
+              </div>
+            {% endif %}
+            {#
+              战报截图。读战报那一刻截的整块面板（双方名称、两侧坐标、战斗详情），
+              存在库里而不是磁盘上——实机 runner 跑在另一台机器上，存路径的话
+              这个链接在控制台上必然打不开。
+
+              ⚠️ **只放链接，不放 `<img>`。** 一页几十行、每张约 40 KB，内联进来
+              就是几 MB 的首屏。有图才出现这一行：没图时摆一个点开是 404 的链接，
+              比没有链接更难排查。
+            #}
+            {% if entry.report_screenshot %}
+              <div style="font-size:11px">
+                <a href="/api/reports/{{ entry.report_id }}/screenshot" target="_blank" rel="noopener">查看战报截图</a>
               </div>
             {% endif %}
           </td>

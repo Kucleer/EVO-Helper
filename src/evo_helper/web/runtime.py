@@ -18,6 +18,7 @@ from evo_helper.config import Settings
 from evo_helper.infrastructure.system_log import attach_system_log_handler
 from evo_helper.infrastructure.system_log_db import install_database_system_log, purge_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
+from evo_helper.storage.report_screenshots import purge_report_screenshots
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .app import create_persistent_app
@@ -44,6 +45,11 @@ def create_runtime_app(
     # 保留期清理挂在启动上：这是本进程唯一一个「每次开机跑一次」的现成时机，
     # 而这张表按设计只增不改，攒着不清迟早把库撑大。
     purge_system_log(session_factory, retention_days=actual_settings.system_log_retention_days)
+    # 战报截图照同一条路子清：也是「只增不改、攒着会撑大库」的旁路数据，
+    # 也没有别的「每次开机跑一次」的时机。两者的保留期各自配（图贵得多）。
+    purge_report_screenshots(
+        session_factory, retention_days=actual_settings.report_screenshot_retention_days
+    )
     # 旧版把每个 `bot_<g>_<s>_<position>` 都纳入候选；固定海盗位 1--4
     # 因而被错误固化。保留原始扫描/榜单记录，只撤销派遣候选资格。
     SqlAlchemyRepository(session_factory).clear_pirate_position_bot_candidates()

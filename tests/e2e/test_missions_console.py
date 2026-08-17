@@ -142,17 +142,48 @@ def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
     assert "始终填空隙" in body
 
 
-def test_all_eight_statuses_survive_the_trip_to_the_page(client: TestClient) -> None:
-    """八档一个都不能合并。
+def test_every_status_survives_the_trip_to_the_page(client: TestClient) -> None:
+    """每一档一个都不能合并。
 
     没勾的任务显示「待命」是谎话（它永远不会被起起来）；冷却中显示「等航线」
-    会让用户去调航线数、调完还是不动。页面按状态上色，所以每一档都得在色调表
-    里各占一格——少一格就意味着有两档被当成了同一件事。
+    会让用户去调航线数、调完还是不动；定时窗口那两档显示成「待命」，用户会一直
+    等下一轮，而下一轮永远不来。页面按状态上色，所以每一档都得在色调表里各占
+    一格——少一格就意味着有两档被当成了同一件事。
     """
     html = client.get("/missions").text
 
     for status in TaskStatus:
         assert status.value in html, status.name
+
+
+def test_the_page_offers_a_schedule_window_labelled_in_utc_plus_eight(
+    client: TestClient,
+) -> None:
+    """定时开关那两个输入框，以及它们头上那个写死的时区。
+
+    时区必须写在控件旁边：用户填进去的那串数字按哪个时区解释，不写出来只能靠猜，
+    猜错正好差 8 小时。（「战报补录」那个日期控件标的是 UTC，是特例。）
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "定时开关（UTC+8）" in body
+    assert "'mission-enabled-from'" in body
+    assert "'mission-enabled-until'" in body
+    # 送上去的必须带偏移量，不带的话服务端会 400（而那是有意的）。
+    assert "+08:00" in body
+
+
+def test_the_page_says_the_window_does_not_cut_off_a_running_round(
+    client: TestClient,
+) -> None:
+    """「到点不抢停」必须写在页面上。
+
+    用户看到关闭时刻已过而任务还在跑，不写清楚就只能理解成「定时没生效」，
+    然后去点强制结束——而那一下会把另外几条正常的链路一起停掉。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "正在跑的不打断" in body or "不打断正在跑的那一轮" in body
 
 
 def test_the_bot_row_carries_a_new_round_button(client: TestClient) -> None:
@@ -295,6 +326,52 @@ def test_the_page_shows_the_frozen_configuration_record(client: TestClient) -> N
     # 临时文件名；生产默认走 `DEFAULT_FREEZE_LOG`，由
     # `test_the_console_writes_its_freezes_under_var` 钉住。
     assert "freezes.jsonl" in html
+
+
+def test_the_frozen_record_table_lists_only_the_tasks_that_take_part(
+    client: TestClient,
+) -> None:
+    """历史那张表同样只摆参与调度的任务。用户口径 2026-08-17。
+
+    断言钉的是**整张清单与条数**，不是「不含某个名字」：只查名字的话，把过滤写成
+    「漏掉某一条」照样绿。
+    """
+    # 种子：海盗与 bot 不参与，扫描与军力榜参与。把海盗打开、扫描关掉，这一轮
+    # 参与的恰好是海盗与军力榜——两个 kind 都不是种子里的默认状态。
+    _patch_task(client, "PIRATE", {"enabled": True})
+    _patch_task(client, "SCAN", {"enabled": False})
+    # `reconcile: false`：默认的启动对账会去真的 Popen 一个补录进程。
+    assert client.post("/api/scheduler/start", json={"reconcile": False}).status_code == 200
+
+    cell = _freeze_table_cell(client.get("/missions").text)
+
+    assert cell.count("· 参与 ·") == 2
+    assert "未参与" not in cell
+    for label in ("侦查+攻击海盗", "扫描军力榜"):
+        assert label in cell, label
+    for label in ("扫描+攻击 bot", "扫描全星系 bot"):
+        assert label not in cell, label
+
+
+def _patch_task(client: TestClient, kind: str, payload: dict[str, object]) -> None:
+    """按 kind 找到那一行再 PATCH。接口按 id 寻址（同一 kind 可以有多行）。"""
+    tasks = client.get("/api/scheduler").json()["tasks"]
+    task_id = next(task["task_id"] for task in tasks if task["kind"] == kind)
+    response = client.patch(f"/api/missions/{task_id}", json=payload)
+    assert response.status_code == 200, response.text
+
+
+def _freeze_table_cell(html: str) -> str:
+    """固化记录表里「当时的配置」那一格。
+
+    整页搜不行：页面底部那段脚本自己带着 `未参与` 的字面量（本轮已固化那块
+    卡片由它渲染），整页搜会被它满足，断言就永远绿。
+    """
+    start = html.find('<h2 id="freeze-head">')
+    assert start != -1, "页面上没有配置固化记录这一节了"
+    end = html.find("</table>", start)
+    assert end != -1, "固化记录那张表的结构变了，这个切法得跟着改"
+    return html[start:end]
 
 
 def test_the_page_does_not_recompute_the_scheduling_criteria(client: TestClient) -> None:
