@@ -157,23 +157,31 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
 
 
 def test_a_task_disabled_for_lack_of_lines_stays_disabled_while_the_lines_are_full(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory
+    scheduler, repository, launcher, clock, run_id, session_factory, recorded: RecordingLog
 ) -> None:
     """条件还成立着就别动它。
 
-    时钟往前走了半小时（远超任何「过一会儿再试」会用的间隔），但那发侦察
-    要 50 分钟才回来，航线仍然是满的。恢复判据只要退化成「等一会儿就试试」，
-    这条立刻转红。
+    那发侦察要 50 分钟才回来，所以整整 39 分钟里航线一直是满的。
+
+    ⚠️ **时钟是一格一格往前挪的，每格都 tick。** 一次跳到底的话，任何一种
+    「停用之后等 N 分钟再试试」的实现都可以因为「第一次看见它就是最后一刻」
+    而蒙混过关——分五分钟一格走完 39 分钟，那种实现必然在中途放它出来。
+
+    ⚠️ **日志那条断言才是真正有牙的那半。** 一个「等 N 分钟就放出来」的实现放它
+    出来之后，同一个 tick 里 `_step` 会立刻拿同样的事实把它再停用一次，于是
+    库里那两列看起来一直没变过——churn 只有在日志里留得下痕迹。恢复一次写一条，
+    所以一条都不该有。
     """
     disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
 
-    clock.now = NOW + timedelta(minutes=30)
-    for _ in range(5):
+    for minutes in range(0, 40, 5):
+        clock.now = NOW + timedelta(minutes=minutes)
         scheduler.tick()
 
-    row = row_of(repository, MissionKind.BOT)
-    assert row.disabled_reason is not None
-    assert row.disabled_recovery == DisabledRecovery.FREE_LINES.value
+        row = row_of(repository, MissionKind.BOT)
+        assert row.disabled_reason is not None, f"第 {minutes} 分钟就被放出来了，而航线还满着"
+        assert row.disabled_recovery == DisabledRecovery.FREE_LINES.value
+        assert recorded.messages == [], f"第 {minutes} 分钟放出来又立刻停用了一次"
     assert launcher.spawned == []
 
 
