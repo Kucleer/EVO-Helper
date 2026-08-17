@@ -1243,8 +1243,8 @@ def register_mission_routes(app: FastAPI) -> None:
     ) -> SchedulerOut:
         """点「开始」。**默认直接开工，不先跑对账**（2026-08-13 改的）。
 
-        请求体整个可以省略（桌面悬浮窗和文档里那条 curl 都不带体），省略时
-        按默认值走。要先对账得显式送 `{"reconcile": true}`。
+        请求体整个可以省略（文档里那条 curl 就不带体），省略时按默认值走。
+        要先对账得显式送 `{"reconcile": true}`。
 
         ⚠️ 默认值有**三处**，必须一起改，理由见
         `web.schemas.SchedulerStartIn.reconcile`：这里（不带请求体那条路）、
@@ -1271,8 +1271,7 @@ def register_mission_routes(app: FastAPI) -> None:
         return _scheduler_out(console.force_kill())
 
     # 任务按 **id** 寻址，不再按 kind：同一 `kind` 可以有多行（多个 bot 攻击
-    # 任务），按 kind 寻址会打到不确定的那一行上。桌面悬浮窗
-    # （`tools/scan_console.py`）只用 `/api/scheduler*`，不受这次改动影响。
+    # 任务），按 kind 寻址会打到不确定的那一行上。
     @app.post("/api/missions", response_model=MissionTaskOut, status_code=201)
     def create_mission(
         payload: MissionTaskCreate,

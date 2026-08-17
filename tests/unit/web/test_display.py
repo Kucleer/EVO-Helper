@@ -47,7 +47,7 @@ def test_no_two_statuses_share_a_glyph() -> None:
 
 
 def test_every_mission_kind_has_a_label() -> None:
-    """标签由服务端下发，页面和桌面悬浮窗都不自己拼。"""
+    """标签由服务端下发，页面不自己拼。"""
     assert set(MISSION_LABELS) == {kind.value for kind in MissionKind}
 
 

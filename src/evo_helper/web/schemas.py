@@ -155,7 +155,7 @@ class MissionTaskOut(BaseModel):
     #: （多个 bot 攻击任务），按 kind 寻址会打到不确定的那一行上。
     task_id: int
     kind: str
-    #: 界面上的名字。桌面悬浮窗是个瘦客户端，它只认接口给的这个字符串。
+    #: 界面上的名字。由服务端下发，页面不自己拼。
     label: str
     enabled: bool
     priority: int
@@ -314,7 +314,7 @@ class ConfigFreezeOut(BaseModel):
 
 class SchedulerOut(BaseModel):
     running: bool
-    #: 点「开始」的时刻，供页面与悬浮窗上那块秒表。停着时为 None。
+    #: 点「开始」的时刻，供页面上那块秒表。停着时为 None。
     started_at_utc: datetime | None = None
     current: CurrentMissionOut | None = None
     #: 上次没走正常关闭路径留下的进程号。**只显示给人看**，不据此杀进程——
@@ -343,8 +343,8 @@ class LineReleaseOut(BaseModel):
 class SchedulerStartIn(BaseModel):
     """POST /api/scheduler/start 的请求体。**整个可以省略。**
 
-    省略时按默认值走——桌面悬浮窗（`tools/scan_console.py`）和 4.3 节里那条
-    curl 都是不带体打的，它们不该因为多了这个字段而换一种行为。
+    省略时按默认值走——4.3 节里那条 curl 就是不带体打的，它不该因为多了这个
+    字段而换一种行为。
     """
 
     model_config = ConfigDict(extra="forbid")

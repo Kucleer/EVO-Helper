@@ -301,8 +301,8 @@ class SlowRepository(SqlAlchemyRepository):
     """把「读事实」拖住，模拟一次真实的 `_facts()`。
 
     生产库里 bot 范围有 4237 个目标，一次 `_facts()` 要按目标逐个问库，实测
-    0.32 秒；而 tick 每秒一次、页面每 2 秒问一次状态、桌面悬浮窗还有一次。
-    这里只是把那段时间拉长成一把测试握得住的闸门。
+    0.32 秒；而 tick 每秒一次、页面每 2 秒问一次状态，多开几个浏览器标签就是
+    几份。这里只是把那段时间拉长成一把测试握得住的闸门。
     """
 
     def __init__(self, session_factory) -> None:  # type: ignore[no-untyped-def]

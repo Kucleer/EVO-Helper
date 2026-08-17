@@ -296,7 +296,7 @@ def test_pressing_start_still_reconciles_when_asked(console: Console) -> None:
 def test_an_empty_body_does_not_reconcile(console: Console) -> None:
     """**两个默认值，两条路，而现在两条都是「不对账」。**
 
-    不带请求体走的是路由那个默认（悬浮窗与文档里那条 curl 都是这条）；带一个
+    不带请求体走的是路由那个默认（文档里那条 curl 就是这条）；带一个
     `{}` 走的是 `SchedulerStartIn` 里那个默认。两处必须一致，否则「点开始要不要
     先对账」会因为客户端怎么发请求而不同。
 
