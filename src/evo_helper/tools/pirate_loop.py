@@ -60,6 +60,7 @@ from evo_helper.domain.pirate_round import (
     action_for,
 )
 from evo_helper.domain.planet_switch import switch_needed
+from evo_helper.domain.reconcile_cooldown import ReconcileDecision, decide_reconcile
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
     MISSION_KIND_SCOUT,
@@ -82,6 +83,7 @@ from evo_helper.game.system_navigator import (
     crop_reader,
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
+from evo_helper.storage.report_screenshots import ReportScreenshotRepository
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
@@ -663,11 +665,12 @@ class LoopOptions:
     #: `attack_intents.origin_*`，战报认领正是靠「出发坐标 + 目标坐标 + 时间就近」
     #: 配对的。让 runner 自己去猜，等于两个任务的账可能记到同一颗星球上。
     origin: Coordinate | None = None
-    #: 是否在**这一轮开始前**读一次当日战报。默认关：调度器会因航线逐步
-    #: 释放而多次拉起 runner，若每个 runner 都进信箱，就会在攻击过程中反复
-    #: 翻战报。需要启动对账时由控制台的「启动战报补录」显式做一次；手工运行
-    #: 则传 ``--reconcile``。
-    reconcile_on_start: bool = False
+    #: **强制**在这一轮开始前翻一次信箱，忽略冷却。手工排障用（``--reconcile``）。
+    #:
+    #: ⚠️ 默认档不是「不翻」，是「按冷却翻」——判据在
+    #: `domain.reconcile_cooldown`，那个模块头写着这两者被混为一谈时发生了什么
+    #: （战报断流两天）。调度器**不拼这个参数**，它只走冷却。
+    force_reconcile: bool = False
 
 
 @dataclass
@@ -751,6 +754,7 @@ class PirateLoop:
         self._navigator = SystemNavigator(driver)
         self._outcome = Outcome()
         self._repository: SqlAlchemyRepository | None = None
+        self._session_factory: Any = None
         self._run_id: UUID | None = None
         self._session_keeper: Any = None
         self._coord_dumps = 0
@@ -766,6 +770,10 @@ class PirateLoop:
         #: 缓存的是**一整趟里都不该变**的那部分（今天已经派过什么、报告回了没），
         #: 每写进新的侦察报告就 `refresh=True` 重取一次，见 `_daily_progress`。
         self._daily: dict[Coordinate, PirateProgress] | None = None
+        #: 本轮开工那一下到底翻没翻信箱，以及为什么。`None` = `run()` 还没走到
+        #: 那一步（手工调子方法时会这样）。日志措辞靠它区分「翻过没找到」和
+        #: 「本轮没翻」，见 `_reconcile_if_due` 与 `BotLoop._say_still_waiting`。
+        self._reconcile_decision: ReconcileDecision | None = None
 
     # -- 读屏 ---------------------------------------------------------------
 
@@ -1771,12 +1779,43 @@ class PirateLoop:
             target = reading.defender_target
             say(f"  第 {row.index} 行 → {target} {reading.outcome}（库里已有{note}）")
             return ReportIngest.KNOWN
-        repository.append_report(to_pirate_battle_report(reading, report_id=uuid4()))
+        report_id = uuid4()
+        repository.append_report(to_pirate_battle_report(reading, report_id=report_id))
         say(
             f"  第 {row.index} 行 → {reading.defender_target} {reading.outcome}"
             f"（战损 我 {reading.attacker_losses} · 敌 {reading.defender_losses}；已入库）"
         )
+        self._store_report_screenshot(report_id, page)
         return ReportIngest.STORED
+
+    def _store_report_screenshot(self, report_id: UUID, page: Any) -> None:
+        """把这一屏的战报面板存进库，挂在这份战报上。
+
+        **只在真的读到并存下一份战报时才走到这里**（用户口径 2026-08-17：
+        不要每次进邮件都截）。「库里已有」和「读不出来」两档都在上面就返回了。
+
+        ⚠️ **一句异常都不许漏出去。** 这是一条旁路：图存不下顶多是攻击日志上少
+        一个链接，而漏出去的异常会打断 `_scan_mail_rows` 那一趟——也就是把
+        「战报读不回来」这个正在修的故障重新造一遍，只是换了个成因。
+
+        用的是 `page` 手里那一屏已经拍好的像素（未滚动那一屏，`战报` 横幅与 VS
+        块只在它上面），不另拍一次，理由在 `report_panel_image`。
+        """
+        try:
+            panel = page.report_panel_image()
+            saved = ReportScreenshotRepository(self._ensure_session_factory()).save(
+                report_id,
+                image_bytes=panel.image_bytes,
+                width=panel.width,
+                height=panel.height,
+                captured_at_utc=datetime.now(UTC),
+                image_format=panel.image_format,
+            )
+        except Exception as error:  # noqa: BLE001 - 见 docstring：旁路不许拖累主路径
+            say(f"  战报截图没存下（{error}）；战报本身已入库，不影响判据")
+            return
+        if saved:
+            say(f"  战报截图已入库（{panel.width}×{panel.height}，{len(panel.image_bytes)} 字节）")
 
     def _ingest_report_row(self, row: MailRow, page: Any) -> bool:
         """开工那一趟里开的每一封都走这里。返回「不必再开封了」。
@@ -1930,6 +1969,46 @@ class PirateLoop:
         for _ in range(DETAIL_SCROLL_TO_BOTTOM_DRAGS):
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
         return self._report_screens()
+
+    def _last_reconciled_at(self) -> datetime | None:
+        """本链路上一次真正翻完信箱的时刻；从没对过账（或查不到）时 None。
+
+        单独一个方法只为一件事：它是**冷却判据唯一的输入**，测试要能把它换掉，
+        而换掉整个仓储会把这条链路上另外十几处查询一起牵进来。
+
+        查询失败**当成「从没对过账」**，也就是这一轮翻信箱。冷却是个省钱的优化，
+        而它省掉的那件事是这条链路的全部意义；拿不准的时候多翻一趟，比安静地
+        不翻便宜得多——后者的代价这次已经付过了（两天、86 发）。
+        """
+        try:
+            repository, _run_id = self._ensure_run()
+            return repository.last_reconciled_at(self.TARGET_KIND)
+        except Exception as error:  # noqa: BLE001 - 见 docstring：拿不准就翻
+            say(f"开工对账：查不到上次对账时刻（{error}）；按「从没对过账」处理，这一轮翻信箱")
+            return None
+
+    def _reconcile_if_due(self) -> ReconcileDecision:
+        """这一轮该不该翻信箱，该翻就翻。返回决定，供本轮后续的日志措辞引用。
+
+        判据在 `domain.reconcile_cooldown.decide_reconcile`；这里只负责问库要
+        上次对账时刻、把决定说出来、并把它记在 `self._reconcile_decision` 上。
+
+        ⚠️ **决定必须留下来。** `BotLoop._say_still_waiting` 要靠它区分「翻过
+        信箱没找到」和「本轮压根没翻」——那两句话对用户的意思完全相反，而混着
+        说正是这次故障拖了两天没被发现的直接原因。
+        """
+        options = getattr(self, "_options", None)
+        forced = bool(options is not None and options.force_reconcile)
+        decision = decide_reconcile(
+            last_reconciled_at_utc=self._last_reconciled_at(),
+            now=datetime.now(UTC),
+            forced=forced,
+        )
+        self._reconcile_decision = decision
+        say(decision.note)
+        if decision.sweep:
+            self.reconcile_today()
+        return decision
 
     def reconcile_today(self) -> None:
         """开工第一件事：**把今天的战报读进库**，读完再把「今天已经打了几发」更新掉。
@@ -2321,9 +2400,17 @@ class PirateLoop:
         if self._repository is not None and self._run_id is not None:
             return self._repository, self._run_id
         session_factory = create_session_factory(create_database_engine(Settings().database_url))
+        self._session_factory = session_factory
         self._repository = SqlAlchemyRepository(session_factory)
         self._run_id = _ensure_run_row(session_factory)
         return self._repository, self._run_id
+
+    def _ensure_session_factory(self) -> Any:
+        """这条链路自己那套连接。战报截图不走 `SqlAlchemyRepository`，见
+        `storage.report_screenshots` 的模块头（旁路数据不该并进攻击链路的账本）。
+        """
+        self._ensure_run()
+        return self._session_factory
 
     def _record_intent(self, coordinate: Coordinate, *, preset: str | None = None) -> UUID:
         """**在点出发之前**写意图。
@@ -2583,11 +2670,10 @@ class PirateLoop:
             # 正是用户 2026-08-13 报的那个毛病——一个防记账错乱的功能，反过来
             # 成了战报缺失的新来源。切换失手只该挡住派遣，不该连带挡掉读战报。
             # 调度器会在一条航线返航后再次拉起 runner。这里若无条件进信箱，
-            # 就会把「等舰队回来继续派」误做成「每次续跑都翻一遍战报」。启动
-            # 对账由控制台统一安排一次；runner 只在手工显式请求时才读。
-            options = getattr(self, "_options", None)
-            if options is not None and options.reconcile_on_start:
-                self.reconcile_today()
+            # 就会把「等舰队回来继续派」误做成「每次续跑都翻一遍战报」；而反过来
+            # 无条件不进信箱，就是 2026-08-15 起那两天——攻击照派、战报一份没读。
+            # 判据是**冷却**，理由整段在 `domain.reconcile_cooldown`。
+            self._reconcile_if_due()
             if not self.ensure_origin_planet():
                 # 切不过去/回读不过时**一发都不派**：舰队会从别的星球飞出去，而
                 # `attack_intents.origin_*` 上写着这一轮配的那颗，战报永远配不上。
@@ -3069,7 +3155,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reconcile",
         action="store_true",
-        help="开工前只读一次当日战报；调度器续跑时默认不读",
+        help="强制翻一趟信箱读当日战报，忽略冷却（手工排障用；不给则按冷却自动决定）",
     )
     args = parser.parse_args(argv)
 
@@ -3083,7 +3169,7 @@ def main(argv: list[str] | None = None) -> int:
         attack=args.attack,
         preset=args.preset,
         origin=args.origin,
-        reconcile_on_start=args.reconcile,
+        force_reconcile=args.reconcile,
     )
     mode = "扫描" if not args.scout else ("侦察+攻击" if args.attack else "只侦察")
     listed = ", ".join(f"{galaxy}:{system}" for galaxy, system in options.systems)

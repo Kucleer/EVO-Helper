@@ -343,12 +343,23 @@ class SchedulerStartIn(BaseModel):
     #: 启动对账只是额外多一趟、翻得更深。真正要救过期战报时走页面上那个手动
     #: 按钮——那时人在跟前，确认也就有人点。
     #:
+    #: ⚠️ 上面这句「本来就有」在 2026-08-15 到 08-17 之间**是假的**，而这道闸门
+    #: 就是靠它才敢关的：那两天里 `LoopOptions.reconcile_on_start` 默认 False，
+    #: runner 一趟信箱都不翻，于是攻击照派、战报一份没读。两道闸门各自以「另一道
+    #: 还开着」为理由，谁也没开着。整段前因后果在 `domain.reconcile_cooldown`。
+    #:
+    #: 那一侧现在改成了冷却判据（默认必翻，只是不每轮都翻），所以这句话重新成立。
+    #:
+    #: **但这道闸门仍然保持默认关**：它关掉的理由（对账失败会让
+    #: `BackfillState.blocking` 扣住窗口、整夜一个任务都不起）今天依然成立。
     #: 要恢复默认开，原本要解决两件事，现在还剩一件：
     #:
     #: - ~~CLI 把「抢不到前台」按 75 收场~~ —— 已经做了：
     #:   `game.game_window.ForegroundUnavailable` +
     #:   `tools.scan_coordinates.run_with_foreground_guard`。
     #: - `blocking` 对 `FAILED` 那一档仍然没有无人值守的出路。
+    #:
+    #: 剩下这一件没解决之前单独重开它，只会把故障从「不读战报」换成「整夜不起任务」。
     reconcile: bool = False
 
 

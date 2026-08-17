@@ -130,9 +130,10 @@ class BotOptions:
     origin: Coordinate | None = None
     #: 军力任务会逐目标带标题；缺项才是旧区域攻击的 BBB。绝不 OCR 校验预设内容。
     presets: dict[Coordinate, str] | None = None
-    #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
-    #: 航线返航后的续跑反复打开信箱。
-    reconcile_on_start: bool = False
+    #: **强制**在这一轮开始前翻一次信箱，忽略冷却。仅手工排障用。
+    #: 语义与理由同 `pirate_loop.LoopOptions.force_reconcile`：默认档不是
+    #: 「不翻」而是「按冷却翻」，判据在 `domain.reconcile_cooldown`。
+    force_reconcile: bool = False
     #: 本进程最多真正派出多少发。调度器按当前出发星球的空闲航线数传入，避免
     #: 盲目点到游戏的「航线已满」弹窗；手工运行不传则不设上限。
     max_dispatches: int | None = None
@@ -172,7 +173,7 @@ class BotLoop(PirateLoop):
                 attack=options.attack,
                 preset=BOT_ATTACK_PRESET,
                 origin=options.origin,
-                reconcile_on_start=options.reconcile_on_start,
+                force_reconcile=options.force_reconcile,
             ),
         )
         self._bot = options
@@ -270,7 +271,8 @@ class BotLoop(PirateLoop):
             note = rematch_note(repository, target, live.reported_at_utc)
             say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库{note}")
             return ReportIngest.KNOWN
-        repository.append_report(to_battle_report(live, report_id=uuid4()))
+        report_id = uuid4()
+        repository.append_report(to_battle_report(live, report_id=report_id))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
         # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
         # （没拖到底 / 那一屏的行位置偏了）。战果已不再影响要不要再打一发，
@@ -281,6 +283,9 @@ class BotLoop(PirateLoop):
             f"（我 {live.attacker_units}−{live.attacker_losses}，"
             f"敌 {live.defender_units}−{live.defender_losses}）"
         )
+        # 截图与海盗那条链路共用同一个落点（父类 `_store_report_screenshot`）：
+        # 两条链路读的是同一块面板、存的是同一张表，判据只该有一份。
+        self._store_report_screenshot(report_id, page)
         return ReportIngest.STORED
 
     # -- 主循环 -------------------------------------------------------------
@@ -330,20 +335,44 @@ class BotLoop(PirateLoop):
             # `DONE` 无事可做。
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
-        """还在等战报的目标，日志上要分清「还没到点」和「到点了却没翻到」。
+        """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
 
         ⚠️ **这句话要说准。** 原先统一说「还没出现在信箱最上面几行」，把
         「窗口不够大」说成了「报告还没到」——而实机上正因就是前者：海盗链路整夜
         产出攻击报告，6 行窗口被别人的报告占满，六个目标一视同仁地报「翻不到」，
         连续四趟都是同一句。两者的处置完全相反（一个要把窗口开大、一个要接着等）。
+
+        ⚠️ **第二次，同一个毛病，代价更大。** 改成上面那版之后，「战报到点了却
+        没翻到；下一趟再来」这句话是在**一次信箱都没开**的情况下打出来的：它
+        只查了库。而 2026-08-15 21:59 起本轮压根不翻信箱（见
+        `domain.reconcile_cooldown` 的模块头），于是这条链路整整两天、每一轮、
+        每一个目标都在说「翻不到战报」——**说的是一句假话**，而正是这句假话让
+        「战报一份都没读回来」这件事拖了两天没人发现。日志把「我找过了，没有」
+        和「我根本没去找」说成同一句，就等于把故障伪装成常态。
+
+        所以现在按三档说：
+
+        - 还没到点：接着等，与信箱无关。
+        - 到点了，**本轮翻过信箱**没找到：这才是原来那句话，可以照说。
+        - 到点了，**本轮没翻信箱**：说清没翻的理由，并带上**上次真正翻信箱是
+          什么时候**——那才是用户判断「这一发到底有没有人去看过」的依据。
         """
         repository, _run_id = self._ensure_run()
         due = dict(repository.bot_report_due_at((coordinate,), since=self._round_start()))
         expected = due.get(coordinate, (None, None))[1]
         if expected is not None and expected > datetime.now(UTC):
             say(f"  战报预计 {expected:%H:%M:%S} UTC 才产生；接着等")
-        else:
-            say("  战报到点了却没翻到；下一趟再来")
+            return
+        # `getattr` 而不是直接取：手工调子方法（补录入口、离线工具）时 `run()`
+        # 没走过，这个字段可能压根没被建出来。取不到就按「翻过了」说——那是
+        # `run()` 走完之后的常态，而这一句只在真的没翻时才该换措辞。
+        decision = getattr(self, "_reconcile_decision", None)
+        if decision is not None and not decision.sweep:
+            last = decision.last_reconciled_at_utc
+            when = f"{last:%Y-%m-%d %H:%M:%S} UTC" if last is not None else "从来没翻过"
+            say(f"  战报到点了，但**本轮没翻信箱**（{decision.note}）；上次真正翻信箱：{when}")
+            return
+        say("  本轮翻过信箱，没找到这一发的战报；下一趟再来")
 
     def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。
@@ -458,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reconcile",
         action="store_true",
-        help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
+        help="强制翻一趟信箱读当日攻击战报，忽略冷却（手工排障用；不给则按冷却自动决定）",
     )
     parser.add_argument(
         "--max-dispatches",
@@ -480,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         round_started_at=args.round_started_at,
         origin=args.origin,
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
-        reconcile_on_start=args.reconcile,
+        force_reconcile=args.reconcile,
         max_dispatches=args.max_dispatches,
     )
     mode = "真打" if args.attack else "只认目标"

@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -236,6 +237,55 @@ class BattleReportRow(Base):
         unique=True,
         nullable=True,
     )
+
+
+class BattleReportScreenshotRow(Base):
+    """读一份战报时截下来的那一屏面板，**字节直接存库**。
+
+    用户口径（2026-08-17）：进入邮件详情读战报时截一张图，能在攻击日志页看到。
+
+    ## 为什么是字节，不是路径
+
+    `artifacts` 那张表存的是路径，而这条链路**跑在另一台机器上**（runner 在
+    `E:\\Kucleer_code\\EVO\\EVO-Helper`，人常在另一台机器上开控制台）。存路径
+    等于在控制台上点开一个必然 404 的链接——图还在，只是没人看得见。
+    库是两台机器唯一共享的东西，所以图就存在库里。
+
+    ## 为什么是**自己一张表**，不是塞进 `system_log.payload_json`
+
+    那张表按设计要保持轻：海盗一轮半小时、光 `say()` 就有 80 个调用点，两周
+    几十万行，主视图是「按时刻倒序翻页」。往里面塞几十 KB 的二进制，翻页查询
+    会连着 blob 一起扫，一张按设计只增不改的诊断表会被拖成负担。
+
+    分表还带来一个真正要紧的性质：**攻击日志的列表查询绝不会碰到这些字节**。
+    列表一页几十行、每行几十 KB，连着 blob 查一次就是几 MB 的响应。页面只按
+    `EXISTS` 问「有没有图」，真正的字节由 `/api/reports/{id}/screenshot` 单取。
+
+    ## 一份战报最多一张
+
+    `report_id` 上是唯一约束。同一份战报被重复读到时（换库、重认）不该攒出
+    好几张几乎一样的图；重复入库那条路径本来就走不到这里（`ReportIngest.KNOWN`
+    直接返回）。
+    """
+
+    __tablename__ = "battle_report_screenshots"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    #: 这张图是哪一份战报的。唯一——一份战报最多一张图。
+    report_id: Mapped[UUID] = mapped_column(
+        ForeignKey("battle_reports.id"), unique=True, index=True
+    )
+    #: 截图那一刻（真实时间）。**保留期清理按它算**，不按战报时间：
+    #: 补录会把很旧的战报读进来，按战报时间算的话那张图一入库就过期。
+    captured_at_utc: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    #: 编码格式，目前恒为 `webp`。记下来是为了将来换编码时旧行仍能正确回放——
+    #: 接口要靠它填 `Content-Type`，猜错就是浏览器直接下载而不是显示。
+    image_format: Mapped[str] = mapped_column(String(8), default="webp")
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    #: 字节数。单独一列是为了能不取 blob 就统计占用——保留期这件事要能先量再调。
+    byte_size: Mapped[int] = mapped_column(Integer)
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class FleetSnapshotRow(Base):
