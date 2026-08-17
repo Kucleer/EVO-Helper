@@ -201,6 +201,20 @@
                 · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}
               </div>
             {% endif %}
+            {#
+              战报截图。读战报那一刻截的整块面板（双方名称、两侧坐标、战斗详情），
+              存在库里而不是磁盘上——实机 runner 跑在另一台机器上，存路径的话
+              这个链接在控制台上必然打不开。
+
+              ⚠️ **只放链接，不放 `<img>`。** 一页几十行、每张约 40 KB，内联进来
+              就是几 MB 的首屏。有图才出现这一行：没图时摆一个点开是 404 的链接，
+              比没有链接更难排查。
+            #}
+            {% if entry.report_screenshot %}
+              <div style="font-size:11px">
+                <a href="/api/reports/{{ entry.report_id }}/screenshot" target="_blank" rel="noopener">查看战报截图</a>
+              </div>
+            {% endif %}
           </td>
           {# 预计战报按现实时间显示：这一格的用途是「我几点回来收战报」，而人是按墙上时钟等的。 #}
           <td class="muted">{{ local_time(entry.expected_report_at_utc) }}</td>

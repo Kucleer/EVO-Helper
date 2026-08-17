@@ -253,6 +253,87 @@ def test_a_later_smaller_count_never_lowers_the_day(repository) -> None:  # type
     assert _reconciliation_complete(repository) is True
 
 
+def test_a_link_that_never_reconciled_has_no_last_moment(repository) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 这个 None 是承重的：它让开工冷却判为「必须翻信箱」。
+
+    判据在 `domain.reconcile_cooldown`——手里没有任何依据时唯一安全的默认是翻。
+    """
+    assert repository.last_reconciled_at(TARGET_KIND_PIRATE) is None
+
+
+def test_the_last_moment_is_the_one_that_was_written_last(repository) -> None:  # type: ignore[no-untyped-def]
+    """取的是 `reconciled_at_utc` 的最大值。
+
+    **不是「最新那一天的那一行」**：补录与跨日的那一轮会回填昨天的行，按
+    `day_utc` 排序拿到的未必是时间上最后写的那一条。
+    """
+    yesterday = MIDNIGHT - timedelta(days=1)
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=MIDNIGHT,
+        observed_reports=3,
+        complete=True,
+        reconciled_at_utc=NOON,
+    )
+    # 后写的是**昨天**那一行，时刻却更晚。
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=yesterday,
+        observed_reports=1,
+        complete=True,
+        reconciled_at_utc=NOON + timedelta(hours=2),
+    )
+
+    assert repository.last_reconciled_at(TARGET_KIND_PIRATE) == NOON + timedelta(hours=2)
+
+
+def test_the_last_moment_crosses_the_utc_day_boundary(repository) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **不按 UTC 日筛。**
+
+    按当日筛的话，每个 UTC 00:00 都会凭空变成「从没对过账」，于是恰好卡在日界
+    前后连着起的两轮 runner 会各翻一趟信箱——冷却在最该生效的时刻失效。
+    """
+    yesterday = MIDNIGHT - timedelta(days=1)
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=yesterday,
+        observed_reports=5,
+        complete=True,
+        reconciled_at_utc=MIDNIGHT - timedelta(minutes=5),
+    )
+
+    assert repository.last_reconciled_at(TARGET_KIND_PIRATE) == MIDNIGHT - timedelta(minutes=5)
+
+
+def test_each_link_has_its_own_last_moment(repository) -> None:  # type: ignore[no-untyped-def]
+    """海盗与 bot 各翻各的信箱（主题不同），冷却也各算各的。"""
+    repository.record_daily_reconciliation(
+        TARGET_KIND_BOT,
+        day_utc=MIDNIGHT,
+        observed_reports=2,
+        complete=True,
+        reconciled_at_utc=NOON,
+    )
+
+    assert repository.last_reconciled_at(TARGET_KIND_BOT) == NOON
+    assert repository.last_reconciled_at(TARGET_KIND_PIRATE) is None
+
+
+def test_the_last_moment_comes_back_timezone_aware(repository) -> None:  # type: ignore[no-untyped-def]
+    """naive 的话，冷却那一步的减法会当场抛 TypeError——而那是在实机上抛。"""
+    repository.record_daily_reconciliation(
+        TARGET_KIND_PIRATE,
+        day_utc=MIDNIGHT,
+        observed_reports=1,
+        complete=True,
+        reconciled_at_utc=NOON,
+    )
+
+    moment = repository.last_reconciled_at(TARGET_KIND_PIRATE)
+    assert moment is not None
+    assert moment.tzinfo is not None
+
+
 def test_the_next_day_starts_from_zero_again(repository) -> None:  # type: ignore[no-untyped-def]
     """只增不减是**一天之内**的规则。日界一到，新的一天从头数。"""
     repository.record_daily_reconciliation(

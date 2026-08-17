@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     #: `system_log` 保留多少天。控制台每次启动清一次早于这个期限的行。
     #: 0 或负数表示**不清理**（不是「全删」——见 `infrastructure.system_log_db`）。
     system_log_retention_days: int = 14
+    #: 战报截图（`battle_report_screenshots`）保留多少天。控制台每次启动清一次。
+    #: 0 或负数同样表示**不清理**，不是「全删」——判据与上面那一条共用一套。
+    #:
+    #: 30 天是用户口径（2026-08-17）。量级：约 40 KB/张、每天 80 张，30 天 ≈ 97 MB。
+    report_screenshot_retention_days: int = 30
     #: In-game fleet preset used for scanning. Its signature is still
     #: verified before any dispatch; this only prefills the plan form.
     default_fleet_preset: str = DEFAULT_PRESET.name

@@ -1216,6 +1216,32 @@ class SqlAlchemyRepository:
                 return None
             return _daily_status(row)
 
+    def last_reconciled_at(self, target_kind: str) -> datetime | None:
+        """本链路**最后一次真正翻完信箱**的时刻；从没对过账时 None。
+
+        开工冷却判据的唯一输入（`domain.reconcile_cooldown.decide_reconcile`）。
+
+        ⚠️ **跨日取最大值，不按 UTC 日筛。** 这个数回答的是「上一次有人去看过
+        信箱是什么时候」，而那件事跟日历天毫无关系。按当日筛的话，每个 UTC
+        00:00 都会凭空变成「从没对过账」，于是恰好在日界前后连着起的两轮
+        runner 会各翻一趟信箱——冷却在一天里最容易堆积续跑的那个时刻失效。
+
+        取 `reconciled_at_utc` 的最大值而不是「最新那一天的那一行」：
+        `record_daily_reconciliation` 会回填昨天的行（补录、跨日的那一轮），
+        按 `day_utc` 排序拿到的未必是时间上最后写的那一条。
+        """
+        with self._session_factory() as session:
+            moment = session.scalar(
+                select(func.max(orm.DailyReconciliationRow.reconciled_at_utc)).where(
+                    orm.DailyReconciliationRow.target_kind == target_kind
+                )
+            )
+        if moment is None:
+            return None
+        # SQLite 上读回来可能是 naive（见 `storage.database.UTCDateTime` 的注释里
+        # 那段：`func.max` 绕开了 TypeDecorator 的 `process_result_value`）。
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
     def record_daily_reconciliation(
         self,
         target_kind: str,

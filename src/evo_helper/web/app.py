@@ -802,6 +802,32 @@ def create_app(
         )
         return _revisit_out(service.request_revisit(payload.scope, payload.reason, target))
 
+    @app.get("/api/reports/{report_id}/screenshot")
+    async def report_screenshot(
+        report_id: UUID,
+        service: ApplicationService = Depends(get_service),
+    ) -> Response:
+        """读这份战报时截下来的那一屏面板。攻击日志上那个链接就指这里。
+
+        **单独一条接口，而不是把字节并进攻击日志的列表响应。** 那一页一次取
+        `ATTACK_LOG_LIMIT` 行，每张图约 40 KB；把 base64 塞进列表，一页就是几
+        MB，页面在手机上直接卡死。列表只带一个布尔（有没有图），点了才取。
+
+        `Content-Type` 按库里记的格式填（`ReportScreenshot.media_type`），
+        不写死 `image/webp`：将来换编码时旧行还在，猜错就是浏览器下载而不是显示。
+
+        缓存一年且 `immutable`：一份战报的截图存下来就再也不会变（`save` 不覆盖），
+        而这张图是几十 KB，回回重下没有意义。
+        """
+        shot = service.report_screenshot(report_id)
+        if shot is None:
+            raise NotFoundError(f"report screenshot not found: {report_id}")
+        return Response(
+            content=shot.image_bytes,
+            media_type=shot.media_type,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
     @app.get("/logs", response_class=HTMLResponse)
     async def attack_log_page(
         request: Request,

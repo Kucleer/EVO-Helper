@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
+from evo_helper.storage.report_screenshots import ReportScreenshot
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -250,6 +251,14 @@ class AttackLogView:
     #: （`ScoutReportRow` 没有 `dispatch_id`，理由写在那个类上），所以只能按
     #: 目标 + 时间先后算，没法像战报那样精确到某一发。
     scout_report_back: bool = False
+    #: 匹配上的那份战报的 id。页面靠它拼截图链接。没战报时 None。
+    report_id: UUID | None = None
+    #: 那份战报**有没有存下截图**。
+    #:
+    #: ⚠️ **这里只放一个布尔，绝不放图片字节。** 这一页一次取 `ATTACK_LOG_LIMIT`
+    #: 行，每张图约 40 KB；把 base64 塞进列表响应，一页就是几 MB，页面直接被
+    #: 拖垮。字节由 `/api/reports/{report_id}/screenshot` 按需单取。
+    report_screenshot: bool = False
 
 
 #: 攻击日志「结果」那一档的三个取值。键同 `storage.intel.DISPATCH_*`，
@@ -551,6 +560,7 @@ class ApplicationService(Protocol):
         outcome: str | None = None,
     ) -> list[AttackLogView]: ...
     def attack_log_options(self) -> AttackLogOptions: ...
+    def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None: ...
     def dashboard(self) -> DashboardView: ...
 
 
@@ -901,6 +911,10 @@ class FakeApplicationService:
         两个空元组让筛选器只剩「全部」一项，而不是摆出一串筛不出东西的档位。
         """
         return AttackLogOptions(presets=(), outcomes=())
+
+    def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None:
+        """同上：Fake 服务没有战报，也就没有战报截图。返回 None 让接口 404。"""
+        return None
 
     def dashboard(self) -> DashboardView:
         """Fake 服务里「进行中的运行」恒为 0。

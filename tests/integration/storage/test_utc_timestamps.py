@@ -43,6 +43,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
+        "battle_report_screenshots.captured_at_utc",
         "battle_reports.reported_at_utc",
         "bot_targets.last_attack_at_utc",
         "bot_targets.last_dispatch_at_utc",
@@ -91,6 +92,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
         "attack_dispatches.line_released_at_utc",
+        "battle_report_screenshots.captured_at_utc",
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",

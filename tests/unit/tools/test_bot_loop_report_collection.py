@@ -18,12 +18,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.reconcile_cooldown import decide_reconcile
 from evo_helper.tools.bot_loop import BotLoop, BotOptions
 from evo_helper.tools.pirate_loop import LoopOptions, MailRow, ReportIngest
 from evo_helper.vision.parsers import ReportKind
@@ -390,8 +391,8 @@ def test_a_report_that_is_not_due_yet_says_so_instead_of_blaming_the_window() ->
     assert not any("到点了却没翻到" in line for line in said)
 
 
-def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> None:
-    """到点了还翻不到，那就是这一趟没翻到——说准了才修得动。"""
+def _overdue_loop() -> Any:
+    """一个「战报早该到了却还没有」的循环。到点判据由 `_DueRepository` 给。"""
     now = datetime.now(UTC)
     loop, _events = _loop([])
     loop._ensure_run = lambda: (
@@ -399,10 +400,48 @@ def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> Non
         None,
     )
     loop._round_start = lambda: datetime(2026, 8, 6, tzinfo=UTC)
+    return loop
+
+
+def test_a_report_that_is_due_but_missing_blames_the_trip_not_the_clock() -> None:
+    """本轮**翻过**信箱却没找到，才可以说「没找到」。
+
+    措辞里要有「翻过信箱」四个字：这句话与下面那条「本轮没翻信箱」是一对，
+    读日志的人靠它们区分「我找过了，没有」和「我根本没去找」。
+    """
+    loop = _overdue_loop()
+    loop._reconcile_decision = decide_reconcile(last_reconciled_at_utc=None, now=datetime.now(UTC))
+    assert loop._reconcile_decision.sweep is True
 
     said = _waiting_lines(loop, A)
 
-    assert any("到点了却没翻到" in line for line in said)
+    assert any("本轮翻过信箱，没找到" in line for line in said)
+    assert not any("本轮没翻信箱" in line for line in said)
+
+
+def test_a_round_that_skipped_the_mailbox_never_claims_the_report_was_missing() -> None:
+    """⚠️ **这条钉的就是那次两天的故障。**
+
+    冷却中的那一轮**一封信都没开**，这时说「战报到点了却没翻到」是一句假话——
+    2026-08-15 起整整两天，每一轮、每一个目标都在说它，而真相是这条链路根本
+    没进过信箱。日志把「我找过了，没有」和「我根本没去找」说成同一句，
+    故障就被伪装成了常态。
+
+    所以措辞必须换掉，而且要带上**上次真正翻信箱的时刻**——那才是用户判断
+    「这一发到底有没有人去看过」的依据。
+    """
+    now = datetime.now(UTC)
+    last = now - timedelta(minutes=3)
+    loop = _overdue_loop()
+    loop._reconcile_decision = decide_reconcile(last_reconciled_at_utc=last, now=now)
+    assert loop._reconcile_decision.sweep is False
+
+    said = _waiting_lines(loop, A)
+
+    assert any("本轮没翻信箱" in line for line in said)
+    assert not any("本轮翻过信箱" in line for line in said)
+    # 上次真正翻信箱是什么时候，必须写出来。
+    assert any(f"{last:%Y-%m-%d %H:%M:%S} UTC" in line for line in said)
 
 
 def test_saying_it_is_still_waiting_never_opens_the_mailbox() -> None:

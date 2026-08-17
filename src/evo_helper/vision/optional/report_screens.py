@@ -12,6 +12,8 @@ never binarized, and why coordinates get their own single-line ROI.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from io import BytesIO
 from typing import Any, Protocol
 
 from evo_helper.vision.fleet_counts import COUNT_RECIPES
@@ -75,6 +77,19 @@ FLEET_ROW_PITCH = 22
 #: 不同倍数漏掉的行不一样——侦察报告那 21 行里，3× 整行漏掉 `钛能守卫者`，
 #: 而漏掉的恰好是判定要看的四个舰种之一。多试一档比调参稳。
 NAME_PASS_UPSCALES: tuple[int, ...] = (FLEET_NAME_UPSCALE, 4, 2)
+
+#: 战报存档图的 WEBP 质量。理由见 `ImageReportScreens.report_panel_image`。
+REPORT_PANEL_WEBP_QUALITY = 90
+
+
+@dataclass(frozen=True, slots=True)
+class ReportPanelImage:
+    """裁好、编码好的战报面板。宽高一并带出来——库里那两列不该由调用方再算一遍。"""
+
+    image_bytes: bytes
+    width: int
+    height: int
+    image_format: str
 
 
 class _Ocr(Protocol):
@@ -164,6 +179,32 @@ class ImageReportScreens:
     def security_message(self) -> str:
         """安全提示邮件的正文；与战斗报告的 VS / 舰队区域完全不同。"""
         return self._read(self._layout.security_message, OCR_PSM_COLUMN)
+
+    def report_panel_image(self, quality: int = REPORT_PANEL_WEBP_QUALITY) -> ReportPanelImage:
+        """把整块战报面板裁出来、编码成 WEBP。**这一块不喂 OCR，是给人看的。**
+
+        用户口径（2026-08-17）：读战报时截一张图，能在攻击日志页看到。
+
+        **复用这一屏已经拍好的像素，不另拍一次。** 调用方手里的 `page` 就是读
+        这份战报用的那一屏；重新截一次屏既多花时间，又可能拍到别的画面
+        （面板已经被拖到底、或者已经关掉了）——那正是 `_report_screens` 头上
+        「每次重新建」那条注释在防的事，只是方向相反。
+
+        ROI 与它为什么留这么多余量写在 `report_layout.ReportLayout.report_panel`。
+
+        WEBP q90：实测这个尺寸下 38.8 KB/张，每天 80 张约 3 MB。选有损而不是 PNG
+        （同图 PNG 是它的好几倍），选 90 而不是默认的 80，是因为这张图上要认的
+        是**小字坐标**（`[2:137:18]`），压过头就等于存了一张认不出目标的图。
+        """
+        crop = self._image.crop(self._layout.report_panel.as_box()).convert("RGB")
+        buffer = BytesIO()
+        crop.save(buffer, format="WEBP", quality=quality)
+        return ReportPanelImage(
+            image_bytes=buffer.getvalue(),
+            width=crop.width,
+            height=crop.height,
+            image_format="webp",
+        )
 
     def _report_time(self) -> str | None:
         """窄 ROI 读页眉时间：单行、纯英文、只认数字与分隔符。
