@@ -148,12 +148,14 @@ def enter_game_exit_code(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> 
         make_ocr,
         make_session_keeper,
         restart_if_still_unusable,
+        wait_for_login_if_unrecognised,
     )
 
     del ocr
     keeper = make_session_keeper(driver, make_ocr())
     session = keeper.ensure_connected(force=True)
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
+    session = wait_for_login_if_unrecognised(session, keeper)
     session = restart_if_still_unusable(session, keeper)
     if session is None or session.ready:
         return 0
