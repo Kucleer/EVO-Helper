@@ -7,10 +7,24 @@
   <input id="score-min" type="number" min="0" placeholder="最低军力" aria-label="最低军力">
   <input id="score-max" type="number" min="0" placeholder="最高军力" aria-label="最高军力">
   <select id="galaxy" aria-label="银河系"><option value="">全部银河系</option>{% for g in range(1, 10) %}<option value="{{ g }}">{{ g }} 系</option>{% endfor %}</select>
+  {# 时间范围。默认 24 小时（用户口径 2026-08-17），但「全部」必须留着：
+     排障时要看更早的数据，看不到历史就只能绕路。 #}
+  <select id="window" aria-label="时间范围">
+    <option value="24h">最近 24 小时</option>
+    <option value="7d">最近 7 天</option>
+    <option value="all">全部数据</option>
+  </select>
   <button class="btn primary small" id="search">筛选</button>
   <button class="btn small" type="button" id="reset">重置筛选</button>
 </div><p class="muted" id="meta">尚无军力榜数据。</p></section>
-<section class="panel"><table><thead><tr><th>名次</th><th>名称</th><th>军力值</th><th>坐标</th><th>来源</th><th>更新时间（UTC+8）</th></tr></thead><tbody id="rows"></tbody></table></section>
+<section class="panel"><table><thead><tr>
+  <th data-column="rank"><button type="button" class="sort">名次<span class="arrow"></span></button></th>
+  <th>名称</th>
+  <th data-column="score"><button type="button" class="sort">军力值<span class="arrow"></span></button></th>
+  <th data-column="coordinate"><button type="button" class="sort">坐标<span class="arrow"></span></button></th>
+  <th>来源</th>
+  <th data-column="observed_at"><button type="button" class="sort">更新时间（UTC+8）<span class="arrow"></span></button></th>
+</tr></thead><tbody id="rows"></tbody></table></section>
 <script>
 // 「类型」下拉框已移除：这张榜按构造只可能有 bot（扫描入库前先过 is_bot_coordinate），
 // 海盗与真人根本进不来，留个永远筛出空集的框只会让人以为筛坏了。
@@ -19,7 +33,35 @@ const e=(x)=>document.getElementById(x), val=(x)=>e(x).value.trim();
 // 日期格式化器——抄第二份的那天两处就开始分家，而且它对缺时区后缀的字符串会按
 // 浏览器本地时区解释，凭空差 8 小时。
 const local=(value)=>EVOHelper.localTime(value);
-async function search(){const p=new URLSearchParams(); for(const [key,id] of [['q','q'],['score_min','score-min'],['score_max','score-max'],['galaxy','galaxy']]) if(val(id))p.set(key,val(id)); const data=await EVOHelper.get('/api/military-rankings?'+p); e('meta').textContent=data.refreshed_at_utc?`最近一次采集（UTC+8）：${local(data.refreshed_at_utc)} · 命中 ${data.total} 条`:'尚无军力榜数据。'; e('rows').innerHTML=data.rows.map(r=>`<tr><td>${r.rank??'—'}</td><td>${r.name}</td><td>${r.score??'—'}${r.estimated?' <span class="muted">(估算)</span>':''}</td><td>${r.coordinate??'—'}</td><td>${r.source==='scan'?'已核验':'榜单'}</td><td>${r.observed_at_utc?local(r.observed_at_utc):'—'}</td></tr>`).join('');}
-function reset(){for(const id of ['q','score-min','score-max','galaxy'])e(id).value=''; search();} e('search').onclick=search; e('reset').onclick=reset; search();
+// 排序键与后端白名单一一对应（storage.military_rankings 的 _BOARD_SORT_COLUMNS）。
+// 排序在 SQL 里做，这里只负责把键传过去——库里 1,700+ 行，全量取回来再在浏览器里
+// 排既慢又会把翻页切在错的顺序上。
+// 每个键还带一个「头一次点它时往哪边排」：时间和军力值先看最大的，名次和坐标先看最小的。
+const FIRST_DIR={observed_at:'desc',score:'desc',rank:'asc',coordinate:'asc'};
+const WINDOW_LABEL={'24h':'最近 24 小时','7d':'最近 7 天','all':'全部数据'};
+let sort='observed_at', direction='desc';
+async function search(){
+  const p=new URLSearchParams();
+  for(const [key,id] of [['q','q'],['score_min','score-min'],['score_max','score-max'],['galaxy','galaxy']]) if(val(id))p.set(key,val(id));
+  p.set('sort',sort); p.set('direction',direction); p.set('window',val('window'));
+  const data=await EVOHelper.get('/api/military-rankings?'+p);
+  // 范围要和条数写在一起。光说「命中 N 条」会被当成库里的全部，而默认只看 24 小时；
+  // 「全榜最近一次采集」则不受时间窗影响，窗内 0 条时正是它告诉你数据有多旧。
+  e('meta').textContent=data.refreshed_at_utc
+    ?`${WINDOW_LABEL[val('window')]} · 命中 ${data.total} 条 · 全榜最近一次采集（UTC+8）：${local(data.refreshed_at_utc)}`
+    :'尚无军力榜数据。';
+  e('meta').title=data.window_start_utc?`只列出 ${local(data.window_start_utc)} 之后采到的数据`:'不设时间窗，列出全部数据';
+  e('rows').innerHTML=data.rows.map(r=>`<tr><td>${r.rank??'—'}</td><td>${r.name}</td><td>${r.score??'—'}${r.estimated?' <span class="muted">(估算)</span>':''}</td><td>${r.coordinate??'—'}</td><td>${r.source==='scan'?'已核验':'榜单'}</td><td>${r.observed_at_utc?local(r.observed_at_utc):'—'}</td></tr>`).join('');
+  markSorted();
+}
+// 当前按哪一列、哪个方向排，写在表头上：`aria-sort` 给读屏软件，箭头给眼睛。
+function markSorted(){for(const th of document.querySelectorAll('th[data-column]')){const active=th.dataset.column===sort;
+  if(active)th.setAttribute('aria-sort',direction==='desc'?'descending':'ascending'); else th.removeAttribute('aria-sort');
+  th.querySelector('.arrow').textContent=active?(direction==='desc'?' ↓':' ↑'):'';}}
+for(const button of document.querySelectorAll('th[data-column] button.sort'))
+  button.onclick=()=>{const key=button.parentElement.dataset.column;
+    direction=key===sort?(direction==='desc'?'asc':'desc'):FIRST_DIR[key]; sort=key; search();};
+function reset(){for(const id of ['q','score-min','score-max','galaxy'])e(id).value=''; e('window').value='24h'; sort='observed_at'; direction='desc'; search();}
+e('search').onclick=search; e('reset').onclick=reset; e('window').onchange=search; search();
 </script>
 {% endblock %}

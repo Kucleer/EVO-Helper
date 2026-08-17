@@ -22,7 +22,11 @@ from evo_helper.storage.database import Base, create_database_engine, create_ses
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 
-READ_AT = datetime(2026, 8, 16, 1, 0, tzinfo=UTC)
+#: 造数据的读取时刻。**必须相对当下算，不能写死一个日期。**
+#:
+#: 列表默认只出最近 24 小时的行（见 `storage.military_rankings.live_board`），
+#: 写死的日期跑到明天就出窗了，这一整个文件会在某个与它无关的日子集体转红。
+READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=1)
 
 
 def _client(tmp_path: Path) -> tuple[TestClient, SqlAlchemyRepository]:
@@ -38,6 +42,9 @@ def test_the_api_returns_the_time_each_row_was_read(tmp_path: Path) -> None:
 
     两行**故意隔开 42 分钟**，模拟一趟读榜里相隔很远的两屏：任何拿单一时刻
     （快照时刻、`now()`）去填所有行的实现都会让它们塌成同一个值。
+
+    按名字取值而不是按下标，是为了不跟排序绑在一起：默认排序另有专门的用例
+    （`test_ranking_board_sorting.py`），这一条只管「时刻有没有被压平」。
     """
     client, repository = _client(tmp_path)
     late = READ_AT + timedelta(minutes=42)
@@ -50,8 +57,8 @@ def test_the_api_returns_the_time_each_row_was_read(tmp_path: Path) -> None:
 
     rows = client.get("/api/military-rankings").json()["rows"]
 
-    assert [row["name"] for row in rows] == ["bot_2_137_5", "bot_2_137_6"]
-    assert [datetime.fromisoformat(row["observed_at_utc"]) for row in rows] == [READ_AT, late]
+    observed = {row["name"]: datetime.fromisoformat(row["observed_at_utc"]) for row in rows}
+    assert observed == {"bot_2_137_5": READ_AT, "bot_2_137_6": late}
 
 
 def test_the_board_shows_what_the_scan_wrote_not_a_frozen_snapshot(tmp_path: Path) -> None:
@@ -117,8 +124,12 @@ def test_the_rankings_page_has_a_column_for_it(tmp_path: Path) -> None:
     """页面上得看得见——字段只存不显等于没做。
 
     ⚠️ **判据必须落在表头那一格上**，不能只搜「更新时间」四个字：页面顶上本来就
-    有一句时间说明，裸搜会被它满足。变异测试当场逮到了这一点——把
-    `<th>更新时间（UTC+8）</th>` 整个删掉，裸搜的版本照样绿。
+    有一句时间说明，裸搜会被它满足。变异测试当场逮到了这一点——把整个表头格
+    删掉，裸搜的版本照样绿。
+
+    表头如今是个可排序的按钮，所以判据是「那一格里写着这几个字」而不是完整的
+    `<th>…</th>` 字面量——但仍然锚在 `data-column="observed_at"` 这一格上，
+    换不了别处。
 
     时区标注也一并钉在这里（用户口径 2026-08-17：页面上的时刻一律 UTC+8）：
     这一格显示的是换算过的现实时间，表头不写清楚就得让人猜是哪一套。
@@ -126,5 +137,6 @@ def test_the_rankings_page_has_a_column_for_it(tmp_path: Path) -> None:
     client, _ = _client(tmp_path)
     body = client.get("/rankings").text
 
-    assert "<th>更新时间（UTC+8）</th>" in body
+    header = '<th data-column="observed_at"><button type="button" class="sort">更新时间（UTC+8）'
+    assert header in body
     assert "r.observed_at_utc" in body
