@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import Select, UnaryExpression, func, nulls_last, select
+from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import RankingRow
@@ -36,6 +37,52 @@ from . import models as orm
 
 #: 搜索框里能写成坐标的两种形状：`bot_2_137_5` 与 `2:137:5`，允许只给到恒星系。
 _COORDINATE_QUERY_RE = re.compile(r"^(?:bot[_\s]+)?(\d+)[:_\s]+(\d+)(?:[:_\s]+(\d+))?$", re.I)
+
+#: 榜单能按哪几列排序，以及默认是哪一列。
+#:
+#: 用户口径（2026-08-17）：「军力榜列表增加排序功能，默认时间排序」。所以默认是
+#: `observed_at` 降序——最近读到的排最前面，这也是「这张榜现在长什么样」最直接的读法。
+BoardSort = Literal["observed_at", "score", "rank", "coordinate"]
+BoardDirection = Literal["asc", "desc"]
+
+#: 列表的时间窗，判据是每行自己的 `military_score_at_utc`（页面上那个「更新时间」）。
+#:
+#: 用户口径（2026-08-17）：「列表数据范围为 24 小时内的数据」。榜是逐屏滚出来的，
+#: 库里 1,700+ 行里混着好几天前读到的旧值，不设窗就等于把「现在的榜」和「历史存档」
+#: 端在同一张表里，而两者长得一模一样。
+#:
+#: ⚠️ **`all` 必须留着。** 排障时经常要看更早的数据——2026-08-17 晚上就因为看不到
+#: 历史数据绕了路。窗口是默认值，不是牢笼。
+BoardWindow = Literal["24h", "7d", "all"]
+BOARD_WINDOW_HOURS: Final[dict[BoardWindow, float | None]] = {
+    "24h": 24.0,
+    "7d": 24.0 * 7,
+    "all": None,
+}
+
+#: 坐标要三列一起排：拼成字符串排会把 `4:10:1` 排到 `4:9:1` 前面。
+_BOARD_COORDINATE_COLUMNS: Final[tuple[InstrumentedAttribute[int], ...]] = (
+    orm.BotTargetRow.galaxy,
+    orm.BotTargetRow.system,
+    orm.BotTargetRow.position,
+)
+
+#: 排序键 → 真正进 `ORDER BY` 的列。**这张表就是白名单本身。**
+#:
+#: 调用方传来的排序键只用来在这里查表，一个字符也不会进 SQL 文本。`ORDER BY` 的
+#: 列名没法走绑定参数，所以「就拼一下」在这里等于把注入口子敞开——白名单是这一
+#: 处唯一的防线，别为了多支持一列而绕开它。
+#:
+#: 查不到就抛错，不静默回落到默认排序：回落会让「按名次排」看起来生效了，其实
+#: 一直在按别的列排，而页面上根本看不出来。
+_BOARD_SORT_COLUMNS: Final[dict[str, tuple[InstrumentedAttribute[Any], ...]]] = {
+    # 页面上叫「更新时间」，库里是 `military_score_at_utc`：这一行的军力值是什么
+    # 时候读到的。时间窗用的也是这一列，排序和筛选说的必须是同一件事。
+    "observed_at": (orm.BotTargetRow.military_score_at_utc,),
+    "score": (orm.BotTargetRow.military_score,),
+    "rank": (orm.BotTargetRow.military_rank,),
+    "coordinate": _BOARD_COORDINATE_COLUMNS,
+}
 
 
 @dataclass(frozen=True)
@@ -67,8 +114,13 @@ class MilitaryBoardRow:
 class MilitaryBoardPage:
     rows: tuple[MilitaryBoardRow, ...]
     total: int
-    #: 整张榜最近一次采到数据的时刻（不受筛选影响），给页面顶部那句话用。
+    #: 整张榜最近一次采到数据的时刻（**不受筛选也不受时间窗影响**），给页面顶部
+    #: 那句话用。窗内一条都没命中时它仍然有值，页面就能说清「窗里 0 条、但库里
+    #: 最近一次采集是某某时刻」，而不是让人以为库空了。
     refreshed_at_utc: datetime | None
+    #: 时间窗的下界；`None` 表示这次没设窗（`window=all`）。页面靠它把当前范围
+    #: 写清楚——「命中 N 条」不写明范围就会被当成库里的全部。
+    window_start_utc: datetime | None
 
 
 class MilitaryRankingRepository:
@@ -235,10 +287,25 @@ class MilitaryRankingRepository:
         score_max: float | None = None,
         galaxy: int | None = None,
         query: str | None = None,
+        sort: str = "observed_at",
+        direction: str = "desc",
+        window_hours: float | None = 24.0,
+        now_utc: datetime | None = None,
         offset: int = 0,
         limit: int = 100,
     ) -> MilitaryBoardPage:
-        """从 `bot_targets` 读当前榜单。**在 SQL 里筛、在 SQL 里数、在 SQL 里翻页。**
+        """从 `bot_targets` 读当前榜单。**在 SQL 里筛、在 SQL 里排、在 SQL 里数、在 SQL 里翻页。**
+
+        排序和翻页都交给数据库：库里 1,700+ 行，全量查回来再在 Python 里排等于
+        每翻一页都把整张表搬一遍，而且 `offset/limit` 会切在错的顺序上。
+
+        `sort` 只能是 `_BOARD_SORT_COLUMNS` 的键，`direction` 只能是 `asc` / `desc`，
+        都是**查表**而不是拼字符串（理由见 `_BOARD_SORT_COLUMNS` 的注释）。不认识
+        的值抛 `ValueError`，不回落到默认排序。
+
+        `window_hours` 按每行自己的 `military_score_at_utc` 掐时间窗，默认 24 小时；
+        传 `None` 表示不设窗（见 `BOARD_WINDOW_HOURS`）。`now_utc` 只为测试能钉住
+        窗口边界，生产不传，走真实时钟。
 
         没有 `kind` 参数，因为这张榜按构造只可能有 bot：`ranking_scan` 写库前先过
         `is_bot_coordinate`，海盗（1--4 位）和真人（名字反解不出坐标）根本进不来。
@@ -249,11 +316,17 @@ class MilitaryRankingRepository:
         1,721 行里只有 140 行有名次）——榜单名次只在少数几趟里读全过。用它筛会把
         绝大多数行滤掉，这是数据现状，不是 bug。
         """
+        order = _board_order(sort, direction)
+        window_start = _board_window_start(window_hours, now_utc)
         with self._session_factory() as session:
             base = select(orm.BotTargetRow).where(
                 orm.BotTargetRow.military_score.is_not(None),
                 orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
             )
+            if window_start is not None:
+                # 时间窗和 `total` 是同一条语句上的两件事：计数必须也在窗内，
+                # 否则页面会显示「命中 1721 条」却只列得出窗内那几十行。
+                base = base.where(orm.BotTargetRow.military_score_at_utc >= window_start)
             filtered = self._narrow_board(
                 base,
                 rank_min=rank_min,
@@ -265,14 +338,7 @@ class MilitaryRankingRepository:
             )
             total = int(session.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
             rows = session.scalars(
-                filtered.order_by(
-                    orm.BotTargetRow.military_score.desc(),
-                    orm.BotTargetRow.galaxy,
-                    orm.BotTargetRow.system,
-                    orm.BotTargetRow.position,
-                )
-                .offset(max(offset, 0))
-                .limit(limit)
+                filtered.order_by(*order).offset(max(offset, 0)).limit(limit)
             ).all()
             # 顶部那句「数据更新时间」说的是整张榜最近一次采集，所以不带筛选条件。
             refreshed = session.scalar(
@@ -299,6 +365,7 @@ class MilitaryRankingRepository:
             ),
             total=total,
             refreshed_at_utc=refreshed,
+            window_start_utc=window_start,
         )
 
     @staticmethod
@@ -323,6 +390,35 @@ class MilitaryRankingRepository:
         if galaxy is not None:
             statement = statement.where(orm.BotTargetRow.galaxy == galaxy)
         return _narrow_by_query(statement, query)
+
+
+def _board_order(sort: str, direction: str) -> list[UnaryExpression[Any]]:
+    """把排序键翻成 `ORDER BY`。**只查表，不拼字符串。**"""
+    columns = _BOARD_SORT_COLUMNS.get(sort)
+    if columns is None:
+        raise ValueError(f"unknown board sort key: {sort!r}")
+    if direction not in ("asc", "desc"):
+        raise ValueError(f"unknown board sort direction: {direction!r}")
+    descending = direction == "desc"
+    # NULL 一律沉底，两个方向都一样。`military_rank` 大多是空的（实测 1,721 行里
+    # 只有 140 行有名次），不钉住的话「按名次排」在 PostgreSQL 上是一屏空名次打头、
+    # 在 SQLite 上又是另一个样——同一个页面不该因为底下换了套库就长得不一样。
+    order = [nulls_last(column.desc() if descending else column.asc()) for column in columns]
+    if sort != "coordinate":
+        # 平手的行要有稳定次序，否则翻页会漏行：第 2 页是重新查一次，同分的行换了
+        # 个顺序，边界那几行就可能两页都不出现。坐标是这张表的唯一键。
+        order.extend(nulls_last(column.asc()) for column in _BOARD_COORDINATE_COLUMNS)
+    return order
+
+
+def _board_window_start(window_hours: float | None, now_utc: datetime | None) -> datetime | None:
+    """时间窗的下界；`None` 表示不设窗。"""
+    if window_hours is None:
+        return None
+    now = now_utc or datetime.now(UTC)
+    if now.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+    return now - timedelta(hours=window_hours)
 
 
 def _narrow_by_query(
