@@ -46,7 +46,7 @@ from evo_helper.domain.report_wait import (
     vet_flight_time,
 )
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
-from evo_helper.domain.scheduler import MissionKind
+from evo_helper.domain.scheduler import DisabledRecovery, MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
 
@@ -2277,6 +2277,9 @@ class SqlAlchemyRepository:
                 _require_utc(enabled_until_utc, "enabled_until_utc")
                 row.enabled_until_utc = enabled_until_utc
             row.disabled_reason = None
+            # 原因清掉，类别跟着清掉：留着一个指向已经不存在的停用的标记，
+            # 迟早有人照它做判断。
+            row.disabled_recovery = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
@@ -2430,6 +2433,9 @@ class SqlAlchemyRepository:
                 row.disabled_reason = (
                     f"连续 {row.consecutive_failures} 次异常退出（退出码 {exit_code}）"
                 )
+                # 连崩到上限说的是「这不是暂时的」，只能由用户动手放它出来。
+                # 自动恢复会让调度循环退回那个满速空转的重启循环。
+                row.disabled_recovery = DisabledRecovery.MANUAL.value
             failures = row.consecutive_failures
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
@@ -2449,13 +2455,55 @@ class SqlAlchemyRepository:
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
-    def disable_mission_task(self, task_id: int, reason: str) -> None:
-        """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。"""
+    def disable_mission_task(
+        self,
+        task_id: int,
+        reason: str,
+        *,
+        recovery: DisabledRecovery = DisabledRecovery.MANUAL,
+    ) -> None:
+        """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。
+
+        `recovery` 说的是「这一次靠什么被放回来」，见 `DisabledRecovery`。
+        默认 `MANUAL`——认不出来就要用户动手，这是唯一安全的默认。
+
+        **每次停用都要把这一列写一遍**，哪怕写的就是默认值：这一行可能正挂着
+        上一次停用留下的 `FREE_LINES`，不覆盖的话，一次「范围里没有 bot」会
+        顶着「等航线就自动恢复」的标记落库，然后被自动放出来。
+        """
         with self._session_factory() as session:
             row = _mission_task(session, task_id)
             row.disabled_reason = reason
+            row.disabled_recovery = recovery.value
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
+
+    def resume_mission_task(self, task_id: int, *, recovery: DisabledRecovery) -> bool:
+        """把一个**自动停用**的任务放回来，仅当它此刻正挂着 `recovery` 这个标记。
+
+        返回「这一下真的恢复了吗」，好让调用方只在真恢复时写日志——任务突然又
+        开始跑而日志里一个字都没有，事后没人查得出是谁放的它。
+
+        标记要在这个事务里**再确认一次**：调用方读行与这里写行之间隔着几次查库，
+        用户可能刚好在这期间点了「恢复」（那时 `disabled_reason` 已经是 NULL），
+        或者这条链路刚被另一个原因重新停用（标记已经换成 `MANUAL`）。两种情况下
+        都不能动它，尤其后者——那会把一条「连续失败」停用的链路悄悄放出来。
+
+        **不碰 `consecutive_failures`。** 会自愈的那几档停用（当前只有航线不足）
+        本来就不是失败，那个计数与它无关；顺手清掉等于把一条真在连崩的链路的
+        账抹平，下次它离自动停用又远了三次。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.MissionTaskRow, task_id)
+            if row is None or row.disabled_reason is None:
+                return False
+            if row.disabled_recovery != recovery.value:
+                return False
+            row.disabled_reason = None
+            row.disabled_recovery = None
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+            return True
 
 
 def _mission_task(session: Session, task_id: int) -> orm.MissionTaskRow:

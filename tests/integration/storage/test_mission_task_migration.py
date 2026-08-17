@@ -41,6 +41,7 @@ EXPECTED_MISSION_TASK_COLUMNS = frozenset(
         "quota_exhausted_until_utc",
         "consecutive_failures",
         "disabled_reason",
+        "disabled_recovery",
         "created_at_utc",
         "updated_at_utc",
     }

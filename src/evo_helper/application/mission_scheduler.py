@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,6 +62,7 @@ from evo_helper.domain.military_attack import (
 from evo_helper.domain.missions import (
     ORIGIN,
     MissionParamError,
+    NoFreeLineError,
     bot_command,
     bot_targets_in_range,
     pirate_command,
@@ -76,6 +77,7 @@ from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, Wai
 from evo_helper.domain.scheduler import (
     Action,
     Decision,
+    DisabledRecovery,
     MissionKind,
     RunningProcess,
     SchedulerFacts,
@@ -570,6 +572,10 @@ class MissionScheduler:
             if not self._enabled:
                 return
             self._cut_off_a_stalled_round()
+            # 放在 `_step` **之前**：刚被放回来的任务这一秒就该参与排队，不必
+            # 白等一个 tick。放在循环外面是因为它按 tick 算一次就够——`_step`
+            # 一个 tick 里会转好几圈，每圈都去数一遍在飞舰队纯属白付。
+            self._resume_tasks_waiting_for_a_line(self._clock())
             # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
             # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
             for _ in range(len(MissionKind)):
@@ -777,6 +783,90 @@ class MissionScheduler:
             return False
         return self._act(decision, facts)
 
+    # -- 因航线不足停用的自动恢复 --------------------------------------------------
+
+    def _resume_tasks_waiting_for_a_line(self, now: datetime) -> None:
+        """把「因空闲航线不足而自动停用」的任务放回来——**只在此刻真的有空闲航线时**。
+
+        **为什么这一类不该要人工恢复。** 触发它的条件会自愈：舰队总会飞回来，
+        航线总会空出来（占用判据是纯时间的，见 `storage.repository` 的
+        `_still_holding_a_line`）。而 `disabled_reason` 一旦写下就只有两条清除
+        路径——用户点「恢复」，或者用户改一次任务配置。于是条件早就不成立了，
+        任务却一直挂着「已停用」，一发都不派。2026-08-17 11:19 生产库实测：一个
+        配了 9 条航线的 bot 攻击任务只占着 2 条，7 条空着，仍然停用着。
+
+        **别的停用原因绝不能顺带被放出来。** 连续失败到上限说的是「这不是暂时
+        的」，自动放出来只会让调度循环退回那个满速空转的重启循环；参数填错也一样
+        ——改之前重试一万次都是同一个结果。所以这里认的是
+        `DisabledRecovery.FREE_LINES` 这个标记，不是 `disabled_reason` 里那句
+        中文（措辞改一次判据就静默失效）。最终那一下由
+        `repository.resume_mission_task` 在同一个事务里再确认一遍标记。
+
+        **判据现算，不挂定时器。** 每 tick 拿此刻的在飞舰队重新算一次空闲航线，
+        不是「过了 N 分钟就试试」：调度器进程会重启，内存里的闹钟一重启就没了，
+        而「有没有空闲航线」重启后照样算得出来。空闲航线用的是
+        `_free_lines_from`——`_facts` 那一份同一个函数，所以放它出来的这一刻，
+        它一定过得了 `_launch` 里那道让它停用的闸门，不会一放出来就再停一次。
+
+        **恢复要写 `system_log`。** 任务突然又开始跑而日志里一个字都没有，
+        事后没人查得出是谁放的它。
+        """
+        rows = [
+            row
+            for row in self._repository.mission_tasks()
+            if row.disabled_reason is not None
+            and row.disabled_recovery == DisabledRecovery.FREE_LINES.value
+            and _known(row.kind)
+        ]
+        if not rows:
+            # 绝大多数 tick 走这里：一次 `mission_tasks()` 之外一个查询都不多付。
+            return
+        config = self._repository.scheduler_config()
+        snapshots = {task.task_id: task for task in self._snapshots(rows, config)}
+        inflight: dict[Coordinate, int] = {}
+        for row in rows:
+            task = snapshots[row.id]
+            origins = (
+                self._military_origins(row)
+                if task.kind is MissionKind.BOT and _bot_by_military(row.params_json)
+                else None
+            )
+            coordinates = (
+                [task.origin] if origins is None else [item.coordinate for item in origins]
+            )
+            for coordinate in coordinates:
+                if coordinate not in inflight:
+                    inflight[coordinate] = self._repository.count_inflight(
+                        now_utc=now, origin=coordinate
+                    )
+            free = _free_lines_from(
+                task,
+                origins=origins,
+                inflight=inflight,
+                reserved_lines=config.reserved_lines,
+            )
+            if free < 1:
+                continue
+            if not self._repository.resume_mission_task(
+                row.id, recovery=DisabledRecovery.FREE_LINES
+            ):
+                # 这期间用户自己点了「恢复」，或者它已经被别的原因重新停用。
+                continue
+            name = task.name or task.kind.value
+            record_system_log(
+                "INFO",
+                "application.mission_scheduler",
+                f"任务「{name}」曾因空闲航线不足被自动停用，"
+                f"当前空闲航线 {free} 条，已自动恢复参与调度",
+                payload={
+                    "task_id": row.id,
+                    "mission_kind": task.kind.value,
+                    "free_lines": free,
+                    "disabled_recovery": DisabledRecovery.FREE_LINES.value,
+                },
+                logged_at_utc=now,
+            )
+
     def _log_schedule_window_changes(
         self, snapshots: Sequence[TaskSnapshot], now: datetime
     ) -> None:
@@ -915,7 +1005,18 @@ class MissionScheduler:
             else:
                 command = self._command_for(task.kind, row.params_json, task.origin)
         except MissionParamError as exc:
-            self._repository.disable_mission_task(task.task_id, str(exc))
+            # 类别按**异常类型**认，不按那句中文认：`NoFreeLineError` 说的是
+            # 「这一刻没航线」，舰队飞回来就好了；别的都是配置填错，改之前重试
+            # 一万次都一样。判据见 `domain.scheduler.DisabledRecovery`。
+            self._repository.disable_mission_task(
+                task.task_id,
+                str(exc),
+                recovery=(
+                    DisabledRecovery.FREE_LINES
+                    if isinstance(exc, NoFreeLineError)
+                    else DisabledRecovery.MANUAL
+                ),
+            )
             return False
         # 本轮的 id 要在**起子进程之前**定下来：runner 靠环境变量认领它，
         # 好把自己写进 `system_log` 的每一行都挂到这一轮上。起完再生成就晚了，
@@ -1126,9 +1227,12 @@ class MissionScheduler:
                         next_free[item.coordinate] = self._repository.next_line_free_at(
                             now_utc=now, origin=item.coordinate
                         )
-                # 多 origin 的预算是每颗星球各自的预算，绝不再拿全局保留数把它们
-                # 合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
-                free = sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
+                free = _free_lines_from(
+                    task,
+                    origins=origins,
+                    inflight=inflight,
+                    reserved_lines=config.reserved_lines,
+                )
                 last_dispatches = [
                     self._repository.last_dispatch_at(
                         _TARGET_KIND[task.kind], origin=item.coordinate
@@ -1161,9 +1265,10 @@ class MissionScheduler:
             target_kind = _TARGET_KIND[task.kind]
             per_task[task.task_id] = replace(
                 base,
-                free_lines=free_lines_for(
+                free_lines=_free_lines_from(
                     task,
-                    inflight_from_origin=inflight[task.origin],
+                    origins=None,
+                    inflight=inflight,
                     reserved_lines=config.reserved_lines,
                 ),
                 reports_due=self._reports_due(task, now, grace),
@@ -1551,6 +1656,34 @@ def _window_message(task: TaskSnapshot, *, open_now: bool, first_look: bool) -> 
 def _participating(task: TaskSnapshot) -> bool:
     """这个任务此刻参不参与调度。停用（不论哪种）与没勾都算不参与。"""
     return task.enabled and task.disabled_reason is None
+
+
+def _free_lines_from(
+    task: TaskSnapshot,
+    *,
+    origins: Sequence[AttackOrigin] | None,
+    inflight: Mapping[Coordinate, int],
+    reserved_lines: int,
+) -> int:
+    """这个任务此刻估算还剩几条空闲航线。
+
+    **只有这一份判据。** `_facts`（决定要不要起一轮、`--max-dispatches` 传几）
+    与「因航线不足停用后自动恢复」都问它。各写一份的话，放它出来用的尺子会和
+    当初停用它的那把慢慢走散——走散之后要么放不出来，要么放出来就立刻再被停用，
+    每 tick 一次。
+
+    `origins` 非 None = 军力多出发点那一路：**每颗星球各算各的预算**，绝不拿
+    全局保留数把它们合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
+    None 则走单出发星球那条，`reserved_lines` 在 `free_lines_for` 里生效。
+
+    `inflight` 由调用方按出发星球缓存好（同一颗星球一次 tick 只查一次），
+    这一层不查库。
+    """
+    if origins is not None:
+        return sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
+    return free_lines_for(
+        task, inflight_from_origin=inflight[task.origin], reserved_lines=reserved_lines
+    )
 
 
 def _known(kind: str) -> bool:

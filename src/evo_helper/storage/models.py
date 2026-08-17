@@ -522,6 +522,16 @@ class MissionTaskRow(Base):
     #: 连续异常退出次数。到阈值就自动停用，免得调度循环在一个坏掉的任务上空转。
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     disabled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: 这次停用**靠什么被放回来**，取值见 `domain.scheduler.DisabledRecovery`。
+    #:
+    #: 上面那一列是给人看的一句中文，这一列是给判据看的。分成两列而不是让判据
+    #: 去比对文案：措辞改一次判据就静默失效，而失效的样子是「任务停用之后再也
+    #: 没人放它出来」——2026-08-17 生产库里那条配了 9 条航线、只占 2 条、却一直
+    #: 挂着「空闲航线不足」的 bot 任务就是这么来的。
+    #:
+    #: **NULL 一律当 `MANUAL` 读**：没停用的行是 NULL，本列上线之前的历史行也是
+    #: NULL。认不出来就要用户动手，这是唯一安全的默认。
+    disabled_recovery: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 
