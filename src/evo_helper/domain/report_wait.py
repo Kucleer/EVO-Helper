@@ -125,6 +125,13 @@ MAX_REPORT_AGE = timedelta(hours=6)
 #: runner 的 `game.capacity.LineCapacityGate` 看屏复核，撞上限就正常收尾，
 #: `domain.scheduler.waiting_for_a_line` 再把这条链路压到有航线真的空出来为止。
 #: 估长了的代价则是上面那种没有出口的停摆。
+#:
+#: ⚠️ **这是「没配置时」的默认值，不是唯一取值。** 它是一个**运维旋钮**——上面
+#: 那个「四成余量」是拍出来的估算，取值取决于用户当下的舰队速度与激进程度，
+#: 没有唯一正确答案。攻击配置页上有一个框
+#: （`military_attack_config.unknown_line_hold_minutes`），留空才走这里。
+#: 因此**这个数只该写在这一处**：`repository.count_inflight` /
+#: `release_held_lines` 都拿它当参数默认值，谁也不再抄一遍数字。
 UNKNOWN_LINE_HOLD = timedelta(minutes=90)
 
 #: 唤醒余量：预计时间之上再等这么久才去收。

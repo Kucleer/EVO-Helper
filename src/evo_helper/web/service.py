@@ -382,6 +382,11 @@ class MilitaryAttackConfigView:
     tiers: tuple[dict[str, Any], ...]
     #: 军力榜盲拖屏数；`None` = 页面上留空 = 按实测自动标定。
     blind_scrolls: int | None = None
+    #: 下面三个行为旋钮同理：`None` = 页面上留空 = 跟着代码里的默认值走。
+    #: 默认值刻意不在这一层复述——写第二遍日后必然漏改，见各自的常量。
+    unknown_line_hold_minutes: int | None = None
+    reconcile_cooldown_minutes: int | None = None
+    bot_revisit_hours: int | None = None
 
 
 @dataclass(frozen=True)

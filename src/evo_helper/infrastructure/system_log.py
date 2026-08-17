@@ -389,6 +389,56 @@ def record_system_log(
         pass
 
 
+#: 上一次为某个旋钮写过「用的是非默认值」的取值。键是旋钮名，值是当时写下的取值。
+#: 进程级，重启即清零——每个 runner / 控制台进程各留一条，正合适。
+_KNOB_OVERRIDES: dict[str, object] = {}
+
+
+def record_knob_override(
+    knob: str,
+    *,
+    source: str,
+    effective: object,
+    default: object,
+    detail: str = "",
+) -> bool:
+    """某个行为旋钮**用的不是代码里的默认值**时，往 `system_log` 留一条痕迹。
+    返回这一下有没有真的写。
+
+    ⚠️ **这条日志是为「事后只看库里的日志就能定位」准备的。** 一个可配置的阈值
+    最阴的失败方式是：值被改过，而日志里的一切看起来都像默认行为——于是排障的人
+    照着代码里那个 90 分钟去推，怎么算都对不上现场。所以凡是用了非默认值，
+    库里必须有一行说清楚「这一轮实际用的是多少、默认是多少」。
+
+    **等于默认值时什么都不写。** 那一档本来就是代码里写着的行为，每个进程都记一遍
+    只会把真正有信息量的那几行淹掉。
+
+    **同一个取值只写一次**（按进程记账）：调度器每 tick 都会读一遍配置，
+    不去重的话一小时就是三千多行同样的话。取值一变就再写一条——那正是要留的痕迹。
+    """
+    if effective == default:
+        # 改回默认值也要让账翻篇，否则「先改成 30、再改回 90」之后
+        # 下一次真的改成 30 就会被当成重复而不记。
+        _KNOB_OVERRIDES.pop(knob, None)
+        return False
+    if _KNOB_OVERRIDES.get(knob) == effective:
+        return False
+    _KNOB_OVERRIDES[knob] = effective
+    suffix = f"；{detail}" if detail else ""
+    record_system_log(
+        "INFO",
+        source,
+        f"配置生效：{knob} 用的是 {effective}（代码默认 {default}）{suffix}",
+        payload={"knob": knob, "effective": str(effective), "default": str(default)},
+    )
+    return True
+
+
+def reset_knob_override_memo() -> None:
+    """清掉「这个取值已经记过了」的账。**只给测试用。**"""
+    _KNOB_OVERRIDES.clear()
+
+
 def encode_payload(payload: Mapping[str, Any] | None) -> str:
     """把附加信息编成 JSON 文本；编不出来的对象降级成它的 `repr`。
 
@@ -522,6 +572,8 @@ __all__ = [
     "detach_system_log_handler",
     "encode_payload",
     "install_system_log_sink",
+    "record_knob_override",
     "record_system_log",
+    "reset_knob_override_memo",
     "shutdown_system_log_sink",
 ]

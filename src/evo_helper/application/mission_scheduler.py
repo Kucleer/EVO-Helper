@@ -80,7 +80,12 @@ from evo_helper.domain.ranking import (
     is_bot_coordinate,
 )
 from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
-from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
+from evo_helper.domain.report_wait import (
+    MAX_REPORT_AGE,
+    UNKNOWN_LINE_HOLD,
+    ReportWaitPlanner,
+    WaitAction,
+)
 from evo_helper.domain.scheduler import (
     Action,
     Decision,
@@ -112,7 +117,11 @@ from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_SAMPLES,
     BLIND_SCROLLS_MAX,
 )
-from evo_helper.infrastructure.system_log import child_environment, record_system_log
+from evo_helper.infrastructure.system_log import (
+    child_environment,
+    record_knob_override,
+    record_system_log,
+)
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -138,7 +147,39 @@ MAX_CONSECUTIVE_FAILURES = 3
 #:
 #: **任何一个任务跑出一次退出码 0 就全部清零**：那一刻环境被证明是好的，
 #: 之前那几次豁免不该再算在谁头上（见 `_finish`）。
+#:
+#: 分类（2026-08-17 审计）：**低优先级旋钮**——「撑多久算撑不过去」有主观成分，
+#: 但这个数不是独立可调的：它的物理含义是「6 × `RESTART_COOLDOWN` ≈ 半小时」，
+#: 而重启冷却本身在库里可配。真要让豁免时长可配，该配的是**时长**、由它反推次数，
+#: 不是直接开一个次数框——开了之后两个数会各说各话。留待有人真的需要时再做。
 MAX_ENVIRONMENT_EXEMPTIONS = 6
+
+#: 同一个 bot 坐标多久之内不重复打。用户口径（2026-08-15）。
+#:
+#: ⚠️ **这是「没配置时」的默认值。** 它是一个**运维旋钮**：24 小时是用户定的策略，
+#: 不是游戏规则（游戏那侧的硬限制是海盗每日 32 发，在 `scheduler_config`）。
+#: 活动期间想多榨几轮就调小，已知 bot 多、想摊得更开就调大——没有唯一正确答案。
+#: 攻击配置页上有一个框（`military_attack_config.bot_revisit_hours`），
+#: 留空才走这里。
+DEFAULT_BOT_REVISIT = timedelta(hours=24)
+
+#: 用户能填进去的重复攻击间隔上界（小时）。
+#: 一周：bot 军力每周一 UTC+0 刷新，跨过一个刷新周期之后，「上周打过」拦住的是
+#: 一批军力已经变了的目标——那不再是「别重复打」，而是把候选池越锁越小。
+BOT_REVISIT_MAX_HOURS = 168
+
+#: `scheduler_config.report_grace_minutes` 的默认值，抄在这里只为了在配置行还没
+#: 建出来时给冷却上界一个说法（见 `MissionScheduler._report_grace_minutes`）。
+#: ⚠️ 改 `storage.models.SchedulerConfigRow.report_grace_minutes` 的默认值时要一起改。
+DEFAULT_REPORT_GRACE_MINUTES = 30
+
+#: 冷却窗口离宽限期至少要留出来的那一段（分钟）。
+#:
+#: 冷却窗口逼近宽限期就会**自己制造「战报缺失」**：战报最多晚这么久才入库，
+#: 而过了预计时间再等一个宽限期还读不到就判缺失。留一半余量是
+#: `RECONCILE_COOLDOWN` 那个 15 分钟（宽限期 30）当初的取法，这里把它写成规则，
+#: 好让宽限期被用户改过之后上界跟着走。
+RECONCILE_COOLDOWN_GRACE_RATIO = 2
 
 #: 军力候选池连着这么久一个能打的都筛不出来，就往 `system_log` 写一条 WARNING。
 #:
@@ -150,6 +191,9 @@ MAX_ENVIRONMENT_EXEMPTIONS = 6
 #: **为什么按时长而不是按 tick 数。** tick 每秒一次，「连续 3 轮」等于三秒，
 #: 那挡不住任何东西（榜单刚开始写第一屏时分数本来就会短暂全过期）。取半小时：
 #: 约等于半轮扫描，长到不会被一次采集中途的空档触发，短到还来得及在一夜里补救。
+#:
+#: 分类（2026-08-17 审计）：**低优先级旋钮**——它只决定日志里那条 WARNING 什么时候
+#: 出现，不参与任何调度判据；调错了最坏也只是告警早一点或晚一点。没做成可配置。
 STALE_POOL_WARNING_AFTER = timedelta(minutes=30)
 
 #: 调度器的任务种类 → `attack_intents.target_kind` 的取值。
@@ -662,6 +706,100 @@ class MissionScheduler:
         """
         return _blind_scrolls(value)
 
+    def validate_unknown_line_hold_minutes(self, value: object) -> int | None:
+        """校验攻击配置页上那个「读不到飞行时间时占多久航线」。留空返回 `None`。"""
+        return _unknown_line_hold_minutes(value)
+
+    def validate_reconcile_cooldown_minutes(self, value: object) -> int | None:
+        """校验攻击配置页上那个「两次翻信箱之间的冷却」。留空返回 `None`。
+
+        上界**读的是库里当下的 `report_grace_minutes`**，不是写死的 30：
+        那条边界本身就是可配的，拿一个写死的数去卡它，用户把宽限期调大之后
+        照样填不进合法的冷却值。理由整段写在
+        `domain.reconcile_cooldown.RECONCILE_COOLDOWN` 上。
+        """
+        return _reconcile_cooldown_minutes(value, grace_minutes=self._report_grace_minutes())
+
+    def reconcile_cooldown_ceiling(self) -> int:
+        """页面上那个框能填的最大分钟数。**和校验用的是同一条算式。**
+
+        页面必须显示同一个上界：显示一个数、校验用另一个数，用户会填进一个
+        `max` 允许、后端却 400 的值——而那种不一致读起来像是保存功能坏了。
+        """
+        return _reconcile_cooldown_ceiling(self._report_grace_minutes())
+
+    def validate_bot_revisit_hours(self, value: object) -> int | None:
+        """校验攻击配置页上那个「同一个 bot 多久之内不重复打」。留空返回 `None`。"""
+        return _bot_revisit_hours(value)
+
+    def unknown_line_hold(self) -> timedelta:
+        """飞行时间读不到时，一条航线占多久。**读侧的唯一入口。**
+
+        公开出来是给「清理航线占用」那条路用的（`web.persistent_service`）：
+        它和 `count_inflight` 必须量同一把尺子，否则页面上写着「占着 3 条」、
+        按钮却报「放开了 0 条」，而那个数字是这个按钮唯一的可见回执。
+        """
+        return self._unknown_line_hold()
+
+    def _report_grace_minutes(self) -> int:
+        """库里当下的战报宽限期。配置行还没建出来时按默认 30 分钟算——
+        校验一个旋钮时不该因为另一张表没初始化就把整条保存路径弄死。
+        """
+        try:
+            return int(self._repository.scheduler_config().report_grace_minutes)
+        except ValueError:
+            return DEFAULT_REPORT_GRACE_MINUTES
+
+    # -- 行为旋钮的读侧 --------------------------------------------------------
+    #
+    # 三个读法完全同构：问库要那一行 → 空就用代码默认值 → 用了非默认值就往
+    # `system_log` 留一条痕迹。**那条痕迹是硬要求**：一个被改过的阈值最阴的失败
+    # 方式是日志里一切都像默认行为，排障的人照着代码里的数去推，怎么算都对不上。
+
+    def _unknown_line_hold(self) -> timedelta:
+        """读不到飞行时间时，一条航线按派出时刻起算占多久。
+
+        配置行还没建出来时（老库、或 `ensure_mission_rows()` 还没跑）当成留空：
+        一个没初始化的配置表说明不了「用户想改这个数」，为它把航线记账停掉
+        是不成比例的。同 `_blind_scrolls`。
+        """
+        minutes = self._knob("unknown_line_hold_minutes")
+        if minutes is None:
+            return UNKNOWN_LINE_HOLD
+        hold = timedelta(minutes=minutes)
+        record_knob_override(
+            "unknown_line_hold",
+            source=__name__,
+            effective=hold,
+            default=UNKNOWN_LINE_HOLD,
+            detail="飞行时间读不到的派遣按这个时长占航线",
+        )
+        return hold
+
+    def _bot_revisit_window(self) -> timedelta:
+        """同一个 bot 坐标多久之内不重复打。"""
+        hours = self._knob("bot_revisit_hours")
+        if hours is None:
+            return DEFAULT_BOT_REVISIT
+        window = timedelta(hours=hours)
+        record_knob_override(
+            "bot_revisit",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_BOT_REVISIT,
+            detail="这段时间内打过的 bot 坐标不进候选池",
+        )
+        return window
+
+    def _knob(self, column: str) -> int | None:
+        """全局攻击配置上某个旋钮的原始值；没配 / 配置行不存在都返回 None。"""
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return None
+        value = getattr(row, column, None)
+        return None if value is None else int(value)
+
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
 
@@ -937,6 +1075,9 @@ class MissionScheduler:
         config = self._repository.scheduler_config()
         snapshots = {task.task_id: task for task in self._snapshots(rows, config)}
         inflight: dict[Coordinate, int] = {}
+        # 一次读齐，整段复用：航线记账的每一处都必须用同一个值，否则同一颗星球
+        # 在两个判据里占着的航线数不一样。
+        hold = self._unknown_line_hold()
         for row in rows:
             task = snapshots[row.id]
             origins = (
@@ -950,7 +1091,7 @@ class MissionScheduler:
             for coordinate in coordinates:
                 if coordinate not in inflight:
                     inflight[coordinate] = self._repository.count_inflight(
-                        now_utc=now, origin=coordinate
+                        now_utc=now, origin=coordinate, hold=hold
                     )
             free = _free_lines_from(
                 task,
@@ -1401,6 +1542,8 @@ class MissionScheduler:
         pirate_active = any(
             task.kind is MissionKind.PIRATE and _participating(task) for task in tasks
         )
+        # 同上：一趟只读一次，整段共用。
+        hold = self._unknown_line_hold()
         inflight: dict[Coordinate, int] = {}
         next_free: dict[Coordinate, datetime | None] = {}
         per_task: dict[int, TaskFacts] = {}
@@ -1427,7 +1570,7 @@ class MissionScheduler:
                 for item in origins:
                     if item.coordinate not in inflight:
                         inflight[item.coordinate] = self._repository.count_inflight(
-                            now_utc=now, origin=item.coordinate
+                            now_utc=now, origin=item.coordinate, hold=hold
                         )
                         next_free[item.coordinate] = self._repository.next_line_free_at(
                             now_utc=now, origin=item.coordinate
@@ -1470,7 +1613,7 @@ class MissionScheduler:
                 continue
             if task.origin not in inflight:
                 inflight[task.origin] = self._repository.count_inflight(
-                    now_utc=now, origin=task.origin
+                    now_utc=now, origin=task.origin, hold=hold
                 )
                 next_free[task.origin] = self._repository.next_line_free_at(
                     now_utc=now, origin=task.origin
@@ -1675,7 +1818,11 @@ class MissionScheduler:
         first_origin_free = max(
             0,
             first_origin_lines
-            - self._repository.count_inflight(now_utc=self._clock(), origin=first_origin),
+            - self._repository.count_inflight(
+                now_utc=self._clock(),
+                origin=first_origin,
+                hold=self._unknown_line_hold(),
+            ),
         )
         return bot_command(
             [item.coordinate for item in group],
@@ -1771,11 +1918,14 @@ class MissionScheduler:
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
-        """取前 N 名前，先排除本轮与近 24 小时已攻击的 bot。
+        """取前 N 名前，先排除本轮与「重复攻击间隔」之内已攻击的 bot。
 
         若先拿前 N 再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
         空集，较低排名、从未攻击的目标永远轮不到。排除必须在 ``military_pool``
         的前面，随后再由距离给各出发星球分配。
+
+        间隔默认 24 小时（用户口径 2026-08-15），可在攻击配置页上改——
+        它是策略不是游戏规则，见 `DEFAULT_BOT_REVISIT`。
         """
         targets = self._scored_bot_targets()
         now = self._clock()
@@ -1784,7 +1934,9 @@ class MissionScheduler:
             since=row.round_started_at_utc,
             now_utc=now,
         )
-        attacked_last_day = self._repository.attacked_bot_targets_since(now - timedelta(hours=24))
+        attacked_last_day = self._repository.attacked_bot_targets_since(
+            now - self._bot_revisit_window()
+        )
         return [
             target
             for target in targets
@@ -2096,6 +2248,131 @@ def _blind_scrolls(value: object) -> int | None:
             "把榜首那批军力最高的 bot 整段跳过去。宁小勿大——拖少了只是多花几屏检测。"
         )
     return scrolls
+
+
+def _optional_int(value: object, *, label: str) -> int | None:
+    """把页面送上来的东西读成一个整数；留空返回 `None`。
+
+    ⚠️ **「没配」和「配了某个数」是两回事，两个都合法。** 留空是「跟着代码里的
+    默认值走」，所以空串、空白串、`None` 一律返回 `None`，而不是当成 0。
+
+    `bool` 单独排掉（同 `_blind_scrolls`）：它是 `int` 的子类，`True` 会被读成
+    1 分钟——而用户敲进去的根本不是一个时长。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError(f"{label}必须是整数；要用默认值就把它留空")
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"{label}不是整数：{value!r}") from exc
+    if isinstance(value, float) and number != value:
+        raise MissionParamError(f"{label}必须是整数：{value!r}")
+    return number
+
+
+def _unknown_line_hold_minutes(value: object) -> int | None:
+    """读不到飞行时间时，一条航线按派出时刻起算占多久（分钟）。
+    **留空 = 用 `UNKNOWN_LINE_HOLD` 的默认值 90。**
+
+    ## 两条边界
+
+    - **至少 1 分钟。** 0 等于「读不到飞行时间就当没占航线」，而那正是被实机
+      推翻掉的旧口径：每一发读不出飞行时间的派遣都让调度器凭空多出一条空闲
+      航线，到点就起一轮、导航几十秒、撞上游戏的「同时派遣的舰队数量已达
+      上限。」、退出、冷却、再来。整段理由在 `domain.report_wait.line_free_at`。
+    - **必须严格小于 `MAX_REPORT_AGE`。** 那是「等一封战报等到什么时候就死心」的
+      上界；航线占用超过它，就会出现「战报早就被判缺失、航线还锁着」的死角，
+      而那条航线再没有任何事件能把它放开，只能等人来点「清理航线占用」。
+
+    两条边界之间**故意留得很宽**，因为这个值调大调小都不会「错」，只是取舍不同：
+    调小提高吞吐（估短了的代价有界且自纠，runner 的 `LineCapacityGate` 看屏复核
+    兜着），调大更保守（代价是一次读不到就能把一条链路压住那么久）。
+    """
+    minutes = _optional_int(value, label="航线占用时长（分钟）")
+    if minutes is None:
+        return None
+    if minutes < 1:
+        raise MissionParamError(
+            "航线占用时长至少 1 分钟：填 0 等于「读不到飞行时间就当没占航线」，"
+            "而那会让调度器凭空多出空闲航线、反复撞游戏的舰队数量上限。"
+        )
+    ceiling = int(MAX_REPORT_AGE.total_seconds() // 60)
+    if minutes >= ceiling:
+        raise MissionParamError(
+            f"航线占用时长必须短于 {ceiling} 分钟（放弃等战报的上界）："
+            "再长就会出现「战报已判缺失、航线还锁着」的死角，只能靠人手动清理。"
+        )
+    return minutes
+
+
+def _reconcile_cooldown_ceiling(grace_minutes: int) -> int:
+    """翻信箱冷却的上界（分钟）：战报宽限期的一半，且至少 1。
+
+    **写成一个函数而不是两处各算一遍**：页面上显示的上界和校验用的上界必须是
+    同一个数，否则用户会填进一个输入框允许、后端却拒绝的值。
+    """
+    return max(1, grace_minutes // RECONCILE_COOLDOWN_GRACE_RATIO)
+
+
+def _reconcile_cooldown_minutes(value: object, *, grace_minutes: int) -> int | None:
+    """两次开工翻信箱之间至少隔多久（分钟）。
+    **留空 = 用 `RECONCILE_COOLDOWN` 的默认值 15。**
+
+    ## 两条边界
+
+    - **0 合法**，而且它不是「关掉」：0 表示每一轮开工都翻信箱，也就是加这道
+      冷却之前的行为。那是**最安全**的一侧（战报绝不会因为冷却而晚入库），
+      代价只是每轮多花约 83 秒，所以必须放行。
+    - **上界由宽限期定**：冷却窗口逼近 `report_grace_minutes` 就会自己制造
+      「战报缺失」——一份战报最多晚一个冷却窗口才入库，而过了预计时间再等一个
+      宽限期还读不到就判缺失。取宽限期的一半（`RECONCILE_COOLDOWN_GRACE_RATIO`），
+      正是默认那对数（15 / 30）当初的取法。
+
+    ⚠️ **上界跟着库里的宽限期走，不是写死的 15。** 用户把宽限期调到 60，
+    冷却就该能填到 30；拿写死的数去卡，用户会发现两个框互相矛盾却看不出为什么。
+    """
+    minutes = _optional_int(value, label="翻信箱冷却（分钟）")
+    if minutes is None:
+        return None
+    if minutes < 0:
+        raise MissionParamError("翻信箱冷却不能是负数；要每轮都翻就填 0，要用默认值就留空")
+    ceiling = _reconcile_cooldown_ceiling(grace_minutes)
+    if minutes > ceiling:
+        raise MissionParamError(
+            f"翻信箱冷却最多 {ceiling} 分钟（= 战报宽限期 {grace_minutes} 分钟的一半）："
+            "再长就会把战报拖到被判缺失，等于自己制造缺失。要翻得更疏就先把宽限期调大。"
+        )
+    return minutes
+
+
+def _bot_revisit_hours(value: object) -> int | None:
+    """同一个 bot 坐标多久之内不重复打（小时）。**留空 = 默认 24 小时。**
+
+    ## 两条边界
+
+    - **至少 1 小时。** 0 等于取消排除，而候选池是**军力降序**排的
+      （`domain.target_order.strongest_first`）：排除一取消，榜首那一个就会被
+      反复挑中、一夜的航线全烧在同一个目标上，而页面上只会显示一切正常。
+      这跟「调小一点多榨几轮」不是一回事，所以 0 当场拒掉。
+    - **最多 168 小时（一周）。** 再长就超过 bot 军力的刷新周期（周一 UTC+0），
+      上一周的「打过」拦住这一周的候选，等于把候选池越锁越小。
+    """
+    hours = _optional_int(value, label="bot 重复攻击间隔（小时）")
+    if hours is None:
+        return None
+    if hours < 1:
+        raise MissionParamError(
+            "bot 重复攻击间隔至少 1 小时：填 0 等于取消排除，而候选池按军力降序排，"
+            "那会让榜首那一个被反复打、一夜的航线全烧在同一个目标上。"
+        )
+    if hours > BOT_REVISIT_MAX_HOURS:
+        raise MissionParamError(
+            f"bot 重复攻击间隔最多 {BOT_REVISIT_MAX_HOURS} 小时（一周）："
+            "再长就跨过了 bot 军力的刷新周期，上一周打过的会一直拦着这一周的候选。"
+        )
+    return hours
 
 
 def _smallest_limit(*limits: int | None) -> int | None:

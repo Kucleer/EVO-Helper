@@ -1316,3 +1316,87 @@ def test_a_military_bot_plan_uses_global_tiers_and_selected_planets(console: Con
         },
     ]
     assert config.json()["tiers"][0]["preset"] == "CCC"
+
+
+# -- 调度节奏的三个旋钮 --------------------------------------------------------
+#
+# 判据与日志在 `tests/integration/application/test_behaviour_knobs.py`。
+# 这里钉的是**接线**：`PUT /api/attack-config` 收得下、`GET` 原样回读、
+# 不可能的取值被拒，而且改一项不会把另一项冲掉。
+
+
+def test_the_pacing_knobs_default_to_blank_meaning_follow_the_code(console: Console) -> None:
+    """一份没配过的库里，三个框都是空的——也就是「跟着代码里的默认值走」。
+
+    ⚠️ 空必须是 `None` 而不是 0：`0` 在翻信箱冷却上是一个**合法且不同**的取值
+    （每一轮开工都翻）。两者混在一起，升级当天所有老库都会静悄悄换个行为。
+    """
+    body = console.client.get("/api/attack-config").json()
+
+    assert body["unknown_line_hold_minutes"] is None
+    assert body["reconcile_cooldown_minutes"] is None
+    assert body["bot_revisit_hours"] is None
+
+
+def test_the_pacing_knobs_round_trip_through_the_attack_config(console: Console) -> None:
+    saved = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [{"min_score": 0, "preset": "AAA"}],
+            "unknown_line_hold_minutes": 45,
+            "reconcile_cooldown_minutes": 0,
+            "bot_revisit_hours": 6,
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    read_back = console.client.get("/api/attack-config").json()
+    assert read_back["unknown_line_hold_minutes"] == 45
+    # 0 必须原样回来，不能被读成「留空」。
+    assert read_back["reconcile_cooldown_minutes"] == 0
+    assert read_back["bot_revisit_hours"] == 6
+    assert read_back["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+
+
+def test_saving_the_page_clears_a_knob_that_was_left_blank(console: Console) -> None:
+    """这一页是**整份替换**：留空送上来就是「改回跟着默认值走」。
+
+    这条守的是留空那一侧真的写得回去——只认「有值才写」的实现会让用户清不掉
+    一个填错的数，页面上删掉它、保存、刷新，那个数又回来了。
+    """
+    console.client.put(
+        "/api/attack-config",
+        json={"tiers": [], "unknown_line_hold_minutes": 45, "bot_revisit_hours": 6},
+    )
+    console.client.put("/api/attack-config", json={"tiers": [], "bot_revisit_hours": 6})
+
+    body = console.client.get("/api/attack-config").json()
+    assert body["unknown_line_hold_minutes"] is None
+    assert body["bot_revisit_hours"] == 6
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # 0 = 「读不到飞行时间就当没占航线」，被实机推翻掉的旧口径。
+        ("unknown_line_hold_minutes", 0),
+        # 够到「放弃等战报」那条线就会锁死航线。
+        ("unknown_line_hold_minutes", 360),
+        ("reconcile_cooldown_minutes", -1),
+        # 上界 = 战报宽限期（默认 30）的一半。
+        ("reconcile_cooldown_minutes", 16),
+        # 0 = 取消排除，而候选池按军力降序排。
+        ("bot_revisit_hours", 0),
+        ("bot_revisit_hours", 169),
+    ],
+)
+def test_impossible_pacing_knobs_are_refused_by_the_api(
+    console: Console, field: str, value: int
+) -> None:
+    """页面用的是**调度器那把尺子**（`validate_*`），和实机启动时同一段代码。
+    两边分家的结果是「页面收下了、跑起来不是那个数」。
+    """
+    response = console.client.put("/api/attack-config", json={"tiers": [], field: value})
+
+    assert response.status_code == 400, response.text
+    assert console.client.get("/api/attack-config").json()[field] is None

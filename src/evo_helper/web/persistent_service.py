@@ -1289,36 +1289,60 @@ class MissionConsoleService:
             raise ServiceError(str(exc)) from exc
         self._invalidate_scheduler_view()
 
+    def reconcile_cooldown_ceiling(self) -> int:
+        """攻击配置页那个「翻信箱冷却」框能填的最大分钟数。
+
+        它跟着库里的 `report_grace_minutes` 走，所以只能问调度器要，
+        不能在模板里写死——写死之后用户把宽限期一调，页面上那个数就是假的。
+        """
+        return self._scheduler.reconcile_cooldown_ceiling()
+
     def military_attack_config(self) -> MilitaryAttackConfigView:
         row = self._repository.military_attack_config()
         try:
             tiers = json.loads(row.tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
             raise ServiceError("全局军力档位配置损坏") from exc
-        return MilitaryAttackConfigView(tuple(tiers), blind_scrolls=row.blind_scrolls)
+        return MilitaryAttackConfigView(tuple(tiers), **_knobs_of(row))
 
     def replace_military_attack_tiers(
-        self, tiers: tuple[dict[str, Any], ...], *, blind_scrolls: object = None
+        self,
+        tiers: tuple[dict[str, Any], ...],
+        *,
+        blind_scrolls: object = None,
+        unknown_line_hold_minutes: object = None,
+        reconcile_cooldown_minutes: object = None,
+        bot_revisit_hours: object = None,
     ) -> MilitaryAttackConfigView:
         """整份全局攻击配置原子替换。
 
-        `blind_scrolls` 走和档位同一次 `PUT`：这一页是整份替换，两项各配一个
-        「只改自己」的接口，等于给「保存了 A 把 B 冲掉」留了两条路。
+        每个旋钮都走和档位同一次 `PUT`：这一页是整份替换，各配一个「只改自己」的
+        接口，等于给「保存了 A 把 B 冲掉」留了好几条路。
+
+        ⚠️ **校验全部走调度器那把尺子**（`validate_*`），和实机启动时用的是同一段
+        代码。页面自己再判一遍的结果是「页面收下了、跑起来不是那个数」。
         """
         self._refuse_global_config_while_running()
         normalized = [dict(tier) for tier in tiers]
         try:
             self._scheduler.validate_military_tiers(normalized)
             scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
+            hold = self._scheduler.validate_unknown_line_hold_minutes(unknown_line_hold_minutes)
+            cooldown = self._scheduler.validate_reconcile_cooldown_minutes(
+                reconcile_cooldown_minutes
+            )
+            revisit = self._scheduler.validate_bot_revisit_hours(bot_revisit_hours)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
-            json.dumps(normalized, ensure_ascii=False), blind_scrolls=scrolls
+            json.dumps(normalized, ensure_ascii=False),
+            blind_scrolls=scrolls,
+            unknown_line_hold_minutes=hold,
+            reconcile_cooldown_minutes=cooldown,
+            bot_revisit_hours=revisit,
         )
         self._invalidate_scheduler_view()
-        return MilitaryAttackConfigView(
-            tuple(json.loads(row.tiers_json)), blind_scrolls=row.blind_scrolls
-        )
+        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)), **_knobs_of(row))
 
     def create_mission(
         self,
@@ -1412,7 +1436,11 @@ class MissionConsoleService:
         （权威闸门仍在 runner 的 `LineCapacityGate`：真撞上限它会看屏认出来。）
         """
         now = self._scheduler.now_utc()
-        released = self._repository.release_held_lines(now_utc=now)
+        # 尺子必须和 `count_inflight` 那把是同一把（航线占用时长在攻击配置页上
+        # 可配），否则页面写着「占着 3 条」、按钮回执却是「放开了 0 条」。
+        released = self._repository.release_held_lines(
+            now_utc=now, hold=self._scheduler.unknown_line_hold()
+        )
         # 快照缓存里存着「还占着几条」的旧答案，TTL 内不失效的话，用户点完刷新
         # 看到的还是「等航线」——那会让他再点一次。
         self._invalidate_scheduler_view()
@@ -2060,6 +2088,21 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
         # 兼容直接调 service 的旧调用，但绝不把空位重新放进页面统计。
         return false()
     return None
+
+
+def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
+    """全局攻击配置行上那几个行为旋钮，原样搬进视图。
+
+    抽成一处是因为读侧与写侧都要组同一份：各写一遍的话，日后加第四个旋钮时
+    必然有一侧漏掉——而漏掉之后页面只是**显示成留空**，看起来完全正常，
+    用户以为配置没保存上，再填一遍。
+    """
+    return {
+        "blind_scrolls": row.blind_scrolls,
+        "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
+        "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
+        "bot_revisit_hours": row.bot_revisit_hours,
+    }
 
 
 def _pack(coordinate: Coordinate) -> int:

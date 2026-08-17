@@ -1347,7 +1347,9 @@ class SqlAlchemyRepository:
             session.commit()
             return _daily_status(row)
 
-    def count_inflight(self, *, now_utc: datetime, origin: Coordinate) -> int:
+    def count_inflight(
+        self, *, now_utc: datetime, origin: Coordinate, hold: timedelta = UNKNOWN_LINE_HOLD
+    ) -> int:
         """**这颗出发星球上**还占着航线的舰队有几支。**跨 kind**——同一颗星球上
         海盗与 bot 抢的是同一批航线。
 
@@ -1381,11 +1383,16 @@ class SqlAlchemyRepository:
         **人工放过手的不数**：用户在调度台上按过「清理航线占用」的那些
         （`release_held_lines`）一律当作已回港，见 `_still_holding_a_line`。
 
-        **飞行时间为 NULL 的照数**，占到派出时刻 + `UNKNOWN_LINE_HOLD` 为止。
+        **飞行时间为 NULL 的照数**，占到派出时刻 + `hold` 为止。
         NULL 的语义是「不知道它什么时候回来」，不是「它没占航线」——被游戏接受的
         那一发舰队一定占着一条位子。此前这一档按不占记，每一发读不出飞行时间的
         派遣就凭空多出一条空闲航线，而这个错估没有任何回写路径：调度器每隔一个
         `RESTART_COOLDOWN` 就照着它再起一轮，导航几十秒、撞上限、退出、再来。
+
+        `hold` 默认 `UNKNOWN_LINE_HOLD`，也就是**没配置时的行为**；调度器会把
+        攻击配置页上那个框的值传进来（见
+        `application.mission_scheduler.MissionScheduler._unknown_line_hold`）。
+        默认值只写在 `domain.report_wait` 那一处，这里不再抄一遍数字。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
@@ -1400,7 +1407,7 @@ class SqlAlchemyRepository:
                     .where(
                         _from_origin(origin),
                         orm.AttackDispatchRow.accepted.is_(True),
-                        _still_holding_a_line(now_utc),
+                        _still_holding_a_line(now_utc, hold),
                     )
                 )
                 or 0
@@ -1439,7 +1446,7 @@ class SqlAlchemyRepository:
             )
         return moment
 
-    def release_held_lines(self, *, now_utc: datetime) -> int:
+    def release_held_lines(self, *, now_utc: datetime, hold: timedelta = UNKNOWN_LINE_HOLD) -> int:
         """把此刻还占着航线的派遣**全部**标成「人工已放手」，返回改了几行。
 
         用户口径 2026-08-16：「时间到了，自然就释放了航线，我会手动 check 后
@@ -1458,6 +1465,10 @@ class SqlAlchemyRepository:
         **只碰此刻还占着的那些**：早就自然到点的行不写这个时刻，否则日后想问
         「哪些航线是人手动清掉的」，答案里会混进一整库跟这次按钮毫无关系的
         派遣。被游戏拒掉的那些同理不碰——它们压根没飞出去，也就没有航线可放。
+
+        `hold` 必须和 `count_inflight` 用同一个值，否则「页面上还显示占着 N 条」
+        与「这一下清掉了几条」会对不上——用户按一次按钮、数字纹丝不动，
+        而那正是这个按钮唯一的可见回执。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
@@ -1470,7 +1481,7 @@ class SqlAlchemyRepository:
                     update(orm.AttackDispatchRow)
                     .where(
                         orm.AttackDispatchRow.accepted.is_(True),
-                        _still_holding_a_line(now_utc),
+                        _still_holding_a_line(now_utc, hold),
                     )
                     .values(line_released_at_utc=now_utc)
                 ),
@@ -2169,13 +2180,19 @@ class SqlAlchemyRepository:
             return row
 
     def replace_military_attack_tiers(
-        self, tiers_json: str, *, blind_scrolls: int | None = None
+        self,
+        tiers_json: str,
+        *,
+        blind_scrolls: int | None = None,
+        unknown_line_hold_minutes: int | None = None,
+        reconcile_cooldown_minutes: int | None = None,
+        bot_revisit_hours: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
-        `blind_scrolls` 的 `None` 是**「留空」这个取值本身**，不是「这次不改」：
+        每一个旋钮的 `None` 都是**「留空」这个取值本身**，不是「这次不改」：
         这条接口和 `PUT /api/attack-config` 一样是整份替换，写进去的就是页面上
-        当下那一份。想「只改档位、不动盲拖」得把盲拖的现值一起送上来。
+        当下那一份。想「只改档位、不动别的」得把别的现值一起送上来。
         """
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
@@ -2184,6 +2201,9 @@ class SqlAlchemyRepository:
                 session.add(row)
             row.tiers_json = tiers_json
             row.blind_scrolls = blind_scrolls
+            row.unknown_line_hold_minutes = unknown_line_hold_minutes
+            row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
+            row.bot_revisit_hours = bot_revisit_hours
             session.commit()
             session.refresh(row)
             return row
@@ -2618,19 +2638,22 @@ def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
     )
 
 
-def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:
+def _still_holding_a_line(now_utc: datetime, hold: timedelta) -> ColumnElement[bool]:
     """这一发是不是还占着一条航线。抽成具名谓词是为了让三档合在一处看得见。
 
     - **人工放过手**（`line_released_at_utc` 非 NULL）：不占了，别的一概不看。
       用户在游戏里数过航线、确认舰队已回港，那是比这两个推算出来的钟更硬的
       证据；放在最前面是因为另外两档全是估算，而它是观测。
     - 航线钟读到了：到点就放手。
-    - 航线钟为 NULL：**照样占着**，直到派出时刻 + `UNKNOWN_LINE_HOLD`。
+    - 航线钟为 NULL：**照样占着**，直到派出时刻 + `hold`。
       NULL 的意思是「不知道它什么时候回来」，不是「它没占位」。
 
     ⚠️ 人工放手这一档必须**同时**罩住后两档，所以它是 `and_` 的第一项而不是
     第三个 `or_` 分支：只在有航线钟的那一档上判，读不出飞行时间的那些（正是
     实机上最容易卡住的一批，见 `UNKNOWN_LINE_HOLD`）按下按钮也纹丝不动。
+
+    `hold` **必填、没有默认值**：漏传就会静默退回到写死的 90 分钟，而那正是
+    用户在攻击配置页上刚改掉的那个数——两个调用方各配各的比配不上更难查。
     """
     row = orm.AttackDispatchRow
     return and_(
@@ -2639,7 +2662,7 @@ def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:
             row.line_free_at_utc > now_utc,
             and_(
                 row.line_free_at_utc.is_(None),
-                row.dispatched_at_utc > now_utc - UNKNOWN_LINE_HOLD,
+                row.dispatched_at_utc > now_utc - hold,
             ),
         ),
     )

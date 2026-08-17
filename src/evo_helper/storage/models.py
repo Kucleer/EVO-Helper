@@ -700,6 +700,45 @@ class MilitaryAttackConfigRow(Base):
     #: 是「盲拖数量需在攻击配置页可配置」，而这一页存的就是全局的那几项。
     blind_scrolls: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    # -- 行为旋钮（2026-08-17「该不该可配置」审计）--------------------------------
+    #
+    # 下面三项都是**运维旋钮**：取值取决于用户当下的处境（活动期堆信箱、周一 bot
+    # 刷新日、机器闲忙、要不要激进），**没有唯一正确答案**。它们与 `blind_scrolls`
+    # 同住这张表，理由也一样——这张表就是「攻击配置页上的那几项全局值」，
+    # 而 `scheduler_config` 至今没有任何写入接口，放那儿等于配了也改不动。
+    #
+    # 三项**一律可空，一律不给 server_default**：NULL = 「跟着代码里的默认值走」。
+    # 给了默认值就分不开「没配」和「恰好配成了当前默认」，日后调默认值时所有老行
+    # 都被钉死在旧数上——而它们表达的其实是「跟着默认走」。
+
+    #: 飞行时间读不到时，这条航线按派出时刻起算占多久（分钟）。
+    #: **空 = 用 `domain.report_wait.UNKNOWN_LINE_HOLD` 的 90 分钟。**
+    #:
+    #: 旋钮而非标定常量：90 分钟是「实测最长往返 62.6 分钟 + 四成余量」这个
+    #: **兜底估算**，不是物理事实。调小提高吞吐、代价是估短了会多跑几趟撞航线上限
+    #: （有界且自纠）；调大更保守、代价是一次读不到就能把一条链路压住一个多小时。
+    unknown_line_hold_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
+    #: 两次开工翻信箱之间至少隔多久（分钟）。
+    #: **空 = 用 `domain.reconcile_cooldown.RECONCILE_COOLDOWN` 的 15 分钟。**
+    #:
+    #: 旋钮而非标定常量：15 分钟是**夹在两条会动的边界之间**算出来的——下界是
+    #: 实测续跑间隔的中位数，上界是 `scheduler_config.report_grace_minutes`。
+    #: 而 `restart_cooldown_seconds` 和 `report_grace_minutes` 本来就在库里可配，
+    #: 用户一改节奏，那两条边界跟着变，这个数就不再落在中间了。
+    reconcile_cooldown_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
+    #: 同一个 bot 坐标多久之内不重复打（小时）。**空 = 24 小时。**
+    #:
+    #: 旋钮而非标定常量：24 小时是用户口径，不是游戏规则（游戏那侧的硬限制是
+    #: 海盗每日 32 发，那个在 `scheduler_config.pirate_daily_quota`）。活动期间
+    #: 想多榨几轮就调小，已知 bot 多、想摊得更开就调大。
+    bot_revisit_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
 
 class MissionRunRow(Base):
     """调度器每起一个子进程记一行。"""
