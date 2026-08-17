@@ -52,6 +52,7 @@ from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
+from .system_log import SystemLogRepository
 
 #: How far a report's timestamp may deviate from the dispatch time and still
 #: count as the same dispatch under the strict origin/target/time match rule.
@@ -2131,6 +2132,16 @@ class SqlAlchemyRepository:
             )
             session.commit()
 
+    def recent_system_log_messages(self, *, starts_with: str, limit: int) -> list[str]:
+        """转交给 `SystemLogRepository`：那张表的读写只许从那一个入口走。
+
+        这里只是个转发，为的是让调度器不必自己再拿一份 session factory——
+        它手上只有这个仓储。
+        """
+        return SystemLogRepository(self._session_factory).recent_messages(
+            starts_with=starts_with, limit=limit
+        )
+
     def military_attack_config(self) -> orm.MilitaryAttackConfigRow:
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
@@ -2138,13 +2149,22 @@ class SqlAlchemyRepository:
                 raise ValueError("military_attack_config 还没初始化；先调 ensure_mission_rows()")
             return row
 
-    def replace_military_attack_tiers(self, tiers_json: str) -> orm.MilitaryAttackConfigRow:
+    def replace_military_attack_tiers(
+        self, tiers_json: str, *, blind_scrolls: int | None = None
+    ) -> orm.MilitaryAttackConfigRow:
+        """整份全局攻击配置原子替换。
+
+        `blind_scrolls` 的 `None` 是**「留空」这个取值本身**，不是「这次不改」：
+        这条接口和 `PUT /api/attack-config` 一样是整份替换，写进去的就是页面上
+        当下那一份。想「只改档位、不动盲拖」得把盲拖的现值一起送上来。
+        """
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
             if row is None:
                 row = orm.MilitaryAttackConfigRow(id=1)
                 session.add(row)
             row.tiers_json = tiers_json
+            row.blind_scrolls = blind_scrolls
             session.commit()
             session.refresh(row)
             return row

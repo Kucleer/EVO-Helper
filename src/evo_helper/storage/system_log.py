@@ -160,6 +160,26 @@ class SystemLogRepository:
             sources=sources,
         )
 
+    def recent_messages(self, *, starts_with: str, limit: int) -> list[str]:
+        """最近若干条正文以 `starts_with` 开头的日志正文，**新的在前**。
+
+        这张表按设计会长到几十万行，所以前缀匹配、排序、取前 N 全在 SQL 里做
+        （同 `query`）；把全表拉回 Python 再过滤只会把控制台拖死。
+
+        `startswith(..., autoescape=True)` 不能省：前缀里要是带了 `%` 或 `_`，
+        不转义就变成通配符，匹配范围会静悄悄扩大。
+        """
+        if limit < 1:
+            return []
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.SystemLogRow.message)
+                .where(orm.SystemLogRow.message.startswith(starts_with, autoescape=True))
+                .order_by(orm.SystemLogRow.logged_at_utc.desc(), orm.SystemLogRow.id.desc())
+                .limit(limit)
+            ).all()
+        return [str(row) for row in rows]
+
     @staticmethod
     def _clauses(
         *,

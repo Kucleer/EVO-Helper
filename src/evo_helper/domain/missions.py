@@ -109,8 +109,8 @@ def scan_command() -> list[str]:
     return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.scan_coordinates"])
 
 
-def ranking_command(*, bot_limit: int | None = None) -> list[str]:
-    """军力榜采集命令行。**不吃参数，也没有 `--attack`。**
+def ranking_command(*, bot_limit: int | None = None, blind_scrolls: int | None = None) -> list[str]:
+    """军力榜采集命令行。**没有 `--attack`。**
 
     这条链路只导航、只读、只入库——`LiveDriver()` 用默认的 `allow_actions=False`，
     结构上就没有派舰队的能力。列边界之类的都已经实机标定进 `game.ranking_ui`，
@@ -118,6 +118,11 @@ def ranking_command(*, bot_limit: int | None = None) -> list[str]:
 
     ``bot_limit`` 是军力攻击批次所需的榜单目标数。传入时采够这一批就收工，
     让调度器立即转去攻击，而不是继续把整张榜翻完。
+
+    ``blind_scrolls`` 是开榜后先无脑拖几屏（攻击配置页上那个框）。
+    **`None` 时命令行上不能出现 `--blind-scrolls`**：runner 那边的默认值
+    （`game.ranking_ui.BLIND_SCROLLS`）才是「留空」的含义，在这里补一个
+    「看起来一样」的数字送过去，日后调默认值就调不动了。
 
     它和 `scan_command` 同属**填空隙**那一档（`domain.scheduler.GAP_FILLERS`）：
     不占航线、没有完成态、排最后、攻击到点了随时可以把它抢占掉。
@@ -127,6 +132,13 @@ def ranking_command(*, bot_limit: int | None = None) -> list[str]:
         if bot_limit < 1:
             raise MissionParamError("军力榜采集数量必须至少为 1")
         command.extend(["--bot-limit", str(bot_limit)])
+    if blind_scrolls is not None:
+        # 0 合法（「一屏都别盲拖」是最保守的取值），负数不是。上界在
+        # `application.mission_scheduler._blind_scrolls` 里按实测几何量算，
+        # 这一层只挡住不可能的取值。
+        if blind_scrolls < 0:
+            raise MissionParamError("盲拖屏数不能是负数")
+        command.extend(["--blind-scrolls", str(blind_scrolls)])
     return _checked(command)
 
 

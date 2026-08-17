@@ -123,6 +123,20 @@ def say(message: str) -> None:
     record_system_log("INFO", _caller_source(), message)
 
 
+def warn(message: str) -> None:
+    """同 `say()`，但落进 `system_log` 时级别是 `WARNING`。
+
+    有这个出口是因为控制台的日志页可以**按级别筛**：只用 `say()` 的话，一条
+    「盲拖快拖过头了」会和一轮几千行 INFO 混在一起，等于没报。控制台那份仍然
+    照常打印——两份输出的内容一致，只有级别不同。
+    """
+    line = f"{datetime.now().strftime('%H:%M:%S')} {message}"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe, flush=True)
+    record_system_log("WARNING", _caller_source(), message)
+
+
 def _caller_source() -> str:
     """`say()` 的调用方模块名，去掉 `evo_helper.` 前缀。
 
