@@ -1840,17 +1840,27 @@ def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[n
 ) -> None:
     """⚠️ **第 1 步必须在最前，而这一条钉的正是「在最前」这件事本身。**
 
-    这里 `top_n=1`，而 24 小时内打过的那个**恰好是军力最高的**。把剔除挪到军力
-    截断之后（哪怕只挪一步），截断会先选出 `9000` 那个，剔除再把它拿掉——
-    这一轮候选池就是空的，而 `8000` 那个从头到尾都没机会。
+    24 小时内打过的那个**同时是军力最高的、也是读数最新的**，而时间池和军力截断
+    都只留 1 个。于是把剔除往后挪**一步都不行**：
+
+    - 挪到时间池之后：时间池先装进那个打过的，剔除再把它拿掉 → 空池；
+    - 挪到军力截断之后：截断先选出那个打过的，剔除再把它拿掉 → 空手。
+
+    两种挪法下 `8000` 那个从头到尾都没机会，而它本该是这一轮唯一该打的。
 
     `test_military_pool_skips_targets_attacked_within_the_last_24_hours` 守不住
-    这一点：那条 `top_n=2`，两个目标都进得了池，先剔后截和先截后剔的结果一样。
+    这一点：那条的池子装得下两个，先剔后截和先截后剔的结果一样。
     """
+    scheduler._repository.replace_military_attack_tiers("[]", military_time_pool=1)  # noqa: SLF001
     already_attacked = Coordinate(2, 140, 5)
     still_available = Coordinate(2, 141, 6)
-    add_bot_target(session_factory, already_attacked, military_score=9_000.0)
-    add_bot_target(session_factory, still_available, military_score=8_000.0)
+    add_bot_target(session_factory, already_attacked, military_score=9_000.0, scanned_at=NOW)
+    add_bot_target(
+        session_factory,
+        still_available,
+        military_score=8_000.0,
+        scanned_at=NOW - timedelta(hours=1),
+    )
     dispatch(
         repository,
         run_id,
