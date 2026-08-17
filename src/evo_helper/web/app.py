@@ -70,6 +70,8 @@ from .display import (
     STATUS_TONES,
     TARGET_KIND_GLYPHS,
     TARGET_KIND_TONES,
+    payload_image,
+    payload_text,
     resource_amount_text,
     resource_precision_hint,
 )
@@ -436,6 +438,11 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["game_time"] = game_time
     templates.env.globals["local_time"] = local_time
+    # 系统日志那一列要把 payload 里的 base64 图摘出来单独渲染，理由见
+    # `display.payload_text`：几万字符的 base64 当文字铺开会把整页宽度撑爆，
+    # 而有用的是那张图本身。
+    templates.env.globals["payload_text"] = payload_text
+    templates.env.globals["payload_image"] = payload_image
     # 放到 state 上，好让分文件的路由模块（`system_log_routes`）渲染同一套模板，
     # 而不是各自再建一个 `Jinja2Templates`——那样 `tojson` 的中文设置之类的
     # 环境配置会在两处各写一遍，迟早只改一处。

@@ -285,9 +285,9 @@ def test_zero_means_no_blind_drag_at_all_and_is_not_treated_as_blank(  # type: i
 # -- 拒掉不可能的取值 ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("raw", [-1, -40, BLIND_SCROLLS_MAX + 1, 999])
-def test_out_of_range_values_are_refused(scheduler: MissionScheduler, raw: int) -> None:
-    """负数没有意义；超上界的那一侧会**静悄悄少采一截**，所以只能当场拒。"""
+@pytest.mark.parametrize("raw", [-1, -40])
+def test_negative_values_are_refused(scheduler: MissionScheduler, raw: int) -> None:
+    """负数没有意义。**只拒这一侧。**"""
     with pytest.raises(MissionParamError):
         scheduler.validate_blind_scrolls(raw)
 
@@ -306,8 +306,21 @@ def test_a_blank_value_is_not_an_error_it_is_the_auto_mode(
     assert scheduler.validate_blind_scrolls(raw) is None
 
 
-def test_the_ceiling_itself_is_still_accepted(scheduler: MissionScheduler) -> None:
-    assert scheduler.validate_blind_scrolls(BLIND_SCROLLS_MAX) == BLIND_SCROLLS_MAX
+@pytest.mark.parametrize("raw", [BLIND_SCROLLS_MAX, BLIND_SCROLLS_MAX + 1, 70, 999])
+def test_a_value_above_the_recorded_minimum_is_still_accepted(
+    scheduler: MissionScheduler, raw: int
+) -> None:
+    """⚠️ **不设上界**（用户口径 2026-08-17：「不需要这个限制」）。
+
+    这里曾经拒掉大于 `BLIND_SCROLLS_MAX` 的值。那个数是从**已记录的最小实测屏数
+    减余量**推出来的——它只反映我们碰巧量到过什么，不是游戏的事实。榜会随玩家
+    增加变长，实测值也在涨，把一个观测下界当成硬闸门，结果就是用户明明知道该
+    填 70 却填不进去。
+
+    调大的代价仍然是真的（拖过 bot 起点会静悄悄少采一截），所以那句警告留在
+    界面上——但它是**提示**，不是拦路。
+    """
+    assert scheduler.validate_blind_scrolls(raw) == raw
 
 
 # -- 判定本身要在日志里说得出来 ------------------------------------------------
