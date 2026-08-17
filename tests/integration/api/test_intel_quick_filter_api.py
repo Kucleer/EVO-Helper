@@ -39,6 +39,7 @@ from evo_helper.vision.scout_reports import PirateScoutReading
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -54,7 +55,7 @@ SCOUTED_BOT = Coordinate(2, 330, 7)
 
 @pytest.fixture
 def client(tmp_path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'quick-api.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "quick-api.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     _seed(factory)

@@ -20,6 +20,7 @@ from sqlalchemy import Engine, create_engine, inspect
 
 from alembic import command
 from evo_helper.storage.database import Base, create_database_engine
+from support.database import scratch_database_url
 
 #: 本轮之后这两张表长什么样，逐条写死。**不从 metadata 反推**：反推出来的清单
 #: 会跟着模型一起变，那样这条断言永远成立，也就永远不告诉你任何事。
@@ -66,7 +67,7 @@ EXPECTED_MISSION_RUN_COLUMNS = frozenset(
 @pytest.fixture
 def migrated(tmp_path: Path) -> Iterator[Engine]:
     """一个只由 alembic 建出来的库——生产走的就是这条路。"""
-    url = f"sqlite:///{tmp_path / 'migrated.db'}"
+    url = scratch_database_url(tmp_path, "migrated.db")
     config = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", url)
     command.upgrade(config, "head")
@@ -78,7 +79,7 @@ def migrated(tmp_path: Path) -> Iterator[Engine]:
 @pytest.fixture
 def from_metadata(tmp_path: Path) -> Iterator[Engine]:
     """一个只由 `Base.metadata` 建出来的库——测试走的就是这条路。"""
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'metadata.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "metadata.db"))
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
@@ -109,23 +110,29 @@ def test_two_tasks_of_the_same_kind_fit_in_the_migrated_schema(migrated: Engine)
     删不掉——迁移靠「用一份不含它的表定义重建」把它去掉，而那件事只有在真的往里
     插第二行 BOT 时才看得出来做成没有。`Base.metadata` 那条路早就没有它了，
     所以光比列名是发现不了的。
+
+    ⚠️ `enabled` 与两个时刻走**带类型的绑定参数**，不写成字面量。SQLite 拿 `0` 当
+    假、拿 ISO 串当时刻都没意见；Postgres 上 `enabled` 是 `boolean`、时刻是
+    `timestamptz`，塞整数和文本进去直接 `DatatypeMismatch`。带上类型之后，两种方言
+    各自渲染各自认的字面量。
     """
     from datetime import UTC, datetime
 
-    from sqlalchemy import text
+    from sqlalchemy import Boolean, DateTime, bindparam, text
 
-    now = datetime.now(UTC).isoformat()
+    insert = text(
+        "INSERT INTO mission_tasks "
+        "(kind, name, enabled, priority, params_json, consecutive_failures, "
+        " created_at_utc, updated_at_utc) "
+        "VALUES ('BOT', :name, :enabled, 1, '{}', 0, :now, :now)"
+    ).bindparams(
+        bindparam("enabled", type_=Boolean()),
+        bindparam("now", type_=DateTime(timezone=True)),
+    )
+    now = datetime.now(UTC)
     with migrated.begin() as connection:
         for name in ("主星", "2 号星"):
-            connection.execute(
-                text(
-                    "INSERT INTO mission_tasks "
-                    "(kind, name, enabled, priority, params_json, consecutive_failures, "
-                    " created_at_utc, updated_at_utc) "
-                    "VALUES ('BOT', :name, 0, 1, '{}', 0, :now, :now)"
-                ),
-                {"name": name, "now": now},
-            )
+            connection.execute(insert, {"name": name, "enabled": False, "now": now})
         count = connection.execute(
             text("SELECT COUNT(*) FROM mission_tasks WHERE kind = 'BOT'")
         ).scalar()

@@ -410,6 +410,63 @@ class TestRestartBudget:
 
         assert restart.calls == 1
 
+
+class TestBudgetOnTheOutcome:
+    """**剩余配额要跟着结局一起交出去。**
+
+    调用方拿它回答一个问题：巡检没能回到游戏内时，这一轮该按
+    `EXIT_ENVIRONMENT_BUSY`（不计入连续失败）收场，还是按硬失败收场。
+    判据整段在 `domain.scheduler.exit_code_for_environment_fault`——一句话：
+    配额是滚动窗口内**有限**的，所以「还有配额就豁免」这条判据必然有尽头；
+    换成一条没有尽头的判据，坏掉的环境就会整夜静默空转。
+    """
+
+    def test_a_healthy_session_reports_the_full_budget(self) -> None:
+        outcome = keeper(Recorder([ScreenState.IN_GAME]), restart_window=_Restarter()).reconnect()
+
+        assert outcome.restarts_left == MAX_WINDOW_RESTARTS
+
+    def test_each_restart_eats_one(self) -> None:
+        recorder = Recorder([ScreenState.DEAD_SESSION])
+        guard = keeper(recorder, restart_window=_Restarter(), max_restarts=2)
+
+        outcome = guard.reconnect()
+
+        assert outcome.restarts_left == 1
+
+    def test_a_spent_budget_reports_nothing_left(self) -> None:
+        recorder = Recorder([ScreenState.DEAD_SESSION])
+        guard = keeper(recorder, restart_window=_Restarter(), max_restarts=1)
+        guard.reconnect()
+
+        recorder.states = [ScreenState.DEAD_SESSION]
+        outcome = guard.reconnect()
+
+        assert not outcome.ready
+        assert outcome.restarts_left == 0, "配额耗尽 = 这不是暂时的，调用方要按硬失败收场"
+
+    def test_an_unrecognised_screen_carries_the_budget_too(self) -> None:
+        """`UNKNOWN` 那条分支提前返回，一次重开都没走——它同样要如实报配额。"""
+        guard = keeper(Recorder([ScreenState.UNKNOWN]), restart_window=_Restarter())
+
+        assert guard.reconnect().restarts_left == MAX_WINDOW_RESTARTS
+
+    def test_no_restart_action_means_no_budget_at_all(self) -> None:
+        """没注入重开动作时重开这条路压根不存在，说「还有配额」就是骗调用方。"""
+        guard = keeper(Recorder([ScreenState.UNKNOWN]))
+
+        assert guard.reconnect().restarts_left == 0
+
+    def test_the_budget_rolls_forward_on_the_outcome_as_well(self) -> None:
+        recorder = Recorder([ScreenState.DEAD_SESSION])
+        guard = keeper(recorder, restart_window=_Restarter(), max_restarts=1)
+        guard.reconnect()
+
+        recorder.states = [ScreenState.UNKNOWN]
+        recorder.now += RESTART_BUDGET_WINDOW_S + 1
+
+        assert guard.reconnect().restarts_left == 1
+
     def test_a_failed_restart_still_costs_a_slot(self) -> None:
         """否则一个必然失败的重开会被无限重试——正是这里要防的那种循环。"""
         recorder = Recorder([])

@@ -25,6 +25,7 @@ from evo_helper.infrastructure.system_log import (
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.system_log import SystemLogRepository
 from evo_helper.web.runtime import create_runtime_app
+from support.database import scratch_database_url
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +51,7 @@ def _old(message: str, days: int) -> SystemLogRecord:
 
 
 def test_the_console_installs_the_sink_and_the_logging_bridge(tmp_path: Path) -> None:
-    database_url = f"sqlite:///{tmp_path / 'runtime-log.db'}"
+    database_url = scratch_database_url(tmp_path, "runtime-log.db")
 
     create_runtime_app(Settings(database_url=database_url), local_token="runtime-token")
 
@@ -66,7 +67,7 @@ def test_the_console_installs_the_sink_and_the_logging_bridge(tmp_path: Path) ->
 
 
 def test_startup_purges_logs_past_the_retention_window(tmp_path: Path) -> None:
-    database_url = f"sqlite:///{tmp_path / 'retention.db'}"
+    database_url = scratch_database_url(tmp_path, "retention.db")
     # 先把表建出来（迁移会在 `create_runtime_app` 里跑一次；这里手动跑一遍
     # 才能在启动之前塞进旧行）。
     create_runtime_app(Settings(database_url=database_url), local_token="t")
@@ -84,7 +85,7 @@ def test_startup_purges_logs_past_the_retention_window(tmp_path: Path) -> None:
 
 def test_zero_retention_keeps_everything(tmp_path: Path) -> None:
     """0 是「不清理」，不是「全删」——手滑一个配置值不该清空事后唯一能翻的东西。"""
-    database_url = f"sqlite:///{tmp_path / 'retention-off.db'}"
+    database_url = scratch_database_url(tmp_path, "retention-off.db")
     create_runtime_app(Settings(database_url=database_url), local_token="t")
     shutdown_system_log_sink()
     repository = SystemLogRepository(create_session_factory(create_database_engine(database_url)))

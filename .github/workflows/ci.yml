@@ -8,12 +8,44 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+
+    # 生产 2026-08-16 全面切到 PostgreSQL，而测试当时仍然全跑 SQLite。同一天
+    # /planets 整页 500 就是从这个缺口漏过去的：分类计数 SELECT 了一个没进
+    # GROUP BY 的列，SQLite 容忍、PostgreSQL 直接 GroupingError，226 条相关用例
+    # 在 SQLite 上一条都没红。所以 CI 起一个 postgres 服务，让全量测试跑在与
+    # 生产同一种方言上。
+    services:
+      postgres:
+        # 与生产同一个大版本（生产是 18.6）。方言差异是按大版本走的，钉住它，
+        # CI 才代表得了生产。
+        image: postgres:18
+        env:
+          # 只在 GitHub 托管的 runner 内部网络里可达，跑完就销毁，不是凭据。
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: evo_helper_test
+        ports:
+          - 5432:5432
+        # 没有健康检查的话，容器起来了但 postgres 还没 ready，第一个建 schema 的
+        # 用例会以 ConnectionRefused 红掉——而且是随机红，看起来像 flaky。
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # 设了它，tests/support/database.py 就把每个测试库建成这个库里的一个
+      # schema；不设则回落 SQLite（本地迭代用）。
+      EVO_HELPER_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/evo_helper_test
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev]"
+      # `db` 这一组装的是 psycopg。少了它，上面那个 URL 会在
+      # create_database_engine() 就倒在 ModuleNotFoundError: psycopg。
+      - run: python -m pip install -e ".[dev,db]"
       - run: python -m compileall src tests
       - run: pytest -q
       - run: ruff check src tests

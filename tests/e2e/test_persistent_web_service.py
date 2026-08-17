@@ -13,13 +13,14 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 NOW = datetime(2026, 8, 6, 1, 0, tzinfo=UTC)
 
 
 def test_web_configuration_and_run_survive_service_restart(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'web.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "web.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: NOW)
@@ -54,7 +55,7 @@ def test_web_configuration_and_run_survive_service_restart(tmp_path: Path) -> No
     )
     engine.dispose()
 
-    restarted_engine = create_database_engine(f"sqlite:///{tmp_path / 'web.db'}")
+    restarted_engine = create_database_engine(scratch_database_url(tmp_path, "web.db"))
     restarted_factory = create_session_factory(restarted_engine)
     restarted = PersistentApplicationService(restarted_factory, now_utc=lambda: NOW)
 
@@ -72,7 +73,7 @@ def test_web_configuration_and_run_survive_service_restart(tmp_path: Path) -> No
 
 
 def test_persistent_app_retains_plan_across_app_recreation(tmp_path: Path) -> None:
-    database_url = f"sqlite:///{tmp_path / 'api.db'}"
+    database_url = scratch_database_url(tmp_path, "api.db")
     first_engine = create_database_engine(database_url)
     Base.metadata.create_all(first_engine)
     first = TestClient(
@@ -114,7 +115,7 @@ def test_persistent_plan_accepts_an_origin_outside_the_range(tmp_path: Path) -> 
     The fake service was fixed first and the persistent one still rejected the
     plan, which is what the console hit with real coordinates.
     """
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'origin.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "origin.db"))
     Base.metadata.create_all(engine)
     service = PersistentApplicationService(create_session_factory(engine), now_utc=lambda: NOW)
 

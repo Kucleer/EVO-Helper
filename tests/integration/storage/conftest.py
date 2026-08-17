@@ -18,11 +18,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.models import RunInstance, ScanPlan
 from evo_helper.storage.repository import SqlAlchemyRepository
+from support.database import scratch_database_url
 
 
 @pytest.fixture
 def engine(tmp_path: Path) -> Iterator[Engine]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "test.db"))
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()

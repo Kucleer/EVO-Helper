@@ -19,6 +19,7 @@ from evo_helper.domain.records import BattleReport, FleetSnapshotEntry
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.persistent_service import PersistentApplicationService
+from support.database import scratch_database_url
 
 TARGET = Coordinate(2, 137, 14)
 ORIGIN = Coordinate(2, 137, 18)
@@ -29,7 +30,7 @@ ROUND_ONE = ("轻型战斗机", 45), ("重型战斗机", 31)
 
 
 def _service(tmp_path: Path) -> PersistentApplicationService:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'detail.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "detail.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     fleet = [

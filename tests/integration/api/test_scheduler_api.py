@@ -41,6 +41,7 @@ from evo_helper.storage.database import Base, create_database_engine, create_ses
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.scan_console import parse_scheduler
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 TOKEN = "test-token"
@@ -167,7 +168,7 @@ def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
 
 @pytest.fixture
 def console(tmp_path: Path) -> Iterator[Console]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'console.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "console.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     repository = SqlAlchemyRepository(factory)
@@ -784,7 +785,9 @@ def test_a_new_bot_round_is_still_allowed_while_running(console: Console) -> Non
 
 def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> None:
     """「开始」那一下抄一份，页面据此回答「这一轮到底按什么跑的」。"""
-    console.patch("PIRATE", {"params": {"radius": 6}})
+    # 海盗那一行种子里是不参与的，这里连同参与一起打开：记录只摆出参与调度的
+    # 任务（见 `test_the_record_only_shows_the_tasks_that_take_part`）。
+    console.patch("PIRATE", {"enabled": True, "params": {"radius": 6}})
     _start(console)
 
     frozen = console.get()["frozen_config"]
@@ -794,6 +797,31 @@ def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> 
     assert pirate["params"] == {"radius": 6}
     assert pirate["summary"] == "半径 6"
     assert frozen["changes"] == ["首次记录"]
+
+
+def test_the_record_only_shows_the_tasks_that_take_part(console: Console) -> None:
+    """用户口径 2026-08-17：「未生效的任务项，不应留在固化记录里」。
+
+    这份记录在页面上回答的是「这一轮到底要跑什么」，没勾选参与的任务这一轮根本
+    不会被起，混在里面只会让人分不清哪几条是真的在飞。
+
+    断言钉的是**整张清单**而不是「不含某个名字」：只查名字的话，把过滤写成
+    「漏掉某一条」照样绿。条数也一并钉住。
+    """
+    # 种子：海盗与 bot 不参与，扫描与军力榜参与。这里把海盗打开、扫描关掉，
+    # 于是这一轮参与的恰好是海盗与军力榜——两个 kind 都不是种子里的默认状态，
+    # 断言才不会被「碰巧和默认一致」蒙混过去。
+    console.patch("PIRATE", {"enabled": True})
+    console.patch("SCAN", {"enabled": False})
+    _start(console)
+
+    frozen = console.get()["frozen_config"]
+    assert isinstance(frozen, dict)
+    tasks = frozen["tasks"]
+    assert isinstance(tasks, list)
+    assert [task["kind"] for task in tasks] == ["PIRATE", "RANKING"]
+    assert len(tasks) == 2
+    assert all(task["enabled"] is True for task in tasks)
 
 
 def test_a_stopped_scheduler_shows_no_frozen_configuration(console: Console) -> None:
@@ -873,7 +901,7 @@ def test_an_orphan_run_is_surfaced_with_its_pid(tmp_path: Path) -> None:
     pid 是给人拿去任务管理器里核对的，**不是给我们开枪用的**——pid 会被系统
     回收复用。
     """
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'orphan.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "orphan.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     repository = SqlAlchemyRepository(factory)
@@ -907,7 +935,7 @@ def test_the_console_writes_its_freezes_under_var(tmp_path: Path) -> None:
     读构造、写追加的。钉住的是**接线**：控制台自己建调度器时必须给它一个带
     路径的账本，忘了给就只留在内存里，重启一次全没了，而那种丢失是静默的。
     """
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'wiring.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "wiring.db"))
     Base.metadata.create_all(engine)
     app = create_persistent_app(
         create_session_factory(engine), local_token=TOKEN, tick_interval_s=3600.0

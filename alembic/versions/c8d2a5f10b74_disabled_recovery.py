@@ -1,7 +1,7 @@
 """record how an auto-disabled mission task gets re-enabled
 
 Revision ID: c8d2a5f10b74
-Revises: b3f5c8d10a27
+Revises: b3d7e5a91c04
 Create Date: 2026-08-17
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c8d2a5f10b74"
-down_revision: str | None = "b3f5c8d10a27"
+down_revision: str | None = "b3d7e5a91c04"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

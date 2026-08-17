@@ -23,6 +23,7 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.pirate_reports import OUTCOME_VICTORY, PirateReportReading
+from support.database import scratch_database_url
 
 ORIGIN = Coordinate(2, 137, 18)
 TARGET = Coordinate(2, 137, 4)
@@ -43,7 +44,7 @@ READING = PirateReportReading(
 
 
 def _factory(tmp_path: Path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'pirate.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "pirate.db"))
     Base.metadata.create_all(engine)
     return create_session_factory(engine)
 
