@@ -1434,12 +1434,28 @@ class MissionConsoleService:
     def _freeze_view(
         self, record: MissionConfigFreeze, previous: MissionConfigFreeze | None
     ) -> ConfigFreezeView:
+        """一条固化记录翻成页面上的样子。**只摆出当时参与调度的那几个任务。**
+
+        用户口径 2026-08-17：「未生效的任务项，不应留在固化记录里」。这份记录在
+        页面上回答的是「这一轮到底要跑什么」，而没勾选参与的任务这一轮根本不会
+        被起——把它们混在一起，一眼扫过去分不清哪几条是真的在飞。
+
+        过滤只做在**显示**这一层：磁盘上那份 JSONL 是审计凭据，仍然一个字段不少
+        地记着每一个任务（含没参与的），事后要查「那一轮某条链路是开着还是关着」
+        照样查得到。少写进去的信息，以后想要就再也回不来了。
+
+        判据用的是**记录里冻结的** `enabled`，不是库里此刻的值：用户后来改了勾选
+        不该让上一轮的记录跟着改口——那正是这份账要防的走样。
+
+        `changes` 那一列不跟着过滤：「某任务：参与调度 是 → 否」恰恰是用户想看到
+        的改动，按参与与否筛掉，取消勾选这件事就会在页面上无声无息。
+        """
         return ConfigFreezeView(
             frozen_at_utc=record.frozen_at_utc,
             tasks=tuple(
                 _frozen_task_view(task)
                 for task in record.tasks
-                if task.kind.value in MISSION_LABELS
+                if task.kind.value in MISSION_LABELS and task.enabled
             ),
             military_tiers_label=_frozen_tiers_label(record.military_tiers_json),
             changes=_describe_changes(previous, record),
