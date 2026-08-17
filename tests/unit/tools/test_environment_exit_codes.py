@@ -192,9 +192,20 @@ class _Keeper:
 
     def __init__(self, outcomes: list[ReconnectOutcome]) -> None:
         self._outcomes = outcomes
+        self.waits = 0
         self.restarts: list[str] = []
 
     def ensure_connected(self, *, force: bool = False) -> ReconnectOutcome:
+        return self._outcomes[0] if len(self._outcomes) == 1 else self._outcomes.pop(0)
+
+    def wait_for_known_screen(self) -> ReconnectOutcome:
+        """第三级：把认不出先当成「登录还没走完」等一会儿，再谈关窗重开。
+
+        照剧本给结局：剧本里是「认不出」时它就是「等到头还是认不出」，于是阶梯
+        照旧往下走。**这一侧是安全的默认值**——反过来（默认等到了）会让下面
+        「阶梯要走全」那条用例在一个永远等下去的实现上也变绿。
+        """
+        self.waits += 1
         return self._outcomes[0] if len(self._outcomes) == 1 else self._outcomes.pop(0)
 
     def restart_and_reenter(self, reason: str) -> ReconnectOutcome:
@@ -255,6 +266,7 @@ def test_the_ranking_run_walks_the_whole_recovery_ladder(
 
     ranking_scan.enter_game_exit_code(_NoopDriver(), object())  # type: ignore[arg-type]
 
+    assert keeper.waits == 1, "「先当成登录没走完等一会儿」那一级也在阶梯上"
     assert len(keeper.restarts) == 1, "关窗重开那一级必须走到，配额才说明得了问题"
 
 
