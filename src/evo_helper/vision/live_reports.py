@@ -124,12 +124,14 @@ class LiveBattleReport:
     #: 这一行要把详情页拖到底才读得到，所以缺席是常态。
     attacker_losses: int | None = None
     defender_losses: int | None = None
-    #: `VICTORY` / `FAIL` / `DRAW`，**算出来的**，不是从横幅读的：
-    #: 本方剩余 0 判负、对方被全歼判胜、两边都有船判平
-    #: （用户口径 2026-08-11，判据在 `domain.battle_outcome`）。
+    #: `VICTORY` / `FAIL` / `DRAW`。**优先来自画面上那行大字**（用户口径
+    #: 2026-08-17：游戏算法更新后剩余舰艇数已不准），横幅读不出来才回落到
+    #: 按剩余舰艇数算的结果（`domain.battle_outcome`）。仲裁见
+    #: `vision.pirate_reports.decide_outcome`。
     #:
-    #: ⚠️ **算不出就是 None，绝不拿别的东西顶替。** 「没算出胜负」和「打输了」
-    #: 在下游完全不同：后者会进攻击日志的战果列，显示成一场根本没读过的败仗。
+    #: ⚠️ **两条路都定不出就是 None，绝不拿别的东西顶替。** 「没定出胜负」和
+    #: 「打输了」在下游完全不同：后者会进攻击日志的战果列，
+    #: 显示成一场根本没读过的败仗。
     outcome: str | None = None
     #: 「获得资源」那 12 格里**非零**的几格（用户口径 2026-08-17：只统计这 12 个值）。
     #:
@@ -246,16 +248,15 @@ class LiveReportReader:
         其余判据一条不放松：主题必须是可匹配派遣的攻击报告、时间必须读得出、
         VS 块必须两边都全——单边战报会被挂到错的目标上。
 
-        ## 胜负是**算**出来的
+        ## 胜负**以横幅为准**
 
-        剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、两边都有船判平
-        （用户口径 2026-08-11，判据在 `domain.battle_outcome`）。画面上那行
-        `VICTORY` / `FAIL` 大字只做交叉校验，两边都算得出而结论不一致时留一条
-        warning——用户明确说了不看游戏内的提示，横幅没有推翻算式的资格。
+        画面上那行 `VICTORY` / `FAIL` 大字是第一判据（用户口径 2026-08-17：
+        「游戏算法更新，剩余舰艇算法已经不准了，可以读 victory」）。
+        横幅读不出来才回落到「剩余 = 单位 − 损失单位」那套算式
+        （`domain.battle_outcome`），并留一条 warning 说明这一条是回落来的。
 
-        代价说在前面：**四个数缺一个就判不出**，而「损失单位」那一行恰恰要拖到底
-        才读得到（见下）。所以没有第二屏时 `outcome` 多半是 None，这是诚实的空，
-        不是故障。
+        横幅只在**没拖过的那一屏**上，所以它取自 `self._screens` 而不是 `bottom`。
+        两条路都定不出时 `outcome` 才是 None——这是诚实的空，不是故障。
 
         ## `bottom`：拖到底之后的那一屏
 
@@ -265,8 +266,9 @@ class LiveReportReader:
         所以这不是定位错、是那一行**根本没画出来**——只能拖。
         「损失单位」在它下面一行，更是**只有**拖到底才读得到。
 
-        这一步因此从「补一个展示字段」变成了**判据的输入**：不拖就没有战损，
-        没有战损就算不出胜负。
+        战损本身仍然只在这一屏上，而它是页面「战损 我 X · 敌 Y」的来源，也是
+        兜底算式的输入。2026-08-17 横幅升回第一判据之后，不拖这一屏**不再等于
+        没有战果**——横幅照样给得出——但战损那两个数还是拿不到。
 
         ⚠️ **时间与 VS 块必须仍旧从没拖过的那一屏读**——拖到底之后它们都滚出了
         可视区。所以两屏各有各的用处，不能互相顶替：
@@ -284,13 +286,13 @@ class LiveReportReader:
         attacker_losses, defender_losses = self._loss_totals(
             bottom if bottom is not None else self._screens
         )
-        outcome = outcome_from_totals(
+        computed = outcome_from_totals(
             attacker_units=attacker_units,
             attacker_losses=attacker_losses,
             defender_units=defender_units,
             defender_losses=defender_losses,
         )
-        self._cross_check_banner(outcome, raw_time)
+        outcome = self._decide_outcome(computed, raw_time)
         timer.stage("outcome")
         resources = self._resources(self._screens, where=raw_time)
         timer.stage("resources")
@@ -387,28 +389,34 @@ class LiveReportReader:
         totals = reader() if reader is not None else ("", "")
         return (_unit_count(totals[0]), _unit_count(totals[1]))
 
-    def _cross_check_banner(self, computed: str | None, where: str) -> None:
-        """算出来的胜负与画面横幅对不上就留一条 warning。**只记不改。**
+    def _decide_outcome(self, computed: str | None, where: str) -> str | None:
+        """定战果：**以画面横幅为准**，读不出来才用算出来的那个兜底。
 
-        用户明确说了不看游戏内的提示，所以横幅没有推翻算式的资格；但两者都读得出
-        还不一致，说明其中一条链路坏了——那正是值得有人看一眼的事。
+        用户口径（2026-08-17）：「游戏算法更新，剩余舰艇算法已经不准了，
+        可以读 victory」。仲裁与日志都在 `pirate_reports.decide_outcome` 里，
+        两条链路共用同一套规则。
 
-        **算不出胜负时连读都不读**：横幅那一次 OCR 只为校验，而这时没有东西可校，
-        白花约 0.3 秒。bot 战报缺战损是常态，省下的正是常态那一路。
+        **横幅现在每份战报都要读**，不像从前那样「算不出胜负就连读都不读」——
+        那条省法建立在「横幅只是校验」之上，而横幅已经是第一判据。
+        代价是每份战报多约 0.3 秒 OCR；收益是那五张拖不到底的 bot 战报
+        （四个数缺战损，算式一律给 None）从此也有战果，不再永远空着。
 
-        **不在这里抛。** 海盗那条链路算不出胜负就整份拒收，因为那份记录**只有**
+        横幅取的必须是**没拖过那一屏**（`self._screens`）：拖到底之后它已经滚出
+        可视区，同一段 ROI 实测读作 `'Z ?'`。
+
+        取字面对象没有 `outcome_banner` 时传 `None` 而不是 `""`：那是结构性缺席，
+        静默回落即可，不该刷 warning（判据见 `decide_outcome`）。
+
+        **不在这里抛。** 海盗那条链路定不出胜负就整份拒收，因为那份记录**只有**
         胜负与战损；bot 这条链路的主业是「战报回来了没有」与守方单位数，
-        为一个算不出的战果丢掉整份战报，会让目标重新卡回 `AWAITING_PROBE_REPORT`
+        为一个定不出的战果丢掉整份战报，会让目标重新卡回 `AWAITING_PROBE_REPORT`
         ——那正是这条链路上一次的死结。
         """
-        if computed is None:
-            return
-        from evo_helper.vision.pirate_reports import cross_check_banner
+        from evo_helper.vision.pirate_reports import decide_outcome
 
         reader = getattr(self._screens, "outcome_banner", None)
-        if reader is None:
-            return
-        cross_check_banner(computed, reader(), where=f"攻击战报 {where}")
+        banner_text = reader() if reader is not None else None
+        return decide_outcome(banner_text, computed, where=f"攻击战报 {where}")
 
     def _read_report(
         self,
@@ -436,13 +444,13 @@ class LiveReportReader:
 
         attacker_units, defender_units = self._unit_totals(self._screens)
         attacker_losses, defender_losses = self._loss_totals(self._screens)
-        outcome = outcome_from_totals(
+        computed = outcome_from_totals(
             attacker_units=attacker_units,
             attacker_losses=attacker_losses,
             defender_units=defender_units,
             defender_losses=defender_losses,
         )
-        self._cross_check_banner(outcome, raw_time)
+        outcome = self._decide_outcome(computed, raw_time)
 
         return LiveBattleReport(
             kind=kind,

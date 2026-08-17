@@ -2,6 +2,9 @@
 
 这条链路刻意**不读逐舰种明细**，所以它不能复用 `LiveReportReader`：
 后者要求参战两列非空，还会因为「海盗攻击报告」不可与派遣匹配而整份拒收。
+
+胜负**以画面横幅为准**（用户口径 2026-08-17：「游戏算法更新，剩余舰艇算法
+已经不准了，可以读 victory」），横幅读不出来才回落到按剩余舰艇数算的结果。
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from evo_helper.vision.pirate_reports import (
     OUTCOME_FAIL,
     OUTCOME_VICTORY,
     PirateReportUnreadable,
-    cross_check_banner,
+    decide_outcome,
     parse_outcome,
     read_pirate_report,
 )
@@ -77,28 +80,30 @@ def test_per_ship_detail_is_not_recorded() -> None:
     assert not hasattr(reading, "fleet")
 
 
-def test_a_lost_battle_is_computed_from_the_survivors_not_the_banner() -> None:
-    """⚠️ 判据是**剩余舰艇数**，不是画面上那行大字（用户口径 2026-08-11）。
+def test_the_banner_wins_when_it_disagrees_with_the_arithmetic() -> None:
+    """⚠️ 判据是**画面上那行大字**，不是剩余舰艇数（用户口径 2026-08-17）。
 
-    这里故意让两者打架：横幅写着 `VICTORY`，而我方 100 全损、对方 783 一艘没掉。
-    按算式我方剩余 0 → `FAIL`。横幅没有推翻算式的资格，只会留一条 warning。
+    这里故意让两者打架：横幅写着 `VICTORY`，而我方 100 全损、对方 783 一艘没掉
+    （按算式我方剩余 0 → `FAIL`）。生产日志 2026-08-17 18:20:17 见过的正是这个
+    形状；用户说「游戏算法更新，剩余舰艇算法已经不准了，可以读 victory」，
+    所以现在算式让位。
     """
     reading = read_pirate_report(
         _Screens(banner="VICTORY", units=("100", "783"), losses=("100", "0")),
         _Screens(losses=("100", "0")),
     )
 
-    assert reading.outcome == OUTCOME_FAIL
+    assert reading.outcome == OUTCOME_VICTORY
 
 
-def test_a_draw_needs_no_screenshot_of_a_draw() -> None:
-    """平局这一档是**算出来的**，不必先认出一张没人见过的横幅。
+def test_a_draw_still_comes_out_of_the_fallback_arithmetic() -> None:
+    """平局这一档**没有横幅样本**，只会从兜底算式里出来。
 
-    仓库里 7 张详情页只有 `VICTORY` 与 `FAIL` 两种大字；换成按剩余数算之后，
-    「两边都还有船」自然就落到 `DRAW`。
+    仓库里 7 张详情页只有 `VICTORY` 与 `FAIL` 两种大字，平局长什么样谁也没见过。
+    所以横幅读不出来（这里给一段噪声）而两边都还有船时，回落的算式给出 `DRAW`。
     """
     reading = read_pirate_report(
-        _Screens(units=("100", "783"), losses=("30", "200")),
+        _Screens(banner="- a", units=("100", "783"), losses=("30", "200")),
         _Screens(losses=("30", "200")),
     )
 
@@ -112,51 +117,79 @@ def test_a_banner_missing_a_letter_still_snaps() -> None:
     assert parse_outcome("FAlL") == OUTCOME_FAIL
 
 
-def test_an_unreadable_banner_no_longer_rejects_anything() -> None:
-    """横幅降级成交叉校验之后，它读不出来**不再影响**这份记录能不能存。
+def test_an_unreadable_banner_falls_back_instead_of_dropping_the_report() -> None:
+    """⚠️ **横幅读不出来不许静默丢数据。**
 
-    胜负来自四个数，横幅没有一票否决权——那五张 bot 实拍上的横幅一度全读成
-    `'- a'`，而它们的四个数（拖到底之后）是齐的。
+    横幅是第一判据，但它读不出来时这份记录照样要存下去——回落到那四个数
+    （我方 100−0 还有船、对方 783−783 被全歼 → `VICTORY`）。
+    那五张 bot 实拍上的横幅一度全读成 `'- a'`，而它们的四个数是齐的。
     """
     reading = read_pirate_report(_Screens(banner=""), _Screens())
 
     assert reading.outcome == OUTCOME_VICTORY
 
 
-def test_a_report_whose_outcome_cannot_be_computed_is_refused() -> None:
-    """胜负与战损是这条记录**唯一**的内容，算不出胜负就没有存的价值。
+def test_a_report_whose_outcome_cannot_be_decided_at_all_is_refused() -> None:
+    """胜负与战损是这条记录**唯一**的内容，两条路都定不出就没有存的价值。
 
-    判据换了（从「横幅读不出」变成「四个数缺一个」），拒收这条规矩没换。
+    这里横幅是噪声、「单位」也读不出来——横幅顶不上，算式也算不出。
     """
-    with pytest.raises(PirateReportUnreadable, match="算不出胜负"):
-        read_pirate_report(_Screens(units=("", "")), _Screens())
+    with pytest.raises(PirateReportUnreadable, match="定不出胜负"):
+        read_pirate_report(_Screens(banner="- a", units=("", "")), _Screens())
 
 
-class TestTheBannerIsOnlyACrossCheck:
-    """横幅**只记不改**：它没有推翻算式的资格，但对不上时要有人看得见。"""
+class TestTheBannerIsTheVerdict:
+    """横幅说了算；算式只当兜底。三条出路都要在日志里认得出来。"""
 
-    def test_a_disagreement_leaves_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_a_disagreement_says_the_banner_wins(self, caplog: pytest.LogCaptureFixture) -> None:
+        """⚠️ 这条钉的是**日志说的是新规则**。
+
+        旧措辞「以算出来的为准」在新规则下是假话，而这个仓库出过
+        「日志说假话比不说更糟、故障因此拖了两天」的事故。
+        """
         with caplog.at_level("WARNING"):
-            cross_check_banner(OUTCOME_FAIL, "VICTORY", where="测试")
+            decided = decide_outcome("VICTORY", OUTCOME_FAIL, where="测试")
 
-        assert "以算出来的为准" in caplog.text
+        assert decided == OUTCOME_VICTORY
+        assert "以横幅为准" in caplog.text
+        assert "以算出来的为准" not in caplog.text
+        # 两边各是什么、原文读到的是什么，都要说清楚，否则事后无从复核。
+        assert "VICTORY" in caplog.text
+        assert OUTCOME_FAIL in caplog.text
 
     def test_agreement_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level("WARNING"):
-            cross_check_banner(OUTCOME_VICTORY, "VICTORY", where="测试")
+            decided = decide_outcome("VICTORY", OUTCOME_VICTORY, where="测试")
 
+        assert decided == OUTCOME_VICTORY
         assert caplog.text == ""
 
-    def test_an_unreadable_banner_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
-        """bot 战报缺战损是常态，横幅读不出来也是常态。
+    def test_a_fallback_says_it_is_a_fallback(self, caplog: pytest.LogCaptureFixture) -> None:
+        """回落值来自「已知会不准」的那套算式，日后核账要认得出哪些是它。"""
+        with caplog.at_level("WARNING"):
+            decided = decide_outcome("- a", OUTCOME_FAIL, where="测试")
 
-        为常态刷 warning 等于把这条校验变成噪声，用不了几次就没人再看它了。
+        assert decided == OUTCOME_FAIL
+        assert "回落" in caplog.text
+
+    def test_a_missing_banner_reader_falls_back_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`None` 表示这一屏根本没有横幅取字面——结构性缺席，不是读失败。
+
+        离线入库与旧截图那几条路都走这里，为它们刷 warning 就是把这条日志
+        变成噪声，用不了几次就没人再看它了。
         """
         with caplog.at_level("WARNING"):
-            cross_check_banner(OUTCOME_FAIL, "- a", where="测试")
-            cross_check_banner(None, "VICTORY", where="测试")
+            decided = decide_outcome(None, OUTCOME_FAIL, where="测试")
 
+        assert decided == OUTCOME_FAIL
         assert caplog.text == ""
+
+    def test_neither_source_yields_nothing_rather_than_a_guess(self) -> None:
+        """「没定出胜负」和「打输了」在下游完全不同，绝不拿一档顶替。"""
+        assert decide_outcome("- a", None, where="测试") is None
+        assert decide_outcome(None, None, where="测试") is None
 
 
 def test_the_third_label_does_not_swallow_the_other_two() -> None:
@@ -165,6 +198,9 @@ def test_the_third_label_does_not_swallow_the_other_two() -> None:
     列进词表的前提是它不能把另外两档吸走：三档两两距离都远大于容差 2，
     而 `snap_to_vocabulary` 遇到并列命中还会判歧义返回 None。
     这条钉的就是「多一档没有代价」，而不是「平局读得出来」——后者无从验证。
+
+    横幅升回第一判据（2026-08-17）之后这一条更要紧：那串噪声任何一段被吸上，
+    都会直接变成库里一条假战果。
     """
     assert parse_outcome("DRAW") == OUTCOME_DRAW
     assert parse_outcome("FAIL") == OUTCOME_FAIL
@@ -179,14 +215,20 @@ def test_unreadable_losses_reject_the_whole_report() -> None:
         read_pirate_report(_Screens(), _Screens(losses=("0", "")))
 
 
-def test_unit_totals_are_no_longer_optional() -> None:
-    """「单位」从附带信息变成了**判据的输入**：剩余 = 单位 − 损失单位。
+def test_unit_totals_are_only_needed_when_the_banner_fails() -> None:
+    """「单位」退回成**兜底算式的输入**：横幅读得出来时它缺席无所谓。
 
-    以前它读不出来只是少一个展示字段，现在少了就判不出胜负，而胜负是这条记录的
-    正文——所以整份拒收。这是换判据带来的、有意的收紧。
+    2026-08-11 那版把它收紧成「读不出就整份拒收」（因为胜负只能靠算），
+    2026-08-17 横幅升回第一判据之后这条收紧自然松开——但只在横幅顶得上的时候。
+    横幅也读不出来时仍旧整份拒收（见
+    `test_a_report_whose_outcome_cannot_be_decided_at_all_is_refused`）。
     """
-    with pytest.raises(PirateReportUnreadable, match="算不出胜负"):
-        read_pirate_report(_Screens(units=("", "")), _Screens())
+    reading = read_pirate_report(_Screens(units=("", "")), _Screens())
+
+    assert reading.outcome == OUTCOME_VICTORY
+    assert (reading.attacker_units, reading.defender_units) == (None, None)
+    # 战损照旧是硬要求：它是这条记录的另一半正文，不受横幅影响。
+    assert (reading.attacker_losses, reading.defender_losses) == (0, 783)
 
 
 def test_a_non_pirate_report_is_refused() -> None:

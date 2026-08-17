@@ -9,7 +9,7 @@ bot 那条链路的同一个死结刚修过（PR #91）：没人读战报 → `b
 `tools.ingest_pirate_report`（要人手工喂两张截图）上，活链路从来不调它。
 
 这里守的是**活链路那一侧的接线**：两屏怎么取、胜负从哪来、去重与拒收怎么落。
-读法本身（四个数怎么算出胜负、横幅只作交叉校验）在
+仲裁本身（横幅为准、算式兜底，用户口径 2026-08-17）在
 `tests/unit/vision/test_pirate_reports.py`。
 """
 
@@ -50,10 +50,12 @@ class _Screens:
         header: str = HEADER,
         units: tuple[str, str] = ("100", "783"),
         losses: tuple[str, str] = ("0", "783"),
+        banner: str = "VICTORY",
     ) -> None:
         self._header = header
         self._units = units
         self._losses = losses
+        self._banner = banner
 
     def report_header(self) -> str:
         return self._header
@@ -62,7 +64,7 @@ class _Screens:
         return VERSUS
 
     def outcome_banner(self) -> str:
-        return "VICTORY"
+        return self._banner
 
     def unit_totals(self) -> tuple[str, str]:
         return self._units
@@ -126,16 +128,27 @@ def test_a_readable_pirate_report_is_stored_with_its_outcome() -> None:
     assert report.reported_at_utc == REPORTED_AT
 
 
-def test_the_outcome_comes_from_the_survivors_not_the_banner() -> None:
-    """⚠️ 胜负按**剩余舰艇数**算（用户口径 2026-08-11），不看画面上那行大字。
+def test_the_outcome_comes_from_the_banner_not_the_survivors() -> None:
+    """⚠️ 胜负看**画面上那行大字**（用户口径 2026-08-17），不按剩余舰艇数算。
 
-    这里让两者打架：横幅写着 `VICTORY`，而我方 100 全损、对方 783 一艘没掉。
-    按算式我方剩余 0 → `FAIL`。横幅没有推翻算式的资格。
+    这里让两者打架：横幅写着 `VICTORY`，而我方 100 全损、对方 783 一艘没掉
+    （按算式我方剩余 0 → `FAIL`）。游戏算法更新后算式已不可信，横幅赢。
     """
     repository = _Repository()
     loop, _events = _loop(repository, bottom=_Screens(losses=("100", "0")))
 
     assert loop._ingest_report(ROW, _Screens(losses=("100", "0"))) is ReportIngest.STORED
+    assert repository.appended[0].outcome == OUTCOME_VICTORY
+
+
+def test_an_unreadable_banner_falls_back_to_the_survivors() -> None:
+    """横幅读不出来不许静默丢数据：回落到四个数，这一份照样入库。"""
+    repository = _Repository()
+    loop, _events = _loop(repository, bottom=_Screens(losses=("100", "0")))
+
+    ingest = loop._ingest_report(ROW, _Screens(banner="- a", losses=("100", "0")))
+
+    assert ingest is ReportIngest.STORED
     assert repository.appended[0].outcome == OUTCOME_FAIL
 
 
