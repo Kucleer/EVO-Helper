@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -89,6 +90,39 @@ def _attack_with_report(repo, run_id):  # type: ignore[no-untyped-def]
     return report_id
 
 
+def _binary_fields(value: object, *, path: str = "entry", depth: int = 0) -> list[str]:
+    """`value` 里所有二进制内容的位置，逐层往下找。
+
+    只看顶层字段是不够的：把一整个 `ReportScreenshot`（里面躺着 40 KB）挂在
+    `report_screenshot` 上，顶层那一眼看过去只是「一个对象」，而响应已经胖了。
+    """
+    if isinstance(value, bytes | bytearray | memoryview):
+        return [path]
+    if depth > 4:
+        return []
+    if is_dataclass(value) and not isinstance(value, type):
+        return [
+            found
+            for field in fields(value)
+            for found in _binary_fields(
+                getattr(value, field.name), path=f"{path}.{field.name}", depth=depth + 1
+            )
+        ]
+    if isinstance(value, list | tuple | set):
+        return [
+            found
+            for index, item in enumerate(value)
+            for found in _binary_fields(item, path=f"{path}[{index}]", depth=depth + 1)
+        ]
+    if isinstance(value, dict):
+        return [
+            found
+            for key, item in value.items()
+            for found in _binary_fields(item, path=f"{path}[{key!r}]", depth=depth + 1)
+        ]
+    return []
+
+
 def test_a_report_with_a_screenshot_is_flagged_on_its_row(tmp_path: Path) -> None:
     """有图的那一行才该出现「查看战报截图」这个入口。"""
     repo, service, run_id, factory = _setup(tmp_path)
@@ -149,11 +183,10 @@ def test_the_list_response_never_carries_the_image_bytes(tmp_path: Path) -> None
 
     (entry,) = service.list_attack_log(50)
 
-    values = list(vars(entry).values())
-    assert not any(isinstance(value, bytes | bytearray) for value in values), (
-        "攻击日志的一行里出现了二进制字段"
-    )
-    assert PIXELS not in repr(entry).encode("utf-8", "ignore")
+    # **逐层往下找**，不是只看顶层字段：把整个 `ReportScreenshot` 挂在
+    # `report_screenshot` 上同样是把几十 KB 塞进了列表，而顶层那一眼看过去
+    # 只是「一个对象」。这条断言的第一版正是这样被绕过去的。
+    assert _binary_fields(entry) == [], "攻击日志的一行里挂上了二进制内容"
     # 图本身仍然取得到，只是走另一条路径。
     shot = service.report_screenshot(report_id)
     assert shot is not None
