@@ -218,6 +218,18 @@ def test_a_view_still_gone_after_a_successful_restart_follows_the_same_rule(
     assert caught.value.recoverable is True
 
 
+def test_a_view_still_gone_with_the_budget_spent_is_a_real_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一处的另一半：重开是成功了，但那是最后一次配额。"""
+    loop, _navigator, _keeper = _loop(monkeypatch, [False, False], _in_game(restarts_left=0))
+
+    with pytest.raises(module.SessionUnavailable, match="重开之后仍然切不回来") as caught:
+        loop._require_system_view("读完邮件切不回恒星系视图")
+
+    assert caught.value.recoverable is False
+
+
 class _Driver:
     def click(self, _x: int, _y: int, *, label: str = "") -> None:
         pass

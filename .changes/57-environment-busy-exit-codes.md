@@ -68,14 +68,16 @@ Chrome，却挡不住「每 N 分钟起一轮、每轮失败」，而豁免计�
 
 - Configuration: 无。
 - Database: **无迁移**。`mission_runs.exit_code` 本来就可空。存量行不动。
-- Verification: 2196 passed（起点 2166）/ ruff check + format `src tests` 全绿 /
-  mypy 117 源文件零问题。四组变异各验过一次（改坏 → 转红 → 还原 → 复跑全绿）：
-  ① 三类无条件退 75（`exit_code_for_environment_fault` 恒 75）→ 4 条红；
-  ①b pirate 那条恒 `recoverable=True` → 2 条红；
-  ② 三类退回 1（恒 1，且 `run_with_foreground_guard` 不豁免）→ 6 条红；
-  ③ 维护类/配置类也改成 75（`exit_code_for` 的 `failed` / `busy_is_permanent`
-  两支）→ 3 条红；
-  ④ `exit_code is None` 当成 0（榜单批次那条判据）→ 1 条红。
+- Verification: 2198 passed（起点 2166）/ ruff check + format `src tests` 全绿 /
+  mypy 117 源文件零问题。五组变异各验过一次（改坏 → 转红 → 还原 → 复跑全绿）：
+  ① `exit_code_for_environment_fault` 恒 75 → 4 条红；
+  ①b pirate 那三处恒 `recoverable=True` → 3 条红；
+  ② `exit_code_for_environment_fault` 恒 1，且 `run_with_foreground_guard`
+  改成返回 1 → 4 条红；
+  ②b pirate 那三处恒 `recoverable=False` → 3 条红；
+  ③ 维护类/配置类也放行成 75（`exit_code_for` 的 `failed` / `busy_is_permanent`
+  两支，加上守卫改 catch `GameWindowError`）→ 5 条红；
+  ④ `exit_code is None` 当成 0（`(exit_code or 0) != 0`）→ 1 条红。
 - Safety: 全程只改退出码与异常类型，**没有新增任何点击、派遣或写库路径**。
   `ranking_scan` 新走的那一级关窗重开是既有的 `SessionKeeper` 出口（只送一个
   `WM_CLOSE`，不在认不出的画面上动手），配额与另外两条链路完全共用。

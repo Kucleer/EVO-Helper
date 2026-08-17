@@ -168,9 +168,33 @@ def test_it_still_stops_when_even_a_restart_does_not_help(
         monkeypatch, [_outcome(ScreenState.UNKNOWN), _outcome(ScreenState.UNKNOWN)]
     )
 
-    with pytest.raises(RuntimeError, match="重开也没能回到游戏内"):
+    with pytest.raises(module.SessionUnavailable, match="重开也没能回到游戏内") as caught:
         loop._ensure_session(force=True)
     assert len(keeper.restarts) == 1, "重开只许试一次，不许成环"
+    # 配额耗尽 = 这不是暂时的。照样报 75 的话就没有任何东西会最终停下这条链路。
+    assert caught.value.recoverable is False
+
+
+def test_a_session_that_may_still_come_back_does_not_count_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """还有关窗重开配额：阶梯还没走到头，下一轮再试有意义。
+
+    与上一条合起来是这次改动的两个方向——**两个都要钉**，只钉一边的话
+    「无条件豁免」和「一律硬失败」各有一半能溜过去。
+    """
+    loop, _keeper, _events = _loop(
+        monkeypatch,
+        [_outcome(ScreenState.UNKNOWN), _outcome(ScreenState.UNKNOWN)],
+        after_restart=ReconnectOutcome(
+            ScreenState.UNKNOWN, reconnected=False, detail="still unknown", restarts_left=2
+        ),
+    )
+
+    with pytest.raises(module.SessionUnavailable) as caught:
+        loop._ensure_session(force=True)
+
+    assert caught.value.recoverable is True
 
 
 def test_a_throttled_check_is_not_treated_as_a_failure(
