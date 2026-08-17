@@ -80,7 +80,12 @@ from evo_helper.domain.ranking import (
     is_bot_coordinate,
 )
 from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
-from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
+from evo_helper.domain.report_wait import (
+    MAX_REPORT_AGE,
+    REPORT_SCAN_HOURS_MAX,
+    ReportWaitPlanner,
+    WaitAction,
+)
 from evo_helper.domain.scheduler import (
     Action,
     Decision,
@@ -661,6 +666,14 @@ class MissionScheduler:
         返回 `None` 表示留空——那不是 0，是「跟着 `BLIND_SCROLLS` 的默认值走」。
         """
         return _blind_scrolls(value)
+
+    def validate_report_scan_hours(self, value: object) -> int | None:
+        """校验攻击配置页上那个「翻信箱时长」。同 `validate_blind_scrolls`：
+        页面在**写库之前**用调度器自己这把尺子量一遍。
+
+        返回 `None` 表示留空 = 跟着 `DEFAULT_REPORT_SCAN_FLOOR`（6 小时）走。
+        """
+        return _report_scan_hours(value)
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -2096,6 +2109,44 @@ def _blind_scrolls(value: object) -> int | None:
             "把榜首那批军力最高的 bot 整段跳过去。宁小勿大——拖少了只是多花几屏检测。"
         )
     return scrolls
+
+
+def _report_scan_hours(value: object) -> int | None:
+    """对账那一趟翻信箱最多往回读几个小时。**留空 = 用默认的 6 小时。**
+
+    用户口径（2026-08-17）：「可能我的希望是，不要读那么多，毕竟数量是大几百封」
+    「这个参数改为可配置，这样遇到活动我可以灵活调整」。
+
+    ⚠️ **0 不是合法取值，这一点与 `_blind_scrolls` 相反。** 那边的 0 是最保守的
+    一侧（多花几十次廉价检测）；这里的 0 意味着下界就是「此刻」，而信箱里每一封
+    都比此刻旧——于是对账那一趟**一封都翻不到**，还一声不响。留空才是「跟着默认
+    走」，0 只可能是手滑。
+
+    上界 `REPORT_SCAN_HOURS_MAX` 不是策略上的界，是**防手滑与防溢出**：
+    `now - timedelta(hours=值)` 在几十万年那个量级上会直接 `OverflowError`，
+    把一趟对账变成 traceback。「配多大才有意义」那条留在页面上说（超过 6 小时之后
+    多读回来的战报，对应的派遣早就掉出了 `due_attack_dispatches` 的追踪窗口，
+    救它们是 `--exhaustive` 补录的活），这里不拦。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_blind_scrolls` 那条）。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("翻信箱时长必须是整数小时；要用默认值就把它留空")
+    try:
+        hours = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"翻信箱时长不是整数：{value!r}") from exc
+    if isinstance(value, float) and hours != value:
+        raise MissionParamError(f"翻信箱时长必须是整数小时：{value!r}")
+    if hours < 1:
+        raise MissionParamError("翻信箱时长至少 1 小时；要用默认值就把它留空，别填 0")
+    if hours > REPORT_SCAN_HOURS_MAX:
+        raise MissionParamError(
+            f"翻信箱时长最多 {REPORT_SCAN_HOURS_MAX} 小时（{REPORT_SCAN_HOURS_MAX // 24} 天）；"
+            "要救更早的战报请用手动补录（那一条不受这个下限约束）。"
+        )
+    return hours
 
 
 def _smallest_limit(*limits: int | None) -> int | None:

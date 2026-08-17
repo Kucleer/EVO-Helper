@@ -382,6 +382,8 @@ class MilitaryAttackConfigView:
     tiers: tuple[dict[str, Any], ...]
     #: 军力榜盲拖屏数；`None` = 页面上留空 = 按实测自动标定。
     blind_scrolls: int | None = None
+    #: 对账那一趟翻信箱最多往回读几个小时；`None` = 页面上留空 = 默认 6 小时。
+    report_scan_hours: int | None = None
 
 
 @dataclass(frozen=True)

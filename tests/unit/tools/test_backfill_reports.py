@@ -53,11 +53,16 @@ class _Driver:
 
 
 class _Repository:
-    def __init__(self, *, due: Sequence[Coordinate] = ()) -> None:
+    def __init__(self, *, due: Sequence[Coordinate] = (), scan_hours: int | None = None) -> None:
         self.due = list(due)
+        self.scan_hours = scan_hours
 
     def due_attack_dispatches(self, target_kind: str, **_fields: Any) -> list[Any]:
         return [SimpleNamespace(target=target) for target in self.due]
+
+    def military_attack_config(self) -> Any:
+        """攻击配置页那一行。`scan_hours=None` = 页面上留空。"""
+        return SimpleNamespace(report_scan_hours=self.scan_hours)
 
 
 def _row(index: int, kind: ReportKind = ReportKind.PIRATE, *, at: datetime = NOON) -> MailRow:
@@ -212,7 +217,7 @@ def test_the_default_mode_stops_once_the_worklist_is_empty() -> None:
         ingest=ReportIngest.KNOWN,
     )
 
-    tally = loop.backfill_reports(not_before=DAY_START)
+    tally = loop.backfill_reports(not_before=DAY_START, now=NOON)
 
     assert opened == [0], "第一封就是库里已有的，单子又是空的，不该再往下开"
     assert tally.scan.opened == 1
@@ -230,7 +235,7 @@ def test_a_pending_worklist_keeps_the_default_mode_going() -> None:
         ingest=ReportIngest.KNOWN,
     )
 
-    loop.backfill_reports(not_before=DAY_START)
+    loop.backfill_reports(not_before=DAY_START, now=NOON)
 
     assert opened == [0, 1, 2, 3]
 
@@ -275,7 +280,7 @@ def test_the_budgets_reach_the_mailbox_scan() -> None:
     """传进来的预算要真的落到那一趟信箱上，而不是被默认值盖掉。"""
     loop, _opened, budgets = _loop([[_row(0)]])
 
-    loop.backfill_reports(not_before=DAY_START, max_pages=7, max_opens=5)
+    loop.backfill_reports(not_before=DAY_START, max_pages=7, max_opens=5, now=NOON)
 
     assert budgets["max_pages"] == 7
     assert budgets["max_opens"] == 5
@@ -289,7 +294,156 @@ def test_the_backfill_never_records_a_daily_reconciliation() -> None:
     """
     loop, _opened, _budgets = _loop([[_row(0)]])
 
-    loop.backfill_reports(not_before=DAY_START)  # 不抛异常即通过
+    loop.backfill_reports(not_before=DAY_START, now=NOON)  # 不抛异常即通过
+
+
+# -- 时间下限（攻击配置页可配） ----------------------------------------------
+#
+# 用户口径（2026-08-17）：活动期间信箱最上面堆着几百封活动战报，而库里最近一封
+# 战报停在好几天前，于是「撞见库里已有的那一封」这个早停迟迟不触发，对账那一趟
+# 把翻页预算整个烧满。「不要读那么多，毕竟数量是大几百封」「这个参数改为可配置，
+# 这样遇到活动我可以灵活调整」。
+
+
+def test_the_routine_pass_stops_at_rows_older_than_the_floor() -> None:
+    """对账翻到比下限更旧的那一行就收工——**断言实际读了几行**。
+
+    只断言「返回了结果」是测不出这条的：不设下限时它照样返回，只是多翻了几屏
+    几百封。所以这里数的是 `observed`（每一行都会经过它）与开封数。
+    """
+    loop, opened, _budgets = _loop(
+        [
+            # 前两行在 6 小时窗口内，第三行是 7 小时前的——列表按时间倒序，
+            # 翻到它就该收工，它后面那一行连开都不该开。
+            [
+                _row(0, at=NOON - timedelta(hours=1)),
+                _row(1, at=NOON - timedelta(hours=2)),
+                _row(2, at=NOON - timedelta(hours=7)),
+                _row(3, at=NOON - timedelta(hours=8)),
+            ],
+            [_row(0)],  # 不该翻到这一屏
+        ],
+        # 单子非空，所以「撞见库里已有的」那条早停在这一趟里不会触发——
+        # 停下来的只可能是时间下限。
+        repository=_Repository(due=[Coordinate(2, 56, 20)]),
+        ingest=ReportIngest.KNOWN,
+    )
+
+    tally = loop.backfill_reports(not_before=DAY_START, now=NOON)
+
+    assert opened == [0, 1], "7 小时前那两行不该开封"
+    assert tally.scan.pages == 1, "第一屏就该收工，第二屏一屏都不该翻"
+
+
+def test_an_unreadable_timestamp_never_triggers_the_early_stop() -> None:
+    """⚠️ **时间读不出来的行一律不早停。**（既有取舍，`MailRow.is_older_than`）
+
+    停错的代价是把还没翻到的战报永久判成「不在信箱里」；多翻一屏只花一两秒。
+    OCR 糊掉一行时间在实机上一点都不罕见。
+    """
+    blind = MailRow(
+        index=1,
+        subject="海盗攻击报告",
+        raw_time_text=None,
+        reported_at_utc=None,
+        kind=ReportKind.PIRATE,
+    )
+    loop, opened, _budgets = _loop(
+        [[_row(0, at=NOON - timedelta(hours=1)), blind, _row(2, at=NOON - timedelta(hours=2))]],
+        repository=_Repository(due=[Coordinate(2, 56, 20)]),
+        ingest=ReportIngest.KNOWN,
+    )
+
+    loop.backfill_reports(not_before=DAY_START, now=NOON)
+
+    assert opened == [0, 1, 2], "读不出时间的那一行不该把整趟停在半路"
+
+
+def test_an_empty_setting_falls_back_to_six_hours() -> None:
+    """留空 = 6 小时。**钉死具体数字**，不去引那个常量。
+
+    断言 `floor == now - DEFAULT_REPORT_SCAN_FLOOR` 的话，把默认值改成 0 小时
+    （＝一封都翻不到）这条用例照样绿。
+    """
+    loop, _opened, budgets = _loop([[_row(0)]], repository=_Repository(scan_hours=None))
+
+    loop.backfill_reports(not_before=None, now=NOON)
+
+    assert budgets["not_before"] == NOON - timedelta(hours=6)
+
+
+def test_a_configured_setting_wins_over_the_default() -> None:
+    """配了 N 小时就按 N 小时停。活动期间用户要调的正是这个数。"""
+    loop, _opened, budgets = _loop([[_row(0)]], repository=_Repository(scan_hours=2))
+
+    loop.backfill_reports(not_before=None, now=NOON)
+
+    assert budgets["not_before"] == NOON - timedelta(hours=2)
+
+
+def test_the_floor_only_ever_tightens_the_since_date() -> None:
+    """`--since` 是硬下界，这道下限只让它更紧，绝不把它顶开。
+
+    反过来（取更早的那个）会让一个配大了的时长翻到用户根本没要的日期去。
+    """
+    loop, _opened, budgets = _loop([[_row(0)]], repository=_Repository(scan_hours=240))
+
+    loop.backfill_reports(not_before=NOON - timedelta(hours=3), now=NOON)
+
+    assert budgets["not_before"] == NOON - timedelta(hours=3)
+
+
+def test_a_missing_configuration_row_falls_back_instead_of_failing() -> None:
+    """老库、或者 `ensure_mission_rows()` 还没跑：当成留空，别把整趟对账停掉。"""
+    repository = _Repository()
+    repository.military_attack_config = _raise_not_initialised  # type: ignore[method-assign]
+    loop, _opened, budgets = _loop([[_row(0)]], repository=repository)
+
+    loop.backfill_reports(not_before=None, now=NOON)
+
+    assert budgets["not_before"] == NOON - timedelta(hours=6)
+
+
+@pytest.mark.parametrize("stored", [0, -3, True, "两小时", None])
+def test_a_nonsense_stored_value_falls_back_to_the_default(stored: object) -> None:
+    """库里那个值也要复核：0 / 负数 / 不是整数一律当留空。
+
+    页面那把尺子管不到直接改库的人，而下界落在「此刻」之后的后果是**一封都翻不到，
+    还一声不响**。
+    """
+    loop, _opened, budgets = _loop(
+        [[_row(0)]],
+        repository=_Repository(scan_hours=stored),  # type: ignore[arg-type]
+    )
+
+    loop.backfill_reports(not_before=None, now=NOON)
+
+    assert budgets["not_before"] == NOON - timedelta(hours=6)
+
+
+def test_the_exhaustive_backfill_is_never_touched_by_the_floor() -> None:
+    """⚠️⚠️ **本次改动最要紧的一条。**
+
+    `--exhaustive` 手动补录存在的唯一理由，就是够到那些早就掉出追踪窗口的历史
+    战报。下限要是也作用在它身上，这个入口就被悄悄废掉了——**而且不报错**：
+    用户会看到一趟「完成」的补录和一句「读通 0 份」，然后以为信箱里真的没有。
+    """
+    loop, opened, budgets = _loop(
+        # 配一个极紧的下限（1 小时），而这几封都是几小时前的：对账那一档到这里
+        # 一封都开不了，补录必须照开不误（它们仍在 `--since` 之内）。
+        [[_row(index, at=NOON - timedelta(hours=2 + index)) for index in range(4)]],
+        repository=_Repository(due=[], scan_hours=1),
+        ingest=ReportIngest.KNOWN,
+    )
+
+    loop.backfill_reports(not_before=DAY_START, exhaustive=True, now=NOON)
+
+    assert budgets["not_before"] == DAY_START, "补录的下界只能是 --since 那一个"
+    assert opened == [0, 1, 2, 3], "配置页上那个框不许够到补录"
+
+
+def _raise_not_initialised() -> Any:
+    raise ValueError("military_attack_config 还没初始化；先调 ensure_mission_rows()")
 
 
 # -- 摘要 --------------------------------------------------------------------
