@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1054,11 +1055,13 @@ class SqlAlchemyRepository:
         """
         floor = _require_utc(since, "since")
         with self._session_factory() as session:
-            dispatched = func.date(orm.AttackDispatchRow.dispatched_at_utc)
-            per_day = {
-                str(day): int(count)
-                for day, count in session.execute(
-                    select(dispatched, func.count())
+            # 切日在 Python 里做，不在 SQL 里做——理由见 `_utc_day`。窗口是
+            # `quota_day_start_utc(now)` 起的一个 UTC 日，行数是当天派出的发数，
+            # 拉回来自己数不值得心疼。
+            per_day = Counter(
+                _utc_day(dispatched)
+                for dispatched in session.scalars(
+                    select(orm.AttackDispatchRow.dispatched_at_utc)
                     .select_from(orm.AttackDispatchRow)
                     .join(
                         orm.AttackIntentRow,
@@ -1070,9 +1073,8 @@ class SqlAlchemyRepository:
                         orm.AttackDispatchRow.accepted.is_(True),
                         orm.AttackDispatchRow.dispatched_at_utc >= floor,
                     )
-                    .group_by(dispatched)
-                ).all()
-            }
+                )
+            )
             observed = {
                 str(day): int(count)
                 for day, count in session.execute(
@@ -2566,6 +2568,23 @@ def _bot_target_for(session: Session, coordinate: Coordinate) -> orm.BotTargetRo
     )
 
 
+def _utc_day(moment: datetime) -> str:
+    """一个时刻属于哪个 **UTC** 日，写成 `YYYY-MM-DD`。
+
+    ⚠️ **这件事刻意不在 SQL 里做。** 原来两处都是 `func.date(dispatched_at_utc)`：
+
+    - SQLite 上那一列存的就是 UTC 挂钟字符串，`date()` 切出来正好是 UTC 日；
+    - Postgres 上那一列是 `TIMESTAMPTZ`，`date()` 按**会话时区**换算。服务器时区
+      是 UTC+8 时，UTC 8/10 23:55 派出的那一发会被切成 8/11——海盗每天 32 次的
+      日界整体挪 8 小时。它不报错，只是把昨天的发数算进今天：配额提前打满，
+      或者跨过零点之后接着打、直到游戏把攻击强制返回。
+
+    `daily_reconciliations.day_utc` 存的是 UTC 日的字符串，两边要对得上，所以这里
+    统一按 UTC 切。列都走 `UTCDateTime`，读出来一定是 aware 的 UTC。
+    """
+    return _require_utc(moment, "moment").strftime("%Y-%m-%d")
+
+
 def _daily_status(row: orm.DailyReconciliationRow) -> DailyAttackStatus:
     return DailyAttackStatus(
         day_utc=row.day_utc,
@@ -2585,7 +2604,10 @@ def _accepted_attacks_on(session: Session, target_kind: str, *, day: str) -> int
     口径与 `count_dispatches_since` 里那半段逐字一致：`accepted` + 只数
     `MISSION_KIND_ATTACK`。侦察也是打向海盗的，不排掉的话一轮 4 发侦察就吃掉
     4 次攻击额度，当天 32 次以 4 倍速度静默消失。
+
+    切日用的是**半开区间**而不是 `date(dispatched_at_utc) = day`，理由见 `_utc_day`。
     """
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC)
     return int(
         session.scalar(
             select(func.count())
@@ -2595,7 +2617,8 @@ def _accepted_attacks_on(session: Session, target_kind: str, *, day: str) -> int
                 orm.AttackIntentRow.target_kind == target_kind,
                 orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                 orm.AttackDispatchRow.accepted.is_(True),
-                func.date(orm.AttackDispatchRow.dispatched_at_utc) == day,
+                orm.AttackDispatchRow.dispatched_at_utc >= start,
+                orm.AttackDispatchRow.dispatched_at_utc < start + timedelta(days=1),
             )
         )
         or 0

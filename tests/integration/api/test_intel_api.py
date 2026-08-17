@@ -12,6 +12,7 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 BASE_TIME = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -25,7 +26,7 @@ def and_group(*children: dict[str, object]) -> dict[str, object]:
 
 @pytest.fixture
 def client(tmp_path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'api.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "api.db"))
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
     _seed(session_factory)

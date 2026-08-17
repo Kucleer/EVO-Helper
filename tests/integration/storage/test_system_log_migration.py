@@ -17,6 +17,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 
 from alembic import command
+from support.database import scratch_database_url
 
 REVISION = "a7f2c9d40b16"
 DOWN_REVISION = "fa1c3d4e5f67"
@@ -33,7 +34,7 @@ def _config(database_url: str) -> Config:
 
 @pytest.fixture
 def database_url(tmp_path: Path) -> str:
-    return f"sqlite:///{tmp_path / 'migration.db'}"
+    return scratch_database_url(tmp_path, "migration.db")
 
 
 def test_upgrade_creates_the_table_with_its_four_indexes(database_url: str) -> None:

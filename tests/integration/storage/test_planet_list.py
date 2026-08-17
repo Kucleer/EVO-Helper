@@ -16,6 +16,7 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import PLANET_KINDS, planet_kind
+from support.database import scratch_database_url
 
 SCANNED = datetime(2026, 8, 8, tzinfo=UTC)
 
@@ -35,7 +36,7 @@ PLANETS = [
 
 @pytest.fixture
 def service(tmp_path: Path) -> PersistentApplicationService:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'planets.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "planets.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     with factory() as session:
