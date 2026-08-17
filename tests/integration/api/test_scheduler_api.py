@@ -341,6 +341,44 @@ def test_the_bot_row_echoes_how_many_bots_the_range_holds(console: Console) -> N
     assert "1" in summary
 
 
+def test_the_range_bot_row_reports_how_many_of_this_round_are_left(console: Console) -> None:
+    """范围模式下这个数是真的本轮进度：范围里那几个目标，还有几个没走完。
+
+    与下一条成对——改坏「军力模式不报数」时，这条要保持绿，否则说明连范围模式
+    那句对的话也一起删掉了。
+    """
+    _seed_bot(console.repository, Coordinate(2, 150, 5))
+    console.patch(
+        "BOT",
+        {"params": {"galaxy": 2, "first_system": 100, "last_system": 200}, "enabled": True},
+    )
+
+    assert console.task("BOT")["detail"] == "还剩 1 个未完成"
+
+
+def test_the_military_bot_row_never_claims_a_round_progress(console: Console) -> None:
+    """军力优先模式下不报「还剩 N 个未完成」——那个 N 不是本轮进度。
+
+    军力模式没有「本轮范围」：`targets_remaining` 走的是 `_military_candidates`，
+    数的是**全库**还能打的 bot（排除近 24 小时打过的），实机两千多个，而任务
+    每轮只取前 `top_n` 名。把它写成「还剩 N 个未完成」，用户会当成本轮进度盯着
+    它往下走，可两个数从来对不上。用户口径 2026-08-17：「那个剩余 2098 就不需要
+    显示」。
+
+    这里断言的是**整句为空**而不是「不含某个数字」：后者用「还剩 2 个未完成」
+    照样能过（2 这个数字它不找），等于什么都没验。
+    """
+    _seed_bot(console.repository, Coordinate(2, 150, 5))
+    _seed_bot(console.repository, Coordinate(2, 151, 6))
+    console.patch("BOT", {"params": {"by_military": True, "top_n": 1}, "enabled": True})
+
+    row = console.task("BOT")
+    # 先确认它真的在参与调度：状态是「未启用」的话，`_detail` 早在 BOT 那一档
+    # 之前就返回空串了，这条用例会因为一个完全无关的原因变绿。
+    assert row["status"] != "未启用"
+    assert row["detail"] == ""
+
+
 # -- 开始 / 结束 -----------------------------------------------------------------
 
 

@@ -195,11 +195,21 @@ DISPATCH_STATE_GLYPHS: dict[str, str] = {
 #:
 #: 认不出来的 outcome **原样显示**，不拿「不是胜就是负」兜底：库里存的是画面
 #: 原文，将来多一档会被静默显示成败仗（`logs.html` 上同一条取舍）。
+#: `NO_REPORT`（无战报）是**终态，不是告警**，所以它不上色。
+#:
+#: 它说的是「这一发的战报永远不会来了」（判据见 `intel.RESULT_NO_REPORT`）。
+#: 用户手动撤回舰队之后就会留下这样一行——账要留着，但它已经没有下一步了，
+#: 而 `warn` 的含义是「有件事等着人去处理」。继续挂黄的话，那一行会一直亮着，
+#: 一个消不掉的告警最后只会让人连真正要看的那些也一并忽略。
+#:
+#: 与 `AWAITING` 分开而不是并档：`AWAITING` 是**还在等**，那才是「等着人回来收」
+#: 的意思，黄色在它身上是对的。
 BATTLE_RESULT_LABELS: dict[str, str] = {
     "VICTORY": "胜",
     "FAIL": "负",
     "DRAW": "平",
     "AWAITING": "待战报",
+    "NO_REPORT": "无战报",
     "NONE": "不适用",
 }
 
@@ -208,6 +218,7 @@ BATTLE_RESULT_TONES: dict[str, str] = {
     "FAIL": "danger",
     "DRAW": "",
     "AWAITING": "warn",
+    "NO_REPORT": "",
     "NONE": "",
 }
 
@@ -216,6 +227,7 @@ BATTLE_RESULT_GLYPHS: dict[str, str] = {
     "FAIL": "✕",
     "DRAW": "＝",
     "AWAITING": "🕗",
+    "NO_REPORT": "∅",
     "NONE": "—",
 }
 
