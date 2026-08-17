@@ -139,10 +139,20 @@
           <td class="muted">
             {{ row.mission_kind or '—' }}{% if row.task_id %} #{{ row.task_id }}{% endif %}
           </td>
-          <td>
-            {{ row.message }}
-            {% if row.payload_json and row.payload_json != '{}' %}
-              <br><span class="muted" style="font-size:12px">{{ row.payload_json }}</span>
+          {# 限宽 + hover 展开：`payload_json` 动辄几千字符，原样铺开会把整页
+             宽度撑到横向滚动条拉不到头（用户报 2026-08-17）。默认截断，鼠标
+             停在这一行上才展开全文。 #}
+          <td class="log-body">
+            <div class="log-line">{{ row.message }}</div>
+            {% set detail = payload_text(row.payload_json) %}
+            {% if detail %}
+              <div class="log-line muted" style="font-size:12px">{{ detail }}</div>
+            {% endif %}
+            {% set shot = payload_image(row.payload_json) %}
+            {% if shot %}
+              {# 那张 base64 缩略图是**证据本身**，以文字显示对谁都没用。
+                 缩成一小张，hover 放大——查「画面认不出」时它比任何文字都直接。 #}
+              <img class="log-shot" src="{{ shot }}" alt="出事那一刻的画面" loading="lazy">
             {% endif %}
           </td>
         </tr>

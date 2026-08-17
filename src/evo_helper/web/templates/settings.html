@@ -22,10 +22,11 @@
   <p class="muted">
     ⚠️ <strong>宁小勿大。</strong>填小了只是多花几屏检测（一屏约 0.3 秒），代价极小；
     填大了会<strong>拖过 bot 起点</strong>，把榜首那批军力最高的 bot 整段跳过去——而采回来的数只会静悄悄少一截，页面上完全看不出来。
-    上限 {{ blind_scrolls_max }} 屏（= 已记录的最小实测屏数减余量）。
+    参考：已记录的最小实测屏数减余量是 {{ blind_scrolls_max }} 屏——这只是**观测下界**，不是上限。
+    榜会随玩家增加变长，实测值也在涨，所以这里<strong>不拦</strong>更大的值，由你判断。
   </p>
   <div class="filter-bar" style="margin-top:10px">
-    <input id="blind-scrolls" type="number" min="0" max="{{ blind_scrolls_max }}" step="1"
+    <input id="blind-scrolls" type="number" min="0" step="1"
            placeholder="留空 = 自动标定" aria-label="军力榜盲拖屏数">
     <button class="btn primary small" type="button" id="btn-save-blind">保存盲拖屏数</button>
   </div>

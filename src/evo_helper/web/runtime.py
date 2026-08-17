@@ -27,9 +27,25 @@ from .app import create_persistent_app
 def create_runtime_app(
     settings: Settings | None = None, *, local_token: str | None = None
 ) -> FastAPI:
-    """Apply schema migrations and build the real local management service."""
+    """建出真正的控制台 app。**这里不跑迁移。**
+
+    ⚠️ **迁移只在 `main()` 里跑，也就是只在 bat 真正启动服务的那条路上。**
+
+    这个函数以前顺手跑了 `alembic upgrade head`，于是**任何人只要构造一次 app
+    就会静默升级它连到的那个库**——写个脚本渲染页面、跑个诊断、在 REPL 里看一眼，
+    都算。2026-08-17 我就是这么在**生产库**上跑掉了七条迁移：当时只是想渲染
+    `/system-log` 看一个翻页 bug，全程没有任何提示。
+
+    这件事的严重性不在版本号对不对，而在**schema 变更回退不了**：代码能回滚，
+    已经改过的表回不去。而那次操作既没有备份、也没有经过用户同意。
+
+    用户口径（2026-08-17）：迁移由生产自己升——「开发过程中不要影响生产环境，
+    但是生产环境重新执行 bat 后会执行数据库表结构最新修改」。`main()` 就是
+    「重新执行 bat」那条路，所以判据放在那里才对得上这句话。
+
+    把闸门挪到 `main()`，是把「靠人记住别用错函数」换成「用错也不出事」。
+    """
     actual_settings = settings or Settings()
-    _upgrade_database(actual_settings.database_url)
     engine = create_database_engine(actual_settings.database_url)
     session_factory = create_session_factory(engine)
     # 系统日志：出口 + 标准库桥 + 保留期清理，三件都只在**真实进程**里做。
@@ -91,10 +107,17 @@ def announce(settings: Settings) -> list[str]:
 
 
 def main() -> int:
-    """Start the local service on the configured interface."""
+    """Start the local service on the configured interface.
+
+    ⚠️ **迁移在这里跑，而且只在这里。** 这是 bat 启动服务那条路——用户口径
+    （2026-08-17）：「生产环境重新执行 bat 后会执行数据库表结构最新修改」。
+    别把它挪回 `create_runtime_app`：那样任何构造一次 app 的代码都会静默
+    升级生产库，理由见那个函数的说明。
+    """
     settings = Settings()
     for line in announce(settings):
         print(line)
+    _upgrade_database(settings.database_url)
     uvicorn.run(create_runtime_app(settings), host=settings.host, port=settings.port)
     return 0
 

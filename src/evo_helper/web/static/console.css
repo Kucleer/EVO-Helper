@@ -424,3 +424,29 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
   .sidenav a { border-left: none; border-bottom: 2px solid transparent; }
   .sidenav a[aria-current="page"] { border-bottom-color: var(--accent); }
 }
+
+/* 系统日志的正文列：默认限宽截断，鼠标停在那一行才展开。
+   payload 动辄几千字符（还夹着 base64 图），原样铺开会把整页宽度撑到
+   横向滚动条拉不到头——用户 2026-08-17 报的就是这个。 */
+.log-body { max-width: 46vw; }
+.log-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 展开只在悬停那一行发生：整列常驻展开会让每行高度不一，扫读时更难找。 */
+tr:hover .log-line {
+  white-space: pre-wrap;
+  overflow: visible;
+  word-break: break-word;
+}
+/* 出事那一刻的画面。缩略图本身就是 480px 宽，这里再缩一道，hover 放大。 */
+.log-shot {
+  display: block;
+  margin-top: 6px;
+  width: 120px;
+  border-radius: 4px;
+  opacity: 0.75;
+  transition: width 0.15s ease, opacity 0.15s ease;
+}
+tr:hover .log-shot { width: 480px; opacity: 1; }

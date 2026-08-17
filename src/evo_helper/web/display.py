@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from evo_helper.application.backfill import BACKFILL_KINDS, BackfillPhase
 from evo_helper.domain.records import TARGET_KIND_LABELS, BattleResourceEntry
 from evo_helper.domain.scheduler import TaskStatus
@@ -358,3 +360,49 @@ def resource_precision_hint(entry: BattleResourceEntry) -> str:
     if not entry.approximate:
         return "精确读数"
     return f"画面上是缩写显示的，误差不超过 ±{entry.uncertainty:,}"
+
+
+#: `payload_json` 里这些键装的是 base64 图，**不能当文字显示**。
+#:
+#: ⚠️ 一张 480px 缩略图的 base64 有几万字符。原样塞进表格那一列，整页宽度会被
+#: 它撑到几十屏、横向滚动条永远拉不到头（实机 2026-08-17 用户报的就是这个），
+#: 而那串字符对读日志的人**没有任何用处**——有用的是那张图本身。
+#: 所以从正文里摘出来，另行渲染成图。
+_IMAGE_PAYLOAD_KEYS = ("thumbnail_png_base64",)
+
+
+def payload_text(payload_json: str | None) -> str:
+    """`payload_json` 去掉图之后的部分，给表格那一列显示。
+
+    整段解析不出来就原样返回——诊断数据宁可显示得难看，也不要因为格式不对
+    而**整条消失**：查故障时最需要它的那一刻，往往正是它写坏了的那一刻。
+    """
+    if not payload_json or payload_json == "{}":
+        return ""
+    try:
+        data = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return payload_json
+    if not isinstance(data, dict):
+        return payload_json
+    kept = {k: v for k, v in data.items() if k not in _IMAGE_PAYLOAD_KEYS}
+    if not kept:
+        return ""
+    return json.dumps(kept, ensure_ascii=False)
+
+
+def payload_image(payload_json: str | None) -> str:
+    """`payload_json` 里那张 base64 图，可以直接当 `src` 用；没有就返回空串。"""
+    if not payload_json or payload_json == "{}":
+        return ""
+    try:
+        data = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in _IMAGE_PAYLOAD_KEYS:
+        raw = data.get(key)
+        if isinstance(raw, str) and raw:
+            return f"data:image/png;base64,{raw}"
+    return ""

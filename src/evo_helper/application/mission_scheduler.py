@@ -117,7 +117,6 @@ from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
     BLIND_SCROLL_SAMPLES,
     BLIND_SCROLLS,
-    BLIND_SCROLLS_MAX,
 )
 from evo_helper.infrastructure.system_log import (
     child_environment,
@@ -2382,9 +2381,15 @@ def _blind_scrolls(value: object) -> int | None:
     **最保守**的取值（多花几十次廉价检测，绝不可能拖过头），所以它必须放行，
     而不是像 `bot_limit` 那个 0 一样当成「把链路关掉」而拒绝。
 
-    上界是 `BLIND_SCROLLS_MAX`(48)：再往上就证不出「盲拖那一段够不到 bot 起点」
-    了（见 `game.ranking_ui` 上那几条）。越界当场拒掉——这个值调大的代价是
-    **静悄悄少采一截**，页面上和日志里都看不出异常，不能靠用户自己发现。
+    ⚠️ **不设上界**（用户口径 2026-08-17：「不需要这个限制」）。
+
+    这里曾经拒掉大于 `BLIND_SCROLLS_MAX` 的值，理由是「再往上就证不出盲拖那一段
+    够不到 bot 起点」。那个上界是从**已记录的最小实测屏数减余量**推出来的——
+    也就是说它只反映**我们碰巧量到过什么**，不是游戏的事实。榜会随玩家增加变长，
+    实测值也在涨，把一个观测下界当成硬闸门，结果就是用户明明知道该填 70 却填不进去。
+
+    调大的代价仍然是真的（拖过 bot 起点会**静悄悄少采一截**，页面和日志都看不出），
+    所以那句警告留在界面上；但它是**提示**，不是拦路。
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
@@ -2400,11 +2405,6 @@ def _blind_scrolls(value: object) -> int | None:
         raise MissionParamError(f"盲拖屏数必须是整数：{value!r}")
     if scrolls < 0:
         raise MissionParamError("盲拖屏数不能是负数；要用默认值就把它留空")
-    if scrolls > BLIND_SCROLLS_MAX:
-        raise MissionParamError(
-            f"盲拖屏数最多 {BLIND_SCROLLS_MAX} 屏：再多就可能拖过 bot 起点，"
-            "把榜首那批军力最高的 bot 整段跳过去。宁小勿大——拖少了只是多花几屏检测。"
-        )
     return scrolls
 
 

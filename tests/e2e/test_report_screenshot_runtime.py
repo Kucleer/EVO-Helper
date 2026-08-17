@@ -18,7 +18,7 @@ from evo_helper.infrastructure.system_log import shutdown_system_log_sink
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
-from evo_helper.web.runtime import create_runtime_app
+from evo_helper.web.runtime import _upgrade_database, create_runtime_app
 
 PIXELS = b"RIFF\x00\x00\x00\x00WEBPVP8 fake-bytes"
 
@@ -50,12 +50,14 @@ def _seed(session_factory, *, days_ago: int) -> UUID:  # type: ignore[no-untyped
 def test_startup_purges_screenshots_past_the_retention_window(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'shot-retention.db'}"
     # 先起一次把表（含迁移）建出来，才能在下一次启动之前塞进旧行。
+    _upgrade_database(database_url)
     create_runtime_app(Settings(database_url=database_url), local_token="t")
     shutdown_system_log_sink()
     session_factory = create_session_factory(create_database_engine(database_url))
     old = _seed(session_factory, days_ago=31)
     fresh = _seed(session_factory, days_ago=1)
 
+    _upgrade_database(database_url)
     create_runtime_app(
         Settings(database_url=database_url, report_screenshot_retention_days=30), local_token="t"
     )
@@ -69,11 +71,13 @@ def test_startup_purges_screenshots_past_the_retention_window(tmp_path: Path) ->
 def test_zero_retention_keeps_every_screenshot(tmp_path: Path) -> None:
     """0 是「不清理」，不是「全删」。判据与 `system_log` 那一侧共用一套。"""
     database_url = f"sqlite:///{tmp_path / 'shot-retention-off.db'}"
+    _upgrade_database(database_url)
     create_runtime_app(Settings(database_url=database_url), local_token="t")
     shutdown_system_log_sink()
     session_factory = create_session_factory(create_database_engine(database_url))
     ancient = _seed(session_factory, days_ago=900)
 
+    _upgrade_database(database_url)
     create_runtime_app(
         Settings(database_url=database_url, report_screenshot_retention_days=0), local_token="t"
     )
@@ -89,6 +93,7 @@ def test_the_migration_creates_the_table(tmp_path: Path) -> None:
     永远是绿的，只在实机上炸。
     """
     database_url = f"sqlite:///{tmp_path / 'shot-migrated.db'}"
+    _upgrade_database(database_url)
     create_runtime_app(Settings(database_url=database_url), local_token="t")
     shutdown_system_log_sink()
     session_factory = create_session_factory(create_database_engine(database_url))
