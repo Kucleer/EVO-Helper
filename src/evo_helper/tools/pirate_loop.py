@@ -3090,10 +3090,100 @@ def rematch_note(repository: Any, target: Coordinate, reported_at: datetime) -> 
     它们永远不会被重新读一遍。所以要在这里主动重认一次。
 
     不重开邮件、不重读像素，只是拿现在的判据把旧行重算一遍：一次本地写库。
+
+    ## 这一句话必须说清「库里那一行是谁」
+
+    ⚠️ 原先这条路只有两种输出：补认上了说一句，没补上就**什么都不说**。于是实机
+    日志里只剩一句「这份战报（17/08/2026 09:05:46）已经在库里；不重复入库」，
+    而攻击日志页上同一个坐标 4:480:6 还挂着「待战报」——用户看到的是两条自相
+    矛盾的记录（2026-08-17 报障）。
+
+    真相是**没有矛盾**：库里那一行 `match_status='UNMATCHED'`，它不属于页面上
+    那一发；页面那一发派于 08-15 22:13，战报早在信箱停摆的那 44 小时里过期了。
+    可这句话当时说不出口，因为日志既没说库里那一行是哪一条、也没说它认没认上
+    派遣——「跳过入库」听上去就像「跳过了一次认领机会」。**日志少说一句，
+    故障就得连生产库才查得清。**
+
+    所以现在三档都要说出来，并把结构化证据落进 `system_log`：
+
+    - 补认上了：说补上了、认的是哪一发（派出时刻）。
+    - 本来就认领着：说它认的是哪一发——这一句才排除了「跳过害得它没认上」。
+    - 至今没认领：**明说 `UNMATCHED`**，并点破它不会出现在攻击日志的战果列上。
+
+    **不限流。** 这条路一份战报每趟最多走一次（撞见「库里已有」之后 `_ingest_report`
+    就返回了），不是每 tick 都可能触发的那一类。
     """
-    if repository.rematch_report_at(target, reported_at):
-        return "；这一份原先没认上派遣，刚补认上了"
-    return ""
+    before = _report_claims(repository, target, reported_at)
+    rematched = bool(repository.rematch_report_at(target, reported_at))
+    after = _report_claims(repository, target, reported_at) if rematched else before
+    claimed = [claim for claim in after if claim.dispatch_id is not None]
+    unclaimed = [claim for claim in after if claim.dispatch_id is None]
+    record_system_log(
+        "INFO",
+        "tools.report_ingest",
+        f"{target} 的战报（{reported_at:%Y-%m-%d %H:%M:%S} UTC）库里已有，不重复入库",
+        payload={
+            "target": str(target),
+            "reported_at_utc": reported_at.isoformat(),
+            "rematched": rematched,
+            "rows": [
+                {
+                    "report_id": str(claim.report_id),
+                    "match_status": claim.match_status,
+                    "dispatch_id": None if claim.dispatch_id is None else str(claim.dispatch_id),
+                    "dispatched_at_utc": (
+                        None
+                        if claim.dispatched_at_utc is None
+                        else claim.dispatched_at_utc.isoformat()
+                    ),
+                }
+                for claim in after
+            ],
+            # 认领与否是**跳过入库之前就定下的**，这一次跳过并没有改变它。
+            # 带上「之前」那一份，是为了让「跳过害得它没认上」这个猜想当场被排除。
+            "claimed_before_skip": sum(1 for claim in before if claim.dispatch_id is not None),
+        },
+    )
+    if not after:
+        # 查不到行：只可能是那份战报刚被别的进程删了、或者仓库对象是个不认得
+        # `report_claims_at` 的替身。不猜，照实说。
+        return ""
+    if rematched:
+        return f"；这一份原先没认上派遣，刚补认上了（{_claim_note(claimed)}）"
+    if claimed:
+        return f"；库里那一份认的是{_claim_note(claimed)}"
+    statuses = "/".join(sorted({claim.match_status or "?" for claim in unclaimed}))
+    return f"；⚠️ 库里那一份至今没认领任何派遣（{statuses}），它的战果不会出现在攻击日志上"
+
+
+def _report_claims(repository: Any, target: Coordinate, reported_at: datetime) -> tuple[Any, ...]:
+    """库里那几行战报的认领状态；仓库替身不认得这个方法时退回空元组。
+
+    ⚠️ **不许让它把这一趟弄死。** 这是一条纯诊断查询，而调用它的地方正夹在
+    「读完战报」与「决定还要不要往下开封」之间——一个 `AttributeError` 漏出去
+    就是把「战报读不回来」那个故障重新造一遍，只是换了个成因
+    （先例见 `_store_report_screenshot`）。
+    """
+    reader = getattr(repository, "report_claims_at", None)
+    if reader is None:
+        return ()
+    try:
+        return tuple(reader(target, reported_at))
+    except Exception as error:  # noqa: BLE001 - 见 docstring：诊断路径不许拖累主路径
+        say(f"  查不到库里那一份战报的认领状态（{error}）；不影响判据")
+        return ()
+
+
+def _claim_note(claims: Sequence[Any]) -> str:
+    """把认领到的那几发写成人话：排障要对的是**派出时刻**，不是 UUID。"""
+    if not claims:
+        return "某一发派遣"
+    return "、".join(
+        "派出时刻未知"
+        if claim.dispatched_at_utc is None
+        else f"{claim.dispatched_at_utc:%m-%d %H:%M:%S} UTC 派出的那一发"
+        for claim in claims
+    )
 
 
 def _coordinate_order(coordinate: Coordinate) -> tuple[int, int, int]:
