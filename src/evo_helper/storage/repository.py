@@ -2169,13 +2169,18 @@ class SqlAlchemyRepository:
             return row
 
     def replace_military_attack_tiers(
-        self, tiers_json: str, *, blind_scrolls: int | None = None
+        self,
+        tiers_json: str,
+        *,
+        blind_scrolls: int | None = None,
+        report_scan_hours: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
-        `blind_scrolls` 的 `None` 是**「留空」这个取值本身**，不是「这次不改」：
-        这条接口和 `PUT /api/attack-config` 一样是整份替换，写进去的就是页面上
-        当下那一份。想「只改档位、不动盲拖」得把盲拖的现值一起送上来。
+        `blind_scrolls` / `report_scan_hours` 的 `None` 是**「留空」这个取值本身**，
+        不是「这次不改」：这条接口和 `PUT /api/attack-config` 一样是整份替换，
+        写进去的就是页面上当下那一份。想「只改档位、不动其余两项」得把它们的现值
+        一起送上来。
         """
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
@@ -2184,6 +2189,7 @@ class SqlAlchemyRepository:
                 session.add(row)
             row.tiers_json = tiers_json
             row.blind_scrolls = blind_scrolls
+            row.report_scan_hours = report_scan_hours
             session.commit()
             session.refresh(row)
             return row
