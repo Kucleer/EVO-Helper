@@ -108,6 +108,7 @@ from evo_helper.tools.scan_coordinates import (
     LiveDriver,
     make_console_encoding_safe,
     make_ocr,
+    run_with_foreground_guard,
     say,
 )
 from evo_helper.vision.parsers import ReportKind
@@ -489,18 +490,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     say(f"模式：{mode}；目标 {listed}")
 
-    driver = LiveDriver(allow_actions=args.attack)
-    driver.window()
-    outcome = BotLoop(driver, make_ocr(), options).run()
-    say(
-        f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
-        f"拦下 {len(outcome.refused)} 次"
-    )
-    for coordinate, reason in outcome.refused:
-        say(f"  [拦下] {coordinate} {reason}")
-    # 退出码与海盗那条共用一份判据（`exit_code_for`）：切不到出发星球时两边都要
-    # 报 `EXIT_ENVIRONMENT_BUSY`，各写一份迟早分家。
-    return exit_code_for(outcome)
+    def go() -> int:
+        driver = LiveDriver(allow_actions=args.attack)
+        driver.window()
+        outcome = BotLoop(driver, make_ocr(), options).run()
+        say(
+            f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
+            f"拦下 {len(outcome.refused)} 次"
+        )
+        for coordinate, reason in outcome.refused:
+            say(f"  [拦下] {coordinate} {reason}")
+        # 退出码与海盗那条共用一份判据（`exit_code_for`）：切不到出发星球时两边都要
+        # 报 `EXIT_ENVIRONMENT_BUSY`，各写一份迟早分家。
+        return exit_code_for(outcome)
+
+    return run_with_foreground_guard(go)
 
 
 __all__ = ["BotLoop", "BotOptions", "main"]

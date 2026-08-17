@@ -2422,9 +2422,11 @@ class SqlAlchemyRepository:
             row = _mission_task(session, task_id)
             row.consecutive_failures += 1
             if row.consecutive_failures >= limit and row.disabled_reason is None:
-                row.disabled_reason = (
-                    f"连续 {row.consecutive_failures} 次异常退出（退出码 {exit_code}）"
-                )
+                # 退出码可能为 None：停顿看门狗掐掉的那一档是我们自己动的手，
+                # 收不到 runner 的表态（见 `MissionSupervisor.stop`）。
+                # 写「未知」而不是 None，那一行是要给用户看的。
+                code = "未知" if exit_code is None else str(exit_code)
+                row.disabled_reason = f"连续 {row.consecutive_failures} 次异常退出（退出码 {code}）"
             failures = row.consecutive_failures
             row.updated_at_utc = datetime.now(UTC)
             session.commit()

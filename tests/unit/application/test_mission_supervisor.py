@@ -223,9 +223,8 @@ def test_a_crash_counts_as_a_failure() -> None:
 def test_being_stopped_by_us_is_never_a_failure() -> None:
     """抢占、用户点停、控制台关闭：我们自己动的手，任务本身没毛病。
 
-    实机 2026-08-11 01:16–01:32 扫描被抢占了 7 次（`terminate()` 之后退出码
-    照样是 1）。算进去的话，最该一直有活干、也最容易被抢占的那条链路，三次就
-    被自动停用了。
+    实机 2026-08-11 01:16–01:32 扫描被抢占了 7 次。算进去的话，最该一直有活干、
+    也最容易被抢占的那条链路，三次就被自动停用了。
     """
     for reason in (StopReason.PREEMPTED, StopReason.USER, StopReason.SHUTDOWN):
         supervisor, spawned = make()
@@ -234,8 +233,45 @@ def test_being_stopped_by_us_is_never_a_failure() -> None:
         exited = supervisor.stop(reason)
 
         assert exited is not None
-        assert exited.exit_code != 0, "terminate() 之后退出码非 0，豁免不能靠它"
         assert not exited.failed
+
+
+def test_a_terminated_child_never_gets_an_exit_code_put_in_its_mouth() -> None:
+    """⚠️ **`terminate()` 之后那个码不是 runner 的表态。**
+
+    Windows 上它走 `TerminateProcess(handle, 1)`，那个 1 是我们自己传给内核的
+    参数；POSIX 上是 `-SIGTERM`。原样记进 `mission_runs.exit_code` 的后果是
+    全库每一条 PREEMPTED / USER / SHUTDOWN 记录都长着「退出码 1」这副失败的样子
+    ——判据那侧本来就挡住了（`failed` 先看 `stopped_by`），但 `/logs` 页面和
+    `mission_runs` 因此分不清「被抢占的」和「自己崩了的」。
+
+    记 None 而不是 0：0 是「这一轮正常跑完」，同样是替一个没表过态的进程编造表态，
+    而且 0 会被当成成功。**没收到退出码**才是事实。
+    """
+    for reason in (StopReason.PREEMPTED, StopReason.USER, StopReason.SHUTDOWN, StopReason.STALLED):
+        supervisor, spawned = make()
+        supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
+
+        exited = supervisor.stop(reason)
+
+        assert exited is not None
+        assert spawned[0].terminated, "该杀还是要杀，只是不采信它留下的码"
+        assert exited.exit_code is None
+
+
+def test_a_stalled_round_still_counts_as_a_failure() -> None:
+    """`STALLED` 手是我们动的，但毛病是这条链路自己的——它不吃上面那条豁免。
+
+    退出码变成 None 之后这一条尤其要钉住：`failed` 一旦退化成看退出码，
+    停顿看门狗掐掉的那一轮就会被当成「没退出码 = 不算失败」，同一个卡死会
+    一轮接一轮地复现，每轮白烧 45 分钟。
+    """
+    supervisor, _spawned = make()
+    supervisor.start(MissionKind.SCAN, SCAN_ARGV, task_id=3)
+
+    exited = supervisor.stop(StopReason.STALLED)
+
+    assert exited is not None and exited.failed
 
 
 def test_the_environment_busy_code_is_not_a_failure() -> None:

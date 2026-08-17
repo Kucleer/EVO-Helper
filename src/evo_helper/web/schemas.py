@@ -343,8 +343,12 @@ class SchedulerStartIn(BaseModel):
     #: 启动对账只是额外多一趟、翻得更深。真正要救过期战报时走页面上那个手动
     #: 按钮——那时人在跟前，确认也就有人点。
     #:
-    #: 要恢复默认开，先解决两件事：CLI 把「抢不到前台」按 75 收场，
-    #: 且 `blocking` 对 `FAILED` 那一档给一条无人值守的出路。
+    #: 要恢复默认开，原本要解决两件事，现在还剩一件：
+    #:
+    #: - ~~CLI 把「抢不到前台」按 75 收场~~ —— 已经做了：
+    #:   `game.game_window.ForegroundUnavailable` +
+    #:   `tools.scan_coordinates.run_with_foreground_guard`。
+    #: - `blocking` 对 `FAILED` 那一档仍然没有无人值守的出路。
     reconcile: bool = False
 
 

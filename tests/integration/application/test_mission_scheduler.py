@@ -19,6 +19,7 @@ from evo_helper.application.mission_scheduler import (
     MAX_ENVIRONMENT_EXEMPTIONS,
     MissionScheduler,
 )
+from evo_helper.application.mission_supervisor import MissionExit, StopReason
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
@@ -1533,6 +1534,38 @@ def test_military_ranking_batch_finishes_before_its_bot_attack_is_started(  # ty
 
     assert launcher.kinds == [MissionKind.RANKING, MissionKind.BOT]
     assert "2:140:5=BBB" in launcher.latest.command
+
+
+def test_a_ranking_run_without_an_exit_code_is_never_read_as_a_full_batch(  # type: ignore[no-untyped-def]
+    scheduler, repository
+) -> None:
+    """⚠️ **`exit_code is None` 必须落在「没采满」那一侧。**
+
+    手动停掉的那几档现在一律记 None（`MissionSupervisor.stop`：`terminate()` 之后
+    拿到的那个码是内核参数，不是 runner 的表态）。判据只认一件事：**只有 runner
+    自己报的 0 才算采满**。写成 `(exit_code or 0) != 0` 之类「None 当 0 看」的形状，
+    就等于把一趟半截的榜单当成采满了，接着照它去派攻击。
+
+    两个 `stopped_by` 都要钉：`SELF` 那一支单独钉住第二个子句，否则
+    「非 SELF」那半句会替它把用例撑过去，坑还在。
+    """
+    ranking = task_id(repository, MissionKind.RANKING)
+    for stopped_by in (StopReason.SELF, StopReason.USER):
+        scheduler._military_ranking_batch_task_id = ranking
+
+        scheduler._finish(
+            MissionExit(
+                task_id=ranking,
+                kind=MissionKind.RANKING,
+                command=(),
+                exit_code=None,
+                stopped_by=stopped_by,
+                started_at_utc=NOW,
+                ended_at_utc=NOW,
+            )
+        )
+
+        assert scheduler._military_ranking_batch_task_id is None, stopped_by
 
 
 def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]

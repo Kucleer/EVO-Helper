@@ -957,6 +957,13 @@ class MissionScheduler:
             and (exited.stopped_by is not StopReason.SELF or exited.exit_code != 0)
         ):
             # 没采满就失败/被用户停止的榜单不能假装是一批可攻击目标。
+            #
+            # ⚠️ **`exit_code is None` 必须落在「没采满」这一侧。** 手动停掉的那几档
+            # 现在一律记 None（见 `MissionSupervisor.stop`），而 `None != 0` 为真，
+            # 所以这句话本身已经是对的——但凡把它写成 `(exited.exit_code or 0) != 0`
+            # 或者 `exited.exit_code in (None, 0)` 之类「None 当 0 看」的形状，
+            # 就等于把一趟半截的榜单当成采满了，接着按它去派攻击。
+            # 判据只认一件事：**只有 runner 自己报的 0 才算采满。**
             self._military_ranking_batch_task_id = None
         if exited.stopped_by is StopReason.SELF and exited.exit_code == 0:
             # 跑完一轮。「连续」是连续，成功过一次就重新数。
