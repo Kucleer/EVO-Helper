@@ -1253,22 +1253,30 @@ class MissionConsoleService:
             tiers = json.loads(row.tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
             raise ServiceError("全局军力档位配置损坏") from exc
-        return MilitaryAttackConfigView(tuple(tiers))
+        return MilitaryAttackConfigView(tuple(tiers), blind_scrolls=row.blind_scrolls)
 
     def replace_military_attack_tiers(
-        self, tiers: tuple[dict[str, Any], ...]
+        self, tiers: tuple[dict[str, Any], ...], *, blind_scrolls: object = None
     ) -> MilitaryAttackConfigView:
+        """整份全局攻击配置原子替换。
+
+        `blind_scrolls` 走和档位同一次 `PUT`：这一页是整份替换，两项各配一个
+        「只改自己」的接口，等于给「保存了 A 把 B 冲掉」留了两条路。
+        """
         self._refuse_global_config_while_running()
         normalized = [dict(tier) for tier in tiers]
         try:
             self._scheduler.validate_military_tiers(normalized)
+            scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
-            json.dumps(normalized, ensure_ascii=False)
+            json.dumps(normalized, ensure_ascii=False), blind_scrolls=scrolls
         )
         self._invalidate_scheduler_view()
-        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
+        return MilitaryAttackConfigView(
+            tuple(json.loads(row.tiers_json)), blind_scrolls=row.blind_scrolls
+        )
 
     def create_mission(
         self,

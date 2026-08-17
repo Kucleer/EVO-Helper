@@ -12,6 +12,25 @@
   </div>
 </section>
 
+<section class="panel" aria-labelledby="blind-head">
+  <h2 id="blind-head">军力榜盲拖屏数</h2>
+  <p class="muted">
+    开榜之后先无脑往下拖几屏再开始逐屏检测 bot——那一段必定还是真人，检测纯属白花。
+    <strong>留空 = 按实测自动标定</strong>：取最近 {{ blind_scroll_samples }} 次「翻了 N 屏到达 bot 区」的<strong>最小值</strong>再减 {{ blind_scroll_margin }} 屏余量；
+    历史不足 {{ blind_scroll_samples }} 次时用默认的 {{ blind_scrolls_default }} 屏。<strong>填了数就锁死</strong>，不再自动调。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>宁小勿大。</strong>填小了只是多花几屏检测（一屏约 0.3 秒），代价极小；
+    填大了会<strong>拖过 bot 起点</strong>，把榜首那批军力最高的 bot 整段跳过去——而采回来的数只会静悄悄少一截，页面上完全看不出来。
+    上限 {{ blind_scrolls_max }} 屏（= 已记录的最小实测屏数减余量）。
+  </p>
+  <div class="filter-bar" style="margin-top:10px">
+    <input id="blind-scrolls" type="number" min="0" max="{{ blind_scrolls_max }}" step="1"
+           placeholder="留空 = 自动标定" aria-label="军力榜盲拖屏数">
+    <button class="btn primary small" type="button" id="btn-save-blind">保存盲拖屏数</button>
+  </div>
+</section>
+
 <section class="panel" aria-labelledby="planet-head">
   <h2 id="planet-head">出发星球</h2>
   <p class="muted">按列表自动编号为星球1、星球2……任务里直接选择，例如“星球1 [2:137:18]”。被任务使用的星球不能删除。</p>
@@ -33,6 +52,7 @@
 (() => {
   const tiers = document.getElementById('tier-list');
   const planets = document.getElementById('planet-list');
+  const blindScrolls = document.getElementById('blind-scrolls');
   const errorBox = document.getElementById('settings-error');
   const coordinatePayload = (text) => {
     const parts = text.trim().split(':').map(Number);
@@ -81,24 +101,46 @@
   function refresh() {
     showError('');
     return Promise.all([EVOHelper.get('/api/attack-config'), EVOHelper.get('/api/attack-planets')])
-      .then(([config, list]) => { tiers.textContent = ''; for (const tier of config.tiers) addTier(tier); renderPlanets(list); })
+      .then(([config, list]) => {
+        tiers.textContent = '';
+        for (const tier of config.tiers) addTier(tier);
+        // `?? ''` 而不是 `|| ''`：0 是合法取值（「一屏都别盲拖」），
+        // `||` 会把它显示成空框，也就是显示成「自动标定」。
+        blindScrolls.value = config.blind_scrolls ?? '';
+        renderPlanets(list);
+      })
       .catch(fail);
   }
 
-  document.getElementById('btn-add-tier').onclick = () => addTier();
-  document.getElementById('btn-save-tiers').onclick = () => {
+  // 攻击配置是**整份替换**（PUT），所以两个保存按钮都送整份：只送自己那一半
+  // 会把另一半冲成空的。
+  function configPayload() {
+    const tierPayload = [];
+    for (const line of tiers.querySelectorAll('.tier-line')) {
+      const min = Number(line.querySelector('.tier-minimum').value);
+      const preset = line.querySelector('.tier-preset').value.trim();
+      if (!Number.isFinite(min) || min < 0 || !preset) throw new Error('每个档位都要填写非负最低军力和预设标题');
+      tierPayload.push({ min_score: min, preset });
+    }
+    tierPayload.sort((left, right) => right.min_score - left.min_score);
+    const raw = blindScrolls.value.trim();
+    let scrolls = null;
+    if (raw !== '') {
+      scrolls = Number(raw);
+      if (!Number.isInteger(scrolls) || scrolls < 0) throw new Error('盲拖屏数要填非负整数；要自动标定就把它留空');
+    }
+    return { tiers: tierPayload, blind_scrolls: scrolls };
+  }
+
+  const saveConfig = () => {
     try {
-      const payload = [];
-      for (const line of tiers.querySelectorAll('.tier-line')) {
-        const min = Number(line.querySelector('.tier-minimum').value);
-        const preset = line.querySelector('.tier-preset').value.trim();
-        if (!Number.isFinite(min) || min < 0 || !preset) throw new Error('每个档位都要填写非负最低军力和预设标题');
-        payload.push({ min_score: min, preset });
-      }
-      payload.sort((left, right) => right.min_score - left.min_score);
-      EVOHelper.request('PUT', '/api/attack-config', { tiers: payload }).then(refresh).catch(fail);
+      EVOHelper.request('PUT', '/api/attack-config', configPayload()).then(refresh).catch(fail);
     } catch (error) { fail(error); }
   };
+
+  document.getElementById('btn-add-tier').onclick = () => addTier();
+  document.getElementById('btn-save-tiers').onclick = saveConfig;
+  document.getElementById('btn-save-blind').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {
     try {
       const input = document.getElementById('new-planet-coordinate');

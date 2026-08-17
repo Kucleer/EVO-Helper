@@ -30,6 +30,7 @@ from evo_helper.domain.scout_verdict import (
     triggers_attack,
 )
 from evo_helper.domain.text import snap_to_vocabulary
+from evo_helper.game.overlay import OVERLAY_CLOSE_BUTTON
 
 #: 行星面板上「敌对海盗」的标题与坐标行。两者都读到才算认出是海盗位。
 PIRATE_TITLE_ROI = (760, 350, 1160, 392)
@@ -232,7 +233,11 @@ NAV_SCROLL_RIGHT = (1204, 862)
 # 会绕开唯一正确的入口。两种用途都写在这里，别再只留一半。
 
 #: 浮层左上角的 ✕。与派遣面板同一处（这些浮层共用一套外框）。
-PLANET_LIST_CLOSE = (750, 71)
+#:
+#: 不再各写一遍那对数字：这个点同时也是信箱的「返回」、扫描链路恢复阶梯上的
+#: 「关闭面板」。三处分别写死过，改一处漏两处只是时间问题——现在共用
+#: `game.overlay.OVERLAY_CLOSE_BUTTON`。
+PLANET_LIST_CLOSE = OVERLAY_CLOSE_BUTTON
 
 #: 每行右侧那列橙色坐标 `[2:137:18]` 所在的**竖条**。整块一次读，逐词拿 y。
 #:

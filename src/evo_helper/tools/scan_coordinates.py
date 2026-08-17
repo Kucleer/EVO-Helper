@@ -33,6 +33,7 @@ from evo_helper.domain.scan_bounds import ScanBounds
 from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments, total_coordinates
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, exit_code_for_environment_fault
 from evo_helper.game.game_window import ForegroundUnavailable
+from evo_helper.game.overlay import dismiss_overlays
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -121,6 +122,20 @@ def say(message: str) -> None:
     safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
     print(safe, flush=True)
     record_system_log("INFO", _caller_source(), message)
+
+
+def warn(message: str) -> None:
+    """同 `say()`，但落进 `system_log` 时级别是 `WARNING`。
+
+    有这个出口是因为控制台的日志页可以**按级别筛**：只用 `say()` 的话，一条
+    「盲拖快拖过头了」会和一轮几千行 INFO 混在一起，等于没报。控制台那份仍然
+    照常打印——两份输出的内容一致，只有级别不同。
+    """
+    line = f"{datetime.now().strftime('%H:%M:%S')} {message}"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe, flush=True)
+    record_system_log("WARNING", _caller_source(), message)
 
 
 def _caller_source() -> str:
@@ -896,7 +911,7 @@ EVIDENCE_THUMBNAIL_WIDTH = 480
 _last_evidence_at: float | None = None
 
 
-def _thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
+def thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
     """整帧缩到 `width` 宽的 PNG，base64。失败返回空串——证据不许把链路弄死。"""
     import base64
     import io
@@ -951,19 +966,11 @@ def record_unrecognised_screen(
             "capture_size": list(size) if size else None,
             "nav_text": nav_text,
             "entry_title_text": entry_text,
-            "thumbnail_png_base64": _thumbnail_base64(image),
+            "thumbnail_png_base64": thumbnail_base64(image),
         },
     )
     return True
 
-
-#: 各种浮层左上角的关闭键。信箱、消息详情、飞行中列表、派遣面板共用这一个位置，
-#: 所以关浮层这件事不需要先认出是哪一种浮层（`pirate_loop.MAIL_BACK` 是同一个点）。
-OVERLAY_CLOSE_BUTTON = (750, 71)
-
-#: 关浮层最多点这么多下。每种浮层最多套两层（列表 → 详情），4 下留了余量；
-#: 点空了也无害，那个位置在恒星系视图上什么都不是。
-OVERLAY_CLOSE_ATTEMPTS = 4
 
 ENTRY_TITLE_ROI = (780, 305, 1140, 355)
 ENTRY_BUTTON_ROI = (999, 385, 1118, 430)
@@ -1182,19 +1189,24 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
 
     这里对 UNKNOWN 放行去点关闭键并没有破坏「认不出的画面绝不点击」：那个位置在
     恒星系视图上什么都不是，点空无害；而真掉线的三种画面走的是守护自己的入口序列。
+
+    点击动作本身在 `game.overlay.dismiss_overlays`——攻击链路（`game.planet_list`）
+    用的是同一份。这里只负责「什么时候算认不出」和「关完再问一次守护」。
     """
     from evo_helper.game.session_keeper import ScreenState
 
     if session is None or session.state is not ScreenState.UNKNOWN:
         return session
     say("画面认不出（多半是浮层）；关掉浮层后重新巡检")
-    for _attempt in range(OVERLAY_CLOSE_ATTEMPTS):
-        driver.click(*OVERLAY_CLOSE_BUTTON, label="关闭面板")
-        driver.wait(2.0)
-        session = keeper.ensure_connected(force=True)
-        if session is None or session.state is not ScreenState.UNKNOWN:
-            return session
-    return session
+    # 每关一下就重新巡检一次，认回来了就停手——用一格可变单元把结局带出闭包。
+    latest = [session]
+
+    def cleared() -> bool:
+        latest[0] = keeper.ensure_connected(force=True)
+        return latest[0] is None or latest[0].state is not ScreenState.UNKNOWN
+
+    dismiss_overlays(driver, is_clear=cleared)
+    return latest[0]
 
 
 def restart_if_still_unusable(session: Any, keeper: Any) -> Any:

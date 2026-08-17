@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,6 +64,7 @@ from evo_helper.domain.missions import (
     ORIGIN,
     MissionIdle,
     MissionParamError,
+    NoFreeLineError,
     bot_command,
     bot_targets_in_range,
     pirate_command,
@@ -72,12 +73,18 @@ from evo_helper.domain.missions import (
     scan_command,
 )
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.ranking import is_bot_coordinate
+from evo_helper.domain.ranking import (
+    BOT_AREA_REACHED_PREFIX,
+    bot_area_scrolls,
+    calibrated_blind_scrolls,
+    is_bot_coordinate,
+)
 from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
 from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
 from evo_helper.domain.scheduler import (
     Action,
     Decision,
+    DisabledRecovery,
     MissionKind,
     RunningProcess,
     SchedulerFacts,
@@ -99,6 +106,11 @@ from evo_helper.domain.target_order import (
     ScoredTarget,
     split_by_freshness,
     strongest_then_nearest,
+)
+from evo_helper.game.ranking_ui import (
+    BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_SAMPLES,
+    BLIND_SCROLLS_MAX,
 )
 from evo_helper.infrastructure.system_log import child_environment, record_system_log
 from evo_helper.storage import models as orm
@@ -642,6 +654,14 @@ class MissionScheduler:
         """校验全局攻击档位；任务参数不再携带档位。"""
         return _bot_tiers({"tiers": tiers})
 
+    def validate_blind_scrolls(self, value: object) -> int | None:
+        """校验攻击配置页上那个「盲拖屏数」。同 `validate_military_tiers`：
+        页面在**写库之前**用调度器自己这把尺子量一遍。
+
+        返回 `None` 表示留空——那不是 0，是「跟着 `BLIND_SCROLLS` 的默认值走」。
+        """
+        return _blind_scrolls(value)
+
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
 
@@ -664,6 +684,10 @@ class MissionScheduler:
             if not self._enabled:
                 return
             self._cut_off_a_stalled_round()
+            # 放在 `_step` **之前**：刚被放回来的任务这一秒就该参与排队，不必
+            # 白等一个 tick。放在循环外面是因为它按 tick 算一次就够——`_step`
+            # 一个 tick 里会转好几圈，每圈都去数一遍在飞舰队纯属白付。
+            self._resume_tasks_waiting_for_a_line(self._clock())
             # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
             # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
             for _ in range(len(MissionKind)):
@@ -872,6 +896,90 @@ class MissionScheduler:
             return False
         return self._act(decision, facts)
 
+    # -- 因航线不足停用的自动恢复 --------------------------------------------------
+
+    def _resume_tasks_waiting_for_a_line(self, now: datetime) -> None:
+        """把「因空闲航线不足而自动停用」的任务放回来——**只在此刻真的有空闲航线时**。
+
+        **为什么这一类不该要人工恢复。** 触发它的条件会自愈：舰队总会飞回来，
+        航线总会空出来（占用判据是纯时间的，见 `storage.repository` 的
+        `_still_holding_a_line`）。而 `disabled_reason` 一旦写下就只有两条清除
+        路径——用户点「恢复」，或者用户改一次任务配置。于是条件早就不成立了，
+        任务却一直挂着「已停用」，一发都不派。2026-08-17 11:19 生产库实测：一个
+        配了 9 条航线的 bot 攻击任务只占着 2 条，7 条空着，仍然停用着。
+
+        **别的停用原因绝不能顺带被放出来。** 连续失败到上限说的是「这不是暂时
+        的」，自动放出来只会让调度循环退回那个满速空转的重启循环；参数填错也一样
+        ——改之前重试一万次都是同一个结果。所以这里认的是
+        `DisabledRecovery.FREE_LINES` 这个标记，不是 `disabled_reason` 里那句
+        中文（措辞改一次判据就静默失效）。最终那一下由
+        `repository.resume_mission_task` 在同一个事务里再确认一遍标记。
+
+        **判据现算，不挂定时器。** 每 tick 拿此刻的在飞舰队重新算一次空闲航线，
+        不是「过了 N 分钟就试试」：调度器进程会重启，内存里的闹钟一重启就没了，
+        而「有没有空闲航线」重启后照样算得出来。空闲航线用的是
+        `_free_lines_from`——`_facts` 那一份同一个函数，所以放它出来的这一刻，
+        它一定过得了 `_launch` 里那道让它停用的闸门，不会一放出来就再停一次。
+
+        **恢复要写 `system_log`。** 任务突然又开始跑而日志里一个字都没有，
+        事后没人查得出是谁放的它。
+        """
+        rows = [
+            row
+            for row in self._repository.mission_tasks()
+            if row.disabled_reason is not None
+            and row.disabled_recovery == DisabledRecovery.FREE_LINES.value
+            and _known(row.kind)
+        ]
+        if not rows:
+            # 绝大多数 tick 走这里：一次 `mission_tasks()` 之外一个查询都不多付。
+            return
+        config = self._repository.scheduler_config()
+        snapshots = {task.task_id: task for task in self._snapshots(rows, config)}
+        inflight: dict[Coordinate, int] = {}
+        for row in rows:
+            task = snapshots[row.id]
+            origins = (
+                self._military_origins(row)
+                if task.kind is MissionKind.BOT and _bot_by_military(row.params_json)
+                else None
+            )
+            coordinates = (
+                [task.origin] if origins is None else [item.coordinate for item in origins]
+            )
+            for coordinate in coordinates:
+                if coordinate not in inflight:
+                    inflight[coordinate] = self._repository.count_inflight(
+                        now_utc=now, origin=coordinate
+                    )
+            free = _free_lines_from(
+                task,
+                origins=origins,
+                inflight=inflight,
+                reserved_lines=config.reserved_lines,
+            )
+            if free < 1:
+                continue
+            if not self._repository.resume_mission_task(
+                row.id, recovery=DisabledRecovery.FREE_LINES
+            ):
+                # 这期间用户自己点了「恢复」，或者它已经被别的原因重新停用。
+                continue
+            name = task.name or task.kind.value
+            record_system_log(
+                "INFO",
+                "application.mission_scheduler",
+                f"任务「{name}」曾因空闲航线不足被自动停用，"
+                f"当前空闲航线 {free} 条，已自动恢复参与调度",
+                payload={
+                    "task_id": row.id,
+                    "mission_kind": task.kind.value,
+                    "free_lines": free,
+                    "disabled_recovery": DisabledRecovery.FREE_LINES.value,
+                },
+                logged_at_utc=now,
+            )
+
     def _log_schedule_window_changes(
         self, snapshots: Sequence[TaskSnapshot], now: datetime
     ) -> None:
@@ -1075,7 +1183,8 @@ class MissionScheduler:
                     bot_limit=_smallest_limit(
                         _ranking_bot_limit(row.params_json),
                         None if batch_task is None else _bot_top_n(batch_task.params_json),
-                    )
+                    ),
+                    blind_scrolls=self._blind_scrolls(),
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
                 command = self._military_command(row, max_dispatches=facts.free_lines)
@@ -1092,7 +1201,18 @@ class MissionScheduler:
             _LOGGER.info("%s 这一轮没活干：%s", task.name, exc)
             return False
         except MissionParamError as exc:
-            self._repository.disable_mission_task(task.task_id, str(exc))
+            # 类别按**异常类型**认，不按那句中文认：`NoFreeLineError` 说的是
+            # 「这一刻没航线」，舰队飞回来就好了；别的都是配置填错，改之前重试
+            # 一万次都一样。判据见 `domain.scheduler.DisabledRecovery`。
+            self._repository.disable_mission_task(
+                task.task_id,
+                str(exc),
+                recovery=(
+                    DisabledRecovery.FREE_LINES
+                    if isinstance(exc, NoFreeLineError)
+                    else DisabledRecovery.MANUAL
+                ),
+            )
             return False
         # 本轮的 id 要在**起子进程之前**定下来：runner 靠环境变量认领它，
         # 好把自己写进 `system_log` 的每一行都挂到这一轮上。起完再生成就晚了，
@@ -1312,9 +1432,12 @@ class MissionScheduler:
                         next_free[item.coordinate] = self._repository.next_line_free_at(
                             now_utc=now, origin=item.coordinate
                         )
-                # 多 origin 的预算是每颗星球各自的预算，绝不再拿全局保留数把它们
-                # 合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
-                free = sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
+                free = _free_lines_from(
+                    task,
+                    origins=origins,
+                    inflight=inflight,
+                    reserved_lines=config.reserved_lines,
+                )
                 last_dispatches = [
                     self._repository.last_dispatch_at(
                         _TARGET_KIND[task.kind], origin=item.coordinate
@@ -1355,9 +1478,10 @@ class MissionScheduler:
             target_kind = _TARGET_KIND[task.kind]
             per_task[task.task_id] = replace(
                 base,
-                free_lines=free_lines_for(
+                free_lines=_free_lines_from(
                     task,
-                    inflight_from_origin=inflight[task.origin],
+                    origins=None,
+                    inflight=inflight,
                     reserved_lines=config.reserved_lines,
                 ),
                 reports_due=self._reports_due(task, now, grace),
@@ -1724,7 +1848,10 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.RANKING:
-            return ranking_command(bot_limit=_ranking_bot_limit(params_json))
+            return ranking_command(
+                bot_limit=_ranking_bot_limit(params_json),
+                blind_scrolls=self._blind_scrolls(),
+            )
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
@@ -1740,6 +1867,51 @@ class MissionScheduler:
         # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
         # 而一夜只走到第 121 系——后面那些永远轮不到。
         return self._bot_command(params_json, origin)
+
+    def _blind_scrolls(self) -> int | None:
+        """军力榜盲拖屏数。**填了数就锁死，留空则按实测自动标定。**
+
+        取自**全局攻击配置**（攻击配置页），不是任务参数——用户口径
+        （2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+
+        返回 `None` 的意思是「命令行上不带 `--blind-scrolls`」，runner 用
+        `game.ranking_ui.BLIND_SCROLLS` 那个写死的默认值。样本攒不够时就走这条，
+        行为与加这个框之前完全一致。**不在这里自己回落成一个数字**：默认值只该
+        有一处，写第二遍日后必然漏改。
+
+        手填的值优先于自动标定：它是覆盖，不是初值。
+
+        配置行还没建出来时（老库、或者 `ensure_mission_rows()` 还没跑）当成留空：
+        一个还没初始化的配置表说明不了「用户想改盲拖屏数」，为它把整条采集链路
+        停掉是不成比例的。
+        """
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return None
+        manual = _blind_scrolls(row.blind_scrolls)
+        if manual is not None:
+            return manual
+        return self._calibrated_blind_scrolls()
+
+    def _calibrated_blind_scrolls(self) -> int | None:
+        """从 `system_log` 里那些「翻了 N 屏到达 bot 区」反推盲拖屏数。
+
+        ⚠️ **实测记录刻意没有自己的表或列。** 每趟采集本来就会把这句话写进
+        `system_log`，那里已经攒着全部历史；再加一张表等于让同一件事有两份账，
+        而两份账迟早对不上（其中一份还只有新版本才写）。
+
+        多读一些行再筛：那句话不是每条日志都是，而 `recent_messages` 只做前缀
+        匹配。读 `BLIND_SCROLL_SAMPLES` 的若干倍足以覆盖前缀相同但不是这句话的
+        邻居，同时仍然只碰几十行。
+        """
+        raw = self._repository.recent_system_log_messages(
+            starts_with=BOT_AREA_REACHED_PREFIX, limit=BLIND_SCROLL_SAMPLES * 8
+        )
+        measurements = [value for value in map(bot_area_scrolls, raw) if value is not None]
+        return calibrated_blind_scrolls(
+            measurements, sample_size=BLIND_SCROLL_SAMPLES, margin=BLIND_SCROLL_MARGIN
+        )
 
     def _bot_command(
         self, params_json: str, origin: Coordinate, *, max_dispatches: int | None = None
@@ -1804,6 +1976,34 @@ def _participating(task: TaskSnapshot) -> bool:
     return task.enabled and task.disabled_reason is None
 
 
+def _free_lines_from(
+    task: TaskSnapshot,
+    *,
+    origins: Sequence[AttackOrigin] | None,
+    inflight: Mapping[Coordinate, int],
+    reserved_lines: int,
+) -> int:
+    """这个任务此刻估算还剩几条空闲航线。
+
+    **只有这一份判据。** `_facts`（决定要不要起一轮、`--max-dispatches` 传几）
+    与「因航线不足停用后自动恢复」都问它。各写一份的话，放它出来用的尺子会和
+    当初停用它的那把慢慢走散——走散之后要么放不出来，要么放出来就立刻再被停用，
+    每 tick 一次。
+
+    `origins` 非 None = 军力多出发点那一路：**每颗星球各算各的预算**，绝不拿
+    全局保留数把它们合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
+    None 则走单出发星球那条，`reserved_lines` 在 `free_lines_for` 里生效。
+
+    `inflight` 由调用方按出发星球缓存好（同一颗星球一次 tick 只查一次），
+    这一层不查库。
+    """
+    if origins is not None:
+        return sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
+    return free_lines_for(
+        task, inflight_from_origin=inflight[task.origin], reserved_lines=reserved_lines
+    )
+
+
 def _known(kind: str) -> bool:
     """库里出现不认识的 kind（手改或旧版本留下的）就跳过，不让调度器崩掉。"""
     return kind in {item.value for item in MissionKind}
@@ -1860,6 +2060,42 @@ def _ranking_bot_limit(raw: str) -> int | None:
     if limit < 1:
         raise MissionParamError("扫描数量至少是 1；要全扫就把它留空，别填 0")
     return limit
+
+
+def _blind_scrolls(value: object) -> int | None:
+    """军力榜开榜后先盲拖几屏。**留空 = 用 `BLIND_SCROLLS` 的默认值 40。**
+
+    用户口径（2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+
+    ⚠️ **「没配」和「配了 0」是两回事，两个都合法。** 留空是「跟着默认走」；
+    `0` 是用户真的敲进去的「一屏都别盲拖，从第一屏就开始检测 bot」——那是
+    **最保守**的取值（多花几十次廉价检测，绝不可能拖过头），所以它必须放行，
+    而不是像 `bot_limit` 那个 0 一样当成「把链路关掉」而拒绝。
+
+    上界是 `BLIND_SCROLLS_MAX`(48)：再往上就证不出「盲拖那一段够不到 bot 起点」
+    了（见 `game.ranking_ui` 上那几条）。越界当场拒掉——这个值调大的代价是
+    **静悄悄少采一截**，页面上和日志里都看不出异常，不能靠用户自己发现。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）：`True` 会被
+    # 当成盲拖 1 屏，而用户敲进去的根本不是一个屏数。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("盲拖屏数必须是整数；要用默认值就把它留空")
+    try:
+        scrolls = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"盲拖屏数不是整数：{value!r}") from exc
+    if isinstance(value, float) and scrolls != value:
+        raise MissionParamError(f"盲拖屏数必须是整数：{value!r}")
+    if scrolls < 0:
+        raise MissionParamError("盲拖屏数不能是负数；要用默认值就把它留空")
+    if scrolls > BLIND_SCROLLS_MAX:
+        raise MissionParamError(
+            f"盲拖屏数最多 {BLIND_SCROLLS_MAX} 屏：再多就可能拖过 bot 起点，"
+            "把榜首那批军力最高的 bot 整段跳过去。宁小勿大——拖少了只是多花几屏检测。"
+        )
+    return scrolls
 
 
 def _smallest_limit(*limits: int | None) -> int | None:
