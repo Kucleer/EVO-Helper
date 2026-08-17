@@ -9,8 +9,8 @@ from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
     TOP_BY_MILITARY,
     ScoredTarget,
-    fresh_targets,
     score_is_fresh,
+    split_by_freshness,
     strongest_first,
     strongest_then_nearest,
 )
@@ -137,6 +137,10 @@ def test_the_cap_never_drops_a_target_whose_score_is_unknown() -> None:
 
     「不知道多强」不构成「一定太强」。按上限把 None 一起扔掉的话，凡是没被
     榜单扫到过的 bot 就永远不会被攻击——而那正是库里最多的一批。
+
+    ⚠️ 顺带记一笔：这个上限**目前是空转的**。用户口径（2026-08-17）：「目前的 bot
+    的军事能力不存在太强这个可能性……已知周一刷新当日 bot 的最高战力只有 70 多 K」。
+    留着不删是为了哪天 bot 变强，不是因为它现在在挡什么。
     """
     ordered = strongest_then_nearest([_target(140, None)], HOME, max_score=100_000.0)
 
@@ -172,35 +176,45 @@ def test_a_reading_older_than_the_window_is_not_fresh() -> None:
     assert score_is_fresh(stale, now=NOW, max_age=timedelta(hours=1)) is False
 
 
-def test_a_target_that_was_never_read_counts_as_stale() -> None:
-    """⚠️ **`military_score_at_utc is None` 一律算超期。「从没读过」不是「刚读的」。**
+def test_a_target_without_a_score_is_never_called_fresh_or_expired() -> None:
+    """⚠️ **没有分数的目标在这里恒为假，而那不表示它出局。**
 
-    把它当成新鲜，等于让一个从来没上过军力榜的 bot 顶着「读数没问题」进池——
-    而军力优先这一支的全部前提就是那个读数。
-
-    ⚠️ 这一条和 `test_the_cap_never_drops_a_target_whose_score_is_unknown`
-    **不矛盾，也不能互相顶替**：那一条说的是 `military_score is None`（不知道多强，
-    按次序排最后），这一条说的是 `military_score_at_utc is None`（从没读过，
-    连「什么时候不知道的」都没有）。两个 None 在库里是两列。
+    `score_is_fresh` 只回答「这个**分数**还能不能用来排序」。没有分数就没有可排的
+    东西，所以它为假；能不能打是 `split_by_freshness` 那一层的事，那里把它放进
+    补位池。两件事合起来问的那一版，把库里最多的那批目标（从没上过榜的）
+    永久排除掉了。
     """
     assert score_is_fresh(_target(140, None), now=NOW, max_age=TWO_HOURS) is False
-    # 分数读到过、时刻没有，同样算超期：判据只看时刻那一列。
-    assert score_is_fresh(_target(141, 9_000.0), now=NOW, max_age=TWO_HOURS) is False
+    assert score_is_fresh(_target(141, None, scanned_at=NOW), now=NOW, max_age=TWO_HOURS) is False
+
+    split = split_by_freshness([_target(140, None)], now=NOW, max_age=TWO_HOURS)
+    assert split.expired == (), "没有分数不等于分数过期"
+    assert [item.coordinate.system for item in split.unrated] == [140]
 
 
-def test_filtering_keeps_the_order_it_was_given() -> None:
-    """新鲜度只做筛，不做排。排序是后面两步（军力截断、距离）的事。"""
-    kept = fresh_targets(
+def test_a_score_without_a_reading_time_is_expired() -> None:
+    """读到过分数、却没有读取时刻，算过期：说不清什么时候读的分数不能拿来排序。"""
+    split = split_by_freshness([_target(141, 9_000.0)], now=NOW, max_age=TWO_HOURS)
+
+    assert [item.coordinate.system for item in split.expired] == [141]
+
+
+def test_the_split_keeps_the_order_it_was_given() -> None:
+    """分堆只做分，不做排。排序是后面两步（军力截断、距离补位）的事。"""
+    split = split_by_freshness(
         [
             _target(400, 100.0, scanned_at=NOW),
             _target(140, 9_000.0, scanned_at=NOW - timedelta(days=3)),
             _target(200, 8_000.0, scanned_at=NOW),
+            _target(300, None),
         ],
         now=NOW,
         max_age=TWO_HOURS,
     )
 
-    assert [item.coordinate.system for item in kept] == [400, 200]
+    assert [item.coordinate.system for item in split.rated] == [400, 200]
+    assert [item.coordinate.system for item in split.unrated] == [300]
+    assert [item.coordinate.system for item in split.expired] == [140]
 
 
 def test_the_default_window_is_about_twice_one_scan_round() -> None:
