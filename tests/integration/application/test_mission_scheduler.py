@@ -1911,14 +1911,10 @@ def test_a_target_never_seen_on_the_board_still_fills_a_seat(  # type: ignore[no
 def test_the_filler_never_takes_a_seat_the_rated_ones_want(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """⚠️ **补位只填主力剩下的空位，绝不参与按军力取前 N。**
-
-    混排的话，没有分数的那些会占掉前 N 的名额（`strongest_first` 把 None 排最后，
-    但**排最后也是占位**），于是「军力优先」在补位多的夜里退化成「随便打」。
+    """⚠️ **补位只填主力剩下的空位，绝不占掉前 N 的名额。**
 
     这里 `top_n=2`、两个新鲜的主力刚好占满，补位那个再近也不许挤进来——它就在
-    出发星球隔壁（`2:138`），一旦混排，池内按距离排序会让它第一个被派出去，
-    这条断言当场转红。
+    出发星球隔壁（`2:138`），一旦它进了池，池内按距离排序会让它第一个被派出去。
     """
     add_bot_target(session_factory, Coordinate(2, 138, 9), military_score=None, scanned_at=None)
     add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0, scanned_at=NOW)
@@ -1930,6 +1926,36 @@ def test_the_filler_never_takes_a_seat_the_rated_ones_want(  # type: ignore[no-u
 
     command = launcher.latest.command
     assert not any(part.startswith("2:138:9") for part in command)
+
+
+def test_the_filler_seat_goes_to_the_nearest_one_not_the_first_one(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **补位之间按距离挑，而不是跟着军力排序捎带出来的次序。**
+
+    这一条守的是「两步分开」在接线上真的成立。**上一条守不住它**：`strongest_first`
+    把没有分数的排在所有已知的后面，所以就算把补位混进按军力排序的那一批，它们也
+    抢不走主力的名额——两条路唯一看得出差别的地方，是**剩下那个空位给了谁**：
+
+    - 混排（错）：跟着 `strongest_first` 的并列打破走，也就是**按坐标**，选 `2:100`；
+    - 两步（对）：按到出发星球的距离，选 `2:170`（离 `2:137` 33 步，`2:100` 是 37 步）。
+
+    补位没有分数，彼此之间没有任何「更值得打」的依据，唯一还剩的可比量就是路程
+    ——一夜的航线有限，先打近的能多派十几发。
+    """
+    add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0, scanned_at=NOW)
+    add_bot_target(session_factory, Coordinate(2, 100, 7), military_score=None, scanned_at=None)
+    add_bot_target(session_factory, Coordinate(2, 170, 8), military_score=None, scanned_at=None)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    targets = command[command.index("--targets") + 1 : command.index("--origin")]
+    # 这组夹具只留一条空航线；池子是「主力 2:400 + 补位一个」，池内按距离排，
+    # 所以派出去的就是那个补位。它是 `2:170` 还是 `2:100`，正好把两条路分开。
+    assert targets == ["2:170:8=BBB"]
 
 
 def test_the_freshness_filter_runs_before_the_top_n_cut(  # type: ignore[no-untyped-def]
