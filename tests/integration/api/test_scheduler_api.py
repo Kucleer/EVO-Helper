@@ -1316,3 +1316,49 @@ def test_a_military_bot_plan_uses_global_tiers_and_selected_planets(console: Con
         },
     ]
     assert config.json()["tiers"][0]["preset"] == "CCC"
+
+
+def test_the_report_scan_floor_round_trips_through_the_attack_config(console: Console) -> None:
+    """攻击配置页那个「翻信箱时长」存得住、读得回，非法值当场 422。
+
+    整份替换是这一页的既有约定，所以每次 `PUT` 都要把三项一起送——这条同时钉住
+    「送了时长没把档位冲掉」。
+    """
+    saved = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [{"min_score": 0, "preset": "AAA"}],
+            "blind_scrolls": 30,
+            "report_scan_hours": 2,
+        },
+    )
+    read_back = console.client.get("/api/attack-config")
+    # 0 = 下界就是此刻 = 一封都翻不到，只可能是手滑。
+    zero = console.client.put("/api/attack-config", json={"tiers": [], "report_scan_hours": 0})
+    negative = console.client.put("/api/attack-config", json={"tiers": [], "report_scan_hours": -3})
+    words = console.client.put(
+        "/api/attack-config", json={"tiers": [], "report_scan_hours": "两小时"}
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert read_back.json()["report_scan_hours"] == 2
+    assert read_back.json()["blind_scrolls"] == 30
+    assert read_back.json()["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+    # 两道关各管一段：数字但不合理的由调度器那把尺子拒（400，带中文原因），
+    # 压根不是整数的在 pydantic 那层就进不来（422）。
+    assert zero.status_code == 400, zero.text
+    assert "别填 0" in zero.json()["detail"], "拒了还得说清「留空」和「填 0」不是一回事"
+    assert negative.status_code == 400, negative.text
+    assert words.status_code == 422, words.text
+
+
+def test_a_blank_report_scan_floor_is_stored_as_blank_not_as_a_number(
+    console: Console,
+) -> None:
+    """留空要一路留空到库里：回落成具体数字的话，日后调默认值它不跟。"""
+    console.client.put("/api/attack-config", json={"tiers": [], "report_scan_hours": 6})
+
+    cleared = console.client.put("/api/attack-config", json={"tiers": []})
+
+    assert cleared.status_code == 200, cleared.text
+    assert console.client.get("/api/attack-config").json()["report_scan_hours"] is None

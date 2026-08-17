@@ -68,7 +68,11 @@ from evo_helper.domain.records import (
     AttackDispatch,
     AttackIntent,
 )
-from evo_helper.domain.report_wait import parse_game_duration
+from evo_helper.domain.report_wait import (
+    DEFAULT_REPORT_SCAN_FLOOR,
+    REPORT_SCAN_HOURS_MAX,
+    parse_game_duration,
+)
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
 from evo_helper.game import pirate_ui
@@ -1910,6 +1914,68 @@ class PirateLoop:
         say("  往下都是更旧的报告，不再开封")
         return True
 
+    def _routine_scan_floor(self, not_before: datetime | None, *, now: datetime) -> datetime:
+        """**对账那一档**最早翻到哪一行为止：`not_before` 与「现在往回 N 小时」取更晚的。
+
+        N 取攻击配置页上那个框；留空就是 `DEFAULT_REPORT_SCAN_FLOOR`（6 小时）。
+        用户口径（2026-08-17）：「不要读那么多，毕竟数量是大几百封」「这个参数改为
+        可配置，这样遇到活动我可以灵活调整」。
+
+        ## 为什么默认是 6 小时——这不是性能优化
+
+        对账那一趟的活是**把还在等的那几发的战报读回来**，而「还在等」本身就以
+        6 小时为界：`due_attack_dispatches` 与 `bot_dispatch_facts` 都按
+        `MAX_REPORT_AGE` 把更早的派遣剔掉，`storage.intel.RESULT_NO_REPORT` 也在
+        那一刻把它们判成「战报永远不会来了」。再往下翻，翻到的都是**没有任何一条
+        判据还在等的**战报。
+
+        ⚠️ **别把它读成「6 小时以上的战报认领不上」。** 认领窗口是
+        `dispatched_at_utc >= reported_at - MAX_REPORT_AGE`，相对**战报自己的
+        时间戳**算，隔多久读回来都认领得上。所以把这个数调大**确实**能补回更早的
+        战报——只是那是 `--exhaustive` 手动补录的活，而补录不走这个下限。
+
+        ## 取更晚的那个，不是覆盖
+
+        `not_before`（`--since`）是调用方给的硬下界，这道下限只会让它**更紧**。
+        反过来（取更早的）会让一个配大了的时长把 `--since` 顶开，翻到用户没要的
+        日期去。
+
+        配置读不到时（老库、`ensure_mission_rows()` 还没跑、仓储替身没有这个方法）
+        一律当留空：一个还没初始化的配置表说明不了「用户想改翻信箱时长」，
+        为它把整趟对账停掉是不成比例的。同 `MissionScheduler._blind_scrolls`。
+        """
+        hours = self._report_scan_hours()
+        span = DEFAULT_REPORT_SCAN_FLOOR if hours is None else timedelta(hours=hours)
+        floor = now - span
+        source = "默认" if hours is None else "攻击配置页"
+        say(f"  对账只往回读 {int(span.total_seconds() // 3600)} 小时（{source}）")
+        if not_before is None:
+            return floor
+        return max(not_before, floor)
+
+    def _report_scan_hours(self) -> int | None:
+        """攻击配置页上那个「翻信箱时长」。留空 / 读不到 / 不是正数都返回 None。
+
+        **不在这里自己回落成一个数字**：默认值只该有一处
+        （`DEFAULT_REPORT_SCAN_FLOOR`），写第二遍日后必然漏改。
+
+        库里那个值也要复核一遍而不是照单全收：页面那把尺子
+        （`MissionScheduler.validate_report_scan_hours`）管不到直接改库的人，
+        而一个 0 或负数会让下界落在「此刻」或之后——那一趟一封都翻不到，还一声不响。
+        """
+        repository, _run_id = self._ensure_run()
+        reader = getattr(repository, "military_attack_config", None)
+        if reader is None:
+            return None
+        try:
+            row = reader()
+        except ValueError:
+            return None
+        hours = getattr(row, "report_scan_hours", None)
+        if not isinstance(hours, int) or isinstance(hours, bool) or hours < 1:
+            return None
+        return min(hours, REPORT_SCAN_HOURS_MAX)
+
     def backfill_reports(
         self,
         *,
@@ -1917,6 +1983,7 @@ class PirateLoop:
         max_pages: int = BACKFILL_SCAN_PAGES,
         max_opens: int = BACKFILL_MAX_OPENS,
         exhaustive: bool = False,
+        now: datetime | None = None,
     ) -> BackfillTally:
         """把**信箱里已经躺着的**战报补进库。只读信箱、只写库，一发都不派。
 
@@ -1942,6 +2009,17 @@ class PirateLoop:
           `not_before` 为止，不管单子空不空。**这一档不能省**：那些派遣早就掉出
           单子了（`due_attack_dispatches` 有 6 小时上限），早停会让它一封都开不了。
 
+        ## 时间下限只作用在对账那一档
+
+        对账那一趟另有一道下限（`_routine_scan_floor`，攻击配置页可配，默认 6
+        小时）：活动期间信箱最上面堆着几百封活动战报，而库里最近一封战报可能停在
+        好几天前，于是「撞见库里已有的那一封」这个早停迟迟不触发，整趟把翻页预算
+        烧满（用户口径 2026-08-17：「不要读那么多，毕竟数量是大几百封」）。
+
+        ⚠️ **补录模式一律不受它约束。** 补录存在的唯一理由就是够到那些早就掉出
+        追踪窗口的历史战报；让下限也作用在它身上，等于把这个入口悄悄废掉——
+        而且**不报错**：用户会看到一趟「完成」的补录和一句「读通 0 份」。
+
         ⚠️ **过了六小时的战报照样认领得上**，所以补录模式是有意义的：认领窗口是
         `dispatched_at_utc >= reported_at - MAX_REPORT_AGE`，相对**战报自己的
         时间戳**算的；单子那个 6 小时是相对现在算的，管的是「还追不追」。
@@ -1951,7 +2029,11 @@ class PirateLoop:
         只有实机才走的那一层，否则任何一条忘了打桩的单元测试都会伸手去改用户的
         窗口尺寸。
         """
-        tally = BackfillTally(due_before=len(self._due_dispatches(datetime.now(UTC))))
+        moment = now or datetime.now(UTC)
+        tally = BackfillTally(due_before=len(self._due_dispatches(moment)))
+        # ⚠️ **`exhaustive` 那一档一个字都不改 `not_before`。** 见上面那段：
+        # 补录要够到的正是这道下限之外的战报。
+        floor = not_before if exhaustive else self._routine_scan_floor(not_before, now=moment)
 
         def visit(row: MailRow, page: Any) -> bool:
             if row.kind is ReportKind.PLANET_SCOUTED:
@@ -1970,7 +2052,7 @@ class PirateLoop:
             wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED),
             label=f"{self.REPORT_LABEL}或安全告警",
             visit=visit,
-            not_before=not_before,
+            not_before=floor,
             max_pages=max_pages,
             max_opens=max_opens,
         )
