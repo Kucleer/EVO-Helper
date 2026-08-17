@@ -114,6 +114,29 @@ class DueDispatch:
 
 
 @dataclass(frozen=True)
+class StoredReportClaim:
+    """库里那一份战报此刻认领到了哪一发派遣。**只为排障而存在。**
+
+    去重（`has_report_at`）只回答「这一份在不在库里」，而排障要问的是下一句：
+    **在库里的那一行，认领上派遣了吗？** 两者分家的代价踩过一次（2026-08-17）：
+    实机日志上只有一句「这份战报已经在库里；不重复入库」，而攻击日志页上同一个
+    坐标还挂着「待战报」，看上去自相矛盾。真相是库里那一行 `match_status`
+    是 `UNMATCHED`——它压根不属于页面上那一发，两条记录说的是两次不同的攻击。
+    日志说不出这一句，人就只能靠猜，或者去连生产库。
+
+    `dispatched_at_utc` 是**认领到的那一发**的派出时刻（没认领上就是 None）：
+    排障时真正要对的就是这个时刻与页面上那一行对不对得上，光有一个 UUID
+    还得再查一次库。
+    """
+
+    report_id: UUID
+    #: `MATCHED` / `AMBIGUOUS` / `UNMATCHED`（`_link_dispatch` 写的那三档）。
+    match_status: str | None
+    dispatch_id: UUID | None
+    dispatched_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
 class DailyAttackStatus:
     """某条链路某个 UTC 日的攻击状态，**一行读回**，不必再翻信箱。
 
@@ -586,6 +609,52 @@ class SqlAlchemyRepository:
                 )
             session.commit()
         return matched
+
+    def report_claims_at(
+        self, target: Coordinate, reported_at_utc: datetime
+    ) -> tuple[StoredReportClaim, ...]:
+        """库里「这个目标 + 这个报告时刻」的那几行战报，各自认领到了哪一发派遣。
+
+        去重键（`has_report_at`）与这里问的是同一把键，**故意如此**：排障要看的
+        正是「被那道去重挡下来的，到底是哪一行」。整段理由写在 `StoredReportClaim` 上。
+
+        **只读，一个字节都不写。** 与 `rematch_report_at` 分开正是为了这一点：
+        排障可以随时问，不必担心问一次就改一次库。
+
+        返回元组而不是单行：`battle_reports` 上没有「目标 + 时间」的唯一约束
+        （只有 `dispatch_id` 上有），历史数据里同一把键出现两行是可能的，
+        而那种情况本身就是要看见的东西——静默取第一行等于把它藏起来。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.BattleReportRow.id,
+                    orm.BattleReportRow.match_status,
+                    orm.BattleReportRow.dispatch_id,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                )
+                .outerjoin(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.id == orm.BattleReportRow.dispatch_id,
+                )
+                .where(
+                    orm.BattleReportRow.defender_target_galaxy == target.galaxy,
+                    orm.BattleReportRow.defender_target_system == target.system,
+                    orm.BattleReportRow.defender_target_position == target.position,
+                    orm.BattleReportRow.reported_at_utc == reported_at_utc,
+                )
+                .order_by(orm.BattleReportRow.id)
+            ).all()
+        return tuple(
+            StoredReportClaim(
+                report_id=report_id,
+                match_status=match_status,
+                dispatch_id=dispatch_id,
+                dispatched_at_utc=dispatched_at,
+            )
+            for report_id, match_status, dispatch_id, dispatched_at in rows
+        )
 
     def rematch_unlinked_reports(self, *, limit: int = 500) -> int:
         """重试认领库中尚未挂到派遣的战报，返回本次补上的数量。

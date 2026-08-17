@@ -1,0 +1,16 @@
+b3f5c8d10a27
+  downgrade 操作: drop_column
+b3d7e5a91c04
+  downgrade 操作: drop_index, drop_table
+  会删表: ['battle_report_screenshots']
+c8d2a5f10b74
+  downgrade 操作: drop_column
+c2a8f4d31e75
+  downgrade 操作: drop_column
+c4e8b2f70a15
+  downgrade 操作: drop_index, drop_table, f
+  会删表: ['battle_report_resources']
+a7d4e91c05b3
+  downgrade 操作: drop_column
+d1a7f30c94e6
+  downgrade 操作: drop_column

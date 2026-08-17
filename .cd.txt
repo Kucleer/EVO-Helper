@@ -1,0 +1,5 @@
+库时间 18:03:52
+  BOT      task=2 起于 18:02:55（0.9 分钟前） exit=None
+  BOT      task=2 起于 17:56:28（7.4 分钟前） exit=None
+  RANKING  task=4 起于 17:52:46（11.1 分钟前） exit=75
+  BOT      task=2 起于 17:48:33（15.3 分钟前） exit=75
