@@ -1,0 +1,205 @@
+"""军力榜的「扫描数量范围」：配了就是这一趟的上限，**留空就是全扫**。
+
+用户口径（2026-08-17）：「军力扫描增加扫描数量范围，为空则全扫」。
+
+这个文件钉的是**两件互相制衡**的事，缺一件另一件就会走样：
+
+1. **留空 = 全扫。** 这是加这个框之前就有的行为，也是绝大多数时候想要的：
+   榜单一趟翻到底才写得全。空框在页面上根本不往上送（`missions.html` 里
+   `.mission-param` 的处理器只送非空的），所以 `params_json` 里没有这个键；
+   一旦有人把「没配」当成 0 或者当成某个默认值，采集就会在第 N 个 bot 上
+   收工，而页面上什么都看不出来——库里少的那几千个 bot 不会报错。
+2. **配了 N 就最多 N 个。** 否则这个框是个摆设，用户填完以为限住了，
+   实际上照样跑一个多小时。
+
+参数走 `mission_tasks.params_json`，**没有为它加数据库列**（同 `galaxy` /
+`first_system` 那几个，见 `storage.models` 上那一行的注释）。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+import evo_helper.web
+from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.domain.missions import MissionParamError
+from evo_helper.domain.models import Coordinate
+from evo_helper.domain.scheduler import GAP_FILLERS, MissionKind
+from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.web.persistent_service import ranking_scan_summary
+
+from .conftest import Clock, make_supervisor
+
+ORIGIN = Coordinate(2, 137, 18)
+
+
+@pytest.fixture
+def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[no-untyped-def]
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    return scheduler
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock(datetime(2026, 8, 17, 12, 0, tzinfo=UTC))
+
+
+def _task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
+    return next(row.id for row in repository.mission_tasks() if row.kind == kind.value)
+
+
+def _only_ranking(repository: SqlAlchemyRepository, params_json: str) -> None:
+    """只留军力榜这一条能跑，并给它配上这份参数。
+
+    另一条填空隙的（扫描）必须关掉：不关的话它会顶上来把空隙填掉，
+    于是断言看到的是扫描那条命令行，而不是军力榜的。
+    """
+    for kind in GAP_FILLERS:
+        if kind is not MissionKind.RANKING:
+            repository.update_mission_task(_task_id(repository, kind), enabled=False)
+    repository.update_mission_task(
+        _task_id(repository, MissionKind.RANKING), enabled=True, params_json=params_json
+    )
+
+
+def _launched(scheduler: MissionScheduler, launcher) -> list[str]:  # type: ignore[no-untyped-def]
+    scheduler.start()
+    scheduler.tick()
+    assert launcher.kinds == [MissionKind.RANKING]
+    return list(launcher.latest.command)
+
+
+# -- 留空 = 全扫 ---------------------------------------------------------------
+
+
+def test_an_empty_scan_count_scans_the_whole_ranking(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """没配数量时，起出来的命令行上**一个 `--bot-limit` 都不能有**。
+
+    断言「没有这个开关」而不是「限额等于某个大数」：`ranking_scan.scan()` 判的是
+    `bot_limit is not None`，塞一个「足够大」的数进去在类型上是合法的、在行为上
+    也几乎看不出来，但它会把「全扫」悄悄变成「扫到某个数为止」。
+    """
+    _only_ranking(repository, "{}")
+
+    command = _launched(scheduler, launcher)
+
+    assert "--bot-limit" not in command
+    assert command[1:] == ["-u", "-m", "evo_helper.tools.ranking_scan"]
+
+
+def test_a_blank_scan_count_is_the_same_as_not_configuring_it(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """空串也是「没配」。页面正常不会送它上来，但库里可以有旧值或手改的值。"""
+    _only_ranking(repository, '{"bot_limit": ""}')
+
+    assert "--bot-limit" not in _launched(scheduler, launcher)
+
+
+# -- 配了 N 就最多 N 个 --------------------------------------------------------
+
+
+def test_a_configured_scan_count_caps_this_run(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    _only_ranking(repository, '{"bot_limit": 30}')
+
+    assert _launched(scheduler, launcher)[1:] == [
+        "-u",
+        "-m",
+        "evo_helper.tools.ranking_scan",
+        "--bot-limit",
+        "30",
+    ]
+
+
+def test_the_configured_count_and_the_attack_batch_size_take_the_smaller_one(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """两个上限同时在场时取**小**的那个。
+
+    军力批次（`by_military` 的 bot 任务）本来就会给榜单带一个 `--bot-limit`
+    ——它是「这一批攻击需要几个目标」。用户在军力榜这一行配的数量是另一回事：
+    它是这条链路的天花板。取大的会越过用户划的线，取任务那个又会让批次采不满，
+    所以只能取小的。
+    """
+    _only_ranking(repository, '{"bot_limit": 3}')
+    repository.update_mission_task(
+        _task_id(repository, MissionKind.BOT),
+        enabled=True,
+        params_json='{"by_military": true, "top_n": 50}',
+    )
+
+    command = _launched(scheduler, launcher)
+
+    assert command[-2:] == ["--bot-limit", "3"]
+
+
+# -- 拒掉不可能的取值 ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ['{"bot_limit": 0}', '{"bot_limit": -5}'])
+def test_zero_or_negative_is_refused_instead_of_silently_scanning_nothing(  # type: ignore[no-untyped-def]
+    scheduler, raw: str
+) -> None:
+    """`0` 不是「全扫」，也不是一个能跑的数量：它的意思只能是「别跑」。
+
+    要停掉这条链路有复选框。让 `0` 通过等于起一个必然什么都不采的采集，
+    而页面上它看起来一切正常。
+    """
+    with pytest.raises(MissionParamError):
+        scheduler.command_for(MissionKind.RANKING, raw, origin=ORIGIN)
+
+
+def test_a_non_numeric_scan_count_is_refused(scheduler: MissionScheduler) -> None:
+    with pytest.raises(MissionParamError):
+        scheduler.command_for(MissionKind.RANKING, '{"bot_limit": "很多"}', origin=ORIGIN)
+
+
+# -- 页面上说得出这件事 --------------------------------------------------------
+
+
+def test_the_console_row_says_that_an_empty_box_means_a_full_scan() -> None:
+    """「留空 = 全扫」必须**写在页面上**，不能只写在这份文档里。
+
+    一个空的数字框自己说不出它是什么意思：可能是「还没配」，也可能是
+    「配了但没生效」。回显那一句就是用来消掉这个歧义的。
+    """
+    assert "留空 = 全扫" in ranking_scan_summary({})
+    assert "留空 = 全扫" in ranking_scan_summary({"bot_limit": ""})
+    assert ranking_scan_summary({"bot_limit": 30}) == "本趟最多采 30 个 bot（留空 = 全扫）"
+
+
+def test_the_missions_page_gives_the_ranking_row_a_count_box() -> None:
+    """调度台上军力榜那一行要有这个输入框，而且旁边写着「留空 = 全扫」。
+
+    参数只在库里能存、页面上没地方填，等于这个功能不存在。
+    """
+    page = (Path(evo_helper.web.__file__).parent / "templates" / "missions.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "RANKING: [" in page, "PARAM_FIELDS 里没有军力榜那一条，页面上就不会有输入框"
+    assert "key: 'bot_limit'" in page
+    assert "留空 = 全扫" in page
+
+
+def test_the_console_validates_the_count_with_the_same_ruler_as_the_launcher(
+    scheduler: MissionScheduler,
+) -> None:
+    """页面保存前那道校验走的就是 `command_for`（见 `web.persistent_service._validate`）。
+
+    这条把「能存下来的」和「起得来的」钉成同一件事：两边分家的结果是页面收下了、
+    调度器起不来，而起不来时它只会把任务自动停用，用户要等下次看页面才发现。
+    """
+    assert "--bot-limit" not in scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+    assert scheduler.command_for(MissionKind.RANKING, '{"bot_limit": 7}', origin=ORIGIN)[-2:] == [
+        "--bot-limit",
+        "7",
+    ]

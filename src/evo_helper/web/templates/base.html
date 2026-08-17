@@ -44,6 +44,104 @@
         return `${parts.year}-${parts.month}-${parts.day} `
           + `${parts.hour}:${parts.minute}:${parts.second}`;
       },
+      //: 自动刷新的周期。用户口径（2026-08-17）：「攻击/系统日志页面增加 15 秒
+      //: 自动刷新」。
+      AUTO_REFRESH_MS: 15000,
+
+      //: 让当前这一页每 15 秒自己更新一次。**只有攻击日志与系统日志用它。**
+      //:
+      //: 收在这里而不是两页各抄一份：抄第二份的那天，两处就开始分家——而这段
+      //: 里每一条都是「少了它就会烧掉带宽或者惹恼用户」的：
+      //:
+      //: 1. **重新取的是 `window.location.href`，不是 `/logs`。** 这两页的筛选
+      //:    与翻页全部走 URL 查询参数（两页的模板头上都写着），所以照着当前
+      //:    地址取一遍，取回来的就是**同一份筛选、同一页**。刷掉筛选比不刷还烦。
+      //: 2. **只换标了 `data-refresh` 的那几块**，筛选表单一律不动。整页
+      //:    `location.reload()` 会把用户正在输入的关键字、正在选的下拉框、
+      //:    以及滚动位置一起丢掉，而这两页恰恰是「一边看一边调筛选」的。
+      //: 3. **页面不可见就真的停表**（`visibilityState` / `visibilitychange`），
+      //:    不是发了请求再丢掉。这两页会被挂在后台一整夜，每 15 秒一次的空转是
+      //:    白烧带宽，而每一次都要走一遍 SQL 查询。
+      //: 4. **上一次没回来就不发下一次**（`inFlight`）。库忙的时候一次查询可能
+      //:    超过 15 秒，不挡的话请求会越堆越多，把本来就慢的库压得更慢。
+      //:
+      //: 开关（`#auto-refresh`）与「最后刷新」（`#auto-refresh-note`）由
+      //: `_auto_refresh.html` 那个片段提供；这里只做接线。开关状态按路径记在
+      //: `localStorage` 里：关掉它多半是因为「我正在读这一页」，而那件事不会
+      //: 因为翻了一页就结束。
+      autoRefresh() {
+        const toggle = document.getElementById('auto-refresh');
+        if (!toggle) return null;
+        const note = document.getElementById('auto-refresh-note');
+        // 先把 `this` 抓下来：下面几个嵌套函数里 `this` 已经不是这个对象了，
+        // 而「最后刷新」那一格要走 `localTime()`（控制台上所有时刻一律 UTC+8）。
+        const helper = this;
+        const period = this.AUTO_REFRESH_MS;
+        const key = `evo-helper.auto-refresh:${window.location.pathname}`;
+        let timer = null;
+        let inFlight = false;
+        // localStorage 在某些隐私设置下会直接抛异常；读写一律包起来，
+        // 记不住偏好只是不方便，而抛出去会把整段自动刷新一起废掉。
+        const remembered = (() => {
+          try { return window.localStorage.getItem(key); } catch (_) { return null; }
+        })();
+        // 默认开：没记过就是开着的。
+        toggle.checked = remembered !== 'off';
+
+        const visible = () => document.visibilityState === 'visible';
+
+        function stop() {
+          if (timer !== null) { window.clearInterval(timer); timer = null; }
+        }
+
+        function start() {
+          stop();
+          if (!toggle.checked || !visible()) return;
+          timer = window.setInterval(refresh, period);
+        }
+
+        async function refresh() {
+          if (inFlight || !toggle.checked || !visible()) return;
+          inFlight = true;
+          try {
+            const response = await fetch(window.location.href, {
+              cache: 'no-store',
+              credentials: 'same-origin',
+              headers: { 'X-Auto-Refresh': '1' },
+            });
+            if (!response.ok) return;
+            const fresh = new DOMParser().parseFromString(await response.text(), 'text/html');
+            for (const target of document.querySelectorAll('[data-refresh]')) {
+              // 按 id 对位。取回来的那一页里找不到同一个 id 就不动它——
+              // 宁可留着上一份，也不要把一块内容换成空的。
+              const replacement = target.id ? fresh.getElementById(target.id) : null;
+              if (replacement) target.innerHTML = replacement.innerHTML;
+            }
+            if (note) note.textContent = `最后刷新 ${helper.localTime(new Date())}`;
+          } catch (_) {
+            // 刷新失败不弹窗、也不停表：控制台常在服务重启期间开着，
+            // 一个 alert 会把整页挡住，而下一轮多半就好了。
+            if (note) note.textContent = '最后一次刷新没成功，下一轮会重试';
+          } finally {
+            inFlight = false;
+          }
+        }
+
+        toggle.addEventListener('change', () => {
+          try { window.localStorage.setItem(key, toggle.checked ? 'on' : 'off'); } catch (_) {}
+          start();
+        });
+
+        document.addEventListener('visibilitychange', () => {
+          // 回到前台先补一次：挂了一夜之后，页面上摆着的是离开时那一份。
+          if (visible()) refresh();
+          start();
+        });
+
+        start();
+        return { refresh, start, stop };
+      },
+
       async request(method, url, data) {
         const options = { method, headers: {} };
         if (data !== undefined) {
