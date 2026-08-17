@@ -24,6 +24,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.pirate_reports import OUTCOME_VICTORY
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -33,7 +34,7 @@ PRESET = FleetPresetRef(name="探路", signature="小型运输船:1")
 
 
 def _setup(tmp_path: Path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'log.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "log.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory)

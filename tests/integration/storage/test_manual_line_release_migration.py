@@ -3,9 +3,9 @@
 本地测试用 `Base.metadata.create_all` 建表，所以模型和迁移可以静默分叉：一路全绿，
 只有真实的库会在启动时炸。这里两边对着比一遍。
 
-⚠️ **生产是 Postgres，测试跑 SQLite。** 时区语义只在 Postgres 上有区别
-（`TIMESTAMP WITHOUT TIME ZONE` 会把 tzinfo 静默截掉），而这里跑不到 Postgres，
-所以那一半靠直接对迁移里那个分岔函数断言——见最后一条。
+⚠️ **方言取决于跑在哪**：设了 `EVO_HELPER_TEST_DATABASE_URL`（CI 上就是）时这几条
+跑在真 Postgres 上，不设时仍是 SQLite。最后一条不建库、直接对迁移里那个分岔函数
+断言，所以两种方言下它都在守着——SQLite 那一轮里它是唯一守得住 Postgres 那一半的。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 
 from alembic import command
+from support.database import scratch_database_url
 
 REVISION = "a9d5f31c0e77"
 DOWN_REVISION = "a7f2c9d40b16"
@@ -36,7 +37,7 @@ def _config(database_url: str) -> Config:
 
 @pytest.fixture
 def database_url(tmp_path: Path) -> str:
-    return f"sqlite:///{tmp_path / 'migration.db'}"
+    return scratch_database_url(tmp_path, "migration.db")
 
 
 def test_upgrade_adds_a_nullable_column(database_url: str) -> None:
@@ -87,7 +88,7 @@ def test_upgrade_is_replayable_after_a_downgrade(database_url: str) -> None:
     assert COLUMN in columns
 
 
-def test_the_migration_matches_the_orm_model(database_url: str) -> None:
+def test_the_migration_matches_the_orm_model(database_url: str, tmp_path: Path) -> None:
     """迁移建出来的列，和 `create_all` 建出来的必须一模一样。
 
     分叉了不会有人报错——测试库走 `create_all`，真库走迁移，两边各自都对。
@@ -100,8 +101,9 @@ def test_the_migration_matches_the_orm_model(database_url: str) -> None:
         for column in inspect(create_engine(database_url)).get_columns("attack_dispatches")
     }
 
-    orm_url = database_url.replace("migration.db", "orm.db")
-    orm_engine = create_engine(orm_url)
+    # 另开一个库：迁移建的那份和 `create_all` 建的那份必须互不干扰，
+    # 不然后建的那次 `checkfirst` 会直接跳过，比出来永远相等。
+    orm_engine = create_engine(scratch_database_url(tmp_path, "orm.db"))
     Base.metadata.create_all(orm_engine)
     created = {
         column["name"]: (str(column["type"]), column["nullable"])

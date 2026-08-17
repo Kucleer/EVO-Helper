@@ -7,10 +7,11 @@ from sqlalchemy import create_engine, inspect, text
 
 from evo_helper.config import Settings
 from evo_helper.web.runtime import create_runtime_app
+from support.database import scratch_database_url
 
 
 def test_runtime_migrates_database_and_serves_persistent_api(tmp_path: Path) -> None:
-    database_url = f"sqlite:///{tmp_path / 'runtime.db'}"
+    database_url = scratch_database_url(tmp_path, "runtime.db")
     app = create_runtime_app(Settings(database_url=database_url), local_token="runtime-token")
     client = TestClient(app)
     response = client.post(
@@ -62,7 +63,7 @@ def test_applying_migrations_does_not_silence_application_logging(tmp_path: Path
     logger = logging.getLogger("evo_helper.vision.live_reports")
     logger.setLevel(logging.INFO)
 
-    _upgrade_database(f"sqlite:///{tmp_path / 'migrated.db'}")
+    _upgrade_database(scratch_database_url(tmp_path, "migrated.db"))
 
     assert logger.isEnabledFor(logging.INFO)
     assert not logger.disabled

@@ -28,6 +28,7 @@ from evo_helper.vision.scout_reports import (
     VERDICT_UNREADABLE,
     PirateScoutReading,
 )
+from support.database import scratch_database_url
 
 ORIGIN = Coordinate(2, 137, 18)
 TARGET = Coordinate(2, 137, 4)
@@ -56,7 +57,7 @@ def _reading(
 
 
 def _repository(tmp_path: Path) -> tuple[SqlAlchemyRepository, object]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'scout.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "scout.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     return SqlAlchemyRepository(factory), factory

@@ -21,6 +21,7 @@ from evo_helper.domain.records import RankingTarget
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 #: 造数据的读取时刻。**必须相对当下算，不能写死一个日期。**
 #:
@@ -30,7 +31,7 @@ READ_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=1)
 
 
 def _client(tmp_path: Path) -> tuple[TestClient, SqlAlchemyRepository]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'rankings.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "rankings.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     client = TestClient(create_persistent_app(factory, local_token="test-token"))

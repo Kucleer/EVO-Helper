@@ -20,15 +20,42 @@ ruff format --check src tests
 mypy src
 ```
 
+### Which database the tests run on
+
+`pytest -q` builds its scratch databases through `tests/support/database.py`, which picks the
+dialect from one environment variable:
+
+| `EVO_HELPER_TEST_DATABASE_URL` | scratch database |
+| --- | --- |
+| unset | a SQLite file per test — fast, good enough for local iteration |
+| a PostgreSQL URL | one schema per test inside that database — same dialect as production |
+
+CI sets it, so every pull request is checked against PostgreSQL. That matters: on 2026-08-16 the
+`/planets` page returned 500 in production because a category count selected a column that was not
+in its `GROUP BY` — SQLite tolerates that, PostgreSQL raises `GroupingError`, and all 226 tests
+covering the page were green on SQLite.
+
+To run against PostgreSQL locally, point the variable at a **scratch** database (never production)
+and install the `db` extra for the driver:
+
+```powershell
+python -m pip install -e ".[dev,db]"
+$env:EVO_HELPER_TEST_DATABASE_URL = "postgresql+psycopg://user:password@host:5432/evo_helper_test"
+pytest -q
+python tests/support/database.py   # drop the evotest_* schemas afterwards
+```
+
 Run the persistent local management service after installing dependencies:
 
 ```powershell
 evo-web
 ```
 
-Startup applies the bundled migrations to whatever `EVO_HELPER_DATABASE_URL` points at —
-SQLite by default, PostgreSQL in the live deployment (install the `db` extra for the driver;
-see [`docs/部署到挂机机器.md`](docs/部署到挂机机器.md)).
+Startup applies the bundled migrations to whatever `EVO_HELPER_DATABASE_URL` points at.
+The live deployment is PostgreSQL — install the `db` extra for the driver; see
+[`docs/部署到挂机机器.md`](docs/部署到挂机机器.md). There is no silent SQLite fallback: with no
+configuration at all the default URL points at a local PostgreSQL that most likely does not exist,
+so a missing `.env` fails loudly instead of quietly opening an empty database.
 
 The service binds `0.0.0.0:8770` by default so other devices on the LAN can open the console —
 a deliberate choice, and the reason it is only fit for a trusted network. Set
