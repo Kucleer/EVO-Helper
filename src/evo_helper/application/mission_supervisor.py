@@ -1,7 +1,8 @@
 """任务子进程的起停。
 
-照 `tools/scan_console.py` 的 `ScanSupervisor` 长，但**去掉了自动续跑**。
-那是扫描链路的特性：扫描不派遣、断在哪都能接着扫，所以它自己重启没有代价。
+照早先桌面悬浮窗里那个 `ScanSupervisor` 长（已随悬浮窗一并删除），但**去掉了
+自动续跑**。那是扫描链路的特性：扫描不派遣、断在哪都能接着扫，所以它自己重启
+没有代价。
 攻击类任务自己重启会连着再派一轮舰队——一天 32 次配额可以在没人看着的时候
 悄悄打光。起不起下一个由调度器按判据决定，不由子进程的退出来决定。
 
@@ -23,7 +24,7 @@ from typing import Protocol
 
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, MissionKind
 
-#: 子进程日志的落脚处。与 `tools/scan_console.py` 同一个目录。
+#: 子进程日志的落脚处。
 LOG_DIR = Path("var/logs")
 
 #: `terminate()` 之后等它收尾的秒数。等不到就放手——一个不肯死的子进程不该让

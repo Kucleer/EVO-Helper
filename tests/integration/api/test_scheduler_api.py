@@ -39,7 +39,6 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.tools.scan_console import parse_scheduler
 from evo_helper.web.app import create_persistent_app
 from support.database import scratch_database_url
 
@@ -318,7 +317,7 @@ def test_every_task_is_listed_in_priority_order(console: Console) -> None:
 
 
 def test_every_task_carries_a_status_and_a_detail(console: Console) -> None:
-    """悬浮窗是个瘦客户端：它不查库，状态那句话必须由这个接口给全。"""
+    """页面不查库：状态那句话必须由这个接口给全。"""
     assert console.task("SCAN")["status"] == "待命"
     assert console.task("PIRATE")["status"] == "未启用"
     assert console.task("BOT")["status"] == "未启用"
@@ -396,7 +395,7 @@ def test_starting_and_stopping_flips_the_flag(console: Console) -> None:
 
 
 def test_the_running_child_is_reported_with_its_log(console: Console) -> None:
-    """悬浮窗要显示「当前跑的是哪条链路、已运行多久」，两样都从这里取。"""
+    """页面要显示「当前跑的是哪条链路、已运行多久」，两样都从这里取。"""
     console.start()
     console.scheduler.tick()
     console.clock.now = NOW + timedelta(minutes=2)
@@ -960,32 +959,37 @@ def test_force_kill_stops_the_child_we_do_know_about(console: Console) -> None:
     assert body["running"] is False
 
 
-# -- 桌面悬浮窗的契约 -----------------------------------------------------------
+# -- 页面顶栏的契约 -------------------------------------------------------------
 
 
-def test_the_desktop_window_can_read_this_endpoint(console: Console) -> None:
-    """桌面悬浮窗（`tools/scan_console.py`）解的就是这个回包。
+def test_the_header_gets_the_state_the_stopwatch_and_the_label(console: Console) -> None:
+    """页面顶栏那三样——跑没跑、跑了多久、跑的是哪条链路——全在这个回包里。
 
-    悬浮窗那边只能拿假回包测自己，接口这边只能测自己的字段——两边都绿、
-    形状却对不上，是这种「服务端下发、客户端照抄」的接口最典型的失效方式，
-    而它在实机上表现为状态窗一直显示「未连接」，没有任何报错。
-    所以在真接口的回包上跑一遍悬浮窗的解析器。
+    这三个字段是「服务端下发、页面照抄」：页面只做显示，一个字都不自己拼。
+    所以少一个字段不会报错，只会让顶栏静静地缺一块——秒表不动、链路名空着，
+    而调度器其实好好地在派舰队。这条把三样一次钉住。
+
+    （这原本是桌面悬浮窗的契约测试。悬浮窗 2026-08-17 删掉了，但它读的正是
+    页面读的同一份回包，所以断言留下来，改成对着页面的口径写。）
     """
-    stopped = parse_scheduler(console.get())
-    assert stopped.running is False
-    assert stopped.current is None
+    stopped = console.get()
+    assert stopped["running"] is False
+    assert stopped["current"] is None
+    assert stopped["started_at_utc"] is None
 
     console.start()
     console.scheduler.tick()
     console.clock.now = NOW + timedelta(minutes=2)
 
-    snapshot = parse_scheduler(console.get())
-    assert snapshot.running is True
-    assert snapshot.started_at_utc == NOW
-    assert snapshot.current is not None
-    # 链路名由服务端下发，悬浮窗不自己拼——两处各写一份就会有一天对不上。
-    assert snapshot.current.label == "扫描全星系 bot"
-    assert snapshot.current.started_at_utc == NOW
+    body = console.get()
+    assert body["running"] is True
+    # 顶栏那块「已运行」秒表从它算起。
+    assert body["started_at_utc"].startswith("2026-08-09T12:00")
+    current = body["current"]
+    assert isinstance(current, dict)
+    # 链路名由服务端下发，页面不自己拼——两处各写一份就会有一天对不上。
+    assert current["label"] == "扫描全星系 bot"
+    assert current["started_at_utc"].startswith("2026-08-09T12:00")
 
 
 # -- 旧页面 ---------------------------------------------------------------------

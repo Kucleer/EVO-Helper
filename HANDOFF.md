@@ -379,12 +379,6 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates --status
 .venv/Scripts/python.exe -m evo_helper.tools.scan_coordinates
 
-# 桌面状态窗：调度器的瘦客户端。右下角显示「现在跑的是哪条链路 + 跑了多久」，
-# Alt+F8 开始调度 / Alt+F9 结束调度（等同网页上的开始/结束）。
-# **它自己不起任何进程**，得先把上面那台 Web 服务跑起来，否则只显示「未连接」。
-.venv/Scripts/python.exe -m evo_helper.tools.scan_console
-.venv/Scripts/python.exe -m evo_helper.tools.scan_console --stop-key ctrl+alt+f9
-
 # 旧的扫描结果入库（外部 JSON）
 .venv/Scripts/python.exe -m evo_helper.tools.ingest_scan --results <json> --run-id <uuid>
 ```
@@ -395,8 +389,7 @@ bot 的位号分布大致均匀（位 5–20 各 3–11 个）。
 > 扫描期间会**反复把游戏窗口提到前台并操作鼠标**，机器在此期间不能同时用于别的事。
 > 急停：把鼠标甩到屏幕左上角（`pyautogui.FAILSAFE`）。
 
-⚠️ **这台机器上 `Alt+F9` 与 `Alt+F10` 被 NVIDIA ShadowPlay 占用**
-（`RegisterHotKey` 返回错误码 1409）。控制台会逐个注册、逐个报告，
-能用的照常生效；换键用 `--stop-key ctrl+alt+f9`（实测空着），
-或去 GeForce Experience 里把录制快捷键改掉。状态窗右键=结束调度，不依赖任何注册。
-（右键**只停不启**：做成切换的话，在状态刚变过的那一瞬右键会变成又起一轮。）
+ℹ️ 屏幕右下角那个桌面状态窗（`tools/scan_console.py`）**2026-08-17 删了**，
+连同它的 `Alt+F8` / `Alt+F9` 全局快捷键。控制台能远程访问之后它就没有存在意义了：
+它显示的三样（跑没跑、哪条链路、跑了多久）网页顶栏上全有，起停也在页面上。
+要看要控，浏览器打开 `http://<挂机机器>:8770/missions`。

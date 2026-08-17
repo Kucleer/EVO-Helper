@@ -829,7 +829,7 @@ class PersistentApplicationService:
 
 
 class MissionConsoleService:
-    """调度台的读写口。页面和桌面悬浮窗都只跟它说话。
+    """调度台的读写口。页面只跟它说话。
 
     它**不含任何调度判据**：起谁、为什么不起，全部问 `domain.scheduler`；
     参数合不合格，全部问调度器自己那段换算（`MissionScheduler.command_for`）。

@@ -108,7 +108,7 @@ workflow / web schema 与 API / 每页都显示的「🔒 演习模式 已锁定
   这也解释了之前 #60 里记的「窗口自己变回 1536×733」，那是 DPI 假象，不是真缩。
 - **旧的网页服务进程会活着占住 8770。** 迁移之后 `/runs`、`/logs` 报 500，不是
   代码问题——是迁移前启动的老进程还在服务，它的模型里还有 `dry_run` 列。
-  改完库一定要把所有 `evo_helper.web.runtime` / `scan_console` 进程杀干净再起。
+  改完库一定要把所有 `evo_helper.web.runtime` 进程杀干净再起。
 - 改配置要带同源头：`PATCH /api/missions/{kind}` 等改动请求会被
   `LocalSecurityMiddleware` 403，除非带 `Origin: http://127.0.0.1:8770`。
 
