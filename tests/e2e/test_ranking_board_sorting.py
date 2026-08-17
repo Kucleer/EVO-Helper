@@ -73,13 +73,19 @@ def test_the_board_defaults_to_newest_read_first(tmp_path: Path) -> None:
     用户口径（2026-08-17）：「默认时间排序」。数据故意让两种排序给出不同的顺序：
     军力值最高的 `2:100:5` 是三行里读得最早的那一条，所以只要默认还挂在军力值上，
     它就会窜到第一行。
+
+    ⚠️ **接口和仓储两处的默认值都要钉。** 接口每次都显式把 `sort` 传下去，所以
+    只测接口的话，仓储签名上那个默认值改成什么都没人管——变异测试当场逮到了这一点。
     """
-    client, repository, _ = _client(tmp_path)
+    client, repository, board = _client(tmp_path)
     repository.save_ranking_targets(list(BOARD))
 
     payload = client.get("/api/military-rankings").json()
 
     assert _coordinates(payload) == list(reversed(ASCENDING["observed_at"]))
+    assert [str(row.coordinate) for row in board.live_board().rows] == list(
+        reversed(ASCENDING["observed_at"])
+    )
 
 
 @pytest.mark.parametrize("sort", get_args(BoardSort))
