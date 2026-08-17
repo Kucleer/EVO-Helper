@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.target_order import (
+    DEFAULT_SCORE_MAX_AGE,
     TOP_BY_MILITARY,
     ScoredTarget,
+    score_is_fresh,
+    split_by_freshness,
     strongest_first,
     strongest_then_nearest,
 )
 
 HOME = Coordinate(2, 137, 18)
+NOW = datetime(2026, 8, 17, 5, 28, tzinfo=UTC)
+TWO_HOURS = timedelta(hours=2)
 
 
-def _target(system: int, score: float | None, *, galaxy: int = 2) -> ScoredTarget:
-    return ScoredTarget(Coordinate(galaxy, system, 5), score)
+def _target(
+    system: int,
+    score: float | None,
+    *,
+    galaxy: int = 2,
+    scanned_at: datetime | None = None,
+) -> ScoredTarget:
+    return ScoredTarget(Coordinate(galaxy, system, 5), score, scanned_at)
 
 
 # -- 两步的地位完全不同 --------------------------------------------------------
@@ -124,6 +137,10 @@ def test_the_cap_never_drops_a_target_whose_score_is_unknown() -> None:
 
     「不知道多强」不构成「一定太强」。按上限把 None 一起扔掉的话，凡是没被
     榜单扫到过的 bot 就永远不会被攻击——而那正是库里最多的一批。
+
+    ⚠️ 顺带记一笔：这个上限**目前是空转的**。用户口径（2026-08-17）：「目前的 bot
+    的军事能力不存在太强这个可能性……已知周一刷新当日 bot 的最高战力只有 70 多 K」。
+    留着不删是为了哪天 bot 变强，不是因为它现在在挡什么。
     """
     ordered = strongest_then_nearest([_target(140, None)], HOME, max_score=100_000.0)
 
@@ -135,3 +152,77 @@ def test_no_cap_keeps_even_the_strongest() -> None:
     ordered = strongest_then_nearest([_target(140, 1_773_000.0)], HOME)
 
     assert [item.system for item in ordered] == [140]
+
+
+# -- 读数的新鲜度 --------------------------------------------------------------
+
+
+def test_a_reading_inside_the_window_is_fresh() -> None:
+    """有效期之内的读数照打。边界取「小于」：正好等于有效期算超期。"""
+    just_read = _target(140, 9_000.0, scanned_at=NOW - timedelta(minutes=1))
+    right_on_the_line = _target(141, 9_000.0, scanned_at=NOW - TWO_HOURS)
+
+    assert score_is_fresh(just_read, now=NOW, max_age=TWO_HOURS) is True
+    assert score_is_fresh(right_on_the_line, now=NOW, max_age=TWO_HOURS) is False
+
+
+def test_a_reading_older_than_the_window_is_not_fresh() -> None:
+    """实机 2026-08-17：`4:293:6` 的读数是 01:50 UTC，攻击发生在 05:28——3.6 小时。
+
+    用户设的是 1 小时，而那一版只在日志里记一句就照样派了出去。
+    """
+    stale = _target(293, 9_000.0, galaxy=4, scanned_at=datetime(2026, 8, 17, 1, 50, tzinfo=UTC))
+
+    assert score_is_fresh(stale, now=NOW, max_age=timedelta(hours=1)) is False
+
+
+def test_a_target_without_a_score_is_never_called_fresh_or_expired() -> None:
+    """⚠️ **没有分数的目标在这里恒为假，而那不表示它出局。**
+
+    `score_is_fresh` 只回答「这个**分数**还能不能用来排序」。没有分数就没有可排的
+    东西，所以它为假；能不能打是 `split_by_freshness` 那一层的事，那里把它放进
+    补位池。两件事合起来问的那一版，把库里最多的那批目标（从没上过榜的）
+    永久排除掉了。
+    """
+    assert score_is_fresh(_target(140, None), now=NOW, max_age=TWO_HOURS) is False
+    assert score_is_fresh(_target(141, None, scanned_at=NOW), now=NOW, max_age=TWO_HOURS) is False
+
+    split = split_by_freshness([_target(140, None)], now=NOW, max_age=TWO_HOURS)
+    assert split.expired == (), "没有分数不等于分数过期"
+    assert [item.coordinate.system for item in split.unrated] == [140]
+
+
+def test_a_score_without_a_reading_time_is_expired() -> None:
+    """读到过分数、却没有读取时刻，算过期：说不清什么时候读的分数不能拿来排序。"""
+    split = split_by_freshness([_target(141, 9_000.0)], now=NOW, max_age=TWO_HOURS)
+
+    assert [item.coordinate.system for item in split.expired] == [141]
+
+
+def test_the_split_keeps_the_order_it_was_given() -> None:
+    """分堆只做分，不做排。排序是后面两步（军力截断、距离补位）的事。"""
+    split = split_by_freshness(
+        [
+            _target(400, 100.0, scanned_at=NOW),
+            _target(140, 9_000.0, scanned_at=NOW - timedelta(days=3)),
+            _target(200, 8_000.0, scanned_at=NOW),
+            _target(300, None),
+        ],
+        now=NOW,
+        max_age=TWO_HOURS,
+    )
+
+    assert [item.coordinate.system for item in split.rated] == [400, 200]
+    assert [item.coordinate.system for item in split.unrated] == [300]
+    assert [item.coordinate.system for item in split.expired] == [140]
+
+
+def test_the_default_window_is_about_twice_one_scan_round() -> None:
+    """⚠️ **默认取「一轮扫描时长的约 2 倍」，不是 1 小时。**
+
+    实测一轮军力榜扫描约 61 分钟（1000 个 · 8.7--16.3 个/分）。军力榜按军力降序排、
+    扫描也从上往下读，所以一轮扫完之后先读到的（军力最高的）读数最旧。有效期若卡在
+    「刚好一轮时长」附近，任何时刻能通过筛选的恰恰是这一批里**军力最低**的那些
+    ——而「军力优先」正是为了打高军力的。改回 1 小时会把这个模式的意义抵消掉。
+    """
+    assert DEFAULT_SCORE_MAX_AGE == timedelta(hours=2)

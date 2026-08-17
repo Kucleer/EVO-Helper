@@ -29,6 +29,12 @@ from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_sp
 from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
+from evo_helper.game.ranking_ui import (
+    BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_SAMPLES,
+    BLIND_SCROLLS,
+    BLIND_SCROLLS_MAX,
+)
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import (
@@ -609,7 +615,16 @@ def create_app(
         return templates.TemplateResponse(
             request=request,
             name="settings.html",
-            context={"active": "settings"},
+            # 盲拖那几个数从 `game.ranking_ui` 传进模板，不在 HTML 里手抄一遍：
+            # 抄一遍之后调常量页面不跟，而页面上那句话正是用户判断「填多少」的
+            # 唯一依据。
+            context={
+                "active": "settings",
+                "blind_scrolls_default": BLIND_SCROLLS,
+                "blind_scrolls_max": BLIND_SCROLLS_MAX,
+                "blind_scroll_samples": BLIND_SCROLL_SAMPLES,
+                "blind_scroll_margin": BLIND_SCROLL_MARGIN,
+            },
         )
 
     @app.get("/intel", response_class=HTMLResponse)
@@ -1077,7 +1092,10 @@ def _attack_planet_out(view: AttackPlanetView) -> AttackPlanetOut:
 
 
 def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttackConfigOut:
-    return MilitaryAttackConfigOut(tiers=[MilitaryTierIn(**tier) for tier in view.tiers])
+    return MilitaryAttackConfigOut(
+        tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
+        blind_scrolls=view.blind_scrolls,
+    )
 
 
 def _scheduler_out(view: SchedulerView) -> SchedulerOut:
@@ -1138,7 +1156,8 @@ def register_mission_routes(app: FastAPI) -> None:
     ) -> MilitaryAttackConfigOut:
         return _military_attack_config_out(
             console.replace_military_attack_tiers(
-                tuple(item.model_dump() for item in payload.tiers)
+                tuple(item.model_dump() for item in payload.tiers),
+                blind_scrolls=payload.blind_scrolls,
             )
         )
 

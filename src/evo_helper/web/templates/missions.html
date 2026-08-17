@@ -677,10 +677,26 @@
       const settings = document.createElement('div');
       settings.className = 'military-settings';
       const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力候选数量' });
-      const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限' });
-      const rescan = makeInput('military-rescan-hours', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力榜重扫提示小时数' });
-      settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　榜单超过 '), rescan, document.createTextNode(' 小时提示重扫'));
+      // ⚠️ 这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
+      // 最高战力只有 70 多 K，离打不动还很远），留着是为了哪天 bot 变强。
+      // 别以为页面上填了它就在挡什么。
+      const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限', title: '实测 bot 最高战力约 70K，这个上限目前挡不掉任何目标；留着备用' });
+      // ⚠️ 这一格从前叫「榜单超过 N 小时提示重扫」，那时它真的只是提示：日志记一句，
+      // 照样拿旧分数派遣。现在它是硬判据（分数过期的目标不进排序），所以文案跟着
+      // 改成「有效期」。改名不是措辞问题——2026-08-17 实机就是因为「日志说的不是
+      // 实话」才让一份 3.6 小时前的读数派了出去。
+      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '分数超过这个时长的目标本轮跳过（不是提示，是硬判据）；从没读到过分数的不受影响，按距离补位' });
+      settings.append('候选 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　军力分数有效期 '), maxAge, document.createTextNode(' 小时'));
       params.append(settings);
+      // 用户要手动调这个数（主要是周一 bot 刷新日），所以那两条约束必须看得见：
+      // ① 有效期一旦卡在「一轮扫描时长」附近，能通过筛选的恰恰是这一批里军力最低的
+      //    那些（榜单按军力降序扫，先读到的读数最旧），「军力优先」就被抵消掉了；
+      // ② 它只管有分数的那些，免得用户以为调紧它会让助手少打。
+      const advice = document.createElement('div');
+      advice.className = 'muted';
+      advice.style.fontSize = '11px';
+      advice.textContent = '实测一轮军力榜扫描约 60 分钟（1000 个 · 8.7–16.3 个/分）；有效期取一轮时长的约 2 倍，卡在一轮时长附近会只剩低军力目标可打。只影响有分数的目标：从没读到过分数的不参与排序，主力不够时按距离补位。';
+      params.append(advice);
     }
     const summary = document.createElement('div');
     summary.className = 'muted mission-summary';
@@ -901,7 +917,9 @@
         mode.checked = task.params.by_military === true;
         row.querySelector('.military-top-n').value = task.params.top_n ?? 50;
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
-        row.querySelector('.military-rescan-hours').value = task.params.rescan_after_hours ?? 6;
+        // 旧任务的 params_json 里还存着从前那个键，回显要认得出来，
+        // 否则页面会把用户配好的数显示成默认值，保存一次就真的改掉了。
+        row.querySelector('.military-score-max-age').value = task.params.score_max_age_hours ?? task.params.rescan_after_hours ?? 2;
         loadMilitaryOrigins(task, row);
       }
       if (task.kind === 'BOT') setMilitaryVisible(row, locked);
@@ -1088,12 +1106,14 @@
     const payload = { ...task.params, by_military: enabled };
     if (!enabled) return patch(taskId, payload);
     const topN = Number(row.querySelector('.military-top-n').value);
-    const rescan = Number(row.querySelector('.military-rescan-hours').value);
+    const maxAge = Number(row.querySelector('.military-score-max-age').value);
     const maximumText = row.querySelector('.military-max-score').value.trim();
     if (!Number.isInteger(topN) || topN < 1) throw new Error('候选数量必须是大于 0 的整数');
-    if (!Number.isFinite(rescan) || rescan <= 0) throw new Error('重扫提示小时数必须大于 0');
+    if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error('军力分数有效期（小时）必须大于 0');
     payload.top_n = topN;
-    payload.rescan_after_hours = rescan;
+    payload.score_max_age_hours = maxAge;
+    // 存下来的那一份只留新名字，免得两个键各存一个数、以后谁也说不清听哪个。
+    delete payload.rescan_after_hours;
     if (maximumText === '') delete payload.max_score;
     else {
       payload.max_score = Number(maximumText);

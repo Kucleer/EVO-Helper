@@ -97,6 +97,28 @@ class MissionKind(Enum):
     RANKING = "RANKING"
 
 
+class DisabledRecovery(Enum):
+    """一次自动停用**靠什么被放回来**。落在 `mission_tasks.disabled_recovery` 上。
+
+    停用原因（`disabled_reason`）是写给人看的一句中文，措辞随时会改；这一列是
+    写给判据看的。两者必须分开：拿中文去认「这次停用会不会自愈」，改一次文案
+    就静默失效，而失效的样子正是「任务停用之后再也没人放它出来」。
+
+    `MANUAL` 是**默认**，也是唯一安全的默认：认不出来的一律要用户动手。
+    连续失败达上限就属于这一档——它说的是「这不是暂时的」，自动放它出来只会
+    让调度循环回到那个满速空转的重启循环里。
+
+    `FREE_LINES` 那一档的成立条件由 `application.mission_scheduler` 每 tick
+    **现算**（此刻这个任务那颗出发星球上到底有没有空闲航线），不挂定时器：
+    调度器进程会重启，内存里的闹钟一重启就没了，现算的判定重启后照样成立。
+    """
+
+    #: 只有人能放它出来（页面上那个「恢复」按钮，或者改一次任务配置）。
+    MANUAL = "MANUAL"
+    #: 出现空闲航线就自己回来。停用它的是 `domain.missions.NoFreeLineError`。
+    FREE_LINES = "FREE_LINES"
+
+
 #: **填空隙**的那几种任务：不派遣舰队、没有完成态、排最后、可被攻击抢占。
 #:
 #: 抽成集合而不是继续逐处写 `is MissionKind.SCAN`，是因为 2026-08-15 加军力榜

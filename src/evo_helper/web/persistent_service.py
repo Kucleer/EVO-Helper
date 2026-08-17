@@ -1295,22 +1295,30 @@ class MissionConsoleService:
             tiers = json.loads(row.tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
             raise ServiceError("全局军力档位配置损坏") from exc
-        return MilitaryAttackConfigView(tuple(tiers))
+        return MilitaryAttackConfigView(tuple(tiers), blind_scrolls=row.blind_scrolls)
 
     def replace_military_attack_tiers(
-        self, tiers: tuple[dict[str, Any], ...]
+        self, tiers: tuple[dict[str, Any], ...], *, blind_scrolls: object = None
     ) -> MilitaryAttackConfigView:
+        """整份全局攻击配置原子替换。
+
+        `blind_scrolls` 走和档位同一次 `PUT`：这一页是整份替换，两项各配一个
+        「只改自己」的接口，等于给「保存了 A 把 B 冲掉」留了两条路。
+        """
         self._refuse_global_config_while_running()
         normalized = [dict(tier) for tier in tiers]
         try:
             self._scheduler.validate_military_tiers(normalized)
+            scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
-            json.dumps(normalized, ensure_ascii=False)
+            json.dumps(normalized, ensure_ascii=False), blind_scrolls=scrolls
         )
         self._invalidate_scheduler_view()
-        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
+        return MilitaryAttackConfigView(
+            tuple(json.loads(row.tiers_json)), blind_scrolls=row.blind_scrolls
+        )
 
     def create_mission(
         self,
@@ -1666,9 +1674,13 @@ class MissionConsoleService:
                 # 数字本身没有能对上的口径，所以宁可不说，也不换算一个假的出来。
                 if remaining > 0:
                     return ""
-                # 池子空了是句能站住的事实：已知 bot 全在 24 小时冷却里或还在飞。
+                # 池子空了是句能站住的事实，但**成因有两个**，所以两个都得说出来：
+                # 已知 bot 全在 24 小时冷却里（或还在飞），或者它们的军力**分数**
+                # 全都过了有效期（`domain.target_order.split_by_freshness`）。只说
+                # 前一个的话，用户会去等 24 小时过去，而实际要等的是军力榜扫描。
+                # 「从没读到过分数」不在成因之列——那一档走补位池，照样能打。
                 # 不写「本轮已全部完成」——军力模式没有那个「轮」。
-                return "近 24 小时内暂无可打目标"
+                return "暂无可打目标（近 24 小时打过，或军力分数已过期）"
             if remaining <= 0:
                 return "本轮已全部完成"
             return f"还剩 {remaining} 个未完成"

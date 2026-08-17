@@ -19,6 +19,12 @@
 3. **只有「前往此处」那一个 x 进代码**（`pirate_ui.PLANET_GOTO_COLUMN_X`），
    其余七个图标的坐标本仓根本不存在。
 
+## 一行都没读出来 ≠ 列表里没有这颗星球
+
+前者多半是**有别的浮层盖着导航栏**，那时点「行星」那一下压根没打开任何东西；
+后者才是「配错了出发星球」。两种的善后完全相反，所以只有前者才去关浮层重读一遍
+（`PLANET_LIST_OVERLAY_RETRIES`，用的是全仓共用的 `game.overlay`）。
+
 ## 拖动用慢拖，不用一步式 drag
 
 `tools.pirate_loop.slow_drag` 的注释里写着：一步到位的 `dragTo` 会被游戏面板
@@ -42,6 +48,7 @@ from evo_helper.domain.planet_switch import (
     origin_confirmed,
     rows_from_words,
 )
+from evo_helper.game.overlay import OVERLAY_CLOSE_ATTEMPTS, dismiss_overlays
 from evo_helper.game.pirate_ui import (
     FLEET_PANEL_OPEN_WAIT_S,
     NAV_FLEET,
@@ -67,6 +74,19 @@ PLANET_LIST_REREAD_WAIT_S = 0.6
 #: 一张行星列表的 OCR 绝不能无限占住攻击轮。超时一律当作本帧没读到；
 #: ``PlanetSwitcher`` 会按既有的确认策略重读，仍为空则安全地不点击。
 PLANET_LIST_OCR_TIMEOUT_S = 8.0
+
+#: 「一行都没读出来」时，关掉浮层再重开列表读一遍——**只此一遍**。
+#:
+#: ⚠️ 实机事故（2026-08-17 11:20–11:40）：游戏停在「太空舱」面板上（材料/星云/
+#: 加速器/资源/舰长/行星工具 那一屏），它把整条底部导航栏连同行星列表一起盖住了。
+#: 于是每一轮都是同一段：点 `NAV_PLANET` 那一下落在浮层上、什么也没打开 → 逐屏
+#: 读到 `[[]]` → 判 `NOT_FOUND` → 「这一轮一发都不派」。**连续多轮，一发没派。**
+#: 而关浮层的机制早就有（`game.overlay`），只是从没接到这条链路上——攻击链路里
+#: 没有任何一步会去关那个面板。
+#:
+#: 上限是 1：关完重读还是空，就是真的读不出（OCR 配置、视口漂了、界面改版），
+#: 那时照常 `NOT_FOUND` 安全退出。做成循环重试只会把整轮卡死在一个面板上。
+PLANET_LIST_OVERLAY_RETRIES = 1
 
 
 class SwitchResult(Enum):
@@ -111,15 +131,21 @@ class PlanetSwitcher:
     read_origin: Callable[[], str]
     say: Callable[[str], None] = print
     dry_run: bool = False
+    #: 走到「关浮层重读」那一支时留下的现场：`(一句话, 结构化 payload)`。
+    #:
+    #: 默认空操作，实机由 `tools.pirate_loop` 接到 `system_log`（还捎一张缩略图）。
+    #: 不在这一层直接写库：`game/` 整层都不认识 `infrastructure/`，而且真写进去了
+    #: 单元测试就得有库。
+    record_evidence: Callable[[str, dict[str, Any]], None] = lambda _message, _payload: None
     #: 每一屏读到的行，按顺序记下来，找不到时原样说出去（照 `PresetNotFound` 的做法）。
     screens: list[list[str]] = field(default_factory=list)
 
     def switch_to(self, target: Coordinate) -> SwitchResult:
         """切到 `target`，返回结局。**任何一步认不出都不点**。"""
         self.screens = []
-        self.driver.click(*NAV_PLANET, label="行星列表")
-        self.driver.wait(PLANET_LIST_OPEN_WAIT_S)
-        row = self._locate(target)
+        row = self._open_and_locate(target)
+        if row is None and self._read_nothing_at_all():
+            row = self._retry_behind_overlays(target)
         if row is None:
             self.say(f"  行星列表上找不到 {target}；逐屏读到的是 {self.screens}；什么都不点")
             self._close()
@@ -140,6 +166,65 @@ class PlanetSwitcher:
         # 反过来，顺手在这里补一个 `_close()` 同样是错的：那时点的 (750, 71) 落在
         # 新星球的画面上，那个位置上有什么本仓没有标定过。
         return self._confirm(target)
+
+    # -- 开列表、找那一行 ---------------------------------------------------
+
+    def _open_and_locate(self, target: Coordinate) -> PlanetRow | None:
+        """点开行星列表浮层，然后一屏一屏找。找不到返回 None。"""
+        self.driver.click(*NAV_PLANET, label="行星列表")
+        self.driver.wait(PLANET_LIST_OPEN_WAIT_S)
+        return self._locate(target)
+
+    def _read_nothing_at_all(self) -> bool:
+        """逐屏一行都没认出来吗？——这才是「疑似有浮层盖住」的证据。
+
+        ⚠️ **这道界限是本支的全部要害。** 读到了内容却没有目标那一行，是**另一回事**：
+        多半是任务配错了出发星球（`SwitchResult.NOT_FOUND` 的注释里写着这一条，
+        `Outcome.busy_is_permanent` 也是照它分流的）。把那种情况也当成「被盖住了」，
+        代价是每一次配错坐标都要先朝 (750, 71) 盲点四下——而**星球地表上那个位置
+        本仓没有标定过**（见 `switch_to` 里那段告警）。所以：只在一行都没有时才关。
+
+        注意「一行都没有」用的是 `screens`，也就是 `rows_from_words` **认出来的
+        坐标行**，不是 OCR 的原始词框。行星大小 `155/223`、图标漏出来的零星 `5`
+        这些噪声算不得「读到了列表」。
+        """
+        return bool(self.screens) and all(not screen for screen in self.screens)
+
+    def _retry_behind_overlays(self, target: Coordinate) -> PlanetRow | None:
+        """关掉盖在上面的浮层，重开列表再读一遍。见 `PLANET_LIST_OVERLAY_RETRIES`。
+
+        动作顺序是有讲究的：**先关再开**。这一刻列表多半根本没开出来（点 `NAV_PLANET`
+        那一下落在浮层上），所以那几下 ✕ 关的是压在导航栏上的那个面板；关完必须
+        重新点一次「行星」，否则读的还是同一张什么都没有的画面。
+        """
+        before = [list(screen) for screen in self.screens]
+        self.say("  行星列表一行都没读出来；疑似有浮层盖住了导航栏，先关掉浮层再读一遍")
+        clicked = 0
+        row: PlanetRow | None = None
+        for _attempt in range(PLANET_LIST_OVERLAY_RETRIES):
+            clicked += dismiss_overlays(self.driver, attempts=OVERLAY_CLOSE_ATTEMPTS)
+            row = self._open_and_locate(target)
+            if row is not None:
+                break
+        after = [list(screen) for screen in self.screens[len(before) :]]
+        verdict = (
+            f"重读认到了 {target}"
+            if row is not None
+            else ("重读读到了内容但没有这颗星球" if any(after) else "重读还是一行都没有")
+        )
+        self.say(f"  关浮层点了 {clicked} 下；{verdict}（重读逐屏 {after}）")
+        self.record_evidence(
+            f"行星列表读空（逐屏 {before}）；疑似有浮层盖住导航栏，"
+            f"已点 {clicked} 下关闭键并重开列表；{verdict}（重读逐屏 {after}）",
+            {
+                "target": str(target),
+                "screens_before": before,
+                "screens_after": after,
+                "close_clicks": clicked,
+                "recovered": row is not None,
+            },
+        )
+        return row
 
     # -- 找那一行 -----------------------------------------------------------
 

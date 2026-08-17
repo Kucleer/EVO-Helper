@@ -44,7 +44,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -82,6 +82,7 @@ from evo_helper.game.system_navigator import (
     SystemNavigator,
     crop_reader,
 )
+from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
@@ -92,6 +93,7 @@ from evo_helper.tools.scan_coordinates import (
     origin,
     run_with_foreground_guard,
     say,
+    thumbnail_base64,
 )
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
@@ -704,6 +706,48 @@ class Outcome:
     #: 故障」，而这个字段说「这一轮出了非得有人管的事」。目前唯一的来源是
     #: `MailboxUnreachable`——单子非空却翻不了信箱，升级重启之后还是翻不了。
     failed: str | None = None
+
+
+#: 「行星列表读空 → 关浮层重读」这一支隔多久才肯再往库里塞一张图。
+#: 理由与 `scan_coordinates.UNRECOGNISED_EVIDENCE_INTERVAL_S` 一模一样：
+#: **限流不是省空间，是防刷爆**。文字那一条每次都写，图才限流。
+OVERLAY_EVIDENCE_INTERVAL_S = 120.0
+
+#: 上一次往 `system_log` 塞图的时刻（`time.monotonic`）。进程级，重启即清零。
+_last_overlay_evidence_at: float | None = None
+
+
+def record_planet_list_overlay_retry(
+    message: str,
+    payload: Mapping[str, Any],
+    *,
+    capture: Callable[[], Any] | None = None,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """把「行星列表读空 → 疑似浮层 → 关掉 → 重读结果」写进 `system_log`。
+
+    ⚠️ **跨机排障靠的就是这一条。** 2026-08-17 那次实机故障里，日志只留下
+    「逐屏读到的是 `[[]]`」——够说明列表读空，却说不出**画面上盖着的是什么**。
+    `_dump_frame("planet-list-unreadable")` 确实存了整帧，可它落在 runner 那台
+    机器的 `var/logs` 下，本机根本取不到；最后是用户手工截了一张图，才认出那是
+    「太空舱」面板。所以这里照 `scan_coordinates.record_unrecognised_screen` 的
+    路子，把缩略图一起塞进 `payload_json`——`artifacts` 表存的是**路径**，
+    而路径只在出事那台机器上有意义。
+
+    文字每次都记（这一支本来就少见，而它每出现一次就等于一轮没派）；
+    **图限流**，免得画面卡在浮层上时每轮都写一张进库。
+    """
+    global _last_overlay_evidence_at
+    body: dict[str, Any] = dict(payload)
+    moment = now()
+    fresh = (
+        _last_overlay_evidence_at is None
+        or moment - _last_overlay_evidence_at >= OVERLAY_EVIDENCE_INTERVAL_S
+    )
+    if fresh and capture is not None:
+        _last_overlay_evidence_at = moment
+        body["thumbnail_png_base64"] = thumbnail_base64(capture())
+    record_system_log("WARNING", "tools.pirate_loop", message, payload=body)
 
 
 class PirateLoop:
@@ -2599,7 +2643,19 @@ class PirateLoop:
             read_rows=self._planet_rows,
             read_origin=self._fleet_origin_text,
             say=say,
+            record_evidence=self._record_planet_list_overlay,
             dry_run=dry_run,
+        )
+
+    def _record_planet_list_overlay(self, message: str, payload: dict[str, Any]) -> None:
+        """`PlanetSwitcher` 走到「关浮层重读」那一支时的落地口。
+
+        截图能力是可选的：轻量驱动（尤其单元测试桩）只实现点击和等待，那时
+        照样把文字证据写进库——**诊断路径不许因为配图失败而整条丢掉**。
+        """
+        capture = getattr(self._driver, "capture", None)
+        record_planet_list_overlay_retry(
+            message, payload, capture=capture if callable(capture) else None
         )
 
     def ensure_origin_planet(self) -> bool:

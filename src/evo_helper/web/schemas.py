@@ -255,6 +255,12 @@ class MilitaryTierIn(BaseModel):
 
 class MilitaryAttackConfigOut(BaseModel):
     tiers: list[MilitaryTierIn]
+    #: 军力榜采集开榜后先盲拖几屏。**`None` = 留空 = 按实测自动标定。**
+    #:
+    #: 这里只认「是不是整数」（`3.5` / `"很多"` / `true` 一律 422）；范围由
+    #: `MissionScheduler.validate_blind_scrolls` 判，和调度器启动时用的是同一把
+    #: 尺子——两边分家的结果是页面收下了、实机跑起来不是那个数。
+    blind_scrolls: int | None = None
 
 
 class CurrentMissionOut(BaseModel):

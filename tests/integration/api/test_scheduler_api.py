@@ -151,6 +151,9 @@ def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
 
     「范围内有没有 bot」是启用 bot 链路的硬前提，所以它必须来自真实的库，
     不能靠打桩——打桩的话，这条判据断了测试也不会红。
+
+    `military_score_at_utc` 给的是「刚读到」：军力优先那一支按它筛新鲜度，
+    留空的话这颗目标会被当成超期跳过，而那与用例本身要验的事情无关。
     """
     with repository._session_factory() as session:  # noqa: SLF001 - 测试直接落库
         session.add(
@@ -161,6 +164,7 @@ def _seed_bot(repository: SqlAlchemyRepository, coordinate: Coordinate) -> None:
                 is_bot=True,
                 latest_owner_name="bot",
                 last_scanned_at_utc=NOW,
+                military_score_at_utc=NOW,
             )
         )
         session.commit()
