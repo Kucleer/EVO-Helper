@@ -59,14 +59,20 @@ class _Keeper:
         return self._outcome
 
 
-def _in_game() -> ReconnectOutcome:
-    return ReconnectOutcome(ScreenState.IN_GAME, reconnected=True, detail="restarted")
+def _in_game(restarts_left: int = 0) -> ReconnectOutcome:
+    return ReconnectOutcome(
+        ScreenState.IN_GAME, reconnected=True, detail="restarted", restarts_left=restarts_left
+    )
 
 
 def _refused(
     detail: str = "restart budget exhausted: 3/3 restarts within 3600s",
+    *,
+    restarts_left: int = 0,
 ) -> ReconnectOutcome:
-    return ReconnectOutcome(ScreenState.UNKNOWN, reconnected=False, detail=detail)
+    return ReconnectOutcome(
+        ScreenState.UNKNOWN, reconnected=False, detail=detail, restarts_left=restarts_left
+    )
 
 
 def _loop(
@@ -165,6 +171,63 @@ def test_a_restart_that_lands_outside_the_game_is_not_clicked_through(
         loop._require_system_view("开工时切不到恒星系视图")
 
     assert navigator.calls == 1
+
+
+# -- 抛出去之后按哪个退出码收场 -------------------------------------------------
+#
+# 抛本身只是把这一轮打住；**真正决定后果的是退出码**。`EXIT_ENVIRONMENT_BUSY`
+# 不计入连续失败，1 计入。判据是关窗重开配额——那份配额在滚动窗口内是有限的，
+# 所以「还有配额就报 75」必然有尽头：同一小时里最多三轮能这么收场，之后
+# `restart_and_reenter` 直接被拒、配额恒为 0、退回 1，豁免照常攒。
+#
+# 反过来若无条件报 75，调度器会每隔一个冷却再起一轮、再吃一次配额、再什么都不
+# 推进，而**豁免计数不再增长，再没有任何东西会最终把它停下来**——2026-08-17 那种
+# 故障就会从「26 分钟后被 6/6 拦住」变成整夜静默空转。
+
+
+def test_a_restart_with_budget_left_is_worth_another_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, _navigator, _keeper = _loop(monkeypatch, [False], _refused(restarts_left=2))
+
+    with pytest.raises(module.SessionUnavailable) as caught:
+        loop._require_system_view("读完邮件切不回恒星系视图")
+
+    assert caught.value.recoverable is True
+
+
+def test_an_exhausted_restart_budget_is_a_real_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ **安全底线。** 配额耗尽还是回不去，说明重开这条路已经证明救不了。"""
+    loop, _navigator, _keeper = _loop(monkeypatch, [False], _refused(restarts_left=0))
+
+    with pytest.raises(module.SessionUnavailable) as caught:
+        loop._require_system_view("读完邮件切不回恒星系视图")
+
+    assert caught.value.recoverable is False
+
+
+def test_a_view_still_gone_after_a_successful_restart_follows_the_same_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重开成功、视图还是切不回来：判据仍旧是「重开之后还剩几次配额」。"""
+    loop, _navigator, _keeper = _loop(monkeypatch, [False, False], _in_game(restarts_left=2))
+
+    with pytest.raises(module.SessionUnavailable, match="重开之后仍然切不回来") as caught:
+        loop._require_system_view("读完邮件切不回恒星系视图")
+
+    assert caught.value.recoverable is True
+
+
+def test_a_view_still_gone_with_the_budget_spent_is_a_real_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一处的另一半：重开是成功了，但那是最后一次配额。"""
+    loop, _navigator, _keeper = _loop(monkeypatch, [False, False], _in_game(restarts_left=0))
+
+    with pytest.raises(module.SessionUnavailable, match="重开之后仍然切不回来") as caught:
+        loop._require_system_view("读完邮件切不回恒星系视图")
+
+    assert caught.value.recoverable is False
 
 
 class _Driver:

@@ -28,6 +28,7 @@ from evo_helper.vision.pirate_reports import OUTCOME_DRAW, OUTCOME_FAIL, OUTCOME
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -38,7 +39,7 @@ PRESET = FleetPresetRef(name="AAA", signature="深空吞噬者:70")
 
 
 def _client(tmp_path: Path, *, with_report: bool, outcome: str = OUTCOME_VICTORY) -> TestClient:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'logs.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "logs.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: DISPATCHED)
@@ -153,7 +154,7 @@ def _scout_client(tmp_path: Path, *, with_report: bool) -> TestClient:
     """
     from evo_helper.domain.records import MISSION_KIND_SCOUT, ScoutReport
 
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'scout-logs.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "scout-logs.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: DISPATCHED)

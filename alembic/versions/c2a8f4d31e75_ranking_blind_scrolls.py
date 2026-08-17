@@ -1,7 +1,7 @@
 """make the ranking blind-scroll count configurable
 
 Revision ID: c2a8f4d31e75
-Revises: b3f5c8d10a27
+Revises: c8d2a5f10b74
 Create Date: 2026-08-17
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c2a8f4d31e75"
-down_revision: str | None = "b3f5c8d10a27"
+down_revision: str | None = "c8d2a5f10b74"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

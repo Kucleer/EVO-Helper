@@ -12,6 +12,23 @@ def test_the_console_listens_on_the_lan_by_default() -> None:
     assert settings.lan_exposed is True
 
 
+def test_a_missing_env_file_does_not_fall_back_to_an_empty_sqlite_file() -> None:
+    """⚠️ 读不到配置时必须**响地失败**，不许静默换一个空库。
+
+    `env_file=".env"` 按当前工作目录解析，所以从别的目录起控制台就读不到它。
+    旧默认值是 `sqlite:///var/evo-helper.db`：那会在当时的目录下新建一个空库，
+    控制台照常启动、页面照常打开、一个错都不报——而所有数据都不见了。生产已
+    全面切到 PostgreSQL，这条把「静默回落」这个失败方式钉死在外面。
+
+    ⚠️ 判据落在**字段默认值**上，不是 `Settings().database_url`：开发机上有 `.env`，
+    那个值会被 `.env` 满足，于是这条在本地永远绿——绿得毫无意义。
+    """
+    default = Settings.model_fields["database_url"].default
+
+    assert isinstance(default, str)
+    assert not default.startswith("sqlite")
+
+
 def test_loopback_binding_is_not_reported_as_exposed() -> None:
     """设回 127.0.0.1 时不该再打「已暴露」的警告，否则警告会被无视。"""
     assert Settings(host="127.0.0.1").lan_exposed is False

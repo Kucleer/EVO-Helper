@@ -8,10 +8,11 @@ from evo_helper.application.bindings import DatabaseBindingResolver
 from evo_helper.domain.models import Coordinate
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.models import RunInstance, ScanPlan, ScanRangeRow
+from support.database import scratch_database_url
 
 
 def test_database_binding_resolver_uses_range_origin_and_exact_signature(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'bindings.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "bindings.db"))
     Base.metadata.create_all(engine)
     sessions = create_session_factory(engine)
     now = datetime(2026, 8, 6, tzinfo=UTC)

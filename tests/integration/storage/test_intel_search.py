@@ -19,13 +19,14 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.intel import IntelSearchQuery, SqlAlchemyIntelRepository
 from evo_helper.storage.repository import SqlAlchemyRepository
+from support.database import scratch_database_url
 
 BASE_TIME = datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC)
 
 
 @pytest.fixture
 def session_factory(tmp_path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'intel.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "intel.db"))
     Base.metadata.create_all(engine)
     return create_session_factory(engine)
 

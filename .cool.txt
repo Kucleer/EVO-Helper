@@ -1,0 +1,42 @@
+库时间 11:43:31
+
+=== 任务 #2 ===
+  id = 2
+  kind = BOT
+  enabled = True
+  priority = 0
+  round_started_at_utc = None
+  quota_exhausted_until_utc = None
+  consecutive_failures = 1
+  disabled_reason = None
+  created_at_utc = 2026-08-10 11:07:03.849512+08:00
+  updated_at_utc = 2026-08-17 11:40:04.300239+08:00
+  name = 扫描+攻击 bot
+  origin_galaxy = 4
+  origin_system = 277
+  origin_position = 15
+  fleet_lines = 7
+
+=== 最近 8 次运行 ===
+  BOT      11:39:35     29s exit=1 by=SELF
+  RANKING  11:24:43    870s exit=1 by=USER
+  RANKING  11:21:17    190s exit=1 by=USER
+  BOT      11:20:29     48s exit=75 by=SELF
+  RANKING  11:16:17    221s exit=1 by=USER
+  RANKING  10:18:12   3485s exit=0 by=SELF
+  BOT      10:13:12    300s exit=0 by=SELF
+  RANKING  09:31:34   2483s exit=1 by=USER
+
+=== 此刻占着航线的 ===
+
+=== 最近 10 条日志 ===
+  11:40:03 [INFO] __main__               :: 完成：目标 0 个，攻击 0 发，拦下 0 次
+  11:40:03 [INFO] tools.pirate_loop      ::   这颗星球不在你的行星列表里；请核对任务配的出发星球 4:277:15
+  11:40:03 [INFO] tools.pirate_loop      ::   切不到出发星球 4:277:15（not_found）；这一轮一发都不派
+  11:40:00 [INFO] game.planet_list       ::   行星列表上找不到 4:277:15；逐屏读到的是 [[]]；什么都不点
+  11:40:00 [INFO] tools.pirate_loop      ::   行星列表坐标 OCR 全空；tesseract='C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
+  11:40:00 [INFO] tools.pirate_loop      ::   已存现场 var\logs\dump-planet-list-unreadable-114000.png（1920x917）
+  11:39:58 [INFO] tools.pirate_loop      ::   行星列表坐标 OCR 全空；tesseract='C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
+  11:39:58 [INFO] tools.pirate_loop      ::   已存现场 var\logs\dump-planet-list-unreadable-113958.png（1920x917）
+  11:39:57 [INFO] tools.pirate_loop      ::   行星列表坐标 OCR 全空；tesseract='C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
+  11:39:57 [INFO] tools.pirate_loop      ::   已存现场 var\logs\dump-planet-list-unreadable-113957.png（1920x917）

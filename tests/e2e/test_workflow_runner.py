@@ -19,6 +19,7 @@ from evo_helper.game.simulator import SimulatedGameAdapter
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.models import RunInstance, ScanPlan, ScanRangeRow
 from evo_helper.storage.repository import SqlAlchemyRepository
+from support.database import scratch_database_url
 
 NOW = datetime(2026, 8, 6, 1, 0, tzinfo=UTC)
 ORIGIN = Coordinate(1, 1, 1)
@@ -133,7 +134,7 @@ class BrokenReportsGame(SimulatedGameAdapter):
 def _seed(
     database_path: Path,
 ) -> tuple[UUID, SqlAlchemyRepository, sessionmaker[Session]]:
-    engine = create_database_engine(f"sqlite:///{database_path}")
+    engine = create_database_engine(scratch_database_url(database_path.parent, database_path.name))
     Base.metadata.create_all(engine)
     sessions = create_session_factory(engine)
     with sessions() as session:

@@ -348,6 +348,33 @@ def test_the_run_detail_page_is_gone_and_leaves_no_dead_link() -> None:
         assert 'href="/runs' not in body, path
 
 
+def test_the_intel_page_is_off_the_nav_but_still_reachable() -> None:
+    """「情报中心」的导航入口已隐藏（用户口径 2026-08-17：「隐藏掉入口，新功能可以
+    不兼容这部分」，理由是「基本不会使用这个功能」）。
+
+    两件事一起钉，缺哪一条这道断言都失去意义：
+
+    1. **没有任何一页还指向 `/intel`**——入口是要藏掉的，藏一半（侧栏没了但别处
+       还留着链接）比不藏还乱。
+    2. **`/intel` 本身仍然返回 200**，`/targets` 的 307 也照旧落在它上面。少了这
+       半条，将来有人把「隐藏入口」顺手做成「删掉路由」不会有任何东西转红，而
+       `storage/intel.py` 还被 `application/mission_progress.py` 当作任务进度判据
+       用着——那是链路，不是展示。
+    """
+    client, _ = _make_client()
+
+    for path in ("/missions", "/intel", "/planets", "/logs", "/diagnostics"):
+        assert 'href="/intel"' not in client.get(path).text, path
+
+    response = client.get("/intel")
+    assert response.status_code == 200
+    assert "情报中心" in response.text
+
+    redirect = client.get("/targets", follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/intel"
+
+
 def response_ok(client: TestClient, path: str) -> bool:
     return client.get(path).status_code == 200
 

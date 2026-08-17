@@ -42,6 +42,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.storage.system_log import SystemLogRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 #: 同一个瞬时的两种写法。差 8 小时，而且跨了一天。
@@ -57,7 +58,7 @@ ORIGIN = Coordinate(2, 137, 18)
 @pytest.fixture()
 def seeded(tmp_path: Path) -> tuple[TestClient, sessionmaker[Session]]:
     """一个库里每一页都有一行、而且那一行的时刻都是 `MOMENT_UTC` 的控制台。"""
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'timezone.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "timezone.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
 

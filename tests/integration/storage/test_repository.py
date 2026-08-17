@@ -33,11 +33,12 @@ from evo_helper.storage.models import (
     TargetRevisitRow,
 )
 from evo_helper.storage.repository import SqlAlchemyRepository, StorageConflictError
+from support.database import scratch_database_url
 
 
 @pytest.fixture
 def engine(tmp_path: Path):
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "test.db"))
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
@@ -128,10 +129,21 @@ def _report(
     return BattleReport(**values)
 
 
-def test_sqlite_pragmas_are_enabled(engine) -> None:
-    with engine.connect() as connection:
-        journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar()
-        foreign_keys = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+def test_sqlite_pragmas_are_enabled(tmp_path: Path) -> None:
+    """⚠️ 这条**必须**自己开一个 SQLite 库，不能走上面那个 `engine` fixture。
+
+    `create_database_engine` 只在 SQLite 上挂 PRAGMA，钉的也正是这个分支。跟着
+    `scratch_database_url` 走的话，`EVO_HELPER_TEST_DATABASE_URL` 一设它就跑到
+    Postgres 上，然后倒在 `syntax error at or near "PRAGMA"`——那不是发现了问题，
+    是把一条只对 SQLite 有意义的断言问错了对象。
+    """
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'pragmas.db'}")
+    try:
+        with engine.connect() as connection:
+            journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar()
+            foreign_keys = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+    finally:
+        engine.dispose()
     assert journal_mode == "wal"
     assert foreign_keys == 1
 
