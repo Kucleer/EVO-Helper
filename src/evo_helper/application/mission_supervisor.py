@@ -94,7 +94,11 @@ class MissionExit:
     command: tuple[str, ...]
     #: 退出码是唯一的进程间协议：0 = 这一轮正常跑完，
     #: `EXIT_ENVIRONMENT_BUSY` = 这会儿轮不到我（不算故障），其余非 0 = 异常。
-    #: 收不到（杀不掉、等超时）则为 None。
+    #:
+    #: **只有 `stopped_by is SELF` 时它才有意义。** 手是我们动的那几档
+    #: （抢占、用户点停、关闭、停顿看门狗）一律为 None：那时子进程是被
+    #: `terminate()` 打死的，拿得到的那个码是内核参数而不是 runner 的表态，
+    #: 见 `MissionSupervisor.stop`。收不到（杀不掉、等超时）同样为 None。
     exit_code: int | None
     stopped_by: StopReason
     started_at_utc: datetime
@@ -126,9 +130,10 @@ class MissionExit:
         真坏了必须还能数到三，否则调度循环会在一个坏掉的任务上满速空转。
 
         **`STALLED` 反过来：手是我们动的，但它算故障。** 那一轮跑着却一件事都
-        没做成（判据见 `application.mission_progress`），退出码是 `terminate()`
-        留下的、说明不了任何事，而「一件事都没做成」本身就是这条链路此刻起不来的
-        证据。不算的话，同一个卡死会一轮接一轮地复现，每轮白烧 45 分钟。
+        没做成（判据见 `application.mission_progress`），退出码是 None、说明不了
+        任何事（手动停掉的那几档都是 None，见 `MissionSupervisor.stop`），
+        而「一件事都没做成」本身就是这条链路此刻起不来的证据。
+        不算的话，同一个卡死会一轮接一轮地复现，每轮白烧 45 分钟。
         """
         if self.stopped_by is StopReason.STALLED:
             return True
@@ -221,10 +226,23 @@ class MissionSupervisor:
             return None
         process.terminate()
         try:
-            exit_code: int | None = process.wait(timeout=TERMINATE_TIMEOUT_S)
+            process.wait(timeout=TERMINATE_TIMEOUT_S)
         except Exception:  # noqa: BLE001 - 收不到退出码也不该让控制台卡住
-            exit_code = None
-        return self._exit(running, exit_code=exit_code, stopped_by=reason)
+            pass
+        # ⚠️ **`terminate()` 之后那个退出码不是 runner 的表态，一律记 None。**
+        #
+        # Windows 上 `Popen.terminate()` 走的是 `TerminateProcess(handle, 1)`，
+        # 那个 1 是我们自己传给内核的参数，跟子进程想说什么毫无关系；POSIX 上同理
+        # （被信号打死，`wait()` 给的是 `-SIGTERM`）。原样写进 `mission_runs.exit_code`
+        # 的结果是：全库每一条 PREEMPTED / USER / SHUTDOWN 记录都长着「退出码 1」
+        # 这副失败的样子。判据那侧本来就挡住了（`MissionExit.failed` 先看
+        # `stopped_by`），但 `/logs` 页面和 `mission_runs` 因此没法读——分不清
+        # 「抢占掉的」和「自己崩了的」。
+        #
+        # 记 None 而不是 0：0 是「这一轮正常跑完」，同样是在替一个没表过态的进程
+        # 编造表态，而且 0 会被当成成功。None 就是 None——**没收到退出码**，
+        # 那正是事实。这一列本来就可空（`storage.models`）。
+        return self._exit(running, exit_code=None, stopped_by=reason)
 
     def poll(self) -> MissionExit | None:
         """收退出码。**不自动重启。**

@@ -42,7 +42,12 @@ from evo_helper.game.ranking_ui import (
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
-from evo_helper.tools.scan_coordinates import LiveDriver, SlowDragDriver, say
+from evo_helper.tools.scan_coordinates import (
+    LiveDriver,
+    SlowDragDriver,
+    run_with_foreground_guard,
+    say,
+)
 
 
 @dataclass(frozen=True)
@@ -80,8 +85,12 @@ def release_stuck_mouse(driver: LiveDriver) -> None:
     driver._gui.mouseUp()  # noqa: SLF001 - 与 SlowDragDriver 同一个理由
 
 
-def ensure_in_game(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> bool:
+def enter_game_exit_code(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> int:
     """确认画面在游戏里；不在就交给 `SessionKeeper` 走完整条入口序列。
+
+    返回**本趟该用的退出码**：0 = 进去了；否则见
+    `scan_coordinates.exit_code_for_unusable_session`（还有关窗重开配额就报
+    `EXIT_ENVIRONMENT_BUSY`，配额耗尽才报 1）。
 
     ⚠️ **不要自己手写这一段。** 2026-08-15 实机：原先这里只认「进入」那一页，
     于是会话掉回 **START 页**时读到全空、如实拒绝，一整趟采集起不来——而画面
@@ -90,17 +99,34 @@ def ensure_in_game(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> bool:
     `SessionKeeper` 认得 ENTRY / START / 掉线弹窗 / 会话已死 / 服务器维护五种，
     每一种的善后都不一样（点「进入」/ 点 START / 点掉弹窗 / 关窗重开 / 点「知道了」），
     而且那几条都是实机踩出来的。重写一份必然漏，漏掉的那种就是下一次卡整夜的。
+
+    ⚠️ **恢复阶梯要走全，不能只巡检一次就收。** 这里原先只调一次
+    `ensure_connected`，读到 `UNKNOWN` 就当场返回失败——而 `UNKNOWN` 多半只是
+    上一条链路把游戏停在某个面板上（浮层压着导航条），关掉浮层就好，
+    整段道理写在 `scan_coordinates.dismiss_overlays_if_unrecognised`。
+    两条链路各走各的阶梯本来就该合并；更要紧的是**退出码判据要求它走全**：
+    「还有重开配额」只有在这一轮真的走到过重开那一级时才说明得了问题，
+    否则每一轮都在配额满格的状态下报 75，就成了没有尽头的静默空转。
     """
     del attempts  # 重试与等待都由 SessionKeeper 自己管
-    from evo_helper.tools.scan_coordinates import make_ocr, make_session_keeper
+    from evo_helper.tools.scan_coordinates import (
+        dismiss_overlays_if_unrecognised,
+        exit_code_for_unusable_session,
+        make_ocr,
+        make_session_keeper,
+        restart_if_still_unusable,
+    )
 
     del ocr
-    outcome = make_session_keeper(driver, make_ocr()).ensure_connected(force=True)
-    if outcome is None:
-        return True
-    if not outcome.ready:
-        say(f"进不去游戏：{outcome.state.value} — {outcome.detail}")
-    return bool(outcome.ready)
+    keeper = make_session_keeper(driver, make_ocr())
+    session = keeper.ensure_connected(force=True)
+    session = dismiss_overlays_if_unrecognised(session, driver, keeper)
+    session = restart_if_still_unusable(session, keeper)
+    if session is None or session.ready:
+        return 0
+    code = exit_code_for_unusable_session(session)
+    say(f"进不去游戏：{session.state.value} — {session.detail}（退出码 {code}）")
+    return code
 
 
 def name_column_text(image: Any, ocr: Any, columns: RankingColumns | None = None) -> str:
@@ -250,8 +276,9 @@ def scan(
     driver = LiveDriver()  # 默认 False：此工具没有派舰队能力。
     ocr = pytesseract
     release_stuck_mouse(driver)
-    if not ensure_in_game(driver, ocr):
-        return 1
+    entry = enter_game_exit_code(driver, ocr)
+    if entry != 0:
+        return entry
 
     player_name = Settings().player_name
 
@@ -494,13 +521,15 @@ def main(argv: list[str] | None = None) -> int:
     def pair(raw: list[int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
         return (raw[0], raw[1]) if raw else fallback
 
-    return scan(
-        RankingColumns(
-            rank=pair(args.rank_column, default.rank),
-            name=pair(args.name_column, default.name),
-            score=pair(args.score_column, default.score),
-        ),
-        bot_limit=args.bot_limit,
+    return run_with_foreground_guard(
+        lambda: scan(
+            RankingColumns(
+                rank=pair(args.rank_column, default.rank),
+                name=pair(args.name_column, default.name),
+                score=pair(args.score_column, default.score),
+            ),
+            bot_limit=args.bot_limit,
+        )
     )
 
 
@@ -522,7 +551,7 @@ __all__ = [
     "RankingColumns",
     "progress_mark",
     "is_self_row",
-    "ensure_in_game",
+    "enter_game_exit_code",
     "keep_screens",
     "name_column_text",
     "release_stuck_mouse",
