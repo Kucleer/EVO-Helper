@@ -577,6 +577,15 @@ class MilitaryAttackConfigRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     tiers_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    #: 军力榜采集开榜后先「盲拖」几屏（`game.ranking_ui.BLIND_SCROLLS`）。
+    #:
+    #: **可空，空 = 用代码里的默认值 40**，与加这一列之前的行为完全一致。
+    #: 不给它写 `default=40`：那样「没配」和「配了 40」就分不开了，日后调默认值
+    #: 时所有老行都会被钉死在 40 上，而它们表达的其实是「跟着默认走」。
+    #:
+    #: 放在这张全局表而不是 `mission_tasks.params_json`：用户口径（2026-08-17）
+    #: 是「盲拖数量需在攻击配置页可配置」，而这一页存的就是全局的那几项。
+    blind_scrolls: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
 
 class MissionRunRow(Base):

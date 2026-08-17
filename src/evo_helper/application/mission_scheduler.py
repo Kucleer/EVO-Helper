@@ -70,7 +70,12 @@ from evo_helper.domain.missions import (
     scan_command,
 )
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.ranking import is_bot_coordinate
+from evo_helper.domain.ranking import (
+    BOT_AREA_REACHED_PREFIX,
+    bot_area_scrolls,
+    calibrated_blind_scrolls,
+    is_bot_coordinate,
+)
 from evo_helper.domain.records import TARGET_KIND_BOT, TARGET_KIND_PIRATE
 from evo_helper.domain.report_wait import MAX_REPORT_AGE, ReportWaitPlanner, WaitAction
 from evo_helper.domain.scheduler import (
@@ -94,6 +99,11 @@ from evo_helper.domain.target_order import (
     TOP_BY_MILITARY,
     ScoredTarget,
     strongest_then_nearest,
+)
+from evo_helper.game.ranking_ui import (
+    BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_SAMPLES,
+    BLIND_SCROLLS_MAX,
 )
 from evo_helper.infrastructure.system_log import child_environment, record_system_log
 from evo_helper.storage import models as orm
@@ -548,6 +558,14 @@ class MissionScheduler:
         """校验全局攻击档位；任务参数不再携带档位。"""
         return _bot_tiers({"tiers": tiers})
 
+    def validate_blind_scrolls(self, value: object) -> int | None:
+        """校验攻击配置页上那个「盲拖屏数」。同 `validate_military_tiers`：
+        页面在**写库之前**用调度器自己这把尺子量一遍。
+
+        返回 `None` 表示留空——那不是 0，是「跟着 `BLIND_SCROLLS` 的默认值走」。
+        """
+        return _blind_scrolls(value)
+
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
 
@@ -902,7 +920,8 @@ class MissionScheduler:
                     bot_limit=_smallest_limit(
                         _ranking_bot_limit(row.params_json),
                         None if batch_task is None else _bot_top_n(batch_task.params_json),
-                    )
+                    ),
+                    blind_scrolls=self._blind_scrolls(),
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
                 command = self._military_command(row, max_dispatches=facts.free_lines)
@@ -1473,7 +1492,10 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.RANKING:
-            return ranking_command(bot_limit=_ranking_bot_limit(params_json))
+            return ranking_command(
+                bot_limit=_ranking_bot_limit(params_json),
+                blind_scrolls=self._blind_scrolls(),
+            )
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
@@ -1489,6 +1511,51 @@ class MissionScheduler:
         # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
         # 而一夜只走到第 121 系——后面那些永远轮不到。
         return self._bot_command(params_json, origin)
+
+    def _blind_scrolls(self) -> int | None:
+        """军力榜盲拖屏数。**填了数就锁死，留空则按实测自动标定。**
+
+        取自**全局攻击配置**（攻击配置页），不是任务参数——用户口径
+        （2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+
+        返回 `None` 的意思是「命令行上不带 `--blind-scrolls`」，runner 用
+        `game.ranking_ui.BLIND_SCROLLS` 那个写死的默认值。样本攒不够时就走这条，
+        行为与加这个框之前完全一致。**不在这里自己回落成一个数字**：默认值只该
+        有一处，写第二遍日后必然漏改。
+
+        手填的值优先于自动标定：它是覆盖，不是初值。
+
+        配置行还没建出来时（老库、或者 `ensure_mission_rows()` 还没跑）当成留空：
+        一个还没初始化的配置表说明不了「用户想改盲拖屏数」，为它把整条采集链路
+        停掉是不成比例的。
+        """
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return None
+        manual = _blind_scrolls(row.blind_scrolls)
+        if manual is not None:
+            return manual
+        return self._calibrated_blind_scrolls()
+
+    def _calibrated_blind_scrolls(self) -> int | None:
+        """从 `system_log` 里那些「翻了 N 屏到达 bot 区」反推盲拖屏数。
+
+        ⚠️ **实测记录刻意没有自己的表或列。** 每趟采集本来就会把这句话写进
+        `system_log`，那里已经攒着全部历史；再加一张表等于让同一件事有两份账，
+        而两份账迟早对不上（其中一份还只有新版本才写）。
+
+        多读一些行再筛：那句话不是每条日志都是，而 `recent_messages` 只做前缀
+        匹配。读 `BLIND_SCROLL_SAMPLES` 的若干倍足以覆盖前缀相同但不是这句话的
+        邻居，同时仍然只碰几十行。
+        """
+        raw = self._repository.recent_system_log_messages(
+            starts_with=BOT_AREA_REACHED_PREFIX, limit=BLIND_SCROLL_SAMPLES * 8
+        )
+        measurements = [value for value in map(bot_area_scrolls, raw) if value is not None]
+        return calibrated_blind_scrolls(
+            measurements, sample_size=BLIND_SCROLL_SAMPLES, margin=BLIND_SCROLL_MARGIN
+        )
 
     def _bot_command(
         self, params_json: str, origin: Coordinate, *, max_dispatches: int | None = None
@@ -1609,6 +1676,42 @@ def _ranking_bot_limit(raw: str) -> int | None:
     if limit < 1:
         raise MissionParamError("扫描数量至少是 1；要全扫就把它留空，别填 0")
     return limit
+
+
+def _blind_scrolls(value: object) -> int | None:
+    """军力榜开榜后先盲拖几屏。**留空 = 用 `BLIND_SCROLLS` 的默认值 40。**
+
+    用户口径（2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+
+    ⚠️ **「没配」和「配了 0」是两回事，两个都合法。** 留空是「跟着默认走」；
+    `0` 是用户真的敲进去的「一屏都别盲拖，从第一屏就开始检测 bot」——那是
+    **最保守**的取值（多花几十次廉价检测，绝不可能拖过头），所以它必须放行，
+    而不是像 `bot_limit` 那个 0 一样当成「把链路关掉」而拒绝。
+
+    上界是 `BLIND_SCROLLS_MAX`(48)：再往上就证不出「盲拖那一段够不到 bot 起点」
+    了（见 `game.ranking_ui` 上那几条）。越界当场拒掉——这个值调大的代价是
+    **静悄悄少采一截**，页面上和日志里都看不出异常，不能靠用户自己发现。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）：`True` 会被
+    # 当成盲拖 1 屏，而用户敲进去的根本不是一个屏数。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("盲拖屏数必须是整数；要用默认值就把它留空")
+    try:
+        scrolls = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"盲拖屏数不是整数：{value!r}") from exc
+    if isinstance(value, float) and scrolls != value:
+        raise MissionParamError(f"盲拖屏数必须是整数：{value!r}")
+    if scrolls < 0:
+        raise MissionParamError("盲拖屏数不能是负数；要用默认值就把它留空")
+    if scrolls > BLIND_SCROLLS_MAX:
+        raise MissionParamError(
+            f"盲拖屏数最多 {BLIND_SCROLLS_MAX} 屏：再多就可能拖过 bot 起点，"
+            "把榜首那批军力最高的 bot 整段跳过去。宁小勿大——拖少了只是多花几屏检测。"
+        )
+    return scrolls
 
 
 def _smallest_limit(*limits: int | None) -> int | None:

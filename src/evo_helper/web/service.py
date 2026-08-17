@@ -361,6 +361,8 @@ class AttackPlanetView:
 @dataclass(frozen=True)
 class MilitaryAttackConfigView:
     tiers: tuple[dict[str, Any], ...]
+    #: 军力榜盲拖屏数；`None` = 页面上留空 = 按实测自动标定。
+    blind_scrolls: int | None = None
 
 
 @dataclass(frozen=True)
