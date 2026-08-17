@@ -64,6 +64,7 @@ from evo_helper.domain.records import (
     TARGET_KIND_BOT,
     TARGET_KIND_PIRATE,
 )
+from evo_helper.domain.report_wait import MAX_REPORT_AGE
 from evo_helper.storage import models as orm
 
 DEFAULT_LIMIT = 50
@@ -95,8 +96,31 @@ RESULT_VICTORY = "VICTORY"
 RESULT_FAIL = "FAIL"
 RESULT_DRAW = "DRAW"
 RESULT_AWAITING = "AWAITING"
+#: 那一发的战报**永远不会来了**：派出至今超过 `MAX_REPORT_AGE`，一份战报都没接上。
+#:
+#: 它与 `AWAITING` 分家，是因为「还在等」和「等不到了」在页面上是两件事，而
+#: 混成一档的代价只落在后者身上——一个消不掉的告警。
+#:
+#: **用户口径（2026-08-17）：「对账允许有对不上的情况，比如我手动操作的，只是读
+#: 已经对上的。」** 助手点了「出发！」、用户随后手动把舰队撤了回来，那一发就
+#: 永远不会产生战报；派遣记录是账、要留着，但它不该一直摆出「还在等」的样子。
+#:
+#: 6 小时这个界**不是这里新立的**：`repository.pending_reports_for_kind` /
+#: `due_attack_dispatches` / `bot_dispatch_facts` 早就按同一个 `MAX_REPORT_AGE`
+#: 把这类派遣判成「战报永远不会来」并整条剔掉了（判据现算，不写标记，理由见
+#: `pending_reports_for_kind` 的 docstring）。情报中心这一格是唯一一处**没有**
+#: 跟上那条界的地方，于是同一发派遣在调度那边早已结案、在页面上却还挂着黄色的
+#: 「待战报」。这里补的就是这处不一致，不是新增一条时限。
+RESULT_NO_REPORT = "NO_REPORT"
 RESULT_NONE = "NONE"
-BATTLE_RESULTS = (RESULT_VICTORY, RESULT_FAIL, RESULT_DRAW, RESULT_AWAITING, RESULT_NONE)
+BATTLE_RESULTS = (
+    RESULT_VICTORY,
+    RESULT_FAIL,
+    RESULT_DRAW,
+    RESULT_AWAITING,
+    RESULT_NO_REPORT,
+    RESULT_NONE,
+)
 
 #: 坐标的三个分量在 SQL 里的样子：ORM 属性（`orm.BotTargetRow.galaxy`）与子查询
 #: 上的列（`latest.c.galaxy`）是两个类型，而打包比较对两者一视同仁。
@@ -227,6 +251,11 @@ class _Attempt:
     accepted: bool | None
     mission_kind: str | None
     outcome: str | None
+    #: 接上了一份战报没有。**与 `outcome` 分开**，理由同
+    #: `web.service.AttackLogView.report_received`：战报收到了、可 OCR 没读出胜负
+    #: 时 `outcome` 也是 None，而那一档绝不是「没有战报」——把它判成
+    #: `RESULT_NO_REPORT` 就是拿一份真躺在库里的战报说它不存在。
+    report_received: bool = False
 
 
 @dataclass(frozen=True)
@@ -308,6 +337,9 @@ class SqlAlchemyIntelRepository:
                 if attempt.target_kind == TARGET_KIND_PIRATE
             }
         )
+        # 整批行共用**同一个**此刻：逐行各读一次的话，「这一发算不算等不到了」
+        # 会在同一张表里按两个略微不同的时刻判，而那正好是排序与分页最怕的抖动。
+        now = datetime.now(UTC)
         rows = [
             _build_row(
                 coordinate,
@@ -315,6 +347,7 @@ class SqlAlchemyIntelRepository:
                 attempts.get(coordinate),
                 reports.get(coordinate),
                 scouts.get(coordinate),
+                now=now,
             )
             for coordinate in coordinates
         ]
@@ -360,6 +393,9 @@ class SqlAlchemyIntelRepository:
                 dispatch.accepted.label("accepted"),
                 dispatch.mission_kind.label("mission_kind"),
                 report.outcome.label("outcome"),
+                # 战报**行**在不在，和它读没读出胜负是两件事，见 `_Attempt.report_received`。
+                # 这一列不额外多一次连接：`report` 本来就已经外连接上来了。
+                report.id.label("report_id"),
                 func.row_number()
                 .over(
                     partition_by=(
@@ -387,6 +423,7 @@ class SqlAlchemyIntelRepository:
                 accepted=row.accepted,
                 mission_kind=row.mission_kind,
                 outcome=row.outcome,
+                report_received=row.report_id is not None,
             )
             for row in rows
         }
@@ -687,6 +724,8 @@ def _build_row(
     attempt: _Attempt | None,
     report: _Report | None,
     scout: _Scout | None,
+    *,
+    now: datetime,
 ) -> IntelRow:
     return IntelRow(
         coordinate=coordinate,
@@ -709,7 +748,7 @@ def _build_row(
         kind=_kind_of(target, attempt, scout),
         preset_name=attempt.preset_name if attempt else None,
         dispatch_state=_dispatch_state(attempt),
-        battle_result=_battle_result(attempt),
+        battle_result=_battle_result(attempt, now=now),
         scout_at=scout.reported_at if scout else None,
         scout_ships=dict(scout.ships) if scout else {},
     )
@@ -745,17 +784,31 @@ def _dispatch_state(attempt: _Attempt | None) -> str:
     return DISPATCH_SENT if attempt.accepted else DISPATCH_REJECTED
 
 
-def _battle_result(attempt: _Attempt | None) -> str:
+def _battle_result(attempt: _Attempt | None, *, now: datetime) -> str:
     """战果只对「真的飞出去的攻击发」有意义。
 
     `outcome` 原样返回，不拿「不是 VICTORY 就算负」兜底：库里存的是画面原文，
     将来多一档会被静默显示成败仗（`logs.html` 上同一条取舍）。
+
+    没有战报时还要再分一次「还在等」与「等不到了」，判据是同一个
+    `MAX_REPORT_AGE`——理由与它是从哪儿借来的，都写在 `RESULT_NO_REPORT` 上。
+
+    **判据现算，不写标记**，与 `repository.pending_reports_for_kind` 同一个理由：
+    写标记要有人在每一发到期的那一刻去写，而那个人不存在；先落地标记再依赖它，
+    中间这段时间页面会一行都排不掉。所以这里要一个 `now`，而不是去读某个列。
+
+    `report_received` 那一档**不许并进来**：战报收到了、只是没读出胜负时
+    `outcome` 同样是 None，判成「无战报」就是拿一份真躺在库里的战报说它不存在。
     """
     if attempt is None or attempt.dispatched_at is None or not attempt.accepted:
         return RESULT_NONE
     if attempt.mission_kind == MISSION_KIND_SCOUT:
         return RESULT_NONE
-    return attempt.outcome if attempt.outcome is not None else RESULT_AWAITING
+    if attempt.outcome is not None:
+        return attempt.outcome
+    if not attempt.report_received and attempt.dispatched_at <= now - MAX_REPORT_AGE:
+        return RESULT_NO_REPORT
+    return RESULT_AWAITING
 
 
 def _defender_counts(session: Session, latest: Any) -> dict[Coordinate, dict[str, int]]:

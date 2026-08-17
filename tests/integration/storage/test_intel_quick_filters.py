@@ -37,6 +37,7 @@ from evo_helper.domain.records import (
     BattleReport,
     CoordinateScan,
 )
+from evo_helper.domain.report_wait import MAX_REPORT_AGE
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.intel import (
     DISPATCH_BLOCKED,
@@ -45,6 +46,7 @@ from evo_helper.storage.intel import (
     DISPATCH_SENT,
     RESULT_AWAITING,
     RESULT_FAIL,
+    RESULT_NO_REPORT,
     RESULT_NONE,
     RESULT_VICTORY,
     IntelRow,
@@ -395,9 +397,65 @@ class TestQuickFiltersUseTheLatestAttempt:
         assert row.preset_name is None
 
     def test_a_dispatched_attack_without_a_report_is_awaiting(self, seed: _Seed) -> None:
-        seed.attempt(BOT, preset="AAA", at=BASE_TIME)
+        """还在 6 小时窗口里的那一发才叫「待战报」——它真的还等得到。
+
+        ⚠️ **派出时刻必须跟着此刻走，不能再用固定的 `BASE_TIME`。** 这一档是拿
+        `MAX_REPORT_AGE` 和现在比出来的（判据现算、不写标记，理由见
+        `intel._battle_result`），钉死一个 2026-08-11 的时刻，测到的就是下面那条
+        「等不到了」，而这条用例的名字会照旧说它测的是「还在等」。
+        """
+        seed.attempt(BOT, preset="AAA", at=datetime.now(UTC) - timedelta(minutes=5))
 
         assert seed.rows()[BOT].battle_result == RESULT_AWAITING
+
+    def test_a_report_that_will_never_arrive_stops_looking_like_a_warning(
+        self, seed: _Seed
+    ) -> None:
+        """派出去超过 6 小时还没战报的，判「无战报」而不是一直挂着「待战报」。
+
+        实机成因：用户手动关掉 runner 并**撤回了舰队**，那一发（00:36:31 派出、
+        目标 2:277:8）永远不会产生战报。用户口径（2026-08-17）：「对账允许有对不上
+        的情况，比如我手动操作的，只是读已经对上的。」
+
+        6 小时不是这里新立的界：`repository.pending_reports_for_kind` /
+        `due_attack_dispatches` / `bot_dispatch_facts` 早就按同一个 `MAX_REPORT_AGE`
+        把这类派遣判成「战报永远不会来」整条剔掉了。情报中心这一格是唯一没跟上的
+        地方，于是同一发在调度那边早已结案、页面上却还亮着黄色的「待战报」。
+        """
+        seed.attempt(
+            BOT, preset="AAA", at=datetime.now(UTC) - MAX_REPORT_AGE - timedelta(minutes=1)
+        )
+
+        row = seed.rows()[BOT]
+
+        assert row.battle_result == RESULT_NO_REPORT
+        # **账要留着**：这一行照旧在情报中心里、照旧记着它派出去过，
+        # 变的只是它不再摆出「还等得到」的样子。
+        assert row.dispatch_state == DISPATCH_SENT
+        assert BOT not in seed.rows(battle_result=RESULT_AWAITING)
+
+    def test_a_received_report_is_never_called_missing(self, seed: _Seed) -> None:
+        """战报收到了、只是没读出胜负——那一档绝不能判成「无战报」。
+
+        `outcome` 为 None 有两个完全不同的成因，而其中一个手里正握着一份真躺在
+        库里的战报。只按时间判就会拿它说这份战报不存在，用户于是去补录一份
+        永远补不出新东西的东西。判据里那个 `report_received` 就是这条用例。
+        """
+        dispatched_at = datetime.now(UTC) - MAX_REPORT_AGE - timedelta(minutes=1)
+        seed.attempt(BOT, preset="AAA", at=dispatched_at)
+        # 直接落一份 **`outcome` 为 NULL** 的战报：`_Seed.attempt` 的 `outcome=None`
+        # 那一档表示「压根不写战报」，而这里要的恰恰是「战报在、胜负没读出来」。
+        seed.repository.append_report(
+            BattleReport(
+                report_id=uuid4(),
+                reported_at_utc=dispatched_at + timedelta(minutes=30),
+                attacker_origin=ORIGIN,
+                defender_target=BOT,
+                fleet=(),
+            )
+        )
+
+        assert seed.rows()[BOT].battle_result != RESULT_NO_REPORT
 
     def test_a_scout_leg_is_never_left_waiting_for_a_battle_report(self, seed: _Seed) -> None:
         """侦察发不产生战报，把它算成「待战报」会让页面上永远挂着等不到的行。
