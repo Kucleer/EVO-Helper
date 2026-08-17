@@ -19,7 +19,14 @@ from evo_helper.game.pirate_ui import (
     PRESET_SAVE_BUTTON_MARGIN_PX,
     PRESET_STRIP_ROI,
 )
-from evo_helper.game.preset_picker import PRESET_NAME_ROI, PresetNotFound, PresetPicker
+from evo_helper.game.preset_picker import (
+    PRESET_DRAG_WAIT_S,
+    PRESET_NAME_ROI,
+    PresetNotFound,
+    PresetPicker,
+    _clickable_hit,
+    merged_names,
+)
 
 Screen = list[tuple[int, str]]
 
@@ -90,6 +97,184 @@ def _left_end_screen() -> Screen:
     return [(748, "AAA"), (985, "探路")]
 
 
+# -- 先看打开时这一屏 ----------------------------------------------------------
+
+
+def _legacy_pick(picker: PresetPicker, name: str) -> int:
+    """**改动之前那一版 `pick()` 的原样搬运**，一行都没改。
+
+    留一份参照实现，是为了让「首屏没命中就走老路」这件事有一个不会跟着改动一起
+    漂移的对照：下面那条等价性用例比的是两版在**驱动上留下的动作序列**，
+    而不是我手抄一串期望值。手抄的期望值改一次代码就得改一次，改着改着就成了
+    「按新行为重新誊写」，那时它已经不证明任何东西了。
+    """
+    from evo_helper.game.pirate_ui import PRESET_MAX_DRAGS, PRESET_NAME_ROW_Y
+
+    picker.expand()
+    entries = list(picker.scroll_to_left_end())
+    screens: list[list[str]] = []
+    previous: list[str] | None = None
+    for _attempt in range(PRESET_MAX_DRAGS + 1):
+        runs = merged_names(entries)
+        screens.append([text for _x, text in runs])
+        target = _clickable_hit(runs, name)
+        if target is not None:
+            picker.driver.click(target, PRESET_NAME_ROW_Y, label=f"预设 {name}")
+            picker.driver.wait(PRESET_DRAG_WAIT_S)
+            return target
+        words = [text for _x, text in entries]
+        if previous is not None and words == previous:
+            break
+        previous = words
+        entries = list(picker.scroll_right_once())
+    picker.scroll_to_left_end()
+    raise PresetNotFound(f"预设条上找不到 {name!r}；从左到右逐屏读到的是 {screens}")
+
+
+def test_a_preset_on_the_screen_the_strip_opened_at_is_clicked_without_any_drag() -> None:
+    """(a) 打开时就在目标那一屏 → **一次都不拖**，直接点。
+
+    「拖到左端夹住」的判据是「往左拖一次之后名字没变」，所以条本来就开在左端时
+    也必然白拖一次、白读一屏。实测（生产 `system_log`，2026-08-17 一天 177 次派遣）
+    「翻预设条」137 次落在 9–10 秒的最短路径上、只有 40 次是 13–14 秒——
+    也就是说这一次白拖是常态，不是例外。省下的是约 12 分钟／天。
+    """
+    picker, driver, strip = _picker([_left_end_screen(), [(830, "探路"), (990, "BBB")]])
+
+    assert picker.pick("AAA") == 748
+
+    assert driver.drags == [], "打开时就看得见，不该拖任何一次"
+    assert _preset_clicks(driver) == [(748, PRESET_NAME_ROW_Y, "预设 AAA")]
+    assert strip.at == 0, "条不该被挪动过"
+
+
+def test_the_shortcut_also_works_when_the_strip_did_not_open_at_the_left_end() -> None:
+    """捷径认的是「这一屏有没有」，不是「是不是左端」。
+
+    用户口径（2026-08-18）：「目前首屏预设就是 AAA 和 BBB」——首屏是哪一屏由游戏
+    决定，本仓不该假设它一定是左端那一屏。
+    """
+    screens = [_left_end_screen(), [(830, "探路"), (990, "BBB")]]
+    picker, driver, _strip = _picker(screens, at=1)
+
+    assert picker.pick("BBB") == 990
+
+    assert driver.drags == []
+
+
+def test_missing_on_the_opening_screen_replays_the_old_route_move_for_move() -> None:
+    """(b) 首屏没有 → 老路，**驱动上的动作序列与改动前逐字一致**。
+
+    捷径多读的那一屏不是白读：它被当作 `scroll_to_left_end` 的起点传下去，
+    所以连 OCR 的次数都没变。这里两边各跑一条同样的假预设条，比的是
+    点击与拖动的完整流水。
+    """
+    screens = [
+        _left_end_screen(),
+        [(830, "探路"), (990, "中转")],
+        [(770, "中转"), (985, "CCC")],
+    ]
+
+    new_picker, new_driver, new_strip = _picker([list(screen) for screen in screens], at=1)
+    old_picker, old_driver, old_strip = _picker([list(screen) for screen in screens], at=1)
+
+    assert new_picker.pick("CCC") == _legacy_pick(old_picker, "CCC")
+
+    assert new_driver.clicks == old_driver.clicks
+    assert new_driver.drags == old_driver.drags
+    assert new_strip.at == old_strip.at
+
+
+def test_a_refusal_reports_exactly_what_it_used_to_report() -> None:
+    """没找到那一支同样一字不改：措辞与「逐屏读到的是」那份清单都照旧。
+
+    报错文字是实机排障唯一能看到的东西，捷径不该顺手把它改了。
+    """
+    screens = [_left_end_screen(), [(830, "探路"), (990, "BBB")]]
+
+    new_picker, _nd, _ns = _picker([list(screen) for screen in screens])
+    old_picker, _od, _os = _picker([list(screen) for screen in screens])
+
+    with pytest.raises(PresetNotFound) as new_error:
+        new_picker.pick("CCC")
+    with pytest.raises(PresetNotFound) as old_error:
+        _legacy_pick(old_picker, "CCC")
+
+    assert str(new_error.value) == str(old_error.value)
+
+
+def test_an_opening_screen_that_reads_blank_is_not_taken_as_absence() -> None:
+    """(c) **首屏读空绝不等于「这儿没有」**，也不能当成老路的起点。
+
+    这正是 2026-08-13 通宵事故的形态：一屏读空被当成「这一段没有预设」，于是往右
+    拖过头，白跑 145 次约两小时。捷径把「读一屏」提到了最前面，等于给这个坑新开了
+    一个入口——读空必须落回老路，而且**不许把那份空清单当作 `scroll_to_left_end`
+    的起点**（拿空清单当起点，「拖了一次还是空」会被误判成「已经夹住了」）。
+
+    这里让打开时那一屏（第 1 屏）连读多次都是空，而目标 `BBB` 就在第 0 屏。
+    """
+    strip = _FlakyStrip(
+        [_left_end_screen(), [(830, "探路"), (990, "CCC")]],
+        blank_screen=1,
+        blank_times=999,
+    )
+    strip.at = 1
+    driver = _Driver(strip)
+    picker = PresetPicker(driver=driver, read_names=strip.read)
+
+    assert picker.pick("AAA") == 748
+
+    assert _preset_clicks(driver) == [(748, PRESET_NAME_ROW_Y, "预设 AAA")]
+    assert driver.drags, "读空之后必须真的去拖，而不是当场判「没有」"
+
+
+def test_the_shortcut_never_clicks_into_the_save_button_margin() -> None:
+    """(d) 首屏命中但中心 x 落在安全区右边 → 不点，落老路。
+
+    捷径走的必须是同一个 `_clickable_hit`。绕过它的实现会在这里点下去——
+    而那个位置上是「+ 保存当前舰队」，点一下就覆盖用户自己维护的预设。
+    """
+    picker, driver, _strip = _picker([[(760, "AAA"), (SAVE_BUTTON_X, "CCC")]])
+
+    with pytest.raises(PresetNotFound, match="CCC"):
+        picker.pick("CCC")
+
+    assert _preset_clicks(driver) == []
+    assert driver.drags, "被边距挡下之后要接着走老路，不是就地放弃"
+
+
+def test_the_shortcut_never_clicks_a_name_that_reads_like_the_save_button() -> None:
+    """(e) 首屏读到含「保存」的名字 → 不当候选。
+
+    独立于坐标的第二道闸，捷径同样要过。
+    """
+    picker, driver, _strip = _picker([[(760, "AAA"), (900, "+保存当前舰队")]])
+
+    with pytest.raises(PresetNotFound, match="保存当前舰队"):
+        picker.pick("保存当前舰队")
+
+    assert _preset_clicks(driver) == []
+
+
+def test_both_routes_are_told_apart_in_the_log() -> None:
+    """两条路在结果上一模一样，只有日志能把它们分开。
+
+    没有这一行，「捷径到底有没有生效」在实机上无从查证——而这条改动的**全部收益**
+    就是它生效的那些次。
+    """
+    said: list[str] = []
+    strip = _Strip([_left_end_screen(), [(830, "探路"), (990, "BBB")]])
+    picker = PresetPicker(driver=_Driver(strip), read_names=strip.read, say=said.append)
+
+    picker.pick("AAA")
+    hit = list(said)
+    said.clear()
+    picker.pick("BBB")
+
+    assert any("不用拖" in line for line in hit)
+    assert any("拖到左端从头找" in line for line in said)
+
+
 # -- 左端 ----------------------------------------------------------------------
 
 
@@ -113,8 +298,16 @@ def test_the_search_starts_leftward_before_it_ever_goes_right() -> None:
 
     往左夹住是为了拿到一个确定的起点；先往右扫的话，打开时停在中间的那次
     就会漏掉左边的预设——`AAA` 正是最左那个。
+
+    ⚠️ 目标**不能**摆在打开时那一屏上：那样会走「先看这一屏」的捷径，一次都不拖，
+    这条就变成空断言了。所以中间插一屏，让打开时那一屏读不到 `BBB`。
     """
-    picker, driver, _strip = _picker([_left_end_screen(), [(830, "探路"), (990, "BBB")]], at=1)
+    screens = [
+        _left_end_screen(),
+        [(830, "探路"), (990, "中转")],
+        [(770, "中转"), (985, "BBB")],
+    ]
+    picker, driver, _strip = _picker(screens, at=1)
 
     picker.pick("BBB")
 
@@ -279,8 +472,12 @@ def test_the_drag_endpoints_stay_clear_of_the_save_button() -> None:
 
 
 def test_the_leftward_drag_keeps_the_coordinates_it_was_calibrated_with() -> None:
-    """往左拖的两端一个字不改——那是实机走通的一对，别顺手跟着右拖一起「统一」了。"""
-    picker, driver, _strip = _picker([_left_end_screen()])
+    """往左拖的两端一个字不改——那是实机走通的一对，别顺手跟着右拖一起「统一」了。
+
+    ⚠️ 条必须**开在左端以外**：开在左端时「先看这一屏」的捷径会直接点中，一次左拖
+    都不发生，这条就无从检查了。
+    """
+    picker, driver, _strip = _picker([_left_end_screen(), [(830, "探路"), (990, "BBB")]], at=1)
 
     picker.pick("AAA")
 

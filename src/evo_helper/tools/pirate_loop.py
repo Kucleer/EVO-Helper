@@ -84,6 +84,8 @@ from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
     NAV_LABEL_ROI,
+    NAV_VALUE_RECIPES,
+    NAV_VALUE_ROIS,
     PLANET_VIEW_BUTTON,
     VIEW_MENU_BUTTON,
     VIEW_SWITCH_WAIT_S,
@@ -1245,7 +1247,7 @@ class PirateLoop:
         timer.lap("开面板")
 
         picker = PresetPicker(
-            driver=_PresetPickerDriver(self._driver), read_names=self._preset_names
+            driver=_PresetPickerDriver(self._driver), read_names=self._preset_names, say=say
         )
         try:
             picker.pick(wanted)
@@ -2802,6 +2804,9 @@ class PirateLoop:
 
         切完还要把画面拨回恒星系视图——切换会把游戏丢到新星球的地表上，
         而 `_sweep` 的第一件事就是照恒星系视图的坐标导航。
+
+        视图拨回来之后再回读一次导航栏（`_adopt_navigation_bar`）：读通了，本轮头一个
+        目标就不必把没变的那一两个字段重设一遍。原先这里是无条件清缓存，代价见那边。
         """
         target = self._options.origin or origin()
         if not switch_needed(target, self._current_planet):
@@ -2826,10 +2831,58 @@ class PirateLoop:
                 say(f"  这颗星球不在你的行星列表里；请核对任务配的出发星球 {target}")
             return False
         self._current_planet = target
-        # 浮层与派遣面板都开过，导航栏里是什么已经不可知了。
-        self._navigator.invalidate()
+        # ⚠️ **顺序：先切回恒星系视图，再回读导航栏。** `_require_system_view` 一旦
+        # 需要切视图，`ensure_system_view` 内部自己就 `invalidate()` 了——回读放在
+        # 它前面的话，刚记下的那份确认会被当场抹掉，白读一次。
         self._require_system_view("切换出发星球之后切不回恒星系视图")
+        self._adopt_navigation_bar(target)
         return True
+
+    def _adopt_navigation_bar(self, origin: Coordinate) -> None:
+        """回读导航栏三个值框，读出来就是 `origin` 才让导航器记住。
+
+        ## 这一步替掉的是什么
+
+        原先切完星球无条件 `invalidate()`，于是**下一个目标的 `goto` 三个字段全设**
+        ——哪怕出发星是 `4:277:15`、目标是 `4:273:12`，那个银河系 `4` 一个字都没变。
+        实测（生产 `system_log`，2026-08-17 一天 177 次派遣）37 次三字段导航里
+        **33 次紧跟在「出发星球：切到 …」之后**，而一个字段是 6.6 秒。
+
+        ## 为什么读导航栏，而不是拿切星球那次回读将就
+
+        `game.planet_list._confirm` 切完确实回读过一次坐标（「起点回读 …」），但那读的
+        是**派遣面板的起点**，证明的是「我现在站在这颗星球上」；缓存要描述的却是
+        **导航栏三个输入框里的值**。两者在游戏里应该耦合（实拍
+        `var/logs/calib-恒星系-client.png`：刚登录、一个字都没往框里打过，切到恒星系
+        视图后三个框就是当前星球 `2:137:18`），但**那是观察不是证明**——只有一颗
+        星球的样本，分不开「显示当前星球」与「显示主星」。
+
+        所以这里老老实实读那三个框本身。代价是每轮一次 OCR（约几百毫秒，一轮只切一次
+        星球），换来的是这条捷径**不依赖任何未证实的耦合**：读通了就是证据，读不通就
+        照旧 `invalidate()`，也就是今天的行为。顺带地，日志里那行读数会把耦合到底成不
+        成立当场记下来——下次谁想省掉这次 OCR，库里就有一整月的证据可查。
+        """
+        values = self._navigation_bar_values()
+        if self._navigator.adopt_readback(origin, values):
+            say(f"  导航栏回读 {values}，确认停在 {origin}；同银河的下一个目标少设 1–2 个字段")
+            return
+        say(f"  导航栏回读 {values}，对不上 {origin}；清掉导航缓存，下一个目标三个字段全设")
+
+    def _navigation_bar_values(self) -> tuple[str, str, str]:
+        """导航栏银河系 / 恒星系 / 行星三个值框的读数；读不出的那一格交空串。
+
+        每个框各自逐套配方试到读出数字为止（`NAV_VALUE_RECIPES`）：同一张画面上
+        三个框的难度并不一样，实拍里出现过「三倍读得出行星、两倍才读得出银河系」。
+        """
+        values: list[str] = []
+        for roi in NAV_VALUE_ROIS:
+            text = ""
+            for upscale, threshold in NAV_VALUE_RECIPES:
+                text = self._read(roi, digits=True, upscale=upscale, threshold=threshold)
+                if text:
+                    break
+            values.append(text)
+        return (values[0], values[1], values[2])
 
     # -- 主循环 -------------------------------------------------------------
 
