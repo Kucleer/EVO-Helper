@@ -1,7 +1,7 @@
 """战报「获得资源」12 格的明细表
 
 Revision ID: c4e8b2f70a15
-Revises: b3d7e5a91c04
+Revises: c2a8f4d31e75
 Create Date: 2026-08-17
 
 新增 `battle_report_resources`：战报详情页未滚动那一屏上「获得资源」那 12 个格子里
@@ -34,7 +34,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c4e8b2f70a15"
-down_revision: str | None = "b3d7e5a91c04"
+down_revision: str | None = "c2a8f4d31e75"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
