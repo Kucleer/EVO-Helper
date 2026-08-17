@@ -53,6 +53,24 @@ class TestBattleReportFormats:
         assert _quantity("1.2B").amount == 1_200_000_000
 
 
+class TestDecimalConversion:
+    """⚠️ **换算必须走 `Decimal`。**
+
+    这三个是 2026-08-17 军力榜上原样读到的值，也是 `float(x) * 1000` 唯一会露馅
+    的那一类——脏值曾经**落进过库**（`bot_targets.military_score`），页面上显示成
+    一串小数尾巴。战报那 12 格的样本恰好没有一个是脏的，所以这条只能靠榜上的
+    真实值来钉：解析器是共用的，它在哪一侧退回 float 都是同一个缺陷。
+    """
+
+    @pytest.mark.parametrize(
+        ("text", "value"),
+        [("64.96K", 64_960), ("64.26K", 64_260), ("64.18K", 64_180)],
+    )
+    def test_the_measured_dirty_values_land_exactly(self, text: str, value: int) -> None:
+        assert _quantity(text).value == Decimal(value)
+        assert _quantity(text).amount == value
+
+
 class TestInventoryFormats:
     """太空舱材料页：点是**千分位分隔符**。
 
