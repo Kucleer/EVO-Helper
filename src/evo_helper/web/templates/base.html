@@ -181,7 +181,17 @@
     <div class="brand">EVO&nbsp;HELPER</div>
     <a href="/missions" {% if active == 'missions' %}aria-current="page"{% endif %}>任务中心</a>
     <a href="/settings" {% if active == 'settings' %}aria-current="page"{% endif %}>攻击配置</a>
-    <a href="/intel" {% if active == 'intel' %}aria-current="page"{% endif %}>情报中心</a>
+    {# 「情报中心」的导航入口已隐藏（用户口径 2026-08-17：「隐藏掉入口，新功能可以
+       不兼容这部分」，理由是「基本不会使用这个功能」）。
+
+       **只去掉入口，页面与代码都还在**：`/intel` 手输地址仍然返回 200，
+       `/targets → /intel` 那条 307 也照旧——旧书签不该变成 404。而
+       `storage/intel.py` 更是不能碰，`application/mission_progress.py` 靠它判任务
+       进度，那是链路不是展示。
+
+       ⚠️ **它不再是需要同步维护的一等公民。** 用户同时明确「新功能可以不兼容
+       这部分」，所以以后做全站改动（统一时间显示、加自动刷新这类）**不必再捎带
+       这一页**。写在这里是免得后来的人为了「保持一致」去改一个没有读者的页面。 #}
     <a href="/rankings" {% if active == 'rankings' %}aria-current="page"{% endif %}>军力榜</a>
     <a href="/planets" {% if active == 'planets' %}aria-current="page"{% endif %}>星球列表</a>
     {# 「分档阈值」已关闭：bot 不再按守方舰队量分档，一律用预设 BBB 打
