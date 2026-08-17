@@ -1551,12 +1551,9 @@ class SqlAlchemyRepository:
         代价有界：每个目标每 6 小时最多重来一次；而不剔的代价是它这一整轮
         再也不动，且画面上只是「在等」。
 
-        ⚠️ 这也正是「读不到战报的那一发算不算一次重打配额」的答案
-        （`domain.bot_round.MAX_ATTACKS_PER_TARGET`）：**6 小时之内算**——它还在
-        这张表上，目标就停在 `AWAITING_ATTACK_REPORT`，压根走不到重打那一步；
-        **超过 6 小时不算**——那一条被剔掉，配额跟着退回去。两段合起来的上界是
-        「每个目标每 6 小时最多多打一发」，与既有的「战报丢了就允许重来一次」
-        是同一条规则，没有新增第二套计时。
+        ⚠️ **这是本方法唯一还会造成「同一坐标再打一发」的路径。** 平局重打已于
+        2026-08-17 移除（见 `domain.bot_round` 模块头），战报丢失这一条与它无关，
+        也不受它牵连：它管的是「这一发的结果永远拿不到」，不是「结果不满意」。
 
         `accepted` 这个过滤不能省，与兄弟方法 `count_dispatches_since` /
         `pending_reports_for_kind` 同口径：被游戏拒掉的那一发没有舰队飞出去，
@@ -1568,14 +1565,15 @@ class SqlAlchemyRepository:
         更认不出「这一发根本不会有战报」——一条侦察发混进来就会被当成攻击发，
         把目标永久钉在等战报上。PR #95 修的正是这个形状。
 
-        ⚠️ **按 `dispatched_at_utc` 排序交出去。** `phase_of` 只看**最后一发**打成
-        了什么（平局才重打），乱序的话，先赢后平的目标会被读成先平后赢、就此收工，
-        而先平后赢的会被无限重打到撞上限。SQLite 不保证不带 `ORDER BY` 的次序。
+        **不再取 `battle_reports.outcome`。** 平局重打移除之后（2026-08-17）
+        `phase_of` 不看战果，取回来就是没人读的一列。战果本身照旧存在库里，
+        取它的是展示那一侧（`storage.intel` / 日志页），不是这条判态链路。
+        `ORDER BY` 保留只为让查询输出稳定，已不再是判据的一部分。
         """
         give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
         with self._session_factory() as session:
             statement = (
-                select(orm.BattleReportRow.id, orm.BattleReportRow.outcome)
+                select(orm.BattleReportRow.id)
                 .select_from(orm.AttackIntentRow)
                 .join(
                     orm.AttackDispatchRow,
@@ -1605,8 +1603,8 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
             return [
-                DispatchFact(has_report=report_id is not None, outcome=outcome)
-                for report_id, outcome in session.execute(statement).all()
+                DispatchFact(has_report=report_id is not None)
+                for (report_id,) in session.execute(statement).all()
             ]
 
     def bot_dispatch_facts_many(
@@ -1636,7 +1634,6 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_system,
                     orm.AttackIntentRow.target_position,
                     orm.BattleReportRow.id,
-                    orm.BattleReportRow.outcome,
                 )
                 .select_from(orm.AttackIntentRow)
                 .join(
@@ -1668,12 +1665,10 @@ class SqlAlchemyRepository:
                 statement = statement.where(
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
-            for galaxy, system, position, report_id, outcome in session.execute(statement).all():
+            for galaxy, system, position, report_id in session.execute(statement).all():
                 coordinate = Coordinate(galaxy, system, position)
                 if coordinate in wanted:
-                    result[coordinate].append(
-                        DispatchFact(has_report=report_id is not None, outcome=outcome)
-                    )
+                    result[coordinate].append(DispatchFact(has_report=report_id is not None))
         return result
 
     def attacked_bot_targets_since(self, since: datetime) -> set[Coordinate]:

@@ -2,8 +2,11 @@
 
 这两个方法喂的是 `domain.bot_round.phase_of`，而那个纯函数的失效方式全是
 **静默**的——不崩溃、不报错，只是某个目标永远停在「等战报」（于是 bot 任务
-永远不退出，画面上看起来只是「在等」），或者反过来被无限重打。所以这里测的
+永远不退出，画面上看起来只是「在等」），或者反过来被从头再打一遍。所以这里测的
 不是「查出来几行」，而是「查错了会让 phase_of 得出什么结论」。
+
+战果那一列仍然查得到、仍然入库，只是**不再喂给 `phase_of`**：平局重打已按用户
+口径（2026-08-17）移除。下面「战果」那一节守的正是这条界线的两边。
 """
 
 from __future__ import annotations
@@ -91,9 +94,8 @@ def test_an_intent_with_no_dispatch_at_all_is_not_a_fact(repository, run_id) -> 
 def test_facts_from_an_earlier_round_are_excluded(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """上一轮打过不代表本轮打过。
 
-    不按轮切开的话，重开一轮会立刻显示「已完成」；而重打配额
-    （`MAX_ATTACKS_PER_TARGET`）也是按这条查询的行数算的，把昨天那几发算进来
-    就等于这个目标今天一发都不许打。
+    不按轮切开的话，昨天那一发会被当成本轮打过的，这个目标今天一发都不会派——
+    而重开一轮的页面上它会立刻显示「已完成」。
     """
     _intent(repository, run_id, created_at=LAST_ROUND, has_report=True)
 
@@ -157,50 +159,52 @@ def test_the_attack_report_is_what_finishes_the_target(repository, run_id) -> No
     )
 
 
-# -- 战果：平局才重打 --------------------------------------------------------
+# -- 战果：入库照旧，但不再影响判态 ------------------------------------------
 
 
-def test_the_stored_outcome_is_carried_into_the_fact(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """`battle_reports.outcome` 必须原样送到 `phase_of` 手上。
+def test_a_draw_report_finishes_the_target(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**平局也走完。** 用户口径（2026-08-17）：「bot 攻击移除平局再打一次机制」。
 
-    不送的话平局永远看不见（`outcome` 恒为 None），「平局就继续攻击」这条口径
-    在库这一侧就断了——而断掉的样子是「每个目标都只打一发就收工」，看着完全正常。
+    这条原先叫 `test_the_stored_outcome_is_carried_into_the_fact`，钉的是反过来的
+    口径（平局 → `NEEDS_ATTACK`，好让链路补刀）。规则移除之后它改钉新口径，
+    而不是删掉：删掉的话，「平局又被接回去重打」就没有任何一层拦得住，
+    而复发的样子是链路悄悄多烧航线，日志上只是一句「又打了一发」。
+
+    ⚠️ **战果本身照旧写在库里。** 这条只说 `phase_of` 不看它；那一行
+    `battle_reports.outcome` 仍是 `DRAW`，日志页与情报中心照样显示、照样筛得出来。
     """
     _intent(repository, run_id, created_at=ROUND_START, has_report=True, outcome=OUTCOME_DRAW)
 
     facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
-    assert [fact.outcome for fact in facts] == [OUTCOME_DRAW]
-    assert phase_of(facts) is BotPhase.NEEDS_ATTACK
-
-
-def test_the_facts_come_back_in_dispatch_order(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """**次序是判据的一部分**：`phase_of` 只看最后一发打成了什么。
-
-    先平后胜的目标，乱序读成先胜后平就会被一直重打到撞上限；反过来则是
-    该重打的目标一发就收工。SQLite 不保证不带 `ORDER BY` 的次序，所以这条
-    要在真库上量，不能只在纯函数那一层量。
-
-    ⚠️ 这里刻意让**先派出的那一发时间戳更晚地写进库**（先写 later、再写
-    earlier），这样「按插入顺序返回」和「按派出时刻返回」会给出相反的答案。
-    """
-    later = ROUND_START + timedelta(minutes=30)
-    _intent(repository, run_id, created_at=later, has_report=True, outcome=OUTCOME_VICTORY)
-    _intent(repository, run_id, created_at=ROUND_START, has_report=True, outcome=OUTCOME_DRAW)
-
-    facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
-
-    assert [fact.outcome for fact in facts] == [OUTCOME_DRAW, OUTCOME_VICTORY]
     assert phase_of(facts) is BotPhase.DONE
+
+
+def test_the_outcome_column_is_still_written(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """判态不看战果 ≠ 战果没写进去。
+
+    上一条只证明了「平局不再补刀」。要是有人顺手把战果那一列一起停写了，
+    上一条照样绿——而攻击日志上那一列会静默变成一片空白。这条守住的是那半边：
+    库里存的仍然是 `DRAW` 这个词本身。
+    """
+    from sqlalchemy import select
+
+    from evo_helper.storage import models as orm
+
+    _intent(repository, run_id, created_at=ROUND_START, has_report=True, outcome=OUTCOME_DRAW)
+
+    with repository._session_factory() as session:  # noqa: SLF001
+        stored = list(session.scalars(select(orm.BattleReportRow.outcome)))
+
+    assert stored == [OUTCOME_DRAW]
 
 
 def test_a_lost_report_frees_the_target_to_be_attacked_again(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """派出超过 `MAX_REPORT_AGE` 还没战报的那一发整条剔掉。
 
-    这就是「读不到战报算不算一次重打配额」的答案：**6 小时之内算**（它还在这张
-    表上，目标停在等战报，根本走不到重打那一步）；**超过就不算**（那一条消失，
-    配额跟着退回去）。合起来的上界是「每个目标每 6 小时最多多打一发」——
-    不剔的代价则是它这一整轮再也不动，而画面上只是「在等」。
+    平局重打移除之后，**这是唯一还会让同一坐标本轮再吃一发的路径**，而它管的是
+    「这一发的结果永远拿不到」，不是「结果不满意」。不剔的代价则是它这一整轮
+    再也不动，而画面上只是「在等」。
     """
     from evo_helper.domain.report_wait import MAX_REPORT_AGE
 
@@ -287,8 +291,9 @@ def test_a_refused_dispatch_is_not_waiting_either(repository, run_id) -> None:  
 def test_the_earliest_open_dispatch_wins(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """同一个坐标有多发未闭合时取**最早**那一发。
 
-    平局重打之后这个坐标上会同时挂着两发，所以这条不是假想情形。翻信箱要的是
-    覆盖全部候选的下界；取最晚那一发会把更早那一发的报告挡在外面。
+    战报丢失后允许重来一发，于是这个坐标上会同时挂着两发，所以这条不是假想情形
+    （平局重打已于 2026-08-17 移除，但那条路径与它无关）。翻信箱要的是覆盖全部
+    候选的下界；取最晚那一发会把更早那一发的报告挡在外面。
     """
     _intent(repository, run_id, created_at=ROUND_START)
     _intent(repository, run_id, created_at=ROUND_START + timedelta(minutes=10))
