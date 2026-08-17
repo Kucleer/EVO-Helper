@@ -56,9 +56,12 @@ bot 攻击移除「平局就对同一坐标再打一次」的重试规则。**�
 - 配置：无
 - 数据库：**无迁移，无 schema 变更**，一行业务数据不动；`battle_reports.outcome`
   照旧读写
-- 验证：`pytest tests`（2159 passed / 80 skipped）、`ruff check src tests`、
-  `ruff format --check src tests`、`mypy src`；两条变异逐条确认转红（把重试规则
-  加回去 → 判态与两种模式的用例红；把 `DRAW` 这个战果本身删掉 → 观测侧的用例红）
+- 验证：`pytest tests`（2158 passed / 80 skipped）、`ruff check src tests`、
+  `ruff format --check src tests`、`mypy src`；三条变异逐条确认转红：
+  ① 把重试规则连同 `DispatchFact.outcome` 一起接回去 → 6 条红（判态、仓储、
+  范围模式、军力模式各有守卫）；② 让 `battle_outcome` 不再产出 `DRAW` → 4 条红；
+  ③ 停写 `battle_reports.outcome` 这一列 → 14 条红（日志页、情报中心筛选、仓储）。
+  ②③ 证明这次没有把观测数据一起删掉
 - 安全：默认仍不派任何东西（`--attack` 才动鼠标）；出发前三道闸门不变；
   这次改动**只会让 bot 少派**，不会多派
 - 回滚：revert 本次提交即可（没有迁移要退）

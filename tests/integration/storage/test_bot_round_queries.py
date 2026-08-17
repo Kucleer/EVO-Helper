@@ -5,8 +5,8 @@
 永远不退出，画面上看起来只是「在等」），或者反过来被从头再打一遍。所以这里测的
 不是「查出来几行」，而是「查错了会让 phase_of 得出什么结论」。
 
-战果那一列仍然查得到、仍然入库，只是**不再喂给 `phase_of`**：平局重打已按用户
-口径（2026-08-17）移除。下面「战果」那一节守的正是这条界线的两边。
+战果那一列仍然入库、仍然显示，只是**不再喂给 `phase_of`**：平局重打已按用户
+口径（2026-08-17）移除。下面「战果」那一节守的是这条界线本身。
 """
 
 from __future__ import annotations
@@ -170,33 +170,17 @@ def test_a_draw_report_finishes_the_target(repository, run_id) -> None:  # type:
     而不是删掉：删掉的话，「平局又被接回去重打」就没有任何一层拦得住，
     而复发的样子是链路悄悄多烧航线，日志上只是一句「又打了一发」。
 
-    ⚠️ **战果本身照旧写在库里。** 这条只说 `phase_of` 不看它；那一行
-    `battle_reports.outcome` 仍是 `DRAW`，日志页与情报中心照样显示、照样筛得出来。
+    ⚠️ **这条只说 `phase_of` 不看战果，不说战果没写进去。** 那一列照旧写、照旧
+    显示。守它的不是本文件（这里的桩件是直接塞进 `battle_reports` 的，绕开了真正
+    的写入路径，量不到写没写），而是走真 `append_report` 的
+    `test_bot_report_ingest.py::test_ingesting_the_report_unblocks_the_target`
+    以及日志页/情报中心那一批（`test_attack_log*.py`、`test_intel_quick_filters.py`）。
     """
     _intent(repository, run_id, created_at=ROUND_START, has_report=True, outcome=OUTCOME_DRAW)
 
     facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=NOW)
 
     assert phase_of(facts) is BotPhase.DONE
-
-
-def test_the_outcome_column_is_still_written(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """判态不看战果 ≠ 战果没写进去。
-
-    上一条只证明了「平局不再补刀」。要是有人顺手把战果那一列一起停写了，
-    上一条照样绿——而攻击日志上那一列会静默变成一片空白。这条守住的是那半边：
-    库里存的仍然是 `DRAW` 这个词本身。
-    """
-    from sqlalchemy import select
-
-    from evo_helper.storage import models as orm
-
-    _intent(repository, run_id, created_at=ROUND_START, has_report=True, outcome=OUTCOME_DRAW)
-
-    with repository._session_factory() as session:  # noqa: SLF001
-        stored = list(session.scalars(select(orm.BattleReportRow.outcome)))
-
-    assert stored == [OUTCOME_DRAW]
 
 
 def test_a_lost_report_frees_the_target_to_be_attacked_again(repository, run_id) -> None:  # type: ignore[no-untyped-def]
