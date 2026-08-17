@@ -164,6 +164,41 @@ def test_a_finished_bot_round_says_done_not_waiting() -> None:
     assert status(MissionKind.BOT, targets_remaining=0) is TaskStatus.DONE
 
 
+def test_stale_military_scores_are_not_dressed_up_as_a_finished_round() -> None:
+    """⚠️ 本组的核心判据：**「分数全过期」不许显示成「已完成」。**
+
+    军力优先模式下这两件事在 `targets_remaining` 上长得一模一样（都是 0）——
+    新鲜度闸门把超期的目标全滤掉之后，「一个都打不了」和「全都打完了」在那个数
+    上无从分辨。而「已完成」听起来是这一轮顺利跑完了，实际正相反：目标一个没少，
+    只是军力数据放旧了。
+
+    说反了的代价是具体的：用户不会去做真正该做的两件事（等军力榜扫一轮、
+    或者把有效期调长），而会去按「已完成」的意思重开一轮——重开之后候选池还是
+    那批超期目标，于是立刻又「已完成」。
+    """
+    assert (
+        status(MissionKind.BOT, targets_remaining=0, scores_are_stale=True)
+        is TaskStatus.STALE_MILITARY_SCORES
+    )
+
+
+def test_a_genuinely_finished_round_still_says_done() -> None:
+    """反向那一半：真打完了就得说「已完成」。
+
+    少了这条，一个「把 `bot_round_complete` 整个删掉、一律报过期」的改动会全绿。
+    """
+    assert status(MissionKind.BOT, targets_remaining=0, scores_are_stale=False) is TaskStatus.DONE
+
+
+def test_stale_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
+    """还有能打的目标时，这一档一个字都不该说——那时它是「待命」。
+
+    新鲜度这件事只在**它是不动的原因**时才值得占那一句话。候选池里还剩几个能打的，
+    却写着「军力数据已过期」，用户会去等一轮根本不需要等的扫描。
+    """
+    assert status(MissionKind.BOT, targets_remaining=3, scores_are_stale=True) is TaskStatus.READY
+
+
 def test_no_free_lines_reads_as_waiting_for_lines() -> None:
     assert status(MissionKind.BOT, free_lines=0) is TaskStatus.WAITING_LINES
 
