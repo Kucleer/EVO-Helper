@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -54,8 +55,13 @@ def _loop(
     *,
     result: SwitchResult = SwitchResult.SWITCHED,
     origin: Coordinate | None = SECOND,
-    reconcile_on_start: bool = False,
+    last_reconciled_minutes_ago: float | None = 1.0,
 ) -> tuple[Any, _FakeSwitcher, list[str]]:
+    """`last_reconciled_minutes_ago` 决定这一轮翻不翻信箱（`domain.reconcile_cooldown`）。
+
+    默认 1 分钟前刚对过账 = 冷却中、本轮不翻。切星球那条链路的用例只关心切换，
+    不该被那一趟信箱搅进来；要看信箱就把它设成 `None`（从没对过账，必翻）。
+    """
     from evo_helper.game import game_window
 
     monkeypatch.setattr(game_window, "ensure_game_window", lambda: None)
@@ -64,9 +70,7 @@ def _loop(
     swept: list[str] = []
     switcher = _FakeSwitcher(result)
     loop = PirateLoop.__new__(PirateLoop)
-    loop._options = LoopOptions(
-        systems=(), scout=False, attack=True, origin=origin, reconcile_on_start=reconcile_on_start
-    )
+    loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=origin)
     loop._outcome = Outcome()
     loop._current_planet = None
     loop._navigator = _FakeNavigator()
@@ -76,6 +80,12 @@ def _loop(
     loop._require_system_view = lambda _what: None
     loop._goto_planet_surface = lambda: True
     loop.planet_switcher = lambda **_k: switcher
+    loop._reconcile_decision = None
+    loop._last_reconciled_at = lambda: (
+        None
+        if last_reconciled_minutes_ago is None
+        else datetime.now(UTC) - timedelta(minutes=last_reconciled_minutes_ago)
+    )
     loop.reconcile_today = lambda: swept.append("开工那一趟信箱")
     loop._sweep = lambda: swept.append("扫目标")
     return loop, switcher, swept
@@ -102,7 +112,7 @@ class TestSwitchingOncePerRound:
 
         这里钉的是**交错顺序**，光看两个清单各自的内容看不出来。
         """
-        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
+        loop, switcher, order = _loop(monkeypatch, last_reconciled_minutes_ago=None)
         loop.reconcile_today = lambda: order.append("信箱")
         loop._sweep = lambda: order.append("扫目标")
         switcher.switch_to = lambda target: (  # type: ignore[method-assign]
@@ -119,7 +129,7 @@ class TestSwitchingOncePerRound:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """恒星系底栏同一像素不是「行星」；必须先回地表。"""
-        loop, switcher, order = _loop(monkeypatch, reconcile_on_start=True)
+        loop, switcher, order = _loop(monkeypatch, last_reconciled_minutes_ago=None)
         loop._goto_planet_surface = lambda: (order.append("回地表"), True)[1]
         switcher.switch_to = lambda target: (  # type: ignore[method-assign]
             order.append("切星球"),
@@ -199,7 +209,7 @@ class TestRefusingToDispatchWhenTheSwitchFailed:
 
         outcome = loop.run()
 
-        assert swept == [], "关闭启动补录时，切星球失败也不应打开信箱"
+        assert swept == [], "冷却中的那一轮不翻信箱，切星球失败也不该改变这一点"
         assert outcome.attacked == []
         assert outcome.busy is not None
         assert "9:250:8" in outcome.busy

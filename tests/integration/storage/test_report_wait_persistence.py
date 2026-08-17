@@ -17,6 +17,7 @@ from evo_helper.storage.database import Base, create_database_engine, create_ses
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 DISPATCHED = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -26,7 +27,7 @@ CYCLE_START = datetime(2026, 8, 3, tzinfo=UTC)
 
 
 def _plan_and_run(tmp_path: Path, name: str):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / name}")
+    engine = create_database_engine(scratch_database_url(tmp_path, name))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: DISPATCHED)
@@ -93,7 +94,7 @@ def test_the_wake_up_time_survives_a_restart(tmp_path: Path) -> None:
     engine.dispose()
 
     # 助手在这里完全退出：新引擎、新仓储，没有任何内存状态。
-    reopened = create_database_engine(f"sqlite:///{tmp_path / 'restart.db'}")
+    reopened = create_database_engine(scratch_database_url(tmp_path, "restart.db"))
     repo2 = SqlAlchemyRepository(create_session_factory(reopened))
 
     pending = repo2.pending_reports(run_id)

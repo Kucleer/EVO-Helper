@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -46,11 +47,12 @@ from evo_helper.domain.report_wait import (
     vet_flight_time,
 )
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
-from evo_helper.domain.scheduler import MissionKind
+from evo_helper.domain.scheduler import DisabledRecovery, MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
 
 from . import models as orm
+from .system_log import SystemLogRepository
 
 #: How far a report's timestamp may deviate from the dispatch time and still
 #: count as the same dispatch under the strict origin/target/time match rule.
@@ -1054,11 +1056,13 @@ class SqlAlchemyRepository:
         """
         floor = _require_utc(since, "since")
         with self._session_factory() as session:
-            dispatched = func.date(orm.AttackDispatchRow.dispatched_at_utc)
-            per_day = {
-                str(day): int(count)
-                for day, count in session.execute(
-                    select(dispatched, func.count())
+            # 切日在 Python 里做，不在 SQL 里做——理由见 `_utc_day`。窗口是
+            # `quota_day_start_utc(now)` 起的一个 UTC 日，行数是当天派出的发数，
+            # 拉回来自己数不值得心疼。
+            per_day = Counter(
+                _utc_day(dispatched)
+                for dispatched in session.scalars(
+                    select(orm.AttackDispatchRow.dispatched_at_utc)
                     .select_from(orm.AttackDispatchRow)
                     .join(
                         orm.AttackIntentRow,
@@ -1070,9 +1074,8 @@ class SqlAlchemyRepository:
                         orm.AttackDispatchRow.accepted.is_(True),
                         orm.AttackDispatchRow.dispatched_at_utc >= floor,
                     )
-                    .group_by(dispatched)
-                ).all()
-            }
+                )
+            )
             observed = {
                 str(day): int(count)
                 for day, count in session.execute(
@@ -1215,6 +1218,32 @@ class SqlAlchemyRepository:
             if row is None:
                 return None
             return _daily_status(row)
+
+    def last_reconciled_at(self, target_kind: str) -> datetime | None:
+        """本链路**最后一次真正翻完信箱**的时刻；从没对过账时 None。
+
+        开工冷却判据的唯一输入（`domain.reconcile_cooldown.decide_reconcile`）。
+
+        ⚠️ **跨日取最大值，不按 UTC 日筛。** 这个数回答的是「上一次有人去看过
+        信箱是什么时候」，而那件事跟日历天毫无关系。按当日筛的话，每个 UTC
+        00:00 都会凭空变成「从没对过账」，于是恰好在日界前后连着起的两轮
+        runner 会各翻一趟信箱——冷却在一天里最容易堆积续跑的那个时刻失效。
+
+        取 `reconciled_at_utc` 的最大值而不是「最新那一天的那一行」：
+        `record_daily_reconciliation` 会回填昨天的行（补录、跨日的那一轮），
+        按 `day_utc` 排序拿到的未必是时间上最后写的那一条。
+        """
+        with self._session_factory() as session:
+            moment = session.scalar(
+                select(func.max(orm.DailyReconciliationRow.reconciled_at_utc)).where(
+                    orm.DailyReconciliationRow.target_kind == target_kind
+                )
+            )
+        if moment is None:
+            return None
+        # SQLite 上读回来可能是 naive（见 `storage.database.UTCDateTime` 的注释里
+        # 那段：`func.max` 绕开了 TypeDecorator 的 `process_result_value`）。
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
     def record_daily_reconciliation(
         self,
@@ -1551,12 +1580,9 @@ class SqlAlchemyRepository:
         代价有界：每个目标每 6 小时最多重来一次；而不剔的代价是它这一整轮
         再也不动，且画面上只是「在等」。
 
-        ⚠️ 这也正是「读不到战报的那一发算不算一次重打配额」的答案
-        （`domain.bot_round.MAX_ATTACKS_PER_TARGET`）：**6 小时之内算**——它还在
-        这张表上，目标就停在 `AWAITING_ATTACK_REPORT`，压根走不到重打那一步；
-        **超过 6 小时不算**——那一条被剔掉，配额跟着退回去。两段合起来的上界是
-        「每个目标每 6 小时最多多打一发」，与既有的「战报丢了就允许重来一次」
-        是同一条规则，没有新增第二套计时。
+        ⚠️ **这是本方法唯一还会造成「同一坐标再打一发」的路径。** 平局重打已于
+        2026-08-17 移除（见 `domain.bot_round` 模块头），战报丢失这一条与它无关，
+        也不受它牵连：它管的是「这一发的结果永远拿不到」，不是「结果不满意」。
 
         `accepted` 这个过滤不能省，与兄弟方法 `count_dispatches_since` /
         `pending_reports_for_kind` 同口径：被游戏拒掉的那一发没有舰队飞出去，
@@ -1568,14 +1594,15 @@ class SqlAlchemyRepository:
         更认不出「这一发根本不会有战报」——一条侦察发混进来就会被当成攻击发，
         把目标永久钉在等战报上。PR #95 修的正是这个形状。
 
-        ⚠️ **按 `dispatched_at_utc` 排序交出去。** `phase_of` 只看**最后一发**打成
-        了什么（平局才重打），乱序的话，先赢后平的目标会被读成先平后赢、就此收工，
-        而先平后赢的会被无限重打到撞上限。SQLite 不保证不带 `ORDER BY` 的次序。
+        **不再取 `battle_reports.outcome`。** 平局重打移除之后（2026-08-17）
+        `phase_of` 不看战果，取回来就是没人读的一列。战果本身照旧存在库里，
+        取它的是展示那一侧（`storage.intel` / 日志页），不是这条判态链路。
+        `ORDER BY` 保留只为让查询输出稳定，已不再是判据的一部分。
         """
         give_up_before = _require_utc(now_utc or datetime.now(UTC), "now_utc") - MAX_REPORT_AGE
         with self._session_factory() as session:
             statement = (
-                select(orm.BattleReportRow.id, orm.BattleReportRow.outcome)
+                select(orm.BattleReportRow.id)
                 .select_from(orm.AttackIntentRow)
                 .join(
                     orm.AttackDispatchRow,
@@ -1605,8 +1632,8 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
             return [
-                DispatchFact(has_report=report_id is not None, outcome=outcome)
-                for report_id, outcome in session.execute(statement).all()
+                DispatchFact(has_report=report_id is not None)
+                for (report_id,) in session.execute(statement).all()
             ]
 
     def bot_dispatch_facts_many(
@@ -1636,7 +1663,6 @@ class SqlAlchemyRepository:
                     orm.AttackIntentRow.target_system,
                     orm.AttackIntentRow.target_position,
                     orm.BattleReportRow.id,
-                    orm.BattleReportRow.outcome,
                 )
                 .select_from(orm.AttackIntentRow)
                 .join(
@@ -1668,12 +1694,10 @@ class SqlAlchemyRepository:
                 statement = statement.where(
                     orm.AttackIntentRow.created_at_utc >= _require_utc(since, "since")
                 )
-            for galaxy, system, position, report_id, outcome in session.execute(statement).all():
+            for galaxy, system, position, report_id in session.execute(statement).all():
                 coordinate = Coordinate(galaxy, system, position)
                 if coordinate in wanted:
-                    result[coordinate].append(
-                        DispatchFact(has_report=report_id is not None, outcome=outcome)
-                    )
+                    result[coordinate].append(DispatchFact(has_report=report_id is not None))
         return result
 
     def attacked_bot_targets_since(self, since: datetime) -> set[Coordinate]:
@@ -2108,6 +2132,16 @@ class SqlAlchemyRepository:
             )
             session.commit()
 
+    def recent_system_log_messages(self, *, starts_with: str, limit: int) -> list[str]:
+        """转交给 `SystemLogRepository`：那张表的读写只许从那一个入口走。
+
+        这里只是个转发，为的是让调度器不必自己再拿一份 session factory——
+        它手上只有这个仓储。
+        """
+        return SystemLogRepository(self._session_factory).recent_messages(
+            starts_with=starts_with, limit=limit
+        )
+
     def military_attack_config(self) -> orm.MilitaryAttackConfigRow:
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
@@ -2115,13 +2149,22 @@ class SqlAlchemyRepository:
                 raise ValueError("military_attack_config 还没初始化；先调 ensure_mission_rows()")
             return row
 
-    def replace_military_attack_tiers(self, tiers_json: str) -> orm.MilitaryAttackConfigRow:
+    def replace_military_attack_tiers(
+        self, tiers_json: str, *, blind_scrolls: int | None = None
+    ) -> orm.MilitaryAttackConfigRow:
+        """整份全局攻击配置原子替换。
+
+        `blind_scrolls` 的 `None` 是**「留空」这个取值本身**，不是「这次不改」：
+        这条接口和 `PUT /api/attack-config` 一样是整份替换，写进去的就是页面上
+        当下那一份。想「只改档位、不动盲拖」得把盲拖的现值一起送上来。
+        """
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
             if row is None:
                 row = orm.MilitaryAttackConfigRow(id=1)
                 session.add(row)
             row.tiers_json = tiers_json
+            row.blind_scrolls = blind_scrolls
             session.commit()
             session.refresh(row)
             return row
@@ -2277,6 +2320,9 @@ class SqlAlchemyRepository:
                 _require_utc(enabled_until_utc, "enabled_until_utc")
                 row.enabled_until_utc = enabled_until_utc
             row.disabled_reason = None
+            # 原因清掉，类别跟着清掉：留着一个指向已经不存在的停用的标记，
+            # 迟早有人照它做判断。
+            row.disabled_recovery = None
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
@@ -2427,9 +2473,14 @@ class SqlAlchemyRepository:
             row = _mission_task(session, task_id)
             row.consecutive_failures += 1
             if row.consecutive_failures >= limit and row.disabled_reason is None:
-                row.disabled_reason = (
-                    f"连续 {row.consecutive_failures} 次异常退出（退出码 {exit_code}）"
-                )
+                # 退出码可能为 None：停顿看门狗掐掉的那一档是我们自己动的手，
+                # 收不到 runner 的表态（见 `MissionSupervisor.stop`）。
+                # 写「未知」而不是 None，那一行是要给用户看的。
+                code = "未知" if exit_code is None else str(exit_code)
+                row.disabled_reason = f"连续 {row.consecutive_failures} 次异常退出（退出码 {code}）"
+                # 连崩到上限说的是「这不是暂时的」，只能由用户动手放它出来。
+                # 自动恢复会让调度循环退回那个满速空转的重启循环。
+                row.disabled_recovery = DisabledRecovery.MANUAL.value
             failures = row.consecutive_failures
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
@@ -2449,13 +2500,55 @@ class SqlAlchemyRepository:
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
-    def disable_mission_task(self, task_id: int, reason: str) -> None:
-        """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。"""
+    def disable_mission_task(
+        self,
+        task_id: int,
+        reason: str,
+        *,
+        recovery: DisabledRecovery = DisabledRecovery.MANUAL,
+    ) -> None:
+        """参数不合格之类的配置问题：重试一万次也一样，直接停用并写清原因。
+
+        `recovery` 说的是「这一次靠什么被放回来」，见 `DisabledRecovery`。
+        默认 `MANUAL`——认不出来就要用户动手，这是唯一安全的默认。
+
+        **每次停用都要把这一列写一遍**，哪怕写的就是默认值：这一行可能正挂着
+        上一次停用留下的 `FREE_LINES`，不覆盖的话，一次「范围里没有 bot」会
+        顶着「等航线就自动恢复」的标记落库，然后被自动放出来。
+        """
         with self._session_factory() as session:
             row = _mission_task(session, task_id)
             row.disabled_reason = reason
+            row.disabled_recovery = recovery.value
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
+
+    def resume_mission_task(self, task_id: int, *, recovery: DisabledRecovery) -> bool:
+        """把一个**自动停用**的任务放回来，仅当它此刻正挂着 `recovery` 这个标记。
+
+        返回「这一下真的恢复了吗」，好让调用方只在真恢复时写日志——任务突然又
+        开始跑而日志里一个字都没有，事后没人查得出是谁放的它。
+
+        标记要在这个事务里**再确认一次**：调用方读行与这里写行之间隔着几次查库，
+        用户可能刚好在这期间点了「恢复」（那时 `disabled_reason` 已经是 NULL），
+        或者这条链路刚被另一个原因重新停用（标记已经换成 `MANUAL`）。两种情况下
+        都不能动它，尤其后者——那会把一条「连续失败」停用的链路悄悄放出来。
+
+        **不碰 `consecutive_failures`。** 会自愈的那几档停用（当前只有航线不足）
+        本来就不是失败，那个计数与它无关；顺手清掉等于把一条真在连崩的链路的
+        账抹平，下次它离自动停用又远了三次。
+        """
+        with self._session_factory() as session:
+            row = session.get(orm.MissionTaskRow, task_id)
+            if row is None or row.disabled_reason is None:
+                return False
+            if row.disabled_recovery != recovery.value:
+                return False
+            row.disabled_reason = None
+            row.disabled_recovery = None
+            row.updated_at_utc = datetime.now(UTC)
+            session.commit()
+            return True
 
 
 def _mission_task(session: Session, task_id: int) -> orm.MissionTaskRow:
@@ -2587,6 +2680,23 @@ def _bot_target_for(session: Session, coordinate: Coordinate) -> orm.BotTargetRo
     )
 
 
+def _utc_day(moment: datetime) -> str:
+    """一个时刻属于哪个 **UTC** 日，写成 `YYYY-MM-DD`。
+
+    ⚠️ **这件事刻意不在 SQL 里做。** 原来两处都是 `func.date(dispatched_at_utc)`：
+
+    - SQLite 上那一列存的就是 UTC 挂钟字符串，`date()` 切出来正好是 UTC 日；
+    - Postgres 上那一列是 `TIMESTAMPTZ`，`date()` 按**会话时区**换算。服务器时区
+      是 UTC+8 时，UTC 8/10 23:55 派出的那一发会被切成 8/11——海盗每天 32 次的
+      日界整体挪 8 小时。它不报错，只是把昨天的发数算进今天：配额提前打满，
+      或者跨过零点之后接着打、直到游戏把攻击强制返回。
+
+    `daily_reconciliations.day_utc` 存的是 UTC 日的字符串，两边要对得上，所以这里
+    统一按 UTC 切。列都走 `UTCDateTime`，读出来一定是 aware 的 UTC。
+    """
+    return _require_utc(moment, "moment").strftime("%Y-%m-%d")
+
+
 def _daily_status(row: orm.DailyReconciliationRow) -> DailyAttackStatus:
     return DailyAttackStatus(
         day_utc=row.day_utc,
@@ -2606,7 +2716,10 @@ def _accepted_attacks_on(session: Session, target_kind: str, *, day: str) -> int
     口径与 `count_dispatches_since` 里那半段逐字一致：`accepted` + 只数
     `MISSION_KIND_ATTACK`。侦察也是打向海盗的，不排掉的话一轮 4 发侦察就吃掉
     4 次攻击额度，当天 32 次以 4 倍速度静默消失。
+
+    切日用的是**半开区间**而不是 `date(dispatched_at_utc) = day`，理由见 `_utc_day`。
     """
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC)
     return int(
         session.scalar(
             select(func.count())
@@ -2616,7 +2729,8 @@ def _accepted_attacks_on(session: Session, target_kind: str, *, day: str) -> int
                 orm.AttackIntentRow.target_kind == target_kind,
                 orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
                 orm.AttackDispatchRow.accepted.is_(True),
-                func.date(orm.AttackDispatchRow.dispatched_at_utc) == day,
+                orm.AttackDispatchRow.dispatched_at_utc >= start,
+                orm.AttackDispatchRow.dispatched_at_utc < start + timedelta(days=1),
             )
         )
         or 0

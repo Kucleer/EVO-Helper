@@ -31,6 +31,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools import pirate_loop
 from evo_helper.tools.pirate_loop import LoopOptions, MailRow, PirateLoop
 from evo_helper.vision.parsers import ReportKind
+from support.database import scratch_database_url
 
 ORIGIN = Coordinate(2, 137, 18)
 FULL = {"深空吞噬者": 2, "噬能截击者": 4, "钛能守卫者": 4, "收割者": 0}
@@ -73,7 +74,7 @@ def _loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mails: list[_Screens]
 
     库是每个测试自己一个临时文件——**绝不碰生产库**。
     """
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'loop.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "loop.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
 

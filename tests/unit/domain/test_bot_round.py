@@ -1,16 +1,18 @@
-"""bot 目标在一轮里走的三态，以及「平局就再打」那条口径的边界。
+"""bot 目标在一轮里走的三态。
 
-态从库里推导而不是新增列：派了几发、每发的战报回来了没有、打成了什么，
+态从库里推导而不是新增列：派了几发、每发的战报回来了没有，
 `attack_dispatches` + `battle_reports` 已经全知道了。多一列就多一处可能和
 事实对不上的地方。
+
+**战果不在这份判据里。** 平局重打已按用户口径（2026-08-17）移除，所以本模块
+一个 `outcome` 都不该出现。下面那几条守的正是这个新口径：平局、胜、负一律
+走完。战果本身仍然是观测事实，它的守卫在 `test_battle_outcome` 与展示那一侧。
 """
 
 from __future__ import annotations
 
-from evo_helper.domain.battle_outcome import OUTCOME_DRAW, OUTCOME_FAIL, OUTCOME_VICTORY
 from evo_helper.domain.bot_round import (
     BOT_ATTACK_PRESET,
-    MAX_ATTACKS_PER_TARGET,
     BotPhase,
     DispatchFact,
     phase_of,
@@ -25,90 +27,56 @@ def test_an_attack_in_flight_means_wait_for_its_report() -> None:
     assert phase_of((DispatchFact(has_report=False),)) is BotPhase.AWAITING_ATTACK_REPORT
 
 
-def test_a_win_completes_the_target() -> None:
-    facts = (DispatchFact(has_report=True, outcome=OUTCOME_VICTORY),)
+def test_a_shot_whose_report_came_back_completes_the_target() -> None:
+    """战报回来了就走完。**判据里没有战果这一项**。
 
-    assert phase_of(facts) is BotPhase.DONE
-
-
-def test_a_loss_completes_the_target_too() -> None:
-    """打输了也走完。**只有平局才重打**——用户口径只提了平局。
-
-    把战败也算成「再来一发」等于拿同一套预设去撞同一支守军，
-    第二发的结局只会和第一发一样，白烧一条航线。
+    这一条原先分成三条（胜 → 走完、负 → 走完、平 → 再打一发），最后那条是
+    2026-08-13 的口径；2026-08-17 用户要求「bot 攻击移除平局再打一次机制」，
+    于是三条合成一条：回来了就完了。
     """
-    facts = (DispatchFact(has_report=True, outcome=OUTCOME_FAIL),)
-
-    assert phase_of(facts) is BotPhase.DONE
+    assert phase_of((DispatchFact(has_report=True),)) is BotPhase.DONE
 
 
-def test_a_draw_sends_another_attack_at_the_same_coordinate() -> None:
-    """「如果同一坐标攻击结果为平局，则继续进行攻击」（用户口径 2026-08-13）。"""
-    facts = (DispatchFact(has_report=True, outcome=OUTCOME_DRAW),)
+def test_the_phase_decision_cannot_see_the_outcome_at_all() -> None:
+    """**平局重打移除之后，战果连进都进不来这一层。**
 
-    assert phase_of(facts) is BotPhase.NEEDS_ATTACK
+    这条守的是移除本身，不是某一个分支的取值：只要 `DispatchFact` 上重新长出
+    一个战果字段，「平局就再打」就有地方接回去，而那正是用户 2026-08-17
+    要求去掉的东西。把它钉在结构上，比逐个战果各写一条断言更难绕过去。
 
-
-def test_the_cap_is_a_small_finite_number() -> None:
-    """**上限的取值本身要钉住，不能只钉「有个上限」。**
-
-    下面那条用例拿 `MAX_ATTACKS_PER_TARGET` 当尺子量 `phase_of`，所以把常量改成
-    100 它照样绿——那种「自己量自己」的断言挡不住「上限名存实亡」这种改动。
-    这一条补上缺的那一半：3 发（初打一发 + 平局最多补两发）是个决定，与仓里
-    另外两条自愈配额同一档（断线重开 3 次/滚动 1 小时、认不出只自愈一次）。
+    ⚠️ 这不是说战果没人要了。`battle_reports.outcome` 照旧写、照旧显示，
+    守卫在 `tests/unit/domain/test_battle_outcome.py` 与日志页那几条 e2e 上。
+    这里说的只是：**判「还要不要再打」的时候不看它。**
     """
-    assert MAX_ATTACKS_PER_TARGET == 3
+    from dataclasses import fields
+
+    assert tuple(item.name for item in fields(DispatchFact)) == ("has_report",)
 
 
-def test_the_retries_are_capped_so_one_target_cannot_eat_the_round() -> None:
-    """连着平局也不能无限打下去。
+def test_more_shots_this_round_still_just_means_done() -> None:
+    """本轮同一坐标上有好几发、全都回了战报：一律走完，不再补刀。
 
-    没有上限的话，两边势均力敌的一个坐标会把整轮的航线全吃掉，别的目标一发都
-    轮不到，而日志上只是一句接一句「又打了一发」。上限打满之后这个目标算走完，
-    留给下一轮。
+    多发是会发生的——战报过期被剔掉之后允许重来一发
+    （`repository.bot_dispatch_facts`）。原先这里还有一条
+    `MAX_ATTACKS_PER_TARGET = 3` 的上限，专门用来兜住「平局无限重打」；
+    重打没了，上限也就没有要兜的东西，跟着一起删掉而不是留成死常量。
+
+    所以这条同时守两件事：多发不会被判成「还要再打」，也不存在一个「打满三发
+    才算完」的门槛——第二发回来就该是 `DONE`，不是等到第三发。
     """
-    draws = tuple(
-        DispatchFact(has_report=True, outcome=OUTCOME_DRAW) for _ in range(MAX_ATTACKS_PER_TARGET)
-    )
+    for count in (1, 2, 3, 4):
+        facts = tuple(DispatchFact(has_report=True) for _ in range(count))
 
-    assert phase_of(draws[:-1]) is BotPhase.NEEDS_ATTACK
-    assert phase_of(draws) is BotPhase.DONE
+        assert phase_of(facts) is BotPhase.DONE, f"{count} 发全部回报之后应当走完"
 
 
-def test_only_the_last_shot_decides_whether_to_go_again() -> None:
-    """口径说的是「这一发的结果」，不是「历史上有没有平过」。
+def test_waiting_for_a_report_beats_everything_else() -> None:
+    """有一发还在飞就等，哪怕前面那一发已经回来了。
 
-    按 any 判的话，先平后胜的目标会一直被判成还要再打，直到撞上发数上限——
-    多出来的那两发全是白打的。
+    不等的话，同一个坐标上会在几趟之内摞起四五支舰队。
     """
     facts = (
-        DispatchFact(has_report=True, outcome=OUTCOME_DRAW),
-        DispatchFact(has_report=True, outcome=OUTCOME_VICTORY),
-    )
-
-    assert phase_of(facts) is BotPhase.DONE
-
-
-def test_an_unreadable_outcome_does_not_trigger_a_retry() -> None:
-    """战果算不出来（四个数缺一个）**不算平局**，不重打。
-
-    重打的唯一依据是**确认**是平局。拿「算不出」去重打，等于凭一次 OCR 失手
-    再送一支舰队出去——而「损失单位」那一行要把详情页拖到底才读得到，
-    读不到是常见情形（`domain.battle_outcome.survivors`）。
-    """
-    facts = (DispatchFact(has_report=True, outcome=None),)
-
-    assert phase_of(facts) is BotPhase.DONE
-
-
-def test_waiting_for_a_report_beats_going_again() -> None:
-    """上一发平局、这一发还在飞：等，不再补第三发。
-
-    不等的话，同一个坐标上会在几趟之内摞起四五支舰队——而是不是平局本来就要
-    等战报回来才知道。
-    """
-    facts = (
-        DispatchFact(has_report=True, outcome=OUTCOME_DRAW),
+        DispatchFact(has_report=True),
         DispatchFact(has_report=False),
     )
 

@@ -1,16 +1,18 @@
-"""bot 目标的「直接 BBB 攻击 → 读战报 → 平局就再打」自动化。
+"""bot 目标的「直接 BBB 攻击 → 读战报 → 收工」自动化。
 
     # 只看目标认不认得出，一次点击都不派（默认）
     python -m evo_helper.tools.bot_loop --targets 2:137:14
 
-    # 真打：用预设 BBB 打一发，回来读战报；平局就对同一坐标再打
+    # 真打：用预设 BBB 打一发，回来读战报
     python -m evo_helper.tools.bot_loop --targets 2:137:14 --attack
 
 与海盗那条链路的区别只在**判定依据**：
 
 - 海盗先派侦察，看侦察报告里几个特定舰种的数量（`vision.scout_reports`）决定打不打；
-- bot **不做任何前置侦查**，直接用预设 BBB 打，打完读战报按
-  `domain.battle_outcome` 算胜负（剩余 = 单位 − 损失），平局就对同一坐标再打一发。
+- bot **不做任何前置侦查**，直接用预设 BBB 打一发，战报回来就收工。战报里的胜负
+  仍然按 `domain.battle_outcome` 算（剩余 = 单位 − 损失）并入库，但它只进日志与
+  情报中心，**不再决定要不要补刀**——「平局就再打一次」已按用户口径
+  （2026-08-17）移除。
 
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
@@ -19,6 +21,9 @@
 
 > 基于第一条，bot攻击模式变更，不再进行攻击侦查，直接用预设BBB进行攻击，
 > 如果同一坐标攻击结果为平局，则继续进行攻击
+
+后半句已经作废——用户口径（2026-08-17）：「bot 攻击移除平局再打一次机制」。
+现在**一个目标本轮就打一发**，战报回来就收工，平局也一样（`domain.bot_round`）。
 
 「第一条」是战报缺失那件事。原先每个目标要**两发**才走得完（探路一发拿守方
 单位数、按 `fleet_tier` 分档再打一发），也就是每个目标要等**两份**战报；而
@@ -60,9 +65,12 @@ bot 战报比海盗战报多一行「生成卫星概率」，「战斗详情」�
 ## 胜负是算出来的，不看那行大字
 
 用户口径（2026-08-11）：剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、
-两边都有船判平（`domain.battle_outcome`）。于是拖那一屏从「补一个展示字段」变成了
-**判据的输入**——四个数缺一个就算不出战果，而 `DRAW` 算不出来时这个目标**不会**
-被重打（见 `domain.bot_round.DispatchFact.outcome`）：重打的唯一依据是确认平局。
+两边都有船判平（`domain.battle_outcome`）。
+
+战果曾经也是**判据的输入**（平局要重打），2026-08-17 移除那条规则之后它退回成
+纯展示字段：还是照样算、照样入库、照样在日志页和情报中心里看得到，只是不再
+决定要不要再打一发。拖到底那一屏仍然要拖——四个数缺一个战果就算不出来，
+而算不出来的战果在库里是个空洞，谁也补不回来。
 
 逐舰种明细则**整整差一屏**：参战战舰那两列在**回放页**上（`ReportLayout.
 participating_rows` 是对着回放页量的，`tools.ingest_report` 也是从 replay 那一屏取的），
@@ -100,6 +108,7 @@ from evo_helper.tools.scan_coordinates import (
     LiveDriver,
     make_console_encoding_safe,
     make_ocr,
+    run_with_foreground_guard,
     say,
 )
 from evo_helper.vision.parsers import ReportKind
@@ -112,8 +121,8 @@ class BotOptions:
     targets: tuple[Coordinate, ...]
     #: 真的动鼠标派舰队。False 是默认档：站过去认一眼，一次点击都不做。
     attack: bool
-    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态，
-    #: 也不占本轮的重打配额（`domain.bot_round.MAX_ATTACKS_PER_TARGET`）。
+    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态——
+    #: 也就是上一轮打过的目标，这一轮照样要打一发。
     round_started_at: datetime | None = None
     #: 这一轮记账用的出发星球。语义与理由同 `pirate_loop.LoopOptions.origin`：
     #: 多个 bot 任务的区别就在这一个参数上，让 runner 自己去猜，两个任务的账
@@ -121,9 +130,10 @@ class BotOptions:
     origin: Coordinate | None = None
     #: 军力任务会逐目标带标题；缺项才是旧区域攻击的 BBB。绝不 OCR 校验预设内容。
     presets: dict[Coordinate, str] | None = None
-    #: 仅手工显式运行时使用。调度器的启动补录统一在 runner 之外做，避免
-    #: 航线返航后的续跑反复打开信箱。
-    reconcile_on_start: bool = False
+    #: **强制**在这一轮开始前翻一次信箱，忽略冷却。仅手工排障用。
+    #: 语义与理由同 `pirate_loop.LoopOptions.force_reconcile`：默认档不是
+    #: 「不翻」而是「按冷却翻」，判据在 `domain.reconcile_cooldown`。
+    force_reconcile: bool = False
     #: 本进程最多真正派出多少发。调度器按当前出发星球的空闲航线数传入，避免
     #: 盲目点到游戏的「航线已满」弹窗；手工运行不传则不设上限。
     max_dispatches: int | None = None
@@ -163,7 +173,7 @@ class BotLoop(PirateLoop):
                 attack=options.attack,
                 preset=BOT_ATTACK_PRESET,
                 origin=options.origin,
-                reconcile_on_start=options.reconcile_on_start,
+                force_reconcile=options.force_reconcile,
             ),
         )
         self._bot = options
@@ -261,17 +271,21 @@ class BotLoop(PirateLoop):
             note = rematch_note(repository, target, live.reported_at_utc)
             say(f"  {target} 这份战报（{live.raw_time_text}）已经在库里；不重复入库{note}")
             return ReportIngest.KNOWN
-        repository.append_report(to_battle_report(live, report_id=uuid4()))
+        report_id = uuid4()
+        repository.append_report(to_battle_report(live, report_id=report_id))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
         # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
-        # （没拖到底 / 那一屏的行位置偏了）。算不出还有第二个后果：`DRAW` 算不出来
-        # 的那一发不会触发重打，这个目标本轮就此收工。
+        # （没拖到底 / 那一屏的行位置偏了）。战果已不再影响要不要再打一发，
+        # 但它是库里那一行的战果列，算不出就是永久的空洞。
         say(
             f"  {target} 战报入库：{live.raw_time_text}，"
             f"战果 {live.outcome or '算不出'}"
             f"（我 {live.attacker_units}−{live.attacker_losses}，"
             f"敌 {live.defender_units}−{live.defender_losses}）"
         )
+        # 截图与海盗那条链路共用同一个落点（父类 `_store_report_screenshot`）：
+        # 两条链路读的是同一块面板、存的是同一张表，判据只该有一份。
+        self._store_report_screenshot(report_id, page)
         return ReportIngest.STORED
 
     # -- 主循环 -------------------------------------------------------------
@@ -303,9 +317,8 @@ class BotLoop(PirateLoop):
         慢拖回顶 → 翻页 → 关面板」（约 20 秒）。
 
         态在开头一次算完，收进来的战报本趟就作数：`reconcile_today` 排在
-        `_sweep` 之前，所以刚回来的战报这一趟就能拿去判平局。**仍旧一趟只推进
-        一态**——每个目标在这个循环里只走一个分支，所以「平局再打一发」也是一趟
-        一发，不会在同一趟里把配额一次烧光。
+        `_sweep` 之前，所以刚回来的战报这一趟就能让对应目标转入 `DONE`。
+        **仍旧一趟只推进一态**——每个目标在这个循环里只走一个分支。
         """
         dispatched = 0
         for coordinate in self._bot.targets:
@@ -322,20 +335,44 @@ class BotLoop(PirateLoop):
             # `DONE` 无事可做。
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
-        """还在等战报的目标，日志上要分清「还没到点」和「到点了却没翻到」。
+        """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
 
         ⚠️ **这句话要说准。** 原先统一说「还没出现在信箱最上面几行」，把
         「窗口不够大」说成了「报告还没到」——而实机上正因就是前者：海盗链路整夜
         产出攻击报告，6 行窗口被别人的报告占满，六个目标一视同仁地报「翻不到」，
         连续四趟都是同一句。两者的处置完全相反（一个要把窗口开大、一个要接着等）。
+
+        ⚠️ **第二次，同一个毛病，代价更大。** 改成上面那版之后，「战报到点了却
+        没翻到；下一趟再来」这句话是在**一次信箱都没开**的情况下打出来的：它
+        只查了库。而 2026-08-15 21:59 起本轮压根不翻信箱（见
+        `domain.reconcile_cooldown` 的模块头），于是这条链路整整两天、每一轮、
+        每一个目标都在说「翻不到战报」——**说的是一句假话**，而正是这句假话让
+        「战报一份都没读回来」这件事拖了两天没人发现。日志把「我找过了，没有」
+        和「我根本没去找」说成同一句，就等于把故障伪装成常态。
+
+        所以现在按三档说：
+
+        - 还没到点：接着等，与信箱无关。
+        - 到点了，**本轮翻过信箱**没找到：这才是原来那句话，可以照说。
+        - 到点了，**本轮没翻信箱**：说清没翻的理由，并带上**上次真正翻信箱是
+          什么时候**——那才是用户判断「这一发到底有没有人去看过」的依据。
         """
         repository, _run_id = self._ensure_run()
         due = dict(repository.bot_report_due_at((coordinate,), since=self._round_start()))
         expected = due.get(coordinate, (None, None))[1]
         if expected is not None and expected > datetime.now(UTC):
             say(f"  战报预计 {expected:%H:%M:%S} UTC 才产生；接着等")
-        else:
-            say("  战报到点了却没翻到；下一趟再来")
+            return
+        # `getattr` 而不是直接取：手工调子方法（补录入口、离线工具）时 `run()`
+        # 没走过，这个字段可能压根没被建出来。取不到就按「翻过了」说——那是
+        # `run()` 走完之后的常态，而这一句只在真的没翻时才该换措辞。
+        decision = getattr(self, "_reconcile_decision", None)
+        if decision is not None and not decision.sweep:
+            last = decision.last_reconciled_at_utc
+            when = f"{last:%Y-%m-%d %H:%M:%S} UTC" if last is not None else "从来没翻过"
+            say(f"  战报到点了，但**本轮没翻信箱**（{decision.note}）；上次真正翻信箱：{when}")
+            return
+        say("  本轮翻过信箱，没找到这一发的战报；下一趟再来")
 
     def _phase_of(self, coordinate: Coordinate) -> BotPhase:
         """这个目标这一趟走到哪一步了。
@@ -356,10 +393,10 @@ class BotLoop(PirateLoop):
     def _attack_once(self, coordinate: Coordinate) -> bool:
         """对这个坐标打一发 BBB。
 
-        走到这里只有两种情形：本轮第一发，或者上一发打成了平局而配额还有剩
-        （`domain.bot_round.phase_of`）。**两种在这里没有分别**——打法完全一样，
-        分开写只会多一处可能和判态那边分家的地方。「还能不能再打」的判定只有
-        `phase_of` 一处。
+        走到这里只有两种情形：本轮第一发，或者上一发的战报被判定永远不会来、
+        整条剔掉之后重来的一发（`repository.bot_dispatch_facts`）。**两种在这里
+        没有分别**——打法完全一样，分开写只会多一处可能和判态那边分家的地方。
+        「还能不能再打」的判定只有 `phase_of` 一处。
         """
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             return False
@@ -374,8 +411,8 @@ class BotLoop(PirateLoop):
 
         `--round-started-at` 是可选的（手工跑时没人会填），但 `None` 一路传到
         仓储那边就是「不限时间范围」：`bot_dispatch_facts(since=None)` 会把这个
-        坐标**历史上每一发**都算进本轮，于是它的重打配额永远是满的，看起来像是
-        「这个目标早就打完了」。
+        坐标**历史上每一发**都算进本轮，于是上一轮（乃至上个月）打过的目标看起来
+        像是「这一轮早就打完了」，这一轮一发都不会派。
 
         所以这里兜底成**当日 UTC 00:00**。取当天而不是「此刻」，是因为一趟里
         先派出的那几发必须仍算本轮；取 UTC 而不是本地时区，是因为游戏内时间
@@ -433,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
     parser.add_argument(
-        "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
+        "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打，每个目标一发"
     )
     parser.add_argument(
         "--origin",
@@ -450,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reconcile",
         action="store_true",
-        help="开工前只读一次当日攻击战报；调度器续跑时默认不读",
+        help="强制翻一趟信箱读当日攻击战报，忽略冷却（手工排障用；不给则按冷却自动决定）",
     )
     parser.add_argument(
         "--max-dispatches",
@@ -472,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         round_started_at=args.round_started_at,
         origin=args.origin,
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
-        reconcile_on_start=args.reconcile,
+        force_reconcile=args.reconcile,
         max_dispatches=args.max_dispatches,
     )
     mode = "真打" if args.attack else "只认目标"
@@ -482,18 +519,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     say(f"模式：{mode}；目标 {listed}")
 
-    driver = LiveDriver(allow_actions=args.attack)
-    driver.window()
-    outcome = BotLoop(driver, make_ocr(), options).run()
-    say(
-        f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
-        f"拦下 {len(outcome.refused)} 次"
-    )
-    for coordinate, reason in outcome.refused:
-        say(f"  [拦下] {coordinate} {reason}")
-    # 退出码与海盗那条共用一份判据（`exit_code_for`）：切不到出发星球时两边都要
-    # 报 `EXIT_ENVIRONMENT_BUSY`，各写一份迟早分家。
-    return exit_code_for(outcome)
+    def go() -> int:
+        driver = LiveDriver(allow_actions=args.attack)
+        driver.window()
+        outcome = BotLoop(driver, make_ocr(), options).run()
+        say(
+            f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
+            f"拦下 {len(outcome.refused)} 次"
+        )
+        for coordinate, reason in outcome.refused:
+            say(f"  [拦下] {coordinate} {reason}")
+        # 退出码与海盗那条共用一份判据（`exit_code_for`）：切不到出发星球时两边都要
+        # 报 `EXIT_ENVIRONMENT_BUSY`，各写一份迟早分家。
+        return exit_code_for(outcome)
+
+    return run_with_foreground_guard(go)
 
 
 __all__ = ["BotLoop", "BotOptions", "main"]

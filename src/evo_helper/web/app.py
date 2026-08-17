@@ -28,6 +28,12 @@ from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_sp
 from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
+from evo_helper.game.ranking_ui import (
+    BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_SAMPLES,
+    BLIND_SCROLLS,
+    BLIND_SCROLLS_MAX,
+)
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import (
@@ -606,7 +612,16 @@ def create_app(
         return templates.TemplateResponse(
             request=request,
             name="settings.html",
-            context={"active": "settings"},
+            # 盲拖那几个数从 `game.ranking_ui` 传进模板，不在 HTML 里手抄一遍：
+            # 抄一遍之后调常量页面不跟，而页面上那句话正是用户判断「填多少」的
+            # 唯一依据。
+            context={
+                "active": "settings",
+                "blind_scrolls_default": BLIND_SCROLLS,
+                "blind_scrolls_max": BLIND_SCROLLS_MAX,
+                "blind_scroll_samples": BLIND_SCROLL_SAMPLES,
+                "blind_scroll_margin": BLIND_SCROLL_MARGIN,
+            },
         )
 
     @app.get("/intel", response_class=HTMLResponse)
@@ -801,6 +816,32 @@ def create_app(
             else None
         )
         return _revisit_out(service.request_revisit(payload.scope, payload.reason, target))
+
+    @app.get("/api/reports/{report_id}/screenshot")
+    async def report_screenshot(
+        report_id: UUID,
+        service: ApplicationService = Depends(get_service),
+    ) -> Response:
+        """读这份战报时截下来的那一屏面板。攻击日志上那个链接就指这里。
+
+        **单独一条接口，而不是把字节并进攻击日志的列表响应。** 那一页一次取
+        `ATTACK_LOG_LIMIT` 行，每张图约 40 KB；把 base64 塞进列表，一页就是几
+        MB，页面在手机上直接卡死。列表只带一个布尔（有没有图），点了才取。
+
+        `Content-Type` 按库里记的格式填（`ReportScreenshot.media_type`），
+        不写死 `image/webp`：将来换编码时旧行还在，猜错就是浏览器下载而不是显示。
+
+        缓存一年且 `immutable`：一份战报的截图存下来就再也不会变（`save` 不覆盖），
+        而这张图是几十 KB，回回重下没有意义。
+        """
+        shot = service.report_screenshot(report_id)
+        if shot is None:
+            raise NotFoundError(f"report screenshot not found: {report_id}")
+        return Response(
+            content=shot.image_bytes,
+            media_type=shot.media_type,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     @app.get("/logs", response_class=HTMLResponse)
     async def attack_log_page(
@@ -1043,7 +1084,10 @@ def _attack_planet_out(view: AttackPlanetView) -> AttackPlanetOut:
 
 
 def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttackConfigOut:
-    return MilitaryAttackConfigOut(tiers=[MilitaryTierIn(**tier) for tier in view.tiers])
+    return MilitaryAttackConfigOut(
+        tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
+        blind_scrolls=view.blind_scrolls,
+    )
 
 
 def _scheduler_out(view: SchedulerView) -> SchedulerOut:
@@ -1104,7 +1148,8 @@ def register_mission_routes(app: FastAPI) -> None:
     ) -> MilitaryAttackConfigOut:
         return _military_attack_config_out(
             console.replace_military_attack_tiers(
-                tuple(item.model_dump() for item in payload.tiers)
+                tuple(item.model_dump() for item in payload.tiers),
+                blind_scrolls=payload.blind_scrolls,
             )
         )
 

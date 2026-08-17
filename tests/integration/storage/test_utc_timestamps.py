@@ -29,6 +29,7 @@ from evo_helper.storage.database import (
     create_database_engine,
     create_session_factory,
 )
+from support.database import scratch_database_url
 
 SHANGHAI = timezone(timedelta(hours=8))
 
@@ -43,6 +44,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
+        "battle_report_screenshots.captured_at_utc",
         "battle_reports.reported_at_utc",
         "bot_targets.last_attack_at_utc",
         "bot_targets.last_dispatch_at_utc",
@@ -97,6 +99,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
         "attack_dispatches.line_released_at_utc",
+        "battle_report_screenshots.captured_at_utc",
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",
@@ -268,11 +271,17 @@ def test_a_non_utc_moment_round_trips_as_the_same_instant(tmp_path: Path) -> Non
 def test_the_stored_text_stays_utc_wall_clock(tmp_path: Path) -> None:
     """落盘字符串必须是 UTC 挂钟时间，且不带偏移量。
 
-    ``repository.count_dispatches_since`` 与 ``_accepted_attacks_on`` 用
-    ``func.date(dispatched_at_utc)`` 直接切日，切的就是这串字符。多出一个 ``+08:00``
-    后缀、或者存成本地挂钟，海盗每天 32 次的日界就会挪位——而 SQLite 不会为此报错。
+    SQLite 上这一列就是这串字符，读出来之后 ``UTCDateTime`` 直接给它贴 UTC 标签
+    （见 ``process_result_value``）——**不换算**。所以多一个 ``+08:00`` 后缀、或者
+    存成本地挂钟，读回来的时刻就整体错 8 小时，海盗每天 32 次的日界跟着挪位，
+    而 SQLite 不会为此报任何错。
+
+    ⚠️ 这条**必须**自己开一个 SQLite 库。断言的是 SQLite 把时刻存成什么样的一串
+    字符；Postgres 上那一列是 ``TIMESTAMPTZ``，读回来是 ``datetime`` 而不是字符串，
+    ``func.date`` 给的也是 ``date`` 对象——同一个断言到那边没有意义。Postgres 那侧
+    的时区语义由本文件其余几条守。
     """
-    session_factory = _session_factory(tmp_path)
+    session_factory = _sqlite_session_factory(tmp_path)
     artifact_id = uuid4()
     # UTC+8 的 8 月 12 日凌晨 3 点，是 UTC 的 8 月 11 日 19 点：跨日，切错日会当场看出来。
     _insert_artifact(session_factory, artifact_id, datetime(2026, 8, 12, 3, 4, 5, tzinfo=SHANGHAI))
@@ -303,6 +312,13 @@ def _insert_artifact(
 
 
 def _session_factory(tmp_path: Path) -> sessionmaker[Session]:
-    engine: Engine = create_database_engine(f"sqlite:///{tmp_path / 'timestamps.db'}")
+    engine: Engine = create_database_engine(scratch_database_url(tmp_path, "timestamps.db"))
+    Base.metadata.create_all(engine)
+    return create_session_factory(engine)
+
+
+def _sqlite_session_factory(tmp_path: Path) -> sessionmaker[Session]:
+    """给「断言 SQLite 落盘长什么样」的那一条用，不跟随全局方言。"""
+    engine: Engine = create_database_engine(f"sqlite:///{tmp_path / 'sqlite-text.db'}")
     Base.metadata.create_all(engine)
     return create_session_factory(engine)

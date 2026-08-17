@@ -254,10 +254,84 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
     return [row for row in rows if is_bot_coordinate(row.coordinate)]
 
 
+# -- 盲拖屏数的自动标定 --------------------------------------------------------
+#
+# 每一趟采集都会量出「翻了 N 屏到达 bot 区」，而盲拖屏数长期是写死的 40——
+# 也就是说系统每天量出八次答案，一次都没反馈回去。生产实测（2026-08-17 同一天
+# 六趟）：77 / 78 / 73 / 74 / 72 / 78，而盲拖 40，中间 32–38 屏全在逐屏 OCR
+# 检测**必定还是真人**的那一段。按每天 8 趟算，一天白花 250–300 次检测。
+#
+# ⚠️ **反馈回去的必须是最近 K 次的最小值，不是最近一次，更不是平均值。**
+# 上面六次里 78 与 72 差 6 屏：拿 78 去设盲拖就会拖过 bot 起点 6 屏，而拖过头的
+# 后果见 `game.ranking_ui` 里那条——该采的那一段被整段跳过去，**采回来的数
+# 静悄悄少一截，页面上看不出来**。玩家只增不减所以这个数长期只涨，但噪声让它
+# 短期内看起来会跌，取最小值正好吃住这一点。
+
+
+#: 那句话的固定前缀。查历史样本时在 SQL 里按它做前缀匹配，**必须和
+#: `bot_area_reached_message` 拼出来的开头一模一样**，所以由它拼、不各写一遍。
+BOT_AREA_REACHED_PREFIX = "翻了 "
+
+_BOT_AREA_REACHED_SUFFIX = " 屏到达 bot 区"
+
+
+def bot_area_reached_message(scrolls: int) -> str:
+    """「翻了 N 屏到达 bot 区」这句话的**唯一出处**。
+
+    ⚠️ 它同时是一句给人看的日志和一条给机器读回来的实测记录
+    （`bot_area_scrolls` 从 `system_log` 里反解它）。所以措辞不许随手改：
+    改了就等于把库里全部历史样本一次性作废，而作废之后自动标定会静悄悄退回
+    写死的默认值——页面上、日志里都看不出任何异常。
+    """
+    return f"{BOT_AREA_REACHED_PREFIX}{scrolls}{_BOT_AREA_REACHED_SUFFIX}"
+
+
+#: 反解上面那句话。锚在两端，免得把「…之后翻了 3 屏到达 bot 区」这种复述也当成样本。
+_BOT_AREA_REACHED = re.compile(
+    f"^{re.escape(BOT_AREA_REACHED_PREFIX)}(\\d+){re.escape(_BOT_AREA_REACHED_SUFFIX)}$"
+)
+
+
+def bot_area_scrolls(message: str) -> int | None:
+    """一条日志正文里的实测屏数；不是那句话就返回 None。"""
+    match = _BOT_AREA_REACHED.match(message.strip())
+    return int(match.group(1)) if match is not None else None
+
+
+def calibrated_blind_scrolls(
+    measurements: Sequence[int], *, sample_size: int, margin: int
+) -> int | None:
+    """按最近 `sample_size` 次实测定盲拖屏数：`min(样本) - margin`。
+
+    `measurements` 按**新到旧**排列，多给的会被截掉——只看最近那一段是因为这个
+    数随玩家增长往上漂，陈年样本只会把盲拖压得越来越保守（安全但白花检测）。
+
+    **样本不够就返回 `None`**，意思是「这次不给答案，用写死的默认值」。返回
+    `None` 而不是自己回落成某个数字：默认值只有 `game.ranking_ui.BLIND_SCROLLS`
+    一处，在这里再写一遍，日后调默认值就会漏掉这一处。
+
+    `margin` 是余量，不是保险丝上的裕度而是**判据的一部分**：实测噪声跨度
+    6 屏（72–78），余量必须大于它，否则算出来的盲拖会落进噪声区间里。
+
+    结果钳到 0：样本比余量还小（榜单极短）时，答案是「一屏都别盲拖」，
+    而不是一个负数。
+    """
+    if sample_size < 1:
+        raise ValueError("sample_size 必须至少为 1")
+    recent = list(measurements)[:sample_size]
+    if len(recent) < sample_size:
+        return None
+    return max(0, min(recent) - margin)
+
+
 __all__ = [
+    "BOT_AREA_REACHED_PREFIX",
     "POSITIONS_PER_SYSTEM",
     "RankingRow",
+    "bot_area_reached_message",
+    "bot_area_scrolls",
     "bot_rows",
+    "calibrated_blind_scrolls",
     "coordinate_of",
     "descending_breaks",
     "interpolate_scores",

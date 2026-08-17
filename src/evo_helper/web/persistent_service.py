@@ -49,6 +49,7 @@ from evo_helper.storage.intel import (
     DISPATCH_SENT,
     RESULT_AWAITING,
 )
+from evo_helper.storage.report_screenshots import ReportScreenshot, ReportScreenshotRepository
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .display import BACKFILL_KIND_LABELS, MISSION_LABELS, PARAM_LABELS
@@ -506,6 +507,12 @@ class PersistentApplicationService:
                 )
                 .limit(limit)
             ).all()
+            # 哪几份战报存了截图。**一次查询、只取 id，绝不把字节读出来**：
+            # 这一页一次取 `ATTACK_LOG_LIMIT` 行，每张图约 40 KB。
+            # 字节走 `report_screenshot()`，一次一张、按需取。
+            with_screenshot = ReportScreenshotRepository(self._session_factory).has_screenshots(
+                [report.id for _intent, _dispatch, report, _scouted in rows if report is not None]
+            )
             return [
                 AttackLogView(
                     intent_id=intent.id,
@@ -529,9 +536,20 @@ class PersistentApplicationService:
                     defender_losses=report.defender_losses if report else None,
                     mission_kind=dispatch.mission_kind if dispatch else None,
                     scout_report_back=bool(scouted),
+                    report_id=report.id if report else None,
+                    report_screenshot=bool(report is not None and report.id in with_screenshot),
                 )
                 for intent, dispatch, report, scouted in rows
             ]
+
+    def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None:
+        """一份战报的存档截图；没有就 None。
+
+        **只有这一条路径会把图片字节取出来**，而且一次只取一张——列表那一侧
+        只问 `EXISTS`，理由见 `list_attack_log` 里那段注释与
+        `web.service.AttackLogView.report_screenshot`。
+        """
+        return ReportScreenshotRepository(self._session_factory).load(report_id)
 
     def attack_log_options(self) -> AttackLogOptions:
         """攻击日志上「预设」「战果」两档的候选值，从库里现有的记录取。
@@ -1235,22 +1253,30 @@ class MissionConsoleService:
             tiers = json.loads(row.tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
             raise ServiceError("全局军力档位配置损坏") from exc
-        return MilitaryAttackConfigView(tuple(tiers))
+        return MilitaryAttackConfigView(tuple(tiers), blind_scrolls=row.blind_scrolls)
 
     def replace_military_attack_tiers(
-        self, tiers: tuple[dict[str, Any], ...]
+        self, tiers: tuple[dict[str, Any], ...], *, blind_scrolls: object = None
     ) -> MilitaryAttackConfigView:
+        """整份全局攻击配置原子替换。
+
+        `blind_scrolls` 走和档位同一次 `PUT`：这一页是整份替换，两项各配一个
+        「只改自己」的接口，等于给「保存了 A 把 B 冲掉」留了两条路。
+        """
         self._refuse_global_config_while_running()
         normalized = [dict(tier) for tier in tiers]
         try:
             self._scheduler.validate_military_tiers(normalized)
+            scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
-            json.dumps(normalized, ensure_ascii=False)
+            json.dumps(normalized, ensure_ascii=False), blind_scrolls=scrolls
         )
         self._invalidate_scheduler_view()
-        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)))
+        return MilitaryAttackConfigView(
+            tuple(json.loads(row.tiers_json)), blind_scrolls=row.blind_scrolls
+        )
 
     def create_mission(
         self,
@@ -1434,12 +1460,28 @@ class MissionConsoleService:
     def _freeze_view(
         self, record: MissionConfigFreeze, previous: MissionConfigFreeze | None
     ) -> ConfigFreezeView:
+        """一条固化记录翻成页面上的样子。**只摆出当时参与调度的那几个任务。**
+
+        用户口径 2026-08-17：「未生效的任务项，不应留在固化记录里」。这份记录在
+        页面上回答的是「这一轮到底要跑什么」，而没勾选参与的任务这一轮根本不会
+        被起——把它们混在一起，一眼扫过去分不清哪几条是真的在飞。
+
+        过滤只做在**显示**这一层：磁盘上那份 JSONL 是审计凭据，仍然一个字段不少
+        地记着每一个任务（含没参与的），事后要查「那一轮某条链路是开着还是关着」
+        照样查得到。少写进去的信息，以后想要就再也回不来了。
+
+        判据用的是**记录里冻结的** `enabled`，不是库里此刻的值：用户后来改了勾选
+        不该让上一轮的记录跟着改口——那正是这份账要防的走样。
+
+        `changes` 那一列不跟着过滤：「某任务：参与调度 是 → 否」恰恰是用户想看到
+        的改动，按参与与否筛掉，取消勾选这件事就会在页面上无声无息。
+        """
         return ConfigFreezeView(
             frozen_at_utc=record.frozen_at_utc,
             tasks=tuple(
                 _frozen_task_view(task)
                 for task in record.tasks
-                if task.kind.value in MISSION_LABELS
+                if task.kind.value in MISSION_LABELS and task.enabled
             ),
             military_tiers_label=_frozen_tiers_label(record.military_tiers_json),
             changes=_describe_changes(previous, record),

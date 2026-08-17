@@ -37,6 +37,22 @@ class MissionParamError(ValueError):
     """任务参数不合格。调度器据此拒绝启动，而不是拉起一个注定空转的进程。"""
 
 
+class NoFreeLineError(MissionParamError):
+    """这一刻没有空闲航线可派。**它会自己好起来，别当配置错误处理。**
+
+    单独立一个类型，是为了让调用方能在**结构上**分清这一档和别的参数不合格：
+    「范围里没有 bot」「命令行超长」要用户动手改配置，改之前重试一万次都一样；
+    而航线是舰队飞回来就空出来的，纯时间判据（`storage.repository`
+    的 `_still_holding_a_line`），没有任何人需要动手。
+
+    ⚠️ **不许拿 `str(exc)` 里的中文去认它。** 那是给人看的一句话，改一次措辞
+    判据就静默失效——静默的后果是任务停用之后再也没人放它出来。
+
+    仍然继承 `MissionParamError`：既有的 `except MissionParamError` 一处都不用改，
+    照旧接得住；只有想区分的那几处才去问 `isinstance`。
+    """
+
+
 # ⚠️ 这里原先有一道临时闸门 `check_origin_dispatchable`：助手还不会在游戏里切换
 # 当前星球时，配一颗不是主星的出发星球会被当场拒掉。**它已经随「切换星球」实装
 # 一起删掉了**（runner 开工时走 `game.planet_list.PlanetSwitcher` 真的切过去，
@@ -93,8 +109,8 @@ def scan_command() -> list[str]:
     return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.scan_coordinates"])
 
 
-def ranking_command(*, bot_limit: int | None = None) -> list[str]:
-    """军力榜采集命令行。**不吃参数，也没有 `--attack`。**
+def ranking_command(*, bot_limit: int | None = None, blind_scrolls: int | None = None) -> list[str]:
+    """军力榜采集命令行。**没有 `--attack`。**
 
     这条链路只导航、只读、只入库——`LiveDriver()` 用默认的 `allow_actions=False`，
     结构上就没有派舰队的能力。列边界之类的都已经实机标定进 `game.ranking_ui`，
@@ -102,6 +118,11 @@ def ranking_command(*, bot_limit: int | None = None) -> list[str]:
 
     ``bot_limit`` 是军力攻击批次所需的榜单目标数。传入时采够这一批就收工，
     让调度器立即转去攻击，而不是继续把整张榜翻完。
+
+    ``blind_scrolls`` 是开榜后先无脑拖几屏（攻击配置页上那个框）。
+    **`None` 时命令行上不能出现 `--blind-scrolls`**：runner 那边的默认值
+    （`game.ranking_ui.BLIND_SCROLLS`）才是「留空」的含义，在这里补一个
+    「看起来一样」的数字送过去，日后调默认值就调不动了。
 
     它和 `scan_command` 同属**填空隙**那一档（`domain.scheduler.GAP_FILLERS`）：
     不占航线、没有完成态、排最后、攻击到点了随时可以把它抢占掉。
@@ -111,6 +132,13 @@ def ranking_command(*, bot_limit: int | None = None) -> list[str]:
         if bot_limit < 1:
             raise MissionParamError("军力榜采集数量必须至少为 1")
         command.extend(["--bot-limit", str(bot_limit)])
+    if blind_scrolls is not None:
+        # 0 合法（「一屏都别盲拖」是最保守的取值），负数不是。上界在
+        # `application.mission_scheduler._blind_scrolls` 里按实测几何量算，
+        # 这一层只挡住不可能的取值。
+        if blind_scrolls < 0:
+            raise MissionParamError("盲拖屏数不能是负数")
+        command.extend(["--blind-scrolls", str(blind_scrolls)])
     return _checked(command)
 
 
@@ -148,9 +176,9 @@ def bot_command(
     看着一切正常，而这一轮一发都没打。
 
     ⚠️ **不再有 `--probe`，也不再有 `--tier-thresholds`。** 用户口径
-    （2026-08-13）：bot 不做攻击侦查，直接用预设 BBB 打，平局就对同一坐标再打
-    （有界，见 `domain.bot_round.MAX_ATTACKS_PER_TARGET`）。预设标题不可配，
-    所以这条命令行上没有任何和「打得多狠」有关的参数了——
+    （2026-08-13）：bot 不做攻击侦查，直接用预设 BBB 打。原先「平局就对同一坐标
+    再打」那半条已按用户口径（2026-08-17）移除，每个目标本轮只打一发。
+    预设标题不可配，所以这条命令行上没有任何和「打得多狠」有关的参数了——
     `mission_runs.command` 仍然回答得了「那一轮到底打了谁」，那才是它的用途。
 
     `--origin` 同 `pirate_command`：这一轮的出发星球，显式传，不许让 runner 自己
@@ -172,7 +200,7 @@ def bot_command(
     ]
     if max_dispatches is not None:
         if max_dispatches < 1:
-            raise MissionParamError("空闲航线不足，暂不启动 bot 攻击")
+            raise NoFreeLineError("空闲航线不足，暂不启动 bot 攻击")
         command += ["--max-dispatches", str(max_dispatches)]
     # `--attack` 历来在末尾；保留这一约定，既让运行台账可直接肉眼识别，也不破坏
     # 依赖该稳定 argv 形状的现有调用方。

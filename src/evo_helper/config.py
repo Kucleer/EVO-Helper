@@ -20,10 +20,27 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"  # noqa: S104 - 局域网可访问是明确需求，见上
     #: 避开 8000/8080/8888 这类常规端口，减少与本机其他开发服务撞车。
     port: int = 8770
-    database_url: str = "sqlite:///var/evo-helper.db"
+    #: ⚠️ **默认值刻意不再是 SQLite。**
+    #:
+    #: `env_file=".env"` 是相对**当前工作目录**解析的。从别的目录直接起控制台时
+    #: `.env` 读不到，旧默认值 `sqlite:///var/evo-helper.db` 会在那个目录下新建一个
+    #: 空库——控制台照常启动、页面照常打开、一个错都不报，只是所有数据都不见了。
+    #: 生产已经全面切到 PostgreSQL，这种**静默回落**是最难认的失败方式。
+    #: （`start-console.bat` 开头的 `cd /d "%~dp0"` 正是为了防这个，但那只保护走
+    #: bat 的那条路径。）
+    #:
+    #: 现在的默认值指向本机一个多半不存在的 PG，连不上就**当场报错**——响的失败
+    #: 好过静默的成功。真实连接串（主机、口令）只放在 `.env` 里：本仓库是公开的，
+    #: 凭据不进代码。
+    database_url: str = "postgresql+psycopg://evo_helper@localhost:5432/evo_helper"
     #: `system_log` 保留多少天。控制台每次启动清一次早于这个期限的行。
     #: 0 或负数表示**不清理**（不是「全删」——见 `infrastructure.system_log_db`）。
     system_log_retention_days: int = 14
+    #: 战报截图（`battle_report_screenshots`）保留多少天。控制台每次启动清一次。
+    #: 0 或负数同样表示**不清理**，不是「全删」——判据与上面那一条共用一套。
+    #:
+    #: 30 天是用户口径（2026-08-17）。量级：约 40 KB/张、每天 80 张，30 天 ≈ 97 MB。
+    report_screenshot_retention_days: int = 30
     #: In-game fleet preset used for scanning. Its signature is still
     #: verified before any dispatch; this only prefills the plan form.
     default_fleet_preset: str = DEFAULT_PRESET.name

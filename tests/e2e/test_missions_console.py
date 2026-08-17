@@ -23,6 +23,7 @@ from evo_helper.domain.scheduler import MissionKind, TaskStatus
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 TOKEN = "test-token"
@@ -49,7 +50,7 @@ class _FakeLauncher:
 
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'console.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "console.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     supervisor = MissionSupervisor(
@@ -325,6 +326,52 @@ def test_the_page_shows_the_frozen_configuration_record(client: TestClient) -> N
     # 临时文件名；生产默认走 `DEFAULT_FREEZE_LOG`，由
     # `test_the_console_writes_its_freezes_under_var` 钉住。
     assert "freezes.jsonl" in html
+
+
+def test_the_frozen_record_table_lists_only_the_tasks_that_take_part(
+    client: TestClient,
+) -> None:
+    """历史那张表同样只摆参与调度的任务。用户口径 2026-08-17。
+
+    断言钉的是**整张清单与条数**，不是「不含某个名字」：只查名字的话，把过滤写成
+    「漏掉某一条」照样绿。
+    """
+    # 种子：海盗与 bot 不参与，扫描与军力榜参与。把海盗打开、扫描关掉，这一轮
+    # 参与的恰好是海盗与军力榜——两个 kind 都不是种子里的默认状态。
+    _patch_task(client, "PIRATE", {"enabled": True})
+    _patch_task(client, "SCAN", {"enabled": False})
+    # `reconcile: false`：默认的启动对账会去真的 Popen 一个补录进程。
+    assert client.post("/api/scheduler/start", json={"reconcile": False}).status_code == 200
+
+    cell = _freeze_table_cell(client.get("/missions").text)
+
+    assert cell.count("· 参与 ·") == 2
+    assert "未参与" not in cell
+    for label in ("侦查+攻击海盗", "扫描军力榜"):
+        assert label in cell, label
+    for label in ("扫描+攻击 bot", "扫描全星系 bot"):
+        assert label not in cell, label
+
+
+def _patch_task(client: TestClient, kind: str, payload: dict[str, object]) -> None:
+    """按 kind 找到那一行再 PATCH。接口按 id 寻址（同一 kind 可以有多行）。"""
+    tasks = client.get("/api/scheduler").json()["tasks"]
+    task_id = next(task["task_id"] for task in tasks if task["kind"] == kind)
+    response = client.patch(f"/api/missions/{task_id}", json=payload)
+    assert response.status_code == 200, response.text
+
+
+def _freeze_table_cell(html: str) -> str:
+    """固化记录表里「当时的配置」那一格。
+
+    整页搜不行：页面底部那段脚本自己带着 `未参与` 的字面量（本轮已固化那块
+    卡片由它渲染），整页搜会被它满足，断言就永远绿。
+    """
+    start = html.find('<h2 id="freeze-head">')
+    assert start != -1, "页面上没有配置固化记录这一节了"
+    end = html.find("</table>", start)
+    assert end != -1, "固化记录那张表的结构变了，这个切法得跟着改"
+    return html[start:end]
 
 
 def test_the_page_does_not_recompute_the_scheduling_criteria(client: TestClient) -> None:

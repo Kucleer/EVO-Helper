@@ -26,6 +26,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -53,7 +54,7 @@ INTENT_ONLY_CREATED = datetime(2026, 8, 9, 12, tzinfo=UTC)
 
 
 def _seed(tmp_path: Path) -> tuple[PersistentApplicationService, TestClient]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'log-filters.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "log-filters.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: NOW)

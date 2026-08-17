@@ -55,6 +55,7 @@ from evo_helper.storage.intel import (
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.vision.scout_reports import PirateScoutReading
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -71,7 +72,7 @@ SCOUTED_BOT = Coordinate(2, 330, 7)
 
 @pytest.fixture
 def factory(tmp_path):  # type: ignore[no-untyped-def]
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'quick.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "quick.db"))
     Base.metadata.create_all(engine)
     return create_session_factory(engine)
 
