@@ -134,12 +134,18 @@ def test_the_error_range_follows_the_displayed_digits(tmp_path: Path) -> None:
     assert '误差不超过 ±50"' in body
 
 
-def test_uncalibrated_slots_are_labelled_by_position(tmp_path: Path) -> None:
-    """对照表还空着，所以页面上只说「第 N 格」，**不编资源名**。"""
+def test_slots_are_rendered_as_their_confirmed_resource_names(tmp_path: Path) -> None:
+    """槽位在**渲染时**翻译成资源名（用户 2026-08-17 逐格确认的那张表）。
+
+    库里存的仍是 0..11：这次从「第 N 格」换成真名只改了一行常量，历史数据自动
+    跟着对上——把名字写进库就再也没有第二次了。
+    """
     body = _client(tmp_path, HAUL).get("/logs").text
 
-    assert "第 1 格" in body
-    assert "第 7 格" in body
+    assert "金属 约 928,000" in body
+    assert "晶体 约 501,100" in body
+    assert "晶体矿石 233" in body
+    assert "第 1 格" not in body
 
 
 def test_a_blank_haul_says_nothing_at_all(tmp_path: Path) -> None:

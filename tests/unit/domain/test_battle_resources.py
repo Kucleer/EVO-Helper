@@ -109,23 +109,97 @@ class TestAllOrNothing:
 
 
 class TestSlotLabels:
-    def test_uncalibrated_slots_are_shown_by_position(self) -> None:
-        """⚠️ **没核对过就不编名字。**
+    """用户 2026-08-17 逐格确认的对照表。
 
-        对照表填错的症状是「数字都对、只是安在了别的资源名下」——页面上每一格
-        都有一个像模像样的数，没有任何人会发现。
+    ⚠️ **逐个断言，不是只数个数。** 这一块最容易犯、也最难发现的错就是「12 个
+    名字都在、只是顺序错了」——数字全对，只是安在了别的资源名下，页面上一点
+    异样都没有。只断言长度的话，这类错误一条都拦不住。
+    """
+
+    @pytest.mark.parametrize(
+        ("slot", "name"),
+        [
+            (0, "金属"),
+            (1, "晶体"),
+            (2, "气体"),
+            (3, "暗能量"),
+            (4, "银河素"),
+            (5, "合金碎片"),
+            (6, "晶体矿石"),
+            (7, "能量凝胶"),
+            (8, "泰坦立方"),
+            (9, "收割者碎片"),
+            (10, "银河石碎片"),
+            (11, "银河石能量"),
+        ],
+    )
+    def test_each_slot_has_its_confirmed_name(self, slot: int, name: str) -> None:
+        assert SLOT_LABELS[slot] == name
+        assert slot_label(slot) == name
+
+    def test_the_grid_order_is_not_the_inventory_page_order(self) -> None:
+        """⚠️ **slot 4 与 slot 5 相对「太空舱」页是对调的。**
+
+        太空舱是 `暗能量 / 合金碎片 / 银河素`，战报网格是
+        `暗能量 / 银河素 / 合金碎片`。谁照太空舱的顺序去「修正」对照表，
+        就会把这两种资源整体对错。这一条钉的就是「别去修正它」。
         """
-        assert all(label is None for label in SLOT_LABELS)
-        assert slot_label(0) == "第 1 格"
-        assert slot_label(11) == "第 12 格"
+        assert MATERIAL_NAMES.index("合金碎片") < MATERIAL_NAMES.index("银河素")
+        assert SLOT_LABELS.index("银河素") < SLOT_LABELS.index("合金碎片")
 
-    def test_the_material_names_are_kept_but_not_wired_in(self) -> None:
-        """材料页那十个名字只是记在手边，**不是槽位顺序**。
+    def test_only_that_one_pair_is_out_of_order(self) -> None:
+        """⚠️ **别把「对调」推广成「处处不同」。**
 
-        十个名字配十二个格子——按序号抄进去连数量都对不上，更别说对应关系。
+        名字本身是同一套词：`晶体矿石` 就是太空舱页上那个词（用户 2026-08-17
+        更正，先前口述的「晶体碎片」是笔误）。把两边共有的那几项按各自顺序列出来，
+        只有银河素 / 合金碎片这一对是反的。
         """
-        assert len(MATERIAL_NAMES) != GAINED_SLOT_COUNT
-        assert set(SLOT_LABELS) == {None}
+        shared_by_grid = [name for name in SLOT_LABELS if name in MATERIAL_NAMES]
+        shared_by_page = [name for name in MATERIAL_NAMES if name in SLOT_LABELS]
+
+        assert "晶体矿石" in shared_by_grid
+        swapped = [
+            (left, right)
+            for left, right in zip(shared_by_grid, shared_by_page, strict=True)
+            if left != right
+        ]
+        assert swapped == [("银河素", "合金碎片"), ("合金碎片", "银河素")]
+
+    def test_the_twelve_names_cannot_be_derived_from_the_inventory_page(self) -> None:
+        """「太空舱前 9 项 + 3 个常规 = 12」这个算式是**巧合**，不是推导。
+
+        常规三种（金属/晶体/气体）不在太空舱页上；`银河石碎片` / `银河石能量`
+        同样不在。拿那个算式去「验证」对照表，只会得出错误结论。
+        """
+        assert {"金属", "晶体", "气体"}.isdisjoint(MATERIAL_NAMES)
+        assert {"银河石碎片", "银河石能量"}.isdisjoint(MATERIAL_NAMES)
+
+    def test_the_database_still_stores_positions_not_names(self) -> None:
+        """⚠️ **名字只活在这张常量表里，库里存的仍是 0..11。**
+
+        这次能一行常量改完、历史数据自动对上，正是那个设计的价值。写进库就再也
+        没有第二次了——所以解析出来的条目上不该有任何名字字段。
+        """
+        entries = parse_resource_grid(FAIL_CELLS[:6] + ("233",) + FAIL_CELLS[7:])
+        assert entries is not None
+        (entry,) = entries
+        assert entry.slot == 6
+        assert not any("name" in field or "label" in field for field in vars(entry))
+
+    def test_positions_beyond_the_table_fall_back_to_a_number(self) -> None:
+        """回落留给「将来网格变大、多出没命名的格子」那种情形。
+
+        那时候按位置说话，比顺手编一个名字安全得多。
+        """
+        from evo_helper.domain import battle_resources
+
+        monkeypatched = battle_resources.SLOT_LABELS[:-1]
+        original = battle_resources.SLOT_LABELS
+        battle_resources.SLOT_LABELS = monkeypatched  # type: ignore[misc]
+        try:
+            assert battle_resources.slot_label(11) == "第 12 格"
+        finally:
+            battle_resources.SLOT_LABELS = original  # type: ignore[misc]
 
     def test_out_of_range_slots_raise(self) -> None:
         with pytest.raises(IndexError):
