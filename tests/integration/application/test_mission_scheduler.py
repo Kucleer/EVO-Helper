@@ -23,6 +23,7 @@ from evo_helper.application.mission_scheduler import (
 )
 from evo_helper.application.mission_supervisor import MissionExit, StopReason
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET
+from evo_helper.domain.missions import MissionIdle, MissionParamError
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -1963,6 +1964,37 @@ def test_a_pool_where_everything_expired_never_disables_the_task(  # type: ignor
     assert row.consecutive_failures == 0, "一个子进程都没起，不许记失败"
     assert row.enabled is True
     assert launcher.spawned == [], "更不许拿超期读数派出去"
+
+
+def test_building_a_command_out_of_a_starved_pool_is_idle_not_a_param_error(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """同一条规矩的另一半：**组命令行那一步也不许抛 `MissionParamError`。**
+
+    上一条走的是正常路径——`has_work` 早就把这条链路判成没活干，`_launch` 根本
+    不会被叫到。这一条钉的是那之间的**时间差**：事实在锁外读，读完到组命令行之间
+    最后一个新鲜目标可能刚好过期，那一刻 `_military_command` 是真会跑到底的。
+    抛成参数错误的话，一次几微秒的时间差会把整条链路停用到用户手动恢复为止。
+
+    ⚠️ **`MissionIdle` 不能继承 `MissionParamError`**，否则 `_launch` 里现成的
+    `except MissionParamError` 会顺手接住它、接住就是停用——这条断言正是钉那一点：
+    第二句要求它**不是** `MissionParamError`。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    row = task(repository, MissionKind.BOT)
+
+    with pytest.raises(MissionIdle):
+        scheduler._military_command(row)  # noqa: SLF001 - 钉的就是这一层的表态
+    try:
+        scheduler._military_command(row)  # noqa: SLF001
+    except MissionIdle as exc:
+        assert not isinstance(exc, MissionParamError), "继承了就等于这个类型白分了"
 
 
 def test_a_stale_pool_lets_the_ranking_scan_take_the_mouse(  # type: ignore[no-untyped-def]
