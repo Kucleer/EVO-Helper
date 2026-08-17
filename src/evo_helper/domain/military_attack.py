@@ -2,16 +2,36 @@
 
 这里刻意只比较距离，**不**推算飞行秒数。现有拟合系数只在一套舰队上验证过；
 预设会改变舰速，把它拿来比较不同预设只会制造一串看似精确的假数据。
+
+## ⚠️ 为什么这里不再有「补位」（2026-08-18）
+
+这个模块从前有一个 `top_up_with_unrated`：主力（有分数的）不满前 N 个时，
+用**没有军力分数**的目标按距离补齐。它的依据是一句话——
+
+    「凡是没被榜单扫到过的 bot 就永远不会被攻击——而那正是库里最多的一批。」
+
+**那句话依据的是一个错数**：它把非 bot 的行也算进了分母。实测生产库，
+从未上过军力榜的 **bot** 有 628 个，占 bot 总数（3604）的 **17.4%**——
+不是「最多的一批」。
+
+用户 2026-08-18 据此决定：**从未上过军力榜的目标不再攻击。** 放弃这 17.4%
+换来的是「军力优先」这个模式真的成立。补位那条路的问题一直都在，只是被那个
+错数压住了：补位不参与按军力排序，一旦补位占了池子里相当一部分名额，这条链路
+就退化成「按距离随便打」，而页面上看不出任何差别。
+
+所以这里既不留补位函数、也不留一个永远不会被调用的空壳；判据搬到了
+`domain.target_order.has_a_military_reading`（第 2 步），整条五步流水线写在
+`domain.target_order` 的模块头上。
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from evo_helper.domain.distance import distance_key
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.target_order import ScoredTarget, strongest_first
+from evo_helper.domain.target_order import ScoredTarget
 
 
 @dataclass(frozen=True)
@@ -44,73 +64,6 @@ def tier_for(score: float | None, tiers: Sequence[MilitaryTier]) -> MilitaryTier
     return next((tier for tier in tiers if score >= tier.min_score), None)
 
 
-def military_pool(
-    targets: Iterable[ScoredTarget], *, take: int, maximum_score: float | None
-) -> tuple[ScoredTarget, ...]:
-    """取尚可攻击的前 N 名；未知值保留，理由同 ``target_order``。
-
-    军力优先那条链路喂进来的已经只有**有分数且读数新鲜**的那一堆
-    （`target_order.split_by_freshness` 的 `rated`），没有分数的走
-    `top_up_with_unrated` 补位。这里仍然保留对 `None` 的处置，因为这个函数是
-    通用的，而「不知道多强不等于太强」在哪里都成立。
-    """
-    if take < 1:
-        return ()
-    affordable = (
-        item
-        for item in targets
-        if maximum_score is None
-        or item.military_score is None
-        or item.military_score <= maximum_score
-    )
-    return tuple(strongest_first(affordable)[:take])
-
-
-def top_up_with_unrated(
-    pool: Sequence[ScoredTarget],
-    unrated: Iterable[ScoredTarget],
-    origins: Sequence[Coordinate],
-    *,
-    take: int,
-) -> tuple[ScoredTarget, ...]:
-    """主力不满 `take` 个时，用**没有军力分数**的目标按距离补齐。
-
-    ## 为什么补位不参与按军力排序
-
-    它们没有分数，谈不上排第几。硬把它们混进 `strongest_first` 的话，`None` 那一档
-    虽然排在最后，却仍然会**占掉前 N 的名额**——于是「军力优先」在补位多的夜里
-    会退化成「随便打」。所以两步分开：**先按军力取满主力，剩下的空位才轮到补位。**
-
-    ## 为什么补位按距离
-
-    没有分数的目标之间没有任何「更值得打」的依据，唯一还剩的可比量就是路程：
-    同银河近距离约 20--30 分钟，跨银河约 2.6 小时（实测，见 `domain.distance`），
-    一夜的航线有限，先打近的能多派十几发。
-
-    距离取**到最近那颗出发星球**的距离：多出发点时按某一颗算等于替另一颗做主。
-    并列时按坐标定序，否则同一批目标每次补进来的可能不是同一批。
-
-    ⚠️ **补位不吃 `max_score` 上限。** 「不知道多强」不构成「一定太强」——同
-    `strongest_then_nearest` 上那条注释，理由和后果都一样。
-    """
-    room = take - len(pool)
-    if room <= 0:
-        return tuple(pool)
-    ordered = sorted(
-        unrated,
-        key=lambda item: (
-            min(
-                (distance_key(item.coordinate, origin) for origin in origins),
-                default=(0, 0, 0),
-            ),
-            item.coordinate.galaxy,
-            item.coordinate.system,
-            item.coordinate.position,
-        ),
-    )
-    return tuple(pool) + tuple(ordered[:room])
-
-
 def assign_by_capacity_and_distance(
     targets: Sequence[ScoredTarget],
     origins: Sequence[AttackOrigin],
@@ -126,6 +79,11 @@ def assign_by_capacity_and_distance(
 
     航线预算仍是硬约束：一颗星球的航线用尽后不再参与配对；只要池中还有目标，
     每个可用 origin 都会被填满。军力排序只负责形成候选池；池内的取舍以距离为先。
+
+    ⚠️ **这是五步流水线的第 5 步，用户 2026-08-18 明确要求保持现状：先打近的。**
+    近目标往返 20--30 分钟、跨银河 2.6 小时（实测，见 `domain.distance`），
+    同样的航线数先打近的能派十几发。把这里换成按军力排，第 4 步那道截断就白做了
+    ——**两处一起按军力，等于让距离完全不参与，一夜的航线会在银河之间来回横跳**。
     """
     remaining = {
         origin.coordinate: origin.fleet_lines for origin in origins if origin.fleet_lines > 0
@@ -174,7 +132,5 @@ __all__ = [
     "AttackOrigin",
     "MilitaryTier",
     "assign_by_capacity_and_distance",
-    "military_pool",
     "tier_for",
-    "top_up_with_unrated",
 ]

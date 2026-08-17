@@ -1,4 +1,13 @@
-"""先按军力取前 N 名，再把这 N 个按距离排。每条钉的都是「改坏了也不报错」的那种。"""
+"""五步选靶流水线的护栏。每条钉的都是「改坏了也不报错」的那种。
+
+流水线（用户口径 2026-08-18，整段写在 `domain.target_order` 模块头上）：
+
+1. 剔除 24h 内已攻击的 + 本轮已走完的（住在 `application`，钉在那一侧）
+2. 只保留有军力读数的
+3. 按读数时间倒序取前 N ＝**时间池**
+4. 在时间池里按军力取前 M ＝**军力截断**
+5. 按距离由近到远出击
+"""
 
 from __future__ import annotations
 
@@ -7,12 +16,17 @@ from datetime import UTC, datetime, timedelta
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
+    DEFAULT_TIME_POOL,
     TOP_BY_MILITARY,
     ScoredTarget,
+    newest_readings_first,
+    recent_then_strongest,
     score_is_fresh,
     split_by_freshness,
     strongest_first,
     strongest_then_nearest,
+    strongest_within,
+    with_a_military_reading,
 )
 
 HOME = Coordinate(2, 137, 18)
@@ -25,12 +39,186 @@ def _target(
     score: float | None,
     *,
     galaxy: int = 2,
-    scanned_at: datetime | None = None,
+    scanned_at: datetime | None = NOW,
 ) -> ScoredTarget:
-    return ScoredTarget(Coordinate(galaxy, system, 5), score, scanned_at)
+    """默认**给「刚读到」**：不给的话每条用例都要为一个与它无关的理由写读取时刻。
+
+    没有分数时读取时刻也一并抹掉——那才是「从没上过榜」的真实形状。
+    """
+    return ScoredTarget(Coordinate(galaxy, system, 5), score, None if score is None else scanned_at)
 
 
-# -- 两步的地位完全不同 --------------------------------------------------------
+# -- 第 2 步：没有军力读数的不再参与 -------------------------------------------
+
+
+def test_a_target_that_never_made_the_board_is_out() -> None:
+    """⚠️ **用户 2026-08-18 决定：从未上过军力榜的目标不再攻击。**
+
+    这一条**推翻**了从前那版「没有分数的按距离补位」。旧设计的依据是一句错话
+    ——「没被榜单扫到过的正是库里最多的一批」——那个数把非 bot 的行也算进了分母。
+    实测 628 个，占 bot 总数（3604）的 17.4%。
+
+    放弃这 17.4% 换来的是「军力优先」真的成立：补位不参与按军力排序，补位一多，
+    这条链路就退化成「按距离随便打」，而页面上看不出任何差别。
+    """
+    never_seen = _target(140, None)
+    rated = _target(400, 8_000.0)
+
+    assert with_a_military_reading([never_seen, rated]) == [rated]
+    assert recent_then_strongest([never_seen, rated]) == (rated,)
+
+
+def test_a_score_without_a_reading_time_is_out_too() -> None:
+    """有分数却说不清什么时候读的，同样进不了池。
+
+    时间池按读数时间排序，一个没有时刻的目标在那把尺子上没有位置。把它当成
+    「很旧」或者「很新」都是在编一个没量到的数——而这个仓有一条硬规矩：
+    猜出来的数不许长得像量出来的。
+    """
+    no_clock = ScoredTarget(Coordinate(2, 141, 5), 9_000.0, None)
+
+    assert with_a_military_reading([no_clock]) == []
+    assert recent_then_strongest([no_clock]) == ()
+
+
+def test_a_pool_with_nothing_rated_is_empty_not_a_crash() -> None:
+    """一个有读数的都没有时给出空清单——上层据此判「此刻没活干」，而不是崩掉。"""
+    assert recent_then_strongest([_target(140, None), _target(141, None)]) == ()
+
+
+# -- 第 3 步：时间池按**读数时间**取，不是按军力取 -----------------------------
+
+
+def test_the_time_pool_takes_the_newest_readings_not_the_strongest() -> None:
+    """⚠️ **排序键是读数时间，不是军力。**
+
+    换成军力的话这一步就变成第二道军力截断，「用多新的数据」这件事再没人管——
+    而最新的那批读数恰恰是军力最低的那些（榜单按军力降序扫，先读到的读数最旧）。
+
+    这里军力与读数时间**刻意反着排**：9000 读得最旧、100 读得最新。按军力取前 2
+    会拿到 [9000, 8000]；按读数时间取前 2 才是这条用例要的 [100, 8000]。
+    """
+    pool = newest_readings_first(
+        [
+            _target(140, 9_000.0, scanned_at=NOW - timedelta(hours=5)),
+            _target(141, 8_000.0, scanned_at=NOW - timedelta(hours=1)),
+            _target(142, 100.0, scanned_at=NOW),
+        ],
+        take=2,
+    )
+
+    assert [item.coordinate.system for item in pool] == [142, 141]
+
+
+def test_the_time_pool_is_never_empty_just_because_everything_expired() -> None:
+    """⚠️ **这是本次改动的核心：全部超期时，时间池照样拿得出最新的那批。**
+
+    旧实现把超期的整批滤掉，于是「一个新鲜分数都没有」时池子退化成
+    「按距离补位、军力完全不参与」——2026-08-17 晚上实机连续 2.5 小时就是这个状态。
+    """
+    three_days = NOW - timedelta(days=3)
+    all_stale = [
+        _target(140, 9_000.0, scanned_at=three_days),
+        _target(141, 8_000.0, scanned_at=three_days - timedelta(hours=1)),
+    ]
+
+    assert len(newest_readings_first(all_stale, take=500)) == 2
+
+
+def test_the_time_pool_breaks_ties_by_coordinate() -> None:
+    """同一时刻读到的（扫描一屏之内很常见）按坐标定序。
+
+    不定的话，同一批目标每次挑出来的可能不是同一批——而那会让「上一轮打到哪了」
+    无从谈起，事后拿日志对账也对不上。
+    """
+    tied = [_target(300, 1.0), _target(100, 2.0), _target(200, 3.0)]
+
+    assert [item.coordinate.system for item in newest_readings_first(tied, take=3)] == [
+        100,
+        200,
+        300,
+    ]
+
+
+def test_a_time_pool_of_nothing_yields_nothing() -> None:
+    """`take=0` 给空清单，不崩也不当成「不设限」。"""
+    assert newest_readings_first([_target(140, 9_000.0)], take=0) == ()
+
+
+# -- 第 4 步：军力是一道**截断**，在时间池**之内**生效 -------------------------
+
+
+def test_the_cut_happens_inside_the_time_pool() -> None:
+    """⚠️ **构造一个「分数最高、却因为读数太旧掉出时间池」的目标：它不该被选中。**
+
+    这一条把两步的从属关系钉死：军力截断只在时间池里挑，不许回头去看池外的目标。
+    倒过来接（先按军力截断、再按读数时间取）的话，`2:140` 那个 99999 会顶着一份
+    三天前的读数被选出来——而那正是「用多新的数据」要挡的。
+    """
+    selected = recent_then_strongest(
+        [
+            _target(140, 99_999.0, scanned_at=NOW - timedelta(days=3)),  # 最强，但读数最旧
+            _target(141, 8_000.0, scanned_at=NOW),
+            _target(142, 7_000.0, scanned_at=NOW - timedelta(minutes=1)),
+        ],
+        time_pool=2,
+        take=1,
+    )
+
+    assert [item.coordinate.system for item in selected] == [141]
+
+
+def test_the_cut_is_a_cut_not_a_sort() -> None:
+    """⚠️ **军力必须真的把人挡在外面，不能只是排个序。**
+
+    第 5 步按距离重排会把排序结果整个抹掉，所以军力只有这一次机会生效。改成
+    「只排序不截断」的话，落选的那个会照样出现在结果里——只是排在后面。
+    """
+    selected = recent_then_strongest(
+        [_target(140, 9_000.0), _target(141, 8_000.0), _target(142, 100.0)], time_pool=3, take=2
+    )
+
+    assert [item.coordinate.system for item in selected] == [140, 141]
+    assert not any(item.coordinate.system == 142 for item in selected), "第 3 名不该出现在结果里"
+
+
+def test_a_cut_larger_than_the_pool_is_not_an_error() -> None:
+    """池子不够 N 个时就全要，而不是报错或者补空。
+
+    ⚠️ 这也正是**军力截断失效**的形状：填成 ≥ 池内目标数，这一刀什么都不挡。
+    2026-08-18 之前 `top_n` 被填成 500 而可用候选只有 591，实际就在这一档上。
+    """
+    assert len(strongest_within([_target(140, 9_000.0)], take=500)) == 1
+
+
+def test_a_cut_of_nothing_yields_nothing() -> None:
+    """`take=0` 要给出空清单——上层据此判「这一轮没得打」，而不是崩掉。"""
+    assert strongest_within([_target(140, 9_000.0)], take=0) == ()
+
+
+# -- 上限 ----------------------------------------------------------------------
+
+
+def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool() -> None:
+    """用户口径（2026-08-14）：「军力确实要设置上限」。
+
+    太强的目标不是当前预设打得动的，派过去只是白烧一次配额和一趟往返。
+    """
+    ordered = strongest_then_nearest(
+        [_target(140, 1_773_000.0), _target(200, 9_000.0)], HOME, max_score=100_000.0
+    )
+
+    assert [item.system for item in ordered] == [200]
+
+
+def test_no_cap_keeps_even_the_strongest() -> None:
+    """默认不设上限。"""
+    ordered = strongest_then_nearest([_target(140, 1_773_000.0)], HOME)
+
+    assert [item.system for item in ordered] == [140]
+
+
+# -- 第 5 步：池内一律按距离 ---------------------------------------------------
 
 
 def test_military_only_decides_who_gets_in_the_pool() -> None:
@@ -50,15 +238,6 @@ def test_military_only_decides_who_gets_in_the_pool() -> None:
     assert [item.system for item in ordered] == [140, 400], "池内按距离，不按军力"
 
 
-def test_the_weak_ones_are_left_out_of_the_pool_entirely() -> None:
-    """截断是硬的：没进前 N 名的这一轮根本不打。"""
-    targets = [_target(140, 100.0), _target(141, 200.0), _target(142, 9_000.0)]
-
-    ordered = strongest_then_nearest(targets, HOME, take=1)
-
-    assert [item.system for item in ordered] == [142]
-
-
 def test_distance_inside_the_pool_is_measured_round_the_ring() -> None:
     """池内的距离用 `distance_key`，也就是**环形**的。
 
@@ -71,7 +250,7 @@ def test_distance_inside_the_pool_is_measured_round_the_ring() -> None:
     assert [item.system for item in ordered] == [499, 287]
 
 
-# -- 挑谁进池子 ----------------------------------------------------------------
+# -- 排序本身 ------------------------------------------------------------------
 
 
 def test_an_unknown_score_never_outranks_a_known_one() -> None:
@@ -80,8 +259,8 @@ def test_an_unknown_score_never_outranks_a_known_one() -> None:
     榜单上真的有 0 分的行。把 None 当成 0 就是把「没数据」伪装成「数据是 0」——
     而这个仓有一条硬规矩：猜出来的数不许长得像量出来的。
 
-    排最后而不是最前：用户要的是「先打强的」，而一个不知道强弱的目标
-    既谈不上强也谈不上弱，先把知道的打完再说。
+    没有分数的目标在第 2 步就出局了，所以这条守的是 `strongest_first` 这个通用
+    排序本身：「不知道不等于 0」在哪里都成立。
     """
     ordered = strongest_first([_target(140, None), _target(141, 0.0)])
 
@@ -100,65 +279,44 @@ def test_the_pool_is_the_same_every_time() -> None:
     assert [item.coordinate.system for item in strongest_first(tied)] == [100, 200, 300]
 
 
-def test_the_default_pool_size_is_the_one_the_user_asked_for() -> None:
-    """用户口径（2026-08-15）：「先取前 50 名」。"""
-    assert TOP_BY_MILITARY == 50
+# -- 两个默认值 ----------------------------------------------------------------
 
 
-def test_a_pool_larger_than_the_target_list_is_not_an_error() -> None:
-    """库里不够 50 个时就全要，而不是报错或者补空。"""
-    ordered = strongest_then_nearest([_target(140, 9_000.0)], HOME, take=50)
+def test_the_two_knobs_have_the_defaults_the_user_asked_for() -> None:
+    """用户口径（2026-08-18）：时间池 500、军力截断 100。
 
-    assert [item.system for item in ordered] == [140]
+    ⚠️ **两个数管两件事，必须分开。** 时间池管「用多新的军力数据」，截断管
+    「只打多强的」。合成一个数的话，想放宽数据新鲜度就只能连带把攻击面一起放宽。
 
-
-def test_a_pool_of_nothing_yields_nothing() -> None:
-    """`take=0` 要给出空清单——上层据此判「这一轮没得打」，而不是崩掉。"""
-    assert strongest_then_nearest([_target(140, 9_000.0)], HOME, take=0) == ()
-
-
-# -- 上限 ----------------------------------------------------------------------
-
-
-def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool() -> None:
-    """用户口径（2026-08-14）：「军力确实要设置上限」。
-
-    太强的目标不是当前预设打得动的，派过去只是白烧一次配额和一趟往返。
+    ⚠️ 截断从 50 改成 100。50 是 2026-08-15 那版「先取前 50 名」的口径，那时
+    这一刀之前没有时间池；2026-08-18 重排流水线时用户把它定成 100。
     """
-    ordered = strongest_then_nearest(
-        [_target(140, 1_773_000.0), _target(200, 9_000.0)], HOME, max_score=100_000.0
-    )
-
-    assert [item.system for item in ordered] == [200]
+    assert DEFAULT_TIME_POOL == 500
+    assert TOP_BY_MILITARY == 100
 
 
-def test_the_cap_never_drops_a_target_whose_score_is_unknown() -> None:
-    """⚠️ **上限只挡「太强」，不挡「读不出来」。**
+# -- 有效期：从判据降级成提示信号 ----------------------------------------------
 
-    「不知道多强」不构成「一定太强」。按上限把 None 一起扔掉的话，凡是没被
-    榜单扫到过的 bot 就永远不会被攻击——而那正是库里最多的一批。
 
-    ⚠️ 顺带记一笔：这个上限**目前是空转的**。用户口径（2026-08-17）：「目前的 bot
-    的军事能力不存在太强这个可能性……已知周一刷新当日 bot 的最高战力只有 70 多 K」。
-    留着不删是为了哪天 bot 变强，不是因为它现在在挡什么。
+def test_the_freshness_window_no_longer_filters_anything() -> None:
+    """⚠️ **`score_is_fresh` 2026-08-18 起只是提示，它不挡任何目标。**
+
+    当过滤器用的那一版，在「一个新鲜分数都没有」的夜里会把军力整个踢出选靶
+    （2026-08-17 实机连续 2.5 小时）。这里两个目标的分数都超期了三天，
+    而它们照样被选出来。
     """
-    ordered = strongest_then_nearest([_target(140, None)], HOME, max_score=100_000.0)
+    three_days = NOW - timedelta(days=3)
+    all_stale = [
+        _target(140, 9_000.0, scanned_at=three_days),
+        _target(141, 8_000.0, scanned_at=three_days),
+    ]
 
-    assert [item.system for item in ordered] == [140]
-
-
-def test_no_cap_keeps_even_the_strongest() -> None:
-    """默认不设上限。"""
-    ordered = strongest_then_nearest([_target(140, 1_773_000.0)], HOME)
-
-    assert [item.system for item in ordered] == [140]
-
-
-# -- 读数的新鲜度 --------------------------------------------------------------
+    assert all(not score_is_fresh(item, now=NOW, max_age=TWO_HOURS) for item in all_stale)
+    assert len(recent_then_strongest(all_stale, time_pool=500, take=100)) == 2
 
 
 def test_a_reading_inside_the_window_is_fresh() -> None:
-    """有效期之内的读数照打。边界取「小于」：正好等于有效期算超期。"""
+    """有效期之内的读数算新。边界取「小于」：正好等于有效期算超期。"""
     just_read = _target(140, 9_000.0, scanned_at=NOW - timedelta(minutes=1))
     right_on_the_line = _target(141, 9_000.0, scanned_at=NOW - TWO_HOURS)
 
@@ -169,43 +327,30 @@ def test_a_reading_inside_the_window_is_fresh() -> None:
 def test_a_reading_older_than_the_window_is_not_fresh() -> None:
     """实机 2026-08-17：`4:293:6` 的读数是 01:50 UTC，攻击发生在 05:28——3.6 小时。
 
-    用户设的是 1 小时，而那一版只在日志里记一句就照样派了出去。
+    用户设的是 1 小时。这个判据本身仍然要准——日志里那句「这批分数已经超期多久」
+    全靠它，而**日志说假话比不说更糟**。
     """
     stale = _target(293, 9_000.0, galaxy=4, scanned_at=datetime(2026, 8, 17, 1, 50, tzinfo=UTC))
 
     assert score_is_fresh(stale, now=NOW, max_age=timedelta(hours=1)) is False
 
 
-def test_a_target_without_a_score_is_never_called_fresh_or_expired() -> None:
-    """⚠️ **没有分数的目标在这里恒为假，而那不表示它出局。**
-
-    `score_is_fresh` 只回答「这个**分数**还能不能用来排序」。没有分数就没有可排的
-    东西，所以它为假；能不能打是 `split_by_freshness` 那一层的事，那里把它放进
-    补位池。两件事合起来问的那一版，把库里最多的那批目标（从没上过榜的）
-    永久排除掉了。
-    """
+def test_a_target_without_a_score_is_never_called_fresh() -> None:
+    """没有分数就没有可排的东西，所以恒为假；它在第 2 步就已经出局了。"""
     assert score_is_fresh(_target(140, None), now=NOW, max_age=TWO_HOURS) is False
-    assert score_is_fresh(_target(141, None, scanned_at=NOW), now=NOW, max_age=TWO_HOURS) is False
-
-    split = split_by_freshness([_target(140, None)], now=NOW, max_age=TWO_HOURS)
-    assert split.expired == (), "没有分数不等于分数过期"
-    assert [item.coordinate.system for item in split.unrated] == [140]
 
 
-def test_a_score_without_a_reading_time_is_expired() -> None:
-    """读到过分数、却没有读取时刻，算过期：说不清什么时候读的分数不能拿来排序。"""
-    split = split_by_freshness([_target(141, 9_000.0)], now=NOW, max_age=TWO_HOURS)
+def test_the_split_only_keeps_accounts_now() -> None:
+    """三堆只用来记账（日志里那句「其中 N 个已超期」），**不再决定谁出局**。
 
-    assert [item.coordinate.system for item in split.expired] == [141]
-
-
-def test_the_split_keeps_the_order_it_was_given() -> None:
-    """分堆只做分，不做排。排序是后面两步（军力截断、距离补位）的事。"""
+    ⚠️ 别把它接回选靶去：`expired` 那一堆现在照样参与，接回去等于把 2026-08-17
+    那晚的停摆重新装上。
+    """
     split = split_by_freshness(
         [
-            _target(400, 100.0, scanned_at=NOW),
+            _target(400, 100.0),
             _target(140, 9_000.0, scanned_at=NOW - timedelta(days=3)),
-            _target(200, 8_000.0, scanned_at=NOW),
+            _target(200, 8_000.0),
             _target(300, None),
         ],
         now=NOW,
@@ -218,11 +363,8 @@ def test_the_split_keeps_the_order_it_was_given() -> None:
 
 
 def test_the_default_window_is_about_twice_one_scan_round() -> None:
-    """⚠️ **默认取「一轮扫描时长的约 2 倍」，不是 1 小时。**
+    """默认取「一轮扫描时长的约 2 倍」，因为那句提示得有个说得出来的基准。
 
-    实测一轮军力榜扫描约 61 分钟（1000 个 · 8.7--16.3 个/分）。军力榜按军力降序排、
-    扫描也从上往下读，所以一轮扫完之后先读到的（军力最高的）读数最旧。有效期若卡在
-    「刚好一轮时长」附近，任何时刻能通过筛选的恰恰是这一批里**军力最低**的那些
-    ——而「军力优先」正是为了打高军力的。改回 1 小时会把这个模式的意义抵消掉。
+    实测一轮军力榜扫描约 61 分钟（1000 个 · 8.7--16.3 个/分）。
     """
     assert DEFAULT_SCORE_MAX_AGE == timedelta(hours=2)

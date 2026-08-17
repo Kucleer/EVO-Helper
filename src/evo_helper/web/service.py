@@ -389,6 +389,8 @@ class MilitaryAttackConfigView:
     unknown_line_hold_minutes: int | None = None
     reconcile_cooldown_minutes: int | None = None
     bot_revisit_hours: int | None = None
+    #: 军力时间池：按读数时间倒序取前几个；`None` = 留空 = 默认 500。
+    military_time_pool: int | None = None
 
 
 @dataclass(frozen=True)

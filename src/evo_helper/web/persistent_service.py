@@ -43,6 +43,7 @@ from evo_helper.domain.scheduler import (
     scheduling_order,
     status_of,
 )
+from evo_helper.domain.target_order import TOP_BY_MILITARY
 from evo_helper.storage import models as orm
 from evo_helper.storage.intel import (
     DISPATCH_BLOCKED,
@@ -1314,6 +1315,7 @@ class MissionConsoleService:
         unknown_line_hold_minutes: object = None,
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
+        military_time_pool: object = None,
     ) -> MilitaryAttackConfigView:
         """整份全局攻击配置原子替换。
 
@@ -1334,6 +1336,7 @@ class MissionConsoleService:
                 reconcile_cooldown_minutes
             )
             revisit = self._scheduler.validate_bot_revisit_hours(bot_revisit_hours)
+            time_pool = self._scheduler.validate_military_time_pool(military_time_pool)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
@@ -1343,6 +1346,7 @@ class MissionConsoleService:
             unknown_line_hold_minutes=hold,
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
+            military_time_pool=time_pool,
         )
         self._invalidate_scheduler_view()
         return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)), **_knobs_of(row))
@@ -1706,12 +1710,13 @@ class MissionConsoleService:
                 if remaining > 0:
                     return ""
                 # 池子空了是句能站住的事实，但**成因有两个**，所以两个都得说出来：
-                # 已知 bot 全在 24 小时冷却里（或还在飞），或者它们的军力**分数**
-                # 全都过了有效期（`domain.target_order.split_by_freshness`）。只说
-                # 前一个的话，用户会去等 24 小时过去，而实际要等的是军力榜扫描。
-                # 「从没读到过分数」不在成因之列——那一档走补位池，照样能打。
+                # 已知 bot 全在 24 小时冷却里（或还在飞），或者它们**从没上过军力榜**
+                # （2026-08-18 起这一档不再攻击，见 `domain.target_order`）。只说前
+                # 一个的话，用户会去等 24 小时过去，而实际要等的是军力榜扫描。
+                # ⚠️ **不再提「分数已过期」**：超期现在不挡任何目标，写上去会让用户
+                # 去调那个什么都不挡的有效期，调完照样一发不派。
                 # 不写「本轮已全部完成」——军力模式没有那个「轮」。
-                return "暂无可打目标（近 24 小时打过，或军力分数已过期）"
+                return "暂无可打目标（近 24 小时打过，或从未上过军力榜）"
             if remaining <= 0:
                 return "本轮已全部完成"
             return f"还剩 {remaining} 个未完成"
@@ -1764,8 +1769,10 @@ class MissionConsoleService:
     def _bot_summary(self, params: dict[str, Any]) -> str:
         """区间里有几个已记录的 bot。N=0 就禁止启用，所以 N 必须先看得见。"""
         if params.get("by_military") is True:
-            top_n = params.get("top_n", 50)
-            return f"军力前 {top_n} 名 · 统一档位 · 按出发点就近分配"
+            # ⚠️ 说的是「截断」而不是「候选」：军力只在那一刀生效一次，之后按距离
+            # 重排。写成「候选 N 名」会让人以为它是一次排序。
+            top_n = params.get("top_n", TOP_BY_MILITARY)
+            return f"军力截断前 {top_n} 名 · 统一档位 · 按出发点就近分配"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -1896,7 +1903,7 @@ def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
             return (
                 "军力攻击（统一档位）"
                 if not isinstance(top_n, int) or isinstance(top_n, bool)
-                else f"军力前 {top_n} 名（统一档位）"
+                else f"军力截断前 {top_n} 名（统一档位）"
             )
         galaxy = params.get("galaxy")
         first = params.get("first_system")
@@ -2110,6 +2117,7 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
         "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,
+        "military_time_pool": row.military_time_pool,
     }
 
 
