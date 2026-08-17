@@ -1184,8 +1184,13 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
     """`UNKNOWN` 先当成「浮层压着导航条」处理：关掉浮层再巡检一次。
 
     `classify_screen` 靠底部导航条的字判 IN_GAME，而信箱、飞行中列表、派遣面板
-    都把它盖住。真掉线时画面是 ENTRY / START / DISCONNECTED，**落不到 UNKNOWN**，
-    所以 UNKNOWN 基本只剩「有浮层」这一种解释。
+    都把它盖住。真掉线时画面是 ENTRY / START / DISCONNECTED，**落不到 UNKNOWN**。
+
+    ⚠️ **「所以 UNKNOWN 只剩浮层这一种解释」——这句话 2026-08-17 被推翻了。**
+    登录/加载翻页的那几秒同样落到 UNKNOWN（导航条读到噪声、入口标题读到残片），
+    而那一档的正解是**等**，不是关浮层、更不是关窗重开。这一级仍然排在最前，
+    因为浮层是常见的那一种、而且几秒就能证否；等待那一级紧随其后，
+    见 `wait_for_login_if_unrecognised`。
 
     实机（2026-08-11 02:38）：上一条链路把游戏停在一个面板上，扫描开工时读到
     UNKNOWN，1.5 秒就「安全停止」并返回 1；连着三次，调度器把扫描整条**自动停用**。
@@ -1213,6 +1218,32 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
     return latest[0]
 
 
+def wait_for_login_if_unrecognised(session: Any, keeper: Any) -> Any:
+    """恢复阶梯的第三级：认不出**先当成「登录还没走完」等一会儿**，再谈关窗重开。
+
+    ⚠️ **2026-08-17 实机：登录流程更新之后，一个正常的中间态被当成了故障。**
+    现象、日志原文、判据与超时上限的取值依据，整段在
+    `game.session_keeper.LOGIN_SETTLE_TIMEOUT_S`。用户口径：
+    「这里应该是等待变更为 start」。
+
+    **为什么排在关浮层之后**：浮层是 UNKNOWN 里更常见的那一种，而且几秒就能证否
+    （点一下关闭键再问一次守护）。把 90 秒的等待挪到它前面，等于让每一次
+    「上一轮把游戏停在某个面板上」都白等一分半。
+
+    **为什么必须排在关窗重开之前**：这一级要挡住的正是那一下。登录才走到一半就
+    把 Chrome 关掉重开，不但救不了，还会**把本来马上就好的会话亲手弄坏**，
+    并且吃掉一次 3 次 / 1 小时的重开配额。
+
+    **最坏情况下点到了什么：什么都没点。** 这一级只观察、只等待。所以它并没有
+    放松「认不出的画面绝不点击」——它是整条阶梯里第二级完全不动手的。
+    """
+    from evo_helper.game.session_keeper import ScreenState
+
+    if session is None or session.state is not ScreenState.UNKNOWN:
+        return session
+    return keeper.wait_for_known_screen()
+
+
 def restart_if_still_unusable(session: Any, keeper: Any) -> Any:
     """恢复阶梯的最后一级：前面都试过了还是回不到游戏内，就关窗重开一次。
 
@@ -1228,7 +1259,10 @@ def restart_if_still_unusable(session: Any, keeper: Any) -> Any:
     1. `keeper.ensure_connected` —— 判据驱动的入口序列，认不出就停，不点。
     2. `dismiss_overlays_if_unrecognised` —— 左上角 (750, 71) 那个 ✕。
        各种浮层的关闭键都在同一处，而那个位置在恒星系视图上什么都不是，点空无害。
-    3. **这里** —— **什么都没点**。只往游戏窗口那个句柄送一个 `WM_CLOSE`
+    3. `wait_for_login_if_unrecognised` —— **什么都没点**，只等登录自己走完
+       （上限 `LOGIN_SETTLE_TIMEOUT_S`）。它排在这里就是为了挡住下面那一下：
+       登录才到一半就关窗重开，救不了，还会把本来马上就好的会话亲手弄坏。
+    4. **这里** —— **什么都没点**。只往游戏窗口那个句柄送一个 `WM_CLOSE`
        （等同用户点右上角 ×，别的 Chrome 窗口不受影响），再由 `ensure_game_window`
        拉一个新的，然后重走判据驱动的入口序列。它是整条阶梯里唯一完全不在认不出
        的画面上动手的一级——所以它排在最后，而不是因为它最危险。
@@ -1323,6 +1357,7 @@ def run_scan(
     # 一次都没提过巡检；而且那三次点击本身就违反「认不出的画面绝不点击」。
     session = keeper.ensure_connected(force=True)
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
+    session = wait_for_login_if_unrecognised(session, keeper)
     session = restart_if_still_unusable(session, keeper)
     if session is not None and not session.ready:
         code = exit_code_for_unusable_session(session)
@@ -1379,7 +1414,10 @@ def run_scan(
             continue
 
         outcome = restart_if_still_unusable(
-            dismiss_overlays_if_unrecognised(keeper.ensure_connected(), driver, keeper), keeper
+            wait_for_login_if_unrecognised(
+                dismiss_overlays_if_unrecognised(keeper.ensure_connected(), driver, keeper), keeper
+            ),
+            keeper,
         )
         if outcome is not None:
             if not outcome.ready:
@@ -1407,8 +1445,11 @@ def run_scan(
             # 核对失败最常见的原因就是掉线。巡检十分钟才一次，等不到——
             # 这里立刻查一次，否则接下来又会在入口页上朝视图菜单盲点。
             dropped = restart_if_still_unusable(
-                dismiss_overlays_if_unrecognised(
-                    keeper.ensure_connected(force=True), driver, keeper
+                wait_for_login_if_unrecognised(
+                    dismiss_overlays_if_unrecognised(
+                        keeper.ensure_connected(force=True), driver, keeper
+                    ),
+                    keeper,
                 ),
                 keeper,
             )

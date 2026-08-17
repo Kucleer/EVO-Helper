@@ -10,6 +10,10 @@
 - **重连只走已知的入口序列**（语言页 → 进入 → START），任何认不出的画面一律停止
   并保留证据，绝不乱点。乱点可能误触派遣、删信或领奖。
 - **不与用户抢登录**。重连失败按 `SessionBackoff` 退避，退避耗尽就安全暂停。
+- **「认不出」里混着一档正常的中间态**：登录/加载翻页的那几秒读出来是花的，
+  跟真的认不出长得一样。分开的判据不是「它长什么样」（OCR 残片每帧都不同），
+  而是「再等一会儿它会不会自己变成认得出的一屏」——见 `wait_for_known_screen`
+  与 `LOGIN_SETTLE_TIMEOUT_S`。**等待有上限**，超时后原样退回「认不出」那条路。
 - **掉线分两种，善后完全不同。** 「连接已断开」点掉弹窗还能接回去；
   「连接已断开，**无法重新连接**」是页面自己宣告没救了，点掉弹窗照样回不去，
   只能关掉窗口重开 Chrome。后者有次数上限，理由见 `MAX_WINDOW_RESTARTS`。
@@ -38,6 +42,39 @@ HEALTH_CHECK_INTERVAL_S = 600.0
 ENTRY_TIMEOUT_S = 30.0
 START_LOAD_TIMEOUT_S = 90.0
 START_POLL_S = 3.0
+
+#: 认不出的画面最多按「登录还没走完」等这么久（秒），等不到就退回「认不出」。
+#:
+#: ⚠️ **2026-08-17 实机：登录流程更新之后，中间态被当成了故障。** 库里那两条告警
+#: （`tools.scan_coordinates`，runner CY-202305011401）是同一件事的两个瞬间：
+#:
+#:     17:xx  尺寸 (1920, 917)；导航条读到 '> =. _'；入口标题读到 ''
+#:     18:04  尺寸 (1920, 917)；导航条读到 ''；入口标题读到 'TAL pisE'
+#:
+#: 两条都不是坏画面，是**登录页正在往 START 翻**的那几秒：一次读到的是导航条位置
+#: 上的噪声（那串 `'>  =.  _'` 在 `scan_coordinates.make_session_keeper.observe`
+#: 的注释里 2026-08-11 就记着，是入口页明暗动画的暗相），一次读到的是标题淡入淡出
+#: 留下的残片。用户口径：「这里应该是等待变更为 start」。
+#:
+#: **判据不看这些残片长什么样。** OCR 每一帧读出来的碎字都不一样，把 `'TAL pisE'`
+#: 之类写死成判据，下一帧换个相位就失效。判据只有一条：**再等一会儿，它会不会自己
+#: 变成认得出的一屏**。会 → 那是登录中间态；不会 → 那才是真认不出。
+#:
+#: ⚠️ **上限比等待本身更要紧。** 没有上限的等待会把一个真坏了的画面变成整夜静默
+#: 空转——整段道理在 `domain.scheduler.exit_code_for_environment_fault`：恢复手段
+#: 必须有尽头，否则「环境暂时不行」那条豁免永远攒不满，再没有任何东西会最终把它
+#: 停下来。等到头仍然认不出就原样退回「认不出」那条路，后面关窗重开的配额
+#: （3 次 / 滚动 1 小时）照旧消耗，该停用的最终会停用。
+#:
+#: **这不是偏好项，是标定常量**（同 `game.overlay.OVERLAY_CLOSE_ATTEMPTS` 那一类）。
+#: 它编码的是「游戏自己把 START 画出来要多久」，不是「用户愿意等多久」——调小会把
+#: 正常的登录判成故障，调大只会让真坏了的画面更晚才进恢复阶梯，两边都是**错**，
+#: 没有一边是「更适合我」。取值与同族的 `START_LOAD_TIMEOUT_S` 一致：两者等的都是
+#: **游戏自己的加载**（点完 START 等游戏起来 / 登录页等 START 出现），而不是 Chrome
+#: 冷启动那一档（`RESTART_ENTRY_TIMEOUT_S = 120`）。上界另有一条硬约束：必须远小于
+#: `HEALTH_CHECK_INTERVAL_S = 600`，否则一次等待就能吞掉一整个巡检周期。
+#: 真要改，先量一遍登录页翻到 START 实际花多久，别按「多等等更保险」调。
+LOGIN_SETTLE_TIMEOUT_S = 90.0
 
 
 #: 判定「已在游戏内」的文字标记。
@@ -132,6 +169,23 @@ class ScreenState(Enum):
     MAINTENANCE = "maintenance"
     #: 认不出——必须停止并保留证据。
     UNKNOWN = "unknown"
+
+
+#: 「等到了」算数的那几屏：入口序列对每一屏都有明确的善后。
+#:
+#: `UNKNOWN` 不在里面——它正是要等掉的那一档，把它算进来等于一等到就说等到了。
+#: `LOADING` 也不在里面：`classify_screen` 从来没判出过它（没有对应的文字判据），
+#: 写进来只会让人以为「加载中」是等得到的一屏，而实际永远等不到。
+SETTLED_SCREENS: frozenset[ScreenState] = frozenset(
+    {
+        ScreenState.ENTRY,
+        ScreenState.START,
+        ScreenState.IN_GAME,
+        ScreenState.DISCONNECTED,
+        ScreenState.DEAD_SESSION,
+        ScreenState.MAINTENANCE,
+    }
+)
 
 
 def classify_screen(text: str) -> ScreenState:
@@ -277,7 +331,11 @@ class SessionKeeper:
             return self._report(state, reconnected=False, detail="session still alive")
 
         if state is ScreenState.UNKNOWN:
-            # 认不出的画面不乱点：可能是弹窗、维护公告或改版。
+            # 认不出的画面不乱点：可能是弹窗、维护公告、改版，或者**登录还没走完**。
+            # 这里仍然当场把 UNKNOWN 报出去，不在这里等：等哪些情况、等多久，是
+            # 恢复阶梯上一级一级的事（见 `wait_for_known_screen`，以及
+            # `tools.scan_coordinates.wait_for_login_if_unrecognised` 里为什么它
+            # 排在关浮层之后、关窗重开之前）。
             return self._report(state, reconnected=False, detail="unrecognised screen")
 
         restarted = False
@@ -290,6 +348,53 @@ class SessionKeeper:
             state = self._wait_after_restart()
 
         return self._walk_entry_sequence(state, restarted=restarted)
+
+    def wait_for_known_screen(self) -> ReconnectOutcome:
+        """认不出的画面**先当成「登录还没走完」**，等它自己变成认得出的一屏。
+
+        ⚠️ **2026-08-17：登录流程更新之后，一个正常的中间态被当成了故障。**
+        现象、两条日志原文、以及「为什么判据不许按 OCR 残片写死」都在
+        `LOGIN_SETTLE_TIMEOUT_S` 那段注释里。用户口径：「这里应该是等待变更为
+        start」。
+
+        **判据是「它会不会自己变」，不是「它长什么样」。** 登录中间态每一帧读出来
+        的碎字都不一样，唯一稳定的区别是：登录中间态过几秒就变成 START（或入口页、
+        或直接进游戏），而一个真坏了的画面一直不变。所以这里只做一件事——等，
+        并且**一下都不点**。
+
+        **等待有尽头。** 超时之后原样退回「认不出」那条路（`ScreenState.UNKNOWN` +
+        `ready` 为假），调用方照旧走它原来的收场：关窗重开、配额耗尽、豁免攒满、
+        最终停用。没有这条，一个真坏了的画面就会变成整夜静默空转——
+        `domain.scheduler.exit_code_for_environment_fault` 整段讲的就是它。
+
+        **为什么复用 `_wait_for` 而不另起一套循环**：进游戏本来就要等（入口页翻到
+        START、点完 START 等游戏起来），那套轮询里已经写着一条来之不易的规矩——
+        「轮询期间容忍 UNKNOWN 继续等，超时才算失败」。另写一份就等于把它抄错一次。
+        """
+        started = self._clock()
+        self._log(
+            "画面认不出：先按「登录还没走完」处理，等它自己变成认得出的一屏"
+            f"（最多 {LOGIN_SETTLE_TIMEOUT_S:.0f} 秒，其间一下都不点）"
+        )
+        state = self._wait_for(set(SETTLED_SCREENS), LOGIN_SETTLE_TIMEOUT_S)
+        waited = self._clock() - started
+        if state not in SETTLED_SCREENS:
+            self._log(
+                f"等了 {waited:.0f} 秒画面还是认不出（最后读到 {state.value}）；"
+                "按原来那条「认不出」收场"
+            )
+            return self._report(
+                ScreenState.UNKNOWN,
+                reconnected=False,
+                detail=(f"unrecognised screen after waiting {waited:.0f}s for the login to settle"),
+            )
+        self._log(f"等了 {waited:.0f} 秒，画面变成了 {state.value}；接着走入口序列")
+        if state is ScreenState.DEAD_SESSION:
+            # 会话已死的善后是关窗重开，不是入口序列。交回 `reconnect` 走那一支：
+            # 配额、日志、失败处理全在 `_restart_now` 一处，这里另写一份就等于
+            # 把上限翻倍——正是 `MAX_WINDOW_RESTARTS` 要防的。
+            return self.reconnect()
+        return self._walk_entry_sequence(state, restarted=False)
 
     def restart_and_reenter(self, reason: str) -> ReconnectOutcome:
         """不是掉线，但画面已经没救了——关窗重开，再走一遍入口序列。

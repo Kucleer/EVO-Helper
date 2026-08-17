@@ -102,6 +102,7 @@ from evo_helper.tools.scan_coordinates import (
     run_with_foreground_guard,
     say,
     thumbnail_base64,
+    wait_for_login_if_unrecognised,
 )
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
@@ -2666,7 +2667,12 @@ class PirateLoop:
         2. 读到 `UNKNOWN` → 关浮层再问一次。**最坏情况下点到了什么：**
            左上角 (750, 71) 那个 ✕；各种浮层的关闭键都在同一处，而那个位置在
            恒星系视图上什么都不是，点空无害。
-        3. 还是不行 → 关窗重开一次。**最坏情况下点到了什么：什么都没点。**
+        3. 还是 `UNKNOWN` → **先当成「登录还没走完」等一会儿**（上限
+           `LOGIN_SETTLE_TIMEOUT_S`）。**最坏情况下点到了什么：什么都没点。**
+           2026-08-17 登录流程更新之后，翻页那几秒读出来的画面跟真认不出长得
+           一样，而正解是等，不是往下走——整段见
+           `scan_coordinates.wait_for_login_if_unrecognised`。
+        4. 还是不行 → 关窗重开一次。**最坏情况下点到了什么：什么都没点。**
            重开只往游戏窗口那个句柄送一个 `WM_CLOSE`（等同用户点右上角 ×），
            再由 `ensure_game_window` 拉一个新的；新窗口停在入口页，之后仍旧走
            判据驱动的入口序列，认不出就停。所以「认不出的画面绝不点击」在这一级
@@ -2691,6 +2697,10 @@ class PirateLoop:
             say("  画面认不出（多半是浮层）；关掉浮层后重新巡检")
             self._reset_to_known_screen()
             session = self._keeper().ensure_connected(force=True)
+        # 关完浮层仍然认不出 → 还有一种解释：**登录还没走完**（2026-08-17 起）。
+        # 这一级只等不点，而且必须排在下面的关窗重开之前——登录才到一半就把
+        # Chrome 关掉，救不了，还会把本来马上就好的会话亲手弄坏。
+        session = wait_for_login_if_unrecognised(session, self._keeper())
         if session is None or not session.ready:
             # 阶梯最后一级。走到这里说明关浮层也没用：画面既不是入口序列里的
             # 任何一屏，也读不出导航条——上一轮多半没能正常收尾（进程被强杀、

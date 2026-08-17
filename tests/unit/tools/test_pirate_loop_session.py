@@ -31,15 +31,32 @@ class _Keeper:
         outcomes: list[ReconnectOutcome | None],
         *,
         after_restart: ReconnectOutcome | None = None,
+        after_wait: ReconnectOutcome | None = None,
     ) -> None:
         self._outcomes = outcomes
         self._after_restart = after_restart
+        self._after_wait = after_wait
         self.calls = 0
+        self.waits = 0
         self.restarts: list[str] = []
 
     def ensure_connected(self, *, force: bool = False) -> ReconnectOutcome | None:
         self.calls += 1
         return self._outcomes.pop(0)
+
+    def wait_for_known_screen(self) -> ReconnectOutcome:
+        """第三级：把认不出先当成「登录还没走完」等一会儿。
+
+        默认「等到头还是认不出」，好让不写这一档的用例照旧往下走到关窗重开——
+        默认值必须倒向「等不到」那一侧，否则一个「永远等下去」的实现会把下面
+        那几条用例全测绿。
+        """
+        self.waits += 1
+        return self._after_wait or ReconnectOutcome(
+            ScreenState.UNKNOWN,
+            reconnected=False,
+            detail="unrecognised screen after waiting 90s for the login to settle",
+        )
 
     def restart_and_reenter(self, reason: str) -> ReconnectOutcome:
         """关窗重开。默认「重开也没救回来」，好让不写这一档的用例照旧停在原地。
@@ -57,9 +74,10 @@ def _loop(
     outcomes: list[ReconnectOutcome | None],
     *,
     after_restart: ReconnectOutcome | None = None,
+    after_wait: ReconnectOutcome | None = None,
 ) -> tuple[Any, _Keeper, list[str]]:
     events: list[str] = []
-    keeper = _Keeper(outcomes, after_restart=after_restart)
+    keeper = _Keeper(outcomes, after_restart=after_restart, after_wait=after_wait)
     loop = PirateLoop.__new__(PirateLoop)
     loop._keeper = lambda: keeper  # type: ignore[attr-defined, assignment, method-assign]
     loop._reset_to_known_screen = lambda: events.append("关浮层")  # type: ignore[assignment, method-assign]
@@ -128,6 +146,29 @@ def test_closing_an_overlay_is_enough_and_nothing_gets_restarted(
     assert loop._ensure_session(force=True) is False
     assert events == ["关浮层"]
     assert keeper.restarts == []
+    assert keeper.waits == 0, "关浮层就救回来了还去等一分半，等于每一轮白等"
+
+
+def test_a_login_that_is_still_loading_is_waited_out_not_restarted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第三级：关浮层没用，但画面只是**登录还没走完**——等它，别关窗重开。
+
+    ⚠️ **2026-08-17 实机：登录流程更新之后这一档被当成了故障。** 库里那两条
+    「画面认不出」（导航条读到 `'> =. _'` / 入口标题读到 `'TAL pisE'`）都是登录页
+    往 START 翻的那几秒。当时的动作是关掉 Chrome 重开——救不了，还把本来马上就好
+    的会话亲手弄坏，并且吃掉一次 3 次 / 1 小时的重开配额。
+    """
+    loop, keeper, events = _loop(
+        monkeypatch,
+        [_outcome(ScreenState.UNKNOWN), _outcome(ScreenState.UNKNOWN)],
+        after_wait=_outcome(ScreenState.IN_GAME, reconnected=True),
+    )
+
+    assert loop._ensure_session(force=True) is True
+    assert keeper.waits == 1
+    assert keeper.restarts == [], "登录才到一半就关窗重开，正是这次要挡住的那一下"
+    assert events == ["关浮层", "清缓存"]
 
 
 def test_a_screen_that_stays_unknown_escalates_to_a_window_restart(
@@ -150,6 +191,9 @@ def test_a_screen_that_stays_unknown_escalates_to_a_window_restart(
 
     assert loop._ensure_session(force=True) is True
     assert len(keeper.restarts) == 1
+    # 等待那一级也走过了，而且**等不到就必须往下走**——这一条是「永远等下去」
+    # 那种实现唯一会踩红的地方。
+    assert keeper.waits == 1
     # 重开之后画面整个换过一遍，导航器那份记忆记的是重开前的坐标。
     assert events == ["关浮层", "清缓存"]
 
