@@ -49,6 +49,10 @@ from evo_helper.storage.system_log import SystemLogRepository
 from evo_helper.tools.ranking_scan import scan
 
 from .conftest import Clock, make_supervisor
+from .test_line_shortage_recovery import (
+    RecordingLog,
+    recorded,  # noqa: F401 - fixture，被下面的用例按名字取用
+)
 
 ORIGIN = Coordinate(2, 137, 18)
 
@@ -304,6 +308,163 @@ def test_a_blank_value_is_not_an_error_it_is_the_auto_mode(
 
 def test_the_ceiling_itself_is_still_accepted(scheduler: MissionScheduler) -> None:
     assert scheduler.validate_blind_scrolls(BLIND_SCROLLS_MAX) == BLIND_SCROLLS_MAX
+
+
+# -- 判定本身要在日志里说得出来 ------------------------------------------------
+#
+# ⚠️ **补的是自动标定唯一的哑点。** `bot_area_reached_message` 上写着：那句实测
+# 日志的措辞一改，库里全部历史样本一次性作废，标定就**静悄悄退回写死的默认值**
+# ——页面上、日志里都看不出任何异常。采集那头照样打「盲拖 40 屏」，看上去和
+# 「本来就没攒够样本」一模一样。所以差别只能由判定这一侧说出来。
+
+
+def _verdicts(log: RecordingLog) -> list[str]:
+    """只挑盲拖那一类的日志。同一个 tick 里还会写别的（定时窗口之类）。"""
+    return [message for message in log.messages if "盲拖屏数" in message]
+
+
+def _verdict_payloads(log: RecordingLog) -> list[dict[str, object]]:
+    return [
+        payload
+        for message, payload in zip(log.messages, log.payloads, strict=True)
+        if "盲拖屏数" in message
+    ]
+
+
+def test_a_missing_calibration_says_so_and_counts_the_samples(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """⚠️ **样本条数是「刚上线」和「反解规则失效了」唯一的分界。**
+
+    两种情形下命令行完全一样（不带 `--blind-scrolls`）、采集日志也完全一样
+    （「盲拖 40 屏」）。区别只有一个：前者的样本会一天天涨上去，后者恒为 0。
+    不把这个数写进 `payload_json`，事后就只能靠猜。
+    """
+    _only_ranking(repository)
+
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    assert len(_verdicts(recorded)) == 1
+    assert str(BLIND_SCROLLS) in _verdicts(recorded)[0], "没说清回落到的是哪个默认值"
+    payload = _verdict_payloads(recorded)[0]
+    assert payload["source"] == "default"
+    assert payload["blind_scrolls"] is None
+    assert payload["measurements"] == 0
+    assert payload["samples_required"] == BLIND_SCROLL_SAMPLES
+
+
+def test_a_successful_calibration_is_written_with_its_sample_count(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    session_factory,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """标定成功也要写：那是「这条反馈回路还活着」唯一的证据。"""
+    _only_ranking(repository)
+    _seed_measurements(session_factory, MEASURED[1:])
+
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    payload = _verdict_payloads(recorded)[0]
+    assert payload["source"] == "calibrated"
+    assert payload["blind_scrolls"] == 62
+    assert payload["measurements"] == len(MEASURED[1:])
+    assert "62" in _verdicts(recorded)[0]
+
+
+def test_a_hand_typed_value_is_reported_as_hand_typed(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    session_factory,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """手填和标定必须分得开。
+
+    盲拖拖过头的后果是**采回来的数静悄悄少一截**，而两种来源的善后完全不同：
+    一个要去攻击配置页上改，一个要去看实测样本。日志说成同一句，用户只能挨个试。
+    """
+    _only_ranking(repository)
+    _seed_measurements(session_factory, MEASURED[1:])
+    repository.replace_military_attack_tiers("[]", blind_scrolls=25)
+
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    payload = _verdict_payloads(recorded)[0]
+    assert payload["source"] == "manual"
+    assert payload["blind_scrolls"] == 25
+    assert "手填" in _verdicts(recorded)[0]
+
+
+def test_the_verdict_is_only_written_when_it_changes(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    session_factory,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """⚠️ **限流：判定没变就一个字都不写。**
+
+    `_blind_scrolls` 在每次组军力榜命令行时都会走，而 `command_for` 那条公开路径
+    **页面保存配置时也会走**。每次都写的话，一天几十条重复的「还是 62 屏」会把
+    真正的那一次变化埋掉——而这条日志存在的全部意义就是那一次变化。
+    """
+    _only_ranking(repository)
+    _seed_measurements(session_factory, MEASURED[1:])
+
+    for _ in range(5):
+        scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    assert len(_verdicts(recorded)) == 1
+
+
+def test_a_changed_verdict_is_written_again(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    session_factory,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """限流不许压掉**真的**变化。
+
+    「样本攒够了、标定第一次给出答案」正是用户最该看到的那一条：在此之前每趟
+    都白拖三十几屏，从这条起不再白拖。压掉它，这个功能到底有没有生效就无从查起。
+    """
+    _only_ranking(repository)
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+    assert _verdict_payloads(recorded)[0]["source"] == "default"
+
+    _seed_measurements(session_factory, MEASURED[1:])
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    assert len(_verdicts(recorded)) == 2
+    assert _verdict_payloads(recorded)[1]["source"] == "calibrated"
+    assert _verdict_payloads(recorded)[1]["blind_scrolls"] == 62
+
+
+def test_the_verdict_never_claims_a_scan_actually_ran(  # type: ignore[no-untyped-def]
+    scheduler,
+    repository,
+    session_factory,
+    recorded: RecordingLog,  # noqa: F811
+) -> None:
+    """⚠️ **措辞只说判定，不说「这一趟拖了几屏」。**
+
+    走到这里未必真会起一轮采集：`command_for` 是页面拿来校验参数的，组出来的
+    命令行随手就丢了。说成「本趟盲拖 N 屏」就是替一件没发生的事作证——而这个
+    仓库今天已经为「日志说假话」付过两天的代价（`bot_loop._say_still_waiting`）。
+
+    真正「这一趟拖了几屏」那句话在 `tools.ranking_scan` 里，由**真的拖完了**的
+    那一侧打出来。
+    """
+    _only_ranking(repository)
+    _seed_measurements(session_factory, MEASURED[1:])
+
+    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
+
+    verdict = _verdicts(recorded)[0]
+    assert "判定" in verdict
+    assert "本趟" not in verdict
+    assert "已盲拖" not in verdict
 
 
 # -- 页面上说得出这件事 --------------------------------------------------------
