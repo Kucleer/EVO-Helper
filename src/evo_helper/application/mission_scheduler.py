@@ -252,6 +252,21 @@ class MilitaryPoolReading:
         return len(self.split.expired)
 
     @property
+    def all_stale(self) -> bool:
+        """一个能打的都没有，**而且原因是分数过期**。
+
+        ⚠️ 它专门用来把两件在 `usable` 上长得一模一样的事分开：
+        「这一轮的目标全打完了」和「目标都还在，只是分数超期被闸门滤掉了」——
+        两边 `usable` 都是 0，而页面把前者写作「已完成」。第二种被那句话盖住时，
+        用户看到的是一句听起来顺利的话，于是不会去做真正该做的两件事：
+        等军力榜扫一轮，或者把有效期调长。
+
+        判据要求 `skipped > 0`，不能只看 `usable == 0`：候选池本来就空（真打完了、
+        或者全在重复攻击间隔里）时 `skipped` 也是 0，那一档不该冒充「数据过期」。
+        """
+        return self.usable == 0 and self.skipped > 0
+
+    @property
     def oldest_skipped_at(self) -> datetime | None:
         """被跳过的那批里最旧的那条读数。"""
         return min(
@@ -1708,6 +1723,7 @@ class MissionScheduler:
                     free_lines=free,
                     reports_due=self._reports_due(task, now, grace),
                     targets_remaining=reading.usable,
+                    scores_are_stale=reading.all_stale,
                     last_dispatch_at_utc=max(
                         (item for item in last_dispatches if item is not None), default=None
                     ),
