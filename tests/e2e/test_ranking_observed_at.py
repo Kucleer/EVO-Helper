@@ -92,6 +92,33 @@ def test_an_interpolated_score_is_marked_as_such(tmp_path: Path) -> None:
     assert [row["estimated"] for row in rows] == [False, True]
 
 
+def test_a_historic_float_tail_never_reaches_the_page(tmp_path: Path) -> None:
+    """⚠️ **这条钉的是接线，不是那个函数。**
+
+    `web.display.settled_score` 自己有单元测试，但那一层全绿也挡不住有人把
+    `ranking_routes` 里那一次调用删掉——脏值照样一路到页面。所以判据必须落在
+    接口返回的 `score` 上，而且**恰好相等**（用 `pytest.approx` 等于没测）。
+
+    输入是 2026-08-17 页面上原样出现的三个值。库里存的就是这样，
+    而用户口径是开发过程不碰生产库、历史值不许 UPDATE——只能在读出来时收。
+    同一份数据里混一个 `72252.5`：它是插值取的中点，**合法**，不许被一起抹掉。
+    """
+    client, repository = _client(tmp_path)
+    repository.save_ranking_targets(
+        [
+            RankingTarget(Coordinate(2, 137, 5), 64959.99999999999, READ_AT),
+            RankingTarget(Coordinate(2, 137, 6), 64260.00000000001, READ_AT),
+            RankingTarget(Coordinate(2, 137, 7), 64180.00000000001, READ_AT),
+            RankingTarget(Coordinate(2, 137, 8), 72252.5, READ_AT, military_score_estimated=True),
+        ]
+    )
+
+    rows = client.get("/api/military-rankings").json()["rows"]
+
+    # 榜单按军力降序，所以那个插值出来的 72252.5 排在最前面。
+    assert [row["score"] for row in rows] == [72252.5, 64960, 64260, 64180]
+
+
 def test_a_bot_name_query_finds_it_by_coordinate(tmp_path: Path) -> None:
     """搜索框里写 `bot_2_137_6` 要找得到。
 

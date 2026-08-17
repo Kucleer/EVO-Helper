@@ -77,6 +77,40 @@ STATUS_GLYPHS: dict[str, str] = {
 }
 
 
+#: 军力值在页面上保留几位小数。
+#:
+#: 取 2 是因为它**同时避开了两边**：
+#:
+#: - 比任何合法值都细。榜上 K 值最小刻度 0.01K = 10、M 值 0.01M = 10000，
+#:   裸数是整数；插值取的中点最多带一位 `.5`。两位小数一个都碰不到。
+#: - 比浮点噪声都粗。脏值的误差在 1e-11（K 量级）到 1e-7（M 量级）之间，
+#:   `round(404169999.99999994, 2)` 就是 404170000.0。
+#:
+#: ⚠️ **不能改成整数位。** 那样会把插值的 `.5` 一起抹掉，而它是合法值——
+#: 见 `domain.ranking.interpolate_scores`。
+SCORE_DECIMALS = 2
+
+
+def settled_score(score: float | None) -> float | None:
+    """把军力值收敛成一个能看的数；`None` 原样透传。
+
+    ⚠️ **这是显示层的补丁，不是修复。** 误差的源头在
+    `tools.ranking_scan.parse_score`（`float("64.96") * 1000` →
+    `64959.99999999999`），那里已经改成走 `Decimal`，此后新采的值是干净的。
+
+    但**库里已经存了一批脏值**，而用户口径（2026-08-17）是开发过程不碰生产库：
+    历史值不许 UPDATE。于是只能在读出来交给页面的这一步收一次，让
+    `64959.99999999999` 显示成 `64960`。以后重采会自然覆盖掉这些行。
+
+    收敛的是**显示**不是判据：筛选（`score_min` / `score_max`）、分档
+    （`domain.military_attack.tier_for`）、排序全都还读原值——那几处差 1e-11
+    不改变任何结论，而在那里动手才是真的在改数据。
+    """
+    if score is None:
+        return None
+    return round(score, SCORE_DECIMALS)
+
+
 #: 补录能补的两条链路在界面上的名字。键是 `application.backfill.BACKFILL_KINDS`
 #: 的取值，也就是 CLI 的 `--kind`。接口与命令行一律英文，界面只显示中文。
 BACKFILL_KIND_LABELS: dict[str, str] = {
