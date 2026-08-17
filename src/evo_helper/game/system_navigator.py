@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -49,6 +49,31 @@ PLANET_VIEW_BUTTON = SYSTEM_VIEW_BUTTON
 NAV_LABEL_ROI = (740, 88, 1190, 115)
 NAV_LABELS = ("银河系", "恒星系", "行星")
 
+#: 导航栏三个**值框**（银河系 / 恒星系 / 行星），也就是 `_set` 往里打字的那三个框。
+#:
+#: ⚠️ **这不是偏好项。** 取值由屏幕几何决定：框位量自实拍 `var/logs/calib-恒星系-client.png`
+#: （1920×917 client 空间，与 `GALAXY_FIELD` 等三个点击点同一次标定），值那一行就压在
+#: `NAV_LABEL_ROI` 正上方。窗口尺寸或界面版面变了要重量，改成别的数只会读错。
+#:
+#: 注意与 `NAV_LABEL_ROI` 的分工：那条读的是**标签**（用来判断在不在恒星系视图），
+#: 这三条读的是**值**（用来判断导航栏此刻停在哪个坐标）。
+#: 下界与 `NAV_LABEL_ROI` 的上界**贴齐但不重叠**：往下多框两行就把「银河系」那几个
+#: 中文挤进了数字白名单，读出来是噪声——而噪声与空串在这条链路上不是一回事。
+NAV_VALUE_ROIS = ((730, 55, 865, 88), (893, 55, 1028, 88), (1056, 55, 1191, 88))
+
+#: 读值框的配方 `(放大倍数, 二值化阈值)`。**每个框各自**逐套试到读出数字为止
+#: （不是三个框绑在一起换配方：同一张图上三个框的难度并不一样）。
+#:
+#: ⚠️ 同样是标定常量，不是偏好项。这三套是在九张实拍图上扫出来的（三张
+#: `calib-*恒星系-client.png` 加六张 `dump-*-coord-mismatch-*.png`，真值人工核对）：
+#: **八张三个框全对、一张的行星框读成空串、零张读错**。空串走的是「读不通就不确认」
+#: 那一支，代价只是下一个目标白设两个字段，也就是今天的行为。
+#:
+#: 挑这三套而不是别的，是因为**它们只会读空，不会读错**。被剔掉的 `(3,140)`
+#: 与 `(4,140)` 在实拍上把 `11` 读成 `1`、把 `9` 读成 `93`——读空是安全的，
+#: 读错才是这一整块最怕的东西（缓存与导航栏分岔，见 `SystemNavigator` 的类注释）。
+NAV_VALUE_RECIPES = ((3, 170), (2, 140), (2, 170))
+
 #: 点开字段后等编辑浮层弹出。
 FIELD_OPEN_WAIT_S = 0.7
 
@@ -83,8 +108,13 @@ class ScanDriver(Protocol):
 class SystemNavigator:
     """按坐标导航，并记住当前停在哪，好省掉不必要的字段输入。
 
-    银河系和恒星系只在变化时才重设——一次字段输入是三个动作约 3 秒，
+    银河系和恒星系只在变化时才重设——**一个字段实测 6.6 秒**，
     同一恒星系内连扫 16 个位时省下的时间占了大头。
+
+    6.6 秒是从生产 `system_log` 量出来的（2026-08-17 一天 177 次派遣）：导航耗时
+    分成两簇，设两个字段 150 次均值 14.02 秒、设三个字段 37 次均值 20.65 秒。
+    （这里原先写的是「约 3 秒」，那是按 `FIELD_OPEN_WAIT_S + APPLY_WAIT_S` 估的，
+    实测翻了一倍——点击与画面切换的真实耗时不在那两个常量里。）
 
     ## 缓存里只放**回读确认过**的坐标
 
@@ -105,6 +135,11 @@ class SystemNavigator:
     反过来，正因为缓存有证据撑着，关掉浮层（派遣面板、信箱）之后不必再无条件
     `invalidate()`：那些浮层压根不改导航栏的值，而真改了值的那些动作（切视图、
     重连、关窗重开）仍然照旧清缓存，见 `invalidate()` 的调用点。
+
+    切换出发星球是「真改了值」那一类，但它有别的出路：切完之后
+    `tools.pirate_loop.ensure_origin_planet` 回读导航栏的三个值框，读通了就
+    `adopt_readback()`。**这仍然是回读确认，不是假定**——读的正是缓存所描述的
+    那三个框本身，读不通照样 `invalidate()`。
     """
 
     driver: ScanDriver
@@ -132,6 +167,22 @@ class SystemNavigator:
         那是全仓唯一一份「面板读出来的算不算数」的判据。
         """
         self.current = coordinate
+
+    def adopt_readback(self, coordinate: Coordinate, values: Sequence[str]) -> bool:
+        """导航栏三个值框读回来就是 `coordinate` 才记住它，否则清缓存。返回记没记住。
+
+        这是 `confirm()` / `invalidate()` 之外**唯一**该被外面调的入口，因为它把
+        「读通了才认」这条规矩关在了里面：调用方交出去的是三个**读数**，不是一个
+        「我觉得现在在哪」的判断，所以不存在「忘了检查就 confirm」这条路。
+
+        读不出（任何一个框是空串）与读出别的坐标，两种都走 `invalidate()`：
+        **方向永远是「拿不准就多设」**，理由整段在类注释里那次 136→9 的事故。
+        """
+        if _reads_as(values, coordinate):
+            self.confirm(coordinate)
+            return True
+        self.invalidate()
+        return False
 
     def invalidate(self) -> None:
         """画面被别的东西改过（切视图、重连、关窗重开）之后调用，下一次重设全部字段。
@@ -166,6 +217,26 @@ class SystemNavigator:
         self.driver.type_number(value)
         self.driver.click(*OK_BUTTON, label="OK")
         self.driver.wait(APPLY_WAIT_S)
+
+
+def _reads_as(values: Sequence[str], coordinate: Coordinate) -> bool:
+    """三个读数**逐字**就是这个坐标吗？
+
+    严格到「一个字都不许差」是有意的：读数是 OCR 的产物，任何「差不多」的放宽
+    （去掉非数字、只比前缀、只比银河系）都会把一次误读放行成一份假记忆。
+    宁可判不通——判不通只花两次字段输入，判错要付的是整轮坐标核对全不过。
+
+    ⚠️ **行星那一格也要比**，哪怕 `goto()` 每次都会重设行星。它在这里的作用不是
+    省字段，而是第三个互相独立的见证：三个格子同时误读成同一个坐标，比一个格子
+    误读难得多。
+    """
+    if len(values) != 3:
+        return False
+    return tuple(values) == (
+        str(coordinate.galaxy),
+        str(coordinate.system),
+        str(coordinate.position),
+    )
 
 
 def crop_reader(image: Any, ocr: Callable[..., str]) -> Callable[..., str]:

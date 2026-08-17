@@ -30,12 +30,29 @@ TARGETS = (Coordinate(2, 137, 4), Coordinate(2, 137, 9), Coordinate(2, 138, 4))
 class _FakeNavigator:
     def __init__(self) -> None:
         self.invalidated = 0
+        self.current: Coordinate | None = None
+        #: `adopt_readback` 收到过的 `(坐标, 三个读数)`，顺序原样记下来。
+        self.readbacks: list[tuple[Coordinate, tuple[str, ...]]] = []
 
     def ensure_system_view(self, _read_labels: Any) -> bool:
         return True
 
+    def confirm(self, coordinate: Coordinate) -> None:
+        self.current = coordinate
+
+    def adopt_readback(self, coordinate: Coordinate, values: Any) -> bool:
+        """照着真货的规矩来：读数逐字对得上才记，否则清缓存。"""
+        self.readbacks.append((coordinate, tuple(values)))
+        expected = (str(coordinate.galaxy), str(coordinate.system), str(coordinate.position))
+        if tuple(values) == expected:
+            self.confirm(coordinate)
+            return True
+        self.invalidate()
+        return False
+
     def invalidate(self) -> None:
         self.invalidated += 1
+        self.current = None
 
 
 class _FakeSwitcher:
@@ -79,6 +96,13 @@ def _loop(
     loop._ensure_session = lambda **_k: False
     loop._require_system_view = lambda _what: None
     loop._goto_planet_surface = lambda: True
+    # 切完星球要回读导航栏三个值框（见 `_adopt_navigation_bar`）。默认读到出发星
+    # 本身，也就是「回读通过」那一支；要看读不通就在用例里改掉它。
+    loop._navigation_bar_values = lambda: (
+        (str(origin.galaxy), str(origin.system), str(origin.position))
+        if origin is not None
+        else ("", "", "")
+    )
     loop.planet_switcher = lambda **_k: switcher
     loop._reconcile_decision = None
     loop._last_reconciled_at = lambda: (

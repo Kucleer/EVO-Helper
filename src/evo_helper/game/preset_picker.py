@@ -29,6 +29,28 @@ BBB 和 CCC 在更右边，于是它俩**永远进不了候选**，报出来的�
    当作这一屏没找到、继续拖。往右拖会把它带进安全区，下一屏再点。
 3. **按名字也不点**：读出来含 `PRESET_SAVE_BUTTON_KEYWORD` 的一律不当候选。
 
+## 先看打开时这一屏，再决定要不要拖
+
+「拖到左端夹住」的判据是「往左拖一次之后名字没变」，所以**条本来就开在左端时也必然
+白拖一次、白读一屏**。而实测（生产 `system_log`，2026-08-17 一天 177 次派遣）
+「翻预设条」这一步 137 次落在 9–10 秒的最短路径上、只有 40 次是 13–14 秒——
+也就是说条**绝大多数时候本来就开在左端**，那一次白拖是常态而不是例外。
+用户口径（2026-08-18）：「目前首屏预设就是 AAA 和 BBB，我已经调整了，
+并且 CCC 场景为兜底场景，出场较少」。
+
+于是 `pick()` 先读一屏当前画面直接试命中：命中就点（零次拖动），没命中就**原封不动**
+走老路（拖到左端 + 逐屏往右）。多出来的那一次读不浪费：它当作 `scroll_to_left_end`
+的起点传下去，驱动上的动作序列与改动前逐字相同。
+
+⚠️ **首屏读空绝不能当成「这儿没有」。** 读空时那一屏不作数、也不当起点，
+让老路自己重读一遍——理由整段在 `read_names_confirming`，那是 2026-08-13
+通宵事故的形态。
+
+⚠️ 这条捷径不影响下游坐标。选中预设之后**预设条整个收起来**，派遣面板回到
+「起点 / 终点 + 绿 ✓」那副样子（实拍 `var/logs/atk-2-presets.png` →
+`atk-3-selected.png`），所以 `DISPATCH_CONFIRM` (1156, 763) 落在哪与条被拖到过
+哪里无关。没点中那一支仍旧照旧拖回左端，见 `pick` 末尾。
+
 ## 位置只能来自当前这一屏
 
 用户口径（2026-08-11）：「这里你需要识别文本进行定位，而不是直接定位」。
@@ -131,6 +153,12 @@ class PresetPicker:
 
     driver: PresetDriver
     read_names: Callable[[], Sequence[tuple[int, str]]]
+    #: 一句话日志的出口。默认空操作（单元测试不该因为选预设而刷屏），实机由
+    #: `tools.pirate_loop` 接上 `say`，也就是接到 `system_log` 表上。
+    #:
+    #: 装它是因为「打开时就在目标那一屏」与「拖了几屏才找到」在结果上一模一样，
+    #: 只有日志能把两者分开——而这正是这条捷径到底有没有生效的唯一证据。
+    say: Callable[[str], None] = lambda _message: None
 
     def read_names_confirming(self) -> Sequence[tuple[int, str]]:
         """读这一屏的预设名，**空结果要重读几次再认**。
@@ -164,15 +192,25 @@ class PresetPicker:
         self.driver.click(*PRESET_TOGGLE, label="预设条")
         self.driver.wait(PRESET_OPEN_WAIT_S)
 
-    def scroll_to_left_end(self, *, max_drags: int = PRESET_MAX_DRAGS) -> Sequence[tuple[int, str]]:
+    def scroll_to_left_end(
+        self,
+        *,
+        max_drags: int = PRESET_MAX_DRAGS,
+        seen: Sequence[tuple[int, str]] | None = None,
+    ) -> Sequence[tuple[int, str]]:
         """一直往左拖到夹住，返回夹住之后这一屏的预设名。
 
         判据是「这一屏读到的名字不再变化」，不是拖固定次数：拖多少次能到左端
         取决于打开时停在哪。实测从「探路 / BBB」那一段出发，两次就夹住了。
 
         两处用它：找之前定起点，以及**放弃之前把条还原成左端**（见 `pick`）。
+
+        `seen` 是**当前这一屏已经读过的那一份**，由 `pick` 的首屏快路传下来，
+        免得同一屏连读两次。⚠️ **只许传非空的那一份**：空读不是证据（见
+        `read_names_confirming`），拿它当起点会让「拖了一次还是空」被误判成
+        「已经夹住了」。`pick` 因此对空首屏传 `None`，让这里自己重读。
         """
-        seen = list(self.read_names_confirming())
+        seen = list(self.read_names_confirming()) if seen is None else list(seen)
         for _attempt in range(max_drags):
             self.driver.drag(
                 PRESET_DRAG_TO_X,
@@ -205,7 +243,7 @@ class PresetPicker:
         return list(self.read_names_confirming())
 
     def pick(self, name: str) -> int:
-        """展开、拖到左端、再一屏一屏往右找，点中名叫 `name` 的那个预设，返回其中心 x。
+        """展开、先看这一屏、不行再拖到左端逐屏往右找，点中 `name`，返回其中心 x。
 
         返回的 x 就是**点下去的那个 x**，且它一定来自命中那一屏刚读出来的词框——
         任何一屏都只用它自己的 OCR 结果定位，见模块头「位置只能来自当前这一屏」。
@@ -213,7 +251,18 @@ class PresetPicker:
         找不到就抛 `PresetNotFound`——由调用方决定放弃这一发，而不是凑合点一个。
         """
         self.expand()
-        entries = list(self.scroll_to_left_end())
+        # 打开时这一屏就够了吗？实测 137/177 次是够的，见模块头「先看打开时这一屏」。
+        # 走的是同一个 `_clickable_hit`：安全区、保存关键字那两道闸原样生效。
+        opening = list(self.read_names_confirming())
+        target = _clickable_hit(merged_names(opening), name)
+        if target is not None:
+            self.say(f"  预设条打开时就停在 {name} 那一屏（读到 {_names_of(opening)}）；不用拖")
+            self.driver.click(target, PRESET_NAME_ROW_Y, label=f"预设 {name}")
+            self.driver.wait(PRESET_DRAG_WAIT_S)
+            return target
+        self.say(f"  预设条打开时这一屏读到 {_names_of(opening)}，没有 {name}；拖到左端从头找")
+        # ⚠️ 空首屏传 `None` 而不是 `[]`：见 `scroll_to_left_end` 的 `seen`。
+        entries = list(self.scroll_to_left_end(seen=opening or None))
         screens: list[list[str]] = []
         previous: list[str] | None = None
         for _attempt in range(PRESET_MAX_DRAGS + 1):
