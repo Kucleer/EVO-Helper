@@ -827,8 +827,15 @@ class MissionScheduler:
         try:
             batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
             if task.kind is MissionKind.RANKING:
+                # 两个上限，取**小**的那个：任务上配的「扫描数量」是用户给这条
+                # 链路划的天花板（留空 = 不划），军力批次要的 `top_n` 是「这一批
+                # 攻击需要多少个目标」。取大的会越过用户划的线，取任务那个又会
+                # 让批次采不满——`min` 是唯一同时守得住两条的。
                 command = ranking_command(
-                    bot_limit=None if batch_task is None else _bot_top_n(batch_task.params_json)
+                    bot_limit=_smallest_limit(
+                        _ranking_bot_limit(row.params_json),
+                        None if batch_task is None else _bot_top_n(batch_task.params_json),
+                    )
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
                 command = self._military_command(row, max_dispatches=facts.free_lines)
@@ -1399,7 +1406,7 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.RANKING:
-            return ranking_command()
+            return ranking_command(bot_limit=_ranking_bot_limit(params_json))
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
@@ -1485,6 +1492,42 @@ def _int_param(data: dict[str, Any], name: str) -> int:
 
 def _pirate_radius(raw: str) -> int:
     return _int_param(_params(raw), "radius")
+
+
+def _ranking_bot_limit(raw: str) -> int | None:
+    """军力榜这一趟最多采几个 bot。**留空 = 全扫**，也就是保持原来的行为。
+
+    用户口径（2026-08-17）：「军力扫描增加扫描数量范围，为空则全扫」。
+
+    ⚠️ **「没配」和「配了 0」必须是两回事。** 空框在页面上什么都不送
+    （`missions.html` 的 `.mission-param` 处理器不把空框往上送），于是这里
+    读到的是 `None`——那是「不划线」。而 `0` 是一个用户真的敲进去的数字，
+    它的意思只可能是「一个都别扫」，而那等于把这条链路关掉：要关掉有复选框，
+    不该用一个看起来像范围的数字表达。所以 `0` 与负数一律当场拒掉，
+    让页面 400 报出来，而不是悄悄跑一趟什么都不采的采集。
+
+    没有为它加数据库列：它和 `galaxy` / `first_system` 一样，是任务参数，
+    住在 `mission_tasks.params_json` 里（见 `storage.models` 那一行的注释）。
+    """
+    value = _params(raw).get("bot_limit")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("扫描数量必须是整数；要全扫就把它留空")
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"扫描数量不是整数：{value!r}") from exc
+    if limit < 1:
+        raise MissionParamError("扫描数量至少是 1；要全扫就把它留空，别填 0")
+    return limit
+
+
+def _smallest_limit(*limits: int | None) -> int | None:
+    """几个上限里最紧的那个；一个都没有就是「不设限」。"""
+    values = [limit for limit in limits if limit is not None]
+    return min(values) if values else None
 
 
 def _bot_by_military(raw: str) -> bool:

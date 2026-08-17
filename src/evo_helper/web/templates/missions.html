@@ -334,6 +334,14 @@
       { key: 'last_system', label: '–', width: 78, min: 1 },
     ],
     SCAN: [],
+    // 军力榜这一趟最多采几个 bot。**留空 = 全扫**（用户口径 2026-08-17）：
+    // 空框在下面那个处理器里根本不往上送，于是 `params_json` 里没有这个键，
+    // 后端读到 `None` 就不带 `--bot-limit`——和加这个框之前一模一样。
+    // 「留空 = 全扫」这句话另有一份摆在框下面的回显里（`ranking_scan_summary`）：
+    // 一个 placeholder 在框里填了字之后就看不见了，而那正是最该确认的时候。
+    RANKING: [
+      { key: 'bot_limit', label: '扫描数量', width: 96, min: 1, placeholder: '留空 = 全扫' },
+    ],
   };
 
   // 运行中改配置一律被后端 409 拒掉（`_refuse_while_running`）。页面这一侧
@@ -611,7 +619,7 @@
       label.className = field.label === '–' ? 'dash' : 'inline-label';
       label.textContent = field.label;
       const input = makeInput('mission-param', {
-        type: 'number', min: field.min, max: field.max,
+        type: 'number', min: field.min, max: field.max, placeholder: field.placeholder,
         style: `width:${field.width}px`, 'aria-label': field.label,
       });
       input.dataset.param = field.key;

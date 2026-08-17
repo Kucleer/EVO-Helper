@@ -34,6 +34,7 @@ PARAM_LABELS: dict[str, str] = {
     "galaxy": "星系",
     "first_system": "起始系号",
     "last_system": "结束系号",
+    "bot_limit": "扫描数量",
 }
 
 

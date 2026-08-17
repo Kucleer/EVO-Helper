@@ -1563,6 +1563,10 @@ class MissionConsoleService:
             return f"{lines} · {self._pirate_summary(task.origin, params)}"
         if task.kind is MissionKind.BOT:
             return f"{lines} · {self._bot_summary(params)}"
+        if task.kind is MissionKind.RANKING:
+            # 军力榜不派遣，所以这一行**不带**出发星球和航线数：那两个数对它
+            # 没有意义，摆上去只会让人以为它会占航线。
+            return ranking_scan_summary(params)
         return "—"
 
     def _pirate_summary(self, origin: Coordinate, params: dict[str, int]) -> str:
@@ -1675,6 +1679,22 @@ def _frozen_task_view(task: FrozenTask) -> FrozenTaskView:
     )
 
 
+def ranking_scan_summary(params: dict[str, Any]) -> str:
+    """军力榜那一行的人话回显。**「留空 = 全扫」必须写在页面上。**
+
+    一个空的数字框自己说不出它是什么意思：它可能是「还没配」，也可能是
+    「配了但没生效」。用户口径（2026-08-17）是「为空则全扫」，那就把这句话
+    原样摆在框边上，而不是让人去猜或者去翻文档。
+
+    只念参数、不查库（同 `_frozen_summary` 那条）：这里没有「现在榜上有多少个」
+    这种今天才算得出来的数。
+    """
+    limit = params.get("bot_limit")
+    if limit is None or (isinstance(limit, str) and not limit.strip()):
+        return "扫描数量留空 = 全扫（一趟翻到底）"
+    return f"本趟最多采 {limit} 个 bot（留空 = 全扫）"
+
+
 def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
     """固化的那份参数念成人话。
 
@@ -1699,6 +1719,8 @@ def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
         if galaxy is None or first is None or last is None:
             return "未设置系号区间"
         return f"{galaxy}:{first} – {galaxy}:{last}"
+    if kind is MissionKind.RANKING:
+        return ranking_scan_summary(params)
     return "不吃参数"
 
 
