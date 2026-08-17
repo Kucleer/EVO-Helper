@@ -23,6 +23,7 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 TOKEN = "test-token"
@@ -54,7 +55,7 @@ class _FakeBackfillLauncher:
 
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'console.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "console.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     app = create_persistent_app(

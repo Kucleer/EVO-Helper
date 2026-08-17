@@ -45,6 +45,7 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, TargetCheck
+from support.database import scratch_database_url
 
 ORIGIN = Coordinate(2, 137, 18)
 SYSTEM = (2, 137)
@@ -70,7 +71,7 @@ class _Loop:
     """
 
     def __init__(self, tmp_path: Path, *, pirates_at: set[int], scout: bool, attack: bool) -> None:
-        engine = create_database_engine(f"sqlite:///{tmp_path / 'dedup.db'}")
+        engine = create_database_engine(scratch_database_url(tmp_path, "dedup.db"))
         Base.metadata.create_all(engine)
         self.factory = create_session_factory(engine)
         self.repository = SqlAlchemyRepository(self.factory)

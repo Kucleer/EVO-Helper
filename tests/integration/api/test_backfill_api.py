@@ -27,6 +27,7 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.app import create_persistent_app
+from support.database import scratch_database_url
 
 #: 现实里的 2026-08-13 20:00（UTC+8），也就是那次事故的第二天。
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -109,7 +110,7 @@ class Console:
 
 @pytest.fixture
 def console(tmp_path: Path) -> Iterator[Console]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'console.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "console.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     launcher = FakeLauncher()
@@ -478,7 +479,7 @@ def test_the_write_endpoints_need_the_token_or_a_same_origin_request(tmp_path: P
     变异测试），这条用例就会亲手起一个去翻信箱的补录进程。实测跑变异 M24 时它就
     在工作区里落下了一份 `var/logs/backfill-pirate.log`。
     """
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'auth.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "auth.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     app = create_persistent_app(

@@ -957,6 +957,13 @@ class MissionScheduler:
             and (exited.stopped_by is not StopReason.SELF or exited.exit_code != 0)
         ):
             # 没采满就失败/被用户停止的榜单不能假装是一批可攻击目标。
+            #
+            # ⚠️ **`exit_code is None` 必须落在「没采满」这一侧。** 手动停掉的那几档
+            # 现在一律记 None（见 `MissionSupervisor.stop`），而 `None != 0` 为真，
+            # 所以这句话本身已经是对的——但凡把它写成 `(exited.exit_code or 0) != 0`
+            # 或者 `exited.exit_code in (None, 0)` 之类「None 当 0 看」的形状，
+            # 就等于把一趟半截的榜单当成采满了，接着按它去派攻击。
+            # 判据只认一件事：**只有 runner 自己报的 0 才算采满。**
             self._military_ranking_batch_task_id = None
         if exited.stopped_by is StopReason.SELF and exited.exit_code == 0:
             # 跑完一轮。「连续」是连续，成功过一次就重新数。
@@ -1233,10 +1240,9 @@ class MissionScheduler:
     def _bot_remaining(self, task: TaskSnapshot) -> int:
         """本轮范围内还有几个 bot 没走完。
 
-        完成 = 收到那一发攻击的战报，而且**战果不是平局**——平局要对同一坐标再打
-        一发（用户口径 2026-08-13），所以它还没走完。打满上限之后也算完成，
-        哪怕最后一发仍是平局。这几条都在 `domain.bot_round.phase_of` 里，
-        这里只负责把事实喂给它。
+        完成 = 收到那一发攻击的战报，**不论战果**。平局曾经要对同一坐标再打一发，
+        该规则已于 2026-08-17 按用户口径移除，所以平局的目标和打赢打输的一样算
+        走完。判据在 `domain.bot_round.phase_of` 里，这里只负责把事实喂给它。
 
         本轮的起点是**这个任务自己的** `round_started_at_utc`：两个 bot 任务各打
         各的范围、各开各的轮，共用一个起点会让先开一轮的那个把另一个的战报一起

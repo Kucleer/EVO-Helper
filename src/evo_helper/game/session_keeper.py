@@ -167,6 +167,18 @@ class ReconnectOutcome:
     state: ScreenState
     reconnected: bool
     detail: str = ""
+    #: 这一刻**还剩几次关窗重开的配额**（滚动窗口内，见 `MAX_WINDOW_RESTARTS`）。
+    #:
+    #: 它是给调用方回答一个问题的：巡检没能回到游戏内时，这一轮该按
+    #: 「环境暂时不行、会自己好」收场（`EXIT_ENVIRONMENT_BUSY`），还是按硬失败
+    #: 收场？判据就是它——**配额本身就是「这是不是暂时的」的现成度量**：
+    #: 还有配额说明这条恢复阶梯还没走到头，下一轮再试有意义；配额耗尽还是回不去，
+    #: 说明重开这条路已经证明救不了，得让连续失败计数看见它。
+    #:
+    #: ⚠️ **默认 0，也就是「没配额」**。默认值必须倒向「按硬失败收场」那一侧：
+    #: 判错成 75 的代价是一个**静默死循环**（不计故障、不报警、停顿看门狗也接不住，
+    #: 因为每轮几十秒就干净退出），判错成 1 的代价只是多攒几次失败计数。
+    restarts_left: int = 0
 
     @property
     def ready(self) -> bool:
@@ -216,6 +228,32 @@ class SessionKeeper:
             return True
         return self._clock() - self._last_check >= self._interval
 
+    def restarts_left(self) -> int:
+        """滚动窗口里还剩几次关窗重开的配额。
+
+        **没注入重开动作时恒为 0**：那种配置下重开这条路压根不存在，说「还有配额」
+        就是骗调用方「再试一轮会好」。见 `ReconnectOutcome.restarts_left` 里
+        为什么默认值要倒向这一侧。
+        """
+        if self._restart_window is None:
+            return 0
+        self._forget_expired_restarts()
+        return max(0, self._max_restarts - len(self._restarts))
+
+    def _forget_expired_restarts(self) -> None:
+        """把滚出窗口的那几次重开忘掉。滚动窗口而不是整点清零，理由见常量。"""
+        now = self._clock()
+        self._restarts = [at for at in self._restarts if now - at < self._restart_budget_window_s]
+
+    def _report(self, state: ScreenState, *, reconnected: bool, detail: str) -> ReconnectOutcome:
+        """出结局。**只此一处**，好让 `restarts_left` 不会在某条分支上漏填。"""
+        return ReconnectOutcome(
+            state,
+            reconnected=reconnected,
+            detail=detail,
+            restarts_left=self.restarts_left(),
+        )
+
     def ensure_connected(self, *, force: bool = False) -> ReconnectOutcome | None:
         """到点就巡检；掉线则重连。未到点且未强制时返回 None。"""
         if not force and not self.due():
@@ -226,11 +264,11 @@ class SessionKeeper:
     def reconnect(self) -> ReconnectOutcome:
         state = self._observe()
         if state is ScreenState.IN_GAME:
-            return ReconnectOutcome(state, reconnected=False, detail="session still alive")
+            return self._report(state, reconnected=False, detail="session still alive")
 
         if state is ScreenState.UNKNOWN:
             # 认不出的画面不乱点：可能是弹窗、维护公告或改版。
-            return ReconnectOutcome(state, reconnected=False, detail="unrecognised screen")
+            return self._report(state, reconnected=False, detail="unrecognised screen")
 
         restarted = False
         if state is ScreenState.DEAD_SESSION:
@@ -284,7 +322,7 @@ class SessionKeeper:
         """
         if state is ScreenState.MAINTENANCE:
             if self._dismiss_notice is None:
-                return ReconnectOutcome(
+                return self._report(
                     state, reconnected=False, detail="maintenance notice with no way to dismiss it"
                 )
             self._dismiss_notice()
@@ -300,7 +338,7 @@ class SessionKeeper:
             if self._dismiss_disconnect is None:
                 # 没给关闭动作就停在这里，而不是把掉线当成「认不出」——
                 # 前者说得清「卡在哪一屏」，后者查起来只能翻截图。
-                return ReconnectOutcome(
+                return self._report(
                     state, reconnected=False, detail="disconnected dialog with no way to dismiss it"
                 )
             self._dismiss_disconnect()
@@ -328,10 +366,10 @@ class SessionKeeper:
             )
             if restarted:
                 self._log("重开之后已经重新进到游戏内")
-            return ReconnectOutcome(state, reconnected=True, detail=detail)
+            return self._report(state, reconnected=True, detail=detail)
         if restarted:
             self._log("重开之后仍然没能走完入口序列；停止并保留现场")
-        return ReconnectOutcome(
+        return self._report(
             state, reconnected=False, detail="entry sequence did not reach the game"
         )
 
@@ -352,14 +390,14 @@ class SessionKeeper:
         """
         if self._restart_window is None:
             # 没给重开动作就停在这里，而不是退回去点弹窗——那条路已经证明没用。
-            return ReconnectOutcome(
+            return self._report(
                 refusal_state,
                 reconnected=False,
                 detail="no way to restart the game window",
             )
 
+        self._forget_expired_restarts()
         now = self._clock()
-        self._restarts = [at for at in self._restarts if now - at < self._restart_budget_window_s]
         minutes = self._restart_budget_window_s / 60
         if len(self._restarts) >= self._max_restarts:
             self._log(
@@ -367,7 +405,7 @@ class SessionKeeper:
                 f"{len(self._restarts)} 次（上限 {self._max_restarts}）；"
                 "多半是服务端在维护，不再重开，安全停止"
             )
-            return ReconnectOutcome(
+            return self._report(
                 refusal_state,
                 reconnected=False,
                 detail=(
@@ -388,7 +426,7 @@ class SessionKeeper:
             # 配额已经记上了：重开失败也算用掉一次，否则一个必然失败的重开
             # 会被无限重试，正是这里要防的那种循环。
             self._log(f"关窗重开失败：{failure}；停止而不是接着重试")
-            return ReconnectOutcome(
+            return self._report(
                 refusal_state,
                 reconnected=False,
                 detail=f"restarting the game window failed: {failure}",

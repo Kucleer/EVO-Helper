@@ -15,6 +15,7 @@ from evo_helper.infrastructure.artifacts import (
 )
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
+from support.database import scratch_database_url
 
 
 def test_artifact_and_ui_observation_are_persisted(tmp_path: Path) -> None:
@@ -61,6 +62,6 @@ def test_ui_observation_rejects_unknown_artifact(tmp_path: Path) -> None:
 
 
 def _session_factory(tmp_path: Path):
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'artifacts.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "artifacts.db"))
     Base.metadata.create_all(engine)
     return create_session_factory(engine)

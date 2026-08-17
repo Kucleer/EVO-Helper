@@ -38,6 +38,7 @@ from evo_helper.vision.pirate_reports import OUTCOME_FAIL, OUTCOME_VICTORY
 from evo_helper.web.app import ATTACK_LOG_LIMIT, create_persistent_app
 from evo_helper.web.persistent_service import PersistentApplicationService
 from evo_helper.web.service import ScanRangeView
+from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
 ORIGIN = Coordinate(2, 137, 18)
@@ -65,7 +66,7 @@ OLD = Coordinate(2, 137, 6)
 
 
 def _seed(tmp_path: Path) -> tuple[PersistentApplicationService, TestClient]:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'log-quick.db'}")
+    engine = create_database_engine(scratch_database_url(tmp_path, "log-quick.db"))
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     service = PersistentApplicationService(factory, now_utc=lambda: NOW)
