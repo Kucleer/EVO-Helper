@@ -115,6 +115,7 @@ from evo_helper.domain.target_order import (
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
     BLIND_SCROLL_SAMPLES,
+    BLIND_SCROLLS,
     BLIND_SCROLLS_MAX,
 )
 from evo_helper.infrastructure.system_log import child_environment, record_system_log
@@ -231,6 +232,40 @@ class MilitaryPoolReading:
         24 小时冷却里或还在飞），拿它去报「军力榜扫描跟不上」是句假话。
         """
         return self.attackable > 0 and self.usable == 0
+
+
+@dataclass(frozen=True)
+class BlindScrollChoice:
+    """盲拖屏数这一次判成了什么，**以及凭什么**。
+
+    做成一个结构而不是只返回一个 `int | None`，是因为答案本身分不清三种来源，
+    而三种的善后完全不同：手填的要去攻击配置页上改，标定出来的说明这条反馈回路
+    还活着，**「没给出答案」则可能是刚上线、也可能是反解规则已经失效**——后者
+    正是 `domain.ranking.bot_area_reached_message` 上警告过的那种静默退化。
+    `samples` 就是分开这两者的那个数：刚上线时它会一天天涨，失效时它恒为 0。
+    """
+
+    #: 判定结果。`None` = 不往命令行上加 `--blind-scrolls`，采集用写死的默认值。
+    scrolls: int | None
+    #: `manual`（攻击配置页手填）/ `calibrated`（按实测标定）/ `default`（没答案）。
+    source: str
+    #: 从 `system_log` 里反解出来的实测样本条数。手填那一支不查库，恒为 0。
+    samples: int
+
+
+def _blind_scroll_verdict(choice: BlindScrollChoice) -> str:
+    """把一次判定念成人话。**三种来源各一句，绝不含糊成一句通用的。**"""
+    if choice.source == "manual":
+        return f"{choice.scrolls} 屏（攻击配置页上手填的，标定不再参与）"
+    if choice.source == "calibrated":
+        return (
+            f"{choice.scrolls} 屏（按最近 {BLIND_SCROLL_SAMPLES} 次实测标定，"
+            f"当前共有 {choice.samples} 条实测样本）"
+        )
+    return (
+        f"「不指定」，采集将用写死的默认值 {BLIND_SCROLLS} 屏"
+        f"（实测样本只有 {choice.samples} 条，自动标定要 {BLIND_SCROLL_SAMPLES} 条）"
+    )
 
 
 @dataclass(frozen=True)
@@ -385,6 +420,9 @@ class MissionScheduler:
         #: `STALE_POOL_WARNING_AFTER` 一条——不是只报一次：一整夜的停摆该在日志里
         #: 留下持续的痕迹，只报一次的话，翻日志的人会以为它早就恢复了。
         self._stale_pool_warned_at: dict[int, datetime] = {}
+        #: 上一次判定出来的盲拖屏数取值与它的来源，用来把日志压成「只在变化时写」。
+        #: 见 `_blind_scrolls`。
+        self._blind_scroll_choice: BlindScrollChoice | None = None
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -993,6 +1031,62 @@ class MissionScheduler:
                 logged_at_utc=now,
             )
 
+    # -- 自动停用 ------------------------------------------------------------
+
+    def _disable_task(
+        self,
+        row: orm.MissionTaskRow,
+        task: TaskSnapshot,
+        reason: str,
+        *,
+        recovery: DisabledRecovery,
+    ) -> None:
+        """把任务自动停用，**并在真正发生跃迁的那一刻写一条 `system_log`**。
+
+        全仓「调度器自己把任务关掉」只走这一处，理由和 `_resume_tasks_waiting_for_a_line`
+        那一条对称：**任务突然不动了而日志里一个字都没有，事后没人查得出是谁关的它。**
+
+        ⚠️ **`disabled_reason` 那一列不算留痕。** 它只留得住**当前**这一次：
+        `resume_mission_task`（航线一空就自动恢复）与 `update_mission_task`
+        （用户改一次配置）都会把它清成 NULL。于是「昨晚三点因为范围里一个 bot
+        都没有被关掉、四点又被自动放回来」这段经过，在库里一个字都不剩——而那
+        正是要查的东西。日志是只增不改的，它才留得住。
+
+        ⚠️ **只在跃迁那一下写。** `_targets_remaining` 每 tick 都会走（页面轮询
+        也会），停用一条配置填错的链路会在那里被重复调用；无条件写就是每秒一条、
+        一夜八万行，把真正要看的那一条淹掉，而且事后按日志对时间会对出一个假的
+        「停用时刻」——真正的那一刻在八万行的最前面。所以判据是**库里此刻的那
+        两列**，不是内存里的记忆：进程重启之后再看到同一个已停用的任务，那不是
+        新的跃迁，不该再记一条。
+
+        `recovery` 一起进比较：措辞没变而恢复方式从「等航线」变成「要人工」，
+        对用户是完全不同的两件事，漏掉它就等于把一次真的跃迁说成没发生。
+        """
+        previous = (row.disabled_reason, row.disabled_recovery)
+        self._repository.disable_mission_task(row.id, reason, recovery=recovery)
+        if previous == (reason, recovery.value):
+            return
+        name = task.name or task.kind.value
+        aftermath = (
+            "空闲航线一空出来就会自动恢复"
+            if recovery is DisabledRecovery.FREE_LINES
+            else "在用户点「恢复」或改一次任务配置之前，它不会再被起起来"
+        )
+        record_system_log(
+            "WARNING",
+            "application.mission_scheduler",
+            f"任务「{name}」已被自动停用：{reason}；{aftermath}",
+            payload={
+                "task_id": row.id,
+                "mission_kind": task.kind.value,
+                "disabled_reason": reason,
+                "disabled_recovery": recovery.value,
+                "previous_disabled_reason": previous[0],
+                "previous_disabled_recovery": previous[1],
+            },
+            logged_at_utc=self._clock(),
+        )
+
     def _log_schedule_window_changes(
         self, snapshots: Sequence[TaskSnapshot], now: datetime
     ) -> None:
@@ -1217,8 +1311,9 @@ class MissionScheduler:
             # 类别按**异常类型**认，不按那句中文认：`NoFreeLineError` 说的是
             # 「这一刻没航线」，舰队飞回来就好了；别的都是配置填错，改之前重试
             # 一万次都一样。判据见 `domain.scheduler.DisabledRecovery`。
-            self._repository.disable_mission_task(
-                task.task_id,
+            self._disable_task(
+                row,
+                task,
                 str(exc),
                 recovery=(
                     DisabledRecovery.FREE_LINES
@@ -1585,7 +1680,9 @@ class MissionScheduler:
                 return self._military_pool_reading(row).usable
             targets = self._bot_selection(row.params_json, self._origin_of(row))
         except MissionParamError as exc:
-            self._repository.disable_mission_task(task.task_id, str(exc))
+            # ⚠️ 这一处每 tick 都会走（页面轮询也会），所以停用必须走
+            # `_disable_task`——它只在库里那两列真的变了时才写日志。
+            self._disable_task(row, task, str(exc), recovery=DisabledRecovery.MANUAL)
             return 0
         facts_by_target = self._repository.bot_dispatch_facts_many(
             targets, since=row.round_started_at_utc, now_utc=self._clock()
@@ -1898,16 +1995,60 @@ class MissionScheduler:
         一个还没初始化的配置表说明不了「用户想改盲拖屏数」，为它把整条采集链路
         停掉是不成比例的。
         """
+        choice = self._blind_scroll_decision()
+        self._log_blind_scroll_change(choice)
+        return choice.scrolls
+
+    def _blind_scroll_decision(self) -> BlindScrollChoice:
+        """这一刻盲拖屏数判成了什么，**以及凭什么**。判定本身不写任何日志。"""
         try:
             row = self._repository.military_attack_config()
         except ValueError:
-            return None
+            return BlindScrollChoice(None, source="default", samples=0)
         manual = _blind_scrolls(row.blind_scrolls)
         if manual is not None:
-            return manual
+            # 手填时不去查库要样本：那次查询只为凑一句日志，而这条路上的答案
+            # 与样本无关。
+            return BlindScrollChoice(manual, source="manual", samples=0)
         return self._calibrated_blind_scrolls()
 
-    def _calibrated_blind_scrolls(self) -> int | None:
+    def _log_blind_scroll_change(self, choice: BlindScrollChoice) -> None:
+        """盲拖屏数的取值或来源变了才写一条。
+
+        ⚠️ **补的是自动标定唯一的哑点。** `domain.ranking.bot_area_reached_message`
+        上写着：那句实测日志的措辞一改，库里全部历史样本一次性作废，标定就
+        **静悄悄退回写死的默认值**——页面上、日志里都看不出任何异常。采集那头
+        照样打「盲拖 40 屏」，看上去和「本来就没攒够样本」一模一样。所以差别只能
+        由**判定这一侧**说出来：这个数是手填的、是标定出来的、还是因为样本不够
+        而根本没给出答案（连带说清此刻攒到了几条）。
+
+        ⚠️ **只在变化时写。** `_blind_scrolls` 每次组军力榜命令行时都会走，而
+        `command_for` 那条公开路径**页面保存配置时也会走**——每次都写的话，一天
+        几十条重复的「盲拖屏数还是 62 屏」会把真正的那一次变化埋掉。
+
+        ⚠️ **措辞只说判定，不说「这一趟拖了几屏」。** 走到这里未必真会起一轮采集：
+        `command_for` 是页面拿来校验参数的，组出来的命令行随手就丢了。说成
+        「本趟盲拖 N 屏」就是替一件没发生的事作证。
+        """
+        if choice == self._blind_scroll_choice:
+            return
+        self._blind_scroll_choice = choice
+        record_system_log(
+            "INFO",
+            "application.mission_scheduler",
+            f"军力榜盲拖屏数判定为 {_blind_scroll_verdict(choice)}",
+            payload={
+                "blind_scrolls": choice.scrolls,
+                "source": choice.source,
+                "measurements": choice.samples,
+                "samples_required": BLIND_SCROLL_SAMPLES,
+                "margin": BLIND_SCROLL_MARGIN,
+                "hard_coded_default": BLIND_SCROLLS,
+            },
+            logged_at_utc=self._clock(),
+        )
+
+    def _calibrated_blind_scrolls(self) -> BlindScrollChoice:
         """从 `system_log` 里那些「翻了 N 屏到达 bot 区」反推盲拖屏数。
 
         ⚠️ **实测记录刻意没有自己的表或列。** 每趟采集本来就会把这句话写进
@@ -1917,13 +2058,21 @@ class MissionScheduler:
         多读一些行再筛：那句话不是每条日志都是，而 `recent_messages` 只做前缀
         匹配。读 `BLIND_SCROLL_SAMPLES` 的若干倍足以覆盖前缀相同但不是这句话的
         邻居，同时仍然只碰几十行。
+
+        **样本条数要一起交出去**，那是日志唯一能分开「这台机器刚上线」和
+        「反解规则失效了」的凭据：前者样本会一天天涨上去，后者恒为 0。
         """
         raw = self._repository.recent_system_log_messages(
             starts_with=BOT_AREA_REACHED_PREFIX, limit=BLIND_SCROLL_SAMPLES * 8
         )
         measurements = [value for value in map(bot_area_scrolls, raw) if value is not None]
-        return calibrated_blind_scrolls(
+        scrolls = calibrated_blind_scrolls(
             measurements, sample_size=BLIND_SCROLL_SAMPLES, margin=BLIND_SCROLL_MARGIN
+        )
+        return BlindScrollChoice(
+            scrolls,
+            source="calibrated" if scrolls is not None else "default",
+            samples=len(measurements),
         )
 
     def _bot_command(
