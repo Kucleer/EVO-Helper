@@ -69,6 +69,7 @@ from .service import (
     FleetEntryView,
     FleetSnapshotView,
     FrozenTaskView,
+    LineReleaseView,
     MilitaryAttackConfigView,
     MissionOriginView,
     MissionRunView,
@@ -1325,6 +1326,30 @@ class MissionConsoleService:
         self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
 
+    def release_attack_lines(self) -> LineReleaseView:
+        """「清理航线占用」：把此刻还记在库里的航线占用一次放开。
+
+        用户口径 2026-08-16：「时间到了，自然就释放了航线，我会手动 check 后
+        清理。」库里那两个钟都是**推算**（出发时刻 + 读到的飞行时长 × 倍数），
+        真实舰队早就回港了它们也不会自己改口；读不到飞行时间的那一档更是按
+        90 分钟的上界硬占。这个按钮就是把「我刚在游戏里数过」这条观测喂进去。
+
+        **调度器跑着的时候照样让点。** 它不是配置（固化记录里没有这一项），
+        而且这一下最想解的正是「调度器正在运行、任务却卡在等航线」那个局面——
+        拒掉它，用户只剩「结束、清理、再开始」这条路。
+
+        ⚠️ **这一下之后调度器会当真去派舰队。** 页面上那个按钮因此带二次确认，
+        文案里写明会烧燃料；后端不再加一道自己的闸门——真实航线数只有用户
+        看得见，服务端拦不出任何有意义的东西，只会拦掉正当的那一下。
+        （权威闸门仍在 runner 的 `LineCapacityGate`：真撞上限它会看屏认出来。）
+        """
+        now = self._scheduler.now_utc()
+        released = self._repository.release_held_lines(now_utc=now)
+        # 快照缓存里存着「还占着几条」的旧答案，TTL 内不失效的话，用户点完刷新
+        # 看到的还是「等航线」——那会让他再点一次。
+        self._invalidate_scheduler_view()
+        return LineReleaseView(released=released, released_at_utc=now)
+
     # -- 内部 ------------------------------------------------------------------
 
     def _refuse_global_config_while_running(self) -> None:
@@ -1510,7 +1535,7 @@ class MissionConsoleService:
             priority=task.priority,
             params=params,
             status=status.value,
-            detail=self._detail(task, status, snapshot),
+            detail=self._detail(task, status, snapshot, params),
             summary=self._summary(task, params),
             disabled_reason=task.disabled_reason,
             origin=str(task.origin),
@@ -1533,6 +1558,7 @@ class MissionConsoleService:
         task: TaskSnapshot,
         status: TaskStatus,
         snapshot: SchedulerSnapshot,
+        params: dict[str, Any],
     ) -> str:
         """状态旁边那句随行的事实。
 
@@ -1552,6 +1578,21 @@ class MissionConsoleService:
             return used
         if task.kind is MissionKind.BOT:
             remaining = facts.of(task).targets_remaining
+            if params.get("by_military") is True:
+                # ⚠️ 军力优先模式**没有「本轮范围」**，所以这一档不报进度。
+                # 范围模式的 `targets_remaining` 数的是本轮范围内那几个目标里还有
+                # 几个没走完，每打完一个就少一个——那是真的本轮进度。军力模式走的是
+                # `_military_candidates`，数的是**全库还能打的 bot 总数**（排除近 24
+                # 小时打过的、只留 NEEDS_ATTACK），实机两千多个；而任务实际每轮只取
+                # 「前 top_n 名」。把这个数写成「还剩 N 个未完成」，用户会当成本轮
+                # 进度盯着它往下走，可它既不是本轮的量、也不随攻击单调下降
+                # （榜单一采、24 小时窗口一滑，它能自己涨回去）。
+                # 数字本身没有能对上的口径，所以宁可不说，也不换算一个假的出来。
+                if remaining > 0:
+                    return ""
+                # 池子空了是句能站住的事实：已知 bot 全在 24 小时冷却里或还在飞。
+                # 不写「本轮已全部完成」——军力模式没有那个「轮」。
+                return "近 24 小时内暂无可打目标"
             if remaining <= 0:
                 return "本轮已全部完成"
             return f"还剩 {remaining} 个未完成"

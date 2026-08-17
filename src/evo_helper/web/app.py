@@ -74,6 +74,7 @@ from .schemas import (
     FleetEntryOut,
     FleetSnapshotOut,
     FrozenTaskOut,
+    LineReleaseOut,
     MilitaryAttackConfigOut,
     MilitaryTierIn,
     MissionOriginIn,
@@ -1249,6 +1250,23 @@ def register_mission_routes(app: FastAPI) -> None:
         console: MissionConsoleService = Depends(get_console),
     ) -> MissionTaskOut:
         return _mission_task_out(console.restart_bot_round(task_id))
+
+    @app.post("/api/attack-lines/release", response_model=LineReleaseOut)
+    def release_attack_lines(
+        console: MissionConsoleService = Depends(get_console),
+    ) -> LineReleaseOut:
+        """「清理航线占用」：把库里此刻还记着的航线占用一次放开。
+
+        ⚠️ **这是会烧燃料的写操作。** 放开之后调度器立刻认为有空闲航线，
+        下一个 tick 就会去派**真实舰队**。授权只能来自用户在游戏里数过航线
+        这件事，所以页面上那个按钮带二次确认；后端不加自己的闸门——真实航线
+        数只有用户看得见，服务端拦不出任何有意义的东西。
+
+        **不按星球分**，理由见 `SqlAlchemyRepository.release_held_lines`。
+        鉴权走的是所有写接口共用的那道（`web.security`），没有额外分支。
+        """
+        view = console.release_attack_lines()
+        return LineReleaseOut(released=view.released, released_at_utc=view.released_at_utc)
 
     # ---- 战报补录 --------------------------------------------------------
     #

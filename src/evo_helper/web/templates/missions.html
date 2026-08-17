@@ -181,6 +181,30 @@
       只有 bot 攻击可以有多个：海盗每天 32 次是账号级配额，扫描恒在最后一位。
     </span>
   </div>
+  {#
+    手动清理航线占用。
+
+    库里那两个钟都是**推算**（出发时刻 + 派出时读到的飞行时长 × 倍数），舰队真
+    回港了它们也不会自己改口；读不出飞行时间的那一档更是按 90 分钟的上界硬占。
+    于是任务会卡在「等航线」上，而真实航线其实是空的。用户口径 2026-08-16：
+    「时间到了，自然就释放了航线，我会手动 check 后清理。」
+
+    ⚠️ **按钮文案必须把后果写在脸上。** 点完调度器就认为航线空了，下一个 tick
+    会派**真实舰队**、烧真实燃料。所以：文案里写「派舰队」，再加一道二次确认。
+  #}
+  <div class="filter-bar" style="margin-top:10px">
+    <span class="inline-label">航线占用</span>
+    <span class="muted" style="font-size:11px">
+      任务卡在「等航线」但舰队其实已经回港时，去游戏里数一遍航线，确认空着再清理。
+    </span>
+    <span class="spacer"></span>
+    <span class="muted" id="release-lines-result" style="font-size:11px"></span>
+    <button class="btn small" type="button" id="btn-release-lines"
+            title="把库里记着的航线占用全部清掉。清完调度器会立刻派出真实舰队。">
+      清理航线占用并立即派舰队
+    </button>
+  </div>
+
   {# 400 / 409 一律显示在这里。静默失败等于把后端那句中文说明扔了。 #}
   <p class="chip danger" id="mission-error" role="status" style="margin:10px 0 0" hidden></p>
   {#
@@ -890,12 +914,10 @@
     }
     const chip = document.createElement('span');
     chip.className = 'chip ok';
-    // 时区后缀缺失时按 UTC 读（同 `elapsed`）：少了它，浏览器会按本地时区解释，
-    // 显示出来的固化时刻会凭空差 8 小时。
-    const stamped = /(Z|[+-]\d{2}:?\d{2})$/.test(freeze.frozen_at_utc)
-      ? freeze.frozen_at_utc
-      : `${freeze.frozen_at_utc}Z`;
-    chip.textContent = `本轮已固化 · ${new Date(stamped).toLocaleString()}`;
+    // 走共用的 `EVOHelper.localTime`（base.html）：它按 UTC+8 显示，也在时区后缀
+    // 缺失时按 UTC 读（同 `elapsed`）。原先用的 `toLocaleString()` 跟的是**浏览器**
+    // 的时区，换台机器看就换个时刻，而下面那张表写死了「现实 UTC+8」——两处对不上。
+    chip.textContent = `本轮已固化 · ${EVOHelper.localTime(freeze.frozen_at_utc)}（UTC+8）`;
     const lines = document.createElement('div');
     for (const task of freeze.tasks) {
       const line = document.createElement('div');
@@ -1138,6 +1160,26 @@
         }
         return refresh();
       })
+      .catch((error) => { fail(error); return refresh(); });
+  };
+
+  // 清理航线占用。**误点的代价是真实舰队出港**（调度器下一个 tick 就照着新的
+  // 空闲数去派），所以这里挡一道二次确认；确认文案把「派出真实舰队、烧燃料」
+  // 写全，只写「确定吗？」等于没问。
+  document.getElementById('btn-release-lines').onclick = () => {
+    const result = document.getElementById('release-lines-result');
+    if (!window.confirm(
+      '把库里记着的航线占用全部清掉？\n\n'
+      + '只有在游戏里数过、确认这些舰队都已回港时才这么做。'
+      + '清完调度器会认为航线是空的，下一轮就派出真实舰队并消耗燃料。'
+    )) return;
+    showError('');
+    result.textContent = '';
+    return EVOHelper.post('/api/attack-lines/release')
+      // 0 条也要说出来：那说明库里本来就没记着占用，问题不在这里，
+      // 用户不该对着一个没有任何回应的按钮再点一次。
+      .then((body) => { result.textContent = `已放开 ${body.released} 条航线占用`; })
+      .then(refresh)
       .catch((error) => { fail(error); return refresh(); });
   };
 

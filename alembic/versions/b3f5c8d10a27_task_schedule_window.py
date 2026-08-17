@@ -1,7 +1,7 @@
 """give each mission task an optional start/stop moment
 
 Revision ID: b3f5c8d10a27
-Revises: a7f2c9d40b16
+Revises: a9d5f31c0e77
 Create Date: 2026-08-17
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b3f5c8d10a27"
-down_revision: str | None = "a7f2c9d40b16"
+down_revision: str | None = "a9d5f31c0e77"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

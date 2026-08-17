@@ -82,7 +82,16 @@
       当前筛选没有匹配的日志。
     {% endif %}
     <br>
-    时刻是<strong>产生时刻</strong>（UTC），不是入库时刻——入库走后台批量刷盘，会晚几百毫秒。
+    时刻按 <strong>UTC+8</strong>（现实时间）显示，它是<strong>产生时刻</strong>，不是入库时刻——
+    入库走后台批量刷盘，会晚几百毫秒。
+    {#
+      ⚠️ 上面「起 / 止」两个框仍按 UTC 解释，和这一列差 8 小时。它们是**输入**不是显示，
+      而同一个解析函数 `_parse_moment` 也是 `GET /api/system-log` 的取值口径——
+      改了就是改接口。这句话把差值明写出来，免得有人按列上的数字去填框。
+    #}
+    「起 / 止」两个筛选框仍按 <strong>UTC</strong> 解释（同 <code>GET /api/system-log</code>），
+    和这一列差 8 小时。
+    <br>
     这一页与「攻击日志」不是一回事：那一页一行是一发打出去的舰队。
   </p>
 </section>
@@ -93,7 +102,7 @@
     <table>
       <thead>
         <tr>
-          <th scope="col">时刻 (UTC)</th>
+          <th scope="col">时刻（UTC+8）</th>
           <th scope="col">级别</th>
           <th scope="col">机器</th>
           <th scope="col">PID</th>
@@ -105,7 +114,8 @@
       <tbody>
       {% for row in page.rows %}
         <tr>
-          <td class="muted">{{ row.logged_at_utc.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          {# 只改显示：`logged_at_utc` 入库与接口返回的一律仍是 UTC。 #}
+          <td class="muted">{{ local_time(row.logged_at_utc) }}</td>
           <td>
             {% if row.level == 'ERROR' %}
               <span class="chip danger"><span class="glyph" aria-hidden="true">✕</span>ERROR</span>

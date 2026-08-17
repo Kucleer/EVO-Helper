@@ -40,6 +40,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.dispatched_at_utc",
         "attack_dispatches.expected_report_at_utc",
         "attack_dispatches.line_free_at_utc",
+        "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
         "battle_reports.reported_at_utc",
@@ -86,11 +87,16 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
 #: 一张当时还不存在的表、或者一列当时还不存在的列，既做不到也会把「迁移清单必须
 #: 与模型一一对应」这条判据讲错。
 #:
+#: `attack_dispatches.line_released_at_utc` 是「列版本」的例子：表是老的，列是 b6
+#: 之后加的，由它自己那条迁移（`a9d5f31c0e77`）按方言建成 `TIMESTAMPTZ`。往 b6 的
+#: 清单里补它，会让那条历史迁移在**已经升过级的**库上去 alter 一列当时还不存在的列。
+#:
 #: ⚠️ **往这里加一行之前先确认那条新迁移真的写了 `timezone=True`。** 免掉的是
 #: 「历史迁移要覆盖它」，不是「它可以是 `WITHOUT TIME ZONE`」——后者在 Postgres 上
 #: 会静默截掉 tzinfo，正是这一整个文件要防的那件事。
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
+        "attack_dispatches.line_released_at_utc",
         "planet_scout_alerts.delivered_at_utc",
         "planet_scout_alerts.reported_at_utc",
         "military_ranking_snapshots.captured_at_utc",

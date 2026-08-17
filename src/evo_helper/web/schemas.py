@@ -305,6 +305,18 @@ class SchedulerOut(BaseModel):
     frozen_config: ConfigFreezeOut | None = None
 
 
+class LineReleaseOut(BaseModel):
+    """POST /api/attack-lines/release 的回执。
+
+    `released` 是**这一下真的放开了几条**。页面把它写出来：这个按钮唯一的可见
+    后果是若干个任务从「等航线」变回「待命」，而那要等下一轮轮询才看得见——
+    中间这段空白里，这个数字是用户判断「点到了没有」的唯一凭据。
+    """
+
+    released: int
+    released_at_utc: datetime
+
+
 class SchedulerStartIn(BaseModel):
     """POST /api/scheduler/start 的请求体。**整个可以省略。**
 
@@ -418,6 +430,7 @@ __all__ = [
     "FleetEntryOut",
     "FleetSnapshotOut",
     "FrozenTaskOut",
+    "LineReleaseOut",
     "MissionTaskCreate",
     "MissionTaskOut",
     "MissionTaskPatch",

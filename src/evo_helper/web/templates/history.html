@@ -57,14 +57,15 @@
     <table>
       <thead>
         <tr>
-          <th scope="col">采集时间 (UTC)</th><th scope="col">阵营</th><th scope="col">总数</th>
+          <th scope="col">采集时间（UTC+8）</th><th scope="col">阵营</th><th scope="col">总数</th>
           <th scope="col">复查</th><th scope="col">匹配置信度</th><th scope="col">人工复核</th>
         </tr>
       </thead>
       <tbody>
       {% for snapshot in history %}
         <tr>
-          <td class="muted">{{ snapshot.captured_at_utc }}</td>
+          {# 只改显示：`captured_at_utc` 本身、以及接口返回的那一份，仍然是 UTC。 #}
+          <td class="muted">{{ local_time(snapshot.captured_at_utc) }}</td>
           <td>{{ snapshot.side }}</td>
           <td>{{ snapshot.total }}</td>
           <td>{{ "是" if snapshot.is_revisit else "否" }}</td>

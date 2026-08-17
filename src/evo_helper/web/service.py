@@ -443,6 +443,20 @@ class SchedulerView:
 
 
 @dataclass(frozen=True)
+class LineReleaseView:
+    """按下「清理航线占用」之后的回执。
+
+    `released` 是**这一下真的放开了几条**，不是库里一共有多少行。它要摆到页面
+    上：这个按钮唯一的可见后果就是若干个任务从「等航线」变成「待命」，而那要
+    等下一轮轮询才看得见——中间这段空白里，一句「放开了 7 条」是用户判断
+    「点到了没有」的唯一凭据。0 条同样要说出来（航线本来就是空的）。
+    """
+
+    released: int
+    released_at_utc: datetime
+
+
+@dataclass(frozen=True)
 class BackfillSummaryView:
     """一批补录改了什么。**跑完摆在页面上，用户看过才放行任务。**
 
@@ -928,6 +942,7 @@ __all__ = [
     "FleetDiffView",
     "FleetEntryView",
     "FleetSnapshotView",
+    "LineReleaseView",
     "MissionRunView",
     "MissionTaskView",
     "MilitaryAttackConfigView",

@@ -118,10 +118,13 @@ def test_the_rankings_page_has_a_column_for_it(tmp_path: Path) -> None:
 
     ⚠️ **判据必须落在表头那一格上**，不能只搜「更新时间」四个字：页面顶上本来就
     有一句时间说明，裸搜会被它满足。变异测试当场逮到了这一点——把
-    `<th>更新时间</th>` 整个删掉，裸搜的版本照样绿。
+    `<th>更新时间（UTC+8）</th>` 整个删掉，裸搜的版本照样绿。
+
+    时区标注也一并钉在这里（用户口径 2026-08-17：页面上的时刻一律 UTC+8）：
+    这一格显示的是换算过的现实时间，表头不写清楚就得让人猜是哪一套。
     """
     client, _ = _client(tmp_path)
     body = client.get("/rankings").text
 
-    assert "<th>更新时间</th>" in body
+    assert "<th>更新时间（UTC+8）</th>" in body
     assert "r.observed_at_utc" in body

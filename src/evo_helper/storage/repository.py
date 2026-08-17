@@ -6,9 +6,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import CursorResult, and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -1329,6 +1330,9 @@ class SqlAlchemyRepository:
 
         **侦察发照数**：它一样占航线。它不进的是配额，见 `count_dispatches_since`。
 
+        **人工放过手的不数**：用户在调度台上按过「清理航线占用」的那些
+        （`release_held_lines`）一律当作已回港，见 `_still_holding_a_line`。
+
         **飞行时间为 NULL 的照数**，占到派出时刻 + `UNKNOWN_LINE_HOLD` 为止。
         NULL 的语义是「不知道它什么时候回来」，不是「它没占航线」——被游戏接受的
         那一发舰队一定占着一条位子。此前这一档按不占记，每一发读不出飞行时间的
@@ -1366,6 +1370,10 @@ class SqlAlchemyRepository:
         `count_inflight`），但它的 `UNKNOWN_LINE_HOLD` 是「等到这里就放弃」的
         上界，不是对返航时刻的预测；拿它当闹钟会让链路一睡 6 小时。全场只剩这种
         派遣时宁可返回 None，让调用方走自己那条有界退避。
+
+        **人工放过手的那些不给当闹钟**（判据同 `_still_holding_a_line`）：
+        用户刚把航线清干净，页面却还写着「等航线」并压着链路等两小时——那句话
+        既是假的，也正好是他按那个按钮想消掉的东西。
         """
         _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
@@ -1377,10 +1385,50 @@ class SqlAlchemyRepository:
                 .where(
                     _from_origin(origin),
                     orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.line_released_at_utc.is_(None),
                     orm.AttackDispatchRow.line_free_at_utc > now_utc,
                 )
             )
         return moment
+
+    def release_held_lines(self, *, now_utc: datetime) -> int:
+        """把此刻还占着航线的派遣**全部**标成「人工已放手」，返回改了几行。
+
+        用户口径 2026-08-16：「时间到了，自然就释放了航线，我会手动 check 后
+        清理。」这一下的授权来自用户**在游戏里亲眼数过航线**，不是来自库里任何
+        一个推算值——所以这里不再做二次判断，用户说空了就是空了。
+
+        **不按出发星球分。** 页面上那个按钮说的是「我刚数过，航线都空着」，
+        那是对整个账号说的一句话；只清一颗星球等于让用户逐颗点，而漏点的那颗
+        会继续把任务钉在「等航线」上——正是这个按钮要消掉的症状。
+
+        **不改 `line_free_at_utc`。** 那一列是观测（派出时读到的飞行时长推算出
+        来的返航时刻），改写它等于把「这一发飞了多久」这个事实抹掉，而
+        `vet_flight_time` 那道下限正是靠这批样本校准的。整段理由写在
+        `storage.models.AttackDispatchRow.line_released_at_utc` 上。
+
+        **只碰此刻还占着的那些**：早就自然到点的行不写这个时刻，否则日后想问
+        「哪些航线是人手动清掉的」，答案里会混进一整库跟这次按钮毫无关系的
+        派遣。被游戏拒掉的那些同理不碰——它们压根没飞出去，也就没有航线可放。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            # `Session.execute` 的静态返回类型是 `Result`，只有 DML 真正跑出来的
+            # `CursorResult` 上才有 `rowcount`（同 `storage.system_log.purge_before`）。
+            # 「放开了几条」是页面上唯一的回执，不能因为类型不好写就不返回。
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    update(orm.AttackDispatchRow)
+                    .where(
+                        orm.AttackDispatchRow.accepted.is_(True),
+                        _still_holding_a_line(now_utc),
+                    )
+                    .values(line_released_at_utc=now_utc)
+                ),
+            )
+            session.commit()
+            return int(result.rowcount or 0)
 
     def last_dispatch_at(self, target_kind: str, *, origin: Coordinate) -> datetime | None:
         """这种目标最近一次**从这颗星球**真的派出去是什么时候。一次都没有则为 None。
@@ -2459,18 +2507,28 @@ def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
 
 
 def _still_holding_a_line(now_utc: datetime) -> ColumnElement[bool]:
-    """这一发是不是还占着一条航线。抽成具名谓词是为了让两档合在一处看得见。
+    """这一发是不是还占着一条航线。抽成具名谓词是为了让三档合在一处看得见。
 
+    - **人工放过手**（`line_released_at_utc` 非 NULL）：不占了，别的一概不看。
+      用户在游戏里数过航线、确认舰队已回港，那是比这两个推算出来的钟更硬的
+      证据；放在最前面是因为另外两档全是估算，而它是观测。
     - 航线钟读到了：到点就放手。
     - 航线钟为 NULL：**照样占着**，直到派出时刻 + `UNKNOWN_LINE_HOLD`。
       NULL 的意思是「不知道它什么时候回来」，不是「它没占位」。
+
+    ⚠️ 人工放手这一档必须**同时**罩住后两档，所以它是 `and_` 的第一项而不是
+    第三个 `or_` 分支：只在有航线钟的那一档上判，读不出飞行时间的那些（正是
+    实机上最容易卡住的一批，见 `UNKNOWN_LINE_HOLD`）按下按钮也纹丝不动。
     """
     row = orm.AttackDispatchRow
-    return or_(
-        row.line_free_at_utc > now_utc,
-        and_(
-            row.line_free_at_utc.is_(None),
-            row.dispatched_at_utc > now_utc - UNKNOWN_LINE_HOLD,
+    return and_(
+        row.line_released_at_utc.is_(None),
+        or_(
+            row.line_free_at_utc > now_utc,
+            and_(
+                row.line_free_at_utc.is_(None),
+                row.dispatched_at_utc > now_utc - UNKNOWN_LINE_HOLD,
+            ),
         ),
     )
 
