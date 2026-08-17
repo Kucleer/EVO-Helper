@@ -1,0 +1,21 @@
+{#
+  「每 15 秒自动刷新」开关。攻击日志与系统日志两页共用这一个片段。
+
+  用户口径（2026-08-17）：「攻击/系统日志页面增加 15 秒自动刷新」。
+
+  ⚠️ **开关必须在页面上，而且要关得掉。** 这两页会被长时间挂着看，而自动刷新
+  在「我正在逐行读一段旧日志」的时候是纯干扰。默认开着（多数时候是想看新的），
+  关掉之后按路径记在 `localStorage` 里。
+
+  接线在 `base.html` 的 `EVOHelper.autoRefresh()` 里，两页不各写一份：
+  可见性暂停、并发保护、保住筛选这三条要么都对要么都错，分成两份迟早分家。
+
+  页面这一侧只需要做一件事：把要跟着刷新的那几块标上 `data-refresh` 和一个 `id`。
+  **筛选表单不要标**——刷掉用户正在填的筛选比不刷还烦。
+#}
+<label class="chip" for="auto-refresh">
+  <input type="checkbox" id="auto-refresh" checked>
+  每 15 秒自动刷新
+</label>
+<span class="muted" id="auto-refresh-note" style="font-size:11px"></span>
+<script>EVOHelper.autoRefresh();</script>

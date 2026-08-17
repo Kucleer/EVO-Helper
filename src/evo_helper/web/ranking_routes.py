@@ -9,7 +9,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.ranking import RankingRow, coordinate_of
-from evo_helper.storage.military_rankings import MilitaryRankingRepository
+from evo_helper.storage.military_rankings import (
+    BOARD_WINDOW_HOURS,
+    BoardDirection,
+    BoardSort,
+    BoardWindow,
+    MilitaryRankingRepository,
+)
+from evo_helper.web.display import settled_score
 
 
 class RankingEntryIn(BaseModel):
@@ -64,6 +71,9 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
         score_max: float | None = Query(default=None, ge=0),
         galaxy: int | None = Query(default=None, ge=1, le=9),
         q: str | None = None,
+        sort: BoardSort = Query(default="observed_at"),
+        direction: BoardDirection = Query(default="desc"),
+        window: BoardWindow = Query(default="24h"),
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict[str, object]:
@@ -72,6 +82,13 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
         快照表没有活着的写入方，页面读它等于永远显示迁移播种时那一份（详见
         `storage.military_rankings` 的模块头）。这里读的是扫描逐屏写进去的实时数据，
         每行自带自己的读取时刻。
+
+        默认按「更新时间」倒序、只出最近 24 小时的行（用户口径 2026-08-17）。
+        `window=all` 放开时间窗——排障时要看更早的数据。
+
+        `sort` / `direction` / `window` 声明成 `Literal`：不认识的值由 FastAPI 当场
+        422，压根到不了 SQL 那一层。白名单本身在 `storage.military_rankings`，这里
+        只是把同一份 `Literal` 引过来，免得两处各写一份、日后分家。
 
         没有 `kind` / `bot_only` 参数：这张榜按构造只可能有 bot。
         """
@@ -82,17 +99,26 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
             score_max=score_max,
             galaxy=galaxy,
             query=q,
+            sort=sort,
+            direction=direction,
+            window_hours=BOARD_WINDOW_HOURS[window],
             offset=offset,
             limit=limit,
         )
         return {
             "refreshed_at_utc": page.refreshed_at_utc,
+            # 当前时间窗的下界（`window=all` 时是 null）。页面靠它把「命中 N 条」
+            # 说成「最近 24 小时命中 N 条」，不然这个数会被当成库里的全部。
+            "window_start_utc": page.window_start_utc,
             "total": page.total,
             "rows": [
                 {
                     "rank": row.rank,
                     "name": row.name,
-                    "score": row.score,
+                    # **收敛一次再交给页面。** 库里存着一批带浮点尾巴的历史值
+                    # （`64959.99999999999`），源头已在 `parse_score` 修掉，但
+                    # 历史值不许 UPDATE 生产库，只能在这里收——见 `settled_score`。
+                    "score": settled_score(row.score),
                     # 行级的「这条数据是什么时候读到的」。页面上按 UTC+8 显示。
                     "observed_at_utc": row.observed_at_utc,
                     "coordinate": str(row.coordinate),

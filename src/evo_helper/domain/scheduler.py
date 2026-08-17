@@ -124,6 +124,14 @@ class TaskStatus(Enum):
     DISABLED = "已停用"
     #: 复选框没勾。**不能显示成「待命」**——它永远不会被起起来，那是句谎话。
     OFF = "未启用"
+    #: 配了开启时刻，而现在还没到。
+    #:
+    #: ⚠️ 这两档**必须**和「待命」分开说。实机 2026-08-16 晚上刚发生过一次：
+    #: 任务一动不动而界面只写着一句笼统的状态，查了一个小时才发现是别的闸门在挡。
+    #: 定时窗口把这种「看不出原因的不动」又多加了一道，所以它必须自报家门。
+    BEFORE_WINDOW = "未到开启时间"
+    #: 配了关闭时刻，而现在已经过了。
+    AFTER_WINDOW = "已过关闭时间"
 
 
 @dataclass(frozen=True)
@@ -148,6 +156,13 @@ class TaskSnapshot:
     fleet_lines: int
     #: 连续失败被自动停用的原因。非空即视为不参与调度。
     disabled_reason: str | None = None
+    #: 定时开启的时刻（绝对时刻，一次性，不是每天循环）。None 表示不限。
+    #:
+    #: ⚠️ **它和 `enabled` 是「与」的关系，谁都不覆盖谁**，理由写在
+    #: `within_schedule_window` 上。两个都为 None 时行为与没有这项功能时完全一致。
+    enabled_from_utc: datetime | None = None
+    #: 定时关闭的时刻。None 表示不限。区间是**左闭右开**的，见 `within_schedule_window`。
+    enabled_until_utc: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -436,6 +451,44 @@ def waiting_for_a_line(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     return next_free is not None and next_free > facts.now_utc
 
 
+def before_schedule_window(task: TaskSnapshot, now: datetime) -> bool:
+    """配了开启时刻，而现在还没到。供状态文案说出「为什么不动」。"""
+    start = task.enabled_from_utc
+    return start is not None and now < start
+
+
+def after_schedule_window(task: TaskSnapshot, now: datetime) -> bool:
+    """配了关闭时刻，而现在已经到了或过了。
+
+    ⚠️ **边界是 `now >= until`，也就是区间左闭右开。** 到点那一秒算「已过」，
+    不算「还能起」。写成 `now > until` 的话，正好落在关闭时刻上的那一 tick 还会
+    再放一轮出去——而用户填「14:00 关闭」的意思是 14:00 起不再开新的，不是
+    「14:00 那一秒再补一轮」。开启侧同理取 `now >= from`（到点即可起），
+    两侧合起来使相邻的两段窗口首尾相接、不重叠也不留缝。
+    """
+    end = task.enabled_until_utc
+    return end is not None and now >= end
+
+
+def within_schedule_window(task: TaskSnapshot, now: datetime) -> bool:
+    """现在处不处在这个任务的定时窗口里。两端都为 None 时恒为真。
+
+    **它只和 `enabled` 取交集，绝不去写 `enabled`。**（用户口径 2026-08-17。）
+    `enabled` 那一列是用户的意志：手动勾掉就是不想跑。让定时器去改它，会造成
+    「我手动开的被悄悄关掉」，而且事后翻库分不清那一下是谁关的——用户关的和
+    定时器关的在列上长得一模一样。所以两者是「与」：
+
+        可派遣 = enabled AND 在窗口内 AND 其它现有判据
+
+    两列都为空时这个函数恒为真，行为与没有这项功能时**完全一致**。
+
+    **判定是每次调度 tick 现算的，不挂内存定时器。** 调度器进程会重启（实机上
+    重开 Chrome、重启控制台都发生过），内存里的定时器一重启就没了，而现算的
+    判定重启之后照样成立。
+    """
+    return not before_schedule_window(task, now) and not after_schedule_window(task, now)
+
+
 def bot_round_complete(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。
 
@@ -467,7 +520,20 @@ def has_work(
     `free_lines` 是**这个任务在它那颗出发星球上**还剩几条（见 `free_lines_for`），
     所以「同一颗星球在飞数达到该任务的航线数就不再派」与「不同星球互不影响」
     这两条在这里是同一个判据的两面，不需要各写一份。
+
+    **定时窗口是这里的第一道闸门，也是唯一一道。** 放在 `has_work` 里而不是
+    `decide` 的候选过滤里，是为了让它自动覆盖三处：普通调度、军力批次那条
+    专用路径（`application.mission_scheduler._military_batch_decision` 也问
+    `has_work`）、以及状态文案。而且**填空隙的那几种（扫描 / 军力榜）同样受它管**
+    ——所以这一句必须在下面那个「填空隙恒为真」的早退之前。
+
+    ⚠️ 它只挡「开新的一轮」。**已经在跑的 runner 一个字都不碰**：中途抢停会留下
+    半截状态（runner 可能正停在派遣面板上），而且已经派出去的舰队本来也停不了。
+    这一点在结构上由「这一层是纯判据、动不了子进程」保证——`decide` 的抢占那一路
+    只在**别人有活干**时才打断填空隙的任务，窗口关掉不会让任何人多出活来。
     """
+    if not within_schedule_window(task, facts.now_utc):
+        return False
     if cooling_down(task, facts, restart_cooldown=restart_cooldown):
         return False
 
@@ -540,6 +606,18 @@ def status_of(
         return TaskStatus.READY
     # 以下都是「没活干」的几种原因。先说结构性的（配额、完成），再说会自己
     # 好起来的（冷却、航线）——前两种要用户动手，后两种只要等。
+    #
+    # 定时窗口排在**所有**原因之前：它是最外层那道闸门（`has_work` 里第一句），
+    # 窗口不在时另外那几个原因成不成立都无关紧要，而说出别的原因会让用户去调
+    # 航线数或者等冷却——调完、等完，它照样不动。今晚（2026-08-16）刚为「任务
+    # 不动而界面不说原因」查了一个小时，这一条是硬要求。
+    #
+    # ⚠️ 它在 `RUNNING` **之后**：到点不抢停，正在跑的那一轮会跑完，那时如实说
+    # 「运行中」才是实话。
+    if before_schedule_window(task, facts.now_utc):
+        return TaskStatus.BEFORE_WINDOW
+    if after_schedule_window(task, facts.now_utc):
+        return TaskStatus.AFTER_WINDOW
     if task.kind is MissionKind.PIRATE and pirate_quota_exhausted(facts):
         return TaskStatus.QUOTA_EXHAUSTED
     if task.kind is MissionKind.BOT and bot_round_complete(task, facts):
