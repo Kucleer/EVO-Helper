@@ -86,14 +86,19 @@ date: 2026-08-18
   下把它调成别的会让结果「更合用」，只会更错。按仓库口径这是标定常量而不是运维
   旋钮。新增的 ROI 与配方注释里各写了一句「这不是偏好项」。
 - Database: 无迁移，无 schema 变更。整个过程没有连过任何数据库。
-- Verification: `pytest -q`（2687 passed / 78 skipped）、`ruff check src tests`、
-  `ruff format --check src tests`、`mypy src` 全绿。skipped 是缺实拍截图 / Tesseract
-  的那批 vision 实拍用例，属正常。含四处变异测试，各自确认对应用例转红（见 PR 正文）。
-  全程没启动游戏、没动鼠标键盘、没起 runner。
+- Verification: `pytest -q`、`ruff check src tests`、`ruff format --check src tests`、
+  `mypy src` 全绿。两组数：备齐 `var/logs/` 实拍时 **2700 passed / 77 skipped**，
+  干净检出（没有实拍）时 **2691 passed / 86 skipped**——差的 9 条就是缺图跳过的那批
+  vision 实拍用例（含本次新增的 4 条），属正常。含六处变异测试，各自确认对应用例转红
+  （见 PR 正文）。全程没启动游戏、没动鼠标键盘、没起 runner、没连任何数据库。
 - Safety: 两处都只改**要不要重复做一件已经做过的事**，不改任何一次点击的落点。
   A 的点击仍旧只用当屏 OCR 出来的 x，且必须过 `_clickable_hit` 那两道闸；
   B 的缓存仍旧只接受回读确认过的坐标，读不出与读出别的坐标一律 `invalidate()`——
   **方向永远是「拿不准就多设」**。万一记忆终究不作数，下一个目标的面板核对会当场
   核不过，走 `_goto_checked` 自愈（这条路径本来就在）。
-- Rollback: 两处互相独立、各自一个 commit，单独回退任一处都不影响另一处。
-  回退 A 恢复「每次都先白拖一次」；回退 B 恢复「切完星球下一个目标三字段全设」。
+- Rollback: 两处在代码上互不相干（A 全在 `game/preset_picker.py`，B 全在
+  `game/system_navigator.py` + `ensure_origin_planet` 那几行），落在同一个 commit 里
+  只是因为 `tools/pirate_loop.py` 两边各改了一处。**单独回退任一处都不会碰到另一处**：
+  A 是把 `pick()` 里首屏那一段删掉、`scroll_to_left_end` 的 `seen` 参数去掉；
+  B 是把 `_require_system_view` 前面那行 `invalidate()` 加回来、`_adopt_navigation_bar`
+  那一行删掉。回退 A 恢复「每次都先白拖一次」；回退 B 恢复「切完星球下一个目标三字段全设」。
