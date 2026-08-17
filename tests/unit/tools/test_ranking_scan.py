@@ -193,6 +193,34 @@ def test_parse_score_reads_the_suffixes_and_refuses_junk() -> None:
     assert parse_score("not a score") is None
 
 
+def test_the_k_suffix_lands_exactly_on_the_listed_value() -> None:
+    """⚠️ **恰好相等，不许用 `pytest.approx`。** 近似断言等于没修。
+
+    这三个是 2026-08-17 军力榜页面上**原样**出现的脏值。榜上的原文是
+    `64.96K` / `64.26K` / `64.18K`，而 `float("64.96") * 1000` 给出
+    64959.99999999999——`64.96` 在二进制里没有精确表示。三个都不是随机偏差，
+    是同一个成因，所以三个一起钉。
+
+    换算走 `Decimal` 之后按十进制乘，误差根本不产生。
+    """
+    assert parse_score("64.96K") == 64_960
+    assert parse_score("64.26K") == 64_260
+    assert parse_score("64.18K") == 64_180
+
+
+def test_the_m_suffix_is_exact_too_and_a_bare_decimal_survives_intact() -> None:
+    """M 量级同病同治；而**没有单位的小数不许被取整抹平**。
+
+    ⚠️ 后半句是这条测试真正的用意。「乘完 `round()` 一下」也能让 K 值变干净，
+    但这条正则同时认裸数（`([KM])?` 是可选的），取整那一支就会把 `1.5` 变成 `2`。
+    `Decimal` 对三种单位一视同仁地精确，不靠「最小刻度是 10」这个前提兜底。
+    """
+    assert parse_score("404.17M") == 404_170_000
+    assert parse_score("115.9M") == 115_900_000
+    assert parse_score("1.5") == 1.5
+    assert parse_score("0") == 0.0
+
+
 def test_an_unreadable_score_stays_none_and_never_becomes_zero() -> None:
     """⚠️ **猜出来的数不许长得像量出来的。** 0 分在这个榜上是有含义的
     （经济榜上的 bot 就是 0），把「读不出来」写成 0 就是在造一条假数据。

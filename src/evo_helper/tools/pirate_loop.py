@@ -86,7 +86,13 @@ from evo_helper.storage.database import create_database_engine, create_session_f
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
-from evo_helper.tools.scan_coordinates import LiveDriver, make_ocr, origin, say
+from evo_helper.tools.scan_coordinates import (
+    LiveDriver,
+    make_ocr,
+    origin,
+    run_with_foreground_guard,
+    say,
+)
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
 # 所以可以在模块顶层导入；真正带可选依赖的 `vision.optional.*` 仍旧惰性导入。
@@ -399,6 +405,29 @@ class RoundExhausted(RuntimeError):
     失败计数。反过来当成失败的话：航线占满是必然会发生的事，连撞三次就把整条
     链路自动停用了，而它其实只是需要等舰队飞回来。
     """
+
+
+class SessionUnavailable(RuntimeError):
+    """恢复阶梯走到头了，画面还是回不到游戏内。
+
+    `recoverable` 说的是「这一轮之后还有没有救」，判据是 `SessionKeeper` 的
+    **关窗重开配额**（`ReconnectOutcome.restarts_left`），整段理由在
+    `domain.scheduler.exit_code_for_environment_fault` 与
+    `tools.scan_coordinates.exit_code_for_unusable_session`。
+
+    - 还有配额 → `run()` 把它收进 `Outcome.busy`，退出码 `EXIT_ENVIRONMENT_BUSY`，
+      **不计入连续失败**：这一轮已经关窗重开过、失败了，但阶梯还没走到头。
+    - 配额耗尽 → `busy_is_permanent`，退出码 1：重开这条路已经证明救不了，
+      得让连续失败计数看见它，该停用时停用。
+
+    ⚠️ **不能无条件豁免。** 走到这里的每一轮都会再吃一次重开配额，而配额那道闸
+    只挡得住「无限重开 Chrome」，挡不住「每隔一个冷却起一轮、每轮失败、什么都不
+    推进」——豁免计数不再增长的话，就再没有任何东西会最终把它停下来。
+    """
+
+    def __init__(self, message: str, *, recoverable: bool) -> None:
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 class MailboxUnreachable(RuntimeError):
@@ -2504,8 +2533,9 @@ class PirateLoop:
             say(f"  会话不可用：{detail}；关窗重开一次再试（兜底策略）")
             session = self._keeper().restart_and_reenter(f"会话不可用：{detail}")
             if not session.ready:
-                raise RuntimeError(
-                    f"会话不可用：{detail}；重开也没能回到游戏内（{session.detail}）；安全停止"
+                raise SessionUnavailable(
+                    f"会话不可用：{detail}；重开也没能回到游戏内（{session.detail}）；安全停止",
+                    recoverable=session.restarts_left > 0,
                 )
         if session.reconnected:
             say("已重新登录")
@@ -2548,11 +2578,17 @@ class PirateLoop:
         say(f"  {what_failed}；关窗重开一次再试（兜底策略）")
         outcome = self._keeper().restart_and_reenter(what_failed)
         if not outcome.ready:
-            raise RuntimeError(f"{what_failed}；重开也没能回到游戏内（{outcome.detail}）；安全停止")
+            raise SessionUnavailable(
+                f"{what_failed}；重开也没能回到游戏内（{outcome.detail}）；安全停止",
+                recoverable=outcome.restarts_left > 0,
+            )
         # 重开之后画面整个换过一遍，导航器那份记忆记的是重开前的坐标。
         self._navigator.invalidate()
         if not self._navigator.ensure_system_view(self._nav_labels):
-            raise RuntimeError(f"{what_failed}；重开之后仍然切不回来；安全停止")
+            raise SessionUnavailable(
+                f"{what_failed}；重开之后仍然切不回来；安全停止",
+                recoverable=outcome.restarts_left > 0,
+            )
 
     # -- 出发星球 -----------------------------------------------------------
 
@@ -2616,11 +2652,15 @@ class PirateLoop:
         from evo_helper.game.game_window import ensure_game_window
 
         ensure_game_window()
-        self._ensure_session(force=True)
-        self._reset_to_known_screen()
-        self._require_system_view("开工时切不到恒星系视图")
 
         try:
+            # ⚠️ **开工那三步也要在 try 里面。** 它们正是环境故障最常倒下的地方
+            # （会话回不来、切不到恒星系视图），而落在 try 外面就等于让
+            # `SessionUnavailable` 抛穿 `main()`、按 Python 默认的退出码 1 收场——
+            # 也就是这次修的那个毛病本身。
+            self._ensure_session(force=True)
+            self._reset_to_known_screen()
+            self._require_system_view("开工时切不到恒星系视图")
             # ⚠️ **显式要求读信箱时，必须排在切星球前面。**
             # 信箱是账号级的，读它跟站在哪颗星球上毫无关系；而切星球是开工阶段
             # 最容易失手的一步（要认坐标、要拖列表、要回读）。
@@ -2650,6 +2690,13 @@ class PirateLoop:
             # 都没读进来，每个目标只会重复上一轮的判断。
             say(f"这一轮判为失败：{unreachable}")
             self._outcome.failed = str(unreachable)
+        except SessionUnavailable as unavailable:
+            # 环境故障：走 `Outcome.busy` 那一档，而不是抛穿 `main()` 退 1。
+            # 「还有救吗」由异常自己带着（判据是关窗重开配额），这里只负责翻译成
+            # `busy_is_permanent`——两个字段合起来正好喂给 `exit_code_for`。
+            say(f"这一轮开不了工：{unavailable}")
+            self._outcome.busy = str(unavailable)
+            self._outcome.busy_is_permanent = not unavailable.recoverable
         except RoundExhausted as exhausted:
             # 资源耗尽**不是失败**：正常收尾、退出码 0。当成失败的话，航线占满
             # （必然会发生）连撞三次就把整条链路自动停用了，而它只是需要等舰队
@@ -3128,19 +3175,22 @@ def main(argv: list[str] | None = None) -> int:
     listed = ", ".join(f"{galaxy}:{system}" for galaxy, system in options.systems)
     say(f"模式：{mode}；恒星系 {listed}")
 
-    # 只有 `--scout` / `--attack` 才需要动作能力。开关只有这一处。
-    driver = LiveDriver(allow_actions=args.scout or args.attack)
-    driver.window()
-    loop = PirateLoop(driver, make_ocr(), options)
-    outcome = loop.run()
+    def go() -> int:
+        # 只有 `--scout` / `--attack` 才需要动作能力。开关只有这一处。
+        driver = LiveDriver(allow_actions=args.scout or args.attack)
+        driver.window()
+        loop = PirateLoop(driver, make_ocr(), options)
+        outcome = loop.run()
 
-    say(
-        f"完成：海盗 {len(outcome.pirates)} 个，侦察 {len(outcome.scouted)} 发，"
-        f"攻击 {len(outcome.attacked)} 发，拦下 {len(outcome.refused)} 次"
-    )
-    for coordinate, reason in outcome.refused:
-        say(f"  [拦下] {coordinate} {reason}")
-    return exit_code_for(outcome)
+        say(
+            f"完成：海盗 {len(outcome.pirates)} 个，侦察 {len(outcome.scouted)} 发，"
+            f"攻击 {len(outcome.attacked)} 发，拦下 {len(outcome.refused)} 次"
+        )
+        for coordinate, reason in outcome.refused:
+            say(f"  [拦下] {coordinate} {reason}")
+        return exit_code_for(outcome)
+
+    return run_with_foreground_guard(go)
 
 
 if __name__ == "__main__":  # pragma: no cover

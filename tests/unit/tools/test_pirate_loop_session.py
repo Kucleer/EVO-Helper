@@ -168,9 +168,33 @@ def test_it_still_stops_when_even_a_restart_does_not_help(
         monkeypatch, [_outcome(ScreenState.UNKNOWN), _outcome(ScreenState.UNKNOWN)]
     )
 
-    with pytest.raises(RuntimeError, match="重开也没能回到游戏内"):
+    with pytest.raises(module.SessionUnavailable, match="重开也没能回到游戏内") as caught:
         loop._ensure_session(force=True)
     assert len(keeper.restarts) == 1, "重开只许试一次，不许成环"
+    # 配额耗尽 = 这不是暂时的。照样报 75 的话就没有任何东西会最终停下这条链路。
+    assert caught.value.recoverable is False
+
+
+def test_a_session_that_may_still_come_back_does_not_count_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """还有关窗重开配额：阶梯还没走到头，下一轮再试有意义。
+
+    与上一条合起来是这次改动的两个方向——**两个都要钉**，只钉一边的话
+    「无条件豁免」和「一律硬失败」各有一半能溜过去。
+    """
+    loop, _keeper, _events = _loop(
+        monkeypatch,
+        [_outcome(ScreenState.UNKNOWN), _outcome(ScreenState.UNKNOWN)],
+        after_restart=ReconnectOutcome(
+            ScreenState.UNKNOWN, reconnected=False, detail="still unknown", restarts_left=2
+        ),
+    )
+
+    with pytest.raises(module.SessionUnavailable) as caught:
+        loop._ensure_session(force=True)
+
+    assert caught.value.recoverable is True
 
 
 def test_a_throttled_check_is_not_treated_as_a_failure(
@@ -181,3 +205,61 @@ def test_a_throttled_check_is_not_treated_as_a_failure(
 
     assert loop._ensure_session() is False
     assert events == []
+
+
+# -- 开不了工时这一轮怎么收场 ---------------------------------------------------
+#
+# 原先这三处（`_ensure_session`、`_require_system_view` 两处）抛的是裸
+# `RuntimeError`，一路抛穿 `main()`，按 Python 默认的退出码 1 收场——也就是被当成
+# 硬失败计进连续失败。实机 2026-08-17 凌晨：三条链路 26 分钟里各撞各的，
+# **每一轮都吃掉一次**「多条一起倒」的豁免，一路攒到 6/6 上限。
+
+
+def _round_that_cannot_start(
+    monkeypatch: pytest.MonkeyPatch, *, recoverable: bool
+) -> module.Outcome:
+    """跑一整轮 `run()`，开工第一步就撞上「会话回不来」。"""
+    loop = PirateLoop.__new__(PirateLoop)
+    loop._outcome = module.Outcome()  # type: ignore[attr-defined]
+
+    def refuse(*, force: bool = False) -> bool:
+        raise module.SessionUnavailable("会话不可用；安全停止", recoverable=recoverable)
+
+    loop._ensure_session = refuse  # type: ignore[assignment, method-assign]
+    monkeypatch.setattr(module, "say", lambda _m: None)
+    monkeypatch.setattr(
+        "evo_helper.game.game_window.ensure_game_window", lambda *_a, **_k: None, raising=False
+    )
+    return loop.run()
+
+
+def test_a_round_that_cannot_start_but_may_recover_does_not_cost_an_exemption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """还有关窗重开配额 = 阶梯还没走到头，下一轮再试有意义。"""
+    outcome = _round_that_cannot_start(monkeypatch, recoverable=True)
+
+    assert outcome.busy and not outcome.busy_is_permanent
+    assert module.exit_code_for(outcome) == module.EXIT_ENVIRONMENT_BUSY
+
+
+def test_a_round_that_cannot_start_and_will_not_recover_counts_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **安全底线。**
+
+    配额耗尽还是回不去就必须按 1 收场。照样报 75 的话，调度器每隔一个冷却再起
+    一轮、再吃一次配额、再什么都不推进，而豁免计数不再增长——再没有任何东西会
+    最终把它停下来，整夜静默空转。
+    """
+    outcome = _round_that_cannot_start(monkeypatch, recoverable=False)
+
+    assert outcome.busy and outcome.busy_is_permanent
+    assert module.exit_code_for(outcome) == 1
+
+
+def test_the_opening_steps_are_inside_the_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """开工那三步落在 `try` 外面就等于让异常抛穿 `main()`——那正是原来的毛病。"""
+    outcome = _round_that_cannot_start(monkeypatch, recoverable=True)
+
+    assert outcome.attacked == [] and outcome.scouted == [], "开不了工就一发都不许派"

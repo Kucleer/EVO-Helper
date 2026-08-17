@@ -1,7 +1,7 @@
 """战报截图单独一张表，字节直接存库
 
 Revision ID: b3d7e5a91c04
-Revises: a9d5f31c0e77
+Revises: b3f5c8d10a27
 Create Date: 2026-08-17
 
 新增 `battle_report_screenshots`：读一份战报时截下来的那一屏面板，字节存进库。
@@ -32,7 +32,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b3d7e5a91c04"
-down_revision: str | None = "a9d5f31c0e77"
+down_revision: str | None = "b3f5c8d10a27"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

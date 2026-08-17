@@ -1,4 +1,4 @@
-"""直接 BBB 攻击 → 读战报 → 平局再打：判定这一层的规则。
+"""直接 BBB 攻击 → 读战报 → 收工：判定这一层的规则。
 
 真正驱动鼠标的部分在 `pirate_loop` 里已经实机跑通，这里只守判定：
 **一趟只把每个目标推进一态**、战报在开工那一趟信箱里先读回来、
@@ -141,8 +141,8 @@ def test_reports_are_read_before_the_phases_are_decided(
     """开工那一趟信箱排在分态之前，而且整轮只有那一趟。
 
     用户口径（2026-08-11）：「任务启动先去读战报。」顺序不能反——反了的话，
-    这一趟刚读回来的战报要等下一轮才作数，于是「平局就再打」也要晚一整个调度
-    周期才动得起来。
+    这一趟刚读回来的战报要等下一轮才作数，于是走完的目标要晚一整个调度周期
+    才转得进 `DONE`，这一轮迟迟宣布不了跑完。
 
     整轮只进一趟信箱，是因为开工那一趟为了数「今天已经打了几发」**本来就要把
     信箱最上面那几屏翻一遍**，顺手把认得出的战报都开了、都入了库。另起一趟收取
@@ -166,12 +166,14 @@ def test_reports_are_read_before_the_phases_are_decided(
     assert calls.count("开工那一趟信箱") == 1
 
 
-def test_a_draw_only_costs_one_extra_shot_per_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """平局重打也是**一趟一发**，不在同一趟里把配额一次烧光。
+def test_a_target_gets_at_most_one_shot_per_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """一个目标**一趟最多一发**。
 
-    `_sweep` 每个目标只走一个分支，所以「再打一发」之后这一趟对它就结束了；
-    下一发要等下一趟——而那时刚才那一发的战报多半已经回来了。在同一趟里循环
-    重打的话，三发会在几十秒内全部飞出去，全部打的是同一支还没被削弱的守军。
+    `_sweep` 每个目标只走一个分支，打完这一趟对它就结束了。原先这条叫
+    `test_a_draw_only_costs_one_extra_shot_per_sweep`，守的是「平局重打不要在同一
+    趟里把配额一次烧光」；平局重打已按用户口径（2026-08-17）移除，但「一趟一发」
+    这条本身与那个规则无关，仍然要守：`NEEDS_ATTACK` 分支里要是长出一个循环，
+    几发会在几十秒内全部飞出去，全打的是同一支还没被削弱的守军。
     """
     assert _run_with_phase(monkeypatch, BotPhase.NEEDS_ATTACK).count("打一发") == 1
 
@@ -220,8 +222,8 @@ def test_a_missing_round_start_falls_back_to_todays_utc_midnight() -> None:
     """**绝不把 None 传给仓储。**
 
     `since=None` 在查询侧是「不限时间范围」：`bot_dispatch_facts` 会把这个坐标
-    历史上每一发都算进本轮，于是它的重打配额永远是满的
-    （`domain.bot_round.MAX_ATTACKS_PER_TARGET`），看起来像是「早就打完了」。
+    历史上每一发都算进本轮，于是上个月打过的目标看起来像是「这一轮早就打完了」，
+    这一轮一发都不会派。
     """
     loop = BotLoop.__new__(BotLoop)
     loop._bot = BotOptions(targets=(TARGET,), attack=True)

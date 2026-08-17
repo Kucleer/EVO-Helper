@@ -17,12 +17,23 @@
 照着它去改判据。分档也一并删了（`domain.fleet_tier` 整个模块），
 所以「守方多少艘」不再是这条链路的输入。
 
-## 平局重打，但有界
+## 平局不再重打（2026-08-17 移除）
 
-平局（`DRAW`）意味着两边都还有船，同一个坐标再打一发是有意义的。但**无限重打
-一个坐标**会把整轮卡在它身上：航线被它吃光、别的目标一发都轮不到，而战报读不到
-时还会变成死循环。所以本轮每个目标最多打 `MAX_ATTACKS_PER_TARGET` 发，
-理由见那个常量。
+原先这里还有一条规则：最后一发打成平局（`DRAW`）就对同一坐标再补一发，上限
+`MAX_ATTACKS_PER_TARGET = 3`。用户口径（2026-08-17）：「bot 攻击移除平局再打
+一次机制」——**平局就当这一发结束**，和打赢、打输一样收工。
+
+所以现在战果**根本不参与判态**：一发攻击的战报回来了，这个目标本轮就走完了。
+判据只剩「派过没有」和「战报回来没有」两件事实。
+
+⚠️ **移除的是「平局要重打」这条规则，不是「平局」这个战果。** `DRAW` 仍然照常
+算出来（`domain.battle_outcome`）、照常写进 `battle_reports.outcome`、照常出现在
+日志页与情报中心的战果筛选里。这里不看它，不等于别处看不到它。
+
+随规则一起删掉的还有 `MAX_ATTACKS_PER_TARGET` 与 `DispatchFact.outcome`：
+两者都只为这条规则存在（前者是它的上限，后者是它的输入）。**删掉而不是留成
+死常量/死字段**——留着的话下一个读它的人会以为「上限」还在约束什么、
+「战果」还在被谁读，照着它去改判据。同一条理由当初也用在探路那两个态上。
 """
 
 from __future__ import annotations
@@ -30,8 +41,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-
-from evo_helper.domain.battle_outcome import OUTCOME_DRAW
 
 #: bot 攻击用的游戏内预设标题。用户口径（2026-08-13）：一律 BBB，不再分档。
 #:
@@ -44,48 +53,29 @@ from evo_helper.domain.battle_outcome import OUTCOME_DRAW
 #: 预设里装了什么由用户在游戏里维护，助手不读也不校验。
 BOT_ATTACK_PRESET = "BBB"
 
-#: 本轮同一个坐标最多打几发（含第一发）。也就是：**平局最多再补两发**。
-#:
-#: 上限本身不可省。「平局就继续攻击」这条口径没有自带终点：两边势均力敌时
-#: 每一发都可能又是平局，而一轮的航线数是个位数——一个咬死的目标能把整轮吃光，
-#: 别的目标一发都轮不到，日志上还只是一句「又打了一发」。
-#:
-#: 取 3 的依据是**和仓里已有的两条自愈配额同一档**：断线重开 3 次/滚动 1 小时
-#: （`game.reconnect`）、认不出目标只自愈一次（`PirateLoop._goto_checked`）。
-#: 都是「给它几次机会，但绝不让它一直试」。3 发之后仍是平局，说明这个目标不是
-#: 多打一发能解决的，留给下一轮（或让用户看日志改预设）比在这一轮里耗完航线好。
-#:
-#: **周期是「一轮」**，不是一天也不是滚动窗口：计数直接由
-#: `repository.bot_dispatch_facts(since=本轮起点)` 给出，`begin_bot_round` 挪一次
-#: 轮次起点，计数就自然归零——不需要任何一列去记「打了几发」，也就没有一列会和
-#: 事实对不上。用户在控制台上点「新一轮」就是重置。
-MAX_ATTACKS_PER_TARGET = 3
-
 
 class BotPhase(Enum):
     """一个目标本轮走到哪一步了。"""
 
-    #: 该打了。本轮还没打过，或者上一发是平局且配额还有剩。
+    #: 该打了。本轮还没打过。
     NEEDS_ATTACK = "NEEDS_ATTACK"
     #: 攻击已派出，等它的战报。
     AWAITING_ATTACK_REPORT = "AWAITING_ATTACK_REPORT"
-    #: 走完了。分出了胜负，或者平局但已经打满 `MAX_ATTACKS_PER_TARGET` 发。
+    #: 走完了。那一发的战报回来了——**不论打成了什么**，平局也在内。
     DONE = "DONE"
 
 
 @dataclass(frozen=True)
 class DispatchFact:
-    """本轮针对某个目标的一次攻击派遣，以及它那份战报的结论。"""
+    """本轮针对某个目标的一次攻击派遣。
+
+    只有一个字段是有意的，形状与 `domain.pirate_round.AttackFact` 一致：
+    平局重打移除之后（2026-08-17），战果不再参与判态，一发攻击就是一发攻击。
+    战果本身仍然存在，只是它的读者在展示那一侧（日志页、情报中心），不在这里。
+    """
 
     #: 这一发的战报入库了没有。
     has_report: bool
-    #: 那份战报算出来的战果（`domain.battle_outcome` 的三个词之一）。
-    #:
-    #: **`None` 有两种来源，而它们在这里合流是对的**：没有战报，或者有战报但四个
-    #: 数缺一个、算不出胜负（`battle_outcome.outcome_from_totals`）。两种都不构成
-    #: 「这一发打成了平局」的证据，而重打的唯一依据就是**确认是平局**——
-    #: 拿「算不出」去重打，等于凭一次 OCR 失手再送一支舰队出去。
-    outcome: str | None = None
 
 
 def phase_of(attacks: Sequence[DispatchFact]) -> BotPhase:
@@ -100,36 +90,22 @@ def phase_of(attacks: Sequence[DispatchFact]) -> BotPhase:
     这个目标就永远停在 `AWAITING_ATTACK_REPORT`，于是整个 bot 任务永远不退出，
     而画面上看起来只是「在等」。
 
-    ⚠️ **等战报优先于重打。** 只要还有一发没回来就一律等：不等的话，一个目标会在
-    第一发还在飞的时候就被当成「还没打够」再补一发，几趟下来同一个坐标上摞着
-    四五支舰队——而平局与否本来就要等战报回来才知道。
+    ⚠️ **有一发没回来就一律等。** 平局重打移除之后，同一坐标在一轮里通常只有
+    一发；但战报过期被剔掉之后允许重来一发（见 `repository.bot_dispatch_facts`），
+    所以「多发」仍然是会发生的情形。不等的话，第一发还在飞时这个目标就会被再补
+    一发，几趟下来同一个坐标上摞着四五支舰队。
     """
     if not attacks:
         return BotPhase.NEEDS_ATTACK
     if not all(item.has_report for item in attacks):
         return BotPhase.AWAITING_ATTACK_REPORT
-    if len(attacks) >= MAX_ATTACKS_PER_TARGET:
-        # 打满了。**不看最后一发是不是平局**：满了就是满了，说成 `NEEDS_ATTACK`
-        # 只会让调用方每趟重算一次、再被别处拦下来，日志上还看不出是被上限挡的。
-        return BotPhase.DONE
-    return BotPhase.NEEDS_ATTACK if _last_outcome(attacks) == OUTCOME_DRAW else BotPhase.DONE
-
-
-def _last_outcome(attacks: Sequence[DispatchFact]) -> str | None:
-    """最后一发打成了什么。
-
-    按**最后一发**而不是「有没有任何一发是平局」判：口径是「同一坐标攻击结果为
-    平局则继续攻击」，说的是这一发的结果。按 any 判的话，第一发平局、第二发打赢
-    的目标会被永远判成还要再打——直到撞上发数上限才停。
-
-    次序由调用方保证（仓储按 `dispatched_at_utc` 排）。
-    """
-    return attacks[-1].outcome
+    # 战报都回来了就收工。**不看战果**——平局、胜、负、算不出，一律走完
+    # （用户口径 2026-08-17，见模块头）。
+    return BotPhase.DONE
 
 
 __all__ = [
     "BOT_ATTACK_PRESET",
-    "MAX_ATTACKS_PER_TARGET",
     "DispatchFact",
     "BotPhase",
     "phase_of",

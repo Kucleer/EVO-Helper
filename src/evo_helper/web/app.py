@@ -1001,6 +1001,8 @@ def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
         fleet_lines=task.fleet_lines,
         origin_is_default=task.origin_is_default,
         fleet_lines_is_default=task.fleet_lines_is_default,
+        enabled_from_utc=task.enabled_from_utc,
+        enabled_until_utc=task.enabled_until_utc,
     )
 
 
@@ -1235,6 +1237,8 @@ def register_mission_routes(app: FastAPI) -> None:
                 name=payload.name,
                 origin=payload.origin,
                 fleet_lines=payload.fleet_lines,
+                enabled_from=payload.enabled_from,
+                enabled_until=payload.enabled_until,
             )
         )
 

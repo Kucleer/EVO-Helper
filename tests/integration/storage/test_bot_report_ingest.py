@@ -14,9 +14,10 @@
 「出发坐标 + 目标坐标 + 时间就近」，而入库路径正确与否，最终就体现在
 `phase_of` 换不换态上。
 
-⚠️ 战果也在这条路上：`outcome` 决定这个坐标要不要再挨一发（平局才重打）。
-所以这里的桩件给了**两屏**——「损失单位」只有拖到底那一屏才读得到，
-不给第二屏时 `outcome` 恒为 None，也就永远测不出平局那条路。
+⚠️ 战果也在这条路上，但**它已经不决定任何事**：平局重打于 2026-08-17 按用户
+口径移除，战果从判据退回成纯观测（`domain.bot_round` 模块头）。这里的桩件仍然
+给**两屏**——「损失单位」只有拖到底那一屏才读得到，不给第二屏时 `outcome`
+恒为 None，那就测不出「战果确实被算出来并写进了那一行」。
 """
 
 from __future__ import annotations
@@ -88,8 +89,9 @@ class DetailScreens:
 class BottomScreens(DetailScreens):
     """拖到底之后那一屏：只有它给得出「损失单位」。
 
-    双方都还剩船（100−40、5360−1200），所以战果算出来是平局——
-    「平局就对同一坐标再打一发」那条口径的输入就是这两行。
+    双方都还剩船（100−40、5360−1200），所以战果算出来是平局。刻意挑平局这一档：
+    它曾经是「再打一发」的触发条件，现在不是了（2026-08-17 移除），而这里正好
+    同时量得到两件事——平局照旧算得出来，且它照旧不再触发任何补刀。
     """
 
     def loss_totals(self) -> tuple[str, str]:
@@ -153,18 +155,26 @@ def test_an_attack_without_its_report_waits(repository, run_id) -> None:  # type
     assert _phase(repository) is BotPhase.AWAITING_ATTACK_REPORT
 
 
-def test_ingesting_the_report_unblocks_the_target_with_its_outcome(repository, run_id) -> None:  # type: ignore[no-untyped-def]
-    """**死锁解除**：入库之后目标不再停在等战报，而且带着战果往下走。
+def test_ingesting_the_report_unblocks_the_target(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """**死锁解除**：入库之后目标不再停在等战报，而且那一行带着算出来的战果。
 
-    这份桩件算出来是平局，所以下一步是「对同一坐标再打一发」。战果没被送到
-    判态那一侧的话，这里会变成 `DONE`——看着也很正常，只是从此再没有补刀。
+    这条原先带着 `_with_its_outcome` 的后缀，断言的是
+    「平局 → `NEEDS_ATTACK`（该补刀了）」。用户口径（2026-08-17）移除了
+    平局重打，于是断言改成 `DONE`——但**两句断言都留着**，因为它们守的是两件
+    互相独立的事：
+
+    - `_phase(...) is DONE`：平局不再触发补刀（新口径）。
+    - `report.outcome == OUTCOME_DRAW`：平局这个**观测**照旧算得出来、照旧入库。
+
+    只留前一句的话，谁把战果那一列停写了都没人管；只留后一句的话，重打被接
+    回去也没人管。
     """
     _attack_dispatch(repository, run_id)
 
     report = _ingest(repository)
 
     assert report.outcome == OUTCOME_DRAW
-    assert _phase(repository) is BotPhase.NEEDS_ATTACK
+    assert _phase(repository) is BotPhase.DONE
 
 
 def test_the_report_is_claimed_by_that_very_dispatch(repository, run_id) -> None:  # type: ignore[no-untyped-def]
@@ -240,8 +250,8 @@ def test_an_attack_whose_report_never_arrives_is_eventually_given_up_on(reposito
     收报告那一步会失败（OCR 读不出、报告根本没来、认不上号），所以这条出路
     必须存在——过了 `MAX_REPORT_AGE` 就把那一发剔掉，目标退回「该打了」。
 
-    这也是重打配额（`MAX_ATTACKS_PER_TARGET`）在「读不到战报」那一侧的边界：
-    剔掉之后那一发不再占配额，所以每个目标每 6 小时最多因此多打一发。
+    平局重打移除之后（2026-08-17），这条是**唯一**还会让同一坐标本轮再吃一发的
+    路径，上界是「每个目标每 6 小时最多因此多打一发」。
     """
     stale = NOW - MAX_REPORT_AGE - timedelta(minutes=1)
     _attack_dispatch(repository, run_id, dispatched_at=stale)
@@ -261,8 +271,8 @@ def test_a_dispatch_still_within_the_window_keeps_waiting(repository, run_id) ->
 def test_an_old_dispatch_that_did_get_its_report_is_not_dropped(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """放弃规则只对**没有战报**的那些生效。
 
-    连已闭合的一起剔掉，这个目标的重打配额就会凭空退回去：一个本轮已经打过
-    三发的 bot 在六小时后被从头再打一遍，而且从日志上看不出为什么。
+    连已闭合的一起剔掉，这个目标就会凭空退回「本轮一发都没打过」：一个战报早就
+    读回来了的 bot 在六小时后被从头再打一遍，而且从日志上看不出为什么。
     """
     stale = REPORTED_AT - timedelta(minutes=30)
     _attack_dispatch(repository, run_id, dispatched_at=stale)
@@ -272,7 +282,7 @@ def test_an_old_dispatch_that_did_get_its_report_is_not_dropped(repository, run_
     facts = repository.bot_dispatch_facts(TARGET, since=ROUND_START, now_utc=much_later)
 
     assert [fact.has_report for fact in facts] == [True]
-    assert [fact.outcome for fact in facts] == [OUTCOME_DRAW]
+    assert phase_of(facts) is BotPhase.DONE
 
 
 # -- 直接看库 ----------------------------------------------------------------

@@ -3,6 +3,7 @@
 {% block heading %}攻击日志{% endblock %}
 {% block topbar_extra %}
 <span class="chip"><span class="glyph" aria-hidden="true">🕗</span>游戏时间 UTC+0 · 现实时间 UTC+8</span>
+{% include "_auto_refresh.html" %}
 {% endblock %}
 {% block content %}
 
@@ -114,7 +115,12 @@
   {% endif %}
 </section>
 
-<section class="panel" aria-labelledby="log-table">
+{#
+  `data-refresh`：自动刷新只换这一块（见 `_auto_refresh.html`）。上面那三个
+  筛选表单**刻意不在里面**——那里有用户正在敲的坐标、正在选的下拉框，
+  每 15 秒替换一次等于没法用。筛选条件本身走 URL，重取时原样带着。
+#}
+<section class="panel" id="log-entries" data-refresh aria-labelledby="log-table">
   <h2 id="log-table">派遣记录 <span class="muted">（{{ entries | length }} 条）</span></h2>
   <div class="table-wrap">
     <table>

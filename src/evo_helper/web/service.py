@@ -341,6 +341,11 @@ class MissionTaskView:
     #: ——两者显示成同一个数字的话，用户改了全局值之后会以为任务也跟着变了。
     origin_is_default: bool = True
     fleet_lines_is_default: bool = True
+    #: 定时开启 / 定时关闭的时刻，**UTC**。None 表示这一端不限。
+    #: 交出去的是 UTC 而不是已经换算好的 UTC+8 字符串：页面上其它时间列
+    #: 也都是拿到 UTC 自己按 Asia/Shanghai 渲染的，两套口径迟早会差 8 小时。
+    enabled_from_utc: datetime | None = None
+    enabled_until_utc: datetime | None = None
 
 
 @dataclass(frozen=True)
