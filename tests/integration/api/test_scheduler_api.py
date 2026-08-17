@@ -1362,3 +1362,136 @@ def test_a_blank_report_scan_floor_is_stored_as_blank_not_as_a_number(
 
     assert cleared.status_code == 200, cleared.text
     assert console.client.get("/api/attack-config").json()["report_scan_hours"] is None
+
+
+# -- 调度节奏的三个旋钮 --------------------------------------------------------
+#
+# 判据与日志在 `tests/integration/application/test_behaviour_knobs.py`。
+# 这里钉的是**接线**：`PUT /api/attack-config` 收得下、`GET` 原样回读、
+# 不可能的取值被拒，而且改一项不会把另一项冲掉。
+
+
+def test_the_pacing_knobs_default_to_blank_meaning_follow_the_code(console: Console) -> None:
+    """一份没配过的库里，三个框都是空的——也就是「跟着代码里的默认值走」。
+
+    ⚠️ 空必须是 `None` 而不是 0：`0` 在翻信箱冷却上是一个**合法且不同**的取值
+    （每一轮开工都翻）。两者混在一起，升级当天所有老库都会静悄悄换个行为。
+    """
+    body = console.client.get("/api/attack-config").json()
+
+    assert body["unknown_line_hold_minutes"] is None
+    assert body["reconcile_cooldown_minutes"] is None
+    assert body["bot_revisit_hours"] is None
+
+
+def test_the_pacing_knobs_round_trip_through_the_attack_config(console: Console) -> None:
+    saved = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [{"min_score": 0, "preset": "AAA"}],
+            "unknown_line_hold_minutes": 45,
+            "reconcile_cooldown_minutes": 0,
+            "bot_revisit_hours": 6,
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    read_back = console.client.get("/api/attack-config").json()
+    assert read_back["unknown_line_hold_minutes"] == 45
+    # 0 必须原样回来，不能被读成「留空」。
+    assert read_back["reconcile_cooldown_minutes"] == 0
+    assert read_back["bot_revisit_hours"] == 6
+    assert read_back["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+
+
+def test_saving_the_page_clears_a_knob_that_was_left_blank(console: Console) -> None:
+    """这一页是**整份替换**：留空送上来就是「改回跟着默认值走」。
+
+    这条守的是留空那一侧真的写得回去——只认「有值才写」的实现会让用户清不掉
+    一个填错的数，页面上删掉它、保存、刷新，那个数又回来了。
+    """
+    console.client.put(
+        "/api/attack-config",
+        json={"tiers": [], "unknown_line_hold_minutes": 45, "bot_revisit_hours": 6},
+    )
+    console.client.put("/api/attack-config", json={"tiers": [], "bot_revisit_hours": 6})
+
+    body = console.client.get("/api/attack-config").json()
+    assert body["unknown_line_hold_minutes"] is None
+    assert body["bot_revisit_hours"] == 6
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # 0 = 「读不到飞行时间就当没占航线」，被实机推翻掉的旧口径。
+        ("unknown_line_hold_minutes", 0),
+        # 够到「放弃等战报」那条线就会锁死航线。
+        ("unknown_line_hold_minutes", 360),
+        ("reconcile_cooldown_minutes", -1),
+        # 上界 = 战报宽限期（默认 30）的一半。
+        ("reconcile_cooldown_minutes", 16),
+        # 0 = 取消排除，而候选池按军力降序排。
+        ("bot_revisit_hours", 0),
+        ("bot_revisit_hours", 169),
+    ],
+)
+def test_impossible_pacing_knobs_are_refused_by_the_api(
+    console: Console, field: str, value: int
+) -> None:
+    """页面用的是**调度器那把尺子**（`validate_*`），和实机启动时同一段代码。
+    两边分家的结果是「页面收下了、跑起来不是那个数」。
+    """
+    response = console.client.put("/api/attack-config", json={"tiers": [], field: value})
+
+    assert response.status_code == 400, response.text
+    assert console.client.get("/api/attack-config").json()[field] is None
+
+
+#: 攻击配置页上**全部**可空旋钮，以及一组各自合法、且两两不同的取值。
+#:
+#: ⚠️ **新增旋钮时必须往这里加一行。** 这张表是下面那条用例的全部输入，
+#: 而那条用例是这一页唯一一条「所有旋钮一起送、一起读回」的断言。
+_ALL_KNOBS = {
+    "blind_scrolls": 30,
+    "report_scan_hours": 2,
+    "unknown_line_hold_minutes": 45,
+    "reconcile_cooldown_minutes": 0,
+    "bot_revisit_hours": 6,
+}
+
+
+def test_every_knob_survives_a_single_save(console: Console) -> None:
+    """一次 `PUT` 把所有旋钮一起送上去，**每一个**都要原样读得回来。
+
+    ⚠️ **这条守的是合并事故，不是业务逻辑。** 这一页的六文件管线
+    （models → repository → service → schemas → app → settings.html）被好几个
+    并行的 PR 各加各的字段，行贴着行；解冲突时漏掉一边的典型症状是**那个字段
+    静默失效**——代码照常编译，而只测自己那几项的用例照样全绿，因为漏掉的字段
+    连同它自己的用例一起没了。
+
+    所以判据必须是「一次保存之后，`_ALL_KNOBS` 里每一项都还在」，而不是各测各的。
+    """
+    saved = console.client.put(
+        "/api/attack-config",
+        json={"tiers": [{"min_score": 0, "preset": "AAA"}], **_ALL_KNOBS},
+    )
+
+    assert saved.status_code == 200, saved.text
+    body = console.client.get("/api/attack-config").json()
+    # 逐项比而不是整个字典比：漏了哪一个要一眼看得出来。
+    for field, value in _ALL_KNOBS.items():
+        assert body[field] == value, f"{field} 没能原样存下来（读回 {body[field]!r}）"
+    assert body["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+
+
+def test_every_knob_is_blank_on_a_fresh_database(console: Console) -> None:
+    """没配过的库里**每一个**旋钮都是空的 = 跟着代码里的默认值走。
+
+    同上：升级完成那一刻行为不变，靠的就是这些列全是 NULL。任何一个被写上了
+    `server_default`，这里就会读到一个具体数字，而那意味着日后调默认值它不跟。
+    """
+    body = console.client.get("/api/attack-config").json()
+
+    for field in _ALL_KNOBS:
+        assert body[field] is None, f"{field} 在新库里不该有值（读到 {body[field]!r}）"

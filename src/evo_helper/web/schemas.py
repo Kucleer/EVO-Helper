@@ -267,6 +267,17 @@ class MilitaryAttackConfigOut(BaseModel):
     #: `MissionScheduler.validate_report_scan_hours` 判——两边分家的结果是页面收下
     #: 了、实机跑起来不是那个数。
     report_scan_hours: int | None = None
+    #: 读不到飞行时间时，一条航线占多久（分钟）。**`None` = 留空 = 默认 90。**
+    #:
+    #: 与 `blind_scrolls` 同一条规矩：这里只认「是不是整数」，范围由
+    #: `MissionScheduler.validate_unknown_line_hold_minutes` 判——页面和调度器
+    #: 必须用同一把尺子，分家的结果是页面收下了、实机跑起来不是那个数。
+    unknown_line_hold_minutes: int | None = None
+    #: 两次开工翻信箱之间至少隔多久（分钟）。**`None` = 留空 = 默认 15。**
+    #: `0` 是合法取值，意思是「每一轮开工都翻」，不是「关掉」。
+    reconcile_cooldown_minutes: int | None = None
+    #: 同一个 bot 坐标多久之内不重复打（小时）。**`None` = 留空 = 默认 24。**
+    bot_revisit_hours: int | None = None
 
 
 class CurrentMissionOut(BaseModel):

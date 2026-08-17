@@ -60,7 +60,11 @@ from evo_helper.domain.pirate_round import (
     action_for,
 )
 from evo_helper.domain.planet_switch import switch_needed
-from evo_helper.domain.reconcile_cooldown import ReconcileDecision, decide_reconcile
+from evo_helper.domain.reconcile_cooldown import (
+    RECONCILE_COOLDOWN,
+    ReconcileDecision,
+    decide_reconcile,
+)
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
     MISSION_KIND_SCOUT,
@@ -86,7 +90,7 @@ from evo_helper.game.system_navigator import (
     SystemNavigator,
     crop_reader,
 )
-from evo_helper.infrastructure.system_log import record_system_log
+from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
@@ -778,6 +782,10 @@ class PirateLoop:
 
     #: 详情页铺不开时最多存这么多张现场图。同样要封顶：一趟最多开 8 封，
     #: 若某一屏整体没渲染，8 张几乎一样的图对定位没有增量。
+    #:
+    #: 分类（2026-08-17 审计）：**低优先级旋钮**。它只影响排障时手上有几张图，
+    #: 不影响任何判据；而「几张几乎一样的图对定位没有增量」这一条跟用户的处境
+    #: 无关。没做成可配置——同 `MAX_COORD_DUMPS`。
     MAX_MAIL_DUMPS: int = 3
 
     #: 开工对账时，信箱里哪一类报告算作「这条链路今天打出去的一发」。
@@ -2113,6 +2121,37 @@ class PirateLoop:
             say(f"开工对账：查不到上次对账时刻（{error}）；按「从没对过账」处理，这一轮翻信箱")
             return None
 
+    def _reconcile_cooldown(self) -> timedelta:
+        """两次翻信箱之间至少隔多久。**留空 / 读不到都走代码里的默认值。**
+
+        值取自全局攻击配置（`military_attack_config.reconcile_cooldown_minutes`），
+        **不走命令行**：调度器起 runner 时那条命令行已经很长，而这个数跟「打谁」
+        毫无关系；runner 本来就连着库，直接问库比多一个参数少一处能漏改的地方。
+
+        读不到就用默认值而不是抛异常——一个查不出来的配置说明不了「用户想改冷却」，
+        为它把整轮任务弄死不成比例。默认值那一侧只会多翻几趟信箱，是安全的一侧。
+
+        用了非默认值必须在库里留一条痕迹：不然事后翻日志会以为跑的是默认的
+        15 分钟，而「本轮没翻信箱」这句话正是靠这个数才解释得通。
+        """
+        try:
+            repository, _run_id = self._ensure_run()
+            minutes = repository.military_attack_config().reconcile_cooldown_minutes
+        except Exception as error:  # noqa: BLE001 - 见 docstring：读不到就走默认值
+            say(f"开工对账：读不到冷却配置（{error}）；按代码默认的 {RECONCILE_COOLDOWN} 算")
+            return RECONCILE_COOLDOWN
+        if minutes is None:
+            return RECONCILE_COOLDOWN
+        cooldown = timedelta(minutes=int(minutes))
+        record_knob_override(
+            "reconcile_cooldown",
+            source=__name__,
+            effective=cooldown,
+            default=RECONCILE_COOLDOWN,
+            detail="两次开工翻信箱之间至少隔这么久",
+        )
+        return cooldown
+
     def _reconcile_if_due(self) -> ReconcileDecision:
         """这一轮该不该翻信箱，该翻就翻。返回决定，供本轮后续的日志措辞引用。
 
@@ -2129,6 +2168,7 @@ class PirateLoop:
             last_reconciled_at_utc=self._last_reconciled_at(),
             now=datetime.now(UTC),
             forced=forced,
+            cooldown=self._reconcile_cooldown(),
         )
         self._reconcile_decision = decision
         say(decision.note)

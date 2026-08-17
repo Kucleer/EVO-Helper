@@ -31,6 +31,54 @@
   </div>
 </section>
 
+<section class="panel" aria-labelledby="knob-head">
+  <h2 id="knob-head">调度节奏</h2>
+  <p class="muted">
+    这三项都<strong>没有唯一正确答案</strong>——取值取决于你当下的处境（活动期信箱堆积、周一 bot 军力刷新日、机器闲忙、要不要激进）。
+    <strong>全部留空 = 用下面括号里的默认值</strong>，行为与没有这一节时完全一致。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="line-hold">航线占用时长（分钟，默认 {{ line_hold_default }}）</label>
+    <input id="line-hold" type="number" min="1" max="{{ line_hold_max }}" step="1"
+           placeholder="留空 = {{ line_hold_default }}" aria-label="航线占用时长（分钟）">
+  </div>
+  <p class="muted">
+    派出时<strong>没读到飞行时间</strong>的那一发，按派出时刻起算占多久航线。实测真实往返 10–62 分钟，默认 {{ line_hold_default }} 分钟是留了余量的兜底估算。<br>
+    <strong>调小</strong>：吞吐更高，航线更快被认为空出来；代价是估短了会多跑几轮撞游戏的「舰队数量已达上限」——这一档<strong>有界且自纠</strong>，runner 会看屏复核后正常收尾。<br>
+    <strong>调大</strong>：更保守，几乎不会误判航线空闲；代价是<strong>一次读不到就能把一条链路压住那么久</strong>，而期间没有任何新证据能推翻这个估算（实机曾因此停摆 4 小时）。
+    上限 {{ line_hold_max }} 分钟——再长会出现「战报已判缺失、航线还锁着」的死角。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="reconcile-cooldown">翻信箱冷却（分钟，默认 {{ reconcile_cooldown_default }}）</label>
+    <input id="reconcile-cooldown" type="number" min="0" max="{{ reconcile_cooldown_max }}" step="1"
+           placeholder="留空 = {{ reconcile_cooldown_default }}" aria-label="翻信箱冷却（分钟）">
+  </div>
+  <p class="muted">
+    每一轮开工时距上次翻信箱不足这么久就跳过，不再进信箱读战报。<br>
+    <strong>调小</strong>（填 0 = 每轮都翻）：战报入库最及时，「今日 X/32」最准；代价是每轮多花约 83 秒导航+读页，而航线是逐条释放的、续跑很频繁。<br>
+    <strong>调大</strong>：省掉大部分翻箱开销；代价是<strong>一份战报最多晚这么久才入库</strong>，逼近战报宽限期就会自己制造「战报缺失」。
+    上限 {{ reconcile_cooldown_max }} 分钟（= 战报宽限期的一半，宽限期改了这个上限跟着变）。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="bot-revisit">bot 重复攻击间隔（小时，默认 {{ bot_revisit_default }}）</label>
+    <input id="bot-revisit" type="number" min="1" max="{{ bot_revisit_max }}" step="1"
+           placeholder="留空 = {{ bot_revisit_default }}" aria-label="bot 重复攻击间隔（小时）">
+  </div>
+  <p class="muted">
+    同一个 bot 坐标在这段时间之内不重复打。<br>
+    <strong>调小</strong>：同一批高军力目标能多榨几轮；代价是打的多半是刚被自己清空的星球，ROI 低，而候选池按军力降序排——调得太小会让航线全烧在榜首那几个上。<br>
+    <strong>调大</strong>：目标摊得更开、重复攻击的浪费更少；代价是已知 bot 不够多时会出现「暂无可打目标」而空转。
+    上限 {{ bot_revisit_max }} 小时（一周）——再长就跨过了 bot 军力的刷新周期。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <button class="btn primary small" type="button" id="btn-save-knobs">保存调度节奏</button>
+  </div>
+</section>
+
 <section class="panel" aria-labelledby="scan-head">
   <h2 id="scan-head">对账翻信箱时长</h2>
   <p class="muted">
@@ -79,6 +127,15 @@
   const planets = document.getElementById('planet-list');
   const blindScrolls = document.getElementById('blind-scrolls');
   const reportScanHours = document.getElementById('report-scan-hours');
+  // 三个调度节奏旋钮。`payload` 里的键名就是 `PUT /api/attack-config` 的字段名。
+  //
+  // 「对账翻信箱时长」**故意不并进这个数组**：它有自己那条前端下界（至少 1，
+  // 因为 0 等于一封都翻不到），并进来就得把那句专门的错误话术拆成通用的一句。
+  const knobs = [
+    { element: document.getElementById('line-hold'), key: 'unknown_line_hold_minutes', label: '航线占用时长' },
+    { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
+    { element: document.getElementById('bot-revisit'), key: 'bot_revisit_hours', label: 'bot 重复攻击间隔' },
+  ];
   const errorBox = document.getElementById('settings-error');
   const coordinatePayload = (text) => {
     const parts = text.trim().split(':').map(Number);
@@ -134,6 +191,9 @@
         // `||` 会把它显示成空框，也就是显示成「自动标定」。
         blindScrolls.value = config.blind_scrolls ?? '';
         reportScanHours.value = config.report_scan_hours ?? '';
+        // 同上，一律 `??`：0 是合法取值（翻信箱冷却填 0 = 每轮都翻），
+        // `||` 会把它显示成空框，也就是显示成「用默认值」。
+        for (const knob of knobs) knob.element.value = config[knob.key] ?? '';
         renderPlanets(list);
       })
       .catch(fail);
@@ -163,7 +223,17 @@
       // 这里的 0 和盲拖那个 0 不一样：下界就是「此刻」，等于一封都翻不到。
       if (!Number.isInteger(hours) || hours < 1) throw new Error('翻信箱时长要填至少 1 的整数小时；要用默认值就把它留空');
     }
-    return { tiers: tierPayload, blind_scrolls: scrolls, report_scan_hours: hours };
+    const payload = { tiers: tierPayload, blind_scrolls: scrolls, report_scan_hours: hours };
+    for (const knob of knobs) {
+      const text = knob.element.value.trim();
+      if (text === '') { payload[knob.key] = null; continue; }
+      const number = Number(text);
+      // 只判「是不是整数」；范围留给后端——它和调度器启动时用的是同一把尺子，
+      // 而其中一条上界还跟着库里的战报宽限期走，前端算不出来。
+      if (!Number.isInteger(number)) throw new Error(`${knob.label}要填整数；要用默认值就把它留空`);
+      payload[knob.key] = number;
+    }
+    return payload;
   }
 
   const saveConfig = () => {
@@ -176,6 +246,7 @@
   document.getElementById('btn-save-tiers').onclick = saveConfig;
   document.getElementById('btn-save-blind').onclick = saveConfig;
   document.getElementById('btn-save-scan').onclick = saveConfig;
+  document.getElementById('btn-save-knobs').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {
     try {
       const input = document.getElementById('new-planet-coordinate');

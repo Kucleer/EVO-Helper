@@ -384,6 +384,11 @@ class MilitaryAttackConfigView:
     blind_scrolls: int | None = None
     #: 对账那一趟翻信箱最多往回读几个小时；`None` = 页面上留空 = 默认 6 小时。
     report_scan_hours: int | None = None
+    #: 下面三个行为旋钮同理：`None` = 页面上留空 = 跟着代码里的默认值走。
+    #: 默认值刻意不在这一层复述——写第二遍日后必然漏改，见各自的常量。
+    unknown_line_hold_minutes: int | None = None
+    reconcile_cooldown_minutes: int | None = None
+    bot_revisit_hours: int | None = None
 
 
 @dataclass(frozen=True)

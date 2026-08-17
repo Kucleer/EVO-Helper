@@ -21,14 +21,24 @@ from starlette.types import Lifespan
 
 from evo_helper.application.backfill import default_since
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
-from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.application.mission_scheduler import (
+    BOT_REVISIT_MAX_HOURS,
+    DEFAULT_BOT_REVISIT,
+    MissionScheduler,
+)
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_span
 from evo_helper.domain.models import Coordinate, CoordinateRange
+from evo_helper.domain.reconcile_cooldown import RECONCILE_COOLDOWN
 from evo_helper.domain.records import TARGET_KIND_LABELS
-from evo_helper.domain.report_wait import DEFAULT_REPORT_SCAN_FLOOR, REPORT_SCAN_HOURS_MAX
+from evo_helper.domain.report_wait import (
+    DEFAULT_REPORT_SCAN_FLOOR,
+    MAX_REPORT_AGE,
+    REPORT_SCAN_HOURS_MAX,
+    UNKNOWN_LINE_HOLD,
+)
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -611,13 +621,14 @@ def create_app(
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_page(request: Request) -> Response:
         """攻击档位与可选出发星球的统一配置页。"""
-        if getattr(request.app.state, "mission_console", None) is None:
+        console = getattr(request.app.state, "mission_console", None)
+        if console is None:
             return RedirectResponse("/missions", status_code=307)
         return templates.TemplateResponse(
             request=request,
             name="settings.html",
-            # 盲拖那几个数从 `game.ranking_ui` 传进模板，不在 HTML 里手抄一遍：
-            # 抄一遍之后调常量页面不跟，而页面上那句话正是用户判断「填多少」的
+            # 每个旋钮的默认值与上界都从常量传进模板，不在 HTML 里手抄一遍：
+            # 抄一遍之后调常量页面不跟，而页面上那几句话正是用户判断「填多少」的
             # 唯一依据。
             context={
                 "active": "settings",
@@ -630,6 +641,12 @@ def create_app(
                 # 之后调常量页面不跟。
                 "report_scan_hours_default": int(DEFAULT_REPORT_SCAN_FLOOR.total_seconds() // 3600),
                 "report_scan_hours_max": REPORT_SCAN_HOURS_MAX,
+                "line_hold_default": int(UNKNOWN_LINE_HOLD.total_seconds() // 60),
+                "line_hold_max": int(MAX_REPORT_AGE.total_seconds() // 60) - 1,
+                "reconcile_cooldown_default": int(RECONCILE_COOLDOWN.total_seconds() // 60),
+                "reconcile_cooldown_max": console.reconcile_cooldown_ceiling(),
+                "bot_revisit_default": int(DEFAULT_BOT_REVISIT.total_seconds() // 3600),
+                "bot_revisit_max": BOT_REVISIT_MAX_HOURS,
             },
         )
 
@@ -1102,6 +1119,9 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
         tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
         blind_scrolls=view.blind_scrolls,
         report_scan_hours=view.report_scan_hours,
+        unknown_line_hold_minutes=view.unknown_line_hold_minutes,
+        reconcile_cooldown_minutes=view.reconcile_cooldown_minutes,
+        bot_revisit_hours=view.bot_revisit_hours,
     )
 
 
@@ -1166,6 +1186,9 @@ def register_mission_routes(app: FastAPI) -> None:
                 tuple(item.model_dump() for item in payload.tiers),
                 blind_scrolls=payload.blind_scrolls,
                 report_scan_hours=payload.report_scan_hours,
+                unknown_line_hold_minutes=payload.unknown_line_hold_minutes,
+                reconcile_cooldown_minutes=payload.reconcile_cooldown_minutes,
+                bot_revisit_hours=payload.bot_revisit_hours,
             )
         )
 

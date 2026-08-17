@@ -33,11 +33,27 @@ class _FakeNavigator:
         return None
 
 
+class _FakeConfig:
+    def __init__(self, minutes: int | None) -> None:
+        self.reconcile_cooldown_minutes = minutes
+
+
+class _FakeRepository:
+    """只回答一个问题：攻击配置页上那个冷却框填的是什么。"""
+
+    def __init__(self, minutes: int | None) -> None:
+        self._minutes = minutes
+
+    def military_attack_config(self) -> _FakeConfig:
+        return _FakeConfig(self._minutes)
+
+
 def _loop(
     monkeypatch: pytest.MonkeyPatch,
     *,
     last_reconciled_at: datetime | None,
     force_reconcile: bool = False,
+    cooldown_minutes: int | None = None,
 ) -> tuple[Any, list[str], list[str]]:
     from evo_helper.game import game_window
 
@@ -61,6 +77,9 @@ def _loop(
     loop.ensure_origin_planet = lambda: True
     loop._reconcile_decision = None
     loop._last_reconciled_at = lambda: last_reconciled_at
+    # `cooldown_minutes=None` 就是攻击配置页上那个框**留空**，也就是走
+    # `RECONCILE_COOLDOWN` 的默认值——上面几条用例正是按默认值算时刻的。
+    loop._ensure_run = lambda: (_FakeRepository(cooldown_minutes), "run-1")
     loop.reconcile_today = lambda: swept.append("翻信箱")
     loop._sweep = lambda: None
     return loop, swept, said
@@ -118,6 +137,76 @@ class TestTheRoundAsksTheCooldown:
         loop.run()
 
         assert swept == ["翻信箱"]
+
+
+class TestTheCooldownComesFromTheAttackConfigPage:
+    """冷却窗口是个**运维旋钮**（2026-08-17 审计）：活动期间信箱堆积就该调小，
+    而它的两条边界（`restart_cooldown_seconds` / `report_grace_minutes`）本来
+    就在库里可配——写死的 15 分钟会在用户一改节奏的当天不再夹在中间。
+    """
+
+    def test_an_empty_box_still_waits_the_hard_coded_fifteen_minutes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **断言具体数字。** 写成「等于 RECONCILE_COOLDOWN」的话，
+        默认值被改掉之后这条用例照样绿。
+        """
+        assert RECONCILE_COOLDOWN == timedelta(minutes=15)
+        now = datetime.now(UTC)
+        loop, swept, _said = _loop(
+            monkeypatch,
+            last_reconciled_at=now - timedelta(minutes=14),
+            cooldown_minutes=None,
+        )
+
+        loop.run()
+
+        assert swept == []
+
+    def test_a_configured_cooldown_is_the_one_that_decides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """配成 5 分钟，一个默认口径下会被跳过的时刻就该翻信箱了。"""
+        now = datetime.now(UTC)
+        loop, swept, _said = _loop(
+            monkeypatch,
+            last_reconciled_at=now - timedelta(minutes=10),
+            cooldown_minutes=5,
+        )
+
+        loop.run()
+
+        assert swept == ["翻信箱"]
+
+    def test_zero_means_sweep_every_round_not_never(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """0 不是「关掉」，是「每一轮开工都翻」——最安全的那一侧，必须放行。"""
+        now = datetime.now(UTC)
+        loop, swept, _said = _loop(
+            monkeypatch, last_reconciled_at=now - timedelta(seconds=1), cooldown_minutes=0
+        )
+
+        loop.run()
+
+        assert swept == ["翻信箱"]
+
+    def test_an_unreadable_configuration_falls_back_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """读不到配置就用默认值，**不是把这一轮弄死**。
+
+        一个查不出来的配置说明不了「用户想改冷却」，而默认值那一侧只会多翻几趟
+        信箱——安全的那一侧。
+        """
+        now = datetime.now(UTC)
+        loop, swept, said = _loop(
+            monkeypatch, last_reconciled_at=now - timedelta(minutes=20), cooldown_minutes=None
+        )
+        loop._ensure_run = lambda: (_ for _ in ()).throw(RuntimeError("连不上库"))
+
+        loop.run()
+
+        assert swept == ["翻信箱"]
+        assert any("读不到冷却配置" in line for line in said)
 
 
 class TestTheDecisionIsRecordedAndSaid:

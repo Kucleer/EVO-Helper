@@ -72,6 +72,12 @@ from datetime import datetime, timedelta
 #:
 #: 要改它先重跑那个分布：节奏（`restart_cooldown_seconds`、任务数）一变，
 #: 上面两条边界跟着变，而这个数是**夹在两条边界之间**才成立的。
+#:
+#: ⚠️ **这是「没配置时」的默认值，不是唯一取值。** 它是一个**运维旋钮**，而且是
+#: 旋钮里最该配的一种：它的两条边界本身就在库里可配（`restart_cooldown_seconds`
+#: 定下界、`report_grace_minutes` 定上界），用户一改节奏，写死的 15 就不再夹在
+#: 中间了。活动期间信箱堆积时也要调小。攻击配置页上有一个框
+#: （`military_attack_config.reconcile_cooldown_minutes`），留空才走这里。
 RECONCILE_COOLDOWN = timedelta(minutes=15)
 
 
