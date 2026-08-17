@@ -43,7 +43,9 @@ from evo_helper.domain.battle_outcome import (
     OUTCOME_VICTORY,
     outcome_from_totals,
 )
+from evo_helper.domain.battle_resources import parse_resource_grid
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.domain.text import snap_to_vocabulary
 from evo_helper.vision.parsers import (
     GAME_DISPLAY_ZONE,
@@ -105,6 +107,12 @@ class PirateReportReading:
     defender_losses: int
     attacker_units: int | None = None
     defender_units: int | None = None
+    #: 「获得资源」那 12 格里**非零**的几格。空元组既可能是白打一发、也可能是
+    #: 那一屏没读全（后者留 warning）——判据见 `domain.battle_resources`。
+    #:
+    #: 这一项**不进「整份拒收」的判据**：这条链路的存在理由是胜负与战损，
+    #: 收获读不出来时那两样照样有意义，拒收等于因为附加项丢掉主产物。
+    resources: tuple[BattleResourceEntry, ...] = ()
 
 
 class PirateReportScreens(Protocol):
@@ -211,7 +219,25 @@ def read_pirate_report(
         defender_losses=losses[1],
         attacker_units=units[0] if units is not None else None,
         defender_units=units[1] if units is not None else None,
+        # 收获读的是**未滚动那一屏**（`detail`）：拖到底之后这一块整个滚出可视区。
+        resources=_resources(detail, where=f"海盗战报 {raw_time}"),
     )
+
+
+def _resources(detail: PirateReportScreens, *, where: str) -> tuple[BattleResourceEntry, ...]:
+    """「获得资源」那 12 格。读不全就一格都不要——**绝不补 0**。
+
+    用 getattr 取而不是写进 `PirateReportScreens` 协议，与 `live_reports._resources`
+    同一个理由：写进协议会打断所有既有实现，而收获是增强项。
+    """
+    reader = getattr(detail, "resource_cells", None)
+    if reader is None:
+        return ()
+    entries = parse_resource_grid(reader())
+    if entries is None:
+        logger.warning("%s 的「获得资源」没读全；这一份不记收获，也不补 0", where)
+        return ()
+    return entries
 
 
 def _subject_of(header: str) -> str | None:

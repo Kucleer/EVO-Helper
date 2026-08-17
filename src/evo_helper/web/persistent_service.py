@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from typing import Any
@@ -32,6 +32,7 @@ from evo_helper.domain.missions import (
     wrap_system,
 )
 from evo_helper.domain.models import Coordinate, CoordinateRange, RunState
+from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS, SYSTEMS_PER_GALAXY
 from evo_helper.domain.scheduler import (
     MissionKind,
@@ -510,9 +511,13 @@ class PersistentApplicationService:
             # 哪几份战报存了截图。**一次查询、只取 id，绝不把字节读出来**：
             # 这一页一次取 `ATTACK_LOG_LIMIT` 行，每张图约 40 KB。
             # 字节走 `report_screenshot()`，一次一张、按需取。
+            report_ids = [
+                report.id for _intent, _dispatch, report, _scouted in rows if report is not None
+            ]
             with_screenshot = ReportScreenshotRepository(self._session_factory).has_screenshots(
-                [report.id for _intent, _dispatch, report, _scouted in rows if report is not None]
+                report_ids
             )
+            resources = self._resources_by_report(session, report_ids)
             return [
                 AttackLogView(
                     intent_id=intent.id,
@@ -538,9 +543,46 @@ class PersistentApplicationService:
                     scout_report_back=bool(scouted),
                     report_id=report.id if report else None,
                     report_screenshot=bool(report is not None and report.id in with_screenshot),
+                    resources=resources.get(report.id, ()) if report is not None else (),
                 )
                 for intent, dispatch, report, scouted in rows
             ]
+
+    @staticmethod
+    def _resources_by_report(
+        session: Session, report_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[BattleResourceEntry, ...]]:
+        """这一页里每份战报的收获明细，按槽位升序。
+
+        **一次查询取完整页**，不是每行一次——这一页一次取 `ATTACK_LOG_LIMIT` 行。
+        这几列都是小整数，和截图那张表不同，取出来不会拖垮响应，所以直接带上
+        而不是像截图那样只问 `EXISTS`。
+
+        ⚠️ **查不到的战报给空元组，不是 None。** 库里只存非零的格子，
+        「一行都没有」就是「那 12 格都是 0」（语义写在
+        `storage.models.BattleReportResourceRow` 上），不是一种要分档显示的状态。
+        """
+        if not report_ids:
+            return {}
+        rows = session.scalars(
+            select(orm.BattleReportResourceRow)
+            .where(orm.BattleReportResourceRow.report_id.in_(report_ids))
+            .order_by(
+                orm.BattleReportResourceRow.report_id,
+                orm.BattleReportResourceRow.slot,
+            )
+        ).all()
+        grouped: dict[UUID, list[BattleResourceEntry]] = {}
+        for row in rows:
+            grouped.setdefault(row.report_id, []).append(
+                BattleResourceEntry(
+                    slot=row.slot,
+                    amount=row.amount,
+                    approximate=row.approximate,
+                    uncertainty=row.uncertainty,
+                )
+            )
+        return {report_id: tuple(entries) for report_id, entries in grouped.items()}
 
     def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None:
         """一份战报的存档截图；没有就 None。

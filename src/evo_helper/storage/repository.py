@@ -496,6 +496,13 @@ class SqlAlchemyRepository:
                 defender_losses=record.defender_losses,
             )
             session.add(report_row)
+            # ⚠️ **先把战报那一行冲出去。** 明细表都靠外键挂在它上面，而这几个
+            # 映射之间没有 `relationship`，SQLAlchemy 排不出插入先后——
+            # `battle_report_resources` 实测会排在 `battle_reports` **前面**，
+            # 于是 `_link_dispatch` 里那次查询触发自动 flush 时直接
+            # `FOREIGN KEY constraint failed`。`fleet_snapshots` 侥幸排在后面，
+            # 所以这个坑一直没露出来。显式 flush 比依赖排序的运气可靠。
+            session.flush()
             for entry in record.fleet:
                 session.add(
                     orm.FleetSnapshotRow(
@@ -505,6 +512,18 @@ class SqlAlchemyRepository:
                         count=entry.count,
                         round_no=entry.round_no,
                         uncertain=entry.uncertain,
+                    )
+                )
+            # 「获得资源」只写非零的格子。**空元组不代表没读到**——判据与那条
+            # 「没有行 = 0」的语义写在 `orm.BattleReportResourceRow` 上。
+            for resource in record.resources:
+                session.add(
+                    orm.BattleReportResourceRow(
+                        report_id=record.report_id,
+                        slot=resource.slot,
+                        amount=resource.amount,
+                        approximate=resource.approximate,
+                        uncertainty=resource.uncertainty,
                     )
                 )
             _link_dispatch(

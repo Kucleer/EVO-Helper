@@ -12,11 +12,11 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.quantities import parse_quantity
 from evo_helper.domain.ranking import (
     RankingRow,
     coordinate_of,
@@ -63,6 +63,10 @@ class RankingColumns:
 def parse_score(text: str) -> float | None:
     """解析军事榜的 K/M 缩写；读不出的分数保持 None。
 
+    **换算本身下沉到了 `domain.quantities.parse_quantity`**，军力榜与战报的
+    「获得资源」共用同一份。两份实现迟早分家，而分家那天不会有人发现：两边都
+    「读出了数」，只是其中一边读错了三个数量级。
+
     ⚠️ **换算必须走 `Decimal`，不能写 `float("64.96") * 1000`。** 后者给出
     `64959.99999999999`——`64.96` 这个十进制小数在二进制里没有精确表示，乘完
     误差就露出来了。榜上读到的原文是 `64.96K`，页面上显示成一串小数尾巴，
@@ -77,20 +81,22 @@ def parse_score(text: str) -> float | None:
     64960.0——十进制字面量按十进制乘，误差根本不产生。
 
     ⚠️ **不要改成「乘完取整」。** 榜上的 K 值只到两位小数（最小刻度 0.01K = 10）、
-    M 值同样两位（0.01M = 10000），取整到个位对这两种确实无害；但这条正则
-    **也认没有单位的裸数**（`(\\d+(?:\\.\\d+)?)\\s*([KM])?`），而那一支取整就会把
-    `1.5` 抹成 `2`。`Decimal` 对三种单位一视同仁地精确，不需要靠「最小刻度」
-    这个前提兜底。
+    M 值同样两位（0.01M = 10000），取整到个位对这两种确实无害；但解析器
+    **也认没有单位的裸数**，而那一支取整就会把 `1.5` 抹成 `2`。`Decimal` 对
+    三种单位一视同仁地精确，不需要靠「最小刻度」这个前提兜底。
 
     插值产生的 `.5`（`domain.ranking.interpolate_scores` 取中点）是**合法值**，
     不是这里的误差，别顺手一起抹掉。
+
+    下沉之后多认两种写法，两种都是**扩张**而不是改口径：`B` 后缀（榜上迟早
+    出现，缺一档的下场是整串判为读不出然后静默丢掉），以及千分位分隔的整数
+    （`5.388.122` = 5388122，判据见 `domain.quantities` 模块头）。
+
+    这里仍旧交 `float`：`bot_targets.military_score` 是 `Float` 列，而插值出来的
+    半数要留住，换成整数会把它抹掉。
     """
-    compact = text.strip().upper().replace(",", "")
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KM])?", compact)
-    if match is None:
-        return None
-    scale = {"K": 1_000, "M": 1_000_000, None: 1}[match.group(2)]
-    return float(Decimal(match.group(1)) * scale)
+    quantity = parse_quantity(text)
+    return None if quantity is None else float(quantity.value)
 
 
 def release_stuck_mouse(driver: LiveDriver) -> None:

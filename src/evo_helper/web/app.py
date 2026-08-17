@@ -24,6 +24,7 @@ from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFre
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.config import Settings
+from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_span
 from evo_helper.domain.models import Coordinate, CoordinateRange
 from evo_helper.domain.records import TARGET_KIND_LABELS
@@ -52,6 +53,8 @@ from .display import (
     STATUS_TONES,
     TARGET_KIND_GLYPHS,
     TARGET_KIND_TONES,
+    resource_amount_text,
+    resource_precision_hint,
 )
 
 # 模块级导入（而不是留在 `create_persistent_app` 里）：`register_mission_routes`
@@ -957,6 +960,11 @@ def create_app(
                 "mission_kind_labels": MISSION_KIND_LABELS,
                 "mission_kind_tones": MISSION_KIND_TONES,
                 "mission_kind_glyphs": MISSION_KIND_GLYPHS,
+                # 收获那一行。槽位到名字的翻译**只在这里发生**：库里存的是位置，
+                # 名字是解释（`domain.battle_resources` 模块头）。
+                "resource_label": slot_label,
+                "resource_amount_text": resource_amount_text,
+                "resource_precision_hint": resource_precision_hint,
                 "kind_url": lambda value: keep(kind=value),
                 "clear_date_url": keep(date=""),
                 "clear_target_url": keep(target_start="", target_end=""),

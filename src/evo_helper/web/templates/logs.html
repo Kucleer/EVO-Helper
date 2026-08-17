@@ -216,6 +216,31 @@
               就是几 MB 的首屏。有图才出现这一行：没图时摆一个点开是 404 的链接，
               比没有链接更难排查。
             #}
+            {#
+              这一发的收获：战报「获得资源」那 12 格里非零的几格。
+
+              ⚠️ **近似值一律带「约」。** 画面上超过一千的值是缩写显示的
+              （`928K`），真值取不回来了。用户接受这个精度（口径 2026-08-17），
+              但把近似值显示得像精确读数是另一回事——仓库里已有先例
+              （`military_score_estimated`）。误差范围放在 title 上，
+              因为它按有效位数算，`928K` 是 ±500 而 `501.1K` 是 ±50。
+
+              ⚠️ **名字还没逐格核对过，所以显示「第 N 格」。** 库里存的是槽位，
+              对照表（`domain.battle_resources.SLOT_LABELS`）填上那天，这里
+              连历史数据一起改口，不用动库。编一个名字挂上去是这一块最坏的
+              失败方式：数字都对，只是安在了别的资源名下。
+
+              没有条目就什么都不显示：库里只存非零的格子，「没有行」就是
+              「这一发没捞着东西」，为它专门摆一句话只会挤占真正有收获的那几行。
+            #}
+            {% if entry.resources %}
+              <div class="muted" style="font-size:11px">
+                收获
+                {%- for item in entry.resources %}
+                  <span title="{{ resource_precision_hint(item) }}">{{ resource_label(item.slot) }} {{ resource_amount_text(item) }}</span>{% if not loop.last %} · {% endif %}
+                {%- endfor %}
+              </div>
+            {% endif %}
             {% if entry.report_screenshot %}
               <div style="font-size:11px">
                 <a href="/api/reports/{{ entry.report_id }}/screenshot" target="_blank" rel="noopener">查看战报截图</a>
