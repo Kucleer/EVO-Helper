@@ -15,10 +15,9 @@ START / DISCONNECTED，各有各的分支。所以 UNKNOWN 基本只剩「浮层
 
 from __future__ import annotations
 
+from evo_helper.game.overlay import OVERLAY_CLOSE_ATTEMPTS, OVERLAY_CLOSE_BUTTON
 from evo_helper.game.session_keeper import ReconnectOutcome, ScreenState
 from evo_helper.tools.scan_coordinates import (
-    OVERLAY_CLOSE_ATTEMPTS,
-    OVERLAY_CLOSE_BUTTON,
     dismiss_overlays_if_unrecognised,
     restart_if_still_unusable,
 )
