@@ -21,6 +21,7 @@ from evo_helper.web.display import (
     missing_backfill_phases,
     missing_intel_labels,
     missing_status_tones,
+    settled_score,
 )
 
 
@@ -112,3 +113,40 @@ def test_no_two_backfill_phases_share_a_glyph() -> None:
 def test_every_backfill_chain_has_a_label() -> None:
     """页面上那个下拉框按它建，漏一条就等于那条链路在页面上补不了。"""
     assert missing_backfill_kind_labels() == []
+
+
+def test_a_historic_float_tail_is_settled_before_it_reaches_the_page() -> None:
+    """⚠️ **恰好相等，不许用 `pytest.approx`。**
+
+    这三个是 2026-08-17 军力榜页面上原样出现的值。源头已经在
+    `tools.ranking_scan.parse_score` 修掉（改走 `Decimal`），但库里存着的
+    那一批只能在读出来的这一步收——用户口径：开发过程不碰生产库，历史值不许
+    UPDATE，重采时自然覆盖。
+    """
+    assert settled_score(64959.99999999999) == 64960
+    assert settled_score(64260.00000000001) == 64260
+    assert settled_score(64180.00000000001) == 64180
+
+
+def test_the_m_scale_tail_is_settled_too() -> None:
+    """M 量级的误差绝对值大得多（1e-7 而不是 1e-11），两位小数照样收得住。
+
+    钉住它是因为「按固定小数位取整」很容易只在 K 量级上验过就收工。
+    """
+    assert settled_score(404169999.99999994) == 404170000
+
+
+def test_an_interpolated_half_survives_the_settling() -> None:
+    """⚠️ **`.5` 不许被一起抹掉。**
+
+    `domain.ranking.interpolate_scores` 取的中点在两个已知值之和为奇数时必然
+    带 `.5`（页面上的 `72252.5 (估算)` 就是），那是合法值不是误差。
+    收敛到整数位能让脏值更好看，代价是把这个真值报错——所以刻度停在两位小数。
+    """
+    assert settled_score(72252.5) == 72252.5
+    assert settled_score(64252.5) == 64252.5
+
+
+def test_an_unknown_score_stays_unknown() -> None:
+    """**猜出来的数不许长得像量出来的**，`None` 更不许变成 `0`。"""
+    assert settled_score(None) is None

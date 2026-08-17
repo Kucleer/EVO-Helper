@@ -16,6 +16,7 @@ from evo_helper.storage.military_rankings import (
     BoardWindow,
     MilitaryRankingRepository,
 )
+from evo_helper.web.display import settled_score
 
 
 class RankingEntryIn(BaseModel):
@@ -114,7 +115,10 @@ def register_ranking_routes(app: FastAPI, session_factory: sessionmaker[Session]
                 {
                     "rank": row.rank,
                     "name": row.name,
-                    "score": row.score,
+                    # **收敛一次再交给页面。** 库里存着一批带浮点尾巴的历史值
+                    # （`64959.99999999999`），源头已在 `parse_score` 修掉，但
+                    # 历史值不许 UPDATE 生产库，只能在这里收——见 `settled_score`。
+                    "score": settled_score(row.score),
                     # 行级的「这条数据是什么时候读到的」。页面上按 UTC+8 显示。
                     "observed_at_utc": row.observed_at_utc,
                     "coordinate": str(row.coordinate),

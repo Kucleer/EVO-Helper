@@ -88,13 +88,14 @@ from evo_helper.domain.scheduler import (
     looks_like_an_environment_fault,
     quota_day_start_utc,
     tasks_failing_together,
+    within_schedule_window,
 )
 from evo_helper.domain.target_order import (
     TOP_BY_MILITARY,
     ScoredTarget,
     strongest_then_nearest,
 )
-from evo_helper.infrastructure.system_log import child_environment
+from evo_helper.infrastructure.system_log import child_environment, record_system_log
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -232,6 +233,15 @@ class MissionScheduler:
         #: 每个任务连着吃了几次「环境故障」豁免，上限 `MAX_ENVIRONMENT_EXEMPTIONS`。
         #: 任何一个任务跑出退出码 0 就整个清空。
         self._exemptions: dict[int, int] = {}
+        #: 每个**配了定时窗口的**任务上一 tick 的窗口判定（True = 在窗口里）。
+        #: 只为「到点开 / 到点关各写一条 `system_log`」而存在。
+        #:
+        #: **只记在内存里**，理由和上面那两份一样：真正的判据是每 tick 现算的
+        #: （`domain.scheduler.within_schedule_window`），这里记的只是「上一次
+        #: 我说的是什么」，好让日志只在**变化**时写一条而不是每秒刷一条。
+        #: 控制台重启后它是空的，于是重复写一条——那是可以接受的代价
+        #: （用户口径 2026-08-17），换来的是判定本身不依赖任何内存状态。
+        self._schedule_window_open: dict[int, bool] = {}
         #: 「跑着不动」的看门狗。**惰性建**：组装点
         #: （`web.app.create_persistent_app`）只往这里传 repository，所以默认那
         #: 一个要自己从 repository 摸出 session 工厂，而摸这一下必须等到真的要用
@@ -740,6 +750,7 @@ class MissionScheduler:
         tasks = self._repository.mission_tasks()
         config = self._repository.scheduler_config()
         snapshots = self._snapshots(tasks, config)
+        self._log_schedule_window_changes(snapshots, now)
         facts = self._facts(snapshots, config, now)
         running = self._supervisor.running
         batch_decision = self._military_batch_decision(snapshots, facts, running)
@@ -765,6 +776,62 @@ class MissionScheduler:
         if decision.action is Action.IDLE or decision.task is None:
             return False
         return self._act(decision, facts)
+
+    def _log_schedule_window_changes(
+        self, snapshots: Sequence[TaskSnapshot], now: datetime
+    ) -> None:
+        """定时窗口开合的那一刻各写一条 `system_log`。
+
+        **只在判定发生变化时写一条**，不是每 tick 刷一条：tick 每秒一次，刷起来
+        一晚上就是几万行，真正要看的那两条会被淹掉。
+
+        ⚠️ 这里**只写日志，不写库**。到点开、到点关都不去碰 `mission_tasks.enabled`
+        ——那一列是用户的意志，定时器改它会造成「我手动开的被悄悄关掉」，而且事后
+        分不清是谁关的（见 `domain.scheduler.within_schedule_window`）。所以这个
+        方法整个是只读的，删掉它不会改变调度器的任何一个决定。
+
+        没配窗口的任务一条都不记：它们永远在窗口里，记了只是给每次重启多刷几行。
+        任务被删掉、或者窗口被清空时把记忆一起丢掉，否则重新配上窗口的那一下
+        会被当成「没变过」而漏掉一条。
+
+        **本次运行第一次看到某个任务时也记一条**，措辞与「到点开 / 到点关」分开
+        （`_window_message`）。这一条不是变化，是现状——控制台重启之后翻日志的人
+        需要知道「这一轮开始的时候它是开还是关」，否则窗口早在上次运行里就关掉的
+        任务在新一轮日志里一个字都没有，看起来又成了「不动而不说原因」。
+        """
+        windowed = {
+            task.task_id: task
+            for task in snapshots
+            if task.enabled_from_utc is not None or task.enabled_until_utc is not None
+        }
+        for task_id in [known for known in self._schedule_window_open if known not in windowed]:
+            del self._schedule_window_open[task_id]
+        for task_id, task in windowed.items():
+            open_now = within_schedule_window(task, now)
+            previous = self._schedule_window_open.get(task_id)
+            if previous == open_now:
+                continue
+            self._schedule_window_open[task_id] = open_now
+            record_system_log(
+                "INFO",
+                "application.mission_scheduler",
+                _window_message(task, open_now=open_now, first_look=previous is None),
+                payload={
+                    "task_id": task_id,
+                    "mission_kind": task.kind.value,
+                    "window_open": open_now,
+                    "first_look": previous is None,
+                    "enabled_from_utc": (
+                        None if task.enabled_from_utc is None else task.enabled_from_utc.isoformat()
+                    ),
+                    "enabled_until_utc": (
+                        None
+                        if task.enabled_until_utc is None
+                        else task.enabled_until_utc.isoformat()
+                    ),
+                },
+                logged_at_utc=now,
+            )
 
     def _act(self, decision: Decision, facts: SchedulerFacts) -> bool:
         """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
@@ -827,8 +894,15 @@ class MissionScheduler:
         try:
             batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
             if task.kind is MissionKind.RANKING:
+                # 两个上限，取**小**的那个：任务上配的「扫描数量」是用户给这条
+                # 链路划的天花板（留空 = 不划），军力批次要的 `top_n` 是「这一批
+                # 攻击需要多少个目标」。取大的会越过用户划的线，取任务那个又会
+                # 让批次采不满——`min` 是唯一同时守得住两条的。
                 command = ranking_command(
-                    bot_limit=None if batch_task is None else _bot_top_n(batch_task.params_json)
+                    bot_limit=_smallest_limit(
+                        _ranking_bot_limit(row.params_json),
+                        None if batch_task is None else _bot_top_n(batch_task.params_json),
+                    )
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
                 command = self._military_command(row, max_dispatches=facts.free_lines)
@@ -1399,7 +1473,7 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.RANKING:
-            return ranking_command()
+            return ranking_command(bot_limit=_ranking_bot_limit(params_json))
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
@@ -1451,7 +1525,27 @@ def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: i
         origin=origin,
         fleet_lines=fleet_lines,
         disabled_reason=row.disabled_reason,
+        enabled_from_utc=row.enabled_from_utc,
+        enabled_until_utc=row.enabled_until_utc,
     )
+
+
+def _window_message(task: TaskSnapshot, *, open_now: bool, first_look: bool) -> str:
+    """定时窗口那条 `system_log` 的正文。
+
+    「本次运行第一次看到」和「到点变了」措辞必须分开。合成一句的话，一个窗口从头
+    到尾都开着的任务，在控制台每次重启时都会留下一条「到达定时开启时刻」——
+    而那一刻什么都没发生。事后按这句话去对时间，对出来的是一个假的开启时刻。
+    """
+    name = task.name or task.kind.value
+    if first_look:
+        state = "在定时窗口内，照常参与调度" if open_now else "不在定时窗口内，暂不开新的一轮"
+        return f"任务「{name}」{state}"
+    if open_now:
+        return f"任务「{name}」到达定时开启时刻，恢复参与调度"
+    # 「不打断」必须写进这句话：日志里只说「已关闭」而实机上还有个 runner 在点
+    # 鼠标，读日志的人会以为进程漏杀了。
+    return f"任务「{name}」已过定时关闭时刻，不再开新的一轮（正在跑的那一轮不打断）"
 
 
 def _participating(task: TaskSnapshot) -> bool:
@@ -1485,6 +1579,42 @@ def _int_param(data: dict[str, Any], name: str) -> int:
 
 def _pirate_radius(raw: str) -> int:
     return _int_param(_params(raw), "radius")
+
+
+def _ranking_bot_limit(raw: str) -> int | None:
+    """军力榜这一趟最多采几个 bot。**留空 = 全扫**，也就是保持原来的行为。
+
+    用户口径（2026-08-17）：「军力扫描增加扫描数量范围，为空则全扫」。
+
+    ⚠️ **「没配」和「配了 0」必须是两回事。** 空框在页面上什么都不送
+    （`missions.html` 的 `.mission-param` 处理器不把空框往上送），于是这里
+    读到的是 `None`——那是「不划线」。而 `0` 是一个用户真的敲进去的数字，
+    它的意思只可能是「一个都别扫」，而那等于把这条链路关掉：要关掉有复选框，
+    不该用一个看起来像范围的数字表达。所以 `0` 与负数一律当场拒掉，
+    让页面 400 报出来，而不是悄悄跑一趟什么都不采的采集。
+
+    没有为它加数据库列：它和 `galaxy` / `first_system` 一样，是任务参数，
+    住在 `mission_tasks.params_json` 里（见 `storage.models` 那一行的注释）。
+    """
+    value = _params(raw).get("bot_limit")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("扫描数量必须是整数；要全扫就把它留空")
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"扫描数量不是整数：{value!r}") from exc
+    if limit < 1:
+        raise MissionParamError("扫描数量至少是 1；要全扫就把它留空，别填 0")
+    return limit
+
+
+def _smallest_limit(*limits: int | None) -> int | None:
+    """几个上限里最紧的那个；一个都没有就是「不设限」。"""
+    values = [limit for limit in limits if limit is not None]
+    return min(values) if values else None
 
 
 def _bot_by_military(raw: str) -> bool:
