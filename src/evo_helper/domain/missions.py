@@ -34,7 +34,36 @@ MAX_COMMAND_CHARS = 30000
 
 
 class MissionParamError(ValueError):
-    """任务参数不合格。调度器据此拒绝启动，而不是拉起一个注定空转的进程。"""
+    """任务参数不合格。调度器据此拒绝启动，而不是拉起一个注定空转的进程。
+
+    ⚠️ **它的后果是「自动停用」，不只是「这一轮不跑」。**
+    `application.mission_scheduler` 接住它之后会调 `repository.disable_mission_task`：
+    任务被停用、挂上 `disabled_reason`，而调度判据认的是
+    `enabled and disabled_reason is None`——也就是说**用户不去页面上点一次「恢复」，
+    它就永远不会再跑**（PR #161 只让「空闲航线不足」那一类自动恢复，其余仍需人工）。
+
+    所以这个异常只许表达「**配置填错了**，重试一百次也是同一个下场」。任何
+    「这会儿暂时没活干」都必须走 `MissionIdle`，否则一次正常的间歇会把整条链路
+    静默地关掉一整夜。
+    """
+
+
+class MissionIdle(Exception):
+    """这一轮没活干。**不是错误**，绝不能让它把任务停用。
+
+    典型的一档：军力优先模式下，候选池里一个读数新鲜的目标都没有
+    （`domain.target_order.fresh_targets` 全滤光了）。那时正确的动作是干净地
+    什么都不做，把鼠标让给调度器的填空隙机制去跑军力榜扫描，把池子刷新——
+    而不是拿旧读数去打，更不是把任务关掉。
+
+    它刻意**不继承** `MissionParamError`（也不继承 `ValueError`）：继承的话，
+    现有那几处 `except MissionParamError` 会顺手把它一起接住，接住之后干的正是
+    `disable_mission_task`，等于这个类型白分了。
+
+    正常情况下它甚至不该被抛出来：`domain.scheduler.has_work` 早在派遣之前就靠
+    `targets_remaining` 把这条链路判成「没活干」了。它兜的是那之间的时间差
+    ——事实是在锁外读的，读完到真的组命令行之间，最后一个新鲜目标可能刚好过期。
+    """
 
 
 # ⚠️ 这里原先有一道临时闸门 `check_origin_dispatchable`：助手还不会在游戏里切换

@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.target_order import (
+    DEFAULT_SCORE_MAX_AGE,
     TOP_BY_MILITARY,
     ScoredTarget,
+    fresh_targets,
+    score_is_fresh,
     strongest_first,
     strongest_then_nearest,
 )
 
 HOME = Coordinate(2, 137, 18)
+NOW = datetime(2026, 8, 17, 5, 28, tzinfo=UTC)
+TWO_HOURS = timedelta(hours=2)
 
 
-def _target(system: int, score: float | None, *, galaxy: int = 2) -> ScoredTarget:
-    return ScoredTarget(Coordinate(galaxy, system, 5), score)
+def _target(
+    system: int,
+    score: float | None,
+    *,
+    galaxy: int = 2,
+    scanned_at: datetime | None = None,
+) -> ScoredTarget:
+    return ScoredTarget(Coordinate(galaxy, system, 5), score, scanned_at)
 
 
 # -- 两步的地位完全不同 --------------------------------------------------------
@@ -135,3 +148,67 @@ def test_no_cap_keeps_even_the_strongest() -> None:
     ordered = strongest_then_nearest([_target(140, 1_773_000.0)], HOME)
 
     assert [item.system for item in ordered] == [140]
+
+
+# -- 读数的新鲜度 --------------------------------------------------------------
+
+
+def test_a_reading_inside_the_window_is_fresh() -> None:
+    """有效期之内的读数照打。边界取「小于」：正好等于有效期算超期。"""
+    just_read = _target(140, 9_000.0, scanned_at=NOW - timedelta(minutes=1))
+    right_on_the_line = _target(141, 9_000.0, scanned_at=NOW - TWO_HOURS)
+
+    assert score_is_fresh(just_read, now=NOW, max_age=TWO_HOURS) is True
+    assert score_is_fresh(right_on_the_line, now=NOW, max_age=TWO_HOURS) is False
+
+
+def test_a_reading_older_than_the_window_is_not_fresh() -> None:
+    """实机 2026-08-17：`4:293:6` 的读数是 01:50 UTC，攻击发生在 05:28——3.6 小时。
+
+    用户设的是 1 小时，而那一版只在日志里记一句就照样派了出去。
+    """
+    stale = _target(293, 9_000.0, galaxy=4, scanned_at=datetime(2026, 8, 17, 1, 50, tzinfo=UTC))
+
+    assert score_is_fresh(stale, now=NOW, max_age=timedelta(hours=1)) is False
+
+
+def test_a_target_that_was_never_read_counts_as_stale() -> None:
+    """⚠️ **`military_score_at_utc is None` 一律算超期。「从没读过」不是「刚读的」。**
+
+    把它当成新鲜，等于让一个从来没上过军力榜的 bot 顶着「读数没问题」进池——
+    而军力优先这一支的全部前提就是那个读数。
+
+    ⚠️ 这一条和 `test_the_cap_never_drops_a_target_whose_score_is_unknown`
+    **不矛盾，也不能互相顶替**：那一条说的是 `military_score is None`（不知道多强，
+    按次序排最后），这一条说的是 `military_score_at_utc is None`（从没读过，
+    连「什么时候不知道的」都没有）。两个 None 在库里是两列。
+    """
+    assert score_is_fresh(_target(140, None), now=NOW, max_age=TWO_HOURS) is False
+    # 分数读到过、时刻没有，同样算超期：判据只看时刻那一列。
+    assert score_is_fresh(_target(141, 9_000.0), now=NOW, max_age=TWO_HOURS) is False
+
+
+def test_filtering_keeps_the_order_it_was_given() -> None:
+    """新鲜度只做筛，不做排。排序是后面两步（军力截断、距离）的事。"""
+    kept = fresh_targets(
+        [
+            _target(400, 100.0, scanned_at=NOW),
+            _target(140, 9_000.0, scanned_at=NOW - timedelta(days=3)),
+            _target(200, 8_000.0, scanned_at=NOW),
+        ],
+        now=NOW,
+        max_age=TWO_HOURS,
+    )
+
+    assert [item.coordinate.system for item in kept] == [400, 200]
+
+
+def test_the_default_window_is_about_twice_one_scan_round() -> None:
+    """⚠️ **默认取「一轮扫描时长的约 2 倍」，不是 1 小时。**
+
+    实测一轮军力榜扫描约 61 分钟（1000 个 · 8.7--16.3 个/分）。军力榜按军力降序排、
+    扫描也从上往下读，所以一轮扫完之后先读到的（军力最高的）读数最旧。有效期若卡在
+    「刚好一轮时长」附近，任何时刻能通过筛选的恰恰是这一批里**军力最低**的那些
+    ——而「军力优先」正是为了打高军力的。改回 1 小时会把这个模式的意义抵消掉。
+    """
+    assert DEFAULT_SCORE_MAX_AGE == timedelta(hours=2)

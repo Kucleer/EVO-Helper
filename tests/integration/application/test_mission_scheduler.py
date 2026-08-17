@@ -12,11 +12,13 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
 from evo_helper.application.mission_progress import STALL_TIMEOUT, ProgressReading
 from evo_helper.application.mission_scheduler import (
     MAX_CONSECUTIVE_FAILURES,
     MAX_ENVIRONMENT_EXEMPTIONS,
+    STALE_POOL_WARNING_AFTER,
     MissionScheduler,
 )
 from evo_helper.application.mission_supervisor import MissionExit, StopReason
@@ -92,8 +94,19 @@ def disable(repository: SqlAlchemyRepository, kind: MissionKind) -> None:
 
 
 def add_bot_target(  # type: ignore[no-untyped-def]
-    session_factory, coordinate: Coordinate, *, military_score: float | None = None
+    session_factory,
+    coordinate: Coordinate,
+    *,
+    military_score: float | None = None,
+    scanned_at: datetime | None = NOW,
 ) -> None:
+    """往 `bot_targets` 里放一颗已记录的 bot。
+
+    `scanned_at` 就是库里那一列 `military_score_at_utc`（页面上叫「更新时间」），
+    **默认给「刚读到」**：军力优先那一支现在按它筛新鲜度，不给的话每颗目标都算
+    超期，于是每一条军力用例都会因为一个与它自己无关的理由变绿或变红。
+    要验超期就显式传一个旧时刻，要验「从没读过」就传 `None`。
+    """
     with session_factory() as session:
         session.add(
             orm.BotTargetRow(
@@ -103,8 +116,25 @@ def add_bot_target(  # type: ignore[no-untyped-def]
                 position=coordinate.position,
                 is_bot=True,
                 military_score=military_score,
+                military_score_at_utc=scanned_at,
             )
         )
+        session.commit()
+
+
+def rescan_bot_target(  # type: ignore[no-untyped-def]
+    session_factory, coordinate: Coordinate, *, scanned_at: datetime
+) -> None:
+    """模拟军力榜又把这一颗读了一遍：只动读取时刻那一列。"""
+    with session_factory() as session:
+        row = session.scalars(
+            select(orm.BotTargetRow).where(
+                orm.BotTargetRow.galaxy == coordinate.galaxy,
+                orm.BotTargetRow.system == coordinate.system,
+                orm.BotTargetRow.position == coordinate.position,
+            )
+        ).one()
+        row.military_score_at_utc = scanned_at
         session.commit()
 
 
@@ -1722,7 +1752,16 @@ def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[n
 def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """上限只挡「太强」，不挡「读不出来」——库里最多的正是没扫到过的那批。"""
+    """上限只挡「太强」，不挡「读不出来」——库里最多的正是没扫到过的那批。
+
+    ⚠️ 这里的 `2:140:5` 是「**榜单读到了这一行，但那一格的分数没解析出来**」：
+    `military_score` 为 None，而 `military_score_at_utc` 是刚才（`add_bot_target`
+    的默认值）。库里真有这种行——`save_ranking_targets` 明写着「军力值为 None 时
+    原样保存」，而它同时必须带一个非空的读取时刻。
+
+    「从没上过榜」是另一档（两列都为 None），那一档被新鲜度闸门挡在池外，
+    钉在 `test_a_target_never_seen_on_the_ranking_board_is_treated_as_stale`。
+    """
     add_bot_target(session_factory, Coordinate(2, 140, 5), military_score=None)
     add_bot_target(session_factory, Coordinate(2, 141, 6), military_score=1_773_000.0)
     enable(
@@ -1737,3 +1776,328 @@ def test_a_target_with_no_score_still_gets_into_the_pool_under_a_cap(  # type: i
     command = launcher.latest.command
     assert "2:140:5=BBB" in command
     assert not any(part.startswith("2:141:6") for part in command)
+
+
+# -- 军力读数的有效期 ----------------------------------------------------------
+#
+# 用户口径（2026-08-17）：「我配置了超过 1 小时要扫描军力，但是仍然获取了旧数据
+# 进行攻击」。这一节钉的是「超期的一律不打」，以及**它不许把任务弄停用**。
+#
+# 实机对照：目标 `4:293:6` 的读数是 01:50 UTC，攻击发生在 05:28 UTC——已经
+# 3.6 小时，而用户设的是 1 小时。旧实现只在日志里记一句「最旧读数 …」（说的还是
+# 整池里三天前的另一条），然后照样派了出去。
+
+BOT_BY_MILITARY_2H = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
+
+
+def test_a_target_whose_reading_expired_is_not_attacked(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """超期的那个再强也不打，读数新鲜的那个才打。
+
+    军力值是会变的（周一 UTC+0 刷新，平时也被别人打掉），所以「读到过」不够，
+    还得「读得够新」——否则派出去的那一发是照着一份已经不成立的军力算的。
+    """
+    stale = Coordinate(2, 140, 5)
+    fresh = Coordinate(2, 141, 6)
+    add_bot_target(
+        session_factory, stale, military_score=9_000.0, scanned_at=NOW - timedelta(hours=3)
+    )
+    add_bot_target(
+        session_factory, fresh, military_score=8_000.0, scanned_at=NOW - timedelta(hours=1)
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command)
+
+
+def test_the_old_parameter_name_still_sets_the_window(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """旧任务的 `params_json` 里存的还是 `rescan_after_hours`，得照样认。
+
+    生产库里已经存着一批带旧键的任务，而用户是自己重启 bat 升级的。读不出来的话
+    这一格会静默回落到默认的 2 小时——用户配的 1 小时被悄悄改宽了一倍，
+    而页面上看不出任何异常。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(minutes=90),
+    )
+    enable(
+        repository,
+        MissionKind.BOT,
+        params_json='{"by_military": true, "top_n": 2, "rescan_after_hours": 1}',
+    )
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    # 90 分钟 > 旧键写的 1 小时。按默认的 2 小时算的话它就该被派出去。
+    assert launcher.spawned == []
+
+
+def test_without_the_parameter_the_window_is_the_documented_default(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """没配就是 2 小时——一轮扫描时长的约 2 倍，理由写在 `DEFAULT_SCORE_MAX_AGE` 上。"""
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(minutes=90),
+    )
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 400, 6),
+        military_score=8_000.0,
+        scanned_at=NOW - timedelta(minutes=150),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:140:5=BBB" in command
+    assert not any(part.startswith("2:400:6") for part in command)
+
+
+def test_a_target_never_seen_on_the_ranking_board_is_treated_as_stale(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **`military_score_at_utc IS NULL` 一律算超期。「从没读过」不是「刚读的」。**
+
+    把 NULL 当成新鲜，等于让一个从来没上过军力榜的 bot 顶着「读数没问题」进池，
+    而军力优先这一支的全部前提就是那个读数。
+
+    代价说在明处：军力优先模式因此**不再攻击从未在榜单上见过的 bot**，那批目标
+    要等军力榜扫到才轮得到。区域攻击那一支不走这条闸门，不受影响。
+    """
+    never_read = Coordinate(2, 140, 5)
+    fresh = Coordinate(2, 400, 6)
+    add_bot_target(session_factory, never_read, military_score=None, scanned_at=None)
+    add_bot_target(session_factory, fresh, military_score=8_000.0, scanned_at=NOW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    # 近的那个反而没被打：`2:140` 比 `2:400` 近得多，若 NULL 被当成新鲜，
+    # 距离排序会把它排在前面，这条断言当场转红。
+    assert "2:400:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command)
+
+
+def test_the_freshness_filter_runs_before_the_top_n_cut(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **先滤新鲜度，再取前 N 名。反过来这一轮就一发都派不出去。**
+
+    这里 `top_n=2`，而军力最高的两个（9000 / 8000）全都超期。先取前 N 再滤的话，
+    池子里剩下的正好是空的；先滤再取，第三名 7000 顶上来。
+
+    这不是钻牛角尖：用户配的是「候选 500 名」，而前 500 里若大半超期，实际可打的
+    就寥寥无几，页面上却看不出任何差别。
+    """
+    old = timedelta(hours=5)
+    add_bot_target(
+        session_factory, Coordinate(2, 140, 5), military_score=9_000.0, scanned_at=NOW - old
+    )
+    add_bot_target(
+        session_factory, Coordinate(2, 141, 6), military_score=8_000.0, scanned_at=NOW - old
+    )
+    add_bot_target(session_factory, Coordinate(2, 142, 7), military_score=7_000.0, scanned_at=NOW)
+    add_bot_target(session_factory, Coordinate(2, 143, 8), military_score=6_000.0, scanned_at=NOW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.BOT]
+    command = launcher.latest.command
+    targets = command[command.index("--targets") + 1 : command.index("--origin")]
+    # 这组夹具只留一条空航线，所以只会派最近的那一个；关键是它来自「滤完之后的
+    # 前 2 名」（7000 / 6000），而不是空池。
+    assert targets == ["2:142:7=BBB"]
+
+
+def test_a_pool_where_everything_expired_never_disables_the_task(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **这一条最重要：「没有新鲜目标」是「暂时没活干」，不是错误。**
+
+    按 `MissionParamError` 抛出去的话，`_launch` 会调 `disable_mission_task`：
+    任务被停用、挂上 `disabled_reason`，而调度判据认的是
+    `enabled and disabled_reason is None`——用户不去页面点一次「恢复」，它就
+    **永远不再跑**。那比现在拿旧数据打糟得多。
+
+    连续失败也一个都不许涨：那个计数数的是「起来了却异常退出」的子进程，而这里
+    连进程都没起。涨了会和 #157（环境条件按 75 收场）、#161（航线不足自动恢复）
+    那两套记账打架。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    add_bot_target(session_factory, Coordinate(2, 141, 6), military_score=8_000.0, scanned_at=None)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+
+    for _ in range(5):
+        scheduler.tick()
+
+    row = task(repository, MissionKind.BOT)
+    assert row.disabled_reason is None, "池子全超期不许把任务停用"
+    assert row.consecutive_failures == 0, "一个子进程都没起，不许记失败"
+    assert row.enabled is True
+    assert launcher.spawned == [], "更不许拿超期读数派出去"
+
+
+def test_a_stale_pool_lets_the_ranking_scan_take_the_mouse(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """池子全超期时这条链路让位，调度器自己去跑军力榜把池子刷新。
+
+    ⚠️ **刷新仍然只能由调度器发起。** 攻击链路自己去起 RANKING 的话，两条链路
+    会争同一只鼠标——那正是原注释里唯一站得住的那半句，这一版一个字都没改它。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository, MissionKind.RANKING)
+    scheduler.start()
+    scheduler.tick()
+
+    assert launcher.kinds == [MissionKind.RANKING]
+
+
+class RecordingLog:
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, str, dict[str, object]]] = []
+
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+        self.entries.append((level, message, dict(payload or {})))
+
+    def warnings(self) -> list[tuple[str, str, dict[str, object]]]:
+        return [item for item in self.entries if item[0] == "WARNING"]
+
+
+@pytest.fixture
+def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
+    log = RecordingLog()
+    monkeypatch.setattr(
+        "evo_helper.application.mission_scheduler.record_system_log", log, raising=True
+    )
+    return log
+
+
+def test_a_pool_starved_for_long_enough_writes_a_warning(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, clock, recorded: RecordingLog
+) -> None:
+    """连着筛不出新鲜目标要留下一条 WARNING，否则攻击就是**悄悄**停摆的。
+
+    新鲜度闸门把「全超期」变成了「此刻没活干」——那是对的，调度器会去跑军力榜。
+    可如果扫描本身跟不上有效期（扫得太慢、榜单读不出来、有效期被调得比一轮扫描
+    还短），这个状态会一直维持，而页面上只有一句不痛不痒的状态。
+
+    ⚠️ **不能每 tick 刷一条**：tick 每秒一次，一晚上就是几万行，真正要看的那条
+    会被淹掉。所以先连 tick 五次确认一条都没写，再把时钟推过那道门槛。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+
+    for _ in range(5):
+        scheduler.tick()
+    assert recorded.warnings() == [], "刚开始那几秒不该报，榜单写第一屏时本来就会短暂全超期"
+
+    clock.now = NOW + STALE_POOL_WARNING_AFTER
+    scheduler.tick()
+
+    assert len(recorded.warnings()) == 1
+    _, message, payload = recorded.warnings()[0]
+    assert "军力候选池" in message
+    assert "军力榜扫描可能跟不上" in message
+    assert payload["attackable"] == 1
+    assert payload["fresh"] == 0
+    assert payload["score_max_age_hours"] == 2.0
+
+    # 再往前走一点点还不到下一次的间隔，不许补第二条。
+    clock.now = NOW + STALE_POOL_WARNING_AFTER + timedelta(minutes=1)
+    scheduler.tick()
+    assert len(recorded.warnings()) == 1
+
+
+def test_a_pool_that_recovered_stops_warning(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, clock, recorded: RecordingLog
+) -> None:
+    """扫描把池子刷新之后就该闭嘴，而且那一段的账要清掉。
+
+    不清的话，下一次全超期会立刻按「已经憋了很久」补一条 WARNING——而那一刻其实
+    才刚开始，报出来的时长是假的。
+    """
+    stale = Coordinate(2, 140, 5)
+    add_bot_target(
+        session_factory, stale, military_score=9_000.0, scanned_at=NOW - timedelta(days=3)
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+    clock.now = NOW + STALE_POOL_WARNING_AFTER
+    scheduler.tick()
+    assert len(recorded.warnings()) == 1
+
+    # 军力榜采到了新读数：池子恢复，这一段的账该清掉。
+    rescan_bot_target(session_factory, stale, scanned_at=clock.now)
+    scheduler.tick()
+
+    # 三天后它又超期了——但那是**新的一段**，刚开始，不许立刻按上一段补一条。
+    # 账没清干净的话，这一 tick 会看到「自三天前起一直饿着」而当场再报。
+    clock.now += timedelta(days=3)
+    scheduler.tick()
+
+    assert len(recorded.warnings()) == 1
+
+
+def test_an_empty_pool_is_never_reported_as_a_starved_one(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, clock, recorded: RecordingLog
+) -> None:
+    """⚠️ **「一个候选都没有」和「候选全超期」是两回事，只有后者该报。**
+
+    前者是完全正常的一档：已知 bot 全在 24 小时冷却里或还在飞。拿它去报
+    「军力榜扫描跟不上有效期」是句假话，而假警报响几次之后就没人看了。
+    """
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+
+    clock.now = NOW + STALE_POOL_WARNING_AFTER * 3
+    for _ in range(5):
+        scheduler.tick()
+
+    assert recorded.warnings() == []
