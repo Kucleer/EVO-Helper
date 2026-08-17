@@ -910,13 +910,20 @@ def test_a_target_that_got_its_attack_report_no_longer_counts_as_remaining(  # t
     assert launcher.kinds == [MissionKind.SCAN]
 
 
-def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type: ignore[no-untyped-def]
+def test_a_target_whose_shot_was_a_draw_no_longer_counts_as_remaining(  # type: ignore[no-untyped-def]
     repository, launcher, clock, run_id, session_factory
 ) -> None:
-    """平局的战报说明该**再打一发**，不说明这一轮走完了。
+    """平局的战报说明这一轮**走完了**，和打赢打输一样。
 
-    把平局当成完成，调度器会在还欠着补刀的状态下宣布 bot 这一轮跑完、
-    再也不起这条链路——而用户口径明写着「平局则继续进行攻击」。
+    这条原先叫 `test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining`，
+    钉的是相反的口径（平局 → 还欠一发补刀 → 调度器要再起 bot）。用户口径
+    （2026-08-17）：「bot 攻击移除平局再打一次机制」，于是改钉新口径而不是删掉
+    ——删掉的话，重打被接回去时调度器这一层没有任何守卫拦得住，而复发的样子是
+    这条链路每个平局目标都多烧一条航线。
+
+    ⚠️ 这里验的是**范围模式**（`BOT_RANGE`）。军力优先那一侧走
+    `_military_candidates`，同一条判据但另一段代码，守卫是本文件的
+    `test_the_military_pool_does_not_re_pick_a_target_that_drew`。
     """
     from evo_helper.domain.battle_outcome import OUTCOME_DRAW
 
@@ -942,7 +949,8 @@ def test_a_target_whose_last_shot_was_a_draw_still_counts_as_remaining(  # type:
 
     scheduler.tick()
 
-    assert launcher.kinds == [MissionKind.BOT]
+    # 这个范围里就这一个 bot，它走完了 → bot 没有剩余目标，调度器不该再起它。
+    assert launcher.kinds == []
 
 
 # -- 孤儿 ----------------------------------------------------------------------
@@ -1640,6 +1648,47 @@ def test_military_pool_skips_targets_attacked_within_the_last_24_hours(  # type:
         dispatched_at=NOW - timedelta(hours=23),
         flight=timedelta(minutes=1),
     )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command)
+
+
+def test_the_military_pool_does_not_re_pick_a_target_that_drew(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """**军力优先这一侧也不再补刀平局。**
+
+    用户口径（2026-08-17）：「bot 攻击移除平局再打一次机制」。范围模式那一条在
+    `test_a_target_whose_shot_was_a_draw_no_longer_counts_as_remaining`，
+    这一条守的是另一半——两种模式共用 `domain.bot_round.phase_of`，但各有各的
+    候选池代码（`_bot_remaining` / `_military_candidates`），只验一边会漏。
+
+    ⚠️ **那一发刻意放在 24 小时以外。** 24 小时内的目标本来就被
+    `attacked_bot_targets_since` 挡掉，无论平局与否——拿那种目标来验，
+    这条用例在旧规则下也是绿的，什么都守不住。放到 25 小时以外，
+    唯一还拦得住它的就只剩 `phase_of` 那一条。
+    """
+    from evo_helper.domain.battle_outcome import OUTCOME_DRAW
+
+    drew = Coordinate(2, 140, 5)
+    untouched = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, drew, military_score=9_000.0)
+    add_bot_target(session_factory, untouched, military_score=8_000.0)
+    dispatch_id = dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=drew,
+        dispatched_at=NOW - timedelta(hours=25),
+        preset_name=BOT_ATTACK_PRESET,
+        flight=timedelta(minutes=1),
+    )
+    attach_report(session_factory, dispatch_id, drew, NOW - timedelta(hours=24), OUTCOME_DRAW)
     enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
     only_gap_filler(repository)
     scheduler.start()

@@ -539,6 +539,109 @@ def test_an_unknown_kind_is_a_404(console: Console) -> None:
     assert console.client.patch("/api/missions/9999", json={"enabled": True}).status_code == 404
 
 
+# -- 定时开启 / 定时关闭 --------------------------------------------------------
+#
+# 用户口径（2026-08-17）：每个任务可以设一个开启时刻和一个关闭时刻，到点自动生效。
+# 绝对时刻、一次性。页面上填的是 **UTC+8** 的墙上时钟，库里存 UTC。
+
+
+def test_a_schedule_window_round_trips_through_the_api(console: Console) -> None:
+    """页面送带 `+08:00` 的时刻，接口回的是同一时刻的 UTC 写法。
+
+    ⚠️ 这里刻意用 **UTC+8 的 08:00**（= UTC 前一天 00:00）：它跨了日期边界，
+    所以「偏移量被当成装饰品直接丢掉」那种错在这一条上必然露馅——丢掉的话回来的
+    是同一天的 08:00，而正确答案是前一天的 00:00。
+    """
+    response = console.patch("BOT", {"enabled_from": "2026-08-17T08:00:00+08:00"})
+
+    assert response.status_code == 200, response.text
+    assert console.task("BOT")["enabled_from_utc"] == "2026-08-17T00:00:00Z"
+
+
+def test_a_moment_without_a_timezone_is_refused(console: Console) -> None:
+    """不带时区一律 400。
+
+    服务端替它猜一个的代价正好是 8 小时——一个「说好 22 点开、实际 14 点就开了」
+    的错，且全程不报任何异常。本仓库已经被时区坑过三次。
+    """
+    response = console.patch("BOT", {"enabled_from": "2026-08-17T08:00:00"})
+
+    assert response.status_code == 400, response.text
+    assert "时区" in response.json()["detail"]
+
+
+def test_clearing_one_end_leaves_the_other_end_alone(console: Console) -> None:
+    """空串是「把这一端退回不限」，而且**只动这一端**。
+
+    两端合起来存的话，只清开启时刻会把关闭时刻一起抹掉——那是一个「本以为到点
+    会停、结果一直跑下去」的错，而页面上看不出任何异样。
+    """
+    console.patch("BOT", {"enabled_from": "2026-08-17T20:00:00+08:00"})
+    console.patch("BOT", {"enabled_until": "2026-08-17T23:00:00+08:00"})
+
+    assert console.patch("BOT", {"enabled_from": ""}).status_code == 200
+
+    assert console.task("BOT")["enabled_from_utc"] is None
+    assert console.task("BOT")["enabled_until_utc"] == "2026-08-17T15:00:00Z"
+
+
+def test_patching_something_else_does_not_wipe_the_window(console: Console) -> None:
+    """`None`（这次不动它）与 `""`（清空）必须分得开。
+
+    分不开的话，任何一次只改优先级的 PATCH——包括页面上那个拖拽把手每拖一次
+    发的一串——都会顺手把定时窗口抹掉。
+    """
+    console.patch("BOT", {"enabled_until": "2026-08-17T23:00:00+08:00"})
+
+    console.patch("BOT", {"name": "改个名字"})
+
+    assert console.task("BOT")["enabled_until_utc"] == "2026-08-17T15:00:00Z"
+
+
+def test_a_stop_time_that_is_not_after_the_start_time_is_refused(console: Console) -> None:
+    """区间是左闭右开的，`until <= from` 表示一个空区间。
+
+    收下它的话，那个任务永远起不来，而页面上只会写「未到开启时间」——一句用户
+    照着等、等到关闭时刻也不会动的话。
+    """
+    console.patch("BOT", {"enabled_from": "2026-08-17T20:00:00+08:00"})
+
+    response = console.patch("BOT", {"enabled_until": "2026-08-17T20:00:00+08:00"})
+
+    assert response.status_code == 400, response.text
+    assert console.task("BOT")["enabled_until_utc"] is None
+
+
+def test_a_task_before_its_start_time_says_why_it_is_standing_still(console: Console) -> None:
+    """状态列必须说出原因，不能笼统地写「待命」。
+
+    2026-08-16 晚上刚发生过「任务不动而界面不说原因、查了一小时」的事。
+    """
+    console.patch("SCAN", {"enabled_from": "2026-08-17T08:00:00+08:00"})
+
+    assert console.task("SCAN")["status"] == "未到开启时间"
+
+
+def test_a_task_past_its_stop_time_says_why_it_is_standing_still(console: Console) -> None:
+    console.patch("SCAN", {"enabled_until": "2026-08-09T19:59:00+08:00"})
+
+    assert console.task("SCAN")["status"] == "已过关闭时间"
+
+
+def test_the_window_cannot_be_changed_while_the_scheduler_runs(console: Console) -> None:
+    """定时窗口和别的配置同档：跑着的时候一样改不动。
+
+    它是判据的一部分，改了会立刻生效到下一轮，而上一轮正拿着旧口径在飞——
+    那正是固化要挡的那件事。
+    """
+    assert console.start().status_code == 200
+
+    response = console.patch("BOT", {"enabled_until": "2026-08-17T23:00:00+08:00"})
+
+    assert response.status_code == 409, response.text
+    assert console.task("BOT")["enabled_until_utc"] is None
+
+
 # -- 运行中不许改 ---------------------------------------------------------------
 #
 # 用户口径（2026-08-11）：「任务开始后，调度台固化任务数据，记录任务内容。
@@ -681,7 +784,9 @@ def test_a_new_bot_round_is_still_allowed_while_running(console: Console) -> Non
 
 def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> None:
     """「开始」那一下抄一份，页面据此回答「这一轮到底按什么跑的」。"""
-    console.patch("PIRATE", {"params": {"radius": 6}})
+    # 海盗那一行种子里是不参与的，这里连同参与一起打开：记录只摆出参与调度的
+    # 任务（见 `test_the_record_only_shows_the_tasks_that_take_part`）。
+    console.patch("PIRATE", {"enabled": True, "params": {"radius": 6}})
     _start(console)
 
     frozen = console.get()["frozen_config"]
@@ -691,6 +796,31 @@ def test_starting_freezes_the_configuration_of_that_moment(console: Console) -> 
     assert pirate["params"] == {"radius": 6}
     assert pirate["summary"] == "半径 6"
     assert frozen["changes"] == ["首次记录"]
+
+
+def test_the_record_only_shows_the_tasks_that_take_part(console: Console) -> None:
+    """用户口径 2026-08-17：「未生效的任务项，不应留在固化记录里」。
+
+    这份记录在页面上回答的是「这一轮到底要跑什么」，没勾选参与的任务这一轮根本
+    不会被起，混在里面只会让人分不清哪几条是真的在飞。
+
+    断言钉的是**整张清单**而不是「不含某个名字」：只查名字的话，把过滤写成
+    「漏掉某一条」照样绿。条数也一并钉住。
+    """
+    # 种子：海盗与 bot 不参与，扫描与军力榜参与。这里把海盗打开、扫描关掉，
+    # 于是这一轮参与的恰好是海盗与军力榜——两个 kind 都不是种子里的默认状态，
+    # 断言才不会被「碰巧和默认一致」蒙混过去。
+    console.patch("PIRATE", {"enabled": True})
+    console.patch("SCAN", {"enabled": False})
+    _start(console)
+
+    frozen = console.get()["frozen_config"]
+    assert isinstance(frozen, dict)
+    tasks = frozen["tasks"]
+    assert isinstance(tasks, list)
+    assert [task["kind"] for task in tasks] == ["PIRATE", "RANKING"]
+    assert len(tasks) == 2
+    assert all(task["enabled"] is True for task in tasks)
 
 
 def test_a_stopped_scheduler_shows_no_frozen_configuration(console: Console) -> None:

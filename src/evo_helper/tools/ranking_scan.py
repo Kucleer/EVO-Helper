@@ -12,6 +12,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from evo_helper.config import Settings
@@ -60,13 +61,36 @@ class RankingColumns:
 
 
 def parse_score(text: str) -> float | None:
-    """解析军事榜的 K/M 缩写；读不出的分数保持 None。"""
+    """解析军事榜的 K/M 缩写；读不出的分数保持 None。
+
+    ⚠️ **换算必须走 `Decimal`，不能写 `float("64.96") * 1000`。** 后者给出
+    `64959.99999999999`——`64.96` 这个十进制小数在二进制里没有精确表示，乘完
+    误差就露出来了。榜上读到的原文是 `64.96K`，页面上显示成一串小数尾巴，
+    而且这个脏值会**落库**：`bot_targets.military_score` 里已经存了一批。
+
+    实测三个（2026-08-17 页面上的原样）：
+
+        64.96K → 64959.99999999999      64.26K → 64260.00000000001
+        64.18K → 64180.00000000001
+
+    `Decimal("64.96") * 1000` 得到 `Decimal("64960.00")`，转回 float 恰好是
+    64960.0——十进制字面量按十进制乘，误差根本不产生。
+
+    ⚠️ **不要改成「乘完取整」。** 榜上的 K 值只到两位小数（最小刻度 0.01K = 10）、
+    M 值同样两位（0.01M = 10000），取整到个位对这两种确实无害；但这条正则
+    **也认没有单位的裸数**（`(\\d+(?:\\.\\d+)?)\\s*([KM])?`），而那一支取整就会把
+    `1.5` 抹成 `2`。`Decimal` 对三种单位一视同仁地精确，不需要靠「最小刻度」
+    这个前提兜底。
+
+    插值产生的 `.5`（`domain.ranking.interpolate_scores` 取中点）是**合法值**，
+    不是这里的误差，别顺手一起抹掉。
+    """
     compact = text.strip().upper().replace(",", "")
     match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KM])?", compact)
     if match is None:
         return None
-    value = float(match.group(1))
-    return value * {"K": 1_000.0, "M": 1_000_000.0, None: 1.0}[match.group(2)]
+    scale = {"K": 1_000, "M": 1_000_000, None: 1}[match.group(2)]
+    return float(Decimal(match.group(1)) * scale)
 
 
 def release_stuck_mouse(driver: LiveDriver) -> None:

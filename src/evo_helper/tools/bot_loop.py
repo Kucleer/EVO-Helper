@@ -1,16 +1,18 @@
-"""bot 目标的「直接 BBB 攻击 → 读战报 → 平局就再打」自动化。
+"""bot 目标的「直接 BBB 攻击 → 读战报 → 收工」自动化。
 
     # 只看目标认不认得出，一次点击都不派（默认）
     python -m evo_helper.tools.bot_loop --targets 2:137:14
 
-    # 真打：用预设 BBB 打一发，回来读战报；平局就对同一坐标再打
+    # 真打：用预设 BBB 打一发，回来读战报
     python -m evo_helper.tools.bot_loop --targets 2:137:14 --attack
 
 与海盗那条链路的区别只在**判定依据**：
 
 - 海盗先派侦察，看侦察报告里几个特定舰种的数量（`vision.scout_reports`）决定打不打；
-- bot **不做任何前置侦查**，直接用预设 BBB 打，打完读战报按
-  `domain.battle_outcome` 算胜负（剩余 = 单位 − 损失），平局就对同一坐标再打一发。
+- bot **不做任何前置侦查**，直接用预设 BBB 打一发，战报回来就收工。战报里的胜负
+  仍然按 `domain.battle_outcome` 算（剩余 = 单位 − 损失）并入库，但它只进日志与
+  情报中心，**不再决定要不要补刀**——「平局就再打一次」已按用户口径
+  （2026-08-17）移除。
 
 所以导航、简报闸门、选预设、写 intent/dispatch 全部复用 `pirate_loop.PirateLoop`；
 这里只换目标识别与判定。
@@ -19,6 +21,9 @@
 
 > 基于第一条，bot攻击模式变更，不再进行攻击侦查，直接用预设BBB进行攻击，
 > 如果同一坐标攻击结果为平局，则继续进行攻击
+
+后半句已经作废——用户口径（2026-08-17）：「bot 攻击移除平局再打一次机制」。
+现在**一个目标本轮就打一发**，战报回来就收工，平局也一样（`domain.bot_round`）。
 
 「第一条」是战报缺失那件事。原先每个目标要**两发**才走得完（探路一发拿守方
 单位数、按 `fleet_tier` 分档再打一发），也就是每个目标要等**两份**战报；而
@@ -60,9 +65,12 @@ bot 战报比海盗战报多一行「生成卫星概率」，「战斗详情」�
 ## 胜负是算出来的，不看那行大字
 
 用户口径（2026-08-11）：剩余 = 单位 − 损失单位；本方剩余 0 判负、对方被全歼判胜、
-两边都有船判平（`domain.battle_outcome`）。于是拖那一屏从「补一个展示字段」变成了
-**判据的输入**——四个数缺一个就算不出战果，而 `DRAW` 算不出来时这个目标**不会**
-被重打（见 `domain.bot_round.DispatchFact.outcome`）：重打的唯一依据是确认平局。
+两边都有船判平（`domain.battle_outcome`）。
+
+战果曾经也是**判据的输入**（平局要重打），2026-08-17 移除那条规则之后它退回成
+纯展示字段：还是照样算、照样入库、照样在日志页和情报中心里看得到，只是不再
+决定要不要再打一发。拖到底那一屏仍然要拖——四个数缺一个战果就算不出来，
+而算不出来的战果在库里是个空洞，谁也补不回来。
 
 逐舰种明细则**整整差一屏**：参战战舰那两列在**回放页**上（`ReportLayout.
 participating_rows` 是对着回放页量的，`tools.ingest_report` 也是从 replay 那一屏取的），
@@ -113,8 +121,8 @@ class BotOptions:
     targets: tuple[Coordinate, ...]
     #: 真的动鼠标派舰队。False 是默认档：站过去认一眼，一次点击都不做。
     attack: bool
-    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态，
-    #: 也不占本轮的重打配额（`domain.bot_round.MAX_ATTACKS_PER_TARGET`）。
+    #: 本轮从何时算起。早于这个时刻的派遣属于上一轮，不参与本轮判态——
+    #: 也就是上一轮打过的目标，这一轮照样要打一发。
     round_started_at: datetime | None = None
     #: 这一轮记账用的出发星球。语义与理由同 `pirate_loop.LoopOptions.origin`：
     #: 多个 bot 任务的区别就在这一个参数上，让 runner 自己去猜，两个任务的账
@@ -265,8 +273,8 @@ class BotLoop(PirateLoop):
         repository.append_report(to_battle_report(live, report_id=uuid4()))
         # 战果是算出来的，所以算不出时要把**四个输入**一起说出来——否则日志上只有
         # 一句「算不出」，没人知道是哪一个数没读到，而它们分别对应两条不同的毛病
-        # （没拖到底 / 那一屏的行位置偏了）。算不出还有第二个后果：`DRAW` 算不出来
-        # 的那一发不会触发重打，这个目标本轮就此收工。
+        # （没拖到底 / 那一屏的行位置偏了）。战果已不再影响要不要再打一发，
+        # 但它是库里那一行的战果列，算不出就是永久的空洞。
         say(
             f"  {target} 战报入库：{live.raw_time_text}，"
             f"战果 {live.outcome or '算不出'}"
@@ -304,9 +312,8 @@ class BotLoop(PirateLoop):
         慢拖回顶 → 翻页 → 关面板」（约 20 秒）。
 
         态在开头一次算完，收进来的战报本趟就作数：`reconcile_today` 排在
-        `_sweep` 之前，所以刚回来的战报这一趟就能拿去判平局。**仍旧一趟只推进
-        一态**——每个目标在这个循环里只走一个分支，所以「平局再打一发」也是一趟
-        一发，不会在同一趟里把配额一次烧光。
+        `_sweep` 之前，所以刚回来的战报这一趟就能让对应目标转入 `DONE`。
+        **仍旧一趟只推进一态**——每个目标在这个循环里只走一个分支。
         """
         dispatched = 0
         for coordinate in self._bot.targets:
@@ -357,10 +364,10 @@ class BotLoop(PirateLoop):
     def _attack_once(self, coordinate: Coordinate) -> bool:
         """对这个坐标打一发 BBB。
 
-        走到这里只有两种情形：本轮第一发，或者上一发打成了平局而配额还有剩
-        （`domain.bot_round.phase_of`）。**两种在这里没有分别**——打法完全一样，
-        分开写只会多一处可能和判态那边分家的地方。「还能不能再打」的判定只有
-        `phase_of` 一处。
+        走到这里只有两种情形：本轮第一发，或者上一发的战报被判定永远不会来、
+        整条剔掉之后重来的一发（`repository.bot_dispatch_facts`）。**两种在这里
+        没有分别**——打法完全一样，分开写只会多一处可能和判态那边分家的地方。
+        「还能不能再打」的判定只有 `phase_of` 一处。
         """
         if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
             return False
@@ -375,8 +382,8 @@ class BotLoop(PirateLoop):
 
         `--round-started-at` 是可选的（手工跑时没人会填），但 `None` 一路传到
         仓储那边就是「不限时间范围」：`bot_dispatch_facts(since=None)` 会把这个
-        坐标**历史上每一发**都算进本轮，于是它的重打配额永远是满的，看起来像是
-        「这个目标早就打完了」。
+        坐标**历史上每一发**都算进本轮，于是上一轮（乃至上个月）打过的目标看起来
+        像是「这一轮早就打完了」，这一轮一发都不会派。
 
         所以这里兜底成**当日 UTC 00:00**。取当天而不是「此刻」，是因为一趟里
         先派出的那几发必须仍算本轮；取 UTC 而不是本地时区，是因为游戏内时间
@@ -434,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
     parser.add_argument(
-        "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打；平局就再打"
+        "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打，每个目标一发"
     )
     parser.add_argument(
         "--origin",
