@@ -187,9 +187,7 @@ def test_a_genuinely_finished_round_still_says_done() -> None:
 
     少了这条，一个「把 `bot_round_complete` 整个删掉、一律报过期」的改动会全绿。
     """
-    assert (
-        status(MissionKind.BOT, targets_remaining=0, scores_are_stale=False) is TaskStatus.DONE
-    )
+    assert status(MissionKind.BOT, targets_remaining=0, scores_are_stale=False) is TaskStatus.DONE
 
 
 def test_stale_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
@@ -198,9 +196,7 @@ def test_stale_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
     新鲜度这件事只在**它是不动的原因**时才值得占那一句话。候选池里还剩几个能打的，
     却写着「军力数据已过期」，用户会去等一轮根本不需要等的扫描。
     """
-    assert (
-        status(MissionKind.BOT, targets_remaining=3, scores_are_stale=True) is TaskStatus.READY
-    )
+    assert status(MissionKind.BOT, targets_remaining=3, scores_are_stale=True) is TaskStatus.READY
 
 
 def test_no_free_lines_reads_as_waiting_for_lines() -> None:

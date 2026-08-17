@@ -63,6 +63,9 @@ STATUS_TONES: dict[str, str] = {
     # 不是故障也不是警告。区别全靠那句话本身和字形。
     TaskStatus.BEFORE_WINDOW.value: "",
     TaskStatus.AFTER_WINDOW.value: "",
+    # 「军力数据已过期」按 warn 上色，和「已完成」（ok）刻意分得远——这一档之所以
+    # 存在，就是因为它以前被「已完成」盖住，而那两个词在页面上给人的印象正好相反。
+    TaskStatus.STALE_MILITARY_SCORES.value: "warn",
 }
 
 STATUS_GLYPHS: dict[str, str] = {
@@ -77,6 +80,9 @@ STATUS_GLYPHS: dict[str, str] = {
     # 沙漏的两个方向：还没到 = 沙子在上，已经过 = 沙子在下。
     TaskStatus.BEFORE_WINDOW.value: "⧗",
     TaskStatus.AFTER_WINDOW.value: "⧖",
+    # 划掉的圈：数据还在，但已经作废。**不能用 ★**（那是「已完成」的字形），
+    # 灰度或色盲下字形是唯一的区分。
+    TaskStatus.STALE_MILITARY_SCORES.value: "⊘",
 }
 
 
