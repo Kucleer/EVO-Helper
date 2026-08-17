@@ -1056,8 +1056,10 @@ class MissionConsoleService:
         name: str | None = None,
         origin: str | None = None,
         fleet_lines: int | None = None,
+        enabled_from: str | None = None,
+        enabled_until: str | None = None,
     ) -> MissionTaskView:
-        """改开关 / 参数 / 优先级 / 名字 / 出发星球 / 航线数。各自独立，
+        """改开关 / 参数 / 优先级 / 名字 / 出发星球 / 航线数 / 定时窗口。各自独立，
         `None` 表示这次不动它。
 
         **调度器运行中一律拒绝**（`_refuse_while_running`），只留「恢复」一个口子。
@@ -1072,6 +1074,8 @@ class MissionConsoleService:
             name=name,
             origin=origin,
             fleet_lines=fleet_lines,
+            enabled_from=enabled_from,
+            enabled_until=enabled_until,
         )
         if fills_gaps(kind) and priority is not None:
             # 领域层的排序键已经把填空隙的那几种（扫描 / 军力榜）结构性地钉在
@@ -1091,6 +1095,18 @@ class MissionConsoleService:
         params_json = None if params is None else json.dumps(params, ensure_ascii=False)
         clear_origin = origin == ""
         parsed_origin = None if origin in (None, "") else _parse_origin(origin or "")
+        # 空串 = 把这一端退回「不限」；None = 这次不动它。两端各判各的。
+        clear_from, clear_until = enabled_from == "", enabled_until == ""
+        parsed_from = _parse_moment(enabled_from, "开启时间")
+        parsed_until = _parse_moment(enabled_until, "关闭时间")
+        # 先后顺序在写库**之前**量一次，而且要拿「这次改完之后」的那两个值量：
+        # 只量本次送上来的两个，会放过「单独把关闭时刻改到开启时刻之前」这一下，
+        # 而那种配置的效果是任务永远起不来，页面上却只写「未到开启时间」——
+        # 一句用户照着等、等到关闭时刻也不会动的话。
+        final_from = None if clear_from else (parsed_from or row.enabled_from_utc)
+        final_until = None if clear_until else (parsed_until or row.enabled_until_utc)
+        if final_from is not None and final_until is not None and final_until <= final_from:
+            raise ServiceError("关闭时间必须晚于开启时间；这样填的任务一轮都不会跑")
         # 用户没动出发星球时按库里现在那颗量。`clear_origin` 那一档要按「退回
         # 全局主星之后」的那颗量，所以两者都不能拿 `row` 的现值兜底。
         target_origin = (
@@ -1125,6 +1141,10 @@ class MissionConsoleService:
             origin=parsed_origin,
             clear_origin=clear_origin,
             fleet_lines=fleet_lines,
+            enabled_from_utc=parsed_from,
+            clear_enabled_from=clear_from,
+            enabled_until_utc=parsed_until,
+            clear_enabled_until=clear_until,
         )
         self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
@@ -1346,6 +1366,8 @@ class MissionConsoleService:
         name: str | None = None,
         origin: str | None = None,
         fleet_lines: int | None = None,
+        enabled_from: str | None = None,
+        enabled_until: str | None = None,
     ) -> None:
         """调度器跑着的时候不许改配置。**「恢复」是唯一的例外。**
 
@@ -1363,7 +1385,11 @@ class MissionConsoleService:
 
         因此口子开得很窄：**只认「这一行确实处在已停用状态」且这次 PATCH 除了
         `enabled: true` 之外什么都没带**。带上 params / priority / 名字 / 出发星球 /
-        航线数里的任何一样都不是恢复，是趁着恢复顺手改一笔。
+        航线数 / 定时窗口里的任何一样都不是恢复，是趁着恢复顺手改一笔。
+
+        **定时窗口和别的配置同档，跑着的时候一样改不动。** 它是判据的一部分
+        （`domain.scheduler.within_schedule_window` 每 tick 现算），改了会立刻生效
+        到下一轮，而上一轮正拿着旧口径在飞——那正是固化要挡的那件事。
         """
         if not self._scheduler.config_locked:
             return
@@ -1374,6 +1400,8 @@ class MissionConsoleService:
             and name is None
             and origin is None
             and fleet_lines is None
+            and enabled_from is None
+            and enabled_until is None
             and row.disabled_reason is not None
         )
         if is_revive:
@@ -1514,6 +1542,8 @@ class MissionConsoleService:
             fleet_lines=task.fleet_lines,
             origin_is_default=row.origin_galaxy is None,
             fleet_lines_is_default=row.fleet_lines is None,
+            enabled_from_utc=task.enabled_from_utc,
+            enabled_until_utc=task.enabled_until_utc,
         )
 
     def _task_view_for(self, task_id: int) -> MissionTaskView:
@@ -1663,6 +1693,26 @@ def _parse_origin(text: str) -> Coordinate:
         return Coordinate(galaxy, system, position)
     except ValueError as exc:
         raise ServiceError(f"出发星球 {text!r} 不是一个合法坐标：{exc}") from exc
+
+
+def _parse_moment(text: str | None, label: str) -> datetime | None:
+    """ISO 8601 → aware 的 UTC 时刻。`None`（不动它）与 `""`（清空）都返回 None。
+
+    **必须带时区，不带就 400。** 页面送的是 `…+08:00`（用户填的是 UTC+8 的墙上
+    时钟），库里存 UTC。少了偏移量，「几点」这件事就没有答案，而服务端替它猜一个
+    的代价正好是 8 小时——一个「说好 22 点开、实际 14 点就开了」的错，且全程
+    不报任何异常。本仓库已经被时区坑过三次（见 `storage.database.UTCDateTime`），
+    这一处宁可当场拒。
+    """
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ServiceError(f"{label}要写成带时区的 ISO 8601 时刻，收到 {text!r}") from exc
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ServiceError(f"{label} {text!r} 少了时区偏移量；不带时区无从判断它是几点")
+    return moment.astimezone(UTC)
 
 
 def _backfill_label(kind: str | None) -> str:

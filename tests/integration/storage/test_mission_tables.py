@@ -35,6 +35,62 @@ def test_a_mission_task_row_round_trips(session_factory) -> None:  # type: ignor
         assert row.consecutive_failures == 0
         assert row.disabled_reason is None
         assert row.quota_exhausted_until_utc is None
+        # 新建的任务**没有**定时窗口。给它一个默认窗口等于把「两列都为空 =
+        # 行为完全不变」这条承诺反过来：新建的任务会在某个没人配过的时刻停掉。
+        assert row.enabled_from_utc is None
+        assert row.enabled_until_utc is None
+
+
+def test_the_schedule_window_survives_a_round_trip_as_utc(repository) -> None:  # type: ignore[no-untyped-def]
+    """定时窗口存进去、读出来仍然是同一个 aware 的 UTC 时刻。
+
+    ⚠️ 存的是 **UTC+8** 的时刻，读出来断言的是它的 UTC 写法：SQLite 的绑定处理会
+    把偏移量**直接丢掉而不换算**（见 `storage.database.UTCDateTime`），所以存一个
+    带 `+08:00` 的时刻是这条判据唯一测得出来的形状——两端都写 UTC 的话，
+    `astimezone(UTC)` 那一步删掉了也照样绿。
+    """
+    from datetime import timedelta, timezone
+
+    repository.ensure_mission_rows(now_utc=datetime.now(UTC))
+    task_id = next(row.id for row in repository.mission_tasks() if row.kind == "PIRATE")
+    shanghai = timezone(timedelta(hours=8))
+
+    repository.update_mission_task(
+        task_id,
+        enabled_from_utc=datetime(2026, 8, 17, 20, 0, tzinfo=shanghai),
+        enabled_until_utc=datetime(2026, 8, 18, 2, 0, tzinfo=shanghai),
+    )
+
+    row = next(item for item in repository.mission_tasks() if item.id == task_id)
+    assert row.enabled_from_utc == datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    assert row.enabled_until_utc == datetime(2026, 8, 17, 18, 0, tzinfo=UTC)
+
+
+def test_clearing_one_end_of_the_window_leaves_the_other_alone(repository) -> None:  # type: ignore[no-untyped-def]
+    """`clear_*` 与「这次不动它」必须分得开，而且两端各清各的。
+
+    合成一个开关的话，只清开启时刻会把关闭时刻一起抹掉——一个「本以为到点会停、
+    结果一直跑下去」的错，页面上看不出任何异样。
+    """
+    repository.ensure_mission_rows(now_utc=datetime.now(UTC))
+    task_id = next(row.id for row in repository.mission_tasks() if row.kind == "PIRATE")
+    repository.update_mission_task(
+        task_id,
+        enabled_from_utc=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+        enabled_until_utc=datetime(2026, 8, 17, 18, 0, tzinfo=UTC),
+    )
+
+    # 只改名字：两端都该原封不动。
+    repository.update_mission_task(task_id, name="改个名字")
+    row = next(item for item in repository.mission_tasks() if item.id == task_id)
+    assert row.enabled_from_utc is not None
+    assert row.enabled_until_utc is not None
+
+    repository.update_mission_task(task_id, clear_enabled_from=True)
+
+    row = next(item for item in repository.mission_tasks() if item.id == task_id)
+    assert row.enabled_from_utc is None
+    assert row.enabled_until_utc == datetime(2026, 8, 17, 18, 0, tzinfo=UTC)
 
 
 def test_a_mission_run_row_records_how_it_ended(session_factory) -> None:  # type: ignore[no-untyped-def]
