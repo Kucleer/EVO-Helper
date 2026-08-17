@@ -10,12 +10,15 @@
   <button class="btn primary small" id="search">筛选</button>
   <button class="btn small" type="button" id="reset">重置筛选</button>
 </div><p class="muted" id="meta">尚无军力榜数据。</p></section>
-<section class="panel"><table><thead><tr><th>名次</th><th>名称</th><th>军力值</th><th>坐标</th><th>来源</th><th>更新时间</th></tr></thead><tbody id="rows"></tbody></table></section>
+<section class="panel"><table><thead><tr><th>名次</th><th>名称</th><th>军力值</th><th>坐标</th><th>来源</th><th>更新时间（UTC+8）</th></tr></thead><tbody id="rows"></tbody></table></section>
 <script>
 // 「类型」下拉框已移除：这张榜按构造只可能有 bot（扫描入库前先过 is_bot_coordinate），
 // 海盗与真人根本进不来，留个永远筛出空集的框只会让人以为筛坏了。
 const e=(x)=>document.getElementById(x), val=(x)=>e(x).value.trim();
-const local=(value)=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(value));
+// 时刻一律走 `EVOHelper.localTime`（UTC+8，见 base.html）。这一页原先自己抄了一份
+// 日期格式化器——抄第二份的那天两处就开始分家，而且它对缺时区后缀的字符串会按
+// 浏览器本地时区解释，凭空差 8 小时。
+const local=(value)=>EVOHelper.localTime(value);
 async function search(){const p=new URLSearchParams(); for(const [key,id] of [['q','q'],['score_min','score-min'],['score_max','score-max'],['galaxy','galaxy']]) if(val(id))p.set(key,val(id)); const data=await EVOHelper.get('/api/military-rankings?'+p); e('meta').textContent=data.refreshed_at_utc?`最近一次采集（UTC+8）：${local(data.refreshed_at_utc)} · 命中 ${data.total} 条`:'尚无军力榜数据。'; e('rows').innerHTML=data.rows.map(r=>`<tr><td>${r.rank??'—'}</td><td>${r.name}</td><td>${r.score??'—'}${r.estimated?' <span class="muted">(估算)</span>':''}</td><td>${r.coordinate??'—'}</td><td>${r.source==='scan'?'已核验':'榜单'}</td><td>${r.observed_at_utc?local(r.observed_at_utc):'—'}</td></tr>`).join('');}
 function reset(){for(const id of ['q','score-min','score-max','galaxy'])e(id).value=''; search();} e('search').onclick=search; e('reset').onclick=reset; search();
 </script>
