@@ -47,7 +47,13 @@ def tier_for(score: float | None, tiers: Sequence[MilitaryTier]) -> MilitaryTier
 def military_pool(
     targets: Iterable[ScoredTarget], *, take: int, maximum_score: float | None
 ) -> tuple[ScoredTarget, ...]:
-    """取尚可攻击的前 N 名；未知值保留，理由同 ``target_order``。"""
+    """取尚可攻击的前 N 名；未知值保留，理由同 ``target_order``。
+
+    军力优先那条链路喂进来的已经只有**有分数且读数新鲜**的那一堆
+    （`target_order.split_by_freshness` 的 `rated`），没有分数的走
+    `top_up_with_unrated` 补位。这里仍然保留对 `None` 的处置，因为这个函数是
+    通用的，而「不知道多强不等于太强」在哪里都成立。
+    """
     if take < 1:
         return ()
     affordable = (
@@ -58,6 +64,51 @@ def military_pool(
         or item.military_score <= maximum_score
     )
     return tuple(strongest_first(affordable)[:take])
+
+
+def top_up_with_unrated(
+    pool: Sequence[ScoredTarget],
+    unrated: Iterable[ScoredTarget],
+    origins: Sequence[Coordinate],
+    *,
+    take: int,
+) -> tuple[ScoredTarget, ...]:
+    """主力不满 `take` 个时，用**没有军力分数**的目标按距离补齐。
+
+    ## 为什么补位不参与按军力排序
+
+    它们没有分数，谈不上排第几。硬把它们混进 `strongest_first` 的话，`None` 那一档
+    虽然排在最后，却仍然会**占掉前 N 的名额**——于是「军力优先」在补位多的夜里
+    会退化成「随便打」。所以两步分开：**先按军力取满主力，剩下的空位才轮到补位。**
+
+    ## 为什么补位按距离
+
+    没有分数的目标之间没有任何「更值得打」的依据，唯一还剩的可比量就是路程：
+    同银河近距离约 20--30 分钟，跨银河约 2.6 小时（实测，见 `domain.distance`），
+    一夜的航线有限，先打近的能多派十几发。
+
+    距离取**到最近那颗出发星球**的距离：多出发点时按某一颗算等于替另一颗做主。
+    并列时按坐标定序，否则同一批目标每次补进来的可能不是同一批。
+
+    ⚠️ **补位不吃 `max_score` 上限。** 「不知道多强」不构成「一定太强」——同
+    `strongest_then_nearest` 上那条注释，理由和后果都一样。
+    """
+    room = take - len(pool)
+    if room <= 0:
+        return tuple(pool)
+    ordered = sorted(
+        unrated,
+        key=lambda item: (
+            min(
+                (distance_key(item.coordinate, origin) for origin in origins),
+                default=(0, 0, 0),
+            ),
+            item.coordinate.galaxy,
+            item.coordinate.system,
+            item.coordinate.position,
+        ),
+    )
+    return tuple(pool) + tuple(ordered[:room])
 
 
 def assign_by_capacity_and_distance(
@@ -125,4 +176,5 @@ __all__ = [
     "assign_by_capacity_and_distance",
     "military_pool",
     "tier_for",
+    "top_up_with_unrated",
 ]
