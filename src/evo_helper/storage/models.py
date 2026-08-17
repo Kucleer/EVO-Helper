@@ -506,6 +506,15 @@ class MissionTaskRow(Base):
     #: **上限是按星球各一份的**（用户口径 2026-08-13），所以它必须挂在任务上而不是
     #: 只有一个全局值：主星 5 条 + 2 号星 2 条是两颗星各占各的，不是一共 7 条。
     fleet_lines: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 定时开启 / 定时关闭的时刻。**绝对时刻，一次性**，不是每天循环、不按星期几。
+    #: 两列都可空，都为空表示不限——那时的行为与没有这项功能时完全一致。
+    #:
+    #: ⚠️ **它们与 `enabled` 取交集，定时器绝不回写 `enabled`**（用户口径
+    #: 2026-08-17）。`enabled` 是用户的意志，被定时器改掉的话，用户手动开的会被
+    #: 悄悄关掉，而且事后分不清是谁关的。判据见
+    #: `domain.scheduler.within_schedule_window`。
+    enabled_from_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    enabled_until_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: 仅 bot 用：本轮从何时算起。早于这个时刻的战报属于上一轮。
     round_started_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: 仅海盗用：收到游戏超限邮件时写下的封锁截止时刻。比计数更硬的信号。

@@ -56,6 +56,8 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "mission_runs.ended_at_utc",
         "mission_runs.started_at_utc",
         "mission_tasks.created_at_utc",
+        "mission_tasks.enabled_from_utc",
+        "mission_tasks.enabled_until_utc",
         "mission_tasks.quota_exhausted_until_utc",
         "mission_tasks.round_started_at_utc",
         "mission_tasks.updated_at_utc",
@@ -80,14 +82,18 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
     }
 )
 
-#: 这几张表是在一次性的 b6 迁移**之后**才建的，建表 DDL 本身就已经写了
-#: `DateTime(timezone=True)`。要求那条历史迁移去 alter 一张当时还不存在的表，
-#: 既做不到也会把「迁移清单必须与模型一一对应」这条判据讲错。
+#: 这几列是在一次性的 b6 迁移**之后**才加进来的（多数是随新表一起建的），
+#: 各自的 DDL 本身就已经写了 `DateTime(timezone=True)`。要求那条历史迁移去 alter
+#: 一张当时还不存在的表、或者一列当时还不存在的列，既做不到也会把「迁移清单必须
+#: 与模型一一对应」这条判据讲错。
 #:
-#: `attack_dispatches.line_released_at_utc` 是同一回事的列版本：表是老的，
-#: 列是 b6 之后加的，由它自己那条迁移（`a9d5f31c0e77`）按方言建成
-#: `TIMESTAMPTZ`。往 b6 的清单里补它，会让那条历史迁移在**已经升过级的**库上
-#: 去 alter 一列当时还不存在的列。
+#: `attack_dispatches.line_released_at_utc` 是「列版本」的例子：表是老的，列是 b6
+#: 之后加的，由它自己那条迁移（`a9d5f31c0e77`）按方言建成 `TIMESTAMPTZ`。往 b6 的
+#: 清单里补它，会让那条历史迁移在**已经升过级的**库上去 alter 一列当时还不存在的列。
+#:
+#: ⚠️ **往这里加一行之前先确认那条新迁移真的写了 `timezone=True`。** 免掉的是
+#: 「历史迁移要覆盖它」，不是「它可以是 `WITHOUT TIME ZONE`」——后者在 Postgres 上
+#: 会静默截掉 tzinfo，正是这一整个文件要防的那件事。
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
         "attack_dispatches.line_released_at_utc",
@@ -96,6 +102,9 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "military_ranking_snapshots.captured_at_utc",
         "military_ranking_entries.observed_at_utc",
         "system_log.logged_at_utc",
+        # b3f5c8d10a27（任务定时开关）加的两列，那条迁移里写着 `timezone=True`。
+        "mission_tasks.enabled_from_utc",
+        "mission_tasks.enabled_until_utc",
     }
 )
 

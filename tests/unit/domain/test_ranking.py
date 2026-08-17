@@ -154,6 +154,17 @@ def test_a_gap_is_filled_with_the_midpoint() -> None:
     assert interpolate_scores([30.0, None, 20.0]) == [30.0, 25.0, 20.0]
 
 
+def test_an_odd_midpoint_keeps_its_half() -> None:
+    """⚠️ **`.5` 是合法值，不是浮点误差。**
+
+    2026-08-17 修「军力值精度溢出」时，页面上 `64959.99999999999`（脏）和
+    `72252.5 (估算)`（干净）混在一起，很容易被当成同一件事一起抹掉。
+    前者是 `float("64.96") * 1000` 的二进制误差，后者是这里取的中点——
+    两个已知值的和是奇数时它必然带 `.5`，抹掉就是在报一个错的中点。
+    """
+    assert interpolate_scores([64_960.0, None, 63_545.0]) == [64_960.0, 64_252.5, 63_545.0]
+
+
 def test_a_gap_with_nothing_on_one_side_stays_empty() -> None:
     """**留 None 而不是外推。** 榜首/榜尾之外没有邻居，编一个出来就是凭空造数据。"""
     assert interpolate_scores([None, 20.0, None]) == [None, 20.0, None]

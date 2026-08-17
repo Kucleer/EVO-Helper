@@ -141,17 +141,48 @@ def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
     assert "始终填空隙" in body
 
 
-def test_all_eight_statuses_survive_the_trip_to_the_page(client: TestClient) -> None:
-    """八档一个都不能合并。
+def test_every_status_survives_the_trip_to_the_page(client: TestClient) -> None:
+    """每一档一个都不能合并。
 
     没勾的任务显示「待命」是谎话（它永远不会被起起来）；冷却中显示「等航线」
-    会让用户去调航线数、调完还是不动。页面按状态上色，所以每一档都得在色调表
-    里各占一格——少一格就意味着有两档被当成了同一件事。
+    会让用户去调航线数、调完还是不动；定时窗口那两档显示成「待命」，用户会一直
+    等下一轮，而下一轮永远不来。页面按状态上色，所以每一档都得在色调表里各占
+    一格——少一格就意味着有两档被当成了同一件事。
     """
     html = client.get("/missions").text
 
     for status in TaskStatus:
         assert status.value in html, status.name
+
+
+def test_the_page_offers_a_schedule_window_labelled_in_utc_plus_eight(
+    client: TestClient,
+) -> None:
+    """定时开关那两个输入框，以及它们头上那个写死的时区。
+
+    时区必须写在控件旁边：用户填进去的那串数字按哪个时区解释，不写出来只能靠猜，
+    猜错正好差 8 小时。（「战报补录」那个日期控件标的是 UTC，是特例。）
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "定时开关（UTC+8）" in body
+    assert "'mission-enabled-from'" in body
+    assert "'mission-enabled-until'" in body
+    # 送上去的必须带偏移量，不带的话服务端会 400（而那是有意的）。
+    assert "+08:00" in body
+
+
+def test_the_page_says_the_window_does_not_cut_off_a_running_round(
+    client: TestClient,
+) -> None:
+    """「到点不抢停」必须写在页面上。
+
+    用户看到关闭时刻已过而任务还在跑，不写清楚就只能理解成「定时没生效」，
+    然后去点强制结束——而那一下会把另外几条正常的链路一起停掉。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "正在跑的不打断" in body or "不打断正在跑的那一轮" in body
 
 
 def test_the_bot_row_carries_a_new_round_button(client: TestClient) -> None:

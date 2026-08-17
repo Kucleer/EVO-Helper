@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}系统日志 · EVO-Helper{% endblock %}
 {% block heading %}系统日志{% endblock %}
+{% block topbar_extra %}
+{% include "_auto_refresh.html" %}
+{% endblock %}
 
 {#
   ⚠️ 这一页不是「攻击日志」（`/logs`）。那一页一行是一发打出去的舰队，
@@ -74,7 +77,9 @@
     <p class="error" role="alert" style="margin:8px 0 0">{{ note }}</p>
   {% endfor %}
 
-  <p class="muted" style="font-size:12px;margin:8px 0 0">
+  {# 这一段里的「共 N 条 / 正在看第几条」会随新日志变，所以它跟着自动刷新走；
+     上面那张筛选表单不跟（用户正在填的关键字不能每 15 秒被替换一次）。 #}
+  <p class="muted" id="system-log-summary" data-refresh style="font-size:12px;margin:8px 0 0">
     {% if page.total %}
       当前筛选共 <strong>{{ page.total }}</strong> 条，正在看第
       {{ page.offset + 1 }}–{{ page.offset + page.rows | length }} 条（新的在上）。
@@ -96,7 +101,8 @@
   </p>
 </section>
 
-<section class="panel" aria-labelledby="system-log-rows">
+{# `data-refresh`：自动刷新只换这一块和上面那段计数（见 `_auto_refresh.html`）。 #}
+<section class="panel" id="system-log-entries" data-refresh aria-labelledby="system-log-rows">
   <h2 id="system-log-rows">日志</h2>
   <div class="table-wrap">
     <table>
