@@ -101,6 +101,29 @@ class FleetSnapshotEntry:
 
 
 @dataclass(frozen=True)
+class BattleResourceEntry:
+    """战报「获得资源」网格里的一格。
+
+    `slot` 是 0..11 的**位置**，不是资源名——位置是观测到的事实，名字是解释
+    （整段道理在 `domain.battle_resources` 模块头）。
+
+    ⚠️ **`approximate` 不是装饰。** 画面上超过一千的值一律缩写显示
+    （`928K` / `3.7M`），真值取不回来了。用户接受这个精度（口径 2026-08-17），
+    但接受误差不等于可以把近似值显示得像精确值——`uncertainty` 记的就是
+    「不准到什么程度」，页面照着它写误差范围。
+
+    有效位数不同，误差差三个数量级：`928K` 是 ±500，`501.1K` 是 ±50，
+    `3.7M` 是 ±50000。所以不能对所有 K 值统一按一个数算。
+    """
+
+    slot: int
+    amount: int
+    approximate: bool = False
+    #: 最大绝对误差（半个末位刻度）。精确读到的值是 0。
+    uncertainty: int = 0
+
+
+@dataclass(frozen=True)
 class BattleReport:
     report_id: UUID
     reported_at_utc: datetime
@@ -125,6 +148,13 @@ class BattleReport:
     #: 而海盗全是同一个预设打的，逐舰种没有分析价值。
     attacker_losses: int | None = None
     defender_losses: int | None = None
+    #: 「获得资源」那 12 格里**非零**的几格。
+    #:
+    #: ⚠️ **空元组有两种来源，库里分不开**：12 格全是 0（正常的一发白打），
+    #: 以及这条链路压根没读资源（老数据、或者那一屏没读全）。
+    #: 判据在 `domain.battle_resources.parse_resource_grid`：读不全就一格都不给，
+    #: 免得把「没读到」当成 0 存进去。
+    resources: tuple[BattleResourceEntry, ...] = ()
 
 
 @dataclass(frozen=True)

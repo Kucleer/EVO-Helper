@@ -64,6 +64,10 @@ def to_battle_report(live: LiveBattleReport, *, report_id: UUID) -> BattleReport
         attacker_losses=live.attacker_losses,
         defender_losses=live.defender_losses,
         fleet=tuple(fleet),
+        # 「获得资源」那 12 格里非零的几格。**空元组照样原样传下去**：
+        # 库里「没有行 = 这一格是 0」，而读不全的那种情况在读的那一层就
+        # 已经整块作废了（`domain.battle_resources.parse_resource_grid`）。
+        resources=live.resources,
     )
 
 
@@ -94,6 +98,7 @@ def to_pirate_battle_report(reading: PirateReportReading, *, report_id: UUID) ->
         outcome=reading.outcome,
         attacker_losses=reading.attacker_losses,
         defender_losses=reading.defender_losses,
+        resources=reading.resources,
     )
 
 

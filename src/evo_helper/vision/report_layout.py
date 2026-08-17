@@ -90,6 +90,58 @@ class ColumnBand:
 
 
 @dataclass(frozen=True)
+class ResourceGrid:
+    """「获得资源」那 12 格**数字**的 ROI（图标不裁，位置即类型）。
+
+    量于 2026-08-17，对着 `var/logs/vp-detail.png`（标定视口 1920×879 的未滚动
+    详情页实拍）。做法是把面板按亮度切成墨迹带，逐条量外接框：
+
+    - 数字左沿：``770 / 883 / 996 / 1109`` —— 列距**恰好 113**，四列等距
+    - 图标左沿：``736 / 847 / 967 / 1080`` —— 数字要裁到下一个图标之前为止
+    - 数字行：``513–521 / 543–551 / 573–581`` —— 行距 30，字高只有 9 像素
+
+    所以每格从 ``(数字左沿 − 3, 数字行顶 − 5)`` 起，取 76×20：横向到
+    ``数字左沿 + 73``，正好停在下一个图标之前（下一格图标左沿比数字左沿大 77）；
+    纵向到 ``数字行顶 + 15``，给 9 像素的字高上下各留几像素。
+    `501.1K` 这样六个字符实测约 48 像素宽，76 还有富余。
+
+    ⚠️ **数字宽度不能再放宽。** 再宽就吃到下一格的图标，而图标的亮边会被
+    tesseract 当成字符——读出来的不是空，是一个混进了噪声的数。
+
+    ⚠️ **这一块只在未滚动那一屏上**（和 `report_panel`、VS 块同一屏）。
+    拖到底之后它整个滚出可视区。
+    """
+
+    #: 第 0 格数字 ROI 的左沿。
+    first_number_left: int
+    #: 数字 ROI 的宽度。
+    number_width: int
+    #: 相邻两列数字左沿的距离。
+    column_pitch: int
+    columns: int
+    #: 第 0 行数字 ROI 的上沿。
+    first_row_top: int
+    #: 数字 ROI 的高度。
+    number_height: int
+    #: 相邻两行数字上沿的距离。
+    row_pitch: int
+    rows: int
+
+    @property
+    def slots(self) -> int:
+        return self.columns * self.rows
+
+    def cell(self, slot: int) -> Region:
+        """第 ``slot`` 格数字的 ROI。编号**行优先**：第一行左起 0/1/2/3。"""
+        if not 0 <= slot < self.slots:
+            raise IndexError(f"槽位 {slot} 不在 0..{self.slots - 1} 之内")
+        row, column = divmod(slot, self.columns)
+        left = self.first_number_left + column * self.column_pitch
+        top = self.first_row_top + row * self.row_pitch
+        return Region(left, top, left + self.number_width, top + self.number_height)
+
+
+@dataclass(frozen=True)
 class ReportLayout:
     viewport: tuple[int, int]
     ocr_upscale: int
@@ -140,6 +192,8 @@ class ReportLayout:
     #: 余量是刻意留的：面板高度会随内容变（舰队回收百分比、战斗详情行数），
     #: 贴着量出来的边裁，换一份内容更长的战报就会切掉数据。
     report_panel: Region
+    #: 「获得资源」那 12 格数字的 ROI，见 `ResourceGrid`。
+    resource_grid: ResourceGrid
 
     def mail_row(self, index: int) -> Region:
         """Region of the ``index``-th visible mail row, counting from 0."""
@@ -176,6 +230,16 @@ LIVE_LAYOUT = ReportLayout(
     defender_column=ColumnBand(960, 1210),
     participating_rows=(405, 750),
     report_panel=Region(700, 105, 1220, 800),
+    resource_grid=ResourceGrid(
+        first_number_left=767,
+        number_width=76,
+        column_pitch=113,
+        columns=4,
+        first_row_top=508,
+        number_height=20,
+        row_pitch=30,
+        rows=3,
+    ),
 )
 
 

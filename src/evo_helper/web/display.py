@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from evo_helper.application.backfill import BACKFILL_KINDS, BackfillPhase
-from evo_helper.domain.records import TARGET_KIND_LABELS
+from evo_helper.domain.records import TARGET_KIND_LABELS, BattleResourceEntry
 from evo_helper.domain.scheduler import TaskStatus
 
 #: 三条任务链路在界面上的名字。
@@ -335,3 +335,26 @@ def missing_intel_labels() -> list[str]:
         if kind not in TARGET_KIND_TONES or kind not in TARGET_KIND_GLYPHS
     ]
     return missing
+
+
+def resource_amount_text(entry: BattleResourceEntry) -> str:
+    """一格收获在页面上怎么写。
+
+    ⚠️ **近似值必须带「约」。** 画面上超过一千的值是缩写显示的（`928K`），
+    真值取不回来了。用户接受这个精度（口径 2026-08-17：合计 123.4K 时误差在
+    10K 之内即可），**但接受误差不等于可以把近似值显示得像精确值**——
+    仓库里已有先例（`military_score_estimated`），这里照办。
+    """
+    text = f"{entry.amount:,}"
+    return f"约 {text}" if entry.approximate else text
+
+
+def resource_precision_hint(entry: BattleResourceEntry) -> str:
+    """鼠标悬停时说清这一格准到什么程度。
+
+    误差按**当初显示了几位有效数字**算，不是对所有近似值统一一个数：
+    `928K` 是 ±500、`501.1K` 是 ±50、`3.7M` 是 ±50000——差三个数量级。
+    """
+    if not entry.approximate:
+        return "精确读数"
+    return f"画面上是缩写显示的，误差不超过 ±{entry.uncertainty:,}"

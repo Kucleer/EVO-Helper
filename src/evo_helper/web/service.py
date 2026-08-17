@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from evo_helper.domain.models import Coordinate, CoordinateRange
+from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.storage.report_screenshots import ReportScreenshot
 
@@ -253,6 +254,15 @@ class AttackLogView:
     scout_report_back: bool = False
     #: 匹配上的那份战报的 id。页面靠它拼截图链接。没战报时 None。
     report_id: UUID | None = None
+    #: 这一发的收获：战报「获得资源」那 12 格里**非零**的几格，按槽位升序。
+    #:
+    #: ⚠️ **空元组不等于「没读到」。** 库里只存非零的格子，没有行就是那一格是 0
+    #: （整段语义在 `storage.models.BattleReportResourceRow` 上）。所以页面上
+    #: 「没有收获」这句话对两种情形都成立，不必也不该分档显示。
+    #:
+    #: 条目里的 `approximate` 要在页面上标出来：`928K` 这样的缩写值真值取不回来，
+    #: 把它显示得像精确读数是不诚实的。
+    resources: tuple[BattleResourceEntry, ...] = ()
     #: 那份战报**有没有存下截图**。
     #:
     #: ⚠️ **这里只放一个布尔，绝不放图片字节。** 这一页一次取 `ATTACK_LOG_LIMIT`

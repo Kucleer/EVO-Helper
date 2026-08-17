@@ -288,6 +288,59 @@ class BattleReportScreenshotRow(Base):
     image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
 
 
+class BattleReportResourceRow(Base):
+    """战报「获得资源」网格里**非零**的那几格。
+
+    用户口径（2026-08-17）：只统计「获得资源」那 12 个值，残骸与两个百分比不做。
+
+    ## ⚠️ 没有行 = 这一格是 0，**不是**「没读到」
+
+    只存非零的格子——一份战报十有八九只有三五格有数，全存等于给每份战报凭空
+    加十二行。所以读的时候是**全有或全无**：12 格但凡有一格读不出来，
+    这份战报一行都不写（判据在 `domain.battle_resources.parse_resource_grid`）。
+    不这样的话，「读到 8 格」会在库里长得和「另外 4 格是 0」一模一样。
+
+    ⚠️ **残留的歧义说在前面**：一份战报**一行都没有**时，既可能是 12 格全 0
+    （正常的一发白打），也可能是这条链路根本没读过资源（这个 PR 之前入库的
+    存量战报全是这种）。库里分不开。当前不要紧——存量战报本来就没有收获数据，
+    而全 0 与没读到在页面上都显示成「没有收获」。真要分开，加一个「读过没有」
+    的标记列即可，别去猜。
+
+    ## 为什么存 `slot` 不存资源名
+
+    位置是观测到的事实，名字是解释。解释错了以后还能靠 slot 重新映射；
+    把名字硬编进库里，原始观测就找不回来了。对照表在
+    `domain.battle_resources.SLOT_LABELS`，页面渲染时才翻译。
+
+    ## 为什么不在 `battle_reports` 上加 12 列
+
+    那是把一张关系表当成电子表格用。加 12 列之后，「第 7 格是什么」只能靠列名
+    回答，而列名一旦定错（见上一段）就只能靠迁移改；更要紧的是，格数是游戏的
+    排版，不是这套系统的常量——它变一次，表结构就要动一次。
+    """
+
+    __tablename__ = "battle_report_resources"
+    __table_args__ = (
+        # 一份战报的一个格子只能有一行。重复读到同一份战报走的是「库里已有」
+        # 那条早停路径，根本走不到这里；真撞上了，宁可写失败也不要攒出两份收获。
+        UniqueConstraint("report_id", "slot", name="uq_battle_report_resources_slot"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    report_id: Mapped[UUID] = mapped_column(ForeignKey("battle_reports.id"), index=True)
+    #: 网格位置 0..11，**行优先**（第一行左起 0/1/2/3）。不是资源名，理由见上。
+    slot: Mapped[int] = mapped_column(Integer)
+    #: 数量。`BigInteger`——画面上已经出现过 `3.7M`，而 `B` 后缀也在解析器里，
+    #: 32 位在这条量级上只是等着某天溢出。
+    amount: Mapped[int] = mapped_column(BigInteger)
+    #: 画面上是缩写显示的（`928K`），真值取不回来了。页面上要标「约」。
+    approximate: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: 最大绝对误差（半个末位刻度）。`928K` 是 500、`501.1K` 是 50、`3.7M` 是 50000。
+    #: 单独记一列而不是按 `approximate` 现算：现算要知道当初显示了几位有效数字，
+    #: 而那个信息在换算成整数的那一刻就没了。
+    uncertainty: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
 class FleetSnapshotRow(Base):
     __tablename__ = "fleet_snapshots"
 

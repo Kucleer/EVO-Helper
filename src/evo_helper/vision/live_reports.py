@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import Protocol
 
 from evo_helper.domain.battle_outcome import outcome_from_totals
+from evo_helper.domain.battle_resources import parse_resource_grid
+from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.vision.models import (
     FleetLine,
     PageObservation,
@@ -129,6 +131,13 @@ class LiveBattleReport:
     #: ⚠️ **算不出就是 None，绝不拿别的东西顶替。** 「没算出胜负」和「打输了」
     #: 在下游完全不同：后者会进攻击日志的战果列，显示成一场根本没读过的败仗。
     outcome: str | None = None
+    #: 「获得资源」那 12 格里**非零**的几格（用户口径 2026-08-17：只统计这 12 个值）。
+    #:
+    #: ⚠️ **空元组有两种来源**：12 格全是 0（白打一发），以及那一屏没读全。
+    #: 后者会留一条 warning，但这个字段本身分不开——分得开的判据在
+    #: `domain.battle_resources.parse_resource_grid`，它读不全就一格都不给，
+    #: 免得把「没读到」当成 0 传下去。
+    resources: tuple[BattleResourceEntry, ...] = ()
     #: How long this report took to read, split by stage.
     timing: ReadTiming = field(default_factory=ReadTiming)
 
@@ -283,6 +292,8 @@ class LiveReportReader:
         )
         self._cross_check_banner(outcome, raw_time)
         timer.stage("outcome")
+        resources = self._resources(self._screens, where=raw_time)
+        timer.stage("resources")
         return LiveBattleReport(
             kind=kind,
             raw_time_text=raw_time,
@@ -300,8 +311,31 @@ class LiveReportReader:
             attacker_losses=attacker_losses,
             defender_losses=defender_losses,
             outcome=outcome,
+            resources=resources,
             timing=timer.finish(),
         )
+
+    def _resources(self, screens: object, *, where: str) -> tuple[BattleResourceEntry, ...]:
+        """「获得资源」那 12 格。读不全就一格都不要——**绝不补 0**。
+
+        **接在读战报这一趟里**：这一块就在未滚动那一屏上（和 VS 块、存档截图
+        同一屏像素），不额外开一次导航。
+
+        用 getattr 取而不是写进 `ReportScreens` 协议，与 `_unit_totals` 同一个
+        理由：写进去会打断所有既有的实现，而资源是增强项——提供不了的实现
+        照样能读出一份完整报告。
+
+        读不全时留一条 warning：交出去的空元组和「12 格全是 0」长得一样，
+        不吭一声的话，这条链路哪天整块失灵都没人看得见。
+        """
+        reader = getattr(screens, "resource_cells", None)
+        if reader is None:
+            return ()
+        entries = parse_resource_grid(reader())
+        if entries is None:
+            logger.warning("战报 %s 的「获得资源」没读全；这一份不记收获，也不补 0", where)
+            return ()
+        return entries
 
     def _header_facts(self, timer: _StageTimer) -> tuple[ReportKind, str, datetime]:
         """报告头上的三件事：类型、时间原文、UTC 时间。任一读不出就抛。"""
