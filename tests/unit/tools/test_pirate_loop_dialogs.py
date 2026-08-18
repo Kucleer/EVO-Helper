@@ -43,12 +43,18 @@ class _Driver:
 
 
 def _loop(dialog_text: str) -> tuple[Any, _Driver]:
-    """一个只会读出 `dialog_text` 的循环。"""
+    """一个只会读出 `dialog_text` 的循环。
+
+    ⚠️ **落库那一步桩掉。** 撞上保护期时 `_handle_dialog` 会把这件事记进
+    `bot_targets`（见 `test_protection_period_record`），而这份用例守的是「三个
+    弹窗分两类」这条判据——让它去开一条真的数据库连接，守的东西就换人了。
+    """
     loop = PirateLoop.__new__(PirateLoop)
     driver = _Driver()
     loop._driver = driver  # type: ignore[attr-defined]
     loop._outcome = Outcome()  # type: ignore[attr-defined]
     loop._read = lambda *_a, **_k: dialog_text  # type: ignore[attr-defined, assignment]
+    loop._note_protection_period = lambda _c: None  # type: ignore[attr-defined, assignment]
     return loop, driver
 
 

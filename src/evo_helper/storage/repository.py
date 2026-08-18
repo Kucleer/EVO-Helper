@@ -1909,6 +1909,49 @@ class SqlAlchemyRepository:
             ).all()
         return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
 
+    def note_protection_period(self, coordinate: Coordinate, *, seen_at_utc: datetime) -> bool:
+        """记下「这个坐标在这一刻撞上了保护期」。写成了返回 True。
+
+        撞上「没有可执行的任务」那个弹窗是**保护期唯一的证据**——保护期任何人打过
+        都会触发，推不出来（见 `game.pirate_ui.DIALOG_NO_MISSION`）。不落库的后果
+        实机验过：2026-08-18 20:29 那一轮当场确认四个目标全在保护期、一发没派，
+        一秒之后的下一轮又把同样的四个挑了出来，因为选靶查不到 `system_log` 里那
+        164 条纯文本。
+
+        ⚠️ **只更新已有行，绝不插新行。** `bot_targets` 的行由坐标扫描和军力榜建，
+        这里插一行等于凭一个弹窗就断言「这坐标是个目标」——而这条链路上的坐标也
+        可能是海盗位（1--4 号位，`clear_pirate_position_bot_candidates` 专门在清
+        它们）。没有对应行时返回 False，调用方据此把话说清楚，而不是静默。
+
+        ⚠️ **写的是「什么时候撞上的」，不是「保护期什么时候结束」。** 排除到什么
+        时候是策略，由旋钮回答，见 `storage.models.BotTargetRow.protection_seen_at_utc`。
+        """
+        seen_at_utc = _require_utc(seen_at_utc, "seen_at_utc")
+        with self._session_factory() as session:
+            target = _bot_target_for(session, coordinate)
+            if target is None:
+                return False
+            target.protection_seen_at_utc = seen_at_utc
+            session.commit()
+            return True
+
+    def protected_bot_targets_since(self, since: datetime) -> set[Coordinate]:
+        """`since` 之后撞上过保护期的坐标。选靶第 ① 步据此排除它们。
+
+        与 `attacked_bot_targets_since` 同形，**故意的**：两条排除是同一档判据
+        （「这个坐标现在打不了」），排在同一处、量同一把尺子。
+        """
+        since = _require_utc(since, "since")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                ).where(orm.BotTargetRow.protection_seen_at_utc >= since)
+            ).all()
+        return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
+
     def pirate_progress(
         self,
         *,
@@ -2337,6 +2380,7 @@ class SqlAlchemyRepository:
         unknown_line_hold_minutes: int | None = None,
         reconcile_cooldown_minutes: int | None = None,
         bot_revisit_hours: int | None = None,
+        protection_exclusion_hours: int | None = None,
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
@@ -2357,6 +2401,7 @@ class SqlAlchemyRepository:
             row.unknown_line_hold_minutes = unknown_line_hold_minutes
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
             row.bot_revisit_hours = bot_revisit_hours
+            row.protection_exclusion_hours = protection_exclusion_hours
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
             session.commit()

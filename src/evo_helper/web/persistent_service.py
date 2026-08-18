@@ -1381,6 +1381,7 @@ class MissionConsoleService:
         unknown_line_hold_minutes: object = None,
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
+        protection_exclusion_hours: object = None,
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
     ) -> MilitaryAttackConfigView:
@@ -1403,6 +1404,9 @@ class MissionConsoleService:
                 reconcile_cooldown_minutes
             )
             revisit = self._scheduler.validate_bot_revisit_hours(bot_revisit_hours)
+            protection = self._scheduler.validate_protection_exclusion_hours(
+                protection_exclusion_hours
+            )
             account_lines = self._scheduler.validate_account_line_limit(account_line_limit)
             toggle_window = self._scheduler.validate_auto_toggle_log_seconds(
                 auto_toggle_log_seconds
@@ -1416,6 +1420,7 @@ class MissionConsoleService:
             unknown_line_hold_minutes=hold,
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
+            protection_exclusion_hours=protection,
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
         )
@@ -1838,14 +1843,16 @@ class MissionConsoleService:
                 # 数字本身没有能对上的口径，所以宁可不说，也不换算一个假的出来。
                 if remaining > 0:
                     return ""
-                # 池子空了是句能站住的事实，但**成因有两个**，所以两个都得说出来：
-                # 已知 bot 全在 24 小时冷却里（或还在飞），或者它们**从没上过军力榜**
-                # （2026-08-18 起这一档不再攻击，见 `domain.target_order`）。只说前
-                # 一个的话，用户会去等 24 小时过去，而实际要等的是军力榜扫描。
+                # 池子空了是句能站住的事实，但**成因有三个**，所以三个都得说出来：
+                # 已知 bot 全在重复攻击间隔里（或还在飞）、全都**刚撞上过游戏的 8
+                # 小时保护期**（2026-08-18 起这一档也排除，见 `_military_candidates`），
+                # 或者它们**从没上过军力榜**（同日起这一档不再攻击，见
+                # `domain.target_order`）。只说第一个的话，用户会去等 24 小时过去，
+                # 而实际要等的可能是保护期，也可能是军力榜扫描。
                 # ⚠️ **不再提「分数已过期」**：超期现在不挡任何目标，写上去会让用户
                 # 去调那个什么都不挡的有效期，调完照样一发不派。
                 # 不写「本轮已全部完成」——军力模式没有那个「轮」。
-                return "暂无可打目标（近 24 小时打过，或从未上过军力榜）"
+                return "暂无可打目标（近期打过、撞上过保护期，或从未上过军力榜）"
             if remaining <= 0:
                 return "本轮已全部完成"
             return f"还剩 {remaining} 个未完成"
@@ -2306,6 +2313,7 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
         "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,
+        "protection_exclusion_hours": row.protection_exclusion_hours,
         "account_line_limit": row.account_line_limit,
         "auto_toggle_log_seconds": row.auto_toggle_log_seconds,
     }

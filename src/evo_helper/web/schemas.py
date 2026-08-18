@@ -278,6 +278,12 @@ class MilitaryAttackConfigOut(BaseModel):
     reconcile_cooldown_minutes: int | None = None
     #: 同一个 bot 坐标多久之内不重复打（小时）。**`None` = 留空 = 默认 24。**
     bot_revisit_hours: int | None = None
+    #: 撞上保护期之后这个坐标排除多久（小时）。**`None` = 留空 = 默认 8。**
+    #:
+    #: ⚠️ 默认值 8 与游戏那条「保护期 8 小时」**同数不同义**：前者是我们的策略
+    #: （撞上的时刻已知、保护期起点未知，宁可过度排除），后者是游戏规则。
+    #: 范围由 `MissionScheduler.validate_protection_exclusion_hours` 判。
+    protection_exclusion_hours: int | None = None
     # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 随那个错误设计一起删掉了
     # （理由在 `storage.models.MilitaryAttackConfigRow` 与 `domain.target_order`
     # 模块头第 3 步）。**别加回来**：「用多新的数据」现在由任务参数
