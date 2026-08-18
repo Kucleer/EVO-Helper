@@ -1,5 +1,5 @@
 ---
-issue: 192
+issue: 193
 agent: domain-storage
 type: Added
 date: 2026-08-18
