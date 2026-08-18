@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 
@@ -12,18 +13,35 @@ from evo_helper.web.runtime import _upgrade_database, create_runtime_app
 from support.database import scratch_database_url
 
 
-def _downgrade_one_step(database_url: str) -> None:
-    """把库退回上一条迁移。**只给用例造「库落后于代码」这个局面用。**
+def _rewind_the_version_pointer(database_url: str) -> None:
+    """只把 `alembic_version` 那一行退回上一条，**表结构一个字不动**。
 
     刻意不做成 `_upgrade_database` 的参数：那个函数是部署路径上的东西，
     为了测试给它加一个「降级」入口，等于在生产代码里留一把只有测试用的刀。
+
+    ⚠️ **这里原先跑的是真的 `downgrade -1`，2026-08-18 换成了 `stamp`。**
+    两条理由：
+
+    - **它更像事故当时的样子。** 用例自己的 docstring 写着「事故当时那个库
+      **已经建好了全部表**、只是版本落后几条」——那正是 `stamp` 造出来的局面，
+      而 `downgrade` 会真的把最新那条迁移的列删掉，造出一个事故里没有的局面。
+    - **`downgrade` 让这条用例被最新那条迁移绑架。** 只要最新迁移往
+      `create_runtime_app` 启动时要读的表（`bot_targets`、`military_attack_config`）
+      加一列，退回去之后 ORM 的 SELECT 就找不到那一列，用例红在
+      `no such column` 上——而那和「构造 app 有没有推进版本」毫无关系。
+      2026-08-18 `b7e4d0c93a15` 往 `bot_targets` 加列时正是这么红的。
     """
     root = Path(__file__).resolve().parents[2]
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     config.set_main_option("sqlalchemy.url", database_url)
     config.attributes["database_url"] = database_url
-    command.downgrade(config, "-1")
+    script = ScriptDirectory.from_config(config)
+    head = script.get_current_head()
+    assert head is not None
+    previous = script.get_revision(head).down_revision
+    assert isinstance(previous, str), "迁移链只有一条，head 一定有唯一的上一条"
+    command.stamp(config, previous)
 
 
 def test_building_the_app_never_advances_the_schema_version(tmp_path: Path) -> None:
@@ -44,7 +62,7 @@ def test_building_the_app_never_advances_the_schema_version(tmp_path: Path) -> N
     """
     database_url = scratch_database_url(tmp_path, "behind.db")
     _upgrade_database(database_url)
-    _downgrade_one_step(database_url)
+    _rewind_the_version_pointer(database_url)
     engine = create_engine(database_url)
     with engine.connect() as connection:
         before = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()

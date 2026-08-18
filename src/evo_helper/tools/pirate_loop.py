@@ -79,6 +79,7 @@ from evo_helper.domain.report_wait import (
 )
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
+from evo_helper.domain.target_order import DEFAULT_PROTECTION_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.game.overlay import look_at_close_button
 from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
@@ -1207,11 +1208,98 @@ class PirateLoop:
             return True
         self._driver.click(*pirate_ui.DIALOG_CONFIRM, label="关闭弹窗")
         self._driver.wait(DISPATCH_WAIT_S)
-        if message == pirate_ui.DIALOG_NO_MISSION:
+        # ⚠️ **类别按弹窗类型认，不按那句中文认**（`pirate_ui.DialogKind`）。
+        # 同 `mission_scheduler._launch` 里那条「类别按异常类型认」。这几句中文是
+        # 从屏幕上 OCR 出来再贴回词表的，字面本来就会抖；而两类做反的代价极不对称。
+        if pirate_ui.dialog_kind(message) is pirate_ui.DialogKind.PROTECTED:
+            self._note_protection_period(coordinate)
             say(f"  {coordinate} 在保护期内（{message}）；跳过这个目标")
             self._outcome.refused.append((coordinate, message))
             return False
         raise RoundExhausted(message)
+
+    def _note_protection_period(self, coordinate: Coordinate) -> None:
+        """把「这个坐标此刻在保护期里」落进库，并说清排除到什么时候。
+
+        **这是保护期唯一的证据。** 游戏的 8 小时保护期任何人打过都会触发，推不
+        出来、只能撞上了才知道（`game.pirate_ui.DIALOG_NO_MISSION`）。不落库的
+        后果实机验过：2026-08-18 20:29 那一轮当场确认四个目标全在保护期、11.5
+        分钟一发没派，20:41 结算完，**一秒之后的下一轮又把同样的四个挑了出来**
+        ——因为「撞上了」当时只存在于 `system_log` 的纯文本里，选靶查不到。
+
+        **不限流，每个目标每次撞上都写一条。** 它不是每 tick 都可能触发的那一类
+        （`REPEATED_LOG_WINDOW` 管的是那一档）：一轮里每个目标最多撞一次，而每一次
+        都对应约 2.9 分钟白烧掉的鼠标时间——正是要能一条一条数出来的东西。
+
+        ⚠️ **排除到什么时候只是「按当下这份配置算出来的预告」，写进日志、不写进库。**
+        库里存的是撞上的时刻（`bot_targets.protection_seen_at_utc`），排除时长是
+        选靶时现读的旋钮。把结束时刻存进库等于把这一刻的策略腌进历史数据。
+        """
+        repository, _run_id = self._ensure_run()
+        seen_at = datetime.now(UTC)
+        window = self._protection_exclusion_window()
+        recorded = repository.note_protection_period(coordinate, seen_at_utc=seen_at)
+        payload = {
+            "target": str(coordinate),
+            "target_kind": self.TARGET_KIND,
+            "seen_at_utc": seen_at.isoformat(),
+            "exclusion_hours": window.total_seconds() / 3600,
+            "excluded_until_utc": (seen_at + window).isoformat(),
+            "recorded": recorded,
+            "evidence": "dialog",
+            "dialog": pirate_ui.DIALOG_NO_MISSION,
+        }
+        if recorded:
+            record_system_log(
+                "INFO",
+                "tools.pirate_loop",
+                f"{coordinate} 在保护期内（派遣时弹「{pirate_ui.DIALOG_NO_MISSION}」）；"
+                f"排除到 {seen_at + window:%Y-%m-%d %H:%M} UTC"
+                f"（撞上时刻 + {window.total_seconds() / 3600:.0f} 小时）",
+                payload=payload,
+            )
+            return
+        # 说实话的那一档：`bot_targets` 里没有这一行（海盗位、或者还没被扫到过），
+        # 所以这一次**没有落库**，下一轮选靶排除不掉它。默不作声的话，日志会看起来
+        # 像是记上了——而「日志说假话比不说更糟」。
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            f"{coordinate} 在保护期内，但 bot_targets 里没有这一行，没能记下来；"
+            "下一轮选靶排除不掉它",
+            payload=payload,
+        )
+
+    def _protection_exclusion_window(self) -> timedelta:
+        """撞上保护期之后排除多久。**留空 / 读不到都走代码里的默认值。**
+
+        和 `_reconcile_cooldown` 同一套写法与同一条理由：值取自全局攻击配置
+        （`military_attack_config.protection_exclusion_hours`），**不走命令行**；
+        读不到就用默认值而不是抛异常——一个查不出来的配置说明不了「用户想改它」，
+        为它把整轮任务弄死不成比例。
+
+        ⚠️ **runner 这一侧只拿它写日志里那句「排除到什么时候」。** 真正的排除在选靶
+        （`application.mission_scheduler._military_candidates`）现读同一列。所以读不到
+        时退回默认值最多让日志里那句预告偏一点，不会让排除本身失效。
+        """
+        try:
+            repository, _run_id = self._ensure_run()
+            hours = repository.military_attack_config().protection_exclusion_hours
+        except Exception as error:  # noqa: BLE001 - 见 docstring：读不到就走默认值
+            fallback = DEFAULT_PROTECTION_EXCLUSION
+            say(f"  读不到保护期排除时长（{error}）；按代码默认的 {fallback} 算")
+            return fallback
+        if hours is None:
+            return DEFAULT_PROTECTION_EXCLUSION
+        window = timedelta(hours=int(hours))
+        record_knob_override(
+            "protection_exclusion",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_PROTECTION_EXCLUSION,
+            detail="撞上保护期的坐标在这段时间内不进候选池",
+        )
+        return window
 
     def _read_flight_time(self) -> timedelta | None:
         """把简报上的飞行时间读下来，**必须在点「出发！」之前**。
