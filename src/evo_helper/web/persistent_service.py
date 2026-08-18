@@ -129,9 +129,10 @@ def _origins_text(origins: Sequence[MissionOriginView]) -> str:
 
     停用的那几颗**照样列出来并标注**：不列的话，用户看到的和「把它删了」一模一样，
     而那两件事的善后完全不同。
+
+    调用方保证 `origins` 非空（`LineBudget._line_budget` 把空的整条滤掉了）：
+    空的含义是「回落到任务级那一个出发星球」，那一档走的是另一句话。
     """
-    if not origins:
-        return "未配置出发点"
     return " / ".join(
         f"{item.galaxy}:{item.system}:{item.position} · {item.fleet_lines} 条"
         + ("" if item.enabled else "（停用）")
@@ -1702,10 +1703,16 @@ class MissionConsoleService:
         （扫描 / 军力榜）都不占航线，算进去只会让这个数虚高，而虚高的告警和没有
         告警一样没用。
         """
+        # ⚠️ **空元组不算「配了多出发点」。** `mission_task_origins` 为空时调度器
+        # 回落到任务级那一个出发星球（`MissionScheduler._configured_origins`），
+        # 所以这一行该照旧显示 `origin` / `fleet_lines`；显示成「未配置出发点」
+        # 会让用户以为它派不出去，而它派得出去。
         origins = {
-            task.task_id: self.mission_origins(task.task_id)
+            task.task_id: planets
             for task in tasks
-            if task.kind is MissionKind.BOT and self._by_military(task, snapshot)
+            if task.kind is MissionKind.BOT
+            and self._by_military(task, snapshot)
+            and (planets := self.mission_origins(task.task_id))
         }
         configured = 0
         for task in tasks:
