@@ -760,6 +760,35 @@ class MilitaryAttackConfigRow(Base):
     #: 「用多新的数据」是这一份数据的属性，不属于某一个攻击任务。
     military_time_pool: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    #: **全账号**同时能在飞的舰队上限。**空 = `domain.scheduler.DEFAULT_ACCOUNT_LINE_LIMIT`。**
+    #:
+    #: 用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
+    #: 最高是到 9 条」「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线
+    #: 数，两者均需要约束」。所以航线有**两道**闸：每颗星球各自的预算（
+    #: `mission_task_origins.fleet_lines` / `mission_tasks.fleet_lines`），以及这一条
+    #: 账号级的总数。判据写在 `application.mission_scheduler._free_lines_from`。
+    #:
+    #: ⚠️ **刻意不复用 `scheduler_config.fleet_line_limit`。** 那一列的含义早已从
+    #: 「账号一共几条」降级成「任务没填航线数时用几条」（见 `SchedulerConfigRow` 与
+    #: `MissionScheduler._fleet_lines_of`），一个数同时表达两件事，改哪一件都会伤到
+    #: 另一件。
+    #:
+    #: 旋钮而非标定常量：取值取决于用户开不开加成道具（常态 6、开道具 9），
+    #: 没有唯一正确答案。调小更保守，代价是配好的星球派不满；调大更激进，
+    #: 代价是 runner 会白跑一趟撞上游戏的「同时派遣的舰队数量已达上限。」。
+    account_line_limit: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
+    #: 「自动停用 / 自动恢复」这一对日志的限流窗口（秒）。
+    #: **空 = `application.mission_scheduler.AUTO_TOGGLE_LOG_WINDOW`（120 秒）。**
+    #:
+    #: 旋钮而非标定常量：调小排障时看得密、日志吵；调大库干净，代价是一次真实的
+    #: 反复跃迁会被合并成看不出频率的一条（被压掉几次会记在 payload 里，见
+    #: `MissionScheduler._log_auto_toggle`）。先例是 `record_unrecognised_screen`
+    #: 那 120 秒。
+    auto_toggle_log_seconds: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
 
 class MissionRunRow(Base):
     """调度器每起一个子进程记一行。"""

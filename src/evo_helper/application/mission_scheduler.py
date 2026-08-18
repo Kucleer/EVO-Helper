@@ -34,6 +34,7 @@ from evo_helper.application.backfill import (
     default_since,
 )
 from evo_helper.application.mission_freeze import (
+    FrozenOrigin,
     FrozenTask,
     MissionConfigFreeze,
     MissionFreezeLog,
@@ -86,6 +87,7 @@ from evo_helper.domain.report_wait import (
     WaitAction,
 )
 from evo_helper.domain.scheduler import (
+    DEFAULT_ACCOUNT_LINE_LIMIT,
     Action,
     Decision,
     DisabledRecovery,
@@ -94,6 +96,7 @@ from evo_helper.domain.scheduler import (
     SchedulerFacts,
     TaskFacts,
     TaskSnapshot,
+    account_free_lines,
     decide,
     fills_gaps,
     free_lines_for,
@@ -164,6 +167,33 @@ MAX_ENVIRONMENT_EXEMPTIONS = 6
 #: 攻击配置页上有一个框（`military_attack_config.bot_revisit_hours`），
 #: 留空才走这里。
 DEFAULT_BOT_REVISIT = timedelta(hours=24)
+
+#: 「从来没从这颗星球派过」在轮换排序里算作**最久远**。
+#: 用 `datetime.min` 而不是 `None`：排序键里混着 `None` 会在 strict mypy 下要额外
+#: 的分支，而一颗从没出过兵的星球，语义上本来就该排在所有出过兵的前面。
+_NEVER = datetime.min.replace(tzinfo=UTC)
+
+#: 用户能填进去的全账号航线上限的上界，纯防手滑。
+#: 游戏那侧的真实上限在 9 附近（用户口径 2026-08-18），但助手不该替游戏写死一个数
+#: ——版本会变、道具会变。这个数只挡住明显不可能的取值。
+ACCOUNT_LINE_LIMIT_MAX = 99
+
+#: 「自动停用 / 自动恢复」这一对日志的默认限流窗口。
+#:
+#: **它是为「反复跃迁」准备的，去重挡不住那一档。** 2026-08-18 01:00 那一小时里，
+#: 任务「扫描+攻击 bot」自动停用 447 次、自动恢复 447 次、写了 1368 行日志，
+#: 每一下都是真跃迁（库里那两列每次都在变），所以按「只在变化时写」去重一条都拦
+#: 不下来。判据不是「有没有打日志」，是**出事时能不能只靠库里的日志定位**——
+#: 一小时 1368 行同一句话定位不了任何东西。
+#:
+#: 取 120 秒是抄 `record_unrecognised_screen` 的先例（同一类问题：一个每 tick 都
+#: 可能触发的东西）。它是**运维旋钮**，可在攻击配置页上改
+#: （`military_attack_config.auto_toggle_log_seconds`）：调小排障时看得密、日志吵；
+#: 调大库干净，代价是一次真实的反复跃迁被合并成看不出频率的一条。
+AUTO_TOGGLE_LOG_WINDOW = timedelta(seconds=120)
+
+#: 用户能填进去的日志窗口上界（秒）。一小时——再长就把一整夜的抖动合并成寥寥几条。
+AUTO_TOGGLE_LOG_MAX_SECONDS = 3600
 
 #: 用户能填进去的重复攻击间隔上界（小时）。
 #: 一周：bot 军力每周一 UTC+0 刷新，跨过一个刷新周期之后，「上周打过」拦住的是
@@ -304,6 +334,21 @@ class MilitaryPoolReading:
         ——「军力榜还没扫过（或者刚清过一次坏读数），此刻一个都派不出去」。
         """
         return self.attackable > 0 and self.usable == 0
+
+
+@dataclass(frozen=True)
+class ConfiguredOrigin:
+    """`mission_task_origins` 上配着的一颗出发星球，**连「有没有勾上」一起带**。
+
+    和 `domain.military_attack.AttackOrigin` 的区别只在这一个字段，但那个区别是
+    要紧的：判据只该看到启用的那几颗（停用的星球不该分到目标），而**固化记录要连
+    停用的一起记**——「用户把 2 号星停掉了」这件事在账里必须留得下来，否则事后
+    翻记录只看得见「少了一颗星球」，分不清是停用还是删掉了。
+    """
+
+    coordinate: Coordinate
+    fleet_lines: int
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -497,6 +542,10 @@ class MissionScheduler:
         #: 上一次判定出来的盲拖屏数取值与它的来源，用来把日志压成「只在变化时写」。
         #: 见 `_blind_scrolls`。
         self._blind_scroll_choice: BlindScrollChoice | None = None
+        #: 「自动停用 / 自动恢复」这一对日志的限流账：`(任务, 事件)` →
+        #: `(上一次真的落库的时刻, 那之后被压掉了几次)`。见 `_log_auto_toggle`。
+        #: 只记在内存里——重启之后的第一次跃迁本来就该落一条。
+        self._auto_toggle_logged: dict[tuple[int, str], tuple[datetime, int]] = {}
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -635,6 +684,14 @@ class MissionScheduler:
                         # `EVO_HELPER_ORIGIN` 之后旧记录会跟着一起改口。
                         origin=str(self._origin_of(row)),
                         fleet_lines=self._fleet_lines_of(row, config),
+                        # ⚠️ **军力攻击的真相在这里，不在上面那两个字段里。**
+                        # `mission_tasks.origin_*` / `fleet_lines` 是加多出发点之前
+                        # 留下的残值，`replace_mission_origins` 从不回写它们；照着
+                        # 它们记账，固化记录会写出「出发 4:277:15 · 航线 7」，
+                        # 而用户配的是 `4:277:15=6` + `9:250:8=2`（生产实证
+                        # 2026-08-18）。其余链路没有多出发点，记 `()`（「确实没有」，
+                        # 与旧行那个 `None`「没得比」是两回事）。
+                        origins=self._frozen_origins(row),
                     )
                     for row in tasks
                     if _known(row.kind)
@@ -817,6 +874,23 @@ class MissionScheduler:
         """校验攻击配置页上那个「军力时间池」。留空返回 `None` = 默认 500。"""
         return _military_time_pool(value)
 
+    def validate_account_line_limit(self, value: object) -> int | None:
+        """校验攻击配置页上那个「全账号航线上限」。留空返回 `None`。"""
+        return _account_line_limit(value)
+
+    def validate_auto_toggle_log_seconds(self, value: object) -> int | None:
+        """校验攻击配置页上那个「自动停用/恢复日志的限流窗口」。留空返回 `None`。"""
+        return _auto_toggle_log_seconds(value)
+
+    def account_line_limit(self) -> int:
+        """全账号此刻认的航线上限。页面要显示「已配 X 条 / 上限 Y 条」时读它。
+
+        公开出来是为了让页面上那句提示和调度判据量**同一把尺子**：页面另读一次
+        默认值的话，用户在攻击配置页把上限改成 6 之后，任务页仍然写着 9，
+        而那句提示存在的全部意义就是让他一眼看出配超了没有。
+        """
+        return self._account_line_limit()
+
     def unknown_line_hold(self) -> timedelta:
         """飞行时间读不到时，一条航线占多久。**读侧的唯一入口。**
 
@@ -894,6 +968,56 @@ class MissionScheduler:
             detail="这段时间内打过的 bot 坐标不进候选池",
         )
         return window
+
+    def _account_line_limit(self) -> int:
+        """全账号同时能在飞的舰队上限。**留空 = `DEFAULT_ACCOUNT_LINE_LIMIT`（9）。**
+
+        用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具
+        情况下最高是到 9 条」——常态 6、开道具 9，取值取决于用户当下的处境，
+        所以它是旋钮不是常量。
+
+        ⚠️ **不是 `scheduler_config.fleet_line_limit`。** 那一列的含义早已降级成
+        「任务没填航线数时用几条」，两者语义不同，复用会让改任务默认值顺带把
+        账号上限也改掉。
+        """
+        limit = self._knob("account_line_limit")
+        if limit is None:
+            return DEFAULT_ACCOUNT_LINE_LIMIT
+        record_knob_override(
+            "account_line_limit",
+            source=__name__,
+            effective=limit,
+            default=DEFAULT_ACCOUNT_LINE_LIMIT,
+            detail="全账号同时在飞的舰队上限，与每颗星球各自的航线预算同时生效",
+        )
+        return limit
+
+    def _auto_toggle_log_window(self) -> timedelta:
+        """「自动停用 / 自动恢复」日志的限流窗口。**留空 = `AUTO_TOGGLE_LOG_WINDOW`。**"""
+        seconds = self._knob("auto_toggle_log_seconds")
+        if seconds is None:
+            return AUTO_TOGGLE_LOG_WINDOW
+        window = timedelta(seconds=seconds)
+        record_knob_override(
+            "auto_toggle_log_window",
+            source=__name__,
+            effective=window,
+            default=AUTO_TOGGLE_LOG_WINDOW,
+            detail="同一个任务的自动停用/自动恢复在这段时间里最多各落一条日志",
+        )
+        return window
+
+    def _account_free_lines(self, now: datetime, *, hold: timedelta, reserved_lines: int) -> int:
+        """全账号这一刻还剩几条航线。**账号那道闸的唯一算处。**
+
+        散成两份的话，`has_work` 与 `_launch` 会因为一个多减了 `reserved_lines`、
+        另一个没减而慢慢走散——那正是 `_free_lines_from` 的文档一直在说的那件事。
+        """
+        return account_free_lines(
+            account_limit=self._account_line_limit(),
+            inflight_total=self._repository.count_inflight_total(now_utc=now, hold=hold),
+            reserved_lines=reserved_lines,
+        )
 
     def _knob(self, column: str) -> int | None:
         """全局攻击配置上某个旋钮的原始值；没配 / 配置行不存在都返回 None。"""
@@ -1180,8 +1304,12 @@ class MissionScheduler:
         snapshots = {task.task_id: task for task in self._snapshots(rows, config)}
         inflight: dict[Coordinate, int] = {}
         # 一次读齐，整段复用：航线记账的每一处都必须用同一个值，否则同一颗星球
-        # 在两个判据里占着的航线数不一样。
+        # 在两个判据里占着的航线数不一样。全账号那道闸同理，而且它连星球都不分，
+        # 一趟只查一次。
         hold = self._unknown_line_hold()
+        account_free = self._account_free_lines(
+            now, hold=hold, reserved_lines=config.reserved_lines
+        )
         for row in rows:
             task = snapshots[row.id]
             origins = (
@@ -1202,6 +1330,7 @@ class MissionScheduler:
                 origins=origins,
                 inflight=inflight,
                 reserved_lines=config.reserved_lines,
+                account_free=account_free,
             )
             if free < 1:
                 continue
@@ -1211,18 +1340,21 @@ class MissionScheduler:
                 # 这期间用户自己点了「恢复」，或者它已经被别的原因重新停用。
                 continue
             name = task.name or task.kind.value
-            record_system_log(
-                "INFO",
-                "application.mission_scheduler",
-                f"任务「{name}」曾因空闲航线不足被自动停用，"
-                f"当前空闲航线 {free} 条，已自动恢复参与调度",
+            self._log_auto_toggle(
+                task_id=row.id,
+                event="resumed",
+                level="INFO",
+                message=(
+                    f"任务「{name}」曾因空闲航线不足被自动停用，"
+                    f"当前空闲航线 {free} 条，已自动恢复参与调度"
+                ),
                 payload={
                     "task_id": row.id,
                     "mission_kind": task.kind.value,
                     "free_lines": free,
                     "disabled_recovery": DisabledRecovery.FREE_LINES.value,
                 },
-                logged_at_utc=now,
+                now=now,
             )
 
     # -- 自动停用 ------------------------------------------------------------
@@ -1255,6 +1387,11 @@ class MissionScheduler:
 
         `recovery` 一起进比较：措辞没变而恢复方式从「等航线」变成「要人工」，
         对用户是完全不同的两件事，漏掉它就等于把一次真的跃迁说成没发生。
+
+        ⚠️ **跃迁去重挡不住「反复跃迁」**，所以外面还罩着一层限流
+        （`_log_auto_toggle`）：停用 → 恢复 → 停用，每一下都是**真的**跃迁，
+        库里那两列每次都在变，去重一条都拦不下来。2026-08-18 01:00 那一小时
+        写了 1368 行正是这一档。
         """
         previous = (row.disabled_reason, row.disabled_recovery)
         self._repository.disable_mission_task(row.id, reason, recovery=recovery)
@@ -1266,10 +1403,11 @@ class MissionScheduler:
             if recovery is DisabledRecovery.FREE_LINES
             else "在用户点「恢复」或改一次任务配置之前，它不会再被起起来"
         )
-        record_system_log(
-            "WARNING",
-            "application.mission_scheduler",
-            f"任务「{name}」已被自动停用：{reason}；{aftermath}",
+        self._log_auto_toggle(
+            task_id=row.id,
+            event="disabled",
+            level="WARNING",
+            message=f"任务「{name}」已被自动停用：{reason}；{aftermath}",
             payload={
                 "task_id": row.id,
                 "mission_kind": task.kind.value,
@@ -1278,7 +1416,56 @@ class MissionScheduler:
                 "previous_disabled_reason": previous[0],
                 "previous_disabled_recovery": previous[1],
             },
-            logged_at_utc=self._clock(),
+            now=self._clock(),
+        )
+
+    def _log_auto_toggle(
+        self,
+        *,
+        task_id: int,
+        event: str,
+        level: str,
+        message: str,
+        payload: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        """「自动停用 / 自动恢复」这一对日志的**限流**闸门。
+
+        **为什么去重不够。** `_disable_task` 已经按库里那两列做了跃迁去重，
+        `_resume_tasks_waiting_for_a_line` 也只在真的放出来时才写。可 2026-08-18
+        01:00 那一小时里，同一个任务**自动停用 447 次、自动恢复 447 次**——每一下
+        都是真跃迁，两处去重一条都拦不住，结果 1368 行日志把那一小时里别的东西
+        全埋了，而这条链路一发未派。判据不是「有没有打日志」，是**出事时能不能只
+        靠库里的日志定位**；一小时 1368 行同一句话，定位不了任何东西。
+
+        所以按 `(task_id, event)` 限流：一个窗口里最多落一条。**被压掉的次数记在
+        下一条的 `payload` 里**（`suppressed_since_last_log`）——把频率整个抹掉的话，
+        「抖了 447 次」和「老老实实停用了一次」在库里长得一模一样，而那两件事的
+        善后完全相反。
+
+        窗口**可配**（`military_attack_config.auto_toggle_log_seconds`，留空 =
+        `AUTO_TOGGLE_LOG_WINDOW`）：调小排障时看得密、日志吵；调大库干净，代价是
+        一次真实的反复跃迁会被合并成看不出频率的一条。先例是
+        `record_unrecognised_screen` 的 120 秒。
+
+        **状态只在内存里**，进程一重启就忘掉——那是对的：重启之后的第一次跃迁
+        本来就该落一条，它是新一轮运行里的第一手事实。
+        """
+        key = (task_id, event)
+        previous = self._auto_toggle_logged.get(key)
+        if previous is not None and now - previous[0] < self._auto_toggle_log_window():
+            self._auto_toggle_logged[key] = (previous[0], previous[1] + 1)
+            return
+        suppressed = 0 if previous is None else previous[1]
+        self._auto_toggle_logged[key] = (now, 0)
+        record_system_log(
+            level,
+            "application.mission_scheduler",
+            message
+            if suppressed == 0
+            else f"{message}（上一条之后同样的跃迁还发生过 {suppressed} 次，已合并）",
+            payload={**payload, "suppressed_since_last_log": suppressed},
+            logged_at_utc=now,
         )
 
     def _log_schedule_window_changes(
@@ -1702,6 +1889,14 @@ class MissionScheduler:
         )
         # 同上：一趟只读一次，整段共用。
         hold = self._unknown_line_hold()
+        # 全账号那道闸的余量。**一趟只查一次**：它与出发星球无关，按任务查等于
+        # 把同一个数乘上任务数，而 tick 每秒一次。没有任何一条派遣链路参与调度时
+        # 连查都不查——这一趟本来就没人会用到它。
+        account_free = (
+            self._account_free_lines(now, hold=hold, reserved_lines=config.reserved_lines)
+            if any(_participating(task) and not fills_gaps(task.kind) for task in tasks)
+            else 0
+        )
         inflight: dict[Coordinate, int] = {}
         next_free: dict[Coordinate, datetime | None] = {}
         per_task: dict[int, TaskFacts] = {}
@@ -1738,6 +1933,7 @@ class MissionScheduler:
                     origins=origins,
                     inflight=inflight,
                     reserved_lines=config.reserved_lines,
+                    account_free=account_free,
                 )
                 last_dispatches = [
                     self._repository.last_dispatch_at(
@@ -1785,6 +1981,7 @@ class MissionScheduler:
                     origins=None,
                     inflight=inflight,
                     reserved_lines=config.reserved_lines,
+                    account_free=account_free,
                 ),
                 reports_due=self._reports_due(task, now, grace),
                 targets_remaining=(
@@ -1960,41 +2157,75 @@ class MissionScheduler:
     ) -> list[str]:
         """只起一颗出发星球的一组目标，避免 runner 中途切星球留下半组状态。
 
+        ⚠️ **「整轮只跑一颗星球」不是可以放宽的实现细节。** runner 一轮只能站一颗
+        星球：一个游戏窗口、一只鼠标，开工时 `ensure_origin_planet` 真的把当前星球
+        切过去。中途换星球会留下半组状态。
+
         ⚠️ **「这一轮凑不出目标」抛的是 `MissionIdle` 而不是 `MissionParamError`。**
         后者会让 `_launch` 去调 `disable_mission_task`：任务被停用、挂上
         `disabled_reason`，用户不去页面点一次「恢复」就永远不跑。而这里的空手而归
         （池子里没有读数新鲜的目标、航线预算刚好耗尽）全都是**会自己好起来**的一档
         ——扫描刷新池子、舰队飞回来，下一 tick 就成立了。判成参数错误的代价是
         一整夜一发不派，比拿旧数据打糟得多。
+
+        ⚠️ **`NoFreeLineError` 在这条路上一次都不该出现。** 它说的是「配置让我一发
+        都派不出去」，而多出发点场景里「这一颗此刻满了」是**正常的间歇**。
+        2026-08-18 01:00 那一小时把它当成配置错误处理，代价是自动停用 447 次、
+        自动恢复 447 次、bot 链路空转一小时。所以这里一律 `MissionIdle`。
         """
         assignments = self._military_assignments(row)
         if not assignments:
             raise MissionIdle("本轮没有可派遣的军力攻击目标")
-        first_origin = assignments[0].origin
-        group = [item for item in assignments if item.origin == first_origin]
-        first_origin_lines = next(
-            item.fleet_lines
-            for item in self._military_origins(row)
-            if item.coordinate == first_origin
-        )
-        first_origin_free = max(
-            0,
-            first_origin_lines
-            - self._repository.count_inflight(
-                now_utc=self._clock(),
-                origin=first_origin,
-                hold=self._unknown_line_hold(),
-            ),
-        )
+        origin = self._origin_taking_its_turn(assignments)
+        group = [item for item in assignments if item.origin == origin]
+        # `len(group)` 已经被这颗星球的**两道闸预算**卡过一次了
+        # （`_military_assignments` 把预算喂给了 `assign_by_capacity_and_distance`），
+        # 所以这里不必、也不该再去查一次库：再查一次就是第二把尺子。
+        budget = min(max_dispatches if max_dispatches is not None else len(group), len(group))
+        if budget < 1:
+            # 结构上到不了（`facts.free_lines` 是各出发点里最能派的那一个，
+            # 而这颗星球恰恰是分到了目标的那些之一）。留着它是为了让「万一走到了」
+            # 也走 `MissionIdle` 那条路——不停用、不记失败、下一 tick 重算。
+            raise MissionIdle(f"出发点 {origin} 此刻没有可用航线")
         return bot_command(
             [item.coordinate for item in group],
-            origin=first_origin,
+            origin=origin,
             presets={item.coordinate: item.preset for item in group},
-            # `facts.free_lines` 是所有出发点之和；runner 一次只会使用第一颗，
-            # 所以这里重新按真实在飞数收窄，绝不把另一颗星球的余量借过来。
-            max_dispatches=min(
-                max_dispatches if max_dispatches is not None else len(group),
-                first_origin_free,
+            max_dispatches=budget,
+        )
+
+    def _origin_taking_its_turn(self, assignments: Sequence[AssignedTarget]) -> Coordinate:
+        """这一轮跑哪颗星球：**分到了目标的那些里，上次出兵最久远的那颗。**
+
+        ## 为什么必须轮换
+
+        原先取的是 `assignments[0].origin`，而 `assign_by_capacity_and_distance`
+        末尾按 `(origin, distance)` 排序、`Coordinate` 是 `order=True` 的 dataclass
+        ——`4:277:15 < 9:250:8` 恒成立。于是只要 1 号星拿到哪怕一个目标，第一组
+        永远是它，**第二颗星永远轮不到**。那不是「优先级」，是结构性不可达。
+
+        ## ⚠️ 判据绝不能是军力 / 价值
+
+        实测（生产库，2026-08-18）：1 号星邻域最高 47,170，2 号星 38,330。按价值排的
+        话，邻域强的那颗**恒赢**——饿死只是换了个判据复发，而且这一次连
+        「排序恒定」这个线索都没有了，看起来像是「它就是更该打」。所以判据只能是
+        **公平性本身**：谁等得最久谁上。
+
+        ## 事实从库里取，不在内存里记
+
+        `last_dispatch_at(origin=...)` 已经在库里。调度器进程会重启（实机上重开
+        Chrome、重启控制台都发生过），内存里的「上次轮到谁」一重启就没了，
+        而库里那个时刻重启之后照样答得出来。
+
+        从没派过的那颗排最前（`_NEVER`）：它等得比任何人都久。同刻时按坐标定序，
+        只为让结果确定——否则同一份事实能选出两颗不同的星球。
+        """
+        candidates = sorted({item.origin for item in assignments})
+        return min(
+            candidates,
+            key=lambda origin: (
+                self._repository.last_dispatch_at(TARGET_KIND_BOT, origin=origin) or _NEVER,
+                origin,
             ),
         )
 
@@ -2013,6 +2244,12 @@ class MissionScheduler:
 
         - 第 1 步必须在最前，否则首批刚好都打过时候选池会缩成空集；
         - 第 4 步是**截断**不是排序，因为第 5 步按距离重排会把排序结果整个抹掉。
+
+        ⚠️ **第 5 步吃的是「两道闸算完之后的预算」，不是 `mission_task_origins`
+        里那个原样的航线数**（见 `_origin_budgets`）。这一点是「`has_work` 与
+        `_launch` 用同一把尺子」的结构性保证：预算为 0 的星球压根拿不到目标，
+        于是凡是分到了目标的出发点一定还派得出去。喂原样的航线数进去，
+        2026-08-18 01:00 那一小时的 447 次抖动就会原封不动地回来。
         """
         reading = self._military_pool_reading(row)
         origins = self._military_origins(row)
@@ -2034,9 +2271,32 @@ class MissionScheduler:
             raise MissionParamError("全局军力档位配置损坏") from exc
         return assign_by_capacity_and_distance(
             pool,
-            origins,
+            self._dispatchable_origins(origins),
             fallback_preset=BOT_ATTACK_PRESET,
             tiers=self.validate_military_tiers(global_tiers),
+        )
+
+    def _dispatchable_origins(self, origins: Sequence[AttackOrigin]) -> tuple[AttackOrigin, ...]:
+        """各出发点此刻**真的**能派几发，两道闸都算过（见 `_origin_budgets`）。
+
+        这一层负责查库（每颗星球的在飞数、全账号在飞数、保留数），算式本身在
+        `_origin_budgets` 里——**算式只能有一份**，`_facts` 与这里问的是同一个函数。
+        """
+        now = self._clock()
+        hold = self._unknown_line_hold()
+        config = self._repository.scheduler_config()
+        inflight = {
+            item.coordinate: self._repository.count_inflight(
+                now_utc=now, origin=item.coordinate, hold=hold
+            )
+            for item in origins
+        }
+        return _origin_budgets(
+            origins,
+            inflight=inflight,
+            account_free=self._account_free_lines(
+                now, hold=hold, reserved_lines=config.reserved_lines
+            ),
         )
 
     def _military_pool_reading(self, row: orm.MissionTaskRow) -> MilitaryPoolReading:
@@ -2138,14 +2398,39 @@ class MissionScheduler:
             and phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
         ]
 
-    def _military_origins(self, row: orm.MissionTaskRow) -> tuple[AttackOrigin, ...]:
-        """新表为空才回落旧单 origin，区域攻击永远不读新表。"""
+    def _frozen_origins(self, row: orm.MissionTaskRow) -> tuple[FrozenOrigin, ...]:
+        """点「开始」那一刻，这个任务配着哪几颗出发星球。**只有军力攻击有。**
+
+        其余链路返回 `()`——它们的出发星球就是 `FrozenTask.origin` 那一个，
+        再抄一份到 `origins` 里只会让「改动」列把同一件事说两遍。
+
+        ⚠️ **`()` 不是 `None`。** 前者是「记录了，确实没有多出发点」，后者是
+        「这一行本轮之前写的，没有这个字段」，逐条对比对两者的处理完全不同，
+        见 `mission_freeze.FrozenTask.origins`。
+        """
+        if MissionKind(row.kind) is not MissionKind.BOT or not _bot_by_military(row.params_json):
+            return ()
+        return tuple(
+            FrozenOrigin(
+                origin=str(item.coordinate), fleet_lines=item.fleet_lines, enabled=item.enabled
+            )
+            for item in self._configured_origins(row)
+        )
+
+    def _configured_origins(self, row: orm.MissionTaskRow) -> tuple[ConfiguredOrigin, ...]:
+        """`mission_task_origins` 的**唯一读处**（连停用的那些一起带出来）。
+
+        新表为空才回落旧单 origin，区域攻击永远不读新表。
+
+        ⚠️ **判据侧与固化侧读的必须是同一份。** 判据只看启用的
+        （`_military_origins`），而固化记录要连停用的一起记——不然「用户把 2 号星
+        停掉了」这件事在账里一个字都不剩，而那正是事后要查的东西。各写一个读法的
+        话，两边对「这个任务配了哪几颗星球」的理解迟早分家。
+        """
         configured = self._repository.mission_task_origins(row.id)
         if configured:
-            origins: list[AttackOrigin] = []
+            origins: list[ConfiguredOrigin] = []
             for item in configured:
-                if not item.enabled:
-                    continue
                 planet = None
                 if item.planet_id is not None:
                     planet = self._repository.attack_planet(item.planet_id)
@@ -2154,10 +2439,18 @@ class MissionScheduler:
                     if planet is None
                     else Coordinate(planet.galaxy, planet.system, planet.position)
                 )
-                origins.append(AttackOrigin(coordinate, item.fleet_lines))
+                origins.append(ConfiguredOrigin(coordinate, item.fleet_lines, item.enabled))
             return tuple(origins)
         config = self._repository.scheduler_config()
-        return (AttackOrigin(self._origin_of(row), self._fleet_lines_of(row, config)),)
+        return (ConfiguredOrigin(self._origin_of(row), self._fleet_lines_of(row, config), True),)
+
+    def _military_origins(self, row: orm.MissionTaskRow) -> tuple[AttackOrigin, ...]:
+        """这个军力任务此刻**参与派遣**的那几颗出发星球。停用的一律不在内。"""
+        return tuple(
+            AttackOrigin(item.coordinate, item.fleet_lines)
+            for item in self._configured_origins(row)
+            if item.enabled
+        )
 
     def _scored_bot_targets(self) -> list[ScoredTarget]:
         """已记录的 bot，**连军力值一起带出来**。
@@ -2374,12 +2667,45 @@ def _participating(task: TaskSnapshot) -> bool:
     return task.enabled and task.disabled_reason is None
 
 
+def _origin_budgets(
+    origins: Sequence[AttackOrigin],
+    *,
+    inflight: Mapping[Coordinate, int],
+    account_free: int,
+) -> tuple[AttackOrigin, ...]:
+    """每颗出发星球此刻**真的**能派几发。**两道闸同时生效，取小。**
+
+        某出发点此刻可用 = min( 该星预算 − 该星在飞 ,  全账号上限 − 全部在飞 − 保留数 )
+
+    用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
+    最高是到 9 条」「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线数，
+    **两者均需要约束**」。
+
+    ⚠️ **返回的仍是 `AttackOrigin`，而且这个预算就是要喂给
+    `assign_by_capacity_and_distance` 的那一个**，不是原样的
+    `mission_task_origins.fleet_lines`。这一点是「`has_work` 与 `_launch` 用同一把
+    尺子」的结构性保证：预算为 0 的星球拿不到任何目标，于是**凡是分到了目标的
+    出发点，一定至少还能派一发**，`_military_command` 那一路不可能再算出
+    `max_dispatches < 1`。2026-08-18 01:00 那一小时的 447 次「自动停用 / 自动恢复」
+    正是因为这两处各算各的：`has_work` 看所有出发点之和（2 条），而真正要跑的那颗
+    星球上是 0 条。
+    """
+    return tuple(
+        AttackOrigin(
+            item.coordinate,
+            min(max(0, item.fleet_lines - inflight[item.coordinate]), account_free),
+        )
+        for item in origins
+    )
+
+
 def _free_lines_from(
     task: TaskSnapshot,
     *,
     origins: Sequence[AttackOrigin] | None,
     inflight: Mapping[Coordinate, int],
     reserved_lines: int,
+    account_free: int,
 ) -> int:
     """这个任务此刻估算还剩几条空闲航线。
 
@@ -2388,17 +2714,32 @@ def _free_lines_from(
     当初停用它的那把慢慢走散——走散之后要么放不出来，要么放出来就立刻再被停用，
     每 tick 一次。
 
-    `origins` 非 None = 军力多出发点那一路：**每颗星球各算各的预算**，绝不拿
-    全局保留数把它们合计校验一次；游戏的真实硬上限仍由 runner 的看屏闸门兜底。
-    None 则走单出发星球那条，`reserved_lines` 在 `free_lines_for` 里生效。
+    `origins` 非 None = 军力多出发点那一路。这一档返回的是**各出发点里最能派的
+    那一个**（`max`），不是它们的合计（`sum`）：runner 一轮只能站一颗星球
+    （一个游戏窗口、一只鼠标，`ensure_origin_planet`），所以「这一轮能不能起」
+    问的只能是「有没有**某一颗**星球还派得出去」。
+
+    ⚠️ **2026-08-18 之前这里是 `sum`，那正是 447 次抖动的成因**：1 号星占满、
+    2 号星还剩 2 条时，合计 2 > 0 把任务放行，而真正要跑的是 1 号星、它是 0 条，
+    于是 `bot_command` 抛 `NoFreeLineError` → 停用 → 下一 tick 合计仍是 2 → 恢复。
+    一小时 447 个来回、1368 行日志、一发未派。
+
+    `origins` 为 None 则走单出发星球那条，`reserved_lines` 在 `free_lines_for` 里
+    按星球生效；账号那道闸对它同样有效——总数是**所有星球共享**的，海盗那条链路
+    一样占里面的位子。
 
     `inflight` 由调用方按出发星球缓存好（同一颗星球一次 tick 只查一次），
+    `account_free` 也由调用方算好（一次 tick 只查一次全账号在飞数），
     这一层不查库。
     """
     if origins is not None:
-        return sum(max(0, item.fleet_lines - inflight[item.coordinate]) for item in origins)
-    return free_lines_for(
-        task, inflight_from_origin=inflight[task.origin], reserved_lines=reserved_lines
+        budgets = _origin_budgets(origins, inflight=inflight, account_free=account_free)
+        return max((item.fleet_lines for item in budgets), default=0)
+    return min(
+        free_lines_for(
+            task, inflight_from_origin=inflight[task.origin], reserved_lines=reserved_lines
+        ),
+        account_free,
     )
 
 
@@ -2648,6 +2989,64 @@ def _military_time_pool(value: object) -> int | None:
             "这一轮一发都派不出去，而页面上只会显示「暂无可打目标」。要用默认值就留空。"
         )
     return size
+
+
+def _account_line_limit(value: object) -> int | None:
+    """全账号同时能在飞的舰队上限。**留空 = `DEFAULT_ACCOUNT_LINE_LIMIT`（9）。**
+
+    用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
+    最高是到 9 条」。
+
+    ## 两条边界
+
+    - **至少 1。** 0 等于「一发都不许派」，而那是用复选框表达的意思，不该用一个
+      看起来像容量的数字表达；填了 0 之后整台助手会安静地一夜不动。
+    - **最多 `ACCOUNT_LINE_LIMIT_MAX`**，防手滑。它不是策略上的界：游戏那侧的硬
+      上限本就在 9 附近，但助手不该替游戏写死一个数（版本会变、道具会变），
+      所以这里只挡住明显不可能的取值。
+
+    ⚠️ **超过这个数的「已配航线」不在这里拦。** 用户口径（2026-08-18）：
+    「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线数」——他可能
+    正在编辑中途，也可能先配好再去开道具。页面只把「已配 X 条 / 上限 Y 条」摆出来
+    让他一眼看见（`web.persistent_service._summary`），不硬拦。
+    """
+    limit = _optional_int(value, label="全账号航线上限")
+    if limit is None:
+        return None
+    if limit < 1:
+        raise MissionParamError(
+            "全账号航线上限至少是 1：填 0 等于一发都不许派，而那要用复选框表达；"
+            "要用默认值就把它留空。"
+        )
+    if limit > ACCOUNT_LINE_LIMIT_MAX:
+        raise MissionParamError(f"全账号航线上限最多 {ACCOUNT_LINE_LIMIT_MAX} 条；填错了吧？")
+    return limit
+
+
+def _auto_toggle_log_seconds(value: object) -> int | None:
+    """自动停用 / 自动恢复的日志限流窗口（秒）。
+    **留空 = `AUTO_TOGGLE_LOG_WINDOW`（120 秒）。**
+
+    ## 两条边界
+
+    - **0 合法，而且它不是「关掉日志」**：0 表示不限流，也就是加这道闸之前的行为
+      ——每一次真跃迁都落一条。排障时想看清抖动的真实频率就填 0，代价是一次
+      反复跃迁能像 2026-08-18 01:00 那样写 1368 行。
+    - **最多 `AUTO_TOGGLE_LOG_MAX_SECONDS`（一小时）。** 再长就把一整夜的抖动合并
+      成寥寥几条，「抖了几百次」这个事实只剩 payload 里一个数字撑着，翻日志的人
+      按时间线读不出任何频率。
+    """
+    seconds = _optional_int(value, label="自动停用/恢复日志窗口（秒）")
+    if seconds is None:
+        return None
+    if seconds < 0:
+        raise MissionParamError("自动停用/恢复日志窗口不能是负数；要每次都记就填 0")
+    if seconds > AUTO_TOGGLE_LOG_MAX_SECONDS:
+        raise MissionParamError(
+            f"自动停用/恢复日志窗口最多 {AUTO_TOGGLE_LOG_MAX_SECONDS} 秒（一小时）："
+            "再长就把一整夜的抖动合并成寥寥几条，按时间线读不出频率。"
+        )
+    return seconds
 
 
 def _report_scan_hours(value: object) -> int | None:

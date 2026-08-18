@@ -327,19 +327,52 @@ class SchedulerFacts:
         return self.per_task.get(task.task_id, NO_FACTS)
 
 
+#: 全账号同时能在飞的舰队上限的**默认值**（`military_attack_config.account_line_limit`
+#: 留空时用它）。用户口径（2026-08-18）：「我的总航线数是所有星球共享的，
+#: 在启动加成道具情况下最高是到 9 条」。
+#:
+#: **取 9 而不是常态的 6 是有意的。** 留空的含义是「用户还没说」，这时宁可宽一档
+#: ——估高了只是让 runner 白跑一趟并撞上它自己的看屏闸门（`game.capacity`
+#: `LineCapacityGate`，那才是权威），而估低了会把用户配好的星球静默饿死，
+#: 且没有任何回写路径。真实取值由用户在攻击配置页上填。
+DEFAULT_ACCOUNT_LINE_LIMIT = 9
+
+
 def free_lines_for(task: TaskSnapshot, *, inflight_from_origin: int, reserved_lines: int) -> int:
-    """这个任务此刻还能派几发。
+    """这个任务此刻在**它那颗星球上**还能派几发。**这只是两道闸里的一道。**
 
     **`inflight_from_origin` 必须只数同一颗出发星球上的在飞派遣。** 游戏的航线
     上限是按星球各一份的（用户口径 2026-08-13：「航线上限是按星球各一份的，不是
     账号共享」），跨星球一起数等于把两颗星球的额度当成一份用——主星打满 6 条之后，
     2 号星那个任务会以为自己也没位子了，一发都不派。
 
+    另一道是**全账号总数**（用户口径 2026-08-18：「我的总航线数是所有星球共享的」
+    「两者均需要约束」），由 `account_free_lines` 算，两者取小。这里刻意不合成一个
+    函数：两个数的作用域不同（一颗星球 / 一个账号），合起来之后调用方就分不清
+    自己传的在飞数该数谁了，而数错了不报错。
+
     `reserved_lines` 是给用户自己留的缓冲，**按星球生效**：`free_lines` 只是估算
     （数不到用户手动派出去的舰队），这几条位子就是为那段误差留的。
     """
     usable = max(task.fleet_lines - reserved_lines, 0)
     return max(usable - inflight_from_origin, 0)
+
+
+def account_free_lines(*, account_limit: int, inflight_total: int, reserved_lines: int) -> int:
+    """**全账号**此刻还剩几条航线。与出发星球无关。
+
+    用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
+    最高是到 9 条」「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线
+    数，两者均需要约束」。
+
+    ⚠️ **`inflight_total` 必须是全账号的在飞数**（`repository.count_inflight_total`），
+    不是某颗星球的。喂一颗星球的数进来不会报错，只会让这道闸恒松——而这道闸
+    2026-08-18 之前压根不存在，正是这一轮要补的。
+
+    `reserved_lines` 在这里也扣一份：它表达的是「给用户自己留几条」，而用户手动派
+    出去的舰队占的正是账号总数里的位子。
+    """
+    return max(account_limit - inflight_total - reserved_lines, 0)
 
 
 def tasks_failing_together(

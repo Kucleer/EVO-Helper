@@ -1482,6 +1482,39 @@ class SqlAlchemyRepository:
                 or 0
             )
 
+    def count_inflight_total(
+        self, *, now_utc: datetime, hold: timedelta = UNKNOWN_LINE_HOLD
+    ) -> int:
+        """**全账号**还占着航线的舰队有几支，不分出发星球。
+
+        ⚠️ **它不取代 `count_inflight`，两个都要。** 用户口径（2026-08-18）：
+        「我的总航线数是所有星球共享的，在启动加成道具情况下最高是到 9 条」
+        「星球的航线是我来配置的……两者均需要约束」。也就是说航线有**两道**闸：
+        每颗星球各自的预算，以及账号总数。只留这一个，两颗星球的预算就没人管了；
+        只留那一个，账号总数这道闸根本不存在——2026-08-18 之前正是后者。
+
+        判据（`accepted` + `_still_holding_a_line`）与 `count_inflight` **逐字相同**，
+        差别只有那一句 `_from_origin`。两处必须一致：不一致的话，同一发舰队会在
+        「这颗星球占着」和「全账号占着」两个数里各算各的，而那种错静默。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.AttackDispatchRow)
+                    .join(
+                        orm.AttackIntentRow,
+                        orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                    )
+                    .where(
+                        orm.AttackDispatchRow.accepted.is_(True),
+                        _still_holding_a_line(now_utc, hold),
+                    )
+                )
+                or 0
+            )
+
     def next_line_free_at(self, *, now_utc: datetime, origin: Coordinate) -> datetime | None:
         """**这颗出发星球上**已知最早会空出来的那条航线，什么时候空。
         算不出来时返回 None。
@@ -2258,6 +2291,8 @@ class SqlAlchemyRepository:
         reconcile_cooldown_minutes: int | None = None,
         bot_revisit_hours: int | None = None,
         military_time_pool: int | None = None,
+        account_line_limit: int | None = None,
+        auto_toggle_log_seconds: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
@@ -2277,6 +2312,8 @@ class SqlAlchemyRepository:
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
             row.bot_revisit_hours = bot_revisit_hours
             row.military_time_pool = military_time_pool
+            row.account_line_limit = account_line_limit
+            row.auto_toggle_log_seconds = auto_toggle_log_seconds
             session.commit()
             session.refresh(row)
             return row

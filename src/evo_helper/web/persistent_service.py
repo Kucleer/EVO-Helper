@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from typing import Any
@@ -23,7 +24,7 @@ from evo_helper.application.backfill import (
     BackfillRequest,
     BackfillState,
 )
-from evo_helper.application.mission_freeze import FrozenTask, MissionConfigFreeze
+from evo_helper.application.mission_freeze import FrozenOrigin, FrozenTask, MissionConfigFreeze
 from evo_helper.application.mission_scheduler import MissionScheduler, SchedulerSnapshot
 from evo_helper.domain.missions import (
     MissionParamError,
@@ -93,6 +94,49 @@ from .service import (
 # 页面（2 秒）与悬浮台（1 秒）会同时读取同一份重快照。这个缓存只合并瞬时并发
 # 请求，不把运行状态长期藏起来；写操作会主动失效。
 SCHEDULER_VIEW_TTL_S = 0.75
+
+
+@dataclass(frozen=True)
+class LineBudget:
+    """渲染一次任务表所需的**航线账**，整张表算一次。
+
+    做成一个结构而不是三个散参数，是为了让「已配」和「上限」永远一起走：只传
+    其中一个的话，日后总有一处会拿页面上的「已配」去对一个另外读来的上限，
+    而那两个数一旦不同源，这句提示就开始说假话。
+    """
+
+    #: 参与调度且真的会派遣的那些任务，配着的航线数之和。
+    configured: int
+    #: 全账号上限，读的是调度判据那把尺子（`MissionScheduler.account_line_limit`）。
+    limit: int
+    #: 军力攻击任务 → 它配着的那几颗出发星球（含停用的）。非军力任务不在这里。
+    origins: Mapping[int, tuple[MissionOriginView, ...]]
+
+    @property
+    def hint(self) -> str:
+        """页面上那句「已配 X 条 / 上限 Y 条」。**配超了要说出来，但不拦。**
+
+        用户口径（2026-08-18）：「我配置时已经手动确认了不会超过总航线数」——
+        所以这里只把事实摆出来，不硬拦：他可能正编辑到一半，也可能先配好再去开
+        加成道具。
+        """
+        excess = "" if self.configured <= self.limit else "（已超出）"
+        return f"全账号已配 {self.configured} 条 / 上限 {self.limit} 条{excess}"
+
+
+def _origins_text(origins: Sequence[MissionOriginView]) -> str:
+    """多出发点的人话回显：`4:277:15 · 6 条 / 9:250:8 · 2 条（停用）`。
+
+    停用的那几颗**照样列出来并标注**：不列的话，用户看到的和「把它删了」一模一样，
+    而那两件事的善后完全不同。
+    """
+    if not origins:
+        return "未配置出发点"
+    return " / ".join(
+        f"{item.galaxy}:{item.system}:{item.position} · {item.fleet_lines} 条"
+        + ("" if item.enabled else "（停用）")
+        for item in origins
+    )
 
 
 class PersistentApplicationService:
@@ -1316,6 +1360,8 @@ class MissionConsoleService:
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
         military_time_pool: object = None,
+        account_line_limit: object = None,
+        auto_toggle_log_seconds: object = None,
     ) -> MilitaryAttackConfigView:
         """整份全局攻击配置原子替换。
 
@@ -1337,6 +1383,10 @@ class MissionConsoleService:
             )
             revisit = self._scheduler.validate_bot_revisit_hours(bot_revisit_hours)
             time_pool = self._scheduler.validate_military_time_pool(military_time_pool)
+            account_lines = self._scheduler.validate_account_line_limit(account_line_limit)
+            toggle_window = self._scheduler.validate_auto_toggle_log_seconds(
+                auto_toggle_log_seconds
+            )
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
@@ -1347,6 +1397,8 @@ class MissionConsoleService:
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
             military_time_pool=time_pool,
+            account_line_limit=account_lines,
+            auto_toggle_log_seconds=toggle_window,
         )
         self._invalidate_scheduler_view()
         return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)), **_knobs_of(row))
@@ -1604,6 +1656,9 @@ class MissionConsoleService:
         tasks = [task for task in snapshot.snapshots if task.kind.value in MISSION_LABELS]
         # 展示次序用领域层那把尺子，页面上排第一的就是下一个会被起的那条。
         tasks.sort(key=lambda task: (*scheduling_order(task), task.task_id))
+        # 航线账**整张表算一次**：「已配 X 条」是账号级的数，每行各算一遍等于把
+        # 同一批查询乘上任务数，而这个视图每 2 秒被轮询一次。
+        budget = self._line_budget(tasks, snapshot)
         return SchedulerView(
             running=snapshot.enabled,
             started_at_utc=snapshot.started_at_utc,
@@ -1619,7 +1674,7 @@ class MissionConsoleService:
                 )
             ),
             orphan_pid=snapshot.orphan_pid,
-            tasks=tuple(self._task_view(task, snapshot) for task in tasks),
+            tasks=tuple(self._task_view(task, snapshot, budget) for task in tasks),
             config_locked=snapshot.config_locked,
             frozen_config=(
                 None
@@ -1628,7 +1683,51 @@ class MissionConsoleService:
             ),
         )
 
-    def _task_view(self, task: TaskSnapshot, snapshot: SchedulerSnapshot) -> MissionTaskView:
+    def _line_budget(
+        self, tasks: Sequence[TaskSnapshot], snapshot: SchedulerSnapshot
+    ) -> LineBudget:
+        """这一刻「已配几条 / 上限几条」，以及每个军力任务配着哪几颗出发星球。
+
+        **为什么页面上非有这句话不可。** 用户口径（2026-08-18）：「星球的航线是我来
+        配置的，我配置时已经手动确认了不会超过总航线数」——他自己保证，所以助手
+        **不硬拦**（他可能正编辑到一半，也可能先配好再去开加成道具）。但「手动确认」
+        得有个东西给他确认：两颗星球各配 6 条和 2 条、上限却只有 6，这件事在页面上
+        原本一个字都看不出来。
+
+        **上限读的是调度判据那把尺子**（`MissionScheduler.account_line_limit`），
+        不是在这一层再读一次默认值：另读一次的话，用户把上限改成 6 之后任务页仍然
+        写着 9，而这句提示存在的全部意义就是让他一眼看出配超了没有。
+
+        「已配」只数**参与调度且真的会派遣**的任务：没勾的、被停用的、填空隙的
+        （扫描 / 军力榜）都不占航线，算进去只会让这个数虚高，而虚高的告警和没有
+        告警一样没用。
+        """
+        origins = {
+            task.task_id: self.mission_origins(task.task_id)
+            for task in tasks
+            if task.kind is MissionKind.BOT and self._by_military(task, snapshot)
+        }
+        configured = 0
+        for task in tasks:
+            if not task.enabled or task.disabled_reason is not None or fills_gaps(task.kind):
+                continue
+            configured += (
+                sum(item.fleet_lines for item in origins[task.task_id] if item.enabled)
+                if task.task_id in origins
+                else task.fleet_lines
+            )
+        return LineBudget(
+            configured=configured, limit=self._scheduler.account_line_limit(), origins=origins
+        )
+
+    @staticmethod
+    def _by_military(task: TaskSnapshot, snapshot: SchedulerSnapshot) -> bool:
+        row = next((item for item in snapshot.tasks if item.id == task.task_id), None)
+        return row is not None and _view_params(row.params_json).get("by_military") is True
+
+    def _task_view(
+        self, task: TaskSnapshot, snapshot: SchedulerSnapshot, budget: LineBudget
+    ) -> MissionTaskView:
         row = next(item for item in snapshot.tasks if item.id == task.task_id)
         running = snapshot.running
         status = status_of(
@@ -1655,7 +1754,7 @@ class MissionConsoleService:
             params=params,
             status=status.value,
             detail=self._detail(task, status, snapshot, params),
-            summary=self._summary(task, params),
+            summary=self._summary(task, params, budget),
             disabled_reason=task.disabled_reason,
             origin=str(task.origin),
             fleet_lines=task.fleet_lines,
@@ -1667,9 +1766,12 @@ class MissionConsoleService:
 
     def _task_view_for(self, task_id: int) -> MissionTaskView:
         snapshot = self._scheduler.snapshot()
+        # 航线账仍按**整张表**算：单行接口（改完一个参数回一行）返回的
+        # 「已配 X 条」必须和列表里那句是同一个数，否则用户会看到两个说法。
+        budget = self._line_budget(snapshot.snapshots, snapshot)
         for task in snapshot.snapshots:
             if task.task_id == task_id:
-                return self._task_view(task, snapshot)
+                return self._task_view(task, snapshot, budget)
         raise NotFoundError(f"mission_tasks 里没有 id={task_id} 这一行")
 
     @staticmethod
@@ -1722,12 +1824,22 @@ class MissionConsoleService:
             return f"还剩 {remaining} 个未完成"
         return "始终填空隙"
 
-    def _summary(self, task: TaskSnapshot, params: dict[str, Any]) -> str:
+    def _summary(self, task: TaskSnapshot, params: dict[str, Any], budget: LineBudget) -> str:
         """参数与出发星球的人话回显。
 
         出发星球与航线数摆在最前面：多任务之后，「这一行到底从哪出发、能占几条」
         是区分两行 bot 任务的第一件事，而它俩都不在参数框里。
+
+        ⚠️ **军力优先那一支绝不能显示 `task.fleet_lines`。** 那个数来自
+        `mission_tasks.fleet_lines`，而多出发点走的是 `mission_task_origins`；
+        `replace_mission_origins` **从不回写**任务级那一列（回写就成了两份真相），
+        于是它是一个加多出发点之前留下的、永远不会更新的残值。生产实证
+        （2026-08-18）：用户配的是 `4:277:15=6 线` + `9:250:8=2 线`，行头却写着
+        「4:277:15 · 7 条航线」——那个 7 谁都对不上。
         """
+        origins = budget.origins.get(task.task_id)
+        if origins is not None:
+            return f"{_origins_text(origins)} · {budget.hint} · {self._bot_summary(params)}"
         lines = f"{task.origin} · {task.fleet_lines} 条航线"
         if task.kind is MissionKind.PIRATE:
             return f"{lines} · {self._pirate_summary(task.origin, params)}"
@@ -1975,8 +2087,55 @@ def _describe_changes(
             changes.append(
                 f"{label}：航线数 {_or_dash(old.fleet_lines)} → {_or_dash(task.fleet_lines)}"
             )
+        changes.extend(_origin_changes(label, old.origins, task.origins))
         changes.extend(_param_changes(label, old.params_json, task.params_json))
     return tuple(changes)
+
+
+def _origin_changes(
+    label: str,
+    before: tuple[FrozenOrigin, ...] | None,
+    after: tuple[FrozenOrigin, ...] | None,
+) -> list[str]:
+    """多出发点逐颗对比。
+
+    **没有这一段的后果是静默丢账。** 军力攻击的真相全在 `origins` 里，而上面那
+    两行比的是 `origin` / `fleet_lines`（任务级残值，永远不变）——于是「把 2 号星
+    的航线从 2 改成 3」在「改动」列里一个字都不留，看起来像是这一轮什么都没改。
+
+    ⚠️ **任一侧是 `None` 就整段跳过。** `None` 的意思是「这一行本轮之前写的，
+    根本没有这个字段」，也就是**没得比**；当成「当时一颗都没配」的话，升级之后的
+    第一条记录会把用户配着的每一颗星球都报成「新增出发点」。差别整段写在
+    `mission_freeze.FrozenTask.origins` 上。
+
+    按坐标认人，不按位次：位次是页面上那几行的排列顺序，用户拖一下、或者中间删
+    掉一颗，按位次比会把「删了第一颗」报成「每一颗都改了」。
+    """
+    if before is None or after is None:
+        return []
+    old = {item.origin: item for item in before}
+    new = {item.origin: item for item in after}
+    changes: list[str] = []
+    # 次序以**新的那份**为准，旧的那份里多出来的接在后面，同 `_param_changes`。
+    for coordinate in dict.fromkeys([*new, *old]):
+        was, now = old.get(coordinate), new.get(coordinate)
+        if was is None and now is not None:
+            changes.append(f"{label}：新增出发点 {coordinate} · {now.fleet_lines} 条航线")
+            continue
+        if now is None and was is not None:
+            changes.append(f"{label}：移除出发点 {coordinate}")
+            continue
+        if was is None or now is None:  # pragma: no cover - 上面两支已穷举
+            continue
+        if was.fleet_lines != now.fleet_lines:
+            changes.append(
+                f"{label}：出发点 {coordinate} 航线数 {was.fleet_lines} → {now.fleet_lines}"
+            )
+        if was.enabled != now.enabled:
+            changes.append(
+                f"{label}：出发点 {coordinate} 参与派遣 {_yes(was.enabled)} → {_yes(now.enabled)}"
+            )
+    return changes
 
 
 def _matching_task(before: MissionConfigFreeze, task: FrozenTask) -> FrozenTask | None:
@@ -2118,6 +2277,8 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,
         "military_time_pool": row.military_time_pool,
+        "account_line_limit": row.account_line_limit,
+        "auto_toggle_log_seconds": row.auto_toggle_log_seconds,
     }
 
 

@@ -35,7 +35,7 @@
 <section class="panel" aria-labelledby="knob-head">
   <h2 id="knob-head">调度节奏</h2>
   <p class="muted">
-    这三项都<strong>没有唯一正确答案</strong>——取值取决于你当下的处境（活动期信箱堆积、周一 bot 军力刷新日、机器闲忙、要不要激进）。
+    这几项都<strong>没有唯一正确答案</strong>——取值取决于你当下的处境（活动期信箱堆积、周一 bot 军力刷新日、开不开加成道具、机器闲忙、要不要激进）。
     <strong>全部留空 = 用下面括号里的默认值</strong>，行为与没有这一节时完全一致。
   </p>
 
@@ -73,6 +73,35 @@
     <strong>调小</strong>：同一批高军力目标能多榨几轮；代价是打的多半是刚被自己清空的星球，ROI 低，而候选池按军力降序排——调得太小会让航线全烧在榜首那几个上。<br>
     <strong>调大</strong>：目标摊得更开、重复攻击的浪费更少；代价是已知 bot 不够多时会出现「暂无可打目标」而空转。
     上限 {{ bot_revisit_max }} 小时（一周）——再长就跨过了 bot 军力的刷新周期。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="account-line-limit">全账号航线上限（默认 {{ account_line_limit_default }}）</label>
+    <input id="account-line-limit" type="number" min="1" max="{{ account_line_limit_max }}" step="1"
+           placeholder="留空 = {{ account_line_limit_default }}" aria-label="全账号航线上限">
+  </div>
+  <p class="muted">
+    <strong>所有星球共享</strong>的同时在飞舰队总数。它和任务行上那个「每颗星球的航线数」是
+    <strong>两道同时生效</strong>的闸：某个出发点此刻可用 =
+    <code>min( 该星航线数 − 该星在飞 , 这个上限 − 全账号在飞 − 保留航线 )</code>。<br>
+    <strong>常态 6、开加成道具 9</strong>——所以它是旋钮而不是常量，开不开道具就得改一次。<br>
+    <strong>调小</strong>：更保守，绝不会撞游戏的「舰队数量已达上限」；代价是配好的星球派不满，多出来的航线空着。<br>
+    <strong>调大</strong>：吞吐更高；代价是 runner 会白跑一趟导航才被自己的看屏闸门拦下。
+    上限 {{ account_line_limit_max }} 条（纯防手滑）。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="auto-toggle-log">自动停用/恢复日志窗口（秒，默认 {{ auto_toggle_log_default }}）</label>
+    <input id="auto-toggle-log" type="number" min="0" max="{{ auto_toggle_log_max }}" step="1"
+           placeholder="留空 = {{ auto_toggle_log_default }}" aria-label="自动停用/恢复日志窗口（秒）">
+  </div>
+  <p class="muted">
+    同一个任务的「自动停用」「自动恢复」在这段时间里<strong>各最多落一条</strong>日志，
+    被压掉的次数记在下一条的 <code>suppressed_since_last_log</code> 里。<br>
+    <strong>调小</strong>（填 0 = 每次都记）：排障时看得最密、抖动频率一目了然；代价是一次反复跃迁能刷出上千行
+    （2026-08-18 01:00 实机：一小时 447 次停用 + 447 次恢复 = 1368 行）。<br>
+    <strong>调大</strong>：库里干净；代价是一次真实的反复跃迁被合并成看不出频率的一条。
+    上限 {{ auto_toggle_log_max }} 秒（一小时）。
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
@@ -168,6 +197,8 @@
     // 它自己有一节面板（保存按钮是 `btn-save-pool`），但攻击配置是**整份替换**，
     // 所有按钮送的都是同一份 payload。
     { element: document.getElementById('military-time-pool'), key: 'military_time_pool', label: '军力时间池' },
+    { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
+    { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '自动停用/恢复日志窗口' },
   ];
   const errorBox = document.getElementById('settings-error');
   const coordinatePayload = (text) => {
