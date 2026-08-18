@@ -14,6 +14,7 @@ import pytest
 
 from evo_helper.application.mission_freeze import (
     MAX_REMEMBERED,
+    FrozenOrigin,
     FrozenTask,
     MissionConfigFreeze,
     MissionFreezeLog,
@@ -338,3 +339,114 @@ def test_a_task_row_with_a_bogus_priority_is_dropped(tmp_path: Path) -> None:
 
     assert latest is not None
     assert latest.tasks == ()
+
+
+# -- 多出发点 ------------------------------------------------------------------
+
+
+def test_the_origins_survive_a_round_trip_through_the_file(tmp_path: Path) -> None:
+    """军力攻击的真相在 `origins` 里，它必须原样跨进程活下来。
+
+    坐标、航线数、有没有勾上，三样都要——少了 `enabled`，「把 2 号星停用了」
+    在账里就只剩「少了一颗星球」，而那和「删掉了」是两件事。
+    """
+    path = tmp_path / "freezes.jsonl"
+    log = MissionFreezeLog(path)
+    log.append(
+        _freeze(
+            FrozenTask(
+                kind=MissionKind.BOT,
+                enabled=True,
+                priority=0,
+                params_json='{"by_military": true}',
+                task_id=3,
+                origins=(
+                    FrozenOrigin(origin="4:277:15", fleet_lines=6, enabled=True),
+                    FrozenOrigin(origin="9:250:8", fleet_lines=2, enabled=False),
+                ),
+            )
+        )
+    )
+
+    latest = MissionFreezeLog(path).latest()
+
+    assert latest is not None
+    task = latest.task(MissionKind.BOT)
+    assert task is not None
+    assert task.origins == (
+        FrozenOrigin(origin="4:277:15", fleet_lines=6, enabled=True),
+        FrozenOrigin(origin="9:250:8", fleet_lines=2, enabled=False),
+    )
+
+
+def test_a_record_written_before_multiple_origins_still_reads(tmp_path: Path) -> None:
+    """⚠️ **缺 `origins` 的历史行仍然要读得出记录来。**
+
+    生产的那份 JSONL 里全是本轮之前写的行，它们没有这个键。做成必填等于把历史账
+    整份读不出来——模块头那两条硬约束说的就是这件事。
+
+    而且缺失必须读成 `None`（「没得比」）而不是 `()`（「当时一颗都没配」）：
+    读成 `()` 的话，升级之后的第一条记录会把用户配着的每一颗星球都报成「新增
+    出发点」，那正是这份账要避免的走样。
+    """
+    path = tmp_path / "freezes.jsonl"
+    legacy = (
+        '{"frozen_at_utc": "2026-08-17T14:30:31+00:00", '
+        '"tasks": [{"kind": "BOT", "enabled": true, "priority": 1, "params_json": "{}", '
+        '"task_id": 3, "name": "bot", "origin": "4:277:15", "fleet_lines": 7}]}'
+    )
+    path.write_text(legacy + "\n", encoding="utf-8")
+
+    records = MissionFreezeLog(path).records()
+
+    assert len(records) == 1, "缺一个新字段不许把整行丢掉"
+    task = records[0].task(MissionKind.BOT)
+    assert task is not None
+    assert task.origins is None, "「没有这个字段」不等于「当时一颗都没配」"
+    assert (task.origin, task.fleet_lines) == ("4:277:15", 7)
+
+
+def test_an_origin_row_missing_its_enabled_flag_counts_as_enabled(tmp_path: Path) -> None:
+    """出发点那一项缺 `enabled` 时按「参与派遣」读。
+
+    多出发点是 2026-08-18 才有的东西，而它出现之前配着的每一颗星球都是参与派遣的
+    ——按「停用」读的话，一条手写 / 半旧的记录会被念成「用户当时把它关了」。
+    """
+    path = tmp_path / "freezes.jsonl"
+    path.write_text(
+        '{"frozen_at_utc": "2026-08-18T12:00:00+00:00", "tasks": ['
+        '{"kind": "BOT", "enabled": true, "priority": 0, "params_json": "{}", '
+        '"origins": [{"origin": "4:277:15", "fleet_lines": 6}]}]}\n',
+        encoding="utf-8",
+    )
+
+    latest = MissionFreezeLog(path).latest()
+
+    assert latest is not None
+    task = latest.task(MissionKind.BOT)
+    assert task is not None
+    assert task.origins == (FrozenOrigin(origin="4:277:15", fleet_lines=6, enabled=True),)
+
+
+def test_one_bogus_origin_never_takes_the_whole_list_down(tmp_path: Path) -> None:
+    """列表里一项手改坏了，只丢那一项，不丢整段。
+
+    这份 JSONL 是给人看的，也就意味着它会被人编辑。一处手滑不该让这条记录的
+    出发点全部消失——那正是要留的账。
+    """
+    path = tmp_path / "freezes.jsonl"
+    path.write_text(
+        '{"frozen_at_utc": "2026-08-18T12:00:00+00:00", "tasks": ['
+        '{"kind": "BOT", "enabled": true, "priority": 0, "params_json": "{}", '
+        '"origins": [{"origin": "4:277:15", "fleet_lines": 6, "enabled": true}, '
+        '{"origin": "", "fleet_lines": 2, "enabled": true}, '
+        '{"origin": "9:250:8", "fleet_lines": true, "enabled": true}]}]}\n',
+        encoding="utf-8",
+    )
+
+    latest = MissionFreezeLog(path).latest()
+
+    assert latest is not None
+    task = latest.task(MissionKind.BOT)
+    assert task is not None
+    assert task.origins == (FrozenOrigin(origin="4:277:15", fleet_lines=6, enabled=True),)
