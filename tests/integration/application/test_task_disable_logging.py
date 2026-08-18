@@ -138,6 +138,7 @@ def test_the_line_shortage_flavour_says_it_will_come_back_by_itself(  # type: ig
     run_id,
     session_factory,
     clock,
+    monkeypatch: pytest.MonkeyPatch,
     recorded: RecordingLog,  # noqa: F811
 ) -> None:
     """航线不足那一档要说「会自动恢复」，而且标记必须是 `FREE_LINES`。
@@ -146,7 +147,9 @@ def test_the_line_shortage_flavour_says_it_will_come_back_by_itself(  # type: ig
     照样绿——而那个任务会永远挂着，正是 PR #161 修的那个毛病；只钉标记的话，
     日志会对着一个自愈型停用说「要用户动手」，也就是**说了一句假话**。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
 
     assert len(recorded.messages) == 1
     assert "自动恢复" in recorded.messages[0]
@@ -305,7 +308,7 @@ def test_the_log_and_the_row_never_disagree(  # type: ignore[no-untyped-def]
     """
     seen: list[tuple[str | None, str | None]] = []
 
-    def spy(level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+    def spy(level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
         row = bot_row(repository)
         seen.append((row.disabled_reason, row.disabled_recovery))
         recorded(level, source, message, payload=payload, logged_at_utc=logged_at_utc)
@@ -336,7 +339,7 @@ def test_the_logged_moment_comes_from_the_scheduler_clock(  # type: ignore[no-un
     """
     moments: list[datetime | None] = []
 
-    def spy(level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+    def spy(level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
         moments.append(logged_at_utc)
 
     only_bot_with_a_broken_range(repository, session_factory)

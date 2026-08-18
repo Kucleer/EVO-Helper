@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from evo_helper.application.mission_scheduler import MAX_CONSECUTIVE_FAILURES, MissionScheduler
+from evo_helper.domain.missions import NoFreeLineError, bot_command
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import MISSION_KIND_SCOUT, TARGET_KIND_BOT, TARGET_KIND_PIRATE
 from evo_helper.domain.scheduler import GAP_FILLERS, DisabledRecovery, MissionKind
@@ -93,19 +94,52 @@ def occupy_the_only_line(repository, run_id, *, flight: timedelta):  # type: ign
     )
 
 
+class OneShotLineShortage:
+    """第一次组 bot 命令行时抛 `NoFreeLineError`，之后一切照旧。
+
+    ⚠️ **为什么要有它。** 2026-08-19 之前这一档是「跑」出来的：航线满着、
+    但还有战报要收，`has_work` 的右半边（`or reports_due`）把任务放行，
+    `bot_command` 再因 `max_dispatches < 1` 抛 `NoFreeLineError`。那条路已经
+    堵上了（见 `domain.scheduler.has_work`）——bot 链路航线满时压根不再起轮，
+    因为它那两条命令行**都**兑现不了「只收战报不派遣」。
+
+    **不改成直接写一行 `disabled_recovery='FREE_LINES'`**：那样 `_launch` 里
+    「按异常类型认类别」那一段就没人守了，它一旦退化成 `MANUAL`，任务照样
+    永远起不来，而所有用例仍然全绿。所以这里换的只是**触发方式**——异常从哪
+    抛出来的——`_launch` 那一段仍然逐字被执行到。
+
+    只抛一次：恢复之后那几条用例要看着它真的重新开始派遣。
+    """
+
+    def __init__(self) -> None:
+        self.fired = False
+
+    def __call__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not self.fired:
+            self.fired = True
+            raise NoFreeLineError("空闲航线不足，暂不启动 bot 攻击")
+        return bot_command(*args, **kwargs)
+
+
 def disable_for_lack_of_lines(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, run_id, session_factory, clock
+    scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
 ) -> orm.MissionTaskRow:
     """把 bot 任务真的**跑**成「因空闲航线不足停用」，不是直接写库。
 
-    直接写一行 `disabled_recovery='FREE_LINES'` 也能让下面的断言过，但那样
-    `_launch` 里「按异常类型认类别」那一段就没人守了——它一旦退化成
-    `MANUAL`，任务照样永远起不来，而所有用例仍然全绿。
+    两步，次序不能颠倒：
 
-    做法：航线全被一发在飞的侦察占住（`free_lines == 0`），同时给 bot 一发
-    还没收到战报的旧派遣——`has_work` 的右半边（**收战报不占航线**）会照常把它
-    起起来，然后 `bot_command` 因为 `max_dispatches < 1` 抛 `NoFreeLineError`。
-    这正是 2026-08-17 生产库里那条任务的成因：航线满着，但还有战报要收。
+    1. **航线空着**的那一 tick 把任务放行，`bot_command` 抛 `NoFreeLineError`
+       （`OneShotLineShortage`）→ `_launch` 把它停用成 `FREE_LINES`。
+    2. **停用之后**再派一发在飞的侦察，把那颗星球上唯一一条航线占住。下面那
+       几条用例要的「航线还满着 39 分钟、第 40 分钟空出来」由它来摆。
+
+    ⚠️ 顺序颠倒（先占航线再 tick）就回到 2026-08-19 之前那条已经堵上的路：
+    `has_work` 现在会说「没活干」，任务根本不会被起，夹具那句断言当场转红。
+
+    **这一整套为什么还留着**（触发路径已经没了）：`mission_tasks` 那两列是
+    持久化的，生产库里可能还有旧版本留下的 `FREE_LINES` 行；用户重启 bat 之后
+    跑的是新代码，认不得它就永远挂着「已停用」。而「哪一类停用会自愈」是语义
+    边界，边界破了不报错（见模块头）。
     """
     set_config(session_factory, fleet_line_limit=1, reserved_lines=0)
     only_bot(repository)
@@ -114,6 +148,9 @@ def disable_for_lack_of_lines(  # type: ignore[no-untyped-def]
     # 收」（两小时仍在 `MAX_REPORT_AGE` 以内），而这一发早已过了
     # `UNKNOWN_LINE_HOLD`（90 分钟），所以它自己不再占航线——占航线的只有下面
     # 那发侦察，好让「空闲航线」这个变量只由它一个人决定。
+    #
+    # 留着它是为了把生产那个现场原样摆出来：**航线满着，而且还欠着战报**。
+    # 2026-08-19 起这一档就是「什么都不做」，而不是「起一轮去收」。
     dispatch(
         repository,
         run_id,
@@ -121,9 +158,14 @@ def disable_for_lack_of_lines(  # type: ignore[no-untyped-def]
         target=TARGET,
         dispatched_at=NOW - timedelta(hours=2),
     )
-    occupy_the_only_line(repository, run_id, flight=timedelta(minutes=25))
+    monkeypatch.setattr(
+        "evo_helper.application.mission_scheduler.bot_command",
+        OneShotLineShortage(),
+        raising=True,
+    )
     scheduler.start()
     scheduler.tick()
+    occupy_the_only_line(repository, run_id, flight=timedelta(minutes=25))
 
     row = row_of(repository, MissionKind.BOT)
     assert row.disabled_reason is not None, "夹具没能把任务跑成「因航线不足停用」"
@@ -139,7 +181,7 @@ class RecordingLog:
         self.messages: list[str] = []
         self.payloads: list[dict[str, object]] = []
 
-    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
         self.messages.append(message)
         self.payloads.append(dict(payload or {}))
 
@@ -157,7 +199,14 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
 
 
 def test_a_task_disabled_for_lack_of_lines_stays_disabled_while_the_lines_are_full(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory, recorded: RecordingLog
+    scheduler,
+    repository,
+    launcher,
+    clock,
+    run_id,
+    session_factory,
+    recorded: RecordingLog,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """条件还成立着就别动它。
 
@@ -176,7 +225,9 @@ def test_a_task_disabled_for_lack_of_lines_stays_disabled_while_the_lines_are_fu
     夹具那一下停用本身是一次真的跃迁，它写的那一条要先清掉：这里数的是
     「停用之后又发生了什么」，不是「一共写过几条」。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
     recorded.messages.clear()
     recorded.payloads.clear()
 
@@ -195,7 +246,13 @@ def test_a_task_disabled_for_lack_of_lines_stays_disabled_while_the_lines_are_fu
 
 
 def test_the_task_comes_back_by_itself_once_a_line_frees_up(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory
+    scheduler,
+    repository,
+    launcher,
+    clock,
+    run_id,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """舰队一回来就该自己回来，不必用户点「恢复」。
 
@@ -203,7 +260,9 @@ def test_the_task_comes_back_by_itself_once_a_line_frees_up(  # type: ignore[no-
     的时刻，下一个 tick 就恢复——中间没有任何人被通知过，也没有谁在等一个闹钟，
     所以调度器进程重启之后照样成立。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
 
     # 出发前 10 分钟派出，飞 25 分钟、往返 50 分钟 → 航线在 NOW + 40 分钟空出来。
     clock.now = NOW + timedelta(minutes=41)
@@ -215,14 +274,22 @@ def test_the_task_comes_back_by_itself_once_a_line_frees_up(  # type: ignore[no-
 
 
 def test_the_recovered_task_actually_gets_scheduled_again(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory
+    scheduler,
+    repository,
+    launcher,
+    clock,
+    run_id,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """清掉两列还不够，它得真的重新开始派遣。
 
     只清库不参与调度，页面上会从「已停用」变成「待命」然后一直待命——比一直
     显示「已停用」更难查。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
 
     clock.now = NOW + timedelta(minutes=41)
     for _ in range(3):
@@ -232,7 +299,14 @@ def test_the_recovered_task_actually_gets_scheduled_again(  # type: ignore[no-un
 
 
 def test_the_recovery_is_written_into_the_system_log(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory, recorded: RecordingLog
+    scheduler,
+    repository,
+    launcher,
+    clock,
+    run_id,
+    session_factory,
+    recorded: RecordingLog,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """恢复必须留下一条，而且要说清「当前空闲航线几条」。
 
@@ -243,7 +317,9 @@ def test_the_recovery_is_written_into_the_system_log(  # type: ignore[no-untyped
     只留**一条**：tick 每秒一次，恢复那一下如果每 tick 都刷，真正要看的那一条
     会被淹掉。恢复之后标记就清了，所以这里连 tick 五次再数条数。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
     recorded.messages.clear()
     recorded.payloads.clear()
 
@@ -332,14 +408,22 @@ def test_a_config_error_keeps_needing_a_human_even_with_lines_to_spare(  # type:
 
 
 def test_a_task_the_user_turned_off_is_not_switched_back_on(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, clock, run_id, session_factory
+    scheduler,
+    repository,
+    launcher,
+    clock,
+    run_id,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """用户手动停用的语义一个字都不变。
 
     `enabled` 是用户的意志。恢复那一路只清 `disabled_reason`/`disabled_recovery`
     这两列（调度器自己的状态），碰 `enabled` 就等于「我自己勾掉的被悄悄打开了」。
     """
-    disable_for_lack_of_lines(scheduler, repository, launcher, run_id, session_factory, clock)
+    disable_for_lack_of_lines(
+        scheduler, repository, launcher, run_id, session_factory, clock, monkeypatch
+    )
     # 用户在停用状态上又手动把复选框勾掉了。⚠️ 这一下走 `update_mission_task`，
     # 它会顺带清掉停用标记（改配置 = 给它一次重新开始的机会），所以下面钉的是
     # `enabled` 这一列本身。
