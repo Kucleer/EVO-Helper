@@ -17,6 +17,28 @@ __pycache__/
 cookies.json
 tokens.json
 
+# ⚠️ 测试夹具里一张图都不许有。
+#
+# 本仓是**公开仓库**，而这个项目的截图上写着账号 ID、出发星与目标坐标、
+# 逐格的资源数量——发出去就收不回来了。/var/ 与 /debug/ 早就挡住了实机产物，
+# 可 tests/fixtures/ 绕过了那条防线：2026-08-18 有一版把 34 份战报面板当夹具
+# 提交并开了 PR，只能整个撤回。这条是把那个缺口从结构上堵上。
+#
+# 需要真图才能守的判据，一律照 `tests/integration/vision/*_live.py` 的写法办：
+# 图放 /var/ 下、缺图就 skip；CI 里跑的必须是**合成**夹具（拿字模自己渲染，
+# 不含任何游戏数据，见 tests/unit/vision/test_resource_digits.py）。
+#
+# 真要放一张图进来，先回答一个问题：**它能不能反推出坐标、账号或资源数量？**
+tests/fixtures/**/*.png
+tests/fixtures/**/*.jpg
+tests/fixtures/**/*.jpeg
+tests/fixtures/**/*.webp
+tests/fixtures/**/*.gif
+tests/fixtures/**/*.bmp
+tests/fixtures/**/*.tif
+tests/fixtures/**/*.tiff
+tests/fixtures/**/*.avif
+
 # Raw evidence, model weights, and locally sourced legacy fixtures
 /datasets/raw/
 /datasets/processed/
