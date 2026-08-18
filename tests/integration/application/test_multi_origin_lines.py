@@ -506,7 +506,7 @@ def test_an_idle_round_neither_disables_the_task_nor_counts_as_a_failure(  # typ
     一次失败都没记**。
     """
     bot = with_lines(repository, session_factory, (FIRST, 6), (SECOND, 6), account_limit=9)
-    # `max_score` 是军力**上限**：军力高于它的一律不进池（`strongest_within`）。
+    # `max_score` 是军力**上限**：军力高于它的一律不进池（`within_max_score`）。
     # 这两颗目标都远高于 100，于是候选池有货、选中的却是空集。
     repository.update_mission_task(
         bot, params_json='{"by_military": true, "top_n": 50, "max_score": 100}'
