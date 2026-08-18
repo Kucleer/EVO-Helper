@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Protocol
 
-from evo_helper.domain.quantities import parse_quantity
 from evo_helper.vision.fleet_counts import COUNT_RECIPES
 from evo_helper.vision.parsers import REPORT_TIME_RE, normalise_report_time
 from evo_helper.vision.report_layout import (
@@ -28,6 +27,7 @@ from evo_helper.vision.report_layout import (
     banner_bands,
     sections_from_banners,
 )
+from evo_helper.vision.resource_digits import read_resource_cell
 from evo_helper.vision.scan_reading import COORD_RECIPES, COORD_WHITELIST, COORDINATE_RE
 
 OCR_LANGUAGES = "chi_sim+eng"
@@ -82,62 +82,14 @@ NAME_PASS_UPSCALES: tuple[int, ...] = (FLEET_NAME_UPSCALE, 4, 2)
 #: 战报存档图的 WEBP 质量。理由见 `ImageReportScreens.report_panel_image`。
 REPORT_PANEL_WEBP_QUALITY = 90
 
-#: 「获得资源」那 12 格的字符集。`.` 是小数点（`501.1K`），`KMB` 是量级后缀。
-#: **不收逗号**：这一屏从不用逗号分隔，收进来只会把噪点认成分隔符。
-RESOURCE_WHITELIST = "0123456789.KMB"
-
-#: 资源格「算不算墨迹」的亮度门槛。
+#: 「获得资源」那 12 格**不走 tesseract**，走 `vision.resource_digits` 的字模匹配。
 #:
-#: 实测 `var/logs/vp-detail.png` 的 12 格：数字笔画是纯白（255），而格子里其余
-#: 部分（那层 `-TOTAL CREW` / `personnel` 幽灵文字、透出来的星球亮边）**最高只到
-#: 89**。中间隔着一个数量级的空档，门槛落在哪都一样，取 150。
+#: ⚠️ **这一段原先是四套 tesseract 配方 + 两套谈拢，2026-08-18 整段换掉了。**
+#: 换掉的理由不是「读不全」，是「读得不对」：34 份实拍（408 格逐格人工核过真值）上，
+#: 老配方只有 10 份 12 格齐全，而那 10 份里只有 5 份逐格正确——生产库里已经因此
+#: 存进过两个错数。完整的实测对比写在 `vision.resource_digits` 的模块头。
 #:
-#: 这不违反模块头「不要二值化」那条：那条说的是**舰队明细列**，灰度切一刀会打断
-#: tesseract 自己的自适应阈值。这里不切像素，只用门槛**量出墨迹的外接框**，
-#: 喂给 tesseract 的仍是原始灰度（实测二值化在这一块上把 12 格全读废了）。
-RESOURCE_INK_THRESHOLD = 150
-
-#: 外接框四周各留几像素。贴着笔画裁会让 tesseract 把边缘当成笔画的一部分。
-RESOURCE_INK_PADDING = 3
-
-#: 放大之后再补一圈黑边。tesseract 需要字符周围有「纸面」才肯分行，
-#: 实测不补这一圈时 12 格全部读空。
-RESOURCE_BORDER = 25
-
-#: 资源格逐套试的配方。
-#:
-#: ⚠️ **倍数比别处高得多，这是量出来的，不是随手写的。** 这一格的数字字高只有
-#: **9 像素**（`0` 的墨迹是 7×9），比舰队明细还小得多。实测 `vp-detail.png`
-#: 那 12 个 `0`，按「裁到墨迹 + 放大 + 补黑边 + psm 7 + 数字白名单」扫参数：
-#:
-#: ==========  ==========  ==================
-#: 放大         重采样       12 格读对几个
-#: ==========  ==========  ==================
-#: ``4``       lanczos     0（全空）
-#: ``8``       lanczos     3
-#: ``12``      lanczos     **12**
-#: ``12``      nearest     0（全空）
-#: ==========  ==========  ==================
-#:
-#: 最近邻在这一块上完全读不出（与坐标行相反：那边靠它保住相邻 `1` 之间的缝）。
-#: 它仍留在梯子最后一档，专为 `1.2K` 这种相邻竖笔的情形兜底——只有前几档谈不拢
-#: 时才会跑到它。
-RESOURCE_RECIPES: tuple[tuple[int, str], ...] = (
-    (12, "lanczos"),
-    (14, "lanczos"),
-    (10, "lanczos"),
-    (12, "nearest"),
-)
-
-#: 一格要几套配方读出**同一个**结果才采信。
-#:
-#: ⚠️ **这条不能省。** 这一块没有任何校验和：舰队明细有「合计对不上就重读」
-#: （`vision.fleet_counts`）、坐标有「三元组格式」，而一格资源数量读成什么都
-#: 「合法」。实测同一格 `0` 在 10× 下读成 `4`、`5`——单套配方交出来的
-#: `5` 和真正的 `5` 长得一模一样，入库之后没有任何办法回头分辨。
-#:
-#: 要两套谈拢，稳态下每格 2 次 OCR（约 0.18s），一份战报多花两秒出头。
-RESOURCE_AGREEMENTS = 2
+#: 顺带省掉的是每格 2–4 次 OCR：一份战报的这一块从两秒出头降到毫秒级。
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,15 +225,9 @@ class ImageReportScreens:
         和 VS 块、`report_panel` 的存档图是同一屏像素（`report_panel_image`
         的注释写着为什么必须复用同一屏）。
 
-        逐格一次 OCR、逐套配方试到读得出为止：一格是一个孤零零的数，`--psm 7`
-        加数字白名单最稳；一次读一整行会把四个数连成一串，而这一屏上数与数之间
-        隔着图标，连出来的串没法可靠地再切开。
-
-        ⚠️ **判「读得出」用 `parse_quantity`，不是「非空」。** tesseract 在这种
-        小字上常吐出 `'.'`、`'K'` 这样的半个结果，那些串非空却毫无意义；
-        当成读数会把一格收获记成 0（`.` 解析不出→整块作废，尚可），
-        更糟的是像 `'8'` 这样**看起来完全正常**的半个数。逐套配方重试正是
-        为了让下一套有机会给出完整的那一个。
+        识别本身**不走 tesseract**，走 `vision.resource_digits` 的字模匹配：
+        这一格字高只有 9 像素，tesseract 在这个尺寸上既读不全又读不对
+        （实测对比在那个模块的头部）。
 
         读不出来的格子返回空串，由 `domain.battle_resources.parse_resource_grid`
         决定整块作废——这一层不做「补 0」这种决定。
@@ -290,62 +236,14 @@ class ImageReportScreens:
         return tuple(self._read_resource_cell(grid.cell(slot)) for slot in range(grid.slots))
 
     def _read_resource_cell(self, region: Region) -> str:
-        """读一格资源数量：先裁到墨迹，再逐套配方读到**两套谈拢**为止。
-
-        谈不拢、或者格子里压根没有墨迹，都返回空串——由上层整块作废。
-        「没有墨迹」不是 0：这一屏上值为 0 的格子照样画着一个 `0`，
-        一点墨迹都没有说明格子挪了位，那时候补一个 0 是在编数据。
-        """
-        crop = self._trim_to_ink(self._image.crop(region.as_box()).convert("L"))
-        if crop is None:
-            return ""
-        seen: dict[str, int] = {}
-        for scale, resample in RESOURCE_RECIPES:
-            text = self._ocr_resource(crop, scale, resample)
-            if parse_quantity(text) is None:
-                continue
-            seen[text] = seen.get(text, 0) + 1
-            if seen[text] >= RESOURCE_AGREEMENTS:
-                return text
-        return ""
-
-    def _trim_to_ink(self, crop: Any) -> Any | None:
-        """把格子裁到墨迹的外接框（四周留 `RESOURCE_INK_PADDING`）。没有墨迹返回 None。
-
-        ⚠️ **必须裁。** 一格的 ROI 是 76×20，而一个 `0` 只占 7×9——剩下全是背景。
-        实测不裁时 tesseract 在这 12 格上只读出零星几个，还把 `0` 读成 `5`。
-        裁的是**位置**，喂进去的仍是原始灰度像素，见 `RESOURCE_INK_THRESHOLD`。
-        """
-        threshold = RESOURCE_INK_THRESHOLD
-        mask = crop.point(lambda value: 255 if value > threshold else 0)
-        box = mask.getbbox()
-        if box is None:
-            return None
-        left, top, right, bottom = box
-        pad = RESOURCE_INK_PADDING
-        return crop.crop(
-            (
-                max(left - pad, 0),
-                max(top - pad, 0),
-                min(right + pad, crop.width),
-                min(bottom + pad, crop.height),
-            )
-        )
-
-    def _ocr_resource(self, crop: Any, scale: int, resample: str) -> str:
-        """放大、补黑边、按单行读一格数量。"""
-        filters = {
-            "lanczos": self._image_module.Resampling.LANCZOS,
-            "nearest": self._image_module.Resampling.NEAREST,
-        }
-        scaled = crop.resize((crop.width * scale, crop.height * scale), filters[resample])
-        border = RESOURCE_BORDER
-        padded = self._image_module.new(
-            "L", (scaled.width + 2 * border, scaled.height + 2 * border), 0
-        )
-        padded.paste(scaled, (border, border))
-        config = f"--psm {OCR_PSM_LINE} -c tessedit_char_whitelist={RESOURCE_WHITELIST}"
-        return self._ocr.image_to_string(padded, lang="eng", config=config).strip()
+        """把一格裁出来、转成灰度网格，交给字模匹配。"""
+        crop = self._image.crop(region.as_box()).convert("L")
+        # `tobytes()` 是逐行紧排的灰度字节，没有行填充；比 `getdata()` 快，
+        # 也不吃 Pillow 14 要拿掉 `getdata()` 的那条弃用。
+        raw = crop.tobytes()
+        width = crop.width
+        luminance = [raw[y * width : (y + 1) * width] for y in range(crop.height)]
+        return read_resource_cell(luminance)
 
     def _report_time(self) -> str | None:
         """窄 ROI 读页眉时间：单行、纯英文、只认数字与分隔符。
