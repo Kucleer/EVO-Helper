@@ -1614,6 +1614,7 @@ _ALL_KNOBS = {
     "unknown_line_hold_minutes": 45,
     "reconcile_cooldown_minutes": 0,
     "bot_revisit_hours": 6,
+    "protection_exclusion_hours": 4,
     "account_line_limit": 6,
     "auto_toggle_log_seconds": 90,
 }

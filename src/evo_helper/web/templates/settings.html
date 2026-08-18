@@ -76,6 +76,32 @@
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
+    <label for="protection-exclusion">保护期排除时长（小时，默认 {{ protection_exclusion_default }}）</label>
+    <input id="protection-exclusion" type="number" min="1" max="{{ protection_exclusion_max }}" step="1"
+           placeholder="留空 = {{ protection_exclusion_default }}" aria-label="保护期排除时长（小时）">
+  </div>
+  <p class="muted">
+    目标被打过之后会进入游戏的 <strong>{{ game_protection_hours }} 小时保护期</strong>（<strong>任何人</strong>打过都会触发，不只是你）。
+    保护期<strong>推不出来，只能撞上了才知道</strong>——派遣时弹「没有可执行的任务」。
+    撞上一次之后，这个坐标在这里配的时长内不再进候选池。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>{{ game_protection_hours }} 小时是游戏规则，这一格是策略，两者同数不同义。</strong>
+    我们只知道「在某一刻撞上了」，<strong>不知道保护期是什么时候开始的</strong>：可能已经走了 7 小时，也可能刚开始。
+    所以按 {{ game_protection_hours }} 小时排除必然<strong>偏保守</strong>——这是有意的。
+  </p>
+  <p class="muted">
+    <strong>调小</strong>：保护期可能早就过了，早点重试能多打几个目标；代价是撞上保护期的目标会更早回到候选池，
+    而每撞一次就要走一遍「导航 + 开面板 + 撞弹窗 + 退出」，实测每个目标约 <strong>2.9 分钟鼠标时间</strong>，一发都派不出去。<br>
+    <strong>调大</strong>：几乎不会再白跑；代价是少打几个本来已经能打的目标——而候选池有 3000+ 个，这个损失可以忽略。<br>
+    <strong>两边的代价不对称，所以默认宁可过度排除。</strong>
+    参考实机（2026-08-18 20:29）：四个目标全在保护期，整轮 11.5 分钟一发没派，结算完<strong>一秒后的下一轮又挑中同样的四个</strong>。
+    上限 {{ protection_exclusion_max }} 小时——保护期最长就 {{ game_protection_hours }} 小时，再往上纯属余量，
+    超过一天就会和上面那个「bot 重复攻击间隔」争同一件事，排障时分不清目标是被哪一条挡住的。
+    要「关掉这道排除」请不要填 0（后端会拒）——那正是这一格要修的那个毛病。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
     <label for="account-line-limit">全账号航线上限（留空 = 不额外限制）</label>
     <input id="account-line-limit" type="number" min="1" max="{{ account_line_limit_max }}" step="1"
            placeholder="留空 = 不额外限制" aria-label="全账号航线上限">
@@ -176,6 +202,7 @@
     { element: document.getElementById('line-hold'), key: 'unknown_line_hold_minutes', label: '航线占用时长' },
     { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
     { element: document.getElementById('bot-revisit'), key: 'bot_revisit_hours', label: 'bot 重复攻击间隔' },
+    { element: document.getElementById('protection-exclusion'), key: 'protection_exclusion_hours', label: '保护期排除时长' },
     { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
     { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '调度器重复日志窗口' },
   ];
