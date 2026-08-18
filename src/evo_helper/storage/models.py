@@ -823,13 +823,17 @@ class MilitaryAttackConfigRow(Base):
     #: 调大更激进，代价是 runner 会白跑一趟撞上游戏的「同时派遣的舰队数量已达上限。」。
     account_line_limit: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
-    #: 「自动停用 / 自动恢复」这一对日志的限流窗口（秒）。
-    #: **空 = `application.mission_scheduler.AUTO_TOGGLE_LOG_WINDOW`（120 秒）。**
+    #: 调度器**每 tick 都可能触发的那几条日志**共用的限流窗口（秒）。
+    #: **空 = `application.mission_scheduler.REPEATED_LOG_WINDOW`（120 秒）。**
+    #:
+    #: ⚠️ **列名是历史名。** 2026-08-18 之前它只管「自动停用 / 自动恢复」那一对；
+    #: 同日起「军力候选池」「军力读数放宽窗口」这两条也走同一道闸
+    #: （`MissionScheduler._log_a_repeated_line`）。改列名要迁移、要动页面和 API 字段，
+    #: 换不来任何用户可见的好处，所以只把用户看得见的措辞跟着改了。
     #:
     #: 旋钮而非标定常量：调小排障时看得密、日志吵；调大库干净，代价是一次真实的
-    #: 反复跃迁会被合并成看不出频率的一条（被压掉几次会记在 payload 里，见
-    #: `MissionScheduler._log_auto_toggle`）。先例是 `record_unrecognised_screen`
-    #: 那 120 秒。
+    #: 反复抖动会被合并成看不出频率的一条（被压掉几次、横跨多久都会记在 payload
+    #: 里）。先例是 `record_unrecognised_screen` 那 120 秒。
     auto_toggle_log_seconds: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=None
     )
