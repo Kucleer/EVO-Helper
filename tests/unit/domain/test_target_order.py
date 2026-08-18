@@ -1,18 +1,22 @@
-"""五步选靶流水线的护栏。每条钉的都是「改坏了也不报错」的那种。
+"""四步选靶流水线的护栏。每条钉的都是「改坏了也不报错」的那种。
 
 流水线（用户口径 2026-08-18，整段写在 `domain.target_order` 模块头上）：
 
 1. 剔除 24h 内已攻击的 + 本轮已走完的（住在 `application`，钉在那一侧）
 2. 只保留有军力读数的
-3. 只保留读数落在**有效期窗口**内的；窗口内不足军力截断要的个数时**放弃窗口**
-4. 在这一池里按军力取前 M ＝**军力截断**
-5. 按距离由近到远出击
+3. 只保留读数落在**有效期窗口**内的；窗口内不足**窗口门限**时**放弃窗口**
+4. 过军力上限这道安全线，按 **军力 ÷ 往返小时** 降序出击
 
-⚠️ **这一整节 2026-08-18 重写过第二次。** 上一版（PR #176）的第 3 步是「按读数
-时间取前 N 个」，而那是错的：军力榜从强到弱扫，「读数最新」系统性地等价于
-「军力最弱」，于是「军力优先」选出了全库最弱的一批。改写理由与生产实测分段表
-在 `domain.target_order` 模块头第 3 步。被改写的每一条用例各自在 docstring 里
-说明为什么。
+⚠️ **这一整节 2026-08-18 重写过第三次。**
+
+- 上上版（PR #176）的第 3 步是「按读数时间取前 N 个」，而军力榜从强到弱扫，
+  「读数最新」系统性地等价于「军力最弱」——那一版把全库最弱的一批选了出来。
+- 上一版把第 4、5 步写成「窗口内按军力硬截断前 `top_n` 名」＋「这批人按距离
+  由近到远出击」。两步各自说得通，合起来说不清：「第 101 名一个都不打」和
+  「第 1 名与第 100 名之间只按远近分先后」是两条互相矛盾的口径，而它们之间那道墙
+  纯粹是拍出来的。**这一版把两步合成一条判据**：`军力 ÷ 往返小时`。
+
+被改写的每一条用例各自在 docstring 里说明为什么。
 """
 
 from __future__ import annotations
@@ -22,14 +26,16 @@ from datetime import UTC, datetime, timedelta
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
-    TOP_BY_MILITARY,
+    MILITARY_EXPONENT,
+    WINDOW_POOL_FLOOR,
     ScoredTarget,
+    attack_value,
     choose_by_military,
+    most_valuable_first,
     score_is_fresh,
-    strongest_first,
-    strongest_then_nearest,
-    strongest_within,
+    value_key,
     with_a_military_reading,
+    within_max_score,
     within_score_window,
 )
 
@@ -52,10 +58,12 @@ def _target(
     return ScoredTarget(Coordinate(galaxy, system, 5), score, None if score is None else scanned_at)
 
 
-def _chosen(targets: list[ScoredTarget], *, take: int, max_age: timedelta = TWO_HOURS) -> list[int]:
-    """跑完第 2--4 步，把选中的恒星系号列出来。用例里最常问的就是这个。"""
-    choice = choose_by_military(targets, now=NOW, max_age=max_age, take=take)
-    return [item.coordinate.system for item in choice.selected]
+def _eligible(
+    targets: list[ScoredTarget], *, window_floor: int, max_age: timedelta = TWO_HOURS
+) -> list[int]:
+    """跑完第 2--3 步与安全线，把有资格被打的恒星系号列出来。"""
+    choice = choose_by_military(targets, now=NOW, max_age=max_age, window_floor=window_floor)
+    return [item.coordinate.system for item in choice.eligible]
 
 
 # -- 第 2 步：没有军力读数的不再参与 -------------------------------------------
@@ -75,7 +83,7 @@ def test_a_target_that_never_made_the_board_is_out() -> None:
     rated = _target(400, 8_000.0)
 
     assert with_a_military_reading([never_seen, rated]) == [rated]
-    assert _chosen([never_seen, rated], take=10) == [400]
+    assert _eligible([never_seen, rated], window_floor=10) == [400]
 
 
 def test_a_score_without_a_reading_time_is_out_too() -> None:
@@ -88,32 +96,25 @@ def test_a_score_without_a_reading_time_is_out_too() -> None:
     no_clock = ScoredTarget(Coordinate(2, 141, 5), 9_000.0, None)
 
     assert with_a_military_reading([no_clock]) == []
-    assert _chosen([no_clock], take=10) == []
+    assert _eligible([no_clock], window_floor=10) == []
 
 
 def test_a_pool_with_nothing_rated_is_empty_not_a_crash() -> None:
     """一个有读数的都没有时给出空清单——上层据此判「此刻没活干」，而不是崩掉。"""
-    assert _chosen([_target(140, None), _target(141, None)], take=10) == []
+    assert _eligible([_target(140, None), _target(141, None)], window_floor=10) == []
 
 
-# -- 第 3 步：窗口筛选（用例 a / d 就在这一节） ---------------------------------
+# -- 第 3 步：窗口筛选（用例 f 就在这一节） -------------------------------------
 
 
 def test_a_target_outside_the_window_stays_out_however_strong_it_is() -> None:
-    """⚠️ **用例 (a)：窗口内够用时，窗口外的再强也不进。**
+    """⚠️ **窗口内够用时，窗口外的再强也不进。**
 
-    ⚠️ **这条用例翻转了 PR #176 的 `test_the_time_pool_takes_the_newest_readings_not_the_strongest`
-    与 `test_the_cut_happens_inside_the_time_pool`。** 那两条钉的是「按读数时间取
-    前 N 个」，而那一步是错的：军力榜从强到弱扫，「读数最新」系统性地等价于
-    「军力最弱」（实测分段表在 `domain.target_order` 模块头第 3 步），于是那一步
-    实际上是一道**反向的军力截断**。它挡住了 99999 那种目标，靠的却是错误的理由
-    ——所以那两条用例在新规格下仍然会绿，但它们守的是一件已经不存在的事。
+    这里 `2:400` 的军力是全场最高（99999），读数却是三天前的——**它不该进池**。
+    窗口内还剩 3 个，够窗口门限（2 个）用，所以窗口不必放弃。
 
-    这里 `2:400` 的军力是全场最高（99999），读数却是三天前的——**它不该被选中**。
-    窗口内还剩 3 个，够军力截断（2 个）用，所以窗口不必放弃。
-
-    改成「按读数时间取前 N 个」（N 是个大数）的话，`2:400` 会连同所有人一起进池，
-    再按军力截断就把它选出来了——这条用例因此会红。
+    改成「按读数时间取前 N 个」（N 是个大数）的话，`2:400` 会连同所有人一起进池
+    ——这条用例因此会红。
     """
     targets = [
         _target(400, 99_999.0, scanned_at=NOW - timedelta(days=3)),  # 最强，但在窗口外
@@ -122,32 +123,48 @@ def test_a_target_outside_the_window_stays_out_however_strong_it_is() -> None:
         _target(143, 7_000.0),
     ]
 
-    choice = choose_by_military(targets, now=NOW, max_age=TWO_HOURS, take=2)
+    choice = choose_by_military(targets, now=NOW, max_age=TWO_HOURS, window_floor=2)
 
-    assert [item.coordinate.system for item in choice.selected] == [141, 142]
-    assert not any(item.coordinate.system == 400 for item in choice.selected), (
-        "窗口外的目标再强也不该进来"
-    )
+    assert [item.coordinate.system for item in choice.eligible] == [141, 142, 143]
     assert not choice.widened, "窗口内够用，不该报「放宽」"
 
 
+def test_the_window_floor_is_still_the_yardstick_for_step_three() -> None:
+    """⚠️ **用例 (f)：`top_n`（窗口门限）仍然是第 3 步「够不够」的那把尺子。**
+
+    它 2026-08-18 起**不再决定打谁**（军力硬截断取消了），但这一个身份必须原样
+    保留：窗口内的数量 ≥ 门限就只用窗口内的，不足就放弃窗口。
+
+    同一批目标、只改门限，结果必须翻面——把第 3 步的判据换成任何别的东西
+    （固定阈值、`>= 1`、恒真、恒假）都会让这条红。
+    """
+    targets = [
+        _target(141, 9_000.0),
+        _target(142, 8_000.0),
+        _target(400, 99_999.0, scanned_at=NOW - timedelta(days=3)),
+    ]
+
+    assert _eligible(targets, window_floor=2) == [141, 142], "窗口内 2 个 ≥ 门限 2，只用窗口内的"
+    assert _eligible(targets, window_floor=3) == [141, 142, 400], "窗口内 2 个 < 门限 3，放弃窗口"
+
+
 def test_a_short_window_gives_up_the_window_instead_of_reaching_for_the_next_newest() -> None:
-    """⚠️ **用例 (d)：不足时是「放弃窗口」，不是「按时间往下补」。**
+    """⚠️ **不足时是「放弃窗口」，不是「按时间往下补」。**
 
     往下补捞到的正是**刚出窗口**那一批，而军力榜从强到弱扫，那一批恰恰是最弱的
-    ——补下去等于把 PR #176 的缺陷换个地方原样复发。放弃窗口后在全部有读数的目标
-    里按军力截断，至少拿到的是全库最强的那一批。
+    ——补下去等于把 PR #176 的缺陷换个地方原样复发。
 
     这里刻意让「更新的」和「更强的」分开站：
 
-    | 目标 | 读数 | 军力 | 谁会选它 |
-    |---|---|---|---|
-    | `2:100` | 刚读到（窗口内） | 100 | 两种都选不上（太弱） |
-    | `2:200` / `2:300` | 3 小时前（刚出窗口） | 200 / 300 | **按时间往下补**会选 |
-    | `2:900` / `2:800` | 3 天前 | 90000 / 80000 | **按军力截断**会选 |
+    | 目标 | 读数 | 军力 |
+    |---|---|---|
+    | `2:100` | 刚读到（窗口内） | 100 |
+    | `2:200` / `2:300` | 3 小时前（刚出窗口） | 200 / 300 |
+    | `2:900` / `2:800` | 3 天前 | 90000 / 80000 |
 
-    截断要 3 个而窗口内只有 1 个 → 放弃窗口 → 按军力取 [90000, 80000, 300]。
-    改成「按时间往下补」的话出来的是 [100, 300, 200]，这条用例因此会红。
+    门限 3 而窗口内只有 1 个 → 放弃窗口 → **全部有读数的目标**都进池。
+    改成「按时间往下补」的话，进池的只有 `[100, 300, 200]`，两个三天前的强目标
+    会被挡在外面——这条用例因此会红。
     """
     targets = [
         _target(100, 100.0),
@@ -157,9 +174,9 @@ def test_a_short_window_gives_up_the_window_instead_of_reaching_for_the_next_new
         _target(800, 80_000.0, scanned_at=NOW - timedelta(days=3)),
     ]
 
-    choice = choose_by_military(targets, now=NOW, max_age=TWO_HOURS, take=3)
+    choice = choose_by_military(targets, now=NOW, max_age=TWO_HOURS, window_floor=3)
 
-    assert [item.coordinate.system for item in choice.selected] == [900, 800, 300]
+    assert {item.coordinate.system for item in choice.eligible} == {100, 200, 300, 900, 800}
     assert choice.widened, "放弃了窗口就得说出来"
     assert len(choice.in_window) == 1, "告警里那句「窗口内只有几个」取的就是这个数"
 
@@ -185,7 +202,7 @@ def test_the_window_draws_a_line_it_does_not_rank() -> None:
 
 
 def test_the_window_keeps_the_order_it_was_given() -> None:
-    """窗口只筛，不排序。排序是第 4 步（军力）和第 5 步（距离）各自的事。
+    """窗口只筛，不排序。排序是第 4 步的事，而那一步要知道从哪颗星球出发。
 
     在这里顺手排一次的话，两处排序会打架，而打架的症状是「同一批目标每次挑出来
     的不是同一批」——事后拿日志对账就对不上了。
@@ -198,31 +215,28 @@ def test_the_window_keeps_the_order_it_was_given() -> None:
 
 
 def test_a_window_that_keeps_everything_never_reports_a_widening() -> None:
-    """⚠️ **窗口内不足 K，但库里本来就只有这些读数——这不叫「用了旧数据」。**
+    """⚠️ **窗口内不足门限，但库里本来就只有这些读数——这不叫「用了旧数据」。**
 
-    放弃窗口一个目标都没多捞到，所以不该告警。判据因此是「选中的这批里有没有
-    窗口外的」，而不是「有没有走放宽那条分支」。
+    放弃窗口一个目标都没多捞到，所以不该告警。判据因此是「池子里有没有窗口外的」，
+    而不是「有没有走放宽那条分支」。
 
-    少了这条，一个「`len(in_window) < take` 就报警」的实现会全绿，而它会在库里
-    目标本来就少的时候每轮都响——**每轮都响的告警和不响的一样没用**。
+    少了这条，一个「`len(in_window) < window_floor` 就报警」的实现会全绿，而它会在
+    库里目标本来就少的时候每轮都响——**每轮都响的告警和不响的一样没用**。
     """
     only_two = [_target(140, 9_000.0), _target(141, 8_000.0)]
 
-    choice = choose_by_military(only_two, now=NOW, max_age=TWO_HOURS, take=100)
+    choice = choose_by_military(only_two, now=NOW, max_age=TWO_HOURS, window_floor=100)
 
-    assert [item.coordinate.system for item in choice.selected] == [140, 141]
+    assert [item.coordinate.system for item in choice.eligible] == [140, 141]
     assert not choice.widened
 
 
-def test_a_pool_where_everything_expired_still_attacks_by_military() -> None:
+def test_a_pool_where_everything_expired_still_attacks() -> None:
     """⚠️ **2026-08-17 那晚的复现：全部超期也不许让这一轮空手。**
 
     那一版把超期的整批滤掉，于是「一个新鲜分数都没有」时候选池退化成
     「军力完全不参与」，实机连续停摆 2.5 小时。窗口重新会筛，但**筛空了就放弃
     窗口**，所以那种停摆回不来。
-
-    这里三个目标的读数都是三天前的，窗口是 2 小时——一个都不在窗口内，
-    而军力截断照样在全部有读数的目标里正常生效。
     """
     three_days = NOW - timedelta(days=3)
     all_stale = [
@@ -231,55 +245,155 @@ def test_a_pool_where_everything_expired_still_attacks_by_military() -> None:
         _target(142, 100.0, scanned_at=three_days),
     ]
 
-    choice = choose_by_military(all_stale, now=NOW, max_age=TWO_HOURS, take=2)
+    choice = choose_by_military(all_stale, now=NOW, max_age=TWO_HOURS, window_floor=2)
 
-    assert [item.coordinate.system for item in choice.selected] == [140, 141]
+    assert [item.coordinate.system for item in choice.eligible] == [140, 141, 142]
     assert choice.widened, "一个新鲜读数都没有还照打，这件事必须说出来"
     assert choice.in_window == ()
 
 
-# -- 第 4 步：军力是一道**截断** -----------------------------------------------
+# -- 第 4 步：得分 = 军力 ÷ 往返小时（用例 a / b / c 都在这一节）----------------
 
 
-def test_the_cut_is_a_cut_not_a_sort() -> None:
-    """⚠️ **军力必须真的把人挡在外面，不能只是排个序。**
+def test_the_score_beats_both_pure_distance_and_pure_military() -> None:
+    """⚠️ **用例 (a)：近而弱 vs 远而强，两种旧口径给出的答案都不对。**
 
-    第 5 步按距离重排会把排序结果整个抹掉，所以军力只有这一次机会生效。改成
-    「只排序不截断」的话，落选的那个会照样出现在结果里——只是排在后面。
+    这四个目标是特意排的，让三种口径的结果两两不同（从 `2:137` 出发）：
+
+    | 目标 | 军力 | 往返小时 | 得分 |
+    |---|---|---|---|
+    | `2:140` | 8,000 | 0.523 | 15,284 |
+    | `2:141` | 9,000 | 0.530 | 16,982 |
+    | `2:400` | 30,000 | 1.371 | **21,884** |
+    | `2:401` | 10,000 | 1.368 | 7,308 |
+
+        按得分（本判据）  [400, 141, 140, 401]
+        纯军力            [400, 401, 141, 140]      ← 401 冲到第 2 名
+        纯就近            [140, 141, 400, 401]      ← 400 掉到第 3 名
+
+    **`2:400` 远，但强到值得飞过去；`2:401` 一样远，却没强到那个份上。**
+    这正是旧的「军力截断 + 按距离出击」两步说不清的那件事：截断线画在哪都是拍的，
+    而线内又完全不看军力。
+
+    ⚠️ 得分的分子用军力，依据是**用户口径**（2026-08-18：「已知军力和材料产出正
+    相关，但是没有具体数据来拟合相关曲线」），不是实测的材料产出。资源识别修好、
+    材料样本攒够之后应当重新检验（`docs/选靶数据跟踪-待办.md`）。
+
+    把第 4 步改回纯军力或改回纯就近，这条用例都会红。
     """
-    selected = _chosen([_target(140, 9_000.0), _target(141, 8_000.0), _target(142, 100.0)], take=2)
+    targets = [
+        _target(140, 8_000.0),
+        _target(141, 9_000.0),
+        _target(400, 30_000.0),
+        _target(401, 10_000.0),
+    ]
 
-    assert selected == [140, 141]
-    assert 142 not in selected, "第 3 名不该出现在结果里"
+    ordered = most_valuable_first(targets, HOME, now=NOW, window_floor=4)
+
+    assert [item.system for item in ordered] == [400, 141, 140, 401]
 
 
-def test_a_cut_larger_than_the_pool_is_not_an_error() -> None:
-    """池子不够 N 个时就全要，而不是报错或者补空。
+def test_the_round_trip_in_the_score_is_measured_round_the_ring() -> None:
+    """⚠️ **用例 (b)：得分的分母走环形距离，不是 `abs(a - b)`。**
 
-    ⚠️ 这也正是**军力截断失效**的形状：填成 ≥ 池内目标数，这一刀什么都不挡。
-    2026-08-18 之前 `top_n` 被填成 500 而可用候选只有 591，实际就在这一档上。
+    从 `2:137` 看 `2:499` 只有 137 步（绕过 499↔1），而线性减法会算成 362 步。
+    军力一样时，往返更短的那个得分更高——所以 `2:499` 必须排在 `2:287` 前面。
+
+    实测这两个点的单程时间是 1969 秒对 2042 秒（`domain.distance` 模块头）：
+    线性模型会把它们排反，而且不报错。
     """
-    assert len(strongest_within([_target(140, 9_000.0)], take=500)) == 1
+    same_strength = [_target(287, 9_000.0), _target(499, 9_000.0)]
+
+    ordered = most_valuable_first(same_strength, HOME, now=NOW, window_floor=2)
+
+    assert [item.system for item in ordered] == [499, 287]
 
 
-def test_a_cut_of_nothing_yields_nothing() -> None:
-    """`take=0` 要给出空清单——上层据此判「这一轮没得打」，而不是崩掉。"""
-    assert strongest_within([_target(140, 9_000.0)], take=0) == ()
-    assert _chosen([_target(140, 9_000.0)], take=0) == []
+def test_a_cross_galaxy_score_uses_the_galaxy_ring_too() -> None:
+    """⚠️ **用例 (c)：跨银河那一段同样是环形的。**
+
+    从 2 系出发，9 系是**第二近**的银河（`2→1→9`，两步），6 系要走四步。
+    实测单程 5305 秒对 7502 秒。军力一样时 9 系的得分更高。
+
+    写成 `abs(9 - 2)` 的话 9 系变成七步、被排到最后，一夜都轮不到——而且不报错。
+    """
+    same_strength = [
+        _target(250, 9_000.0, galaxy=6),
+        _target(250, 9_000.0, galaxy=9),
+    ]
+
+    ordered = most_valuable_first(same_strength, HOME, now=NOW, window_floor=2)
+
+    assert [item.galaxy for item in ordered] == [9, 6]
 
 
-# -- 上限 ----------------------------------------------------------------------
+def test_the_score_is_military_over_round_trip_hours() -> None:
+    """得分的定义本身：分子是军力（指数 1），分母是往返小时。
+
+    这条用例的作用是让「k = 1」这件事在测试里也说得出口。改指数、或者把分母换成
+    单程/距离单位，它都会红。
+    """
+    target = _target(140, 8_000.0)
+
+    value = attack_value(target, HOME)
+
+    assert value is not None
+    assert abs(value - 8_000.0 / 0.5234) < 1.0
+
+
+def test_a_target_without_a_score_has_no_value_and_sorts_last() -> None:
+    """⚠️ **0 分是读到的事实，None 是不知道。**
+
+    榜单上真的有 0 分的行。把 None 当成 0 就是把「没数据」伪装成「数据是 0」——
+    而这个仓有一条硬规矩：猜出来的数不许长得像量出来的。
+
+    没有分数的目标在第 2 步就出局了，所以这条守的是 `value_key` 这个通用排序本身：
+    「不知道不等于 0」在哪里都成立。
+    """
+    unknown = _target(140, None)
+    really_zero = _target(141, 0.0)
+
+    assert attack_value(unknown, HOME) is None
+    assert sorted([unknown, really_zero], key=lambda item: value_key(item, HOME)) == [
+        really_zero,
+        unknown,
+    ]
+
+
+def test_the_order_is_the_same_every_time() -> None:
+    """⚠️ 得分并列时按坐标定序。
+
+    不定的话，同一批目标每次排出来的先后可能不一样——而那会让「上一轮打到哪了」
+    无从谈起，事后拿日志对账也对不上。这里三个目标同军力、同恒星系环距
+    （`137 ± 3`、`137 + 3` 的位次不同），得分完全相等。
+    """
+    tied = [
+        ScoredTarget(Coordinate(2, 140, 9), 9_000.0, NOW),
+        ScoredTarget(Coordinate(2, 140, 1), 9_000.0, NOW),
+        ScoredTarget(Coordinate(2, 140, 5), 9_000.0, NOW),
+    ]
+
+    ordered = most_valuable_first(tied, HOME, now=NOW, window_floor=3)
+
+    assert [item.position for item in ordered] == [1, 5, 9]
+    assert ordered == most_valuable_first(list(reversed(tied)), HOME, now=NOW, window_floor=3)
+
+
+# -- 安全线（用例 d） ----------------------------------------------------------
 
 
 def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool() -> None:
-    """用户口径（2026-08-14）：「军力确实要设置上限」。
+    """⚠️ **用例 (d)：用户口径（2026-08-14）「军力确实要设置上限」。**
 
     太强的目标不是当前预设打得动的，派过去只是白烧一次配额和一趟往返。
+    ⚠️ 这里刻意让超标的那个**同时是得分最高的**：安全线失效的话它会排在第一个，
+    而不是消失——所以这条用例既钉「有没有被挡住」，也钉「不是只被排到后面」。
     """
-    ordered = strongest_then_nearest(
+    ordered = most_valuable_first(
         [_target(140, 1_773_000.0), _target(200, 9_000.0)],
         HOME,
         now=NOW,
+        window_floor=2,
         max_score=100_000.0,
     )
 
@@ -288,93 +402,46 @@ def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool() -> None:
 
 def test_no_cap_keeps_even_the_strongest() -> None:
     """默认不设上限。"""
-    ordered = strongest_then_nearest([_target(140, 1_773_000.0)], HOME, now=NOW)
+    ordered = most_valuable_first([_target(140, 1_773_000.0)], HOME, now=NOW, window_floor=1)
 
     assert [item.system for item in ordered] == [140]
 
 
-# -- 第 5 步：池内一律按距离（用例 e） -----------------------------------------
+def test_the_cap_blocks_the_too_strong_not_the_unreadable() -> None:
+    """⚠️ **上限只挡「太强」，不挡「读不出来」。**
 
+    「不知道多强」从来不构成「一定太强」。读不出来的那一档在第 2 步就出局了，
+    这里不必也不该再判一次——在安全线上顺手把 None 也扔掉，会让两个判据搅在一起，
+    以后调上限就会静悄悄地改变「谁算没读数」。
 
-def test_military_only_decides_who_gets_in_the_pool() -> None:
-    """⚠️ **用例 (e)：军力只用来截断，进了池子一律按距离。**
-
-    这两步合成一个排序键的话，一夜的航线会在银河之间来回横跳：相邻两个目标的
-    军力差可能只有几十点，而距离差是同银河 30 分钟 vs 跨银河 2.6 小时（实测）。
-
-    第 5 步换成按军力排序的话，出来的是 `[400, 140]`——这条用例因此会红。
+    ⚠️ **它同时钉住「安全线不重排」**：出来的次序必须是传进去的次序。
     """
-    pool_of_two = [
-        _target(400, 9_000.0),  # 更强，但远
-        _target(140, 8_000.0),  # 稍弱，但近
-        _target(200, 100.0),  # 太弱，进不了池
-    ]
+    kept = within_max_score(
+        [_target(140, 30_000.0), _target(141, None), _target(142, 1_000.0)],
+        max_score=20_000.0,
+    )
 
-    ordered = strongest_then_nearest(pool_of_two, HOME, now=NOW, take=2)
-
-    assert [item.system for item in ordered] == [140, 400], "池内按距离，不按军力"
+    assert [item.coordinate.system for item in kept] == [141, 142]
 
 
-def test_distance_inside_the_pool_is_measured_round_the_ring() -> None:
-    """池内的距离用 `distance_key`，也就是**环形**的。
-
-    从 2:137 看 `2:499` 只有 137 步（绕过 499↔1），而线性减法会算成 362。
-    """
-    pool = [_target(287, 9_000.0), _target(499, 9_100.0)]
-
-    ordered = strongest_then_nearest(pool, HOME, now=NOW, take=2)
-
-    assert [item.system for item in ordered] == [499, 287]
-
-
-# -- 排序本身 ------------------------------------------------------------------
-
-
-def test_an_unknown_score_never_outranks_a_known_one() -> None:
-    """⚠️ **0 分是读到的事实，None 是不知道。**
-
-    榜单上真的有 0 分的行。把 None 当成 0 就是把「没数据」伪装成「数据是 0」——
-    而这个仓有一条硬规矩：猜出来的数不许长得像量出来的。
-
-    没有分数的目标在第 2 步就出局了，所以这条守的是 `strongest_first` 这个通用
-    排序本身：「不知道不等于 0」在哪里都成立。
-    """
-    ordered = strongest_first([_target(140, None), _target(141, 0.0)])
-
-    assert [item.coordinate.system for item in ordered] == [141, 140]
-
-
-def test_the_pool_is_the_same_every_time() -> None:
-    """⚠️ 军力相同时按坐标定序。
-
-    不定的话，同一批目标每次挑出来的前 N 个可能不一样——而那会让
-    「上一轮打到哪了」无从谈起，事后拿日志对账也对不上。
-    """
-    tied = [_target(300, 9_000.0), _target(100, 9_000.0), _target(200, 9_000.0)]
-
-    assert strongest_first(tied) == strongest_first(list(reversed(tied)))
-    assert [item.coordinate.system for item in strongest_first(tied)] == [100, 200, 300]
-
-
-# -- 两个默认值 ----------------------------------------------------------------
+# -- 三个默认值 ----------------------------------------------------------------
 
 
 def test_the_knobs_have_the_defaults_the_user_asked_for() -> None:
-    """用户口径（2026-08-18）：军力截断 100、有效期窗口 2 小时。
+    """用户口径（2026-08-18）：窗口门限 100、有效期窗口 2 小时。
 
-    ⚠️ **这条用例改过一次。** 它从前还断言 `DEFAULT_TIME_POOL == 500`，而「时间池」
-    这个旋钮已经随那个错误设计一起删掉了（理由在 `domain.target_order` 模块头
-    第 3 步）。剩下的两个数管的仍然是两件事：截断管「只打多强的」，窗口管
-    「用多新的数据」。
+    ⚠️ **`WINDOW_POOL_FLOOR` 就是从前那个 `TOP_BY_MILITARY`，身份换了、数没变。**
+    它现在只是第 3 步的尺子，不再决定打谁（`domain.target_order` 模块头第 4 步）。
 
-    ⚠️ 截断从 50 改成 100。50 是 2026-08-15 那版「先取前 50 名」的口径；
-    2026-08-18 重排流水线时用户把它定成 100。
-
-    窗口默认取「一轮扫描时长的约 2 倍」：实测一轮军力榜扫描约 61 分钟
-    （1000 个 · 8.7--16.3 个/分）。
+    ⚠️ **`MILITARY_EXPONENT` 写死 1，而且刻意不做旋钮。** 拟合它要的数据
+    （派出那一刻的军力 × 读全的材料）目前一样都不够：`attack_intents` 从 PR #183
+    起才开始快照派出时刻的军力，战报资源识别 34 份只读全了 5 份。没有数据时把它
+    做成旋钮不是「留了余地」，是把一个说不清的数推给用户去猜。
+    资源识别修好之后应当重新检验（`docs/选靶数据跟踪-待办.md`）。
     """
-    assert TOP_BY_MILITARY == 100
+    assert WINDOW_POOL_FLOOR == 100
     assert DEFAULT_SCORE_MAX_AGE == timedelta(hours=2)
+    assert MILITARY_EXPONENT == 1.0
 
 
 # -- 新鲜度判据本身 ------------------------------------------------------------

@@ -29,6 +29,24 @@ DEFAULT_RETENTION_DAYS = 30
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenshotRef:
+    """一张图的**元信息**，不含字节。
+
+    离线重跑（`tools.reread_report_resources`）要先知道「库里有哪些图」，再逐张
+    取字节。**这两步不能合成一步**：34 张 × 42 KB 眼下不过 1.4 MB，可这张表按
+    30 天保留期算最多能到近百 MB，一次性拉回来只为数一数有几张，是把
+    `has_screenshots` 当初分表要避开的那件事又做了一遍。
+    """
+
+    report_id: UUID
+    captured_at_utc: datetime
+    image_format: str
+    width: int
+    height: int
+    byte_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class ReportScreenshot:
     """一张战报截图的完整回读结果。"""
 
@@ -123,6 +141,42 @@ class ReportScreenshotRepository:
                 image_bytes=bytes(row.image_bytes),
             )
 
+    def list_refs(self) -> list[ScreenshotRef]:
+        """库里所有图的元信息，按截图时刻从早到晚。**不取字节。**
+
+        给离线重跑用：先拿到清单，再逐张 `load`。排序固定是为了让重跑的输出
+        在两次之间可比——顺序一变，人就没法把两份干跑结果对着看。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.BattleReportScreenshotRow.report_id,
+                    orm.BattleReportScreenshotRow.captured_at_utc,
+                    orm.BattleReportScreenshotRow.image_format,
+                    orm.BattleReportScreenshotRow.width,
+                    orm.BattleReportScreenshotRow.height,
+                    orm.BattleReportScreenshotRow.byte_size,
+                ).order_by(
+                    orm.BattleReportScreenshotRow.captured_at_utc,
+                    orm.BattleReportScreenshotRow.report_id,
+                )
+            ).all()
+        return [
+            ScreenshotRef(
+                report_id=UUID(str(row.report_id)),
+                captured_at_utc=(
+                    row.captured_at_utc
+                    if row.captured_at_utc.tzinfo is not None
+                    else row.captured_at_utc.replace(tzinfo=UTC)
+                ),
+                image_format=row.image_format,
+                width=row.width,
+                height=row.height,
+                byte_size=row.byte_size,
+            )
+            for row in rows
+        ]
+
     def has_screenshots(self, report_ids: list[UUID]) -> set[UUID]:
         """这些战报里哪几份有图。**一次查询、不取字节。**
 
@@ -193,5 +247,6 @@ __all__ = [
     "DEFAULT_RETENTION_DAYS",
     "ReportScreenshot",
     "ReportScreenshotRepository",
+    "ScreenshotRef",
     "purge_report_screenshots",
 ]

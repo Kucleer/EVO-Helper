@@ -106,8 +106,8 @@ def add_bot_target(  # type: ignore[no-untyped-def]
     """往 `bot_targets` 里放一颗已记录的 bot。
 
     `scanned_at` 就是库里那一列 `military_score_at_utc`（页面上叫「更新时间」），
-    **默认给「刚读到」**：军力优先那一支按它排时间池，不给的话每条用例都要为一个
-    与它无关的理由写读取时刻。要验「读数很旧」就显式传一个旧时刻，
+    **默认给「刚读到」**：军力优先那一支按它划有效期窗口，不给的话每条用例都要为
+    一个与它无关的理由写读取时刻。要验「读数很旧」就显式传一个旧时刻，
     要验「从没上过榜」就 `military_score=None, scanned_at=None`。
 
     ⚠️ **`military_score` 默认是 `None`，也就是「从没上过军力榜」——那一档
@@ -1636,13 +1636,24 @@ def test_a_ranking_run_without_an_exit_code_is_never_read_as_a_full_batch(  # ty
         assert scheduler._military_ranking_batch_task_id is None, stopped_by
 
 
-def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # type: ignore[no-untyped-def]
+def test_the_military_pool_dispatches_the_best_value_first(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """用户口径（2026-08-15）：「先取前 50 名，然后按距离排序，开始攻击」。
+    """⚠️ **判据 2026-08-18 换成了 `军力 ÷ 往返小时`，这条用例跟着换了名字。**
 
-    这里 `top_n=2`：`9000` 与 `8000` 进池，`100` 落选；而池内按距离排，
-    所以近的 2:140 排在远的 2:400 前面——**军力只决定谁进池，不决定池内次序**。
+    从前它叫 `..._takes_the_strongest_then_orders_them_by_distance`，钉的是
+    「先按军力截断，再按距离排」那两步。现在只有一条判据，三个目标的得分
+    （从 `2:137` 出发）是：
+
+    | 目标 | 军力 | 往返小时 | 得分 |
+    |---|---|---|---|
+    | `2:140` | 8,000 | 0.523 | **15,284** |
+    | `2:400` | 9,000 | 1.371 | 6,565 |
+    | `2:150` | 100 | 0.586 | 171 |
+
+    这组夹具只留一条空航线，所以派出去的就是得分最高的 `2:140`——**答案没变，
+    理由变了**：从前是「9000/8000 进池、池内近的先打」，现在是「近而略弱的
+    那一发本来就更划算」。
     """
     add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0)
     add_bot_target(session_factory, Coordinate(2, 140, 6), military_score=8_000.0)
@@ -1656,7 +1667,7 @@ def test_the_military_pool_takes_the_strongest_then_orders_them_by_distance(  # 
     # 用形状过滤会把它一起捞进来（我第一版就是这么写错的）。
     command = launcher.latest.command
     targets = command[command.index("--targets") + 1 : command.index("--origin")]
-    # 这组夹具只留一条空航线；军力 runner 会先取池中最近的那颗，并把实际使用的
+    # 这组夹具只留一条空航线；军力 runner 会先取池中得分最高的那颗，并把实际使用的
     # 预设记进命令行，不能再把 `=BBB` 当成坐标的一部分丢掉。
     assert targets == ["2:140:6=BBB"]
 
@@ -1819,23 +1830,32 @@ def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool(  # type: ignore[no-u
     assert not any(part.startswith("2:141:6") for part in command)
 
 
-# -- 有效期窗口、军力截断、以及「放宽窗口」那一档 -----------------------------
+# -- 有效期窗口、窗口门限、以及「放宽窗口」那一档 -----------------------------
 #
-# 用户口径（2026-08-18）敲定的五步：① 剔除 24h 内打过的 → ② 只留有军力读数的
-# → ③ 只留读数在有效期窗口内的（不够就放弃窗口并告警）→ ④ 按军力截断
-# → ⑤ 按距离由近到远出击。
+# 用户口径（2026-08-18）敲定的四步：① 剔除 24h 内打过的 → ② 只留有军力读数的
+# → ③ 只留读数在有效期窗口内的（不够就放弃窗口并告警）→ ④ 过军力上限这道安全线，
+# 按 `军力 ÷ 往返小时` 降序出击。
 #
-# ⚠️ **这一节 2026-08-18 整段重写过两次。**
+# ⚠️ **这一节 2026-08-18 整段重写过三次。**
 #
 # 第一次（2026-08-17 那一版 → PR #176）：那时第 3 步是硬判据「分数过期的整批跳过」，
 # 失败方式是「一个新鲜分数都没有时军力完全不参与选靶」——实机连续停摆 2.5 小时。
 #
-# 第二次（PR #176 → 现在，就是这一版）：#176 把第 3 步换成了「按读数时间取前 N 个」
+# 第二次（PR #176 → 窗口版）：#176 把第 3 步换成了「按读数时间取前 N 个」
 # ＝时间池。**那一步也是错的，而且错得更隐蔽**：军力榜从强到弱扫，「读数最新」
 # 系统性地等价于「军力最弱」，于是「军力优先」选出的是全库最弱的一批（实机
 # 2026-08-18 09:00 那 8 发只有 3.2K~5.7K；生产实测分段表在 `domain.target_order`
-# 模块头第 3 步）。现在第 3 步换成按有效期**划线**——划线不带选择偏差——
-# 窗口内不够军力截断要的个数时**放弃窗口并打 WARNING**，那道停摆因此也回不来。
+# 模块头第 3 步）。第 3 步因此换成按有效期**划线**——划线不带选择偏差。
+#
+# 第三次（→ 现在）：旧的第 4、5 步是「窗口内按军力硬截断前 `top_n` 名」＋
+# 「这批人按距离由近到远出击」。两步各自说得通，合起来说不清：「第 101 名一个都
+# 不打」与「第 1 名和第 100 名之间只按远近分先后」互相矛盾，而它们之间那道墙纯粹
+# 是拍出来的。**现在合成一条判据**：`军力 ÷ 往返小时`。`top_n` 保留，但只剩
+# 「窗口门限」这一个身份（第 3 步的尺子），**不再决定打谁**。
+#
+# ⚠️ 分子用军力，依据是**用户口径**（2026-08-18：「已知军力和材料产出正相关，
+# 但是没有具体数据来拟合相关曲线」），不是实测的材料产出。整段在
+# `domain.target_order` 模块头第 4 步。
 
 BOT_BY_MILITARY_2H = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
 
@@ -1854,17 +1874,18 @@ def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[n
 ) -> None:
     """⚠️ **用例 (f)：第 1 步必须在最前，而这一条钉的正是「在最前」这件事本身。**
 
-    24 小时内打过的那个**同时是军力最高的、也是读数最新的**，而军力截断只留 1 个。
-    于是把剔除挪到截断之后就会：截断先选出那个打过的，剔除再把它拿掉 → 空手，
-    而 `8000` 那个从头到尾都没机会——它本该是这一轮唯一该打的。
+    24 小时内打过的那个（`2:140`，军力 9000）**同时是得分最高的**：它既更强又更近，
+    得分 15,284 对 `2:141` 的 13,415。这组夹具只留一条空航线，所以把剔除挪到得分
+    排序之后，派出去的就会是那个刚打过的目标——而 `8000` 那个从头到尾没机会，
+    它本该是这一轮唯一该打的。
 
     `test_military_pool_skips_targets_attacked_within_the_last_24_hours` 守不住
-    这一点：那条的截断放得下两个，先剔后截和先截后剔的结果一样。
+    这一点：那条的航线预算放得下两个，先剔后排和先排后剔的结果一样。
 
-    ⚠️ **这条用例 2026-08-18 改过：删掉了那句 `military_time_pool=1`。** 那个旋钮
-    随「时间池」这个错误设计一起删了（理由在 `domain.target_order` 模块头第 3 步）。
-    它当时是用来堵「把剔除挪到时间池之后」那条挪法的；那一步已经不存在，判据
-    因此少了一种挪法要堵，其余一个字没改。
+    ⚠️ **这条用例改过两次，判据一次都没变。** 2026-08-18 早先删掉了
+    `military_time_pool=1`（那个旋钮随「时间池」那个错误设计一起没了）；
+    同日又把「军力截断只留 1 个」这个理由换成了「它同时是得分最高的」——
+    截断取消之后，逼出差别的那件事从「名额只有一个」变成了「航线只有一条」。
     """
     already_attacked = Coordinate(2, 140, 5)
     still_available = Coordinate(2, 141, 6)
@@ -1888,7 +1909,7 @@ def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[n
     scheduler.start()
     scheduler.tick()
 
-    assert launcher.kinds == [MissionKind.BOT], "把剔除挪到截断之后，这一轮就是空池"
+    assert launcher.kinds == [MissionKind.BOT], "剔除必须在最前，否则派的是刚打过的那个"
     assert _targets_of(launcher.latest.command) == ["2:141:6=BBB"]
 
 
@@ -1903,8 +1924,9 @@ def test_a_target_that_never_made_the_board_is_not_attacked(  # type: ignore[no-
     也算进了分母。实测 628 个，占 bot 总数（3604）的 17.4%。放弃这 17.4% 换来的是
     「军力优先」真的成立：补位一多，这条链路就退化成「按距离随便打」。
 
-    这里没有分数的那个**就在出发星球隔壁**（`2:138`），一旦它进得了池，池内按距离
-    排序会让它第一个被派出去——所以「它没出现在命令行里」是一句很强的断言。
+    这里没有分数的那个**就在出发星球隔壁**（`2:138`，往返只要 0.51 小时），一旦它
+    进得了池而又被当成 0 分之外的任何数，得分排序都会让它第一个被派出去——
+    所以「它没出现在命令行里」是一句很强的断言。
     """
     add_bot_target(session_factory, Coordinate(2, 138, 9), military_score=None, scanned_at=None)
     add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0, scanned_at=NOW)
@@ -1916,10 +1938,10 @@ def test_a_target_that_never_made_the_board_is_not_attacked(  # type: ignore[no-
     assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
 
 
-def test_a_pool_where_everything_expired_still_attacks_by_military(  # type: ignore[no-untyped-def]
+def test_a_pool_where_everything_expired_still_attacks(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """⚠️ **本次改动的核心，也是 2026-08-17 那晚的复现：全部超期照样按军力出兵。**
+    """⚠️ **2026-08-17 那晚的复现：全部超期照样出兵。**
 
     ⚠️ **这条用例取代了 `test_a_target_whose_score_expired_is_not_attacked`。**
     那一条钉的是「分数过期的那个再强也不打」——旧规格。旧规格的代价在实机上
@@ -1928,13 +1950,19 @@ def test_a_pool_where_everything_expired_still_attacks_by_military(  # type: ign
     不是「打不动」——用户口径 2026-08-17：bot 最高战力只有 70 多 K，离打不动还很远。
     所以新规格不让它们把整轮拖死。
 
-    ⚠️ **机制 2026-08-18 又换了一次，判据没换。** PR #176 靠「时间池永远拿得出
+    ⚠️ **机制 2026-08-18 又换了两次，判据没换。** PR #176 靠「时间池永远拿得出
     最新的 N 个」保证这一点，而那个池带选择偏差（见本节开头）。现在靠的是
-    **窗口内不足就放弃窗口**：全都超期时窗口是空的，于是在全部有读数的目标里按
-    军力截断——同样不空手，而且拿到的是最强的那批，不是最弱的。
+    **窗口内不足就放弃窗口**：全都超期时窗口是空的，于是全部有读数的目标都进池
+    ——同样不空手。
 
     这里三个目标的分数全都超期（3 天 ≫ 配的 2 小时）。2026-08-17 那一版下一发都
-    派不出去；现在放弃窗口，军力截断（`top_n=2`）正常生效，`100` 那个落选。
+    派不出去；现在放弃窗口，按得分出击（从 `2:137` 出发）：
+
+    | 目标 | 军力 | 往返小时 | 得分 |
+    |---|---|---|---|
+    | `2:140` | 8,000 | 0.523 | **15,284** |
+    | `2:400` | 9,000 | 1.371 | 6,565 |
+    | `2:150` | 100 | 0.586 | 171 |
     """
     three_days = NOW - timedelta(days=3)
     for coordinate, score in (
@@ -1949,8 +1977,7 @@ def test_a_pool_where_everything_expired_still_attacks_by_military(  # type: ign
     scheduler.tick()
 
     assert launcher.kinds == [MissionKind.BOT], "全都超期不该让这一轮空手"
-    # 这组夹具只留一条空航线；池子是截断出来的 [9000, 8000]，池内按距离排，
-    # 所以派出去的是近的 `2:140`。`100` 那个被截断挡在外面。
+    # 这组夹具只留一条空航线，所以派出去的就是得分最高的 `2:140`。
     assert _targets_of(launcher.latest.command) == ["2:140:6=BBB"]
 
 
@@ -1966,9 +1993,10 @@ def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ig
     它们确实也会挡住 `2:400`，但靠的是错误的理由——留着它们等于把那个错误当成
     规格钉住，而实机 2026-08-18 已经量到那个规格选出了全库最弱的一批。
 
-    这里 `2:400` 军力最高（99999），读数却是三天前的；窗口内还剩 2 个，够军力
-    截断（1 个）用，所以窗口不必放弃，它进不来。这组夹具只留一条空航线，
-    所以命令行里那一个就是「第一个被派出去的」。
+    这里 `2:400` 军力最高（99999），读数却是三天前的；窗口内还剩 2 个，够**窗口
+    门限**（1 个）用，所以窗口不必放弃，它进不来。这组夹具只留一条空航线，
+    所以命令行里那一个就是得分最高的：`2:401`（8000 ÷ 1.368h ≈ 5,847）
+    压过 `2:402`（7000 ÷ 1.366h ≈ 5,124）。
     """
     add_bot_target(
         session_factory,
@@ -1996,7 +2024,7 @@ def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ig
 def test_a_short_window_gives_up_the_window_and_says_so_out_loud(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory, recorded: RecordingLog
 ) -> None:
-    """⚠️ **用例 (b)：窗口内不够时放弃窗口，按军力截断，并且打 WARNING。**
+    """⚠️ **用例 (b)：窗口内不够时放弃窗口，照样按得分出击，并且打 WARNING。**
 
     用户 2026-08-18 的原话：「今晚这件事的真正问题不是『用了旧数据』，而是
     **用了旧数据却没人告诉你**——你是从攻击日志里一条一条对出来的」。所以这条
@@ -2005,9 +2033,14 @@ def test_a_short_window_gives_up_the_window_and_says_so_out_loud(  # type: ignor
     ⚠️ **级别必须是 WARNING。** 每一轮都会写一条 INFO 的流水线日志；放宽这件事
     淹在那堆 INFO 里等于没说。降成 INFO 这条用例就会红。
 
-    窗口 2 小时、截断要 2 个，而窗口内只有 1 个（`2:402`）→ 放弃窗口 →
-    在全部 3 个有读数的目标里按军力取前 2 = `[99999, 8000]`，也就是 `2:400`
-    和 `2:401`。这组夹具只留一条空航线，池内按距离排，`2:401` 更近。
+    窗口 2 小时、门限 2 个，而窗口内只有 1 个（`2:402`）→ 放弃窗口 → 全部 3 个
+    有读数的目标都进池。这组夹具只留一条空航线，按 `军力 ÷ 往返小时` 排，
+    `2:400`（99999 ÷ 1.37h ≈ 72,900）远高于 `2:401`（8000 ÷ 1.37h ≈ 5,800）
+    和 `2:402`（100 ÷ 1.37h ≈ 73），所以派出去的是 `2:400`。
+
+    ⚠️ **断言换过一次。** 从前这里派出去的是 `2:401`：旧规格先按军力截断前 2 名
+    （`[99999, 8000]`），再在池内按距离排，而 `2:401` 更近——于是**全场最强的那个
+    被自己的邻居挤掉了**。那正是「截断 + 按距离」两步说不清的地方。
     """
     add_bot_target(
         session_factory,
@@ -2027,15 +2060,15 @@ def test_a_short_window_gives_up_the_window_and_says_so_out_loud(  # type: ignor
     scheduler.start()
     scheduler.tick()
 
-    assert _targets_of(launcher.latest.command) == ["2:401:6=BBB"]
+    assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
     widened = [item for item in recorded.warnings() if "放宽窗口" in item[1]]
     assert len(widened) == 1, "放宽了窗口却没打 WARNING，就是「用了旧数据却没人告诉你」"
     _, message, payload = widened[0]
     # 四个数一个都不能少：少了任何一个，看见告警的人还得回库里查才知道该怎么办。
     assert payload["score_max_age_hours"] == 2.0
     assert payload["in_window"] == 1
-    assert payload["take"] == 2
-    assert payload["oldest_selected_at_utc"] == (NOW - timedelta(days=3)).isoformat()
+    assert payload["window_floor"] == 2
+    assert payload["oldest_eligible_at_utc"] == (NOW - timedelta(days=3)).isoformat()
     assert "2.0 小时" in message
     assert "只有 1 个" in message
 
@@ -2057,8 +2090,8 @@ def test_a_short_window_is_not_topped_up_with_the_next_newest(  # type: ignore[n
     | `2:400` | 3 小时前（刚出窗口） | 200 | 236 |
     | `2:140` | 3 天前 | 99999 | **3** |
 
-    窗口内只有 `2:402` 一个，不够截断要的 2 个 → 放弃窗口 → 按军力取
-    `[99999, 200]` → 池内按距离排，派 `2:140`。
+    窗口内只有 `2:402` 一个，不够窗口门限要的 2 个 → 放弃窗口 → 三个都进池 →
+    按得分排（`2:140` 是 191,073，另外两个都不到 150），派 `2:140`。
 
     **按时间往下补的话池子是 `[2:402, 2:400]`**，派出去的会是 `2:402`，
     而 `2:140` 一次都轮不到——这条用例因此会红。
@@ -2082,7 +2115,7 @@ def test_a_short_window_is_not_topped_up_with_the_next_newest(  # type: ignore[n
     scheduler.tick()
 
     command = launcher.latest.command
-    assert _targets_of(command) == ["2:140:5=BBB"], "放宽之后该按军力挑，不是按时间"
+    assert _targets_of(command) == ["2:140:5=BBB"], "放宽之后该按得分挑，不是按时间"
     assert not any(part.startswith("2:402:7") for part in command), (
         "窗口内那个最弱的不该因为「它在窗口内」就保送"
     )
@@ -2135,25 +2168,34 @@ def test_a_round_inside_the_window_says_nothing_about_widening(  # type: ignore[
     assert [item for item in recorded.warnings() if "放宽窗口" in item[1]] == []
 
 
-def test_the_dispatch_order_is_still_nearest_first(  # type: ignore[no-untyped-def]
+def test_a_far_but_strong_target_can_now_outrank_a_near_weak_one(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """⚠️ **第 5 步保持现状：池内一律按距离，先打近的**（用户 2026-08-18 明确选择）。
+    """⚠️ **这条用例 2026-08-18 整个翻转，名字也换了。**
 
-    近目标往返 20--30 分钟、跨银河 2.6 小时（实测），同样的航线数先打近的能派
-    十几发。这里刻意让**军力次序与距离次序相反**：`2:400`（9000）更强但更远，
-    `2:140`（8000）稍弱但更近。第 5 步换成按军力排的话，出来的会是 `2:400`。
+    从前它叫 `test_the_dispatch_order_is_still_nearest_first`，钉的是「池内一律
+    按距离，先打近的」。现在只有一条判据 `军力 ÷ 往返小时`，于是「远」不再是
+    一票否决，而是一个**要被强度买回来的成本**：
 
-    这组夹具只留一条空航线，所以命令行里那一个就是「第一个被派出去的」。
+    | 目标 | 军力 | 往返小时 | 得分 |
+    |---|---|---|---|
+    | `2:400` | 30,000 | 1.371 | **21,884** |
+    | `2:140` | 8,000 | 0.523 | 15,284 |
+
+    ⚠️ 上一条用例（`..._dispatches_the_best_value_first`）是这条的**反面**：
+    那里 `2:400` 只有 9,000，买不回那 2.6 倍的往返，于是近的 `2:140` 赢。
+    两条一起才把判据钉住——**只留任何一条，纯就近或纯军力都能全绿**。
+
+    这组夹具只留一条空航线，所以命令行里那一个就是得分最高的。
     """
-    add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0)
+    add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=30_000.0)
     add_bot_target(session_factory, Coordinate(2, 140, 6), military_score=8_000.0)
     enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
     only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
 
-    assert _targets_of(launcher.latest.command) == ["2:140:6=BBB"]
+    assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
 
 
 def test_a_pool_with_no_readings_at_all_says_so_instead_of_saying_it_finished(  # type: ignore[no-untyped-def]
@@ -2234,7 +2276,7 @@ def test_the_old_parameter_name_still_sets_the_hint(  # type: ignore[no-untyped-
     assert reading.max_age == timedelta(hours=1), "旧键读不出来会静默改宽一倍"
     # 90 分钟 > 1 小时：这一条**照样出兵**，只是在日志里被点名为「已超期」。
     assert reading.stale == 1
-    assert [item.coordinate for item in reading.selected] == [Coordinate(2, 140, 5)]
+    assert [item.coordinate for item in reading.eligible] == [Coordinate(2, 140, 5)]
 
 
 def test_without_the_parameter_the_hint_uses_the_documented_default(  # type: ignore[no-untyped-def]
@@ -2263,7 +2305,7 @@ def test_without_the_parameter_the_hint_uses_the_documented_default(  # type: ig
     reading = scheduler._military_pool_reading(row)  # noqa: SLF001
 
     assert reading.max_age == timedelta(hours=2)
-    assert len(reading.selected) == 2, "超期的照样进池"
+    assert len(reading.eligible) == 2, "超期的照样进池"
     assert reading.stale == 1, "只有 150 分钟那个该被点名"
 
 
