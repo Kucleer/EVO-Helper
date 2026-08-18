@@ -19,6 +19,7 @@ import pytest
 from evo_helper.game.overlay import (
     OVERLAY_CLOSE_ATTEMPTS,
     OVERLAY_CLOSE_BUTTON,
+    CloseButtonLook,
     close_button_visible,
     dismiss_overlays,
     look_at_close_button,
@@ -77,16 +78,29 @@ def test_a_screen_without_any_overlay_is_not_a_close_button() -> None:
 
 
 def test_an_all_white_screen_is_not_a_close_button() -> None:
-    """⚠️ **只看点阵重合是挡不住这一张的。**
+    """整屏泛白（浏览器还在加载，`var/logs/rankv/00-baseline.png`）不是关闭键。
 
-    整屏泛白时（浏览器还在加载，`var/logs/rankv/00-baseline.png`）框里当然「全中」，
-    IoU 恰好 167/306 = 0.546——离阈值 0.60 只差一点点。挡住它的是**静默环**：
-    ✕ 是孤立的图形，紧贴它的那一圈上不该有白。
+    ⚠️ 这一张离阈值只剩 0.054：框里「全中」时 IoU 恰好 167/306 = 0.546，
+    而另一侧真正的 ✕ 最低是 0.873。所以它同时被**两条**判据挡着，见下一条。
     """
     look = look_at_close_button(screen_all_white())
 
+    assert look.iou == pytest.approx(0.546, abs=0.002)
     assert look.quiet_ratio == pytest.approx(1.0)
     assert not look.visible
+
+
+def test_both_gates_have_to_hold_at_once() -> None:
+    """⚠️ **静默环是第二道独立的闸，不是 IoU 的装饰。**
+
+    两条看的是不同的东西：点阵重合看**形状**，静默环看**孤立性**。任何一条单独
+    成立都不算数——把它们并成一条（或者顺手删掉静默环）在今天的实拍上恰好还
+    过得去，因为「一片白」的 0.546 刚好落在 0.60 下面；靠 0.054 的富余撑着的
+    判据不该被当成两条。
+    """
+    assert not CloseButtonLook(iou=1.0, quiet_ratio=1.0).visible
+    assert not CloseButtonLook(iou=0.0, quiet_ratio=0.0).visible
+    assert CloseButtonLook(iou=1.0, quiet_ratio=0.0).visible
 
 
 def test_the_two_readings_are_carried_out_for_the_log() -> None:

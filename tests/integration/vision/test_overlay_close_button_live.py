@@ -71,11 +71,12 @@ def test_each_named_screenshot_is_judged_the_way_it_looks(name: str, expected: b
     assert look.visible is expected, f"{name}: IoU {look.iou:.3f} 静默环 {look.quiet_ratio:.3f}"
 
 
-def test_the_all_white_screen_is_only_stopped_by_the_quiet_ring() -> None:
-    """⚠️ 这一张专门证明**静默环不是装饰**。
+def test_the_all_white_screen_is_the_case_that_needs_the_quiet_ring() -> None:
+    """⚠️ 这一张是整批实拍里离阈值最近的一个反例。
 
-    整屏泛白时点阵框里「全中」，IoU = 167/306 = 0.546——离阈值 0.60 只差一点点。
-    去掉静默环这条，阈值就只剩 0.05 的余量，而实拍上真的 ✕ 最低 0.873。
+    整屏泛白时点阵框里「全中」，IoU = 167/306 = 0.546——离阈值 0.60 只剩 0.054，
+    而另一侧真的 ✕ 最低是 0.873。单靠 IoU 的话，这道界是靠那 0.054 撑着的；
+    静默环把它拉开成 1.000 对 ≤0.012。
     """
     look = _look("rankv/00-baseline.png")
 

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from evo_helper.domain.scheduler import EXIT_RANKING_INCOMPLETE
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLLS_MAX,
     BOT_DETECTION_BUDGET_SCROLLS,
@@ -24,6 +25,7 @@ from evo_helper.tools.ranking_scan import (
     ScanProgress,
     ScanStage,
     completion_message,
+    exit_code_for_stretch,
     read_name_column_confirming,
     sample_overlap,
     scroll_through_humans,
@@ -262,6 +264,27 @@ class TestTheDetectionBudgetIsAddedNotSubtracted:
         assert BOT_DETECTION_BUDGET_SCROLLS <= 150
 
 
+# -- （E）退出码不许再占 argparse 的 2 ------------------------------------------
+
+
+class TestTheExitCode:
+    def test_reaching_the_bots_is_a_clean_zero(self) -> None:
+        board = _Board([BOTS])
+
+        assert exit_code_for_stretch(_run(board)) == 0
+
+    def test_stopping_short_uses_the_ranking_specific_code(self) -> None:
+        """⚠️ **不许是 2。** 2 是 `argparse` 的，两个含义共用一个值之后，
+        真出参数错误时 `mission_runs.exit_code` 里那个 2 就分辨不出来了。
+        """
+        board = _Board([HUMANS])
+
+        code = exit_code_for_stretch(_run(board))
+
+        assert code == EXIT_RANKING_INCOMPLETE
+        assert code != 2
+
+
 # -- （F）收尾措辞能区分「被掐」与「跑满」 --------------------------------------
 
 
@@ -286,12 +309,17 @@ class TestTheClosingLineTellsThemApart:
         assert "盲拖 70 + 检测 60" in line
 
     def test_the_two_lines_are_not_the_same_sentence(self) -> None:
-        """本类的要害：**两句话必须不一样**，否则日志分不开这两种。"""
-        cut = completion_message(
-            ScanProgress(stage=ScanStage.BLIND, blind_scrolls=70, human_scrolled=31),
+        """本类的要害：**两句话必须不一样**，否则日志分不开这两种。
+
+        ⚠️ 两边的 `outcome`、`written`、`suspect` 全都一样，只有「走到了哪一段、
+        翻了多少屏」不同——这正是原先那句话丢掉的全部信息。拿退出码去凑差别是
+        不算数的：真正把我误导了的那次，两边在日志里长得一模一样。
+        """
+        cut_short = completion_message(
+            ScanProgress(stage=ScanStage.DETECTING, blind_scrolls=70, human_scrolled=31),
             written=0,
             suspect=0,
-            outcome=0,
+            outcome=69,
         )
         exhausted = completion_message(
             ScanProgress(stage=ScanStage.DETECTING, blind_scrolls=70, human_scrolled=130),
@@ -300,7 +328,18 @@ class TestTheClosingLineTellsThemApart:
             outcome=69,
         )
 
-        assert cut != exhausted
+        assert cut_short != exhausted
+
+    def test_a_run_cut_short_is_never_reported_as_finished(self) -> None:
+        """被打断的那一趟**不许**说「完成」——那正是让人放心不管的那两个字。"""
+        line = completion_message(
+            ScanProgress(stage=ScanStage.BLIND, blind_scrolls=70, human_scrolled=31),
+            written=0,
+            suspect=0,
+            outcome=0,
+        )
+
+        assert "完成" not in line
 
     def test_a_normal_finish_still_reads_as_finished(self) -> None:
         progress = ScanProgress(

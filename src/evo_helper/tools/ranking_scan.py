@@ -572,6 +572,16 @@ def _say_sample_verdict(samples: Sequence[NameSample], say_line: Callable[[str],
     say_line(f"  {len(samples)} 次抽样：{moved}；最后读到 {samples[-1].excerpt!r}")
 
 
+def exit_code_for_stretch(stretch: HumanStretch) -> int:
+    """真人段这一段该给整趟留个什么退出码。
+
+    ⚠️ **单拎出来是为了让「用哪个码」这件事测得到。** `scan()` 本身要真驱动，
+    单元测试进不去；而这个选择恰恰是最容易被悄悄改回去的一处——原先它是 `2`，
+    而 2 是 `argparse` 的（整段账在 `domain.scheduler.EXIT_RANKING_INCOMPLETE`）。
+    """
+    return 0 if stretch.reached_bots else EXIT_RANKING_INCOMPLETE
+
+
 # -- 收尾那句话 ----------------------------------------------------------------
 
 
@@ -708,9 +718,8 @@ def scan(
             ),
             progress=progress,
         )
-        if not stretch.reached_bots:
-            outcome = EXIT_RANKING_INCOMPLETE
-        else:
+        outcome = exit_code_for_stretch(stretch)
+        if stretch.reached_bots:
             # ⚠️ 这一句不只是给人看的：它是**自动标定唯一的实测样本来源**，
             # 而同一个出口还负责在余量被吃掉时报警。别把它拆回一句 `say`。
             report_bot_area_reached(stretch.scrolled, blind_scrolls=blind_scrolls)
@@ -924,6 +933,7 @@ __all__ = [
     "ScanProgress",
     "ScanStage",
     "completion_message",
+    "exit_code_for_stretch",
     "progress_mark",
     "is_self_row",
     "enter_game_exit_code",
