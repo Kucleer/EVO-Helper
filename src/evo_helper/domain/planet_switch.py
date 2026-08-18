@@ -136,6 +136,26 @@ def list_exhausted(previous: Sequence[PlanetRow], current: Sequence[PlanetRow]) 
     return [row.coordinate for row in previous] == [row.coordinate for row in current]
 
 
+def origin_in(raw_text: str) -> Coordinate | None:
+    """从「起点」那一行的读数里挑出**第一个**三段数字当坐标；挑不出就 None。
+
+    单独拆出来是为了让**判定**和**说清楚读到了什么**共用同一个解析器。
+    `origin_confirmed` 只回答是非，而对不上时日志必须说出「读到的是哪一颗」——
+    两边各写一遍解析，迟早会出现「判据说对不上、日志说对得上」这种自相矛盾的
+    记录，而那正是 2026-08-17 那条「日志说假话比不说更糟」要防的东西。
+
+    ⚠️ **None 的意思是「读不出」，不是「不是这一颗」。** 调用方必须把这两件事
+    分开：读不出时该重读几帧（会动的画面上单帧的空结果是抛硬币，同
+    `vision.scan_reading.read_panel_confirming`），重读仍读不出才按「核不过」收场；
+    而绝不许当成「对上了」。
+    """
+    match = _COORDINATE_RE.search(raw_text or "")
+    if match is None:
+        return None
+    galaxy, system, position = (int(part) for part in match.groups())
+    return Coordinate(galaxy, system, position)
+
+
 def origin_confirmed(raw_text: str, target: Coordinate) -> bool:
     """派遣面板「起点」那一行读回来的，是不是就是 `target`。
 
@@ -146,12 +166,16 @@ def origin_confirmed(raw_text: str, target: Coordinate) -> bool:
     宽在 ROI 会带进「起点：」的尾巴上（数字白名单会把中文压成零星数字），
     严在三段数字必须逐段相等：从读数里找出**第一个**形如 `d:d:d` 的三段数字
     再比。前缀噪声挑不出三段数字，所以只会被跳过，挑不出一个假的目标来。
+
+    ⚠️ **切换那一刻确认过 ≠ 之后每一发都还站在那儿。** 实机 2026-08-18 18:53–18:56：
+    切到 9:250:8 并回读确认，第一发确实从 9:250:8 飞出去（18.5 分，误差 0.5%），
+    同一轮的第二发却是从主星 4:277:15 打出去的（125.0 分，误差 0%），而两发之间
+    日志里**一条切星球记录都没有**——游戏自己退回了主星。所以「派出之前再核一次
+    起点」是另一道闸门（`tools.pirate_loop.PirateLoop._require_origin_before_dispatch`），
+    不是这一条的重复。
     """
-    match = _COORDINATE_RE.search(raw_text or "")
-    if match is None:
-        return False
-    galaxy, system, position = (int(part) for part in match.groups())
-    return Coordinate(galaxy, system, position) == target
+    shown = origin_in(raw_text)
+    return shown is not None and shown == target
 
 
 __all__ = [
@@ -159,6 +183,7 @@ __all__ = [
     "find_row",
     "list_exhausted",
     "origin_confirmed",
+    "origin_in",
     "rows_from_words",
     "switch_needed",
 ]
