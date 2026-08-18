@@ -209,6 +209,16 @@ class TestAgreedValue:
         """
         assert agreed_value(["277", "277", "77", "77", "77"]) == "277"
 
+    def test_the_winner_is_the_longest_not_whichever_sorts_first(self) -> None:
+        """⚠️ 胜出者按**长度**挑，不许按别的顺序挑。
+
+        `dump-bot-coord-mismatch-123228.png` 的恒星系框就是这个形状：三套读出 `52`、
+        两套漏成 `5`。而 `'5' < '52'`，所以任何「按字典序挑一个」的写法都会挑中 `5`，
+        接着 `52` 解释不成 `5` 漏字、整格作废——功能不会读错，但会一直读不出，
+        也就是这次修之前那个「成功率 0%」的下场。
+        """
+        assert agreed_value(["52", "52", "5", "5"]) == "52"
+
     def test_a_longer_reading_without_a_second_witness_is_refused(self) -> None:
         """反过来：只有一套看全了 `277`，其余都读 `77` —— 交空串。
 
@@ -229,7 +239,12 @@ class TestAgreedValue:
         assert agreed_value(["3", "9", "", "", ""]) == ""
 
     def test_two_equally_long_candidates_are_refused(self) -> None:
-        """两个一样长却不同的值都够票 —— 说不清是哪个，交空串。"""
+        """两个一样长却不同的值都够票 —— 说不清是哪个，交空串。
+
+        管住这一条的是「其余非空必须是漏字」那道闸，不是另开的歧义闸：漏字必然
+        更短，等长的对手永远解释不通。所以这里**没有**单独一道歧义闸（写过，
+        变异测试证明它是死代码）。
+        """
         assert agreed_value(["12", "12", "13", "13"]) == ""
 
     def test_nothing_read_comes_back_empty(self) -> None:

@@ -146,9 +146,14 @@ def agreed_value(reads: Sequence[str], *, min_votes: int = NAV_VALUE_MIN_VOTES) 
        这就是这次修的那个缺陷：老规则「第一套读出非空就采纳」等于一票通过，
        于是 `(3,170)` 把 `277` 读成 `77`、非空、当场被采纳，后两套根本没机会跑。
     2. 够票的候选里**取最长的那个**。错法只有漏字（见 `_is_dropped_from`），
-       所以更长的那个才是更完整的那个。两个一样长却不同的候选都够票 → 说不清，交空串。
+       所以更长的那个才是更完整的那个。
     3. 其余每一个非空读数都**必须能用漏字解释**（是胜出者的子序列）。解释不了就
        意味着出现了替换或凭空多位，那种分歧这里没有能力裁决 → 交空串。
+
+    第 3 条顺带把「两个一样长却不同的候选都够票」也管掉了，所以这里**没有**单独一道
+    歧义闸：漏字必然更短，等长的对手永远解释不通，于是必定在第 3 条上作废。
+    原先真写过那道闸，变异测试证明它是死代码（拆掉一个用例都不红）——
+    这个仓库不留没有判据守着的分支。
 
     ## 这条规则挡住了什么
 
@@ -174,8 +179,6 @@ def agreed_value(reads: Sequence[str], *, min_votes: int = NAV_VALUE_MIN_VOTES) 
     if not candidates:
         return ""
     best = max(candidates, key=len)
-    if sum(1 for text in candidates if len(text) == len(best)) > 1:
-        return ""
     if any(text != best and not _is_dropped_from(text, best) for text in values):
         return ""
     return best
