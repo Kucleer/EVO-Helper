@@ -266,6 +266,29 @@ class TestRefusingToDispatchWhenTheSwitchFailed:
         assert exit_code_for(outcome) == 1
         assert exit_code_for(outcome) != EXIT_ENVIRONMENT_BUSY
 
+    def test_a_list_that_could_not_be_read_is_not_a_failure_and_blames_nobody(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **实机 2026-08-18 连着两轮 exit=1，起因就是这两档没分开。**
+
+        列表一行都没读出来时，**说不出**这颗星球在不在里面。那既不该按「配错了
+        坐标」计进连续失败（走向自动停用），日志也不该指着用户的配置说话——
+        当时那句「这颗星球不在你的行星列表里」是假的，4:277:15 就是用户的主星。
+
+        它落到 `EXIT_ENVIRONMENT_BUSY`：下一轮画面正常了自己就好。
+        """
+        loop, _switcher, _swept = _loop(monkeypatch, result=SwitchResult.UNREADABLE)
+        said: list[str] = []
+        monkeypatch.setattr(module, "say", said.append)  # `_loop` 里那次桩要盖掉
+
+        outcome = loop.run()
+
+        assert outcome.busy_is_permanent is False
+        assert exit_code_for(outcome) == EXIT_ENVIRONMENT_BUSY
+        spoken = "\n".join(said)
+        assert "不在你的行星列表里" not in spoken, "读不出来时不许指控用户的配置"
+        assert "读不出来" in spoken
+
     def test_a_round_that_switched_fine_still_exits_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

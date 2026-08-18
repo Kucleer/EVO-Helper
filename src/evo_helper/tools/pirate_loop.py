@@ -80,6 +80,7 @@ from evo_helper.domain.report_wait import (
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
 from evo_helper.game import pirate_ui
+from evo_helper.game.overlay import look_at_close_button
 from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
@@ -2777,8 +2778,24 @@ class PirateLoop:
             read_origin=self._fleet_origin_text,
             say=say,
             record_evidence=self._record_planet_list_overlay,
+            see_close_button=self._close_button_visible,
             dry_run=dry_run,
         )
+
+    def _close_button_visible(self) -> bool:
+        """关浮层之前那一眼：`OVERLAY_CLOSE_BUTTON` 上现在是不是那个 ✕。
+
+        ⚠️ **截不到图就当认不出。** 轻量驱动（单元测试桩）没有 `capture`，
+        而「看不到画面」与「看到了但不是 ✕」在这里的正确处置是同一个：不点。
+        判据本身在 `game.overlay.look_at_close_button`；那一眼的两个读数也顺手
+        写进日志，免得「认不出」在库里又变成一句没有下文的话。
+        """
+        capture = getattr(self._driver, "capture", None)
+        if not callable(capture):
+            return False
+        look = look_at_close_button(capture())
+        say(f"  关闭键回看：{'认出 ✕' if look.visible else '认不出 ✕'}（{look.as_payload()}）")
+        return look.visible
 
     def _record_planet_list_overlay(self, message: str, payload: dict[str, Any]) -> None:
         """`PlanetSwitcher` 走到「关浮层重读」那一支时的落地口。
@@ -2825,10 +2842,20 @@ class PirateLoop:
             # `SwitchResult` 早就把这两种分开了（「两句话对用户的意思完全不同」），
             # 这里必须把那个区分**带出进程**：翻遍列表都没有 = 配错了坐标，不会
             # 自己好，得让连续失败计数看见它。见 `Outcome.busy_is_permanent`。
+            #
+            # ⚠️ **`UNREADABLE` 不在这一档里**（实机 2026-08-18 连着两轮 exit=1）。
+            # 列表一行都没读出来时，说不出这颗星球在不在里面——那既不该指着用户的
+            # 配置说话，也不该计进连续失败。它落到 `EXIT_ENVIRONMENT_BUSY` 那一档：
+            # 下一轮画面正常了自己就好（判据在 `game.planet_list.SwitchResult`）。
             self._outcome.busy_is_permanent = result is SwitchResult.NOT_FOUND
             say(f"  {self._outcome.busy}；这一轮一发都不派")
             if self._outcome.busy_is_permanent:
                 say(f"  这颗星球不在你的行星列表里；请核对任务配的出发星球 {target}")
+            elif result is SwitchResult.UNREADABLE:
+                say(
+                    f"  行星列表这一轮读不出来，说不出 {target} 在不在里面；"
+                    "**不据此判定配置有误**，下一轮再试"
+                )
             return False
         self._current_planet = target
         # ⚠️ **顺序：先切回恒星系视图，再回读导航栏。** `_require_system_view` 一旦

@@ -33,7 +33,7 @@ from evo_helper.domain.scan_bounds import ScanBounds
 from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments, total_coordinates
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, exit_code_for_environment_fault
 from evo_helper.game.game_window import ForegroundUnavailable
-from evo_helper.game.overlay import dismiss_overlays
+from evo_helper.game.overlay import dismiss_overlays, look_at_close_button
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -1196,8 +1196,12 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
     UNKNOWN，1.5 秒就「安全停止」并返回 1；连着三次，调度器把扫描整条**自动停用**。
     日志里只有三行「会话不可用：unrecognised screen」，而会话好好的。
 
-    这里对 UNKNOWN 放行去点关闭键并没有破坏「认不出的画面绝不点击」：那个位置在
-    恒星系视图上什么都不是，点空无害；而真掉线的三种画面走的是守护自己的入口序列。
+    ⚠️ **「那个位置在恒星系视图上什么都不是，点空无害」这句话 2026-08-18 被推翻了。**
+    实拍（`var/logs/atk-0-panel.png`、`plist-0.png`）里，恒星系视图上 (750, 71)
+    正压在导航栏第一个输入框「银河系」上；星球地表上是等级徽章那一格
+    （`var/logs/rank-closed.png`）；而实机 10:04/10:05 那两次，画面上是**军力排行榜**。
+    所以现在这一下的准入条件是**先认出那个 ✕**（`game.overlay.close_button_visible`），
+    认不出就一下都不点，如实往下走恢复阶梯的下一级。
 
     点击动作本身在 `game.overlay.dismiss_overlays`——攻击链路（`game.planet_list`）
     用的是同一份。这里只负责「什么时候算认不出」和「关完再问一次守护」。
@@ -1214,7 +1218,17 @@ def dismiss_overlays_if_unrecognised(session: Any, driver: Any, keeper: Any) -> 
         latest[0] = keeper.ensure_connected(force=True)
         return latest[0] is None or latest[0].state is not ScreenState.UNKNOWN
 
-    dismiss_overlays(driver, is_clear=cleared)
+    def see_close_button() -> bool:
+        capture = getattr(driver, "capture", None)
+        if not callable(capture):
+            return False  # 看不到画面与「看到了但不是 ✕」处置相同：不点。
+        look = look_at_close_button(capture())
+        say(f"  关闭键回看：{'认出 ✕' if look.visible else '认不出 ✕'}（{look.as_payload()}）")
+        return look.visible
+
+    outcome = dismiss_overlays(driver, see_close_button=see_close_button, is_clear=cleared)
+    if not outcome.recognised:
+        say("  关闭键那个位置上认不出 ✕；一下都不点，交给恢复阶梯的下一级")
     return latest[0]
 
 
@@ -1257,8 +1271,10 @@ def restart_if_still_unusable(session: Any, keeper: Any) -> Any:
     要求逐级说清的：
 
     1. `keeper.ensure_connected` —— 判据驱动的入口序列，认不出就停，不点。
-    2. `dismiss_overlays_if_unrecognised` —— 左上角 (750, 71) 那个 ✕。
-       各种浮层的关闭键都在同一处，而那个位置在恒星系视图上什么都不是，点空无害。
+    2. `dismiss_overlays_if_unrecognised` —— 左上角 (750, 71) 那个 ✕，而且
+       **点之前先在那一帧上认出它**（`game.overlay`）；认不出就一下都不点。
+       原先这里写的是「那个位置在恒星系视图上什么都不是，点空无害」——
+       2026-08-18 实拍推翻了它，那儿坐着导航栏的「银河系」输入框。
     3. `wait_for_login_if_unrecognised` —— **什么都没点**，只等登录自己走完
        （上限 `LOGIN_SETTLE_TIMEOUT_S`）。它排在这里就是为了挡住下面那一下：
        登录才到一半就关窗重开，救不了，还会把本来马上就好的会话亲手弄坏。

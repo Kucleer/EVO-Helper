@@ -33,6 +33,7 @@ import pytest
 from evo_helper.application.mission_supervisor import MissionExit, StopReason
 from evo_helper.domain.scheduler import (
     EXIT_ENVIRONMENT_BUSY,
+    EXIT_RANKING_INCOMPLETE,
     MissionKind,
     exit_code_for_environment_fault,
 )
@@ -280,6 +281,19 @@ def test_a_mailbox_that_stays_unreachable_is_still_a_hard_failure() -> None:
     再丢一轮就永久判缺失。它需要有人来管，而 75 恰恰是「没人管也会好」。
     """
     assert exit_code_for(Outcome(failed="开工翻不了信箱")) == 1
+
+
+def test_the_ranking_scan_has_its_own_code_instead_of_squatting_on_argparse_s() -> None:
+    """⚠️ **`scan()` 原先用 `2` 表示「中途离页」，而 2 是 `argparse` 的。**
+
+    两个含义共用一个值，真出参数错误时 `mission_runs.exit_code` 里那个 2 就分辨
+    不出来了——进程间协议上的值一旦撞车，事后是查不清的。
+
+    它也**不许**并进 `EXIT_ENVIRONMENT_BUSY`：那一档不计入连续失败，而「翻满预算
+    仍没见到 bot」不会自己好，下一轮照样翻满、照样空手，正是那条静默死循环。
+    """
+    assert EXIT_RANKING_INCOMPLETE not in (0, 1, 2, EXIT_ENVIRONMENT_BUSY)
+    assert _exit(EXIT_RANKING_INCOMPLETE).failed, "它按普通失败计，与今天 2 的口径一致"
 
 
 def test_a_misconfigured_origin_planet_is_still_a_hard_failure() -> None:

@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any
 
 from evo_helper.config import Settings
@@ -28,20 +30,28 @@ from evo_helper.domain.ranking import (
     repair_ranks,
 )
 from evo_helper.domain.records import RankingTarget
+from evo_helper.domain.scheduler import EXIT_RANKING_INCOMPLETE
 from evo_helper.game.ranking_nav import RankingNavigator, ScrollOutcome, nav_label_words
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
     BLIND_SCROLLS,
+    BOT_DETECTION_BUDGET_SCROLLS,
     DRY_SCREENS,
     NAME_COLUMN,
+    NAME_SAMPLE_CHARS,
+    NAME_SAMPLE_EVERY_SCROLLS,
+    NAME_SAMPLE_STUCK_OVERLAP,
     RANK_COLUMN,
     RANKING_LIST_MAX_Y,
+    READ_ATTEMPTS,
+    REREAD_WAIT_S,
     ROW_CROP_HALF_HEIGHT,
     ROW_FIRST_Y,
     ROW_PITCH_PX,
     SCORE_COLUMN,
     SCROLL_STALL_CONFIRMATIONS,
 )
+from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
@@ -313,15 +323,302 @@ def report_bot_area_reached(scrolled: int, *, blind_scrolls: int) -> None:
     )
 
 
+# -- 翻真人段：留现场、确认式判空 ----------------------------------------------
+
+
+class ScanStage(Enum):
+    """本趟走到了哪一段。**收尾那句话靠它区分「被掐」与「跑满」**（见 `completion_message`）。"""
+
+    BLIND = "盲拖中"
+    DETECTING = "检测中"
+    COLLECTING = "采集中"
+    CLOSED = "已收尾"
+
+
+@dataclass
+class ScanProgress:
+    """一趟采集的进度。可变，因为它要在 `finally` 里被读到——包括 Ctrl+C 那一次。"""
+
+    stage: ScanStage = ScanStage.BLIND
+    #: 这一趟盲拖了几屏（进入检测段之前）。
+    blind_scrolls: int = 0
+    #: 真人段总共翻了几屏，**含盲拖那一段**。
+    human_scrolled: int = 0
+    #: 采集段滚了几屏。
+    collect_scrolls: int = 0
+
+
+@dataclass(frozen=True)
+class NameSample:
+    """翻真人段途中的一次抽样。
+
+    ⚠️ **这就是 2026-08-18 那一轮缺的东西。** 那趟「采不到」里，
+    「列表根本没动」「开错了面板」「bot 名字读不出来」三种可能完全不可分辨——
+    循环一个字现场都没留。三个字段各自否掉一种：`excerpt` 说明读到了什么
+    （空 = 没在榜单页上 / 读不出），`overlap` 说明列表动没动。
+    """
+
+    scrolled: int
+    excerpt: str
+    #: 与**上一次抽样**的重合率；第一次抽样没有上一次，是 None。
+    overlap: float | None
+
+    @property
+    def stuck(self) -> bool:
+        """重合率高到说明列表压根没在动。"""
+        return self.overlap is not None and self.overlap > NAME_SAMPLE_STUCK_OVERLAP
+
+
+def name_excerpt(text: str) -> str:
+    """把整条名字列压成一行摘要，截到 `NAME_SAMPLE_CHARS`。
+
+    压掉换行与连续空白：进 `payload_json` 的东西要能一眼比对，而 `--psm 6` 的
+    输出里换行位置本身就抖。
+    """
+    return " ".join((text or "").split())[:NAME_SAMPLE_CHARS]
+
+
+def sample_overlap(previous: str, current: str) -> float:
+    """两条名字列摘要有多像（0 = 毫不相干，1 = 一模一样）。
+
+    用 `difflib` 而不是集合交并：名字列跑的是 `eng`，中文玩家名读回来是噪声串，
+    同一行连读两次也不会逐字相同——要的是「这一屏和上一屏是不是同一批人」，
+    而那是个**序列相似度**问题。标准库、确定性、不引依赖。
+
+    ⚠️ 它只当**诊断**用，不做收工判据。`track_progress` 那段注释里记着四次
+    假阳性的账：任何建在 OCR 噪声上的进度判据都别拿来决定停不停。
+    """
+    if not previous and not current:
+        return 1.0
+    return difflib.SequenceMatcher(None, previous, current).ratio()
+
+
+def read_name_column_confirming(
+    read: Callable[[], str], wait: Callable[[float], None]
+) -> tuple[str, tuple[str, ...]]:
+    """读整条名字列，**空结果重读几次再认**。返回 `(读数, 每次各读到什么)`。
+
+    ⚠️ **这里原先是单帧判空，是全仓唯一的漏网处。** `game.ranking_nav` 模块头
+    第一条规矩就是「空结果不是证据」，而同一调用栈里所有别的读法都重读 3 次
+    （`RankingNavigator._rows_confirming` / `_labels_confirming`、
+    `preset_picker.read_names_confirming`、`vision.scan_reading.read_panel_confirming`）。
+    只有翻真人段这一处读到空就**当场**判离页、把整趟作废。
+
+    代价是实打实的：全历史三次触发在第 **101 / 79 / 78** 屏，而 bot 区就在
+    **78–82**——**两次是差一屏就到，整趟扔了**。
+
+    次数与间隔**复用现成的** `READ_ATTEMPTS` / `REREAD_WAIT_S`，不新开常量：
+    它要的就是和那几处同一条规矩，各写一份迟早分家。
+
+    三次各读到什么原样返回，由调用方写进 `payload_json`——「三次都空」和
+    「第一次空、后两次读出半屏」是两种故障，日志得分得开。
+    """
+    seen: list[str] = []
+    for attempt in range(READ_ATTEMPTS):
+        text = read()
+        seen.append(text)
+        if text:
+            return text, tuple(seen)
+        if attempt + 1 < READ_ATTEMPTS:
+            wait(REREAD_WAIT_S)
+    return "", tuple(seen)
+
+
+@dataclass(frozen=True)
+class HumanStretch:
+    """翻真人段的结局。"""
+
+    #: 见到 bot 名字了吗。False = 这一趟到此为止。
+    reached_bots: bool
+    #: 一共翻了几屏（含盲拖）。
+    scrolled: int
+    #: 为什么停下来的，给人看的一句话。
+    reason: str
+    samples: tuple[NameSample, ...] = ()
+
+
+def scroll_through_humans(
+    *,
+    scroll: Callable[[], None],
+    read_names: Callable[[], str],
+    wait: Callable[[float], None],
+    blind_scrolls: int,
+    detection_budget: int,
+    say_line: Callable[[str], None],
+    record: Callable[[str, dict[str, Any]], None] = lambda _m, _p: None,
+    progress: ScanProgress | None = None,
+) -> HumanStretch:
+    """盲拖 + 检测，一直翻到名字列里出现 bot 名字为止。
+
+    预算是 `blind_scrolls + detection_budget`——**加法，不是隐式相减**。
+    整段道理写在 `game.ranking_ui.BOT_DETECTION_BUDGET_SCROLLS` 上。
+
+    每 `NAME_SAMPLE_EVERY_SCROLLS` 屏留一次现场（`NameSample`），到顶时把整串
+    交出去，好让日志说得出这一趟里名字列**一直在变 / 一直没变 / 最后读到的是什么**。
+    """
+    progress = progress if progress is not None else ScanProgress()
+    progress.stage = ScanStage.BLIND
+    progress.blind_scrolls = blind_scrolls
+    for _ in range(blind_scrolls):
+        scroll()
+        progress.human_scrolled += 1
+    scrolled = blind_scrolls
+    progress.human_scrolled = scrolled
+    progress.stage = ScanStage.DETECTING
+    if blind_scrolls:
+        say_line(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
+
+    budget = blind_scrolls + detection_budget
+    samples: list[NameSample] = []
+    marker, attempts = read_name_column_confirming(read_names, wait)
+
+    def take_sample() -> None:
+        excerpt = name_excerpt(marker)
+        previous = samples[-1].excerpt if samples else None
+        sample = NameSample(
+            scrolled=scrolled,
+            excerpt=excerpt,
+            overlap=None if previous is None else round(sample_overlap(previous, excerpt), 3),
+        )
+        samples.append(sample)
+        say_line(
+            f"  翻真人段 {scrolled} 屏…名字列 {sample.excerpt!r}"
+            + ("" if sample.overlap is None else f"（与上次重合 {sample.overlap:.2f}）")
+        )
+        record(
+            f"翻真人段 {scrolled} 屏：名字列摘要与上一次抽样的重合率",
+            {
+                "scrolled": scrolled,
+                "name_excerpt": sample.excerpt,
+                "overlap": sample.overlap,
+                "list_looks_stuck": sample.stuck,
+            },
+        )
+
+    while not mentions_bot(marker):
+        if not marker:
+            # 三次都读不出来才认：整条名字列一个字都没有 = 已经不在榜单页上。
+            say_line(f"翻真人段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空；已离页")
+            record(
+                f"翻真人段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空，判为已离页",
+                {
+                    "scrolled": scrolled,
+                    "reads": list(attempts),
+                    "samples": _samples_payload(samples),
+                },
+            )
+            return HumanStretch(
+                reached_bots=False,
+                scrolled=scrolled,
+                reason=f"名字列连读 {READ_ATTEMPTS} 次全空，已离页",
+                samples=tuple(samples),
+            )
+        if scrolled >= budget:
+            reason = (
+                f"翻满 {budget} 屏（盲拖 {blind_scrolls} + 检测预算 {detection_budget}）"
+                "仍没见到 bot"
+            )
+            say_line(f"{reason}；本轮到此为止")
+            record(reason + "；本轮到此为止", _budget_payload(samples, scrolled=scrolled))
+            _say_sample_verdict(samples, say_line)
+            return HumanStretch(
+                reached_bots=False, scrolled=scrolled, reason=reason, samples=tuple(samples)
+            )
+        scroll()
+        scrolled += 1
+        progress.human_scrolled = scrolled
+        marker, attempts = read_name_column_confirming(read_names, wait)
+        if scrolled % NAME_SAMPLE_EVERY_SCROLLS == 0:
+            take_sample()
+    return HumanStretch(
+        reached_bots=True, scrolled=scrolled, reason="名字列里出现了 bot", samples=tuple(samples)
+    )
+
+
+def _samples_payload(samples: Sequence[NameSample]) -> list[dict[str, Any]]:
+    return [
+        {"scrolled": s.scrolled, "name_excerpt": s.excerpt, "overlap": s.overlap} for s in samples
+    ]
+
+
+def _budget_payload(samples: Sequence[NameSample], *, scrolled: int) -> dict[str, Any]:
+    overlaps = [s.overlap for s in samples if s.overlap is not None]
+    return {
+        "scrolled": scrolled,
+        "samples": _samples_payload(samples),
+        "last_name_excerpt": samples[-1].excerpt if samples else "",
+        "stuck_samples": sum(1 for s in samples if s.stuck),
+        "max_overlap": max(overlaps) if overlaps else None,
+    }
+
+
+def _say_sample_verdict(samples: Sequence[NameSample], say_line: Callable[[str], None]) -> None:
+    """到顶时不只说「翻满 N 屏」，还要说清这一路上名字列到底动没动。
+
+    ⚠️ **这一句就是那三种可能的分辨器。** 「一直没变」= 列表压根没滚（或者开错了
+    面板）；「一直在变」= 滚是滚了，只是没见到 bot（判据或榜单长度出了事）；
+    最后读到的那一串则直接回答「读出来的是不是榜单」。
+    """
+    if not samples:
+        say_line("  这一趟一次抽样都没留下（还没翻到第一次抽样点就停了）")
+        return
+    stuck = sum(1 for sample in samples if sample.stuck)
+    if stuck == len(samples) - 1 and len(samples) > 1:
+        moved = "名字列**一直没变**：列表压根没在滚（或者根本不在榜单页上）"
+    elif stuck:
+        moved = f"名字列有 {stuck}/{len(samples) - 1} 次抽样几乎没变"
+    else:
+        moved = "名字列一直在变：列表确实在滚，只是没见到 bot"
+    say_line(f"  {len(samples)} 次抽样：{moved}；最后读到 {samples[-1].excerpt!r}")
+
+
+def exit_code_for_stretch(stretch: HumanStretch) -> int:
+    """真人段这一段该给整趟留个什么退出码。
+
+    ⚠️ **单拎出来是为了让「用哪个码」这件事测得到。** `scan()` 本身要真驱动，
+    单元测试进不去；而这个选择恰恰是最容易被悄悄改回去的一处——原先它是 `2`，
+    而 2 是 `argparse` 的（整段账在 `domain.scheduler.EXIT_RANKING_INCOMPLETE`）。
+    """
+    return 0 if stretch.reached_bots else EXIT_RANKING_INCOMPLETE
+
+
+# -- 收尾那句话 ----------------------------------------------------------------
+
+
+def completion_message(progress: ScanProgress, *, written: int, suspect: int, outcome: int) -> str:
+    """收尾那一句。**必须说清本趟走到了哪一段、翻了多少屏。**
+
+    ⚠️ 原先它只说「逐屏写入 0 条」，对「跑 2.2 分钟被用户掐」和「跑满预算一无所获」
+    说的是同一句话——2026-08-18 排障时**我据此对用户下过错误结论**。两者的善后
+    完全相反：前者什么都不用管（本来就没跑到采集段），后者说明判据或版面坏了。
+
+    ⚠️ **它在 `finally` 里被调用**，所以 Ctrl+C / 调度器抢占那一路也留得下这一句。
+    """
+    stage = progress.stage
+    detected = progress.human_scrolled - progress.blind_scrolls
+    verdict = "完成" if outcome == 0 and stage is ScanStage.CLOSED else f"停在「{stage.value}」"
+    return (
+        f"军事榜采集{verdict}："
+        f"真人段翻了 {progress.human_scrolled} 屏"
+        f"（盲拖 {progress.blind_scrolls} + 检测 {detected}），"
+        f"采集段滚了 {progress.collect_scrolls} 屏；"
+        f"逐屏写入 {written} 条，其中末屏可疑 {suspect} 条"
+    )
+
+
 def scan(
     columns: RankingColumns | None = None,
     *,
     blind_scrolls: int = BLIND_SCROLLS,
-    human_scrolls: int = 140,
+    detection_budget: int = BOT_DETECTION_BUDGET_SCROLLS,
     bot_scrolls: int = 400,
     bot_limit: int | None = None,
 ) -> int:
-    """跑一趟榜单采集。返回 0 = 正常到底，2 = 中途离页（多半断线）。
+    """跑一趟榜单采集。
+
+    返回 0 = 正常到底，`EXIT_RANKING_INCOMPLETE` = 没走完整趟（中途离页，或者翻满
+    检测预算仍没见到 bot 区）。**那个码不是 2**——2 是 `argparse` 的，整段理由写在
+    `domain.scheduler.EXIT_RANKING_INCOMPLETE` 上。
 
     ⚠️ **离页也要入库。** 原先这里 `return 2` 排在 `save_ranking_targets` 前面，
     于是断线就把这一趟全扔了——而交接文档写着**断线是预期结果**（2026-08-14
@@ -397,6 +694,7 @@ def scan(
 
     screens: list[list[RankingTarget]] = []
     outcome = 0
+    progress = ScanProgress()
     try:
         # -- 第一段：翻真人段，只问「到 bot 区了没有」 ----------------------
         #
@@ -406,38 +704,29 @@ def scan(
         # ⚠️ **这一段刻意不判「滚到底了没有」。** 那条判据建在名次 OCR 上，而名次
         # 恰恰是唯一读不准的一列（榜首的 1–2 位数尤其串），实机 2026-08-15 连着
         # 假阳性四次。而 bot 名字是纯 ASCII、读得稳——把判据换到读得准的信号上，
-        # 整段就不需要那条判据了。这一段只靠 `human_scrolls` 兜底。
+        # 整段就不需要那条判据了。这一段只靠 `detection_budget` 兜底。
         # 头 `blind_scrolls` 屏连检测都省了——那一段**必定**还在真人区。
-        for _ in range(blind_scrolls):
-            nav.scroll_blind()
-        scrolled = blind_scrolls
-        if blind_scrolls:
-            say(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
-
-        marker = name_column_text(driver.capture(), ocr, columns)
-        while not mentions_bot(marker):
-            if scrolled >= human_scrolls:
-                say(f"翻满 {human_scrolls} 屏仍没见到 bot；本轮到此为止")
-                outcome = 2
-                break
-            nav.scroll_blind()
-            scrolled += 1
-            marker = name_column_text(driver.capture(), ocr, columns)
-            if not marker:
-                # 整条名字列一个字都读不出来 = 已经不在榜单页上（多半断线）。
-                # 这同时是「只在刚确认过的画面上按下手指」那条不变式的把关点。
-                say(f"翻真人段第 {scrolled} 屏之后名字列全空；已离页")
-                outcome = 2
-                break
-            if scrolled % 10 == 0:
-                say(f"  翻真人段 {scrolled} 屏…")
-        else:
+        stretch = scroll_through_humans(
+            scroll=nav.scroll_blind,
+            read_names=lambda: name_column_text(driver.capture(), ocr, columns),
+            wait=driver.wait,
+            blind_scrolls=blind_scrolls,
+            detection_budget=detection_budget,
+            say_line=say,
+            record=lambda message, payload: record_system_log(
+                "INFO", "tools.ranking_scan", message, payload=payload
+            ),
+            progress=progress,
+        )
+        outcome = exit_code_for_stretch(stretch)
+        if stretch.reached_bots:
             # ⚠️ 这一句不只是给人看的：它是**自动标定唯一的实测样本来源**，
             # 而同一个出口还负责在余量被吃掉时报警。别把它拆回一句 `say`。
-            report_bot_area_reached(scrolled, blind_scrolls=blind_scrolls)
+            report_bot_area_reached(stretch.scrolled, blind_scrolls=blind_scrolls)
 
         # -- 第二段：细读三列 ------------------------------------------------
         if outcome == 0:
+            progress.stage = ScanStage.COLLECTING
             rows = read_rows()
             first, reached_limit = collect(targets_from_rows(rows, observed_at=datetime.now(UTC)))
             screens.append(first)
@@ -445,10 +734,11 @@ def scan(
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
             dry = 0
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
+                progress.collect_scrolls = extra
                 step = nav.scroll_once()
                 if step.outcome is ScrollOutcome.OFF_PAGE:
                     say(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
-                    outcome = 2
+                    outcome = EXIT_RANKING_INCOMPLETE
                     break
                 rows = list(step.rows)
                 fresh, reached_limit = collect(
@@ -470,18 +760,26 @@ def scan(
                 if dry >= DRY_SCREENS:
                     say(f"连续 {dry} 屏没有新 bot：这一段到头了")
                     break
+            if outcome == 0:
+                progress.stage = ScanStage.CLOSED
     finally:
         if not nav.close():
             say("排行榜已关闭，但导航条还原未确认")
-
-    # 离页时最后一屏是画面已经变了之后读的，可疑——但它**已经逐屏写进去了**。
-    # `keep_screens` 在这里只用来报数，不再决定写什么：真要把它撤回来得删行，
-    # 而删行比留一条可疑记录危险得多（那条记录带着 source='ranking'，本来就标着未验证）。
-    kept = keep_screens(screens, off_page=outcome == 2)
-    say(
-        f"军事榜采集{'（中途离页）' if outcome else '完成'}："
-        f"逐屏写入 {written} 条，其中末屏可疑 {written - len(kept)} 条"
-    )
+        # 离页时最后一屏是画面已经变了之后读的，可疑——但它**已经逐屏写进去了**。
+        # `keep_screens` 在这里只用来报数，不再决定写什么：真要把它撤回来得删行，
+        # 而删行比留一条可疑记录危险得多（那条记录带着 source='ranking'，
+        # 本来就标着未验证）。
+        #
+        # ⚠️ **收尾那句话放在 `finally` 里**，为的是被 Ctrl+C / 调度器抢占打断时
+        # 也留得下「本趟走到了哪一段、翻了多少屏」。原先它在 `try` 外面，
+        # 被打断就一个字都没有——而那正是 2026-08-18 排障时分不清「被掐」与
+        # 「跑满」的原因之一。
+        kept = keep_screens(screens, off_page=outcome != 0)
+        say(
+            completion_message(
+                progress, written=written, suspect=written - len(kept), outcome=outcome
+            )
+        )
     return outcome
 
 
@@ -629,16 +927,26 @@ def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
 
 
 __all__ = [
+    "HumanStretch",
+    "NameSample",
     "RankingColumns",
+    "ScanProgress",
+    "ScanStage",
+    "completion_message",
+    "exit_code_for_stretch",
     "progress_mark",
     "is_self_row",
     "enter_game_exit_code",
     "keep_screens",
     "name_column_text",
+    "name_excerpt",
+    "read_name_column_confirming",
     "release_stuck_mouse",
     "main",
     "parse_score",
     "rows_from_image",
+    "sample_overlap",
+    "scroll_through_humans",
     "targets_from_rows",
     "take_batch_targets",
     "track_progress",

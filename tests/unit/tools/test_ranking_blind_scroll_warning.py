@@ -71,7 +71,7 @@ def test_the_measurement_sentence_round_trips() -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "翻满 140 屏仍没见到 bot；本轮到此为止",
+        "翻满 130 屏（盲拖 70 + 检测预算 60）仍没见到 bot；本轮到此为止",
         "盲拖 40 屏（那一段必定还是真人），开始检测 bot",
         "上一趟翻了 77 屏到达 bot 区",
         "翻了 屏到达 bot 区",

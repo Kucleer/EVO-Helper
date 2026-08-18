@@ -25,6 +25,10 @@
 后者才是「配错了出发星球」。两种的善后完全相反，所以只有前者才去关浮层重读一遍
 （`PLANET_LIST_OVERLAY_RETRIES`，用的是全仓共用的 `game.overlay`）。
 
+而且**结局也必须是两个**：读不出来是 `SwitchResult.UNREADABLE`，翻通了没有才是
+`NOT_FOUND`。把前者说成后者，日志就会指着用户的配置说一句假话，而调用方还会照
+「不会自己好」把这一轮记成失败——整段账在 `SwitchResult` 上。
+
 ## 拖动用慢拖，不用一步式 drag
 
 `tools.pirate_loop.slow_drag` 的注释里写着：一步到位的 `dragTo` 会被游戏面板
@@ -85,7 +89,8 @@ PLANET_LIST_OCR_TIMEOUT_S = 8.0
 #: 没有任何一步会去关那个面板。
 #:
 #: 上限是 1：关完重读还是空，就是真的读不出（OCR 配置、视口漂了、界面改版），
-#: 那时照常 `NOT_FOUND` 安全退出。做成循环重试只会把整轮卡死在一个面板上。
+#: 那时按 `SwitchResult.UNREADABLE` 安全退出——**不是 `NOT_FOUND`**，读不出来
+#: 说不出列表里有什么。做成循环重试只会把整轮卡死在一个面板上。
 PLANET_LIST_OVERLAY_RETRIES = 1
 
 
@@ -96,10 +101,32 @@ class SwitchResult(Enum):
     都没发生**（列表里翻不到这颗星球，多半是配错了坐标），后者是点过了但回读
     没认出来（可能切成了、可能没有）。两句话对用户的意思完全不同，而处置一样：
     本轮不派。
+
+    ⚠️ **`UNREADABLE` 与 `NOT_FOUND` 必须分开，混着用就是在污蔑用户的配置。**
+
+    实机 2026-08-18 10:04:07 与 10:05:10 各一次，日志原文：
+
+        切不到出发星球 4:277:15（not_found）；这一轮一发都不派
+        这颗星球不在你的行星列表里；请核对任务配的出发星球 4:277:15
+
+    **这句话是假的**——4:277:15 就是用户的主星。真实原因是那两轮列表一行都没
+    读出来（画面上压着军力榜面板）。而调用方照 `NOT_FOUND` 把
+    `Outcome.busy_is_permanent` 置了真，于是退出码 1、计入连续失败、走向自动停用；
+    连着两轮 exit=1。
+
+    判据很硬，**看的是逐屏读到的行，不是「找没找到目标」**：
+
+        逐屏里只要有过内容 → NOT_FOUND    列表读通了、里面确实没有这颗星球
+        全部为空           → UNREADABLE   压根没读出列表，说不出里面有什么
+
+    两者的善后相反：前者该指着配置说话、该计失败（不会自己好）；后者只能说
+    「这一轮读不出来」，**不停用、不计失败**（调用方按 `EXIT_ENVIRONMENT_BUSY`
+    收场，见 `tools.pirate_loop.exit_code_for`）。
     """
 
     SWITCHED = "switched"
     NOT_FOUND = "not_found"
+    UNREADABLE = "unreadable"
     UNCONFIRMED = "unconfirmed"
     DRY_RUN = "dry_run"
 
@@ -137,6 +164,12 @@ class PlanetSwitcher:
     #: 不在这一层直接写库：`game/` 整层都不认识 `infrastructure/`，而且真写进去了
     #: 单元测试就得有库。
     record_evidence: Callable[[str, dict[str, Any]], None] = lambda _message, _payload: None
+    #: 「画面上那个 ✕ 现在在不在」。**关浮层之前问它**，答否就一下都不点。
+    #:
+    #: 默认 `False` 是**故意的保守值**：没接这个回读的调用方（轻量工具、单元测试
+    #: 桩）走的是「从不关浮层」，而不是「照旧盲点」。判据本身在 `game.overlay`，
+    #: 实机由 `tools.pirate_loop` 接到 `LiveDriver.capture()`。
+    see_close_button: Callable[[], bool] = lambda: False
     #: 每一屏读到的行，按顺序记下来，找不到时原样说出去（照 `PresetNotFound` 的做法）。
     screens: list[list[str]] = field(default_factory=list)
 
@@ -147,6 +180,13 @@ class PlanetSwitcher:
         if row is None and self._read_nothing_at_all():
             row = self._retry_behind_overlays(target)
         if row is None:
+            # ⚠️ 判据看的是**整趟逐屏读到了什么**（含重读那一遍），不是「找没找到」。
+            # 全空 = 说不出列表里有什么，那时指着用户的配置说话就是在造假；
+            # 读到过内容 = 列表确实翻通了，这颗星球真的不在里面。见 `SwitchResult`。
+            if self._read_nothing_at_all():
+                self.say(f"  行星列表一行都没读出来；说不出里面有没有 {target}；什么都不点")
+                self._close()
+                return SwitchResult.UNREADABLE
             self.say(f"  行星列表上找不到 {target}；逐屏读到的是 {self.screens}；什么都不点")
             self._close()
             return SwitchResult.NOT_FOUND
@@ -196,22 +236,42 @@ class PlanetSwitcher:
         动作顺序是有讲究的：**先关再开**。这一刻列表多半根本没开出来（点 `NAV_PLANET`
         那一下落在浮层上），所以那几下 ✕ 关的是压在导航栏上的那个面板；关完必须
         重新点一次「行星」，否则读的还是同一张什么都没有的画面。
+
+        ⚠️ **认不出那个 ✕ 就一下都不点**（`see_close_button`，2026-08-18 用户指出）。
+        实机撞到过：那一刻画面上是**军力排行榜面板**，而原先的盲点把 4 下全落进了
+        榜单里。认不出时这一支等于什么都没做，本轮照常安全退出——代价只是这一轮
+        不派，远小于在榜单/列表上误触一次真实操作。
         """
         before = [list(screen) for screen in self.screens]
         self.say("  行星列表一行都没读出来；疑似有浮层盖住了导航栏，先关掉浮层再读一遍")
         clicked = 0
+        recognised = False
         row: PlanetRow | None = None
         for _attempt in range(PLANET_LIST_OVERLAY_RETRIES):
-            clicked += dismiss_overlays(self.driver, attempts=OVERLAY_CLOSE_ATTEMPTS)
+            dismissed = dismiss_overlays(
+                self.driver,
+                see_close_button=self.see_close_button,
+                attempts=OVERLAY_CLOSE_ATTEMPTS,
+            )
+            clicked += dismissed.clicked
+            recognised = recognised or dismissed.recognised
+            if not dismissed.recognised:
+                # 那个位置上不是 ✕（实机见过：军力榜面板、恒星系视图的导航输入框）。
+                # 不点，也不重开列表——重开只会再读一张同样的画面。
+                self.say("  关闭键那个位置上认不出 ✕；一下都不点，本轮就此退出")
+                break
             row = self._open_and_locate(target)
             if row is not None:
                 break
         after = [list(screen) for screen in self.screens[len(before) :]]
-        verdict = (
-            f"重读认到了 {target}"
-            if row is not None
-            else ("重读读到了内容但没有这颗星球" if any(after) else "重读还是一行都没有")
-        )
+        if not recognised:
+            verdict = "认不出关闭键 ✕，没点也没重读"
+        elif row is not None:
+            verdict = f"重读认到了 {target}"
+        elif any(after):
+            verdict = "重读读到了内容但没有这颗星球"
+        else:
+            verdict = "重读还是一行都没有"
         self.say(f"  关浮层点了 {clicked} 下；{verdict}（重读逐屏 {after}）")
         self.record_evidence(
             f"行星列表读空（逐屏 {before}）；疑似有浮层盖住导航栏，"
@@ -221,6 +281,7 @@ class PlanetSwitcher:
                 "screens_before": before,
                 "screens_after": after,
                 "close_clicks": clicked,
+                "close_button_recognised": recognised,
                 "recovered": row is not None,
             },
         )

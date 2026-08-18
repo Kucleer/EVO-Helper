@@ -163,15 +163,28 @@ def _covered_switcher(
     opens_needed: int,
     origin_reads: str = "2:137:18",
     evidence: list[tuple[str, dict[str, object]]] | None = None,
+    sees_close_button: bool = True,
 ) -> tuple[PlanetSwitcher, _CoveredDriver]:
     driver = _CoveredDriver(_List(screens), opens_needed=opens_needed)
     recorded = evidence if evidence is not None else []
+
+    def sees() -> bool:
+        """盖着的那层浮层上有个 ✕；**点一下它就没了**，所以之后就认不出了。
+
+        实机由 `tools.pirate_loop` 接到 `game.overlay.look_at_close_button`，
+        判据本身钉在 `tests/unit/game/test_overlay_close_button.py` 上。
+        """
+        if not sees_close_button:
+            return False
+        return not any(label == "关闭面板" for _x, _y, label in driver.clicks)
+
     switcher = PlanetSwitcher(
         driver=driver,  # type: ignore[arg-type]
         read_rows=driver.read,
         read_origin=lambda: origin_reads,
         say=lambda _message: None,
         record_evidence=lambda message, payload: recorded.append((message, payload)),
+        see_close_button=sees,
     )
     return switcher, driver
 
@@ -256,10 +269,13 @@ class TestRefusingToGuess:
 
         绝不按行号盲点：那一排里转移/投送/保护/扩张点错任何一个都是真实操作，
         而「第一行就是主星」这种假设一旦不成立，代价就是其中之一。
+
+        ⚠️ 结局是 `UNREADABLE` 而不是 `NOT_FOUND`：这一屏的噪声（行星大小 `155223`、
+        图标漏出来的 `5`）一条坐标行都没解析出来，也就**说不出列表里有没有主星**。
         """
         switcher, driver, _planets = _switcher([[(211, "155223"), (353, "5")]])
 
-        assert switcher.switch_to(HOME) is SwitchResult.NOT_FOUND
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
         assert driver.in_panel == []
 
     def test_a_planet_that_is_nowhere_in_the_list_costs_zero_clicks(self) -> None:
@@ -301,7 +317,7 @@ class TestClosingOverlaysWhenTheListReadsBlank:
         assert driver.in_panel == [GOTO_ROW_1]
 
     def test_the_retry_happens_exactly_once(self) -> None:
-        """**关完重读还是空，就照常 `NOT_FOUND`。**
+        """**关完重读还是空，就按 `UNREADABLE` 收场。**
 
         这里的列表要开到第三次才露出来，而正确实现只会开两次（原本一次 + 重试
         一次）。做成循环重试的话它就能等到第三次、返回 `SWITCHED`——那正是这条
@@ -309,7 +325,7 @@ class TestClosingOverlaysWhenTheListReadsBlank:
         """
         switcher, driver = _covered_switcher([BASELINE], opens_needed=3)
 
-        assert switcher.switch_to(HOME) is SwitchResult.NOT_FOUND
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
         assert driver.opens == 2, "开一次、重试一次，不许再多"
 
     def test_a_readable_list_without_the_target_never_closes_an_overlay(self) -> None:
@@ -356,7 +372,8 @@ class TestClosingOverlaysWhenTheListReadsBlank:
         assert "浮层" in message
         assert payload["screens_before"] == [[]], "读空那一遍原样留下"
         assert payload["screens_after"] == [["2:137:18", "9:250:8", "4:96:7"]]
-        assert payload["close_clicks"] == 4
+        assert payload["close_clicks"] == 1, "浮层关掉之后 ✕ 就没了，不该继续点"
+        assert payload["close_button_recognised"] is True
         assert payload["recovered"] is True
         assert payload["target"] == "2:137:18"
 
@@ -377,6 +394,90 @@ class TestClosingOverlaysWhenTheListReadsBlank:
 
         assert switcher.switch_to(HOME) is SwitchResult.SWITCHED
         assert evidence == []
+
+    def test_an_unrecognised_close_button_costs_zero_clicks(self) -> None:
+        """⚠️ **实机 2026-08-18 10:04 / 10:05：那两次画面上是军力排行榜面板。**
+
+        原先这一支不看那儿是什么，朝 (750, 71) 盲点 4 下——4 下全落进了榜里。
+        用户口径：「点 4 下关闭，应校验按钮形态，不然就会点到排行榜中去」。
+
+        认不出 ✕ 就一下都不点，也不重开列表（重开只会再读一张同样的画面）。
+        这一轮唯一允许的那一下 ✕ 是收尾的「关掉列表」。
+        """
+        switcher, driver = _covered_switcher([BASELINE], opens_needed=2, sees_close_button=False)
+
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
+        assert driver.closes == 1, "只许有收尾那一下，不许有关浮层那一串"
+        assert driver.opens == 1, "认不出就别重开列表"
+
+    def test_the_unrecognised_close_button_is_written_down(self) -> None:
+        """「认不出」必须留痕，否则库里只会看到一轮莫名其妙的没派。"""
+        evidence: list[tuple[str, dict[str, object]]] = []
+        switcher, _driver = _covered_switcher(
+            [BASELINE], opens_needed=2, evidence=evidence, sees_close_button=False
+        )
+
+        switcher.switch_to(HOME)
+
+        assert len(evidence) == 1
+        message, payload = evidence[0]
+        assert payload["close_button_recognised"] is False
+        assert payload["close_clicks"] == 0
+        assert "认不出" in message
+
+
+class TestBlankIsNotTheSameAsMissing:
+    """⚠️ **实机 2026-08-18 10:04:07 与 10:05:10：日志对用户说了一句假话。**
+
+        切不到出发星球 4:277:15（not_found）；这一轮一发都不派
+        这颗星球不在你的行星列表里；请核对任务配的出发星球 4:277:15
+
+    4:277:15 就是用户的主星。真实原因是那两轮列表一行都没读出来。而调用方照
+    `NOT_FOUND` 把 `Outcome.busy_is_permanent` 置了真——退出码 1、计入连续失败、
+    走向自动停用，连着两轮 exit=1。
+
+    判据看的是**逐屏读到的行**，不是「找没找到目标」。
+    """
+
+    def test_a_list_that_never_read_a_single_row_is_unreadable(self) -> None:
+        switcher, driver = _covered_switcher([BASELINE], opens_needed=9)
+
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
+        assert driver.in_panel == []
+
+    def test_a_list_that_read_rows_without_the_target_is_still_not_found(self) -> None:
+        """⚠️ **这一半不许跟着一起放宽。**
+
+        列表读通了、里面确实没有这颗星球——那是真的配错了坐标，不会自己好，
+        必须让连续失败计数看见它。把它也说成「读不出来」，就等于给自己开了一个
+        永不停用的静默死循环。
+        """
+        switcher, driver, _planets = _switcher([BASELINE])
+
+        assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
+        assert driver.in_panel == []
+
+    def test_rows_read_on_the_retry_alone_are_enough_to_be_not_found(self) -> None:
+        """重读那一遍读到了内容 = 列表翻通了，照 `NOT_FOUND` 走。"""
+        switcher, _driver = _covered_switcher([BASELINE], opens_needed=2, origin_reads="")
+
+        assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
+
+    def test_the_unreadable_verdict_never_blames_the_configuration(self) -> None:
+        """读不出来时**不许**说「这颗星球不在你的行星列表里」。"""
+        said: list[str] = []
+        driver = _CoveredDriver(_List([BASELINE]), opens_needed=9)
+        switcher = PlanetSwitcher(
+            driver=driver,  # type: ignore[arg-type]
+            read_rows=driver.read,
+            read_origin=lambda: "",
+            say=said.append,
+        )
+
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
+        spoken = "\n".join(said)
+        assert "找不到" not in spoken
+        assert "一行都没读出来" in spoken
 
 
 def test_coordinate_words_turns_an_ocr_timeout_into_a_safe_empty_read() -> None:
