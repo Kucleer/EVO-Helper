@@ -41,6 +41,24 @@ RESTART_COOLDOWN = timedelta(minutes=5)
 #: 调度循环会在一个坏掉的任务上变成满速空转的重启循环。
 EXIT_ENVIRONMENT_BUSY = 75
 
+#: 军力榜采集**没走完整趟**就停下来了：中途离开了榜单页（多半断线），或者翻满
+#: 检测预算仍然没见到 bot 区。
+#:
+#: ⚠️ **它存在的理由是「2 已经被占了」。** `tools.ranking_scan.scan()` 原先用
+#: `2` 表示这件事，而上面那条注释里写着 2 是 `argparse` 的退出码——于是真出参数
+#: 错误时，`mission_runs.exit_code` 里那个 2 分辨不出是哪一种。一个进程间协议上的
+#: 值撞车，事后是查不清的。
+#:
+#: 取 69 是 BSD `sysexits.h` 的 `EX_UNAVAILABLE`（"service unavailable"）：
+#: 榜单页没了正是这个意思，而且不与 1 / 2 / 75 相撞。
+#:
+#: ⚠️ **故意不归到 `EXIT_ENVIRONMENT_BUSY` 那一档。** 那一档是**不计入连续失败**
+#: 的，准入条件是「会自己好」，而这里两种成因里至少一种不会：翻满预算没见到 bot
+#: 说明榜单版面或判据出了事，下一轮照样翻满、照样空手，正是
+#: `exit_code_for_environment_fault` 那段注释里写的**静默死循环**。所以它按普通
+#: 失败计（与今天 `2` 的口径一致，改的只是「分辨得出来」这一件事）。
+EXIT_RANKING_INCOMPLETE = 69
+
 
 def exit_code_for_environment_fault(*, recoverable: bool) -> int:
     """环境故障该按哪个退出码收场。`recoverable` = 「还有救、值得下一轮再试」。

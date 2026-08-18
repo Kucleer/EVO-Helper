@@ -11,6 +11,11 @@
 关键事实：**真掉线落不到 UNKNOWN。** `classify_screen` 把登录序列判成 ENTRY /
 START / DISCONNECTED，各有各的分支。所以 UNKNOWN 基本只剩「浮层压着导航条」
 这一种解释。
+
+⚠️ 2026-08-18 起这一级多了一道前置闸：**那一下 ✕ 点之前先在画面上认出它**
+（`game.overlay`）。原先这里的注释写着「那个位置在恒星系视图上什么都不是，
+点空无害」，而实拍推翻了它——恒星系视图上 (750, 71) 正压在导航栏的「银河系」
+输入框上。所以下面的假驱动都要能交出一帧画面。
 """
 
 from __future__ import annotations
@@ -21,14 +26,21 @@ from evo_helper.tools.scan_coordinates import (
     dismiss_overlays_if_unrecognised,
     restart_if_still_unusable,
 )
+from support.screens import CLOSE_BUTTON_PATCH, screen_with, screen_without_overlay
 
 
 class _Driver:
-    def __init__(self) -> None:
+    """假驱动。`overlay=True` 时画面上真有那个 ✕，否则是一屏没有浮层的画面。"""
+
+    def __init__(self, *, overlay: bool = True) -> None:
         self.clicks: list[tuple[int, int, str]] = []
+        self._overlay = overlay
 
     def click(self, x: int, y: int, *, label: str = "") -> None:
         self.clicks.append((x, y, label))
+
+    def capture(self) -> object:
+        return screen_with(CLOSE_BUTTON_PATCH) if self._overlay else screen_without_overlay()
 
     def wait(self, _seconds: float) -> None:
         pass
@@ -102,6 +114,21 @@ def test_it_gives_up_instead_of_clicking_forever() -> None:
 
     assert result.state is ScreenState.UNKNOWN
     assert len(driver.clicks) == OVERLAY_CLOSE_ATTEMPTS
+
+
+def test_an_unrecognised_close_button_costs_zero_clicks() -> None:
+    """⚠️ **实机 2026-08-18 那两次：那一刻画面上是军力排行榜，4 下全落进了榜里。**
+
+    画面认不出（UNKNOWN）**不等于**「那儿有个可以点的 ✕」。认不出 ✕ 就一下都不点，
+    如实把 UNKNOWN 交还给恢复阶梯的下一级（等登录 / 关窗重开），那两级都不动手。
+    """
+    driver = _Driver(overlay=False)
+    keeper = _Keeper([])
+
+    result = dismiss_overlays_if_unrecognised(_outcome(ScreenState.UNKNOWN), driver, keeper)
+
+    assert result.state is ScreenState.UNKNOWN
+    assert driver.clicks == []
 
 
 def test_a_login_screen_is_handed_straight_back() -> None:
