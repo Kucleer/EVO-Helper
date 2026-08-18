@@ -370,10 +370,11 @@ MAIL_BACK_WAIT_S = 2.0
 #: 那时已经落地的 10 发攻击。也就是说战报就躺在列表顶上，而扫描窗口停在
 #: 四个半小时之前，七趟信箱一次都没够到过它。
 #:
-#: 所以停止条件不能是「拖了几次」，只能是**拖不动了**（判据与 `_scan_mail_rows`
-#: 里那条「还是那几封」、`domain.planet_switch.list_exhausted` 同一条）。
+#: 所以停止条件不能是「拖了几次」，只能是**拖不动了**。
 #: 这个数只是兜底上限：40 次 ≈ 186 行，够把一夜攒下的位移拖回去，
 #: 而且保证一定会停。
+#:
+#: ⚠️ **「拖不动了」比的是时间列，不是行身份**，理由见 `mail_times_settled`。
 MAIL_SCROLL_TO_TOP_MAX_DRAGS = 40
 
 #: 面板标题（那块金属牌上的大字），用来认出「现在是哪个面板」。
@@ -624,6 +625,60 @@ def mail_row_from_text(index: int, text: str) -> MailRow:
         ),
         kind=classify_report_subject(subject),
     )
+
+
+def mail_times_settled(
+    previous: Sequence[str | None] | None, current: Sequence[str | None]
+) -> bool:
+    """两屏之间「列表没动」吗。**比时间列，不比主题。**
+
+    ⚠️ **这一条是 2026-08-18 那一整天空转的正因。** 原先比的是行身份
+    （`MailRow.identity` = 主题 + 时间），而主题这一格在实机上根本读不稳：
+    面板是半透明的，背后那一页的字（`-TOTAL CREWS`、`-17003`、`personnel`）
+    透上来落进同一块 ROI，于是同一封邮件两次读成
+    `'大 Sw GEF攻击报告 bad'` 与 `'EN SEFATing bad Za once'`。
+    「拖一下还是那几封」于是**永远不成立**，`_scroll_mail_list_to_top` 必然走满
+    40 次上限：一次约 5.8 秒，白烧近四分钟，而全程它其实就在顶部。
+    生产库里 `往上拖满 40 次` 这一句 2026-08-18 一天就出现了 17 次——**每趟都是**。
+
+    实拍上量过（`var/logs` 下 31 屏真信箱列表、186 行）：形如
+    `DD/MM/YYYY HH:MM:SS` 的时间读出 **174 行（93.5%）**，而主题一字不差的是
+    **0 行（0.0%）**。时间那一格是等宽数字，比中文主题稳一个量级——
+    所以判据只能挂在它上面。
+
+    ## 允许少量抖动，但「读空」不算
+
+    - 逐位比较，**严格多数**相同才算没动（6 行里 ≥4 行）。一格时间偶尔糊掉
+      不该让整趟判成「还能拖」，那正是原先那条判据的死法。
+    - 分母是**总行数**不是「读出来的行数」：整屏读空（或只读出一两行）时
+      分子最多也过不了半数，于是自动落在「照拖不误」那一侧。
+      **读空不是到顶的证据**，它是 OCR 没读出来——这一条从旧实现继承，
+      别在化简的时候弄丢。
+    - 行数对不上（换了布局、读空）一律当没到顶。
+
+    往上拖一次走 400px ≈ 4.6 行，而一屏 6 行；真没到顶时两屏逐位重合的行数是 0,
+    离「多数」很远。所以这个阈值不在钢丝上。
+    """
+    if previous is None:
+        return False
+    if not current or len(previous) != len(current):
+        return False
+    same = sum(
+        1 for before, after in zip(previous, current, strict=True) if before and before == after
+    )
+    return same * 2 > len(current)
+
+
+def _first_row_time(rows: Sequence[MailRow]) -> str:
+    """第 0 行那封邮件的时间，专供日志。读不出/整屏空时说清是哪一种。
+
+    这一句是「验证邮件时间与待读战报」在日志上的落点：`reconcile_today` 紧挨着
+    打出「库里有几发到点还没战报」，两行并排就能看出「邮箱最上面这封，比在等的
+    那几发新还是旧」。
+    """
+    if not rows:
+        return "（整屏没读出行）"
+    return rows[0].raw_time_text or "（时间读不出）"
 
 
 @dataclass
@@ -1541,27 +1596,85 @@ class PirateLoop:
         列表最上面是 16:42–17:02 的侦察报告，而同一屏的角标写着「战斗 10」未读。
         战报一直躺在列表顶上，扫描窗口停在四个半小时之前。
 
-        判据是「拖了一下还是那几封」，与 `_scan_mail_rows` 里判「翻到底了」
-        用的是同一条（也与 `domain.planet_switch.list_exhausted` 同形）：
-        **比行身份，不比位置**——慢拖带惯性，位置每次都差几个像素。
+        判据是「拖了一下**时间列还是那几个**」：**比行身份，不比位置**——慢拖带
+        惯性，位置每次都差几个像素。比时间而不是比主题的理由整段在
+        `mail_times_settled`（一句话：主题那一格在实拍上一字不差的是 0 行）。
 
-        多付的代价是每次拖之前读一屏主题（一次截图 + 六次窄 ROI OCR ≈ 1–2 秒）。
-        到顶之后的稳态是 7–8 次，约 25 秒一趟；换回来的是这一趟真的能看见
-        今天的战报。读不出行（全空）时**不当成到顶**：那是 OCR 没读出来，
-        照拖不误，最坏走满上限。
+        多付的代价是每次拖之前读一屏（一次截图 + 六次窄 ROI OCR）。实机上
+        「读一屏 + 拖一次」约 5.8 秒；本来就在顶部时**只付两屏一拖**（≈12 秒），
+        而 2026-08-18 那一天每一趟都在这里烧掉近四分钟。读不出行（全空）时
+        **不当成到顶**：那是 OCR 没读出来，照拖不误，最坏走满上限。
+
+        ⚠️ **没有「刚登录就当在顶部」这条近路。** 判错方向的代价极不对称：
+        误判「已在顶部」而其实不在就是漏战报（2026-08-13 那次「17 发攻击 0 份
+        战报」正是这个形态，代价是两天排障），而误判「不在顶部」只是多花几秒。
+        用户 2026-08-18 提过「重新登录后信箱默认就在顶部」，那是**没有反证**，
+        不是证据；而库里能拿到的两个「正面证据」候选都被生产数据否掉了：
+
+        - 「第 0 行时间 ≥ 库里最新战报时间」——2026-08-13 那夜库里当天一份战报
+          都没有，判据会空真而跳过拖动，正好**制造**那次事故。
+        - 「第 0 行时间 ≥ 在等的那几发的期望时刻」——`expected_report_at_utc` 是
+          「派完点『出发』记下的时刻 + OCR 读到的飞行时间」，与战报真正的时刻
+          对不齐：112 份已认领战报上实测偏差 −4 s … +1498 s，近期（08-14 起
+          33 份）仍有 −4 s … +219 s。要让判据成立得留 ≥ 219 秒余量，而
+          2026-08-18 20:33 那一趟第 0 行（11:12:00 UTC）只比最晚期望
+          （11:12:02.8 UTC）早 2.8 秒——留够余量就不触发，不留就是拿漏战报去赌
+          飞行时间读得准。
+
+          省下的是**一次**读屏加一次拖动（≈6 秒），赌注是一份战报。不做。
+
+        所以这里只做一件事：拖到拖不动，然后**如实说出第 0 行是什么时候的**，
+        让「邮件时间对不对得上待读战报」这件事在日志上一眼可查（用户口径
+        2026-08-18：「应首先验证邮件时间与待读战报」）。
         """
-        previous: list[tuple[str, str]] | None = None
+        previous: list[str | None] | None = None
+        rows: list[MailRow] = []
         for drag in range(MAIL_SCROLL_TO_TOP_MAX_DRAGS):
-            identities = [row.identity for row in self._mail_list_rows()]
-            if identities and identities == previous:
-                if drag > 1:
-                    say(f"  列表往上拖了 {drag} 次才到顶（上一趟停在很深的地方）")
+            rows = self._mail_list_rows()
+            times = [row.raw_time_text for row in rows]
+            if mail_times_settled(previous, times):
+                say(f"  列表往上拖了 {drag} 次到顶；第 0 行是 {_first_row_time(rows)} 的邮件")
                 return
-            previous = identities
+            previous = times
             slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
-        # 走满上限说明列表比 40 次拖动还深，或者主题一直读不出来。两种都要说出来：
-        # 这一趟看到的「最上面几行」不是信箱最上面几行，收不到战报是**必然**的。
-        say(f"  往上拖满 {MAIL_SCROLL_TO_TOP_MAX_DRAGS} 次仍没到顶；这一趟看到的不是信箱最新的几封")
+        self._say_scroll_to_top_gave_up(rows)
+
+    def _say_scroll_to_top_gave_up(self, rows: Sequence[MailRow]) -> None:
+        """走满上限时**如实**描述，并把证据落库。
+
+        ⚠️ 原先这里打的是「这一趟看到的**不是信箱最新的几封**」，而 2026-08-18
+        实机走满上限的那 17 趟里，用户当场核对过：**进邮箱本来就在顶部**。
+        那句话把一个「判不出来」说成了一个它并不知道的事实。仓库口径写在
+        CLAUDE.md 上：**日志说假话比不说更糟**（`_say_still_waiting` 那次教训）。
+
+        所以现在只说三样能证明的东西：拖了多少次、最后一屏第 0 行是什么时候的、
+        判据为什么没停下来。到没到顶——**不知道就说不知道**。
+
+        走 `record_system_log` 落库而不是只 `print`：实机跑在另一台机器上，
+        本地 `var/logs` 取不到（CLAUDE.md「排障看库里的日志表」）。
+        `payload_json` 带上那一屏的时间列，下次再出这一句时能直接看出来
+        「是列表真的深，还是时间也读不出来了」——这正是原先分不出的那两种。
+        """
+        times = [row.raw_time_text for row in rows]
+        readable = sum(1 for value in times if value)
+        say(
+            f"  往上拖满 {MAIL_SCROLL_TO_TOP_MAX_DRAGS} 次，两屏之间的时间列一直在变；"
+            f"最后一屏第 0 行是 {_first_row_time(rows)} 的邮件，"
+            f"{len(times)} 行里读出时间的有 {readable} 行。"
+            "到没到顶判不出来，这一趟就从这里往下翻"
+        )
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            "拖回信箱顶部走满上限，到没到顶判不出来",
+            payload={
+                "max_drags": MAIL_SCROLL_TO_TOP_MAX_DRAGS,
+                "first_row_time": rows[0].raw_time_text if rows else None,
+                "row_times": list(times),
+                "readable_times": readable,
+                "criterion": "mail_times_settled：逐位比时间列，严格多数相同才算没动",
+            },
+        )
 
     def _scan_mail_rows(
         self,
@@ -2434,7 +2547,15 @@ class PirateLoop:
         # 带着「哪几发理论上已经该有战报了」去找，而不是翻到什么算什么。
         outstanding = self._due_dispatches(now)
         if outstanding:
-            say(f"  库里有 {len(outstanding)} 发到点还没战报：{_targets_note(outstanding)}")
+            # 期望时刻也打出来：紧接着 `_scroll_mail_list_to_top` 会打「第 0 行是
+            # 什么时候的邮件」，两行并排就能一眼看出「邮箱最上面这封比在等的那几发
+            # 新还是旧」——用户口径（2026-08-18）「应首先验证邮件时间与待读战报」。
+            # ⚠️ 它只是**给人看的**，不参与「要不要拖」的判定，理由整段在
+            # `_scroll_mail_list_to_top`：这个时刻与战报真正的时刻实测差 −4…+219 秒。
+            say(
+                f"  库里有 {len(outstanding)} 发到点还没战报：{_targets_note(outstanding)}"
+                f"；{_expected_note(outstanding)}"
+            )
         else:
             say("  库里没有到点还没战报的派遣；这一趟只补没入库的和数今天的份数")
         try:
@@ -3366,6 +3487,19 @@ class PirateLoop:
 def _targets_note(dispatches: Sequence[Any]) -> str:
     """把单子上那几发写成一行人话。日志里没有坐标就无从判断该不该往下翻。"""
     return "、".join(str(item.target) for item in dispatches)
+
+
+def _expected_note(dispatches: Sequence[Any]) -> str:
+    """单子上最晚那一发的期望战报时刻，写成一句人话。**只给人看。**
+
+    飞行时间没读到的那几发 `expected_report_at_utc` 是 None（当作「现在就该有」），
+    这时说不出上界——**照实说没有**，别拿剩下几发的最大值冒充它。
+    """
+    expected = [item.expected_report_at_utc for item in dispatches]
+    known = [moment for moment in expected if moment is not None]
+    if not expected or len(known) != len(expected):
+        return "其中有发没读到飞行时间，说不出最晚该在什么时候"
+    return f"最晚一发的期望战报时刻 {max(known):%Y-%m-%d %H:%M:%S} UTC"
 
 
 def rematch_note(repository: Any, target: Coordinate, reported_at: datetime) -> str:

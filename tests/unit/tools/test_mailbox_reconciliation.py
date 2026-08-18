@@ -29,6 +29,7 @@ import pytest
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
+from evo_helper.tools import pirate_loop
 from evo_helper.tools.bot_loop import BotLoop
 from evo_helper.tools.pirate_loop import (
     MAIL_MAX_OPENS,
@@ -75,11 +76,17 @@ def _row(index: int, kind: ReportKind, at: datetime) -> MailRow:
 
 class _Repository:
     def __init__(
-        self, *, oldest_open: datetime | None = None, due: Sequence[Coordinate] = ()
+        self,
+        *,
+        oldest_open: datetime | None = None,
+        due: Sequence[Coordinate] = (),
+        expected: Sequence[datetime | None] | None = None,
     ) -> None:
         self.oldest_open = oldest_open
         #: 单子：已派出、理论上该有战报、库里还没有的那些攻击发的目标。
         self.due = list(due)
+        #: 单子上每一发的期望战报时刻。飞行时间没读到时是 None（见 `DueDispatch`）。
+        self.expected = list(expected) if expected is not None else [None] * len(self.due)
         self.records: list[dict[str, Any]] = []
 
     def oldest_open_attack_at(
@@ -88,7 +95,10 @@ class _Repository:
         return self.oldest_open
 
     def due_attack_dispatches(self, target_kind: str, **_fields: Any) -> list[Any]:
-        return [SimpleNamespace(target=target) for target in self.due]
+        return [
+            SimpleNamespace(target=target, expected_report_at_utc=expected)
+            for target, expected in zip(self.due, self.expected, strict=True)
+        ]
 
     def record_daily_reconciliation(self, target_kind: str, **fields: Any) -> Any:
         self.records.append({"target_kind": target_kind, **fields})
@@ -366,6 +376,62 @@ def test_a_pending_dispatch_keeps_the_opening_going_past_a_known_report(
     _reconcile(loop, monkeypatch)
 
     assert opened == [0, 1, 2, 3], "单子上还有一发没找到，不该在第一封「已有」就收工"
+
+
+def test_the_worklist_line_says_when_the_latest_report_is_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开工那一句要说清「在等的那几发**最晚该在什么时候**」。
+
+    用户口径（2026-08-18）：「应首先验证邮件时间与待读战报」。紧接着
+    `_scroll_mail_list_to_top` 会打「第 0 行是什么时候的邮件」，两行并排就能
+    一眼看出邮箱最上面那封比在等的那几发新还是旧——而这正是 2026-08-18
+    那一趟排障时日志里**缺的东西**。
+
+    ⚠️ 它只进日志，**不参与「要不要拖」的判定**：`expected_report_at_utc` 与战报
+    真正的时刻实测差 −4…+219 秒，拿它去跳过拖动就是拿漏战报赌 OCR 准不准
+    （理由整段在 `_scroll_mail_list_to_top`）。
+    """
+    said: list[str] = []
+    monkeypatch.setattr(pirate_loop, "say", said.append)
+    early = NOON - timedelta(minutes=30)
+    late = NOON - timedelta(minutes=5)
+    loop, _repository, _opened = _loop(
+        [[_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))]],
+        repository=_Repository(
+            due=[Coordinate(2, 56, 20), Coordinate(2, 57, 5)], expected=[early, late]
+        ),
+    )
+
+    _reconcile(loop, monkeypatch)
+
+    worklist = next(line for line in said if "到点还没战报" in line)
+    assert late.strftime("%Y-%m-%d %H:%M:%S") in worklist
+    assert early.strftime("%Y-%m-%d %H:%M:%S") not in worklist, "要的是最晚那一发"
+
+
+def test_the_worklist_line_admits_when_it_cannot_bound_the_latest_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有一发没读到飞行时间时，**照实说说不出上界**，不许拿其余几发的最大值冒充。
+
+    `expected_report_at_utc` 为 NULL 的那一档是「飞行时间没读到，当作现在就该有」
+    ——它的战报可能是任何时刻。把它当不存在，日志上那句话就成了假话。
+    """
+    said: list[str] = []
+    monkeypatch.setattr(pirate_loop, "say", said.append)
+    loop, _repository, _opened = _loop(
+        [[_row(0, ReportKind.PIRATE, DAY_START - timedelta(minutes=1))]],
+        repository=_Repository(
+            due=[Coordinate(2, 56, 20), Coordinate(2, 57, 5)], expected=[NOON, None]
+        ),
+    )
+
+    _reconcile(loop, monkeypatch)
+
+    worklist = next(line for line in said if "到点还没战报" in line)
+    assert "说不出最晚该在什么时候" in worklist
+    assert NOON.strftime("%Y-%m-%d %H:%M:%S") not in worklist
 
 
 def test_an_empty_worklist_restores_the_early_stop(monkeypatch: pytest.MonkeyPatch) -> None:
