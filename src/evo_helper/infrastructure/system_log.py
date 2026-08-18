@@ -360,11 +360,27 @@ def record_system_log(
     *,
     payload: Mapping[str, Any] | None = None,
     logged_at_utc: datetime | None = None,
+    task_id: int | None = None,
+    mission_kind: str | None = None,
 ) -> None:
     """记一条系统日志。**没装出口时是空操作**，绝不抛异常。
 
     空操作是默认值而不是「自动连库」：`import` 一个工具模块不该在背地里建
     数据库连接，测试更不该。真正装上它的只有 runner 的 `main()` 与控制台进程。
+
+    `task_id` / `mission_kind` **只在调用方比进程更清楚时才传**，传了就盖过
+    `current_context()` 的那一份。
+
+    ⚠️ **这两个参数是为控制台进程准备的，不是给 runner 用的。** runner 整个进程
+    就属于某一轮，身份从环境变量认领一次就够（`context_from_environment`）；
+    而控制台**同时**替所有任务写日志，进程身份恒为「不属于任何一轮」，于是它写的
+    每一行 `task_id` 都是 NULL——按任务过滤日志这件事因此根本做不到。生产实测
+    （2026-08-18）：调度器那句「这一轮没活干」写了 6,661 行，`task_id` 全部为
+    NULL，排障时只能从消息正文里的任务名去认它是谁。
+
+    **传 None 就是「我不知道，用进程那份」，不是「明确置空」。** 控制台进程那份
+    本来就是空的，所以这两种语义在这里没有可观察的差别；真要区分的话得再引入
+    一个哨兵值，而那是为一个不存在的用例付复杂度。
     """
     sink = current_system_log_sink()
     if sink is None:
@@ -380,8 +396,10 @@ def record_system_log(
                 pid=os.getpid(),
                 message=message,
                 run_id=context.run_id,
-                task_id=context.task_id,
-                mission_kind=context.mission_kind,
+                task_id=context.task_id if task_id is None else task_id,
+                mission_kind=(
+                    context.mission_kind if mission_kind is None else mission_kind.lower()
+                ),
                 payload_json=encode_payload(payload),
             )
         )

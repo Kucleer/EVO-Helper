@@ -712,7 +712,7 @@ class RecordingLog:
         self.messages: list[str] = []
         self.payloads: list[dict[str, object]] = []
 
-    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
         self.messages.append(message)
         self.payloads.append(dict(payload or {}))
 
