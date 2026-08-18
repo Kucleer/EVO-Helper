@@ -207,6 +207,10 @@ def test_two_same_origin_legs_are_split_by_the_arrival_window(repository, run_id
 
     assert row.dispatch_id == right
     assert row.match_confidence == CONFIDENCE_EXPECTED_WINDOW
+    # ⚠️ 三档的**大小关系**也要钉住，不然「统一给 1.0」的实现只要把常量一起改掉
+    # 就能瞒过按常量写的等值断言——而库里那一列从此再也分不出这一份是怎么认下来的。
+    assert CONFIDENCE_ORIGIN_MISMATCH < CONFIDENCE_EXPECTED_WINDOW < CONFIDENCE_ORIGIN_TARGET_TIME
+    assert row.match_confidence < CONFIDENCE_ORIGIN_TARGET_TIME
 
 
 # -- 认不上（放宽的边界） ------------------------------------------------------
