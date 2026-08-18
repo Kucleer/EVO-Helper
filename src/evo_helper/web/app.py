@@ -22,6 +22,9 @@ from starlette.types import Lifespan
 from evo_helper.application.backfill import default_since
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import (
+    ACCOUNT_LINE_LIMIT_MAX,
+    AUTO_TOGGLE_LOG_MAX_SECONDS,
+    AUTO_TOGGLE_LOG_WINDOW,
     BOT_REVISIT_MAX_HOURS,
     DEFAULT_BOT_REVISIT,
     MissionScheduler,
@@ -656,6 +659,9 @@ def create_app(
                 "bot_revisit_default": int(DEFAULT_BOT_REVISIT.total_seconds() // 3600),
                 "bot_revisit_max": BOT_REVISIT_MAX_HOURS,
                 "military_time_pool_default": DEFAULT_TIME_POOL,
+                "account_line_limit_max": ACCOUNT_LINE_LIMIT_MAX,
+                "auto_toggle_log_default": int(AUTO_TOGGLE_LOG_WINDOW.total_seconds()),
+                "auto_toggle_log_max": AUTO_TOGGLE_LOG_MAX_SECONDS,
             },
         )
 
@@ -1132,6 +1138,8 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
         reconcile_cooldown_minutes=view.reconcile_cooldown_minutes,
         bot_revisit_hours=view.bot_revisit_hours,
         military_time_pool=view.military_time_pool,
+        account_line_limit=view.account_line_limit,
+        auto_toggle_log_seconds=view.auto_toggle_log_seconds,
     )
 
 
@@ -1200,6 +1208,8 @@ def register_mission_routes(app: FastAPI) -> None:
                 reconcile_cooldown_minutes=payload.reconcile_cooldown_minutes,
                 bot_revisit_hours=payload.bot_revisit_hours,
                 military_time_pool=payload.military_time_pool,
+                account_line_limit=payload.account_line_limit,
+                auto_toggle_log_seconds=payload.auto_toggle_log_seconds,
             )
         )
 

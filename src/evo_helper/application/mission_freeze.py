@@ -41,6 +41,21 @@ MAX_REMEMBERED = 200
 
 
 @dataclass(frozen=True)
+class FrozenOrigin:
+    """军力攻击的一颗出发星球在某一刻的配置。
+
+    三样都要记：坐标、这颗星球上的航线数、有没有勾上。少了 `enabled`，
+    「用户把 2 号星停掉了」在账里就只剩「少了一颗星球」，而那和「删掉了」是
+    两件事。
+    """
+
+    #: 写成 `星系:恒星系:位置`，同 `FrozenTask.origin`。
+    origin: str
+    fleet_lines: int
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class FrozenTask:
     """一个任务在某一刻的配置。**只含用户改得动的那几样。**
 
@@ -64,7 +79,23 @@ class FrozenTask:
     #: 出发星球，写成 `星系:恒星系:位置`。空串表示「用全局主星」（也含旧行）。
     origin: str = ""
     #: 航线数。None 表示「用全局 `fleet_line_limit`」（也含旧行）。
+    #:
+    #: ⚠️ **军力攻击那一支不看这两个字段。** 它的真相在 `origins` 里；
+    #: `mission_tasks.origin_*` / `mission_tasks.fleet_lines` 是加多出发点之前留下的
+    #: 残值，`web.persistent_service.replace_mission_origins` 从不回写它们，所以那两
+    #: 个数**永远不会被更新**。生产实证（2026-08-18）：用户配的是 `4:277:15=6 线` +
+    #: `9:250:8=2 线`，固化记录却写「出发 4:277:15 · 航线 7」——那个 7 是残值。
     fleet_lines: int | None = None
+    #: 军力攻击的全部出发星球（含停用的）。
+    #:
+    #: ⚠️ **三种取值互不相同，别合并**：
+    #:
+    #: - `None` = **这一行是本轮之前写的，没有这个字段**。「没得比」，逐条对比要
+    #:   整段跳过——当成「当时一颗都没配」的话，升级后的第一条记录会把用户的每一颗
+    #:   星球都报成「新增」，而那正是这份账要避免的走样。
+    #: - `()` = 记录了，而且确实没有多出发点（海盗、扫描、区域 bot 都是这一档）。
+    #: - 非空 = 军力攻击当时配的那几颗。
+    origins: tuple[FrozenOrigin, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +129,21 @@ class MissionConfigFreeze:
                     "params_json": task.params_json,
                     "origin": task.origin,
                     "fleet_lines": task.fleet_lines,
+                    # `None`（旧行读进来的「没得比」）原样写回 null，不写成 []：
+                    # 写成 [] 就等于替一条读不到出发点的历史记录断言「当时一颗都
+                    # 没配」，而那件事我们并不知道。
+                    "origins": (
+                        None
+                        if task.origins is None
+                        else [
+                            {
+                                "origin": item.origin,
+                                "fleet_lines": item.fleet_lines,
+                                "enabled": item.enabled,
+                            }
+                            for item in task.origins
+                        ]
+                    ),
                 }
                 for task in self.tasks
             ],
@@ -266,7 +312,7 @@ def _task(item: Any) -> FrozenTask | None:
         return None
     if not isinstance(params_json, str):
         return None
-    # 以下四个是本轮新加的字段。**缺了不算坏行**——旧行本来就没有，理由见
+    # 以下几个都是后加的字段。**缺了不算坏行**——旧行本来就没有，理由见
     # `MissionConfigFreeze.from_json` 的文档。
     name = item.get("name")
     origin = item.get("origin")
@@ -279,7 +325,37 @@ def _task(item: Any) -> FrozenTask | None:
         name=name if isinstance(name, str) else "",
         origin=origin if isinstance(origin, str) else "",
         fleet_lines=_optional_int(item.get("fleet_lines")),
+        origins=_origins(item.get("origins")),
     )
+
+
+def _origins(value: Any) -> tuple[FrozenOrigin, ...] | None:
+    """`origins` 那一段。**缺这个键（或坏成非列表）一律返回 `None` = 「没得比」。**
+
+    ⚠️ 绝不能回落成 `()`：那等于替一条本轮之前写的历史记录断言「当时一颗出发点
+    都没配」，于是升级后的第一条记录会把用户配着的每一颗星球都报成「新增出发点」。
+    `None` 与 `()` 的差别整段写在 `FrozenTask.origins` 上。
+
+    列表里读不懂的那一项跳过、不丢整段：同 `MissionConfigFreeze.from_json`
+    ——这份账被人用记事本编辑过，一处手滑不该让整条记录的出发点全部消失。
+    """
+    if not isinstance(value, list):
+        return None
+    origins: list[FrozenOrigin] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        origin = item.get("origin")
+        fleet_lines = _optional_int(item.get("fleet_lines"))
+        enabled = item.get("enabled")
+        if not isinstance(origin, str) or not origin or fleet_lines is None:
+            continue
+        origins.append(
+            # `enabled` 缺失时按「启用」读：多出发点是 2026-08-18 才有的东西，
+            # 而它出现之前的每一颗配置着的星球都是参与派遣的。
+            FrozenOrigin(origin=origin, fleet_lines=fleet_lines, enabled=enabled is not False)
+        )
+    return tuple(origins)
 
 
 def _optional_int(value: Any) -> int | None:
@@ -299,6 +375,7 @@ def _optional_int(value: Any) -> int | None:
 __all__ = [
     "DEFAULT_FREEZE_LOG",
     "MAX_REMEMBERED",
+    "FrozenOrigin",
     "FrozenTask",
     "MissionConfigFreeze",
     "MissionFreezeLog",

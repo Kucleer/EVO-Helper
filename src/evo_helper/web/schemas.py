@@ -284,6 +284,15 @@ class MilitaryAttackConfigOut(BaseModel):
     #: 那个数管「只打多强的」。范围同样由
     #: `MissionScheduler.validate_military_time_pool` 判，这里只认「是不是整数」。
     military_time_pool: int | None = None
+    #: **全账号**同时在飞的舰队上限。**`None` = 留空 = 默认 9。**
+    #:
+    #: 它和任务上那个「航线数」是两道**同时生效**的闸（用户口径 2026-08-18：
+    #: 「我的总航线数是所有星球共享的」「两者均需要约束」）。范围由
+    #: `MissionScheduler.validate_account_line_limit` 判，这里只认「是不是整数」。
+    account_line_limit: int | None = None
+    #: 自动停用/自动恢复的日志限流窗口（秒）。**`None` = 留空 = 默认 120。**
+    #: `0` 是合法取值，意思是「每一次跃迁都记」，不是「关掉日志」。
+    auto_toggle_log_seconds: int | None = None
 
 
 class CurrentMissionOut(BaseModel):
