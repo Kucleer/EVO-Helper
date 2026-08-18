@@ -296,6 +296,13 @@ class TaskFacts:
     #: `expected_report_at_utc` 为 NULL（飞行时间没读到）时 planner 的语义
     #: 是「立即收取」，若自建 `WHERE expected_report_at_utc <= now_utc`
     #: 会把这一档漏掉。
+    #:
+    #: ⚠️ **2026-08-19 起只有 `PIRATE` 那一支读它。** 不是 bot 的战报不重要，
+    #: 是 bot 那条命令行组不出「只收不派」的一轮（`bot_command` /
+    #: `_military_command` 都带航线闸），于是它在 bot 那边只会说出一句
+    #: `_launch` 兑现不了的「有活干」。整段理由在 `has_work` 上。
+    #: 仍然**照常算**：页面与将来真做出「只收战报」那条路时都要它，而它本身
+    #: 是一句真话——「这个任务有到期未收的战报」。
     reports_due: bool = False
     #: 仅 BOT：本轮范围内还有几个目标没走完流程。
     targets_remaining: int = 0
@@ -688,9 +695,41 @@ def has_work(
     `wanted` 判断值不值得打断扫描）自动跟着生效：一条正在冷却的链路不该把扫描
     打断成谁都不在跑。
 
-    两条攻击链路的判据都是「**有航线可派** 或 **有战报该收**」。左半边多一道
-    `waiting_for_a_line`：`free_lines` 只是估算，被现场推翻过就不能再照着它起轮。
-    右半边不加任何闸门——收报告不占航线。
+    **两条攻击链路的右半边（「有战报该收」）不一样，这是刻意的。**
+
+    - `PIRATE` 是「有航线可派 **或** 有战报该收」。右半边不加闸门——收报告不占
+      航线，而且这条链路真的兑现得了：`domain.missions.pirate_command` 上没有
+      任何航线闸，`free_lines` 为 0 时照样组得出命令行，runner 一开工就是
+      `PirateLoop.reconcile_today()` 那一趟信箱。
+    - `BOT` 只有左半边。**不是「收报告不重要」，是 `_launch` 那一侧根本兑现不了。**
+      两条 bot 路径组命令行时都会拿航线预算把自己挡回来：区域攻击那条
+      （`bot_command`）`max_dispatches < 1` 抛 `NoFreeLineError`，军力优先那条
+      （`_military_command`）预算为 0 的出发点拿不到任何目标、于是抛 `MissionIdle`。
+      也就是说航线满时 `reports_due` 说的「有活干」**没有任何一条路走得通**。
+
+    ⚠️ **这一条是「有没有活干」和「能不能干」用同一把尺子」的一部分**，和
+    `application.mission_scheduler._origin_budgets` 上记的那条同源。生产实测
+    （2026-08-18 16:13 → 08-19 00:04，7.8 小时）：`9:250:8` 四条航线全在飞、
+    另有 8 发的战报因为 OCR 把 `9` 认成 `3` 而永远认领不上，于是 `reports_due`
+    恒为真、`has_work` 每 tick 都说「有活干」、`_military_command` 每 tick 都抛
+    `MissionIdle`——`system_log` 里 6,661 行同一句「这一轮没活干」，占全表 22%，
+    一发未派。
+
+    ⚠️ **它顺带堵上 `waiting_for_a_line` 的侧门。** 那个谓词的本意是「`free_lines`
+    被现场推翻过，别再照着它起轮」，可 `can_dispatch or reports_due` 会在
+    `free_lines > 0 且 waiting_for_a_line` 时照样放行，而 `_launch` 拿到的
+    `max_dispatches` 仍是那个大于 0 的估算值——放出去的是一轮**真的派遣**，
+    不是「回去收战报」。2026-08-11 那九轮「导航几十秒、撞上限、退出」正是这个形状。
+
+    **那战报怎么办？** 战报是**跟着下一轮派遣一起收的**（runner 开工第一趟信箱），
+    不是单独跑一趟。舰队飞回来 → 航线空出来 → 下一轮起来 → 顺手就收了。所以
+    这里不会死锁：`free_lines` 会自己变回正数，`bot_round_complete` 那一档也
+    只在目标全部走完时才为真，而那时本来就不该再起轮。
+
+    ⚠️ **不要把 `_military_command` 改成「没航线就只收战报」来把右半边补回来。**
+    收回来的战报若认领不上（上面那条 OCR 缺陷），`reports_due` 就还是真，于是
+    调度器会一趟趟真的进信箱——烧的是**真实鼠标时间**，比现在多写几行日志糟得多。
+    `application.mission_scheduler._reports_due` 的 docstring 逐字预言过这个形状。
 
     `free_lines` 是**这个任务在它那颗出发星球上**还剩几条（见 `free_lines_for`），
     所以「同一颗星球在飞数达到该任务的航线数就不再派」与「不同星球互不影响」
@@ -732,7 +771,10 @@ def has_work(
     if task.kind is MissionKind.BOT:
         if bot_round_complete(task, facts):
             return False
-        return can_dispatch or facts.of(task).reports_due
+        # ⚠️ **这里没有 `or facts.of(task).reports_due`，别加回去。** 理由在上面
+        # 的 docstring 里：bot 的两条命令行都带航线闸，航线满时那半边判据
+        # 一条路都走不通，加回去换来的只是每 tick 一条「这一轮没活干」。
+        return can_dispatch
 
     # 穷举到这里说明 MissionKind 加了新成员却没人补上面的分支——宁可让
     # strict mypy 在这里报错，也不要让新种类静默套用 BOT 的判据跑起来。

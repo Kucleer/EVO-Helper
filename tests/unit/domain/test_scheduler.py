@@ -235,20 +235,72 @@ def test_one_bot_task_finishing_its_round_does_not_finish_the_other() -> None:
     assert has_work(second, mixed)
 
 
-def test_a_full_line_pool_does_not_stop_a_bot_task_that_owes_a_report() -> None:
-    """BOT 链路和海盗一样：收报告不占航线，否则任务会卡住永远退不出去。"""
-    assert has_work(BOT, facts(every={"free_lines": 0}, per={BOT: {"reports_due": True}}))
+def test_a_full_line_pool_stops_a_bot_task_even_when_a_report_is_due() -> None:
+    """⚠️ **BOT 这一支和海盗刚好相反，而且这正是要钉住的那一条。**
+
+    海盗那一档（上面那条用例）成立，是因为 `pirate_command` 上没有任何航线闸：
+    `free_lines == 0` 时照样组得出命令行，runner 一开工就是那趟信箱。bot 不是
+    ——两条 bot 命令行都会拿航线预算把自己挡回来（`bot_command` 抛
+    `NoFreeLineError`，`_military_command` 抛 `MissionIdle`）。所以这里说
+    「有活干」等于开一张 `_launch` 兑不了的空头支票。
+
+    **兑不了的代价是实测过的**（生产 2026-08-18 16:13 → 08-19 00:04，7.8 小时）：
+    出发点 `9:250:8` 四条航线全在飞，另有 8 发的战报因为 OCR 把 `9` 认成 `3`
+    而永远认领不上 → `reports_due` 恒为真 → 每个 tick 都判「有活干」、每个 tick
+    都抛 `MissionIdle`。`system_log` 里 6,661 行同一句「这一轮没活干」，
+    占全表 22%，一发未派。
+
+    ⚠️ **把 `or facts.of(task).reports_due` 加回 BOT 那一支，这条就转红。**
+    别为了「战报要收」加回去：战报是跟着下一轮派遣一起收的（runner 开工第一趟
+    信箱），舰队飞回来航线就空了，它自己会好。
+    """
+    assert not has_work(BOT, facts(every={"free_lines": 0}, per={BOT: {"reports_due": True}}))
 
 
-def test_a_due_report_on_one_bot_task_does_not_wake_the_other() -> None:
-    """战报也按出发星球分：主星那些没到的战报不该让 2 号星那个任务进信箱扑空。"""
+def test_a_bot_task_held_back_by_the_line_watchdog_is_not_woken_by_a_due_report() -> None:
+    """`waiting_for_a_line` 的侧门也一并堵上。
+
+    那个谓词的意思是「`free_lines` 被现场推翻过，别再照着它起轮」。可只要右半边
+    还在，`free_lines > 0 且 waiting_for_a_line` 时它照样放行，而 `_launch` 拿到
+    的 `max_dispatches` 仍是那个大于 0 的估算值——**放出去的是一轮真的派遣**，
+    不是「回去收战报」。2026-08-11 那九轮「导航几十秒、撞上限、退出」就是这个
+    形状；生产 2026-08-18 的任务 #2 当时也正停在这一档上。
+    """
+    watched = task(MissionKind.BOT, task_id=10, origin=HOME)
+    # 上一轮起来过却一发没派（`came_back_empty`），而且还有舰队在外面没回来
+    # ——`waiting_for_a_line` 的两个条件都成立。
+    held = SchedulerFacts(
+        now_utc=NOW,
+        per_task={
+            watched.task_id: TaskFacts(
+                free_lines=3,
+                targets_remaining=3,
+                reports_due=True,
+                last_started_at_utc=NOW - timedelta(hours=1),
+                last_dispatch_at_utc=None,
+                next_line_free_at_utc=NOW + timedelta(minutes=20),
+            )
+        },
+    )
+
+    assert not has_work(watched, held)
+
+
+def test_a_free_line_on_one_bot_task_does_not_wake_the_other() -> None:
+    """事实按任务分：主星还有航线，不代表 2 号星那个任务也能派。
+
+    ⚠️ 原先这条用的是 `reports_due` 来区分两个任务（「战报也按出发星球分」）。
+    右半边删掉之后那个区分再也分不出东西来——两个都不该醒——所以换成
+    `free_lines` 这个仍然生效的判据，**按任务分**这件事照旧钉得住。
+    「战报不再唤醒 bot」由上面那条用例守。
+    """
     main = task(MissionKind.BOT, task_id=10, origin=HOME)
     second = task(MissionKind.BOT, task_id=11, origin=SECOND)
     mixed = SchedulerFacts(
         now_utc=NOW,
         per_task={
-            main.task_id: TaskFacts(free_lines=0, targets_remaining=3, reports_due=True),
-            second.task_id: TaskFacts(free_lines=0, targets_remaining=3, reports_due=False),
+            main.task_id: TaskFacts(free_lines=2, targets_remaining=3, reports_due=False),
+            second.task_id: TaskFacts(free_lines=0, targets_remaining=3, reports_due=True),
         },
     )
 
