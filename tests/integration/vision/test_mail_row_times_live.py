@@ -1,7 +1,7 @@
 """用真实信箱截图守住一条判据的**前提**：时间那一格比主题稳一个量级。
 
-事故（2026-08-18）：`_scroll_mail_list_to_top` 判「拖不动了」比的是
-`MailRow.identity`（主题 + 时间），而主题那一格读不稳——面板是半透明的，
+事故（2026-08-18）：`_scroll_mail_list_to_top` 判「拖不动了」比的是主题 + 时间
+拼起来的行身份，而主题那一格读不稳——面板是半透明的，
 背后那一页的字（`-TOTAL CREWS`、`-17003`、`personnel`）透上来落进同一块 ROI，
 同一封邮件两次读成 `'大 Sw GEF攻击报告 bad'` 与 `'EN SEFATing bad Za once'`。
 于是「还是那几封」**永远不成立**，每一趟都走满 40 次上限（近四分钟），
@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,9 @@ TESSERACT = os.environ.get("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tes
 #: 混进来只会把统计稀释掉；这几张是确认过的列表页（含到顶的与滚到半路的）。
 SCREENS = (
     "rep-8-reports.png",
+    # 同一秒真有两封邮件的那一屏（`13:07:42` 上 `远征舰队返回` 与 `远征报告`）。
+    # `MailRow.identity` 只认时间那一格，靠的就是「同秒最多是一对」这个前提。
+    "rep-7-mail.png",
     "dump-mail-detail-unrendered-053043.png",
     "dump-mail-detail-unrendered-203351.png",
     "dump-mail-detail-unrendered-113633.png",
@@ -78,6 +82,29 @@ def test_the_time_column_is_readable_where_the_subject_is_not() -> None:
     assert rows, "一行都没读出来，先看 ROI 是不是错了"
     assert len(timed) >= 0.8 * len(rows), f"只有 {len(timed)}/{len(rows)} 行读出时间"
     assert not clean, f"主题居然读对了 {len(clean)} 行：{[row.subject for row in clean]}"
+
+
+def test_mails_that_share_a_second_come_in_pairs_not_screenfuls() -> None:
+    """同一秒的邮件**最多成对**，不会是一整屏。这是「身份只认时间」的前提。
+
+    `MailRow.identity` 拿时间那一格当跨屏去重的身份（理由整段在那里），代价是
+    同秒两封在观测上不可分：那一对正好被屏幕下边缘切开时，后一封这一趟会被
+    当成重复跳过。**这个代价的大小完全取决于同秒能挤几封**——一对就是偶尔漏一封
+    （下一趟还能读到），一屏就是整页塌掉。
+
+    实拍上确实有一对（`rep-7-mail.png`：`08/08/2026 13:07:42` 同时是
+    `远征舰队返回` 和 `远征报告`，舰队落地那一瞬间同时产出通知和报告），
+    但没有任何一屏出现三行同秒。阈值就守在这里：真哪天挤出三封，得先让这条红
+    一次、有人看过，才轮到讨论要不要换别的身份。
+    """
+    worst: dict[str, int] = {}
+    for path in _paths:
+        counts = Counter(row.raw_time_text for row in _rows(path) if row.raw_time_text)
+        worst[path.name] = max(counts.values(), default=0)
+
+    assert worst, "一屏都没读出来，先看 ROI 是不是错了"
+    crowded = {name: most for name, most in worst.items() if most > 2}
+    assert not crowded, f"有屏出现三行以上同秒：{crowded}"
 
 
 def test_the_same_screen_read_twice_agrees_on_the_times() -> None:

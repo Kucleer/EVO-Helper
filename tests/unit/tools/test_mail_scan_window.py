@@ -27,7 +27,8 @@
   漏开一封 = 这一轮少一份报告，多开一封 = 多花八秒。
 - **窗口不再钉死 6 行。** 筛掉的行不花开封预算，于是同样的时间能多翻几屏。
   翻屏的落点没法标定，所以停止条件是「这一屏还有没有没见过的行」，
-  行的身份取自它自己的主题+时间。
+  行的身份取自它自己的**时间那一格**（`MailRow.identity`；原先取主题 + 时间，
+  被 OCR 噪声打穿，见文末那一节）。
 - **按时间早停。** 列表按时间倒序，翻到比「最早那一发的派出时刻」还早的报告，
   往下就不可能再有本轮的报告了。这是把窗口开大之后仍然不会翻一整个信箱的闸门。
 """
@@ -198,13 +199,17 @@ def test_the_window_reaches_past_the_first_screen() -> None:
     原先窗口钉死在最上面 6 行，于是这份报告永远翻不到——而日志只会说
     「还没出现在信箱最上面几行」，听起来像是报告还没到。
 
-    顺带钉住**行身份取主题+时间、不取行号**：第二屏的这一行也是「第 0 行」，
+    顺带钉住**行身份取时间那一格、不取行号**：第二屏的这一行也是「第 0 行」，
     按行号去重就会把它当成第一屏那行、直接跳过，翻屏等于白翻。
+
+    ⚠️ 每一行给一个**各不相同**的时刻，因为信箱按时间倒序排——排在第二屏的这一封
+    必然比第一屏那六封更早。原先这七行全用 `minutes_ago` 的默认值 0，也就是七封
+    邮件同处一秒，而实拍上同秒最多是一对（`MailRow.identity` 里那段取舍）。
     """
     loop, _events, opened = _loop(
         [
-            [_row(index, ReportKind.ATTACK) for index in range(6)],
-            [_row(0, ReportKind.SCOUT)],
+            [_row(index, ReportKind.ATTACK, minutes_ago=index) for index in range(6)],
+            [_row(0, ReportKind.SCOUT, minutes_ago=6)],
         ]
     )
 
@@ -524,8 +529,10 @@ def test_screens_of_already_seen_rows_keep_scrolling() -> None:
 def test_the_trip_stops_when_a_drag_changes_nothing() -> None:
     """真的到底了：拖了一下，还是那几封。
 
-    ⚠️ 判据是**行身份**（主题+时间）而不是行的位置：拖动带惯性，同一批行在两屏
-    之间位置会差几像素，按位置比会永远判「还能拖」，于是拖满上限才罢休。
+    ⚠️ 判据是**行的内容**（时间列，`mail_times_settled`）而不是行的位置：拖动带惯性，
+    同一批行在两屏之间位置会差几像素，按位置比会永远判「还能拖」，于是拖满上限才罢休。
+    主题噪声那一侧另有专文
+    （`test_a_drag_that_changes_nothing_stops_the_trip_despite_subject_noise`）。
     """
     same = [_row(0, ReportKind.SCOUT, minutes_ago=1)]
     loop, _events, opened = _loop([list(same) for _ in range(6)])
@@ -589,3 +596,197 @@ def test_the_step_timer_never_goes_backwards() -> None:
     # 把墙钟往回拨一年也不该影响它。
     assert timer._laps[0][1] >= 0
     assert time_module.monotonic() >= timer._start
+
+
+# -- 跨屏去重：身份只认时间那一格 --------------------------------------------
+#
+# ⚠️ **这一节是 2026-08-18 重复开封的正因。** 行身份原先取「主题 + 时间」，
+# 而主题那一格在实机上根本读不稳（理由整段在 `mail_times_settled`：实拍
+# 32 屏 192 行里，主题一字不差的是 0 行，时间读出 180 行 = 93.8%）。
+# 于是同一封邮件在两屏上算成两封「没见过的」，被**重开一遍**——而开一封约八秒，
+# 一趟的开封预算只有 `MAIL_MAX_OPENS` 封。
+
+
+#: 生产日志（2026-08-18 20:35–20:37，`system_log`）里同一封邮件在两屏上的两次读数。
+#: **主题一个字都对不上，时间那一格分毫不差**——这一对就是缺陷的全貌：
+#:
+#:     20:35:45 第 4 行开封（18/08/2026 09:07:54 '大 sw, 攻击报告 band'）
+#:     20:36:40 第 0 行开封（18/08/2026 09:07:54 'EN ATR band , £& oe'）
+#:
+#: 两次读数一次认成 `ATTACK`、一次认成 `UNKNOWN`，而 `may_be` 刻意把 `UNKNOWN`
+#: 也放进来——所以**两次都会被打开**，主题这一格连「筛掉重复」都指望不上。
+REREAD_TWICE = (
+    ("18/08/2026 09:07:54", "大 sw, 攻击报告 band", "EN ATR band , £& oe"),
+    ("18/08/2026 08:55:37", "26 攻击报告 bad", "一一 bad 了六 Se"),
+)
+
+
+def _read(index: int, raw_time: str | None, subject: str) -> MailRow:
+    """按 OCR **读到的原文**造一行，不修不补——主题就是那串噪声。
+
+    走 `mail_row_from_text` 而不是直接构造 `MailRow`：时间的认法与时区换算
+    要和实机同一条，否则钉住的是夹具而不是判据。
+    """
+    text = f"{subject}\n{raw_time}\n" if raw_time is not None else f"{subject}\n"
+    return mail_row_from_text(index, text)
+
+
+def test_the_same_mail_read_twice_with_different_subjects_is_opened_once() -> None:
+    """**缺陷本体。** 同一封邮件在两屏上主题读成两样，不许因此被开第二次。
+
+    实机 2026-08-18 那一趟：8 封的预算里有 2 封是重复的（≈46 秒），紧接着就打了
+    「这一趟已经开了 8 封，到上限」——**重开挤掉的正是还没读的战报**。
+    """
+    older, newer = REREAD_TWICE[1][0], REREAD_TWICE[0][0]
+    first = [
+        _read(0, "18/08/2026 09:30:11", "攻击报告"),
+        _read(1, "18/08/2026 09:20:04", "攻击报告"),
+        _read(2, newer, REREAD_TWICE[0][1]),
+        _read(3, older, REREAD_TWICE[1][1]),
+    ]
+    # 往下拖了一下：上一屏最后两行滑到了最上面，**主题换了一副样子，时间没变**。
+    second = [
+        _read(0, newer, REREAD_TWICE[0][2]),
+        _read(1, older, REREAD_TWICE[1][2]),
+        _read(2, "18/08/2026 08:41:20", "攻击报告"),
+        _read(3, "18/08/2026 08:30:02", "攻击报告"),
+    ]
+    loop, _events, opened = _loop([first, second])
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+    )
+
+    assert [row.raw_time_text for row in opened] == [
+        "18/08/2026 09:30:11",
+        "18/08/2026 09:20:04",
+        newer,
+        older,
+        "18/08/2026 08:41:20",
+        "18/08/2026 08:30:02",
+    ], "同一封邮件被开了第二次——每重复一封白花八秒，还挤掉一封没读的战报"
+
+
+def test_a_drag_that_changes_nothing_stops_the_trip_despite_subject_noise() -> None:
+    """真的到底了：拖了一下，**时间列**还是那几个。主题噪声不许让这条判据失效。
+
+    ⚠️ 断言的是**它停下来了**（只走 2 屏），不是「没重开」——后者在没停下来时
+    同样成立，因为 `seen` 已经挡着重复开封。差别全在白拖掉的那两屏（每屏一次
+    读屏加一次慢拖）。判据换成 `mail_times_settled` 之前，这里比的是行身份，
+    而主题一字不差的行是 0 行，于是「还是那几封」**永远不成立**。
+    """
+    times = [f"18/08/2026 09:{minute:02d}:11" for minute in (30, 25, 20, 15)]
+    first = [_read(index, moment, "攻击报告") for index, moment in enumerate(times)]
+    # 同一批邮件、同样的时间，主题每读一遍都是一副新样子。
+    second = [
+        _read(index, moment, noise)
+        for index, (moment, noise) in enumerate(
+            zip(times, ("大 sw, band", "EN ATR £& oe", "26 bad", "一一 了六 Se"), strict=True)
+        )
+    ]
+    loop, _events, opened = _loop([first, second, list(first), list(second)])
+
+    scan = loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=4,
+    )
+
+    assert scan.pages == 2, "拖不动了却还在拖：每白拖一屏约 5.8 秒"
+    assert loop._driver.clicks.count("打开邮件") == 4, "同一封不许开第二次"
+
+
+def test_two_rows_without_a_readable_time_are_never_collapsed() -> None:
+    """**时间读不出的行一律算「没见过」**，绝不拿空时间当身份互相顶掉。
+
+    这是把身份从「主题 + 时间」换成「只认时间」时唯一真正危险的一步：写成
+    `raw_time_text or ""` 的话，一屏里所有读不出时间的行会共用同一个身份，
+    第一行之外全被静默判成重复——而实拍上读不出时间的行占 6.2%（192 行里 12 行），
+    一趟 4 屏就摊到两三行。
+
+    静默少开一封的代价与「多开一封」不对称：多开只是多花八秒，少开是这一轮
+    少一份战报（侦察白飞、探路白派），而 `observe` 那一路少数一份**正是会超额
+    的那一侧**（见 `DailyTally`）。
+    """
+    kept = "18/08/2026 09:20:04"
+    first = [
+        _read(0, None, "攻击报告"),
+        _read(1, None, "攻击报告"),  # 同样读不出时间、主题也一模一样，但是**另一封**
+        _read(2, kept, "攻击报告"),
+    ]
+    # 往下拖了一下：读出时间的那封滑到最上面（认得出，不再开），而它下面又是
+    # 一封读不出时间的——**跨屏**这一侧才是 `or ""` 那种写法真正塌掉的地方。
+    second = [
+        _read(0, kept, "攻击报告"),
+        _read(1, None, "攻击报告"),
+    ]
+    loop, _events, opened = _loop([first, second])
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=2,
+    )
+
+    assert [(row.index, row.raw_time_text) for row in opened] == [
+        (0, None),
+        (1, None),
+        (2, kept),
+        (1, None),
+    ], "读不出时间的行被拿空时间当身份互相顶掉了"
+
+
+def test_two_mails_that_share_a_second_on_one_screen_are_both_opened() -> None:
+    """同一秒真的会有两封邮件，同屏时两封都要开。
+
+    实拍 `rep-7-mail.png` 上就有一对：`08/08/2026 13:07:42` 同时是
+    `远征舰队返回` 和 `远征报告`——舰队落地那一瞬间同时产出通知和报告。
+    32 屏 192 行里这样的一对出现 1 次。
+
+    所以「记下见过的」必须排在「挑出没见过的」**之后**：同一屏上的两行按构造
+    就是两封不同的邮件（行号不同），任何时候都不该互相顶掉。跨屏那一侧顶不掉的
+    办法不存在——只有时间这一个可信的观测量，同秒两封在观测上就是不可分的，
+    取舍写在 `MailRow.identity` 里。
+    """
+    rows = [
+        _read(0, "08/08/2026 13:07:42", "bad ao 远征舰队返回"),
+        _read(1, "08/08/2026 13:07:42", "yw a 远征报告 ‘eo m"),
+    ]
+    loop, _events, opened = _loop([rows])
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=1,
+    )
+
+    assert [row.index for row in opened] == [0, 1], "同一屏上同一秒的两封被当成一封了"
+
+
+def test_a_screen_that_read_nothing_is_not_mistaken_for_the_bottom() -> None:
+    """整屏一行都没读出来**不算到底**——那是 OCR 没读出来，照拖不误。
+
+    这一条从旧实现继承（`if identities and ...` 那个前置守卫），换判据时不许弄丢：
+    读空当成到底，一次 OCR 抖动就能把这一趟剩下的屏全部砍掉。
+    """
+    first = [_read(index, f"18/08/2026 09:{30 - index:02d}:11", "攻击报告") for index in range(2)]
+    later = [_read(0, "18/08/2026 08:15:03", "攻击报告")]
+    loop, _events, opened = _loop([first, [], later])
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=3,
+    )
+
+    assert [row.raw_time_text for row in opened] == [
+        "18/08/2026 09:30:11",
+        "18/08/2026 09:29:11",
+        "18/08/2026 08:15:03",
+    ], "读空那一屏被当成到底了，后面的邮件再也翻不到"

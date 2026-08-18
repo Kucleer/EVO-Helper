@@ -42,6 +42,7 @@ from evo_helper.tools.pirate_loop import (
     ReportIngest,
     RoundExhausted,
     exit_code_for,
+    mail_row_from_text,
 )
 from evo_helper.vision.parsers import ReportKind
 
@@ -72,6 +73,15 @@ def _row(index: int, kind: ReportKind, at: datetime) -> MailRow:
         reported_at_utc=at,
         kind=kind,
     )
+
+
+def _reread(index: int, at: datetime, subject: str) -> MailRow:
+    """按 OCR **读到的原文**造一行：主题就是那串噪声，时间是实机的那个格式。
+
+    走 `mail_row_from_text` 而不是直接构造 `MailRow`：主题与时间的认法要和实机
+    同一条，否则钉住的是夹具而不是判据。
+    """
+    return mail_row_from_text(index, f"{subject}\n{at:%d/%m/%Y %H:%M:%S}\n")
 
 
 class _Repository:
@@ -306,6 +316,37 @@ def test_a_screen_with_nothing_new_is_not_a_complete_scan(monkeypatch: pytest.Mo
 
     assert repository.records[0]["observed_reports"] == 1
     assert repository.records[0]["complete"] is False
+
+
+def test_the_same_mail_is_not_counted_twice_when_its_subject_is_read_differently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一封战报在两屏上主题读成两样，**只能算一发**。
+
+    数数走的是 `observe`，而 `observe` 只喂「没见过的行」。行身份原先取
+    「主题 + 时间」，而主题那一格实拍上一字不差的是 0 行——噪声不同、类型却仍认得出
+    （实拍里 `'ea 侦察报告'`、`'wet 侦察报告'`、`'《oO 侦察报告'` 是三行的三副样子），
+    于是同一封被数了两遍。
+
+    数多了不像数少了那样会超额（`DailyTally` 里那一段），但它同样是把配额记错：
+    以为今天已经打够了，于是**提前收手**，白放着额度不打。
+    """
+    at = NOON - timedelta(minutes=5)
+    kept = NOON - timedelta(minutes=20)
+    first = [
+        _row(0, ReportKind.PIRATE, at),
+        _reread(1, kept, "大 sw, 海盗攻击报告 band"),
+    ]
+    # 往下拖了一下：上一屏最后那封滑到最上面，时间没变，主题换了一副样子。
+    second = [
+        _reread(0, kept, "26 海盗攻击报告 bad"),
+        _row(1, ReportKind.PIRATE, DAY_START - timedelta(minutes=1)),
+    ]
+    loop, repository, _opened = _loop([first, second])
+
+    _reconcile(loop, monkeypatch)
+
+    assert repository.records[0]["observed_reports"] == 2, "同一封战报被数成了两发"
 
 
 # -- 读与数：同一趟，两笔预算 ------------------------------------------------
