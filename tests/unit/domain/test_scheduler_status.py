@@ -169,10 +169,15 @@ def test_missing_military_scores_are_not_dressed_up_as_a_finished_round() -> Non
 
     ⚠️ **成因 2026-08-18 换过一次。** 这条用例从前叫
     `test_stale_military_scores_…`，钉的是「分数全过期」那一档：那一版超期的目标
-    会被整批滤掉，所以「全过期」确实能让 `targets_remaining` 归零。这一版超期不再
-    挡任何目标（选靶交给时间池，见 `domain.target_order`），那个成因随之消失，
-    剩下的唯一成因是**候选全都从没上过军力榜**——判据与文案跟着改，否则页面会
-    指着一个不存在的原因，用户照它去把有效期调长，调完照样一发不派。
+    会被整批滤掉，所以「全过期」确实能让 `targets_remaining` 归零。超期不再能让
+    候选归零（读数都旧了就放弃窗口、照打，见 `domain.target_order`），那个成因
+    随之消失，剩下的唯一成因是**候选全都从没上过军力榜**——判据与文案跟着改，
+    否则页面会指着一个不存在的原因，用户照它去把有效期调长，调完照样一发不派。
+
+    ⚠️ **同日第二次改造之后这条判据仍然没动，这是有意的。** 窗口筛选是第 3 步的
+    事，而 `scores_are_missing` 数的是第 2 步的余量（有读数的候选数）——窗口把人
+    筛光了不会让那个数变 0。两档说的是两件事：这一档是「一条读数都没采到」，
+    `WIDENED_SCORE_WINDOW` 是「采到了，只是都旧了」。
 
     判据本身没变，也不该变：两件事在 `targets_remaining` 上长得一模一样（都是 0），
     而「已完成」听起来是这一轮顺利跑完了，实际是一个都打不了。说反了的代价是
@@ -200,6 +205,49 @@ def test_missing_scores_do_not_shout_over_a_task_that_still_has_work() -> None:
     却写着「军力数据未采集」，用户会去等一轮根本不需要等的扫描。
     """
     assert status(MissionKind.BOT, targets_remaining=3, scores_are_missing=True) is TaskStatus.READY
+
+
+def test_a_widened_score_window_says_so_instead_of_saying_ready() -> None:
+    """⚠️ **用例 (c)：放宽窗口时页面得说得出「正在放宽」。**
+
+    用户 2026-08-18 的原话：「今晚这件事的真正问题不是『用了旧数据』，而是
+    **用了旧数据却没人告诉你**——你是从攻击日志里一条一条对出来的」。所以放宽
+    这件事必须在**页面上**也有一档，而不是只写进日志：任务页是他每天真的会看的
+    那一页，日志是出事之后才去翻的。
+
+    它占掉的是「待命」——放宽的时候任务照跑，所以它属于「有活干」那一支。
+    这条用例因此同时钉住两件事：**说得出来**，而且**说在正确的那一档上**。
+    """
+    assert (
+        status(MissionKind.BOT, targets_remaining=3, scores_window_widened=True)
+        is TaskStatus.WIDENED_SCORE_WINDOW
+    )
+
+
+def test_a_normal_round_is_still_plain_ready() -> None:
+    """反向那一半：没放宽就得老老实实显示「待命」。
+
+    少了这条，一个「恒报放宽」的实现会全绿——而每一行都标着警告的页面，
+    和一行都不标的页面一样没用。
+    """
+    assert (
+        status(MissionKind.BOT, targets_remaining=3, scores_window_widened=False)
+        is TaskStatus.READY
+    )
+
+
+def test_a_widened_window_never_hides_why_a_task_is_not_moving() -> None:
+    """⚠️ **「为什么不动」永远排在「用的什么数据」前面。**
+
+    两者同时成立时，用户对着一个不动的任务最想知道的是它什么时候动。放宽窗口
+    这句话盖住「等航线」的话，他会去调有效期——调完任务照样不动。
+
+    这也是这一档**只替换「待命」**、不排在整个 `has_work` 之前的理由。
+    """
+    assert (
+        status(MissionKind.BOT, free_lines=0, scores_window_widened=True)
+        is TaskStatus.WAITING_LINES
+    )
 
 
 def test_no_free_lines_reads_as_waiting_for_lines() -> None:

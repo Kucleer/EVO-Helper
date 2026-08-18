@@ -389,8 +389,9 @@ class MilitaryAttackConfigView:
     unknown_line_hold_minutes: int | None = None
     reconcile_cooldown_minutes: int | None = None
     bot_revisit_hours: int | None = None
-    #: 军力时间池：按读数时间倒序取前几个；`None` = 留空 = 默认 500。
-    military_time_pool: int | None = None
+    # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 删掉了（理由在
+    # `domain.target_order` 模块头第 3 步）。「用多新的数据」改由任务参数
+    # `score_max_age_hours` 划线回答。
     #: 全账号同时在飞的舰队上限；`None` = 留空 = 默认 9。
     account_line_limit: int | None = None
     #: 自动停用/恢复日志的限流窗口（秒）；`None` = 留空 = 默认 120。

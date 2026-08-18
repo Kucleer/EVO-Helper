@@ -278,12 +278,10 @@ class MilitaryAttackConfigOut(BaseModel):
     reconcile_cooldown_minutes: int | None = None
     #: 同一个 bot 坐标多久之内不重复打（小时）。**`None` = 留空 = 默认 24。**
     bot_revisit_hours: int | None = None
-    #: 军力时间池：按军力读数时间倒序取前几个进池。**`None` = 留空 = 默认 500。**
-    #:
-    #: 与任务参数里的「军力截断」（`top_n`）各管一件事：这个数管「用多新的数据」，
-    #: 那个数管「只打多强的」。范围同样由
-    #: `MissionScheduler.validate_military_time_pool` 判，这里只认「是不是整数」。
-    military_time_pool: int | None = None
+    # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 随那个错误设计一起删掉了
+    # （理由在 `storage.models.MilitaryAttackConfigRow` 与 `domain.target_order`
+    # 模块头第 3 步）。**别加回来**：「用多新的数据」现在由任务参数
+    # `score_max_age_hours` 划线回答，不再有「取前几个」这件事。
     #: **全账号**同时在飞的舰队上限。**`None` = 留空 = 默认 9。**
     #:
     #: 它和任务上那个「航线数」是两道**同时生效**的闸（用户口径 2026-08-18：
