@@ -582,6 +582,13 @@ class PersistentApplicationService:
                         intent.origin_galaxy, intent.origin_system, intent.origin_position
                     ),
                     target_kind=intent.target_kind,
+                    # ⚠️ **快照列直读，绝不 join `bot_targets`。** 那张表存的是当前值，
+                    # 每采一次军力榜就整行覆盖；现取会让这一列随着扫描不断改口，
+                    # 而它要答的恰恰是「派这一发时看到的是多少」。整段理由写在
+                    # `storage.models.AttackIntentRow.target_military_score` 上。
+                    # NULL 原样带出去——历史行没有这个观测，页面显示「—」。
+                    target_military_score=intent.target_military_score,
+                    target_military_score_at_utc=intent.target_military_score_at_utc,
                     preset_name=intent.preset_name,
                     preset_signature=intent.preset_signature,
                     guard_status=intent.guard_status,

@@ -44,6 +44,8 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
+        # 派这一发时那个军力读数是什么时候读到的（PR #183 的快照列）。
+        "attack_intents.target_military_score_at_utc",
         "battle_report_screenshots.captured_at_utc",
         "battle_reports.reported_at_utc",
         "bot_targets.last_attack_at_utc",
@@ -108,6 +110,8 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         # b3f5c8d10a27（任务定时开关）加的两列，那条迁移里写着 `timezone=True`。
         "mission_tasks.enabled_from_utc",
         "mission_tasks.enabled_until_utc",
+        # c3f7a2b81d54（派遣时的目标军力快照）加的，那条迁移里也写着 `timezone=True`。
+        "attack_intents.target_military_score_at_utc",
     }
 )
 

@@ -126,6 +126,25 @@ def settled_score(score: float | None) -> float | None:
     return round(score, SCORE_DECIMALS)
 
 
+def military_score_text(score: float | None) -> str:
+    """军力值在攻击日志上的写法：带千分位，没有读数就是「—」。
+
+    ⚠️ **`None` 必须显示成「—」，不能是 0。** 海盗位在 `bot_targets` 里没有行、
+    还没上过榜的 bot 有行但没读数，两种都是 `None`；而被打空的 bot 军力真的是 0，
+    它要照样显示成 `0`。把「没读数」写成 0 会让日志声称观测过一个从未发生的读数。
+
+    先过 `settled_score` 收一次浮点噪声（理由见那个函数），再去掉恒为 `.0` 的
+    小数尾巴：军力值绝大多数是整数，`57,180.00` 只是噪音；插值出来的 `.5`
+    是合法值（`domain.ranking.interpolate_scores`），保留两位显示得出来。
+    """
+    settled = settled_score(score)
+    if settled is None:
+        return "—"
+    if settled == int(settled):
+        return f"{int(settled):,}"
+    return f"{settled:,.2f}"
+
+
 #: 补录能补的两条链路在界面上的名字。键是 `application.backfill.BACKFILL_KINDS`
 #: 的取值，也就是 CLI 的 `--kind`。接口与命令行一律英文，界面只显示中文。
 BACKFILL_KIND_LABELS: dict[str, str] = {
