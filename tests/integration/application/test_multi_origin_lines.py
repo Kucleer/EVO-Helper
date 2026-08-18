@@ -119,11 +119,18 @@ def target_near(  # type: ignore[no-untyped-def]
     return coordinate
 
 
-def occupy(repository, run_id, origin: Coordinate, count: int) -> None:  # type: ignore[no-untyped-def]
+def occupy(  # type: ignore[no-untyped-def]
+    repository, run_id, origin: Coordinate, count: int, *, ago: timedelta | None = None
+) -> None:
     """从这颗星球派 `count` 发还没回来的舰队，把它的航线占住。
 
-    飞行时间给 25 分钟（往返 50 分钟），所以在 `NOW + 40 分钟` 之前它们一直占着。
-    目标位次从 10 起、逐发递增：同一坐标同一周期只记得下一发（唯一约束）。
+    默认 10 分钟前派出、飞行 25 分钟（往返 50 分钟），所以在 `NOW + 40 分钟`
+    之前它们一直占着。目标位次从 10 起、逐发递增：同一坐标同一周期只记得下一发
+    （唯一约束）。
+
+    `ago` 传了就**不给飞行时间**：那一档按 `UNKNOWN_LINE_HOLD`（90 分钟）算仍然
+    占着航线。这是「这颗星球满着，而且它上次出兵是很久以前」唯一的构造方式——
+    给了飞行时间的话，占位时长和「上次出兵多久以前」就绑死在一起了。
     """
     for index in range(count):
         dispatch(
@@ -131,8 +138,8 @@ def occupy(repository, run_id, origin: Coordinate, count: int) -> None:  # type:
             run_id,
             TARGET_KIND_BOT,
             target=Coordinate(origin.galaxy, origin.system, 10 + index),
-            dispatched_at=NOW - timedelta(minutes=10),
-            flight=timedelta(minutes=25),
+            dispatched_at=NOW - (ago if ago is not None else timedelta(minutes=10)),
+            flight=None if ago is not None else timedelta(minutes=25),
             origin=origin,
         )
 
@@ -437,12 +444,48 @@ def test_no_planet_can_dispatch_raises_idle_not_a_config_error(  # type: ignore[
 def test_an_idle_round_neither_disables_the_task_nor_counts_as_a_failure(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, clock, session_factory, run_id
 ) -> None:
-    """空手而归的一轮：任务照常参与调度，连续失败计数一动不动。
+    """空手而归的一轮**真的走一遍 `_launch`**：不停用、不记失败、不起进程。
+
+    ⚠️ **这一条必须让判据真的走到 `_launch` 那道闸上。** 航线全满的构造走不到
+    ——`has_work` 早在 `free_lines == 0` 那里就把它拦下了，于是「抛的是哪个异常」
+    根本没被执行到，把 `MissionIdle` 换回 `NoFreeLineError` 也照样全绿。
+
+    所以这里用的是**航线有、目标却凑不出来**那一档：候选有军力读数（
+    `targets_remaining > 0`，`has_work` 放行），但军力上限把它整批挡在池外，
+    于是 `_military_assignments` 空手而归。这正是 `MissionIdle` 存在的理由。
 
     ⚠️ **不只钉 `disabled_reason`。** 只钉那一列的话，「抛 `NoFreeLineError` 但
     恰好又被自动恢复了」也能蒙混过关——而那正是 447 次抖动的样子。所以这里连着
     tick 二十次（跨过一个 `RESTART_COOLDOWN`），要求这中间**一个进程都没起、
     一次失败都没记**。
+    """
+    bot = with_lines(repository, session_factory, (FIRST, 6), (SECOND, 6), account_limit=9)
+    # `max_score` 是军力**上限**：军力高于它的一律不进池（`strongest_within`）。
+    # 这两颗目标都远高于 100，于是候选池有货、选中的却是空集。
+    repository.update_mission_task(
+        bot, params_json='{"by_military": true, "top_n": 50, "max_score": 100}'
+    )
+    target_near(session_factory, FIRST, offset=0, score=9_000.0)
+    target_near(session_factory, SECOND, offset=1, score=8_000.0)
+    scheduler.start()
+
+    for minutes in range(20):
+        clock.now = NOW + timedelta(minutes=minutes)
+        scheduler.tick()
+
+    row = row_of(repository, bot)
+    assert row.disabled_reason is None, "凑不出目标是正常间歇，不该把任务停用"
+    assert row.disabled_recovery is None
+    assert row.consecutive_failures == 0, "连进程都没起，不该记失败"
+    assert launcher.spawned == []
+
+
+def test_lines_full_on_every_planet_never_starts_a_round(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock, session_factory, run_id
+) -> None:
+    """两颗星都满着的那一档：`has_work` 就该把它拦下，一轮都不起、也不停用。
+
+    和上一条互补——那条量的是「走到了 `_launch` 之后」，这条量的是「压根没走到」。
     """
     bot = with_lines(repository, session_factory, (FIRST, 2), (SECOND, 2), account_limit=9)
     target_near(session_factory, FIRST, offset=0, score=9_000.0)
@@ -458,7 +501,7 @@ def test_an_idle_round_neither_disables_the_task_nor_counts_as_a_failure(  # typ
     row = row_of(repository, bot)
     assert row.disabled_reason is None, "航线暂时占满是正常间歇，不该把任务停用"
     assert row.disabled_recovery is None
-    assert row.consecutive_failures == 0, "连进程都没起，不该记失败"
+    assert row.consecutive_failures == 0
     assert launcher.spawned == []
 
 
@@ -475,13 +518,28 @@ def test_when_has_work_says_yes_the_launch_gate_always_lets_it_through(  # type:
     第一组（1 号星），`max_dispatches = min(2, 0) = 0` → `NoFreeLineError` → 停用
     → 下一 tick 合计仍是 2 → 恢复 → 再撞。一小时 447 个来回。
 
-    所以断言是**两句一起**：`has_work` 说能跑，那 `_military_command` 就必须真的
-    组得出一条命令行。少了后半句，把 `_free_lines_from` 改回 `sum` 也能全绿。
+    ⚠️ **1 号星必须同时是「满着的」和「上次出兵最久远的」那颗**，否则轮换会顺手
+    把它绕过去，这条用例就测不到闸门本身了。所以它那两发占位派遣给的是
+    80 分钟前、且**没有飞行时间**的那一档：按 `UNKNOWN_LINE_HOLD`（90 分钟）算
+    仍然占着航线，而「上次出兵」是 80 分钟前——2 号星才 10 分钟。
+
+    断言是**两句一起**：`has_work` 说能跑，那 `_military_command` 就必须真的组得
+    出一条命令行、而且是从**派得出去**的那颗星球。少了后半句，把
+    `_free_lines_from` 改回 `sum`、或者把原样航线数喂给分配那一步，都能全绿。
     """
     bot = with_lines(repository, session_factory, (FIRST, 2), (SECOND, 2), account_limit=9)
     target_near(session_factory, FIRST, offset=0, score=9_000.0)
     target_near(session_factory, SECOND, offset=1, score=8_000.0)
-    occupy(repository, run_id, FIRST, 2)
+    occupy(repository, run_id, FIRST, 2, ago=timedelta(minutes=80))
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=Coordinate(9, 250, 30),
+        dispatched_at=NOW - timedelta(minutes=10),
+        flight=timedelta(minutes=2),
+        origin=SECOND,
+    )
     scheduler.start()
 
     snapshot = scheduler.snapshot()
@@ -499,19 +557,29 @@ def test_the_task_never_flaps_between_disabled_and_resumed(  # type: ignore[no-u
 ) -> None:
     """整段跑下来一次自动停用都不该发生——这是上一条的行为版。
 
-    1 号星满、2 号星有余量，时钟一格一格往前挪。旧实现会在每个 tick 上停用一次、
-    恢复一次；正确的实现只是安静地从 2 号星派兵。
+    同一个现场（1 号星满着且等得最久、2 号星有余量），时钟一格一格往前挪。
+    旧实现会在每个 tick 上停用一次、恢复一次；正确的实现只是安静地从 2 号星派兵。
     """
     bot = with_lines(repository, session_factory, (FIRST, 2), (SECOND, 2), account_limit=9)
     target_near(session_factory, FIRST, offset=0, score=9_000.0)
     target_near(session_factory, SECOND, offset=1, score=8_000.0)
-    occupy(repository, run_id, FIRST, 2)
+    occupy(repository, run_id, FIRST, 2, ago=timedelta(minutes=80))
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=Coordinate(9, 250, 30),
+        dispatched_at=NOW - timedelta(minutes=10),
+        flight=timedelta(minutes=2),
+        origin=SECOND,
+    )
     scheduler.start()
 
     for minutes in range(20):
         clock.now = NOW + timedelta(minutes=minutes)
         scheduler.tick()
         assert row_of(repository, bot).disabled_reason is None, f"第 {minutes} 分钟被停用了"
+    assert launcher.spawned, "2 号星有航线也有目标，这一段里至少该派出去一轮"
     assert all(str(FIRST) not in " ".join(item.command) for item in launcher.spawned)
 
 
