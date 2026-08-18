@@ -367,7 +367,7 @@ def test_the_military_bot_row_never_claims_a_round_progress(console: Console) ->
 
     军力模式没有「本轮范围」：`targets_remaining` 走的是 `_military_candidates`，
     数的是**全库**还能打的 bot（排除近 24 小时打过的），实机两千多个，而任务
-    每轮只取前 `top_n` 名。把它写成「还剩 N 个未完成」，用户会当成本轮进度盯着
+    每轮只按得分派出航线预算允许的那几发。把它写成「还剩 N 个未完成」，用户会当成本轮进度盯着
     它往下走，可两个数从来对不上。用户口径 2026-08-17：「那个剩余 2098 就不需要
     显示」。
 

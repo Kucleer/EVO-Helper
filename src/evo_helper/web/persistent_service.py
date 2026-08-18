@@ -44,7 +44,7 @@ from evo_helper.domain.scheduler import (
     scheduling_order,
     status_of,
 )
-from evo_helper.domain.target_order import TOP_BY_MILITARY
+from evo_helper.domain.target_order import WINDOW_POOL_FLOOR
 from evo_helper.storage import models as orm
 from evo_helper.storage.intel import (
     DISPATCH_BLOCKED,
@@ -1836,8 +1836,8 @@ class MissionConsoleService:
                 # 范围模式的 `targets_remaining` 数的是本轮范围内那几个目标里还有
                 # 几个没走完，每打完一个就少一个——那是真的本轮进度。军力模式走的是
                 # `_military_candidates`，数的是**全库还能打的 bot 总数**（排除近 24
-                # 小时打过的、只留 NEEDS_ATTACK），实机两千多个；而任务实际每轮只取
-                # 「前 top_n 名」。把这个数写成「还剩 N 个未完成」，用户会当成本轮
+                # 小时打过的、只留 NEEDS_ATTACK），实机两千多个；而任务实际每轮只按得分派
+                # 出航线预算允许的那几发。把这个数写成「还剩 N 个未完成」，用户会当成本轮
                 # 进度盯着它往下走，可它既不是本轮的量、也不随攻击单调下降
                 # （榜单一采、24 小时窗口一滑，它能自己涨回去）。
                 # 数字本身没有能对上的口径，所以宁可不说，也不换算一个假的出来。
@@ -1915,10 +1915,13 @@ class MissionConsoleService:
     def _bot_summary(self, params: dict[str, Any]) -> str:
         """区间里有几个已记录的 bot。N=0 就禁止启用，所以 N 必须先看得见。"""
         if params.get("by_military") is True:
-            # ⚠️ 说的是「截断」而不是「候选」：军力只在那一刀生效一次，之后按距离
-            # 重排。写成「候选 N 名」会让人以为它是一次排序。
-            top_n = params.get("top_n", TOP_BY_MILITARY)
-            return f"军力截断前 {top_n} 名 · 统一档位 · 按出发点就近分配"
+            # ⚠️ **这句话 2026-08-18 改过，别按旧版本理解 `top_n`。**
+            # 从前写的是「军力截断前 N 名 · 按出发点就近分配」，而那两件事都不再
+            # 发生了：军力硬截断取消、出击顺序也不再是「就近」，现在只有一条判据
+            # ——`军力 ÷ 往返小时`。`top_n` 只剩「窗口门限」这一个身份。
+            # 同一个数字在页面上和判据里说两件事，是这条链路每一次事故共同的形状。
+            window_floor = params.get("top_n", WINDOW_POOL_FLOOR)
+            return f"按「军力 ÷ 往返小时」出击 · 统一档位 · 窗口门限 {window_floor} 个"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -2045,11 +2048,11 @@ def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
         return "未设置半径" if radius is None else f"半径 {radius}"
     if kind is MissionKind.BOT:
         if params.get("by_military") is True:
-            top_n = params.get("top_n")
+            window_floor = params.get("top_n")
             return (
                 "军力攻击（统一档位）"
-                if not isinstance(top_n, int) or isinstance(top_n, bool)
-                else f"军力截断前 {top_n} 名（统一档位）"
+                if not isinstance(window_floor, int) or isinstance(window_floor, bool)
+                else f"军力攻击（统一档位）· 窗口门限 {window_floor} 个"
             )
         galaxy = params.get("galaxy")
         first = params.get("first_system")

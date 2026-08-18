@@ -23,8 +23,10 @@
 1. **撞上保护期 → 落库**（`note_protection_period`）。
 2. **下一轮选靶不再挑中它。**
 3. **排除窗口到期后重新可选**——排除是有尽头的，不是把目标永久删掉。
-4. **排除排在取前 N 之前**，和 24 小时那条一样；挪到后面会把候选池缩成空集
-   （`_military_candidates` 的 docstring 写着为什么）。
+4. **排除排在「花掉航线预算」之前**，和 24 小时那条一样；挪到后面会把候选池缩成
+   空集（`_military_candidates` 的 docstring 写着为什么）。
+   ⚠️ PR #194 之前这一条的说法是「排在取前 N 之前」——那道军力硬截断随第 ④⑤ 步
+   合并一起没有了，收窄候选池的闸口换成了航线预算。**不变量没有放宽，只换了载体。**
 5. **旋钮留空 = 默认 8 小时**，配了就按配的算，不可能的取值当场拒掉。
 
 ⚠️ **「保护期 8 小时」和「排除 8 小时」是两件事，同数不同义。** 前者是游戏规则
@@ -44,13 +46,15 @@ import pytest
 from sqlalchemy import select
 
 from evo_helper.application.mission_scheduler import MissionScheduler
-from evo_helper.domain.missions import MissionParamError
+from evo_helper.domain.missions import ORIGIN, MissionParamError
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.domain.target_order import (
     DEFAULT_PROTECTION_EXCLUSION,
     GAME_PROTECTION_HOURS,
     PROTECTION_EXCLUSION_MAX_HOURS,
+    ScoredTarget,
+    attack_value,
 )
 from evo_helper.infrastructure.system_log import (
     SystemLogContext,
@@ -67,8 +71,10 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from .conftest import Clock, make_supervisor
 
 NOW = datetime(2026, 8, 18, 20, 41, tzinfo=UTC)
-#: 军力截断只取 1 个：这样「排除排在取前 N 之前」这条才验得出来（见那条用例）。
-BOT_TOP_ONE = '{"by_military": true, "top_n": 1}'
+#: ⚠️ `top_n` 这个键 PR #194 之后**只剩「窗口门限」一个身份**（Python 侧叫
+#: `window_floor`），**不再决定打谁**。这里填 2 只是把门限压到候选数之下，好让窗口
+#: 不被放弃——「这一轮派几发」现在由航线预算定，见
+#: `test_the_exclusion_runs_before_the_budget_is_spent`。
 BOT_TOP_TWO = '{"by_military": true, "top_n": 2}'
 
 #: 实机 2026-08-18 20:29 那一轮里的两个坐标，原样搬过来。
@@ -95,12 +101,16 @@ def _task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
 def _enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object) -> None:
     """启用一条链路。**默认给 2 条航线**——理由见下。
 
-    ⚠️ `scheduler_config.fleet_line_limit` 的默认值只有 1 条，而按距离分配
-    （`domain.military_attack.assign_by_capacity_and_distance`）只会派到航线用完
-    为止。于是「候选池里有两个、只派得出一个」时，「排除了谁」和「距离谁更近」
-    这两件事的结果长得一模一样——**变异测试当场验出这个洞**：把排除整条删掉，
+    ⚠️ `scheduler_config.fleet_line_limit` 的默认值只有 1 条，而按得分分配
+    （`domain.military_attack.assign_by_capacity_and_value`）只会派到航线用完为止。
+    于是「候选池里有两个、只派得出一个」时，「排除了谁」和「谁的得分更高」这两件事
+    的结果长得一模一样——**变异测试当场验出这个洞**：把排除整条删掉，
     `test_the_next_round_no_longer_picks_a_protected_target` 照样绿，因为被排除的
     那个本来也轮不到。给足 2 条航线，「两个都该派出去」才成立，断言才落在排除上。
+
+    ⚠️ **`test_the_exclusion_runs_before_the_budget_is_spent` 反过来要 1 条**，
+    显式传 `fleet_lines=1` 覆盖这个默认——那一条要的正是「预算不够、必须二选一」
+    这个局面。两条用例的航线数是各自判据的一部分，不是随手填的。
     """
     fields.setdefault("fleet_lines", 2)
     repository.update_mission_task(_task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
@@ -261,35 +271,53 @@ def test_a_target_returns_once_the_exclusion_window_expires(  # type: ignore[no-
     )
 
 
-# -- ④ 排除必须排在取前 N 之前 -------------------------------------------------
+# -- ④ 排除必须排在「按得分花掉航线预算」之前 ---------------------------------
 
 
-def test_the_exclusion_runs_before_the_military_cut(  # type: ignore[no-untyped-def]
+def test_the_exclusion_runs_before_the_budget_is_spent(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
     """⚠️ **顺序本身就是判据。**
 
-    `top_n=1` 且**最强的那个正在保护期里**。两种顺序的结果完全相反：
+    ## PR #194 之后这条不变量换了载体，但**没有放宽**
 
-    - 先排除、再取前 N（正确）：池 = {弱}，取 1 个 → 打弱的那个。
-    - 先取前 N、再排除（错）：池 = {强}，排除之后 → **空集**，这一轮一发不派，
-      而弱的那个明明能打。
+    #194 把旧的第 ④ 步（军力硬截断前 `top_n` 名）与第 ⑤ 步（按距离出击）合并成了
+    一条判据：`得分 = 军力 ÷ 往返小时`。**「取前 N」那道墙没有了**，所以原先那个
+    「先取前 1 个 → 再排除 → 空集」的构造在新结构里造不出来。
 
-    `_military_candidates` 的 docstring 与 `domain.target_order` 的模块头都写着
-    这条，24 小时那一条当初正是因此被要求排在最前——保护期这一条是同一档判据，
-    挪到后面，缩成空集那个失败模式会原样复发。
+    但**缩成空集那个失败模式还在**，只是换了个闸口：如今把候选池收窄成「这一轮
+    真的派几发」的是**航线预算**（`domain.military_attack.assign_by_capacity_and_value`
+    ——航线用尽就不再配对）。所以不变量原样成立，只是措辞从「取前 N 之前」变成
+    「花掉航线预算之前」。
+
+    ## 这一条构造的局面
+
+    **只有 1 条航线**，两个候选，而**得分最高的那个正在保护期里**（两者同银河、
+    往返小时相同，所以 9000 分的排在 8000 分前面）：
+
+    - 先排除、再分配（正确）：池 = {弱}，那条航线派给弱的那个。
+    - 先分配、再排除（错）：那条唯一的航线被**强的那个**占掉，排除之后 →
+      **一发不派**，而弱的那个明明能打——正是实机 20:29 那一轮的形状。
+
+    24 小时那一条当初正是因此被要求排在最前；保护期这一条是同一档判据。
     """
     _add_target(session_factory, STRONGEST, military_score=9_000.0)
     _add_target(session_factory, WEAKER, military_score=8_000.0)
+    # 前置条件明写出来：得分高的那个必须正是被保护的那个，否则这条用例什么都没验。
+    # 断言它而不是相信它——`domain.flight_time` 的系数将来若改，要在这里先红。
+    assert attack_value(ScoredTarget(STRONGEST, military_score=9_000.0), ORIGIN) > attack_value(
+        ScoredTarget(WEAKER, military_score=8_000.0), ORIGIN
+    )
+
     repository.note_protection_period(STRONGEST, seen_at_utc=NOW - timedelta(minutes=12))
-    _enable(repository, MissionKind.BOT, params_json=BOT_TOP_ONE)
+    _enable(repository, MissionKind.BOT, params_json=BOT_TOP_TWO, fleet_lines=1)
     _only_bot(repository)
     scheduler.start()
 
     scheduler.tick()
 
     command = _launched(launcher)
-    assert command, "候选池被缩成了空集——排除跑在了军力截断之后"
+    assert command, "一发都没派——那条唯一的航线被保护期里的目标占掉了，排除跑晚了"
     assert any(part.startswith("4:445:5") for part in command)
 
 
