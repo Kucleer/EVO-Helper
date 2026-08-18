@@ -99,16 +99,19 @@
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
-    <label for="auto-toggle-log">自动停用/恢复日志窗口（秒，默认 {{ auto_toggle_log_default }}）</label>
+    <label for="auto-toggle-log">调度器重复日志窗口（秒，默认 {{ auto_toggle_log_default }}）</label>
     <input id="auto-toggle-log" type="number" min="0" max="{{ auto_toggle_log_max }}" step="1"
-           placeholder="留空 = {{ auto_toggle_log_default }}" aria-label="自动停用/恢复日志窗口（秒）">
+           placeholder="留空 = {{ auto_toggle_log_default }}" aria-label="调度器重复日志窗口（秒）">
   </div>
   <p class="muted">
-    同一个任务的「自动停用」「自动恢复」在这段时间里<strong>各最多落一条</strong>日志，
-    被压掉的次数记在下一条的 <code>suppressed_since_last_log</code> 里。<br>
-    <strong>调小</strong>（填 0 = 每次都记）：排障时看得最密、抖动频率一目了然；代价是一次反复跃迁能刷出上千行
-    （2026-08-18 01:00 实机：一小时 447 次停用 + 447 次恢复 = 1368 行）。<br>
-    <strong>调大</strong>：库里干净；代价是一次真实的反复跃迁被合并成看不出频率的一条。
+    调度器每秒都可能写的那几条日志——「自动停用」「自动恢复」「军力候选池」「军力读数放宽窗口」——
+    <strong>判定变了立刻写，没变则每种在这段时间里最多落一条</strong>。
+    被压掉的次数与横跨的时长记在下一条的 <code>suppressed_since_last_log</code> /
+    <code>suppressed_span_seconds</code> 里，一条信息都不会丢。<br>
+    <strong>调小</strong>（填 0 = 每次都记）：排障时看得最密、抖动频率一目了然；代价是一次反复抖动能刷出上万行
+    （2026-08-18 01:00 实机：一小时 447 次停用 + 447 次恢复 = 1368 行；同日 16:00：军力那两条一小时 12,155 行，
+    占 <code>system_log</code> 全表的 44%）。<br>
+    <strong>调大</strong>：库里干净；代价是一次真实的反复抖动被合并成看不出频率的一条。
     上限 {{ auto_toggle_log_max }} 秒（一小时）。
   </p>
 
@@ -174,7 +177,7 @@
     { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
     { element: document.getElementById('bot-revisit'), key: 'bot_revisit_hours', label: 'bot 重复攻击间隔' },
     { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
-    { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '自动停用/恢复日志窗口' },
+    { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '调度器重复日志窗口' },
   ];
   const errorBox = document.getElementById('settings-error');
   const coordinatePayload = (text) => {

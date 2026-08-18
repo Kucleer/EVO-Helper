@@ -175,7 +175,7 @@ _NEVER = datetime.min.replace(tzinfo=UTC)
 #: ——版本会变、道具会变。这个数只挡住明显不可能的取值。
 ACCOUNT_LINE_LIMIT_MAX = 99
 
-#: 「自动停用 / 自动恢复」这一对日志的默认限流窗口。
+#: 调度器**每 tick 都可能触发的那几条日志**共用的默认限流窗口。
 #:
 #: **它是为「反复跃迁」准备的，去重挡不住那一档。** 2026-08-18 01:00 那一小时里，
 #: 任务「扫描+攻击 bot」自动停用 447 次、自动恢复 447 次、写了 1368 行日志，
@@ -187,10 +187,17 @@ ACCOUNT_LINE_LIMIT_MAX = 99
 #: 可能触发的东西）。它是**运维旋钮**，可在攻击配置页上改
 #: （`military_attack_config.auto_toggle_log_seconds`）：调小排障时看得密、日志吵；
 #: 调大库干净，代价是一次真实的反复跃迁被合并成看不出频率的一条。
-AUTO_TOGGLE_LOG_WINDOW = timedelta(seconds=120)
+#:
+#: ⚠️ **2026-08-18 起它管的不止「自动停用 / 自动恢复」那一对。** 「军力候选池」
+#: 与「军力读数放宽窗口」这两条走的是同一道闸（见 `_log_a_repeated_line`）。
+#: 只做一个旋钮而不是两个，是因为两边的取舍**完全同向**：想把排障看密的人两边
+#: 都想密，嫌库吵的人两边都嫌吵。旋钮多一个就多一个要解释、要配、要配错的地方。
+#: 数据库那一列仍叫 `auto_toggle_log_seconds`（历史名，改名要迁移、要动页面，
+#: 换不来任何用户可见的好处），页面上的标题已经跟着改成「调度器重复日志窗口」。
+REPEATED_LOG_WINDOW = timedelta(seconds=120)
 
 #: 用户能填进去的日志窗口上界（秒）。一小时——再长就把一整夜的抖动合并成寥寥几条。
-AUTO_TOGGLE_LOG_MAX_SECONDS = 3600
+REPEATED_LOG_MAX_SECONDS = 3600
 
 #: 用户能填进去的重复攻击间隔上界（小时）。
 #: 一周：bot 军力每周一 UTC+0 刷新，跨过一个刷新周期之后，「上周打过」拦住的是
@@ -235,6 +242,67 @@ _TARGET_KIND = {
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class _RepeatedLine:
+    """一条高频日志上一次**真的落库**时的账。见 `MissionScheduler._log_a_repeated_line`。
+
+    ⚠️ `signature` 必须覆盖那条消息里出现的**每一个会变的数**。少覆盖一个，
+    「和上一条一样」这句判断就是错的，而错的那一刻会被限流压成沉默——
+    库里留下的是一条**内容已经不对了却假装还没变**的日志。这条不变量由
+    `test_the_signature_covers_every_number_in_the_message` 钉住。
+    """
+
+    #: 上一次落库那条的状态签名。相等 = 这一次要写的和上一条一字不差。
+    signature: tuple[object, ...]
+    #: 上一次真的落库的时刻。限流窗口从它起算。
+    written_at: datetime
+    #: 上一次落库之后被压掉了几次。写下一条时必须交代出去，否则就是撒谎。
+    suppressed: int
+
+
+def _line_signature(message: str, payload: Mapping[str, Any]) -> tuple[object, ...]:
+    """一条日志的内容签名：**消息全文 + payload 的全部键值**。
+
+    刻意**不手写**一份「哪几个数算数」的清单。清单漏掉一个，限流就会把一条内容
+    已经变了的日志压成沉默，而库里留着的上一条还在假装现状没变——那是本仓库最
+    忌讳的那种缺陷（「日志说假话比不说更糟」）。由结构保证「凡是会被写出去的东西
+    都在签名里」，比由纪律保证可靠得多。
+    """
+    return (message, tuple(sorted((key, repr(value)) for key, value in payload.items())))
+
+
+def _spoken_span(span: timedelta) -> str:
+    """把一段时长说成人话。给日志读，不参与任何判据。"""
+    seconds = round(span.total_seconds())
+    if seconds < 90:
+        return f"{seconds} 秒"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.1f} 分钟"
+    return f"{minutes / 60:.1f} 小时"
+
+
+def _merged_note(suppressed: int, span: timedelta, *, repeat_noun: str, changed: bool) -> str:
+    """被限流压掉的那些**在下一条里的交代**。一条都没压掉时是空串。
+
+    ⚠️ **两种情形分开措辞，因为主语不同。** 被压掉的那些按构造与**上一条落库的**
+    一字不差（签名相等才会被压）：
+
+    - `changed=False`（这一条与上一条内容相同，只是窗口到了）：主语就是眼前这条，
+      说「已持续」是照实说。
+    - `changed=True`（判定变了）：被压掉的是**旧**状态。这时候再说「这一判定已持续」
+      就是把旧账算到新状态头上——所以措辞明确指回上一条。
+    """
+    if suppressed == 0:
+        return ""
+    if changed:
+        return (
+            f"（在此之前，上一条同样的{repeat_noun}又原样重复了 {suppressed} 次、"
+            f"横跨 {_spoken_span(span)}，已合并；这一条是判定变了才写的）"
+        )
+    return f"（这一{repeat_noun}已持续 {_spoken_span(span)}，其间原样重复 {suppressed} 次，已合并）"
 
 
 @dataclass(frozen=True)
@@ -571,10 +639,11 @@ class MissionScheduler:
         #: 上一次判定出来的盲拖屏数取值与它的来源，用来把日志压成「只在变化时写」。
         #: 见 `_blind_scrolls`。
         self._blind_scroll_choice: BlindScrollChoice | None = None
-        #: 「自动停用 / 自动恢复」这一对日志的限流账：`(任务, 事件)` →
-        #: `(上一次真的落库的时刻, 那之后被压掉了几次)`。见 `_log_auto_toggle`。
-        #: 只记在内存里——重启之后的第一次跃迁本来就该落一条。
-        self._auto_toggle_logged: dict[tuple[int, str], tuple[datetime, int]] = {}
+        #: 每 tick 都可能触发的那几条日志的限流账：`(任务, 日志种类)` → `_RepeatedLine`。
+        #: 见 `_log_a_repeated_line`。眼下住着四种：自动停用、自动恢复、军力候选池、
+        #: 军力读数放宽窗口。
+        #: 只记在内存里——重启之后的第一条本来就该落库，它是新一轮运行里的第一手事实。
+        self._repeated_lines: dict[tuple[int, str], _RepeatedLine] = {}
 
     # -- 对外 ------------------------------------------------------------------
 
@@ -1002,18 +1071,23 @@ class MissionScheduler:
         )
         return limit
 
-    def _auto_toggle_log_window(self) -> timedelta:
-        """「自动停用 / 自动恢复」日志的限流窗口。**留空 = `AUTO_TOGGLE_LOG_WINDOW`。**"""
+    def _repeated_log_window(self) -> timedelta:
+        """调度器高频日志的限流窗口。**留空 = `REPEATED_LOG_WINDOW`。**
+
+        一个旋钮管四条（自动停用、自动恢复、军力候选池、军力读数放宽窗口）：
+        理由写在 `REPEATED_LOG_WINDOW` 上——两边的取舍完全同向，拆成两个旋钮
+        只是多一个要配错的地方。
+        """
         seconds = self._knob("auto_toggle_log_seconds")
         if seconds is None:
-            return AUTO_TOGGLE_LOG_WINDOW
+            return REPEATED_LOG_WINDOW
         window = timedelta(seconds=seconds)
         record_knob_override(
-            "auto_toggle_log_window",
+            "repeated_log_window",
             source=__name__,
             effective=window,
-            default=AUTO_TOGGLE_LOG_WINDOW,
-            detail="同一个任务的自动停用/自动恢复在这段时间里最多各落一条日志",
+            default=REPEATED_LOG_WINDOW,
+            detail="同一个任务的同一条重复日志在这段时间里最多落一条",
         )
         return window
 
@@ -1457,33 +1531,81 @@ class MissionScheduler:
         全埋了，而这条链路一发未派。判据不是「有没有打日志」，是**出事时能不能只
         靠库里的日志定位**；一小时 1368 行同一句话，定位不了任何东西。
 
-        所以按 `(task_id, event)` 限流：一个窗口里最多落一条。**被压掉的次数记在
-        下一条的 `payload` 里**（`suppressed_since_last_log`）——把频率整个抹掉的话，
-        「抖了 447 次」和「老老实实停用了一次」在库里长得一模一样，而那两件事的
-        善后完全相反。
+        ⚠️ **签名恒为空元组，也就是「只按窗口限流，不看内容」**——这一条与军力那
+        两条**刻意不同**。这里每一次调用本身就是一次货真价实的跃迁，「内容变了没」
+        对它毫无意义；换成按内容签名的话，`previous_disabled_reason` 在
+        停用→恢复→停用的抖动里一变，447 次里就有一大半会绕开窗口重新刷出来，
+        而那正是 #179 花力气按下去的东西。
+        """
+        self._log_a_repeated_line(
+            key=(task_id, event),
+            signature=(),
+            level=level,
+            message=message,
+            payload=payload,
+            now=now,
+            repeat_noun="跃迁",
+        )
+
+    def _log_a_repeated_line(
+        self,
+        *,
+        key: tuple[int, str],
+        signature: tuple[object, ...],
+        level: str,
+        message: str,
+        payload: dict[str, Any],
+        now: datetime,
+        repeat_noun: str,
+    ) -> None:
+        """调度器高频日志的公共闸门：**状态变了就立刻写，没变就一个窗口最多一条。**
+
+        两条规则缺一不可，各自挡的是不同的东西：
+
+        - **状态变了立刻写，不受窗口约束。** 跃迁本身就是要看的那件事；被时间窗
+          压掉的话，「窗口 16:13 开始被放弃」这种时刻就永远读不出来了。
+        - **状态没变时按窗口压。** 2026-08-18 16:00 那一小时，「军力候选池」
+          6,078 行、「军力读数放宽窗口」6,077 行，两条合起来占了 `system_log`
+          全表的 44%；而按内容去重之后各只剩 38 / 37 条——**其余 12,080 行一个新
+          事实都没带来**。成因是 `_step` 一个 tick 里会转好几圈，每圈都要组一次
+          命令行，于是同一秒里同一句话能落四遍。
+
+        ⚠️ **限流不许把信息丢掉。** 被压掉的次数与它们横跨的时长都写进下一条
+        （`suppressed_since_last_log` / `suppressed_span_seconds`，消息里也说一遍）。
+        被压掉的那些**按构造与上一条落库的一字不差**（签名相等才会被压），所以那句
+        补充说的是「**上一条**在那之后又原样重复了 N 次」——主语是上一条，不是眼前
+        这一条。两种情形的措辞因此**分开写**（`_merged_note`）：判定变了的那一条要是
+        也说成「这一判定持续了 N 次」，那就是把被压掉的旧状态算到新状态头上，
+        而仓库的规矩是「日志说假话比不说更糟」——压缩可以，撒谎不行。
 
         窗口**可配**（`military_attack_config.auto_toggle_log_seconds`，留空 =
-        `AUTO_TOGGLE_LOG_WINDOW`）：调小排障时看得密、日志吵；调大库干净，代价是
-        一次真实的反复跃迁会被合并成看不出频率的一条。先例是
+        `REPEATED_LOG_WINDOW`）：调小排障时看得密、日志吵；调大库干净，代价是一次
+        真实的反复抖动会被合并成看不出频率的一条。先例是
         `record_unrecognised_screen` 的 120 秒。
 
-        **状态只在内存里**，进程一重启就忘掉——那是对的：重启之后的第一次跃迁
-        本来就该落一条，它是新一轮运行里的第一手事实。
+        **状态只在内存里**，进程一重启就忘掉——那是对的：重启之后的第一条本来就该
+        落库，它是新一轮运行里的第一手事实。
         """
-        key = (task_id, event)
-        previous = self._auto_toggle_logged.get(key)
-        if previous is not None and now - previous[0] < self._auto_toggle_log_window():
-            self._auto_toggle_logged[key] = (previous[0], previous[1] + 1)
-            return
-        suppressed = 0 if previous is None else previous[1]
-        self._auto_toggle_logged[key] = (now, 0)
+        previous = self._repeated_lines.get(key)
+        changed = previous is None or previous.signature != signature
+        if not changed:
+            assert previous is not None  # noqa: S101 - `changed` 已经把 None 排掉了
+            if now - previous.written_at < self._repeated_log_window():
+                self._repeated_lines[key] = replace(previous, suppressed=previous.suppressed + 1)
+                return
+        suppressed = 0 if previous is None else previous.suppressed
+        span = timedelta() if previous is None else now - previous.written_at
+        self._repeated_lines[key] = _RepeatedLine(signature=signature, written_at=now, suppressed=0)
         record_system_log(
             level,
             "application.mission_scheduler",
-            message
-            if suppressed == 0
-            else f"{message}（上一条之后同样的跃迁还发生过 {suppressed} 次，已合并）",
-            payload={**payload, "suppressed_since_last_log": suppressed},
+            message + _merged_note(suppressed, span, repeat_noun=repeat_noun, changed=changed),
+            payload={
+                **payload,
+                "suppressed_since_last_log": suppressed,
+                "suppressed_span_seconds": round(span.total_seconds()),
+                "signature_changed": changed,
+            },
             logged_at_utc=now,
         )
 
@@ -2373,39 +2495,49 @@ class MissionScheduler:
         窗口内 / 军力截断——少任何一个，读日志的人就分不清是「没候选」「没读数」
         还是「被截断挡在外面」，而这三种的善后完全不同。
 
-        ⚠️ **不限流**：这个函数只在真的要组一次出击命令时走（`_military_assignments`
-        ← `_military_command`），一轮一条，不是每 tick 一条。反过来说也别把它挪到
-        `_facts` 里去——那里页面轮询也会走，一夜就是几万行。
+        ⚠️ **限流：状态变了立刻写，没变就一个窗口最多一条**（`_log_a_repeated_line`）。
 
-        放宽窗口那条 WARNING 单独走 `_warn_about_a_widened_window`：它要能被单独
-        grep 出来，而这一条每轮都写、级别恒为 INFO。
+        原先这里写着「不限流：一轮出击一条」——**那句规格是错的**。`_step` 一个
+        tick 里会转好几圈（`tick()` 里那个 `for _ in range(len(MissionKind))`），
+        每圈都要组一次命令行，于是同一秒里同一句话能落四遍。实机 2026-08-18 16:00
+        那一小时：这一条 6,078 行、放宽窗口那条 6,077 行，两条合起来占了
+        `system_log` 全表的 44%；而按内容去重之后各只剩 38 / 37 条。
+
+        ⚠️ 仍然**别把它挪到 `_facts` 里去**：那里页面轮询也会走。限流只是把重复
+        压掉，挪过去会让「页面开着」和「页面关着」写出不一样的日志。
         """
         oldest = reading.oldest_selected_at
-        record_system_log(
-            "INFO",
-            "application.mission_scheduler",
+        message = (
             f"军力候选池：排除近 24 小时打过的之后剩 {reading.attackable} 个，"
             f"其中 {reading.usable} 个有军力读数（{reading.dropped_unrated} 个从未上榜，不参与）；"
             f"读数在 {reading.max_age.total_seconds() / 3600:.1f} 小时窗口内的有 "
             f"{len(reading.in_window)} 个；"
             f"按军力截断前 {reading.take} 个 → {len(reading.selected)} 个，"
             f"其中 {reading.stale} 个来自窗口外"
-            f"（最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}）",
-            payload={
-                "task_id": row.id,
-                "mission_kind": MissionKind.BOT.value,
-                "attackable": reading.attackable,
-                "with_readings": reading.usable,
-                "dropped_unrated": reading.dropped_unrated,
-                "in_window": len(reading.in_window),
-                "take": reading.take,
-                "selected": len(reading.selected),
-                "stale_selected": reading.stale,
-                "widened": reading.widened,
-                "score_max_age_hours": reading.max_age.total_seconds() / 3600,
-                "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
-            },
-            logged_at_utc=reading.now,
+            f"（最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}）"
+        )
+        payload: dict[str, Any] = {
+            "task_id": row.id,
+            "mission_kind": MissionKind.BOT.value,
+            "attackable": reading.attackable,
+            "with_readings": reading.usable,
+            "dropped_unrated": reading.dropped_unrated,
+            "in_window": len(reading.in_window),
+            "take": reading.take,
+            "selected": len(reading.selected),
+            "stale_selected": reading.stale,
+            "widened": reading.widened,
+            "score_max_age_hours": reading.max_age.total_seconds() / 3600,
+            "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
+        }
+        self._log_a_repeated_line(
+            key=(row.id, "military_pool"),
+            signature=_line_signature(message, payload),
+            level="INFO",
+            message=message,
+            payload=payload,
+            now=reading.now,
+            repeat_noun="账目",
         )
         self._warn_about_a_widened_window(row, reading)
 
@@ -2424,36 +2556,78 @@ class MissionScheduler:
           用到的最旧读数是什么时候。少了任何一个，看见告警的人还是得回去查库才
           知道该把有效期调成多少——而那正是「没人告诉你」的另一种写法。
 
-        ⚠️ **只在真的放宽时打，正常走窗口时一个字都不写。** 每轮都响的告警和
-        不响的告警一样没用；而这一条本来就只在组命令行时走（一轮一条），
-        所以不必也不该再加限流——限流会把「连着几轮都在放宽」压成一条，
-        而「连着几轮」恰恰是该被看见的那件事。
+        ⚠️ **正常走窗口时一个字都不写**（第一次见到这个任务就正常的话，连
+        「恢复」都不写）。每轮都响的告警和不响的告警一样没用。
+
+        ⚠️ **限流：判定变了立刻写，没变就一个窗口最多一条**（`_log_a_repeated_line`）。
+        原先这里写着「不必也不该加限流，因为一轮一条」——**那句规格是错的**，实机
+        2026-08-18 16:00 那一小时它写了 6,077 行，其中只有 37 条内容不同。要看的
+        「连着几轮都在放宽」并没有因此丢掉：它现在由下一条里的
+        `suppressed_since_last_log` / `suppressed_span_seconds` 说出来，而且说得比
+        「数一数有几行」更准。
+
+        ⚠️ **从「放宽」跌回「正常」时补一条 INFO 收口。** 只报开头不报结尾的话，
+        翻日志的人读不出这一段有多长——而「放宽持续了多久」正是判断该不该调
+        有效期的那个数。这一条**只在跃迁那一下写**，不参与窗口兜底：否则一个
+        长期正常的任务会每 `REPEATED_LOG_WINDOW` 刷一句「已恢复」，那是另一种刷屏。
         """
-        if not reading.widened:
-            return
+        key = (row.id, "military_widened")
+        recovered: tuple[object, ...] = ("recovered",)
         oldest = reading.oldest_selected_at
         hours = reading.max_age.total_seconds() / 3600
-        record_system_log(
-            "WARNING",
-            "application.mission_scheduler",
+        if not reading.widened:
+            previous = self._repeated_lines.get(key)
+            if previous is None or previous.signature == recovered:
+                return
+            self._log_a_repeated_line(
+                key=key,
+                signature=recovered,
+                level="INFO",
+                message=(
+                    f"军力读数放宽窗口：已恢复。{hours:.1f} 小时窗口内有 "
+                    f"{len(reading.in_window)} 个目标，够军力截断要的 {reading.take} 个了，"
+                    "这一轮起重新只在窗口内选靶"
+                ),
+                payload={
+                    "task_id": row.id,
+                    "mission_kind": MissionKind.BOT.value,
+                    "score_max_age_hours": hours,
+                    "in_window": len(reading.in_window),
+                    "take": reading.take,
+                    "with_readings": reading.usable,
+                    "widened": False,
+                },
+                now=reading.now,
+                repeat_noun="告警",
+            )
+            return
+        message = (
             f"军力读数放宽窗口：{hours:.1f} 小时窗口内只有 {len(reading.in_window)} 个目标，"
             f"不够军力截断要的 {reading.take} 个，于是放弃窗口、"
             f"在全部 {reading.usable} 个有读数的目标里按军力截断。"
             f"这一轮选中的 {len(reading.selected)} 个里有 {reading.stale} 个来自窗口外，"
             f"最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}。"
-            "要么等军力榜再扫一轮，要么把「军力分数有效期」调大到与扫描周期相称。",
-            payload={
-                "task_id": row.id,
-                "mission_kind": MissionKind.BOT.value,
-                "score_max_age_hours": hours,
-                "in_window": len(reading.in_window),
-                "take": reading.take,
-                "with_readings": reading.usable,
-                "selected": len(reading.selected),
-                "stale_selected": reading.stale,
-                "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
-            },
-            logged_at_utc=reading.now,
+            "要么等军力榜再扫一轮，要么把「军力分数有效期」调大到与扫描周期相称。"
+        )
+        payload: dict[str, Any] = {
+            "task_id": row.id,
+            "mission_kind": MissionKind.BOT.value,
+            "score_max_age_hours": hours,
+            "in_window": len(reading.in_window),
+            "take": reading.take,
+            "with_readings": reading.usable,
+            "selected": len(reading.selected),
+            "stale_selected": reading.stale,
+            "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
+        }
+        self._log_a_repeated_line(
+            key=key,
+            signature=_line_signature(message, payload),
+            level="WARNING",
+            message=message,
+            payload=payload,
+            now=reading.now,
+            repeat_noun="告警",
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
@@ -3096,26 +3270,29 @@ def _account_line_limit(value: object) -> int | None:
 
 
 def _auto_toggle_log_seconds(value: object) -> int | None:
-    """自动停用 / 自动恢复的日志限流窗口（秒）。
-    **留空 = `AUTO_TOGGLE_LOG_WINDOW`（120 秒）。**
+    """调度器重复日志的限流窗口（秒）。**留空 = `REPEATED_LOG_WINDOW`（120 秒）。**
+
+    函数名与数据库那一列都还叫 `auto_toggle_log_seconds`：那是它 2026-08-18 之前
+    只管「自动停用 / 自动恢复」时留下的历史名。改名要迁移、要动页面、要动 API 字段，
+    换不来任何用户可见的好处，所以只把**用户看得见的措辞**跟着改了。
 
     ## 两条边界
 
     - **0 合法，而且它不是「关掉日志」**：0 表示不限流，也就是加这道闸之前的行为
-      ——每一次真跃迁都落一条。排障时想看清抖动的真实频率就填 0，代价是一次
-      反复跃迁能像 2026-08-18 01:00 那样写 1368 行。
-    - **最多 `AUTO_TOGGLE_LOG_MAX_SECONDS`（一小时）。** 再长就把一整夜的抖动合并
+      ——每一次都落一条。排障时想看清抖动的真实频率就填 0，代价是一次反复抖动能
+      像 2026-08-18 01:00 那样写 1368 行、或者像同日 16:00 那样写 12,155 行。
+    - **最多 `REPEATED_LOG_MAX_SECONDS`（一小时）。** 再长就把一整夜的抖动合并
       成寥寥几条，「抖了几百次」这个事实只剩 payload 里一个数字撑着，翻日志的人
       按时间线读不出任何频率。
     """
-    seconds = _optional_int(value, label="自动停用/恢复日志窗口（秒）")
+    seconds = _optional_int(value, label="调度器重复日志窗口（秒）")
     if seconds is None:
         return None
     if seconds < 0:
-        raise MissionParamError("自动停用/恢复日志窗口不能是负数；要每次都记就填 0")
-    if seconds > AUTO_TOGGLE_LOG_MAX_SECONDS:
+        raise MissionParamError("调度器重复日志窗口不能是负数；要每次都记就填 0")
+    if seconds > REPEATED_LOG_MAX_SECONDS:
         raise MissionParamError(
-            f"自动停用/恢复日志窗口最多 {AUTO_TOGGLE_LOG_MAX_SECONDS} 秒（一小时）："
+            f"调度器重复日志窗口最多 {REPEATED_LOG_MAX_SECONDS} 秒（一小时）："
             "再长就把一整夜的抖动合并成寥寥几条，按时间线读不出频率。"
         )
     return seconds

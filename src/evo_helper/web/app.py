@@ -23,10 +23,10 @@ from evo_helper.application.backfill import default_since
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import (
     ACCOUNT_LINE_LIMIT_MAX,
-    AUTO_TOGGLE_LOG_MAX_SECONDS,
-    AUTO_TOGGLE_LOG_WINDOW,
     BOT_REVISIT_MAX_HOURS,
     DEFAULT_BOT_REVISIT,
+    REPEATED_LOG_MAX_SECONDS,
+    REPEATED_LOG_WINDOW,
     MissionScheduler,
 )
 from evo_helper.application.mission_supervisor import MissionSupervisor
@@ -659,8 +659,8 @@ def create_app(
                 "bot_revisit_default": int(DEFAULT_BOT_REVISIT.total_seconds() // 3600),
                 "bot_revisit_max": BOT_REVISIT_MAX_HOURS,
                 "account_line_limit_max": ACCOUNT_LINE_LIMIT_MAX,
-                "auto_toggle_log_default": int(AUTO_TOGGLE_LOG_WINDOW.total_seconds()),
-                "auto_toggle_log_max": AUTO_TOGGLE_LOG_MAX_SECONDS,
+                "auto_toggle_log_default": int(REPEATED_LOG_WINDOW.total_seconds()),
+                "auto_toggle_log_max": REPEATED_LOG_MAX_SECONDS,
             },
         )
 
