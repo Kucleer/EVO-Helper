@@ -255,6 +255,25 @@ def test_a_readable_flight_line_leaves_no_frame_behind() -> None:
     assert dumped == []
 
 
+def test_an_arrival_time_in_the_past_is_thrown_away_not_turned_into_a_negative_flight() -> None:
+    """⚠️ **读出来的到达时刻落在过去时必须丢掉，不许当成一个负的时长。**
+
+    这条路是 `到达时刻 - 现在`，所以一位数字读错就可能得到负数。同一张 OCR
+    网格里 `3×/None` 就把 `09:26:27` 读成过 `03:26:27`——差六小时，足够把一趟
+    30 分钟的飞行算成 −5.5 小时。
+
+    负数不会触发 `MAX_CREDIBLE_FLIGHT` 那道上界（它只管大的），会一路写进库：
+    `expected_report_at_utc` 落在过去 → 战报一被判「到点了」就赖在到期单子上；
+    `line_free_at_utc` 落在过去 → 调度器以为航线**已经空了**，接着派，
+    撞上游戏那句「同时派遣的舰队数量已达上限。」。
+
+    丢掉之后这一路当作读不出来，换下一套配方；全都不行就交给别的来源。
+    """
+    loop = _loop_reading("", arrival="13/08/2026 17:02:56")
+
+    assert loop._read_flight_time(TARGET).flight is None
+
+
 def test_the_ceiling_leaves_room_for_the_longest_briefing_ever_observed() -> None:
     """上界不能收得太紧，否则误杀合法的长途飞行。
 
