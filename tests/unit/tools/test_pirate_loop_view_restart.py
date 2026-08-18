@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from evo_helper.domain.models import Coordinate
 from evo_helper.game.session_keeper import ReconnectOutcome, ScreenState
 from evo_helper.tools import pirate_loop as module
 from evo_helper.tools.pirate_loop import PirateLoop
@@ -119,6 +120,50 @@ def test_the_nav_cache_is_dropped_after_a_restart(monkeypatch: pytest.MonkeyPatc
     loop._require_system_view("派出之后切不回恒星系视图")
 
     assert navigator.invalidated == 1
+
+
+def test_the_origin_planet_memory_is_dropped_after_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**2026-08-18 那次错账的触发点就是这一支。** 生产 `system_log` 一句不差：
+
+        18:52:07  起点回读 '9:250:8'，确认当前星球是 9:250:8
+        18:53:32  已发动攻击 → 9:231:7（预设 AAA）      ← 确实从 9:250:8（18.5 分）
+        18:54:59  派出之后切不回恒星系视图；关窗重开一次再试（兜底策略）
+        18:55:34  重开之后已经重新进到游戏内
+        18:56:22  已发动攻击 → 9:205:14（预设 BBB）     ← 已经是主星（125.0 分）
+
+    重开的是整个 Chrome 窗口，游戏重新走一遍入口序列，**落点是主星**。而这里原先
+    只清了导航器缓存，出发星球那份记忆一个字没动——`switch_needed` 于是说
+    「本轮已经切到 9:250:8，不用切」，余下每一发都从主星飞出去，
+    `attack_intents.origin_*` 上却写着 9:250:8。一发白占 3.4 小时航线，账还是错的。
+
+    另外两处关窗重开（`_ensure_session` 的重连支、`_mailbox_restart`）**都清了**。
+    三处共用一件事而只改了两处，代价就是这个。
+    """
+    loop, _navigator, _keeper = _loop(monkeypatch, [False, True], _in_game())
+    loop._current_planet = Coordinate(9, 250, 8)
+
+    loop._require_system_view("派出之后切不回恒星系视图")
+
+    assert loop._current_planet is None
+
+
+def test_a_view_that_came_back_on_its_own_keeps_the_origin_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """反过来：没重开就不许清。
+
+    清一次的代价是下一轮多切一次星球（约 20 秒）。切视图本身不改当前星球——
+    真改了的话 `ensure_origin_planet` 里那次「切完再切回恒星系视图」就自相矛盾了。
+    """
+    loop, _navigator, keeper = _loop(monkeypatch, [True], _in_game())
+    loop._current_planet = Coordinate(9, 250, 8)
+
+    loop._require_system_view("派出之后切不回恒星系视图")
+
+    assert keeper.reasons == []
+    assert loop._current_planet == Coordinate(9, 250, 8)
 
 
 def test_it_still_raises_when_the_view_is_gone_after_the_restart(
