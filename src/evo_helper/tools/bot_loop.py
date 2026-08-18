@@ -227,13 +227,21 @@ class BotLoop(PirateLoop):
         入库走 `append_report`，它会按「出发坐标 + 目标坐标 + 时间就近」自己认领
         那一发派遣（置 `dispatch_id` 与 `match_status='MATCHED'`），这里不另做匹配。
         """
-        from evo_helper.vision.parsers import parse_versus_block
+        from evo_helper.vision.parsers import compact_ocr_text, parse_versus_block
 
-        versus = parse_versus_block(page.versus_block(), "ocr")
+        text = page.versus_block()
+        versus = parse_versus_block(text, "ocr")
         if versus is None:
             # 读不出来**不猜**：猜错就把战报挂到别的 bot 头上，而那份战报的战果
             # 会决定那个坐标要不要再挨一发。
-            say(f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报")
+            #
+            # **原文要跟着一起说出去**：坐标那一格现在会在几套配方平票时返回空串
+            # （`vision.scan_reading.vote_coordinate`），只说一句「读不出来」的话，
+            # 「配方吵架」与「压根没读到字」在日志里长得一模一样。
+            say(
+                f"  第 {row.index} 行的 VS 块读不出来；不猜它是谁的战报。"
+                f"当时读到：{compact_ocr_text(text)}"
+            )
             return ReportIngest.UNREADABLE
         return self._ingest_battle_report(versus.defender.coordinate.value, page)
 

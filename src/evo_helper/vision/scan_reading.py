@@ -13,7 +13,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 #: 玩家名以此开头即判定为 bot（方案第 2 节）。
@@ -82,6 +83,41 @@ def looks_like_mangled_bot(name: str | None) -> bool:
 
 
 COORDINATE_RE = re.compile(r"(\d{1,3}):(\d{1,3}):(\d{1,3})")
+
+
+def vote_coordinate(reads: Sequence[str]) -> str:
+    """几套配方各读一遍之后，哪个三元组算数。读不出返回**不含坐标的**字符串。
+
+    ⚠️ **这条判据只给「没有外部对照」的那一侧用**，也就是战报上的坐标
+    （`optional.report_screens.ImageReportScreens._read_coordinate`）。面板扫描器
+    那一侧手里有「本来要看哪个坐标」，用的是核对而不是投票
+    （`read_panel_confirming`）——有对照时投票是多余的，还会把一次正确的核对推翻。
+
+    规则三句话：
+
+    1. 读出合法三元组的那几套**投票**，唯一最高票当选。
+    2. 一套都没读出来时，返回最后一次的原文（照旧交给上层判「读不出」）。
+    3. **平票返回空串**：两套说 `9:250:8`、两套说 `3:250:8` 时，我们并不知道是哪一个。
+
+    第 1 条里「唯一最高票」而不是「过半」是有意的：常见的局面是三套哑火、一套读出，
+    那一票就是唯一最高票，仍然采信——那正是当初引入多配方要救的场面。
+
+    第 3 条为什么不学 `fleet_counts._plurality` 的「平票取小」：那边平票的两个值是
+    同一个数量的两种读法，取小是保守；这边平票的两个值是两颗**不同的星球**。
+    """
+    triples: list[str] = []
+    for text in reads:
+        match = COORDINATE_RE.search(text)
+        if match is not None:
+            triples.append(f"{match.group(1)}:{match.group(2)}:{match.group(3)}")
+    if not triples:
+        return reads[-1] if reads else ""
+    ranked = Counter(triples).most_common()
+    top, votes = ranked[0]
+    if len(ranked) > 1 and ranked[1][1] == votes:
+        return ""
+    return top
+
 
 #: bot 名形如 ``bot_<银河>_<恒星>_<行星>``，`bot_` 之后只有数字和下划线。
 #: OCR 在这种小字号上会把 1 读成 l、2 读成 e、0 读成 O。

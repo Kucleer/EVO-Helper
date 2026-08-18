@@ -15,6 +15,7 @@ from evo_helper.vision.scan_reading import (
     owner_of,
     read_panel,
     read_panel_confirming,
+    vote_coordinate,
 )
 
 
@@ -189,3 +190,43 @@ def test_a_normal_name_is_not_reread() -> None:
     assert not looks_like_mangled_bot("bot_2_9_5")
     assert not looks_like_mangled_bot(None)
     assert looks_like_mangled_bot("botleao.-")
+
+
+# -- 战报坐标：几套配方投票 ----------------------------------------------------
+
+
+def test_the_majority_overrules_a_first_recipe_that_read_a_wrong_but_valid_triple() -> None:
+    """⚠️ 这条钉的是实机那 7 份战报。
+
+    `[9` 在 7× LANCZOS 下糊成一个 `3`，第一套配方读出 `3:250:8`——**格式完全合法**，
+    于是「第一套读出三元组就采信」把另外三套的一致反对整个丢掉。7 份战报因此
+    一份都认不上派遣（生产库 2026-08-18）。
+    """
+    assert vote_coordinate(["3:250:8", "9:250:8", "9:250:8", "9:250:8"]) == "9:250:8"
+    # 括号糊进第一位的另一种形态：`[9` 读成 `39`。
+    assert vote_coordinate(["39:250:8", "9:250:8", "9:250:8", "9:250:8"]) == "9:250:8"
+
+
+def test_a_coordinate_only_one_recipe_can_read_is_still_believed() -> None:
+    """当初引入多配方要救的场面**原样保留**：三套哑火、一套读出，那一票就算数。
+
+    实测同一屏两个同形状 ROI，守方读出 `[2:137:14]`、攻方只读出 `]`——
+    要求过半的话这一份会被整个拒收，而战报本身是好的。
+    """
+    assert vote_coordinate(["]", "", "2:137:14", "垃圾"]) == "2:137:14"
+
+
+def test_a_tie_reads_as_nothing() -> None:
+    """⚠️ 平票 = 没读出来，**不许挑一个**。
+
+    平票的两个值是两颗不同的星球，取哪个都是猜；而认错出发点会把战果记到别人
+    头上。这里返回不含坐标的空串，整份战报被上层拒收、下一趟重读。
+    """
+    assert vote_coordinate(["9:250:8", "9:250:8", "3:250:8", "3:250:8"]) == ""
+    assert vote_coordinate(["9:250:8", "3:250:8"]) == ""
+
+
+def test_nothing_readable_returns_the_last_raw_read() -> None:
+    """一套都没读出来时照旧返回最后一次原文——交给上层判「读不出」，不假装读到了。"""
+    assert vote_coordinate(["]", "垃圾", "", "::"]) == "::"
+    assert vote_coordinate([]) == ""
