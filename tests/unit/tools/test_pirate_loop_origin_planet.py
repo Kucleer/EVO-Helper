@@ -21,10 +21,21 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
 from evo_helper.game.planet_list import SwitchResult
 from evo_helper.tools import pirate_loop as module
-from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, exit_code_for
+from evo_helper.tools.pirate_loop import (
+    LoopOptions,
+    NavBarReading,
+    Outcome,
+    PirateLoop,
+    exit_code_for,
+)
 
 SECOND = Coordinate(9, 250, 8)
 TARGETS = (Coordinate(2, 137, 4), Coordinate(2, 137, 9), Coordinate(2, 138, 4))
+
+
+def _reading(values: tuple[str, str, str]) -> NavBarReading:
+    """把三个汇总值包成 `NavBarReading`；这一份用例不关心原始读数。"""
+    return NavBarReading(values=values, reads=tuple((value,) for value in values))
 
 
 class _FakeNavigator:
@@ -98,7 +109,8 @@ def _loop(
     loop._goto_planet_surface = lambda: True
     # 切完星球要回读导航栏三个值框（见 `_adopt_navigation_bar`）。默认读到出发星
     # 本身，也就是「回读通过」那一支；要看读不通就在用例里改掉它。
-    loop._navigation_bar_values = lambda: (
+    loop._nav_readback_dumps = 0
+    loop._read_navigation_bar = lambda: _reading(
         (str(origin.galaxy), str(origin.system), str(origin.position))
         if origin is not None
         else ("", "", "")
