@@ -59,7 +59,7 @@ from evo_helper.domain.pirate_round import (
     PiratePhase,
     action_for,
 )
-from evo_helper.domain.planet_switch import switch_needed
+from evo_helper.domain.planet_switch import origin_in, switch_needed
 from evo_helper.domain.reconcile_cooldown import (
     RECONCILE_COOLDOWN,
     ReconcileDecision,
@@ -181,6 +181,24 @@ FLIGHT_RECIPES = (*pirate_ui.FLIGHT_RECIPES, (6, 160), (5, 120), (3, 140), (6, 1
 #: 而这一行读不出是**永久**的：点完「出发！」这一屏就没了，没有第二次机会。
 #: 所以这里加码到 6 轮（约 5 秒），代价只落在真的读不出来的那几发上。
 FLIGHT_SETTLE_TRIES = 6
+
+#: 派出之前回读「起点」时，最多把那一行读几轮（每轮之间等 `_settle` 的 1 秒）。
+#:
+#: ⚠️ **读不出不许当成「对上了」**。会动的画面上单帧的空结果是抛硬币，不是证据
+#: （`vision.scan_reading.read_panel_confirming`、`game.preset_picker.
+#: read_names_confirming` 都是这个形状）——派遣面板同样是滑进来的，第一帧读空太常见。
+#: 所以这里重读几轮，**重读完仍读不出就按「核不过」收场**，绝不放行。
+#:
+#: 取 4 而不是飞行时间那档的 6：这一行是白字压蓝底的坐标（`FLEET_ORIGIN_RECIPES`
+#: 两套配方离线实测八中八），比绿字压蓝底的飞行时间好读得多；而且读不出的代价
+#: 也不同——飞行时间读不出是**永久**丢失（点完出发那一屏就没了），起点读不出只是
+#: 这一轮停下，下一轮重来。
+#:
+#: 分类（2026-08-18 审计）：**标定常量，不是运维旋钮**。它的取值由「面板滑进来
+#: 要多久」这条画面几何决定，不取决于用户的处境；调大只是让真故障多拖几秒，
+#: 调小则会让正常的一帧空读把整轮停掉。判据见 CLAUDE.md「改这个值会让结果变
+#: 『更适合我』还是变『错』」。
+ORIGIN_SETTLE_TRIES = 4
 
 #: 侦察报告的等待：实机上 17 秒回报，留足余量再读，读不到就再等一轮。
 SCOUT_REPORT_WAIT_S = 45.0
@@ -418,6 +436,25 @@ class RoundExhausted(RuntimeError):
     **这不是失败。** 抛到 `run()` 就正常收尾、退出码 0——调度器据此不计入连续
     失败计数。反过来当成失败的话：航线占满是必然会发生的事，连撞三次就把整条
     链路自动停用了，而它其实只是需要等舰队飞回来。
+    """
+
+
+class OriginDrifted(RoundExhausted):
+    """派出之前回读「起点」，读到的不是这一轮配的出发星球（或者读不出来）。
+
+    ## 为什么这不是「跳过这一个目标」，而是「这一轮到此为止」
+
+    起点是**整轮共用**的一个状态：一发对不上，说明当前星球已经不是这一轮配的
+    那一颗了，而链路里没有任何一步会在两个目标之间把它切回来（`ensure_origin_planet`
+    一轮只跑一次，判据是 `domain.planet_switch.switch_needed`）。所以照着往下走的话，
+    余下每一个目标都会在同一处对不上——几十次开关派遣面板、几十行一模一样的日志、
+    零发派出。停下这一轮，让调度器起下一轮，那一轮开工时会重新切一次星球。
+
+    ## 为什么挂在 `RoundExhausted` 底下
+
+    要的正是它那套善后：**退出码 0、不计入连续失败、不自动停用**（用户口径）。
+    这一条与「航线占满」同类——不是故障，是这一轮干不下去了。单独立一个类
+    只是为了让日志和测试能把两者分开：一个是舰队没了，一个是脚底下的星球换了。
     """
 
 
@@ -792,6 +829,11 @@ class PirateLoop:
     #: 无关。没做成可配置——同 `MAX_COORD_DUMPS`。
     MAX_MAIL_DUMPS: int = 3
 
+    #: 起点核对不过时最多存这么多张现场图。**封顶的理由和 `MAX_COORD_DUMPS` 一样**，
+    #: 只是这里本来就跑不了几张：核不过就停轮，一轮最多存一张。留 2 是给
+    #: 「同一进程里被复用」留的余量，不是预期值。
+    MAX_ORIGIN_DUMPS: int = 2
+
     #: 开工对账时，信箱里哪一类报告算作「这条链路今天打出去的一发」。
     #:
     #: 海盗战的主题是「海盗攻击报告」（`ReportKind.PIRATE`），打玩家/bot 的是
@@ -819,6 +861,7 @@ class PirateLoop:
         self._session_keeper: Any = None
         self._coord_dumps = 0
         self._mail_dumps = 0
+        self._origin_dumps = 0
         #: 本趟开工时刻。本轮派出去的侦察/攻击，其报告一定比它新——
         #: 翻信箱时据此早停（见 `MailRow.is_older_than`）。
         self._started_at = datetime.now(UTC)
@@ -1171,6 +1214,137 @@ class PirateLoop:
             return None
         return flight
 
+    def _require_origin_before_dispatch(self, coordinate: Coordinate) -> None:
+        """**每一发派遣之前**回读派遣面板的「起点」，与这一轮记账用的出发星比对。
+
+        对不上（含读不出）就抛 `OriginDrifted`：这一发不派，这一轮到此为止。
+
+        ## 这道闸门补的是什么
+
+        实机 2026-08-18 18:51–18:56，同一轮里：
+
+            18:51:47  出发星球：切到 9:250:8
+            18:52:07    起点回读 '9:250:8'，确认当前星球是 9:250:8
+            18:53:32    已发动攻击 → 9:231:7   实际 18.5 分（从 9:250:8 应 18.6 分）
+            18:56:22    已发动攻击 → 9:205:14  实际 125.0 分（从 4:277:15 应 125.0 分）
+
+        两发之间**没有任何切星球记录**，游戏自己把当前星球退回了主星。而
+        `game.planet_list` 那条回读**只在切换那一刻做一次**，之后每一发都假定
+        脚底下没变过。代价有两层：一发白占 3.4 小时航线（往返 45 分钟 → 250 分钟），
+        更贵的是**账是错的**——#179 那两道航线闸按 9:250:8 扣，实际占的是 4:277:15
+        的额度，多出发点的整套航线记账在算假账。
+
+        同形的教训仓库里早有：`game.system_navigator.SystemNavigator` 就是因为
+        「打过的字不算数、读回来的才算」才改成只信回读确认过的坐标。**出发星球
+        这一层此前缺的就是这条**——切换那一次是「记下来」，这一次是「每次用之前
+        再问一遍」，两者缺一不可。
+
+        ## 期望值取的是 `_options.origin or origin()`，不是 `_current_planet`
+
+        因为要守的恰恰是**记账**：`_record_intent` 往 `attack_intents.origin_*`
+        写的就是这个表达式。拿 runner 自己那份记忆（`_current_planet`）去比，
+        比的是「我以为我在哪」对「我以为我在哪」——同义反复，正是这次事故里
+        失效的那半边。
+
+        ## 读不出来算核不过
+
+        `origin_in` 返回 None 只说明这一帧没读出坐标，说不出脚底下是哪一颗。
+        重读几轮（`ORIGIN_SETTLE_TRIES`）仍读不出，就按核不过收场。**绝不放行**：
+        放行的代价是继续拿一发不知道从哪儿起飞的舰队去记一笔假账，而拦下的代价
+        只是这一轮不派。方向和 `domain.planet_switch.origin_confirmed` 一致。
+
+        ## 为什么读的是派遣面板而不是简报页
+
+        简报页上没有起点。本仓所有实拍的简报页——`var/logs/calib-侦察-3-简报页-
+        viewport.png`（侦察）与 `var/logs/dump-briefing-*.png`（攻击，2026-08-13 至
+        08-16 共 50 余张）——那一屏只有任务类型 / 速度 / 飞行时间 / 预计到达 /
+        气体消耗 / 货舱容量六行，没有任何坐标。而**没标定过的 ROI 一定读成空，
+        空又按上面那条算核不过**——真照着猜一个框写进去，实机上的结果是**每一发
+        都被拦下**，比这次的故障还糟。
+
+        派遣面板上那一行则是核过的（见 `pirate_ui.FLEET_ORIGIN_ROI`），而且它就在
+        眼前：这道闸门插在「点开攻击/侦察 → 面板铺开」之后，不额外开任何一屏，
+        也不额外花一次导航。⚠️ **必须在展开预设条之前读**，条一展开就把这一行盖住了。
+        """
+        expected = self._options.origin or origin()
+        raw = ""
+        shown: Coordinate | None = None
+
+        def read_once() -> bool:
+            nonlocal raw, shown
+            raw = self._fleet_origin_text()
+            shown = origin_in(raw)
+            return shown is not None
+
+        self._settle(read_once, tries=ORIGIN_SETTLE_TRIES)
+        if shown == expected:
+            return
+        note = (
+            f"  派遣面板起点回读 {shown or '（读不出）'}（原文 {raw!r}），"
+            f"对不上这一轮的出发星球 {expected}；这一发不派，这一轮到此为止"
+        )
+        say(note)
+        self._outcome.refused.append((coordinate, f"起点对不上（读到 {shown or '读不出'}）"))
+        self._dump_origin_mismatch()
+        self._record_origin_mismatch(coordinate, expected=expected, shown=shown, raw=raw)
+        # 那份「本轮已经切到哪」的记忆刚刚被证伪，留着它只会让同一个进程里的下一次
+        # `switch_needed` 说「不用切」。清掉的代价至多是多切一次，而多切一次无害
+        # （点自己那一行只是回到自己的地表），与 `_ensure_session` 里那段同理。
+        self._current_planet = None
+        # 面板还开着，先关掉再走；派遣面板开过之后导航栏里是什么已经不可知了，
+        # 理由与 `attack()` 里「找不到预设」那一支一模一样。
+        self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
+        self._driver.wait(DISPATCH_WAIT_S)
+        self._navigator.invalidate()
+        raise OriginDrifted(f"派出之前起点核对不过：期望 {expected}，读到 {shown or '（读不出）'}")
+
+    def _dump_origin_mismatch(self) -> None:
+        """起点核对不过就留一帧现场，但要封顶（同 `_dump_coord_mismatch` 的理由）。
+
+        这一帧是这条闸门唯一能回答「那一刻画面上到底是什么」的东西：ROI 读成
+        `'4:277:15'` 和 ROI 框歪了读到别处的一串数字，在文字日志上长得一模一样。
+        """
+        if self._origin_dumps >= self.MAX_ORIGIN_DUMPS:
+            return
+        self._origin_dumps += 1
+        self._dump_frame("origin-mismatch", pirate_ui.FLEET_ORIGIN_ROI)
+
+    def _record_origin_mismatch(
+        self,
+        coordinate: Coordinate,
+        *,
+        expected: Coordinate,
+        shown: Coordinate | None,
+        raw: str,
+    ) -> None:
+        """把这次核不过写进 `system_log`——落库不落文件。
+
+        实机跑在另一台机器上，`_dump_frame` 存下的 PNG 在本机根本取不到
+        （`record_planet_list_overlay_retry` 的注释里记着同一件事），所以缩略图
+        跟着 payload 一起进库。
+
+        **不限流。** 这一支每轮最多走一次（走到就停轮），不是「每 tick 都可能触发」
+        的那一类；限流反而会把仅有的那一条证据吞掉。
+        """
+        capture = getattr(self._driver, "capture", None)
+        payload: dict[str, Any] = {
+            "target": str(coordinate),
+            "expected_origin": str(expected),
+            "origin_seen": None if shown is None else str(shown),
+            "origin_raw_text": raw,
+            "roi": list(pirate_ui.FLEET_ORIGIN_ROI),
+            "target_kind": self.TARGET_KIND,
+        }
+        if callable(capture):
+            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            f"派出 {coordinate} 之前起点核对不过：期望 {expected}，"
+            f"派遣面板读到 {shown or '（读不出）'}；这一发没派，这一轮到此为止",
+            payload=payload,
+        )
+
     def _launch(self, coordinate: Coordinate, mission: str) -> bool:
         """简报页核对任务类型，通过才点「出发！」。"""
         shown = self._briefing_mission()
@@ -1203,6 +1377,9 @@ class PirateLoop:
         """
         self._driver.click(*pirate_ui.SCOUT_BUTTON, label="侦察")
         self._driver.wait(DISPATCH_WAIT_S)
+        # 面板刚铺开、还没点绿✓，起点那一行就在眼前：**每一发都核一次脚底下的星球**。
+        # 侦察也要核——它一样占航线、一样按出发坐标记账，从错的星球飞出去同样是假账。
+        self._require_origin_before_dispatch(coordinate)
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
         # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
@@ -1246,6 +1423,11 @@ class PirateLoop:
         self._driver.click(*self.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
         timer.lap("开面板")
+        # ⚠️ **必须排在展开预设条之前。** `PRESET_TOGGLE` 就坐在起点那一行的右端，
+        # 条一展开，「预设 N/10」那一栏整个把起点盖住（实拍 `var/logs/atk-2-presets.png`），
+        # 那时再读只会读到预设名。顺带还省下一次翻预设条：核不过的那一发本来就不派。
+        self._require_origin_before_dispatch(coordinate)
+        timer.lap("核起点")
 
         picker = PresetPicker(
             driver=_PresetPickerDriver(self._driver), read_names=self._preset_names, say=say
@@ -2750,6 +2932,30 @@ class PirateLoop:
           配额用完时 `restart_and_reenter` 直接返回拒绝结局，这里照样抛。
         - **重开之后不假定自己在游戏内**：`restart_and_reenter` 仍然走判据驱动的
           入口序列，`ensure_system_view` 也照旧读导航栏标签。认不出就停，不乱点。
+
+        ## ⚠️ 关窗重开会把当前星球退回主星，这里必须一起忘掉
+
+        **2026-08-18 那次错账的触发点就是这一支**，生产 `system_log` 上一句不差：
+
+            18:52:07  起点回读 '9:250:8'，确认当前星球是 9:250:8
+            18:53:32  已发动攻击 → 9:231:7（预设 AAA）        ← 确实从 9:250:8
+            18:54:59  派出之后切不回恒星系视图；关窗重开一次再试（兜底策略）
+            18:55:34  重开之后已经重新进到游戏内
+            18:56:22  已发动攻击 → 9:205:14（预设 BBB）       ← 已经是主星 4:277:15
+
+        重开的是整个 Chrome 窗口，游戏重新走一遍入口序列，**落点是主星**。
+        而这里原先只清了导航器缓存，`_current_planet` 一个字没动——于是
+        `switch_needed` 仍然说「本轮已经切到 9:250:8，不用切」，余下每一发都从
+        主星飞出去，`attack_intents.origin_*` 上却写着 9:250:8。
+
+        另外两处关窗重开（`_ensure_session` 的重连支、`_mailbox_restart`）**都清了**，
+        理由那边写得明明白白；漏的只有这一处。这是三处共用一件事而只改了两处的
+        典型代价。
+
+        清掉之后本轮不会当场重切（`ensure_origin_planet` 属于开工阶段，一轮只跑
+        一次），但派出之前那道起点闸门会当场拦下并停轮
+        （`_require_origin_before_dispatch`），下一轮开工时重新切一次。
+        **闸门是兜底，这一处是止血；两条都要有。**
         """
         if self._navigator.ensure_system_view(self._nav_labels):
             return
@@ -2762,6 +2968,9 @@ class PirateLoop:
             )
         # 重开之后画面整个换过一遍，导航器那份记忆记的是重开前的坐标。
         self._navigator.invalidate()
+        # 出发星球那份记忆同样作废：重开的落点是主星，不是本轮配的那颗。见上面那段。
+        self._current_planet = None
+        say("  关窗重开之后落点是主星；「本轮已经切到哪」这份记忆作废")
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise SessionUnavailable(
                 f"{what_failed}；重开之后仍然切不回来；安全停止",

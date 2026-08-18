@@ -22,6 +22,9 @@ from evo_helper.domain.records import (
 )
 from evo_helper.game import pirate_ui
 
+#: 本轮配的出发星球。派出之前的起点闸门要拿它跟派遣面板的回读比。
+ORIGIN = Coordinate(2, 137, 18)
+
 
 class _RecordingRepository:
     """只记下写库这一层收到了什么。"""
@@ -271,11 +274,14 @@ def _attackable_loop(
     loop = module.PirateLoop.__new__(module.PirateLoop)
     loop._driver = _RecordingDriver(events)
     loop._navigator = _FakeNavigator()
-    loop._options = module.LoopOptions(systems=(), scout=False, attack=True)
+    loop._options = module.LoopOptions(systems=(), scout=False, attack=True, origin=ORIGIN)
     loop._outcome = module.Outcome()
     loop._repository = repository
     loop._run_id = uuid4()
     loop._read = _read
+    # 派出之前的起点闸门读派遣面板「起点」那一行。让它读到本轮配的那颗，
+    # 这几条用例守的（记录、顺序）才跑得完；闸门自己另有专文。
+    loop._read_coord_line = lambda _roi, _upscale, _resample: str(ORIGIN)
     return loop
 
 
@@ -347,11 +353,13 @@ def _scoutable_loop(
     loop = module.PirateLoop.__new__(module.PirateLoop)
     loop._driver = _RecordingDriver(events)
     loop._navigator = _FakeNavigator()
-    loop._options = module.LoopOptions(systems=(), scout=True, attack=False)
+    loop._options = module.LoopOptions(systems=(), scout=True, attack=False, origin=ORIGIN)
     loop._outcome = module.Outcome()
     loop._repository = repository
     loop._run_id = uuid4()
     loop._read = _read
+    # 侦察一样要过起点闸门（它一样占航线、一样按出发坐标记账）。让它读到本轮配的那颗。
+    loop._read_coord_line = lambda _roi, _upscale, _resample: str(ORIGIN)
     # 闸门拦下时 `_launch` 会把现场存到 `var/logs/`。那是实机复盘用的，
     # 在单元测试里只会往仓库里丢 PNG。
     loop._dump_frame = lambda *_args, **_kwargs: None
