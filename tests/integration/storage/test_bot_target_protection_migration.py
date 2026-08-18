@@ -55,13 +55,18 @@ def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
 
 
 def test_the_history_has_exactly_one_head() -> None:
-    """整条迁移链只有一个 head，而且就是这一条（眼下最新的那一条）。
+    """整条迁移链只有一个 head。
 
     生产靠启动时 `alembic upgrade head` 自升，多一个 head 就是直接起不来。
+
+    ⚠️ 这里**只数个数，不钉是哪一条**：钉住的话，每加一条迁移都要回来改这个
+    与自己毫无关系的文件（本条就是这么被 `c4f8a2e51b07` 改红的）。
+    「head 就是最新那一条」由**最新那条迁移自己的用例**钉住——
+    见 `test_dispatch_flight_source_migration.py`，那份文件里的常量本来就要跟着改。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1, script.get_heads()
 
 
 def test_both_columns_are_nullable_with_no_default(database_url: str) -> None:

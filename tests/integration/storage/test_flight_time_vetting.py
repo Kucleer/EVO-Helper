@@ -47,6 +47,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
     flight: timedelta | None,
     mission: str = MISSION_KIND_ATTACK,
     target: Coordinate = TARGET,
+    source: object = None,
 ) -> UUID:
     intent_id, dispatch_id = uuid4(), uuid4()
     repository.save_attack_intent(
@@ -69,7 +70,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
             mission_kind=mission,
         )
     )
-    repository.record_flight_time(dispatch_id, flight, AT)
+    repository.record_flight_time(dispatch_id, flight, AT, source=source)
     return dispatch_id
 
 
@@ -162,3 +163,65 @@ def test_a_flight_that_was_never_read_still_lands_as_null(repository, run_id) ->
     assert row.flight_seconds is None
     assert row.expected_report_at_utc is None
     assert row.line_free_at_utc is None
+
+
+# -- 这个数是读出来的还是算出来的 -------------------------------------------
+
+
+def test_a_computed_flight_sets_the_clocks_but_never_flight_seconds(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **`domain.flight_time` 公式算出来的值不许进 `flight_seconds`。**
+
+    两个钟照常按它推——省下的正是那 90 分钟空占（`UNKNOWN_LINE_HOLD`）——但
+    「这一发飞了多久」这个**观测记录**仍然留 NULL，来源写在 `flight_source` 上。
+
+    理由不是洁癖：`flight_seconds` 正是 `vet_flight_time` 那道下限赖以标定的
+    样本池（`MIN_CREDIBLE_ATTACK_FLIGHT` 的取值就是从这一列的分布量出来的）。
+    掺进 `domain.flight_time` 自己的输出，下一次标定就成了拿模型的输出去标定
+    模型。`docs/预计战报时间-估算方案.md` 第 2 条早就写着这一条。
+
+    把 `record_flight_time` 里那个三元改成无条件写值，这条就红。
+    """
+    from evo_helper.domain.flight_estimate import FlightSource
+
+    row = _row(
+        repository,
+        _dispatch(repository, run_id, flight=FAR_FLIGHT, source=FlightSource.DISTANCE_MODEL),
+    )
+
+    assert row.flight_seconds is None, "算出来的值混进了标定样本池"
+    assert row.expected_report_at_utc == AT + FAR_FLIGHT
+    assert row.line_free_at_utc == AT + FAR_FLIGHT * 2
+    assert row.flight_source == "distance_model"
+
+
+def test_a_measured_flight_records_which_line_it_was_read_from(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """读出来的那两种照常写 `flight_seconds`，并记下是哪一行读的。
+
+    没有这条对照，「一律不写 `flight_seconds`」也能让上面那条变绿。
+    """
+    from evo_helper.domain.flight_estimate import FlightSource
+
+    row = _row(
+        repository,
+        _dispatch(repository, run_id, flight=FAR_FLIGHT, source=FlightSource.BRIEFING_ARRIVAL),
+    )
+
+    assert row.flight_seconds == int(FAR_FLIGHT.total_seconds())
+    assert row.flight_source == "briefing_arrival"
+
+
+def test_a_vetoed_flight_leaves_no_source_behind(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """下限关把值降级成 NULL 时，来源也要一起清掉。
+
+    留着来源而值是 NULL，等于库里写着「这一发的时长是从到达时间读出来的」，
+    而那一列却是空的——日后查账时那是一句假话，比不说更糟。
+    """
+    from evo_helper.domain.flight_estimate import FlightSource
+
+    row = _row(
+        repository,
+        _dispatch(repository, run_id, flight=TRUNCATED, source=FlightSource.BRIEFING_ARRIVAL),
+    )
+
+    assert row.flight_seconds is None
+    assert row.flight_source is None

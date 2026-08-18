@@ -33,6 +33,7 @@ class _RecordingRepository:
         self.saved_intent: Any | None = None
         self.saved_dispatch: Any | None = None
         self.flight_calls: list[tuple[UUID, timedelta | None, datetime]] = []
+        self.flight_sources: list[Any] = []
 
     def save_attack_intent(self, intent: Any) -> None:
         self.saved_intent = intent
@@ -41,9 +42,26 @@ class _RecordingRepository:
         self.saved_dispatch = dispatch
 
     def record_flight_time(
-        self, dispatch_id: UUID, flight: timedelta | None, dispatched_at_utc: datetime
+        self,
+        dispatch_id: UUID,
+        flight: timedelta | None,
+        dispatched_at_utc: datetime,
+        *,
+        source: Any = None,
     ) -> None:
         self.flight_calls.append((dispatch_id, flight, dispatched_at_utc))
+        self.flight_sources.append(source)
+
+
+def _measured(flight: timedelta | None) -> Any:
+    """把一个时长包成「从简报页读出来的」结论，给只关心记账那几条用。"""
+    from evo_helper.domain.flight_estimate import FlightEstimate, FlightSource
+
+    return FlightEstimate(
+        flight=flight,
+        source=None if flight is None else FlightSource.BRIEFING_ARRIVAL,
+        reason="用例",
+    )
 
 
 def _loop_with(repository: _RecordingRepository) -> object:
@@ -62,7 +80,7 @@ def test_the_flight_time_from_the_briefing_reaches_the_database() -> None:
     repository = _RecordingRepository()
     loop = _loop_with(repository)
 
-    loop._record_dispatch(uuid4(), timedelta(minutes=7))  # type: ignore[attr-defined]
+    loop._record_dispatch(uuid4(), _measured(timedelta(minutes=7)))  # type: ignore[attr-defined]
 
     assert len(repository.flight_calls) == 1
     _dispatch_id, flight, _dispatched = repository.flight_calls[0]
@@ -78,7 +96,7 @@ def test_an_unreadable_briefing_still_records_the_dispatch_with_no_flight_time()
     repository = _RecordingRepository()
     loop = _loop_with(repository)
 
-    loop._record_dispatch(uuid4(), None)  # type: ignore[attr-defined]
+    loop._record_dispatch(uuid4(), _measured(None))  # type: ignore[attr-defined]
 
     assert repository.saved_dispatch is not None
     assert len(repository.flight_calls) == 1
@@ -125,20 +143,44 @@ class _FakeDriver:
         return None
 
 
-def _loop_reading(text: str) -> object:
-    """造一个「简报上的飞行时间 ROI 读作 text」的 loop。"""
-    from evo_helper.tools.pirate_loop import PirateLoop
+#: 这几条用例读的目标。`_read_flight_time` 现在要拿它去算距离公式那一路。
+TARGET = Coordinate(2, 137, 14)
+
+
+def _loop_reading(text: str, *, arrival: str = "", speed: str = "") -> Any:
+    """造一个「简报上各块 ROI 分别读作什么」的 loop。
+
+    默认只有飞行时间那一行有内容，到达时间与速度都读空——也就是**改动之前
+    那个单来源的世界**。这几条老用例守的判据（上界、天、存图、闹钟不是闸门）
+    与来源无关，所以让它们继续在那个世界里跑，多出来的两个来源各自另有专文。
+    """
+    from evo_helper.tools.pirate_loop import LoopOptions, PirateLoop
+
+    date_text, _, time_text = arrival.partition(" ")
+
+    def _read(roi: tuple[int, int, int, int], **_kwargs: Any) -> str:
+        if roi == pirate_ui.BRIEFING_ARRIVAL_DATE_ROI:
+            return date_text
+        if roi == pirate_ui.BRIEFING_ARRIVAL_TIME_ROI:
+            return time_text
+        if roi == pirate_ui.BRIEFING_SPEED_ROI:
+            return speed
+        if roi == pirate_ui.BRIEFING_SPEED_PERCENT_ROI:
+            return "100%" if speed else ""
+        return text
 
     loop = PirateLoop.__new__(PirateLoop)
     loop._driver = _FakeDriver()  # type: ignore[attr-defined]
-    loop._read = lambda *_args, **_kwargs: text  # type: ignore[attr-defined]
+    loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=ORIGIN)
+    loop._read = _read  # type: ignore[attr-defined]
+    loop._dump_frame = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
     return loop
 
 
 def test_a_credible_flight_time_becomes_the_return_alarm() -> None:
     loop = _loop_reading("8分3秒")
 
-    assert loop._read_flight_time() == timedelta(minutes=8, seconds=3)  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight == timedelta(minutes=8, seconds=3)
 
 
 def test_an_implausibly_long_flight_time_is_treated_as_a_misread() -> None:
@@ -151,35 +193,41 @@ def test_an_implausibly_long_flight_time_is_treated_as_a_misread() -> None:
     """
     loop = _loop_reading("8时3分")
 
-    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight is None
 
 
 def test_a_flight_time_in_days_is_never_believed() -> None:
     """`parse_game_duration` 认得 `X天…`，而这条链路打的是同系目标。"""
     loop = _loop_reading("42天17时34分58秒")
 
-    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight is None
 
 
 def test_every_recipe_is_tried_on_every_settle_round() -> None:
     """读不出来时要把**每一套配方 × 每一轮等待**都试满，而不是一次读不出就认输。
 
-    这一行现在是两个钟的唯一来源（战报到点时刻 + 航线空出时刻）。读不出来那一发
-    按 `UNKNOWN_LINE_HOLD`（90 分钟）占航线，而真实往返是 10–62 分钟——白压吞吐。
-    所以把 NULL 压回去的手段是**多试几次**（方向不许反过来去放松解析判据：
-    读出一个小而合理的错值会同时污染两个钟，比 NULL 贵得多）。
+    ⚠️ 这一条守的是「重试确实发生了」，**不是**「重试有用」。2026-08-18 的复标
+    表明飞行时间那一行的失败是**确定性**的（同一块像素每次读出同样的乱码，
+    49 张实拍上现行配方 0/47），重试救不回来——真正的修法是换来源，见
+    `pirate_ui.ARRIVAL_RECIPES`。重试仍然留着，是因为它挡的是另一件事：
+    面板**还在滑进来**（`_settle` 的注释记着那次「等 2.4 秒判一次判不到，
+    而失败时存下的那一帧读得清清楚楚」）。
     """
     from evo_helper.tools.pirate_loop import FLIGHT_RECIPES, FLIGHT_SETTLE_TRIES
 
     loop = _loop_reading("读不出来的一行")
     seen: list[tuple[int, int | None]] = []
-    loop._read = lambda *_args, **kwargs: (  # type: ignore[attr-defined]
-        seen.append((kwargs.get("upscale"), kwargs.get("threshold"))),
-        "读不出来的一行",
-    )[1]
+    plain = loop._read
+
+    def _read(roi: tuple[int, int, int, int], **kwargs: Any) -> str:
+        if roi == pirate_ui.BRIEFING_FLIGHT_ROI:
+            seen.append((kwargs.get("upscale"), kwargs.get("threshold")))
+        return str(plain(roi, **kwargs))
+
+    loop._read = _read
     loop._dump_frame = lambda name, roi=None: None  # type: ignore[attr-defined]
 
-    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight is None
     assert seen == list(FLIGHT_RECIPES) * FLIGHT_SETTLE_TRIES
 
 
@@ -193,7 +241,7 @@ def test_a_totally_unreadable_flight_line_leaves_a_frame_behind() -> None:
     dumped: list[str] = []
     loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[attr-defined]
 
-    assert loop._read_flight_time() is None  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight is None
     assert dumped == ["briefing-flight-unreadable"]
 
 
@@ -203,8 +251,27 @@ def test_a_readable_flight_line_leaves_no_frame_behind() -> None:
     dumped: list[str] = []
     loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[attr-defined]
 
-    assert loop._read_flight_time() == timedelta(minutes=8, seconds=3)  # type: ignore[attr-defined]
+    assert loop._read_flight_time(TARGET).flight == timedelta(minutes=8, seconds=3)
     assert dumped == []
+
+
+def test_an_arrival_time_in_the_past_is_thrown_away_not_turned_into_a_negative_flight() -> None:
+    """⚠️ **读出来的到达时刻落在过去时必须丢掉，不许当成一个负的时长。**
+
+    这条路是 `到达时刻 - 现在`，所以一位数字读错就可能得到负数。同一张 OCR
+    网格里 `3×/None` 就把 `09:26:27` 读成过 `03:26:27`——差六小时，足够把一趟
+    30 分钟的飞行算成 −5.5 小时。
+
+    负数不会触发 `MAX_CREDIBLE_FLIGHT` 那道上界（它只管大的），会一路写进库：
+    `expected_report_at_utc` 落在过去 → 战报一被判「到点了」就赖在到期单子上；
+    `line_free_at_utc` 落在过去 → 调度器以为航线**已经空了**，接着派，
+    撞上游戏那句「同时派遣的舰队数量已达上限。」。
+
+    丢掉之后这一路当作读不出来，换下一套配方；全都不行就交给别的来源。
+    """
+    loop = _loop_reading("", arrival="13/08/2026 17:02:56")
+
+    assert loop._read_flight_time(TARGET).flight is None
 
 
 def test_the_ceiling_leaves_room_for_the_longest_briefing_ever_observed() -> None:

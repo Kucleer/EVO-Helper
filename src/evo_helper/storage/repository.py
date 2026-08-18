@@ -16,6 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
+from evo_helper.domain.flight_estimate import FlightSource
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
@@ -1209,7 +1210,12 @@ class SqlAlchemyRepository:
     # -- 派出后的松手等待 ------------------------------------------------------
 
     def record_flight_time(
-        self, dispatch_id: UUID, flight: timedelta | None, dispatched_at_utc: datetime
+        self,
+        dispatch_id: UUID,
+        flight: timedelta | None,
+        dispatched_at_utc: datetime,
+        *,
+        source: FlightSource | None = None,
     ) -> None:
         """存下飞行时长，以及由它派生的**两个钟**。
 
@@ -1254,13 +1260,22 @@ class SqlAlchemyRepository:
                     and intent.origin_system == intent.target_system
                 ),
             )
+            row.flight_source = None if flight is None or source is None else source.value
             if flight is None:
                 row.flight_seconds = None
                 row.expected_report_at_utc = None
                 row.line_free_at_utc = None
             else:
                 dispatched = _require_utc(dispatched_at_utc, "dispatched_at_utc")
-                row.flight_seconds = int(flight.total_seconds())
+                # ⚠️ **算出来的值不进 `flight_seconds`。** 那一列是
+                # `vet_flight_time` 那道下限的标定样本池；掺进
+                # `domain.flight_time` 公式的输出，下一次标定就变成拿模型的
+                # 输出去标定模型自己。两个钟照常按它推——省下的正是那 90 分钟
+                # 空占——但「这一发飞了多久」这个观测记录仍然是 NULL，
+                # 来源写在 `flight_source` 上。
+                row.flight_seconds = (
+                    None if source is FlightSource.DISTANCE_MODEL else int(flight.total_seconds())
+                )
                 row.expected_report_at_utc = dispatched + flight
                 row.line_free_at_utc = line_free_at(
                     dispatched,

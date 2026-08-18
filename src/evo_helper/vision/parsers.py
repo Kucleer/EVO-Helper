@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
+from evo_helper.domain.flight_estimate import (
+    BRIEFING_SKEW_TOLERANCE as _BRIEFING_SKEW_TOLERANCE,
+)
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.text import edit_distance
 from evo_helper.vision.models import (
@@ -632,7 +635,13 @@ _MISSION_LABELS = {
 
 #: 到达时间与「当前时间 + 飞行时长」允许的偏差。OCR 读的是秒级文本，
 #: 而读取本身要花时间，所以留一分钟；超过就说明至少有一处读错了。
-BRIEFING_SKEW_TOLERANCE = timedelta(minutes=1)
+#:
+#: ⚠️ **定义已经搬到 `domain.flight_estimate`，这里只是原样 re-export。**
+#: 那边的三来源合成也要用同一道容差，而 `domain` 不许 import `vision`
+#: （方向是反的：本模块自己就 import `domain.report_wait`）。老的 import
+#: 路径一个都不用改。**不许在任何一边另起一个数**——两处各调各的，就等于
+#: 这道交叉校验在两条链路上说着不同的话。
+BRIEFING_SKEW_TOLERANCE = _BRIEFING_SKEW_TOLERANCE
 
 
 @dataclass(frozen=True)
