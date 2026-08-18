@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -480,6 +481,54 @@ def _blind_scroll_verdict(choice: BlindScrollChoice) -> str:
         f"「不指定」，采集将用写死的默认值 {BLIND_SCROLLS} 屏"
         f"（实测样本只有 {choice.samples} 条，自动标定要 {BLIND_SCROLL_SAMPLES} 条）"
     )
+
+
+class LaunchOutcome(Enum):
+    """`MissionScheduler._launch()` 这一次的结果。**四态，因为那里真的有四件事。**
+
+    原先这四件事全都挤在一个 `bool` 里（起来了 = True，其余三件 = False），而
+    `_act()` 的 `return not self._launch(...)` 把「其余三件」一律翻成「值得再算一
+    次」。后果是**每一个「没活干」的 tick 都把 `_step` 转满 `len(MissionKind)` = 4
+    圈，每圈一次完整的 `_facts()`**（本地 16 条 SQL / 约 194 ms，生产实测 0.32 秒），
+    而那 3 圈额外的**一发都派不出去**——理由见 `worth_another_round`。
+
+    ⚠️ **`VOID` 和 `IDLE` 对 `_act` 是同一个答案，仍然不许合并。** 「决策指向的任务
+    已经不在了」和「这条链路此刻正常地没活干」在排障时是两回事：前者只该在用户刚删
+    过任务的那一瞬出现，出现在别的时候说明决策与起进程之间还有别的东西在改库；后者
+    每分钟都可能有几十次。合成一个成员，日志和用例就都分不出来了。
+    """
+
+    #: 子进程真的起来了，`mission_runs` 里也已经落了一行。
+    STARTED = "started"
+    #: 决策已作废：`mission_task(...)` 读回来是空的，用户在这期间把它删了。
+    VOID = "void"
+    #: 这会儿没活干（`MissionIdle`）：军力池凑不出目标、航线预算刚好用完。
+    #: **不停用、不记失败、不起进程**，下一 tick 拿新事实重算即可。
+    IDLE = "idle"
+    #: 刚把这条链路**就地停用**了（`MissionParamError`）：参数不合格，用户不点
+    #: 一次「恢复」它就不再参与调度。
+    DISABLED = "disabled"
+
+    @property
+    def worth_another_round(self) -> bool:
+        """本 tick 值得再走一遍「读事实 → 判 → 起」吗。
+
+        **只有 `DISABLED`。** 判据是「候选集变了吗」，而只有停用会真的改它：
+        `disabled_reason` 落了库，`decide()` 下一圈的候选里就少一个，顺位该立刻让给
+        下一条链路（`test_a_bad_radius_yields_its_turn_in_the_same_tick`）。
+
+        另外三档都不改候选集，于是**再走一遍必然挑中同一个任务、得到同一个结果**
+        ——`decide()` 是 `(tasks, facts)` 的纯函数，而这三档一个字都没往库里写。
+        `IDLE` 那一档 2026-08-18 实测过：4 圈跑完 `launcher.kinds == []`，排在后面的
+        SCAN 一次都没顶上。所以「`IDLE` 之后本 tick 就到此为止」**不是把让位取消了**，
+        今天那个位本来就没让出去；下一条链路等下一个 tick（1 秒）。
+
+        ⚠️ **写成白名单（`is DISABLED`）而不是黑名单（`is not IDLE`）。** 将来加第五
+        个成员时，漏改这里的后果必须是「少重算一次」——浪费一个 tick，页面上看不出
+        来；黑名单漏改的后果是每秒空转四圈重算全库候选池，也就是这次修的东西原样
+        复发。
+        """
+        return self is LaunchOutcome.DISABLED
 
 
 @dataclass(frozen=True)
@@ -1748,24 +1797,24 @@ class MissionScheduler:
 
         作废一律返回「不必再算」：再算一遍读的还是同一份库，只是白付一次
         `_facts()` 的钱。只有「刚把某条链路就地停用」才值得重算，那时次序真的
-        变了，顺位该立刻让给下一条。
+        变了，顺位该立刻让给下一条。**这句话现在由 `LaunchOutcome` 保证**——
+        判据在 `LaunchOutcome.worth_another_round` 上，连同它为什么只认
+        `DISABLED` 一档的全部理由。
 
-        ⚠️ **上面这段说的和最后一行做的对不上，这是一个已知缺陷，还没修**
-        （2026-08-18 查明，本条只留证据不动代码）。`_launch` 用一个 `False` 表达了
-        **三**件事：任务被删了、`MissionIdle`（这会儿没活干）、`MissionParamError`
-        （刚停用了谁）。`not self._launch(...)` 把三件都翻成「值得再算」，于是
-        **每一个「没活干」的 tick 都会把 `_step` 转满 `len(MissionKind)` = 4 圈**，
-        每圈一次完整的 `_facts()`。
+        2026-08-18 之前这段规格和最后一行是对不上的：`_launch` 用一个 `False` 表达
+        了任务被删、`MissionIdle`、`MissionParamError` **三**件事，`not
+        self._launch(...)` 把三件都翻成「值得再算」。于是每一个「没活干」的 tick 都把
+        `_step` 转满 `len(MissionKind)` = 4 圈，每圈一次完整的 `_facts()`——
+        实测（本地 SQLite，体量按生产摆到约两倍：`bot_targets` 10,725 行）一次
+        `_military_pool_reading` 4 条 SQL / 约 179 ms，一次 `_facts` 16 条 SQL /
+        约 194 ms（`_facts` 自己的注释记的生产实测是 0.32 秒），乘以 4 就是每个空转
+        tick 近一秒钟全花在重算全库候选池上。它同时是 2026-08-18 16:00 那一小时日志
+        刷屏的成因——实测「同一秒内最多重复 4 次」，与这 4 圈对得上（PR #188 压住了
+        日志，成因留到这里才修）。
 
-        代价（本地 SQLite 量的，体量按生产摆到约两倍：`bot_targets` 10,725 行）：
-        一次 `_military_pool_reading` 4 条 SQL、约 179 ms；一次 `_facts` 16 条
-        SQL、约 194 ms（`_facts` 自己的注释记的生产实测是 0.32 秒）。乘以 4 就是
-        每个空转 tick 近一秒钟全花在重算全库候选池上。它同时是 2026-08-18 16:00
-        那一小时日志刷屏的成因——实测「同一秒内最多重复 4 次」，与这里的 4 圈对得上。
-
-        **修法不是加缓存**，是让 `_launch` 把「没活干」和「停用了谁」分开表达。
-        但那会改到派遣次序（`MissionIdle` 之后本 tick 还让不让下一条链路上），
-        属于调度循环的行为变更，该单独一个 PR 单独验，不搭在日志那次改动上。
+        **修法不是加缓存。** 真正的失效条件（新军力读数写入、新派遣写入、配置变化、
+        窗口边界随时间移动）说不清，而缓存会让调度器拿着过期的候选池去派遣，比多花
+        CPU 糟得多。
         """
         if decision.task is None:
             return False
@@ -1793,10 +1842,10 @@ class MissionScheduler:
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             elif running is not None:
                 return False
-            return not self._launch(decision.task, facts.of(decision.task))
+            return self._launch(decision.task, facts.of(decision.task)).worth_another_round
 
-    def _launch(self, task: TaskSnapshot, facts: TaskFacts) -> bool:
-        """组命令行、起进程、记账。参数不合格则停用该任务并返回 False。
+    def _launch(self, task: TaskSnapshot, facts: TaskFacts) -> LaunchOutcome:
+        """组命令行、起进程、记账。四种结局各有各的成员，见 `LaunchOutcome`。
 
         调用方必须已经持有 `_lock`：这里会真的拉起一个去点鼠标的子进程。
 
@@ -1814,7 +1863,7 @@ class MissionScheduler:
             # 决策与这一刻之间用户把这个任务删了。作废本轮，等下一 tick 拿新事实
             # 重算——照着一份指向已删任务的决策去起子进程，起出来的是一轮没有账
             # 可记的派遣。
-            return False
+            return LaunchOutcome.VOID
         try:
             batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
             if task.kind is MissionKind.RANKING:
@@ -1840,9 +1889,11 @@ class MissionScheduler:
             else:
                 command = self._command_for(task.kind, row.params_json, task.origin)
         except MissionIdle as exc:
-            # 不停用、不记失败、不起进程。下一 tick 拿新事实重算即可。
+            # 不停用、不记失败、不起进程，**而且本 tick 不再重算**：候选集一个字都
+            # 没变，再走一遍必然挑中同一个任务、抛同一个 `MissionIdle`
+            # （见 `LaunchOutcome.worth_another_round`）。下一 tick 拿新事实重算。
             _LOGGER.info("%s 这一轮没活干：%s", task.name, exc)
-            return False
+            return LaunchOutcome.IDLE
         except MissionParamError as exc:
             # 类别按**异常类型**认，不按那句中文认：`NoFreeLineError` 说的是
             # 「这一刻没航线」，舰队飞回来就好了；别的都是配置填错，改之前重试
@@ -1857,7 +1908,9 @@ class MissionScheduler:
                     else DisabledRecovery.MANUAL
                 ),
             )
-            return False
+            # **唯一值得本 tick 再算一次的一档**：候选集真的少了一个，顺位该立刻让给
+            # 下一条链路，否则这一秒谁都不跑。
+            return LaunchOutcome.DISABLED
         # 本轮的 id 要在**起子进程之前**定下来：runner 靠环境变量认领它，
         # 好把自己写进 `system_log` 的每一行都挂到这一轮上。起完再生成就晚了，
         # 那台机器上的日志会全部落成「不属于任何一轮」。
@@ -1878,7 +1931,7 @@ class MissionScheduler:
         elif task.kind is MissionKind.BOT and task.task_id == self._military_ranking_batch_task_id:
             # 这一批已经真正交给带 --attack 的 runner，后续排程恢复常规优先级。
             self._military_ranking_batch_task_id = None
-        return True
+        return LaunchOutcome.STARTED
 
     def _finish(self, exited: MissionExit | None) -> None:
         """一个子进程结束了：回填 `mission_runs`，并更新连续失败计数。"""
