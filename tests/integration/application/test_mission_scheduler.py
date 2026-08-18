@@ -48,6 +48,8 @@ from .conftest import Clock, make_supervisor
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 BOT_RANGE = '{"galaxy": 2, "first_system": 100, "last_system": 200}'
+#: 种子任务的出发星球（`domain.missions.ORIGIN`）。派遣默认记在它头上。
+DEFAULT_ORIGIN = Coordinate(2, 137, 18)
 
 
 # -- 夹具与小工具 --------------------------------------------------------------
@@ -179,19 +181,24 @@ def dispatch(  # type: ignore[no-untyped-def]
     preset_name: str = "AAA",
     flight: timedelta | None = None,
     mission_kind: str = MISSION_KIND_ATTACK,
+    origin: Coordinate = DEFAULT_ORIGIN,
 ):
     """记一发被游戏接受的派遣。
 
     `flight` 不传就留空航线钟，那一档按 `UNKNOWN_LINE_HOLD`（90 分钟）算**仍然
     占着航线**——测试若只想验别的事，就得把飞行时间给上，否则这一发会一直压着
     航线让链路起不来。
+
+    `origin` 默认是全局主星，也就是绝大多数用例里那颗。**多出发点的用例必须显式
+    传**：航线记账按出发星球分（`repository.count_inflight`），派遣记在哪颗星球上
+    决定了这一发压住的是谁的预算。
     """
     intent_id, dispatch_id = uuid4(), uuid4()
     repository.save_attack_intent(
         AttackIntent(
             intent_id=intent_id,
             run_id=run_id,
-            origin=Coordinate(2, 137, 18),
+            origin=origin,
             target=target,
             preset=FleetPresetRef(name=preset_name, signature="sig"),
             cycle_start_utc=dispatched_at,

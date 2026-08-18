@@ -1324,6 +1324,128 @@ def test_a_military_bot_plan_uses_global_tiers_and_selected_planets(console: Con
     assert config.json()["tiers"][0]["preset"] == "CCC"
 
 
+def _military_bot(console: Console, *coordinates: tuple[Coordinate, int]) -> int:
+    """把种子那行 bot 改成军力优先，并配上多出发点。返回它的 id。"""
+    task_id = console.task_id("BOT")
+    console.client.patch(
+        f"/api/missions/{task_id}", json={"params": {"by_military": True, "top_n": 50}}
+    )
+    payload = []
+    for coordinate, lines in coordinates:
+        planet = console.client.post(
+            "/api/attack-planets",
+            json={
+                "galaxy": coordinate.galaxy,
+                "system": coordinate.system,
+                "position": coordinate.position,
+            },
+        )
+        assert planet.status_code == 201, planet.text
+        payload.append(
+            {"planet_id": planet.json()["planet_id"], "fleet_lines": lines, "enabled": True}
+        )
+    saved = console.client.put(f"/api/missions/{task_id}/origins", json=payload)
+    assert saved.status_code == 200, saved.text
+    return task_id
+
+
+def test_a_military_row_shows_its_real_origins_not_the_stale_task_level_count(
+    console: Console,
+) -> None:
+    """⚠️ **行头那句话必须念 `mission_task_origins`，不是任务级那个残值。**
+
+    生产实证（2026-08-18）：用户配的是 `4:277:15=6 线` + `9:250:8=2 线`，页面上却
+    写着「4:277:15 · 7 条航线」——那个 7 是 `mission_tasks.fleet_lines`，
+    一个加多出发点之前留下的、`replace_mission_origins` 从不回写的残值。
+
+    顺带钉住「已配 X 条 / 上限 Y 条」那句提示：用户口径（2026-08-18）
+    「我配置时已经手动确认了不会超过总航线数」——他自己确认，那就得有东西给他看。
+    """
+    console.client.put(
+        "/api/attack-config",
+        json={"tiers": [{"min_score": 0, "preset": "AAA"}], "account_line_limit": 9},
+    )
+    task_id = _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+    console.client.patch(f"/api/missions/{task_id}", json={"enabled": True})
+
+    summary = str(console.task("BOT")["summary"])
+
+    assert "4:277:15 · 6 条" in summary
+    assert "9:250:8 · 2 条" in summary
+    assert "7 条航线" not in summary, "任务级那个残值一个字都不该出现在军力行上"
+    assert "全账号已配 8 条 / 上限 9 条" in summary
+
+
+def test_the_row_says_so_when_the_configured_lines_exceed_the_account_limit(
+    console: Console,
+) -> None:
+    """配超了要说出来——但**不拦**。
+
+    用户可能正编辑到一半，也可能先配好再去开加成道具（常态 6、开道具 9）。
+    所以保存照样 200，只是行头上多一句「已超出」。硬拦的实现会让这条转红。
+    """
+    console.client.put(
+        "/api/attack-config",
+        json={"tiers": [{"min_score": 0, "preset": "AAA"}], "account_line_limit": 6},
+    )
+    task_id = _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+    enabled = console.client.patch(f"/api/missions/{task_id}", json={"enabled": True})
+
+    assert enabled.status_code == 200, enabled.text
+    summary = str(console.task("BOT")["summary"])
+    assert "全账号已配 8 条 / 上限 6 条（已超出）" in summary
+
+
+def test_saving_the_origins_never_writes_back_the_task_level_fleet_lines(
+    console: Console,
+) -> None:
+    """⚠️ **`replace_mission_origins` 不许同步任务级那一列。**
+
+    回写等于造出两份真相：多出发点那张表一份、任务级那一列一份，而两份迟早对不上
+    ——它们对不上正是这次事故的形状。真相只有一份，显示层去读那一份就是了。
+    """
+    before = int(console.task("BOT")["fleet_lines"])  # type: ignore[arg-type]
+    _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+
+    row = console.repository.mission_task(console.task_id("BOT"))
+    assert row is not None
+    assert row.fleet_lines is None or row.fleet_lines == before
+
+
+def test_changing_a_planets_lines_shows_up_in_the_change_list(console: Console) -> None:
+    """「把 2 号星的航线从 2 改成 3」必须出现在「改动」列里。
+
+    ⚠️ 没有这一段的后果是**静默丢账**：军力攻击的真相全在 `origins` 里，而逐条
+    对比原先只比 `origin` / `fleet_lines`（任务级残值，永远不变），于是这一次改动
+    在记录里一个字都不留，看起来像是什么都没改。
+    """
+    task_id = _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+    # 记录只摆出参与调度的任务，所以这一行得先勾上。
+    console.client.patch(f"/api/missions/{task_id}", json={"enabled": True})
+    _start(console)
+    console.client.post("/api/scheduler/stop")
+
+    planets = console.client.get("/api/attack-planets").json()
+    ids = {
+        (item["galaxy"], item["system"], item["position"]): item["planet_id"] for item in planets
+    }
+    console.clock.now = NOW + timedelta(hours=1)
+    console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[
+            {"planet_id": ids[(4, 277, 15)], "fleet_lines": 6, "enabled": True},
+            {"planet_id": ids[(9, 250, 8)], "fleet_lines": 3, "enabled": False},
+        ],
+    )
+    _start(console)
+
+    frozen = console.get()["frozen_config"]
+    assert isinstance(frozen, dict)
+    changes = frozen["changes"]
+    assert any("9:250:8 航线数 2 → 3" in item for item in changes), changes
+    assert any("9:250:8 参与派遣 是 → 否" in item for item in changes), changes
+
+
 def test_the_report_scan_floor_round_trips_through_the_attack_config(console: Console) -> None:
     """攻击配置页那个「翻信箱时长」存得住、读得回，非法值当场 422。
 
@@ -1468,6 +1590,8 @@ _ALL_KNOBS = {
     "reconcile_cooldown_minutes": 0,
     "bot_revisit_hours": 6,
     "military_time_pool": 300,
+    "account_line_limit": 6,
+    "auto_toggle_log_seconds": 90,
 }
 
 
