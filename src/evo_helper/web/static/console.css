@@ -113,7 +113,13 @@ body {
 .topbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
 .topbar .spacer { flex: 1; }
 
-.content { padding: 14px; display: grid; gap: 12px; align-content: start; }
+/* ⚠️ `minmax(0, 1fr)` 而不是默认的 `auto`：网格子项的 `min-width` 默认是
+   `auto`，也就是「不许比内容窄」。于是一张放不下的宽表格会把 `.panel` 连同
+   `.content`、`.main` 一起顶宽，横向滚动条跑到**整个窗口**底下——连左边的
+   导航栏都会被推走。显式允许收缩之后，放不下的表格回到 `.table-wrap` 自己的
+   滚动条里，而那正是那个包裹层存在的理由（见 `.table-wrap` 上的注释）。
+   用户 2026-08-18 报的攻击日志「被撑得太宽」，一半是这里。 */
+.content { padding: 14px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-content: start; }
 
 /* ---- panels --------------------------------------------------------- */
 
@@ -425,10 +431,14 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
   .sidenav a[aria-current="page"] { border-bottom-color: var(--accent); }
 }
 
-/* 系统日志的正文列：默认限宽截断，鼠标停在那一行才展开。
+/* 日志类页面的正文列：默认限宽截断，鼠标停在那一行才展开。
    payload 动辄几千字符（还夹着 base64 图），原样铺开会把整页宽度撑到
-   横向滚动条拉不到头——用户 2026-08-17 报的就是这个。 */
-.log-body { max-width: 46vw; }
+   横向滚动条拉不到头——用户 2026-08-17 报的就是这个。
+
+   同一套类给两页共用：系统日志（`/system-log`）的「正文」列，以及攻击日志
+   （`/logs`）的「战果」列——那一格要铺开战损加 12 项资源，症状一模一样
+   （用户 2026-08-18 报）。 */
+.log-body { max-width: var(--log-body-cap, 46vw); }
 .log-line {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -450,3 +460,22 @@ tr:hover .log-line {
   transition: width 0.15s ease, opacity 0.15s ease;
 }
 tr:hover .log-shot { width: 480px; opacity: 1; }
+
+/* 攻击日志那张表的收窄，两条一起才够。
+   ⚠️ **下面这些数不是偏好项，是按版面量出来的标定量**——它们由这一页的列数、
+   列内容与字号定死，调了就是让横向滚动条回来（或者白白截掉本来放得下的内容）。
+
+   一、三个时刻列允许折行。9 列里最贵的就是它们：`2026-08-17 03:55:00` 一行
+   摊开是 159px，三列合计 477px。允许在日期与时分之间断行之后每列只要 74px，
+   八个定宽列从 972px 降到 714px，而行高只从 70px 涨到 74px——「战果」那一格
+   本来就有三行，多出来的一行不占额外高度。**一个字都没少显示。** */
+#log-entries th:nth-child(1), #log-entries td:nth-child(1),
+#log-entries th:nth-child(2), #log-entries td:nth-child(2),
+#log-entries th:nth-child(9), #log-entries td:nth-child(9) { white-space: normal; }
+
+/* 二、「战果」列比系统日志窄一档。系统日志那一页只有 7 列，46vw 在那里成立；
+   照搬到这里，1920 下是 883px，加上定宽列就是 1597px，容器只有 1650px——
+   而 1280 下容器只有 1010px，46vw 直接溢出。
+   所以取两者的小值：宽屏按 32vw（1920 下 614px，看得见前六七项资源），
+   窄屏按「容器还剩多少」算——62rem 是那八个定宽列加左侧导航、内外边距的量值。 */
+#log-entries { --log-body-cap: min(32vw, calc(100vw - 62rem)); }
