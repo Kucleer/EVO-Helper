@@ -186,6 +186,155 @@ def test_the_page_says_the_window_does_not_cut_off_a_running_round(
     assert "正在跑的不打断" in body or "不打断正在跑的那一轮" in body
 
 
+# -- 压行高：通用说明进 ⓘ、定时开关折叠 --------------------------------------
+#
+# 一屏能看几行任务，取决于**最高的那一列**。原先最高的两样东西都不是这一行自己的
+# 事实，而是每一行逐字重复的通用说明，以及两个绝大多数任务根本没填的日期时间框。
+# 这一批用例守的是「压高度」和「别把信息弄丢」这两件事**同时**成立：
+#
+# - 通用说明搬进 `title`，但**必须真的进了 title**（`makeTips` 那一句），
+#   不许只从页面上删掉；
+# - 摘要压成一行、超出截掉，但**必须同时挂上 title**——截断了又读不到全文，
+#   等于把「全账号已配 N 条 · 已超出」藏起来，而那是超配唯一的显形处；
+# - 定时那一列默认折叠，但**配了定时的任务不许被折起来**。
+
+
+def test_the_military_selection_criteria_moves_into_a_tooltip_instead_of_vanishing(
+    client: TestClient,
+) -> None:
+    """那段近 200 字的「选靶：①…④…」原先每一行任务都铺一遍，是行高的大头。
+
+    它是**通用说明**（在每一行里逐字相同），所以搬进 ⓘ。但「搬走」和「删掉」在
+    页面上看起来一模一样，而这段话里有好几句是判据的一部分（「窗口门限」不决定
+    打谁、有效期是划一条线而不是取最新的几个）——丢了它，页面和代码就开始分家。
+    所以这里钉三件事：文字还在、进的是 `title`、不再每行铺一个 `<div>`。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    # ① 文字一个字都没少（抽查最容易被「精简」掉的那两句）。
+    assert "选靶：① 剔除近 24 小时打过的" in body
+    assert "「窗口门限」不决定打谁" in body
+    # ② 它被交给 `makeTips`——也就是挂在 `title` 上，而不是又变成一行正文。
+    assert "makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP)" in body
+    # ③ `makeTips` 真的把正文写进 `title`。少了这一句，上面两条照样绿，
+    #    而页面上那个 ⓘ 悬停出来是空的——说明就等于丢了。
+    assert "tips.title = text" in body
+    # ④ 不再每行铺一个 `<div>`：那正是要省掉的行高。
+    assert "advice.textContent" not in body
+
+
+def test_the_multi_origin_note_moves_into_a_tooltip_instead_of_vanishing(
+    client: TestClient,
+) -> None:
+    """「每颗出发星球填自己的航线；攻击档位在『攻击配置』页统一维护。」同上。
+
+    它讲的是这个功能怎么用（每一行长得一模一样），不是这一行的事实，所以进 ⓘ。
+    但它是用户找到「档位到底在哪儿改」的唯一线索，删掉就等于把那条路藏了。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "每颗出发星球填自己的航线；攻击档位在" in body
+    assert "页统一维护。" in body
+    assert "makeTips('多出发点说明', MILITARY_ORIGIN_TIP)" in body
+    assert "tips.title = text" in body
+    # 原先那个每行一份的 `<div>` 没了。
+    assert "note.textContent = '每颗出发星球" not in body
+
+
+def test_the_row_summary_is_clipped_to_one_line_but_never_truncated_away(
+    client: TestClient,
+) -> None:
+    """摘要讲的是**这一行自己的事实**，所以留在页面上，只是压成一行。
+
+    ⚠️ **省略号和 `title` 是一对。** 摘要里「全账号已配 N 条 · 未设账号上限」
+    是用户唯一能看见「航线有没有超配」的地方（那句话由
+    `web.persistent_service.LineBudget.hint` 生成，`tests/integration/api/
+    test_scheduler_api.py` 钉着它的内容）。压成一行之后它可能被截在屏幕外——
+    那时能不能读到，全靠 `title`。只截不留 `title`，等于把超配藏了起来。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    # 一行不折行 + 超出用省略号。
+    assert "summary.style.whiteSpace = 'nowrap'" in body
+    assert "summary.style.textOverflow = 'ellipsis'" in body
+    # 完整内容进 `title`，和摆出来的正文同源（都是后端下发的 `task.summary`）。
+    assert "summaryLine.textContent = task.summary || ''" in body
+    assert "summaryLine.title = task.summary || ''" in body
+
+
+def test_a_task_that_has_a_schedule_window_is_never_folded_out_of_sight(
+    client: TestClient,
+) -> None:
+    """⚠️ **这一条是这次改动最危险的地方。**
+
+    定时那一列默认折叠（绝大多数任务没配定时，那三行高度买到的是两个空框），
+    但把一份**已经生效**的定时藏起来，比多占几行危险得多：用户看不见它，就会
+    以为定时没生效，然后去改别的东西——而任务其实每天到点就自己关掉。
+
+    所以守两道，缺一道都算漏：
+    ① 配了定时的行**默认展开**；判据是**库里有没有值**（`enabled_from_utc` /
+       `enabled_until_utc`），不是页面上那两个框里此刻是什么——用框里的值来判，
+       在刚建出来还没 prime 的行上会得出「没配」。
+    ② 折叠那一行本身把配着的时刻念出来，所以哪怕用户自己把它折回去，
+       「这个任务配了定时」照样一眼看得见。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    # ① 判据来自库，不是来自输入框。
+    assert "const scheduled = Boolean(task.enabled_from_utc || task.enabled_until_utc);" in body
+    # ② 配了就默认展开（`windowTouched` 之后听用户的，那是另一回事）。
+    assert "if (!row.dataset.windowTouched) windowToggle.checked = scheduled;" in body
+    # ③ 折叠态自己就说得清「配了没配」。
+    assert "已配定时 · 开启 " in body
+    assert "'未设定时'" in body
+
+
+def test_the_schedule_window_starts_folded(client: TestClient) -> None:
+    """默认折起来——这就是省下来的那几行。
+
+    和上一条是一对：那一条守「配了的不许藏」，这一条守「没配的不许占地方」。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "window_.hidden = true;" in body
+    assert "'mission-window-toggle'" in body
+
+
+def test_folding_the_schedule_window_never_writes_anything_to_the_server(
+    client: TestClient,
+) -> None:
+    """折叠只是这一刻的视图，不是配置。
+
+    ⚠️ 折叠开关和「参与调度」那个复选框都是 `input[type=checkbox]`，走的又是同一个
+    `change` 处理器。它这一支要是没抢在前面并且自己 `return`，折一下就会打出一次
+    PATCH——而「折一下把任务停了」是这里最糟的一种失败。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    fold = body.index("if (event.target.matches('.mission-window-toggle')) {")
+    enabled = body.index("if (event.target.matches('.mission-enabled')) {")
+    assert fold < enabled, "折叠开关那一支排到了「参与调度」后面，会顺带 PATCH 一次"
+    # 这一支自己收尾，绝不往下落。
+    branch = body[fold:enabled]
+    assert "return;" in branch
+    assert "patch(" not in branch
+
+
+def test_the_fold_toggle_still_works_while_the_scheduler_is_running(
+    client: TestClient,
+) -> None:
+    """运行中最想知道的恰恰是「这一轮的定时配的是什么」。
+
+    这一页运行中会把行里所有 `input` 一并置灰（配置已固化，后端也会 409）。
+    折叠开关跟着灰掉的话，一个折起来的定时在运行中就再没有办法展开去看——
+    而展开只是去看，里面那两个输入框仍然是灰的。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    lines = [line for line in body.splitlines() if ".mission-window-toggle')" in line]
+    assert any("disabled = false" in line for line in lines), "折叠开关跟着锁一起灰掉了"
+
+
 def test_the_bot_row_carries_a_new_round_button(client: TestClient) -> None:
     """bot 打完一轮就退出调度，**不自动开下一轮**——开新一轮只能是用户按的。
 
