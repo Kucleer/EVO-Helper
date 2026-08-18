@@ -93,6 +93,16 @@ def _task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
 
 
 def _enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object) -> None:
+    """启用一条链路。**默认给 2 条航线**——理由见下。
+
+    ⚠️ `scheduler_config.fleet_line_limit` 的默认值只有 1 条，而按距离分配
+    （`domain.military_attack.assign_by_capacity_and_distance`）只会派到航线用完
+    为止。于是「候选池里有两个、只派得出一个」时，「排除了谁」和「距离谁更近」
+    这两件事的结果长得一模一样——**变异测试当场验出这个洞**：把排除整条删掉，
+    `test_the_next_round_no_longer_picks_a_protected_target` 照样绿，因为被排除的
+    那个本来也轮不到。给足 2 条航线，「两个都该派出去」才成立，断言才落在排除上。
+    """
+    fields.setdefault("fleet_lines", 2)
     repository.update_mission_task(_task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
 
 
