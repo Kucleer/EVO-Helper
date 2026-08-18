@@ -2932,6 +2932,30 @@ class PirateLoop:
           配额用完时 `restart_and_reenter` 直接返回拒绝结局，这里照样抛。
         - **重开之后不假定自己在游戏内**：`restart_and_reenter` 仍然走判据驱动的
           入口序列，`ensure_system_view` 也照旧读导航栏标签。认不出就停，不乱点。
+
+        ## ⚠️ 关窗重开会把当前星球退回主星，这里必须一起忘掉
+
+        **2026-08-18 那次错账的触发点就是这一支**，生产 `system_log` 上一句不差：
+
+            18:52:07  起点回读 '9:250:8'，确认当前星球是 9:250:8
+            18:53:32  已发动攻击 → 9:231:7（预设 AAA）        ← 确实从 9:250:8
+            18:54:59  派出之后切不回恒星系视图；关窗重开一次再试（兜底策略）
+            18:55:34  重开之后已经重新进到游戏内
+            18:56:22  已发动攻击 → 9:205:14（预设 BBB）       ← 已经是主星 4:277:15
+
+        重开的是整个 Chrome 窗口，游戏重新走一遍入口序列，**落点是主星**。
+        而这里原先只清了导航器缓存，`_current_planet` 一个字没动——于是
+        `switch_needed` 仍然说「本轮已经切到 9:250:8，不用切」，余下每一发都从
+        主星飞出去，`attack_intents.origin_*` 上却写着 9:250:8。
+
+        另外两处关窗重开（`_ensure_session` 的重连支、`_mailbox_restart`）**都清了**，
+        理由那边写得明明白白；漏的只有这一处。这是三处共用一件事而只改了两处的
+        典型代价。
+
+        清掉之后本轮不会当场重切（`ensure_origin_planet` 属于开工阶段，一轮只跑
+        一次），但派出之前那道起点闸门会当场拦下并停轮
+        （`_require_origin_before_dispatch`），下一轮开工时重新切一次。
+        **闸门是兜底，这一处是止血；两条都要有。**
         """
         if self._navigator.ensure_system_view(self._nav_labels):
             return
@@ -2944,6 +2968,9 @@ class PirateLoop:
             )
         # 重开之后画面整个换过一遍，导航器那份记忆记的是重开前的坐标。
         self._navigator.invalidate()
+        # 出发星球那份记忆同样作废：重开的落点是主星，不是本轮配的那颗。见上面那段。
+        self._current_planet = None
+        say("  关窗重开之后落点是主星；「本轮已经切到哪」这份记忆作废")
         if not self._navigator.ensure_system_view(self._nav_labels):
             raise SessionUnavailable(
                 f"{what_failed}；重开之后仍然切不回来；安全停止",
