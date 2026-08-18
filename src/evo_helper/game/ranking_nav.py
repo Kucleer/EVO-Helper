@@ -67,10 +67,13 @@ from evo_helper.game.ranking_ui import (
     NAV_LABELS,
     NAV_MAX_DRAGS,
     PANEL_OPEN_WAIT_S,
+    PANEL_READY_ROW_SLACK,
+    PANEL_REOPEN_ATTEMPTS,
     RANKING_CLOSE,
     RANKING_LABEL,
     READ_ATTEMPTS,
     REREAD_WAIT_S,
+    ROWS_PER_SCREEN,
     SCROLL_FROM_Y,
     SCROLL_SETTLE_WAIT_S,
     SCROLL_TO_Y,
@@ -138,13 +141,18 @@ class ScrollStep[RowT]:
 class RankingNavigator[RowT]:
     """把画面带到军事排行榜上，并一屏一屏往下滚。
 
-    三个回调都由调用方注入，**这一层不认识 OCR，测试里也就不需要假图片**
+    回调都由调用方注入，**这一层不认识 OCR，测试里也就不需要假图片**
     （同 `game.planet_list.PlanetSwitcher`）：
 
     - `read_labels`：底部导航标签行的 `(中心 x, 文字)` 词框。
       那个 x 就是待会儿要点的地方——所以必须是**这一屏**读出来的。
     - `read_rows`：当前这一屏的榜单行，**认不出的丢掉**（见模块头的契约）。
       行是什么类型由调用方定，实机上是 `domain.ranking.RankingRow`。
+    - `row_has_score`：这一行的分数解析出来了没有。**注入而不是 `row.score`**：
+      本层不认识行的形状（`RowT` 是参数化的），认识的是调用方。
+      实机上就是 `lambda row: row.score is not None`。
+      它只在 `_switch_to_military` 那道「面板铺开了没有」的闸上用一次，
+      **不是**用来判「我在哪个页签上」——那个判据不存在，见 `_switch_to_military`。
     ⚠️ **没有「这一屏是不是军事榜」这个回调**，因为那个判据不存在——见
     `_switch_to_military`。想看哪个榜就点哪个页签。
     """
@@ -152,29 +160,61 @@ class RankingNavigator[RowT]:
     driver: RankingDriver
     read_labels: Callable[[], Sequence[tuple[int, str]]]
     read_rows: Callable[[], Sequence[RowT]]
+    row_has_score: Callable[[RowT], bool]
     say: Callable[[str], None] = print
 
     # -- 进榜单 -------------------------------------------------------------
 
     def open_military_ranking(self) -> tuple[RowT, ...]:
-        """走到军事排行榜，返回**回读确认过**的第一屏。
+        """走到军事排行榜，返回**回读确认过、而且确认已经铺开**的第一屏。
 
         每一步都先认出这一屏再点下一下；认不出就抛 `RankingNotReached`，不盲点。
-        """
-        x = self._reveal_ranking_label()
-        self.driver.click(x, NAV_BAR_Y, label=RANKING_LABEL)
-        self.driver.wait(PANEL_OPEN_WAIT_S)
-        rows = self._rows_confirming()
-        if not rows:
-            raise RankingNotReached(
-                f"点完「{RANKING_LABEL}」之后一行榜单都读不出来："
-                "面板没开出来，或者已经不在榜单页上了（比如断线）"
-            )
-        del rows  # 打开时那一屏是经济榜，没有用；真正要的是切过去之后那一屏
-        return self._switch_to_military()
 
-    def _switch_to_military(self) -> tuple[RowT, ...]:
-        """点一次「军事评分」，回读确认还在榜单上。
+        ⚠️ **首屏没铺开时，先关掉重开一次，而不是当场把整趟扔掉。** 生产 08-17
+        17:36:02 那一趟读到的首屏只有 5 行、头一行是 `name='> <A,'`、`score=None`
+        ——面板还没渲染完。那一屏顺利过了当时那道「非空即可」的闸，然后盲翻
+        101 屏一无所获，**白跑约 7 分钟**。而重开一遍只要十几秒。
+
+        真断线时这个重开也不会变成瞎点：`_close_and_reopen` 点完 ✕ 之后要重走
+        `_reveal_ranking_label`，读不出标签行照样抛。
+        """
+        for attempt in range(PANEL_REOPEN_ATTEMPTS):
+            if attempt:
+                self._close_and_reopen(attempt)
+            x = self._reveal_ranking_label()
+            self.driver.click(x, NAV_BAR_Y, label=RANKING_LABEL)
+            self.driver.wait(PANEL_OPEN_WAIT_S)
+            opened = self._rows_confirming()
+            if not opened:
+                raise RankingNotReached(
+                    f"点完「{RANKING_LABEL}」之后一行榜单都读不出来："
+                    "面板没开出来，或者已经不在榜单页上了（比如断线）"
+                )
+            del opened  # 打开时那一屏是经济榜，没有用；真正要的是切过去之后那一屏
+            rows = self._switch_to_military()
+            if rows is not None:
+                return rows
+        raise RankingNotReached(
+            f"重开 {PANEL_REOPEN_ATTEMPTS} 次面板，首屏仍然不像一张铺开的榜单"
+            f"（要么行数不到 {ROWS_PER_SCREEN - PANEL_READY_ROW_SLACK}，"
+            "要么一行分数都解析不出来）；不再往下盲翻"
+        )
+
+    def _close_and_reopen(self, attempt: int) -> None:
+        """首屏没铺开时的退路：点掉 ✕，让下一轮从头再开一次面板。
+
+        ⚠️ **这里可以点 ✕，是因为已经读到过榜单行了。** 「在认不出的画面上不许
+        按下手指」这条（见 `_reveal_ranking_label`）没有被破：走到这一步意味着
+        `_switch_to_military` 至少读出了一行，也就是**确认过面板就开在眼前**，
+        只是没铺开。这也正是「读到 0 行」那一支反而当场抛、不重开的原因——
+        那一支连「面板在不在」都不知道，`RANKING_CLOSE`(750, 71) 落在哪儿没人知道。
+        """
+        self.say(f"  关掉面板准备第 {attempt + 1} 次开榜")
+        self.driver.click(*RANKING_CLOSE, label="关闭排行榜（重开前）")
+        self.driver.wait(NAV_DRAG_WAIT_S)
+
+    def _switch_to_military(self) -> tuple[RowT, ...] | None:
+        """点一次「军事评分」，回读确认**面板铺开了**。铺开了给行，没铺开给 None。
 
         ⚠️ **面板打开时停在「经济评分」**（用户 2026-08-14 实测），所以这一下是必须的，
         不是可选的兜底。
@@ -188,8 +228,28 @@ class RankingNavigator[RowT]:
         两个页签的榜首十三行都是真人、分数都在 404.17M 这个量级，非零判据两边都成立。
         「经济榜 bot 全是 0」只对第 639 名之后成立，而看到那一段要先滚六十屏。
 
-        回读仍然要做，但它回答的是**另一个**问题：「我还在不在排行榜面板上」
-        （读到 0 行 = 断线或面板没开），不是「我在哪个页签上」。
+        ## 下面这道闸判的**不是页签，是渲染**
+
+        它回答的是「这个面板到底铺开了没有」，和「我在哪个页签上」毫无关系——
+        两个页签铺开之后长得一样，都会过这道闸。**别把它误读成又一次尝试判页签**，
+        那个判据上面刚说过，不存在。
+
+        判据两半，缺一不可：
+
+        1. **行数接近满屏**（`ROWS_PER_SCREEN - PANEL_READY_ROW_SLACK`，当前 12）。
+           生产 22 条日志里 21 条是 13 行、1 条是 5 行，**双峰、中间没有灰区**。
+        2. **至少一行解析得出分数**。这一条才是真正区分那一屏坏屏的东西：
+           它的头一行是 `RankingRow(rank=None, name='> <A,', score=None, ...)`
+           ——名字是噪声、分数解析不出来，而这种半渲染的屏**行数也可能凑够**。
+
+        ⚠️ **这不违反模块头第 1 条「空结果不是证据」。** 那一条针对的是**单帧**，
+        而这道闸站在 `_rows_confirming` 之内——它已经按 `READ_ATTEMPTS`(3) ×
+        `REREAD_WAIT_S`(0.6s) 重读过了。所以这里看到的不是「一帧的抖动」，
+        是「重读几次之后仍然只有这么多」。何况不达标也不是当场判死，
+        是退回去重开一次（`open_military_ranking`）。
+
+        读到 0 行仍然当场抛而不重开：那时连「面板在不在」都不知道，
+        见 `_close_and_reopen`。
         """
         self.driver.click(*MILITARY_TAB, label="军事评分")
         self.driver.wait(TAB_SWITCH_WAIT_S)
@@ -199,6 +259,16 @@ class RankingNavigator[RowT]:
                 "点完「军事评分」之后一行榜单都读不出来；"
                 "画面已经不是排行榜面板了（比如断线），不再点下去"
             )
+        minimum = ROWS_PER_SCREEN - PANEL_READY_ROW_SLACK
+        scored = sum(1 for row in rows if self.row_has_score(row))
+        if len(rows) < minimum or not scored:
+            # 挡掉的这一刻要说清**为什么**挡 + **当时看到了什么**（CLAUDE.md 的日志口径）。
+            # 08-17 那次故障之所以拖了两天，正是因为日志只说了行数、没说这一屏长什么样。
+            self.say(
+                f"  首屏不像铺开的榜单：{len(rows)} 行（要 ≥{minimum}）、"
+                f"{scored} 行读得出分数（要 ≥1），头一行 {rows[0]!r}"
+            )
+            return None
         self.say(f"  已切到军事榜（这一屏 {len(rows)} 行，头一行 {rows[0]!r}）")
         return rows
 

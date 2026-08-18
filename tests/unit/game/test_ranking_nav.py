@@ -41,16 +41,49 @@ NAV_ARROW = (1204, 862)
 CLOSE = (750, 71)
 
 #: 经济榜：bot 全是 0 分、按坐标顺序排（实机 2026-08-14）。
+#:
+#: **故意只有 3 行**：开面板那一步的判据是「读得出行 = 面板在眼前」，
+#: 那道「铺开了没有」的闸只加在**切完页签之后**。这里少于满屏而测试仍然全绿，
+#: 就是在钉这件事。
 ECONOMY = ("1 [2:1:1] 0", "2 [2:1:2] 0", "3 [2:1:3] 0")
 
+
+def _row(rank: int, *, scored: bool = True) -> str:
+    """假的一行：`名次 名字 分数`。分数解析不出来时末列写 `?`（实机是 `score=None`）。"""
+    return f"{rank} Player{rank} {'29.59K' if scored else '?'}"
+
+
+def _has_score(row: str) -> bool:
+    """站在 `domain.ranking` 位置上的替身：末列不是 `?` 就算解析出了分数。"""
+    return not row.endswith(" ?")
+
+
+def _screen(first_rank: int, *, rows: int = 13, scored: bool = True) -> tuple[str, ...]:
+    """一屏榜单。
+
+    默认 **13 行**：那不是随手挑的数，是 `ROW_FIRST_Y`(257) / `ROW_LAST_Y`(795) /
+    `ROW_PITCH_PX`(44.8) 这三个实测像素算出来的满屏行数，也正是生产 22 条
+    「已切到军事榜」日志里 21 条的行数。
+    """
+    return tuple(_row(first_rank + index, scored=scored) for index in range(rows))
+
+
 #: 军事榜：有真实分数、按分数降序、坐标是乱的。
-MILITARY_1 = ("1 Alpha 29.59K", "2 Beta 27.10K", "3 Gamma 24.00K")
-MILITARY_2 = ("9 Iota 12.00K", "10 Kappa 11.50K")
+MILITARY_1 = _screen(1)
+MILITARY_2 = _screen(9)
 
+#: ⚠️ **生产 08-17 17:36:02 那一屏，原样搬过来。**
+#:
+#: 5 行、头一行是 `RankingRow(rank=None, name='> <A,', score=None, coordinate=None)`
+#: ——名字是噪声、分数解析不出来。它当年顺利过了「非空即可」那道闸，
+#: 然后盲翻 **101 屏**一无所获，整趟白跑约 7 分钟。
+HALF_RENDERED = ("> <A, ?", *_screen(2, rows=4, scored=False))
 
-def _looks_military(rows: Sequence[str]) -> bool:
-    """站在 `domain.ranking` 位置上的替身：分数列全 0 就说明还在经济榜。"""
-    return any(not row.endswith(" 0") for row in rows)
+#: 行数够、却一行分数都解析不出来。半渲染不一定只掉行数，这一支得单独挡。
+NO_SCORES = _screen(1, scored=False)
+
+#: 行数不够、但分数读得出来。用来钉「阈值是从每屏行数推的」，不是恰好挡住噪声。
+SHORT_BUT_SCORED = _screen(1, rows=5)
 
 
 class _Game:
@@ -87,6 +120,10 @@ class _Game:
     def click(self, x: int, y: int) -> None:
         if (x, y) == MILITARY_TAB and self.tab_works:
             self.tab = "military"
+            self.at = 0
+        elif (x, y) == CLOSE:
+            # 关掉再开，面板重新停在**经济评分**（实机 2026-08-14）。
+            self.tab = "economy"
             self.at = 0
 
     def dragged(self, start: tuple[int, int], end: tuple[int, int]) -> None:
@@ -162,9 +199,24 @@ def _navigator(
         driver=driver,  # type: ignore[arg-type]
         read_labels=read_labels or game.labels,
         read_rows=read_rows or game.rows,
+        row_has_score=_has_score,
         say=lambda _message: None,
     )
     return navigator, driver
+
+
+def _scripted(screens: Sequence[Sequence[str]]) -> Callable[[], list[str]]:
+    """按剧本逐次交出一屏；演完了就一直重复最后一屏。
+
+    每走一遍「开面板 → 切军事」正好读两次（开完读一次、切完读一次），
+    所以剧本按 `[开面板那屏, 切完那屏, 开面板那屏, 切完那屏, …]` 排。
+    """
+    remaining = [list(screen) for screen in screens]
+
+    def read() -> list[str]:
+        return list(remaining.pop(0) if len(remaining) > 1 else remaining[0])
+
+    return read
 
 
 class TestFindingTheRankingTabByText:
@@ -375,6 +427,124 @@ class TestConfirmingTheMilitaryBoard:
         assert navigator.open_military_ranking() == MILITARY_1
 
 
+class TestRefusingAPanelThatHasNotFinishedRendering:
+    """⚠️ 这一组判的是**「面板铺开了没有」**，不是「我在哪个页签上」。
+
+    后面那个判据**不存在**，2026-08-14 当场证伪过（两个页签的榜首十三行都是真人、
+    分数都在 404.17M 量级，非零判据两边都成立）——见
+    `tests/unit/domain/test_ranking.py` 里的负面结论。这里的行数与分数只用来回答
+    「这一屏渲染完了吗」，两个页签铺开之后都会过这道闸。**别把它误读成又一次
+    尝试判页签。**
+
+    起因：生产 08-17 17:36:02 那一趟读到的首屏只有 5 行、头一行是
+    `RankingRow(rank=None, name='> <A,', score=None, ...)`。它过了当时那道
+    「非空即可」的闸，然后盲翻 101 屏一无所获，白跑约 7 分钟。
+    """
+
+    def test_a_full_screen_with_scores_is_let_through(self) -> None:
+        """(a) 正常的那一屏——13 行、分数读得出来——照样一次就过，不许被新闸误伤。"""
+        navigator, driver = _navigator(_Game(tab="economy"))
+
+        assert navigator.open_military_ranking() == MILITARY_1
+        assert driver.points.count(MILITARY_TAB) == 1
+        assert CLOSE not in driver.points
+
+    def test_the_five_row_screen_from_the_incident_is_refused(self) -> None:
+        """(b) **原样复现 08-17 17:36:02 那一屏**：5 行 + 头一行 `> <A,` + 分数 None。
+
+        它当年是从「非空即可」那道闸底下走过去的。放行的代价不是报个错，
+        是**静悄悄盲翻 101 屏**——日志上看着一切正常。
+        """
+        navigator, _driver = _navigator(_Game(), read_rows=_scripted([ECONOMY, HALF_RENDERED]))
+
+        with pytest.raises(RankingNotReached):
+            navigator.open_military_ranking()
+
+    def test_a_full_screen_where_no_row_yields_a_score_is_refused(self) -> None:
+        """(c) 行数够了也不算数：一行分数都解析不出来，那是还没渲染完。
+
+        半渲染的屏不一定只掉行数——行数这一半挡不住这种，所以两半缺一不可。
+        """
+        navigator, _driver = _navigator(_Game(), read_rows=_scripted([ECONOMY, NO_SCORES]))
+
+        with pytest.raises(RankingNotReached):
+            navigator.open_military_ranking()
+
+    def test_a_short_screen_reopens_the_panel_instead_of_throwing_on_the_spot(self) -> None:
+        """(d) **不达标先重开一次，不是当场把整趟扔掉。**
+
+        重开约十几秒，而当场抛掉的是一整趟采集。顺序也钉住：先点 ✕ 关掉，
+        再点「排名」重开，最后才第二次点「军事评分」。
+        """
+        navigator, driver = _navigator(
+            _Game(), read_rows=_scripted([ECONOMY, HALF_RENDERED, ECONOMY, MILITARY_1])
+        )
+
+        navigator.open_military_ranking()
+
+        assert driver.points == [
+            RANKING_CLICK,
+            MILITARY_TAB,
+            CLOSE,  # ← 先关掉
+            RANKING_CLICK,  # ← 再重开
+            MILITARY_TAB,  # ← 最后才第二次切页签
+        ]
+
+    def test_a_panel_that_renders_on_the_second_try_is_accepted(self) -> None:
+        """(e) 重开之后铺开了，就照常交出那一屏——不因为第一次没铺开而记仇。"""
+        navigator, _driver = _navigator(
+            _Game(), read_rows=_scripted([ECONOMY, HALF_RENDERED, ECONOMY, MILITARY_1])
+        )
+
+        assert navigator.open_military_ranking() == MILITARY_1
+
+    def test_a_panel_that_still_does_not_render_after_reopening_is_refused(self) -> None:
+        """(f) 重开之后仍不达标，**才**抛。重开一次不是「重开一次然后无条件放行」。"""
+        navigator, driver = _navigator(
+            _Game(), read_rows=_scripted([ECONOMY, HALF_RENDERED, ECONOMY, HALF_RENDERED])
+        )
+
+        with pytest.raises(RankingNotReached):
+            navigator.open_military_ranking()
+        assert driver.points.count(MILITARY_TAB) == 2
+
+    def test_the_blank_screen_still_throws_on_the_spot_without_clicking_the_close(self) -> None:
+        """读到 **0 行**那一支不重开，仍然当场抛——而且一下都不点。
+
+        差别不是「0 比 5 更严重」，是**知不知道面板在不在眼前**：读出行了就说明
+        面板就开在那儿，点它的 ✕(750, 71) 是安全的；一行都读不出来时连这个都不知道，
+        那一点落在哪儿没人知道——「在认不出的画面上不许按下手指」是这条链路的硬红线。
+        """
+        navigator, driver = _navigator(_Game(), read_rows=_scripted([ECONOMY, ()]))
+
+        with pytest.raises(RankingNotReached):
+            navigator.open_military_ranking()
+        assert driver.points.count(MILITARY_TAB) == 1
+        assert CLOSE not in driver.points
+
+    def test_the_row_threshold_follows_the_rows_per_screen_constant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(g) ⚠️ **阈值是从「每屏行数」推的，不是写死的 13。**
+
+        每屏几行由版面决定：`ROW_FIRST_Y`(257) / `ROW_LAST_Y`(795) /
+        `ROW_PITCH_PX`(44.8) → (795−257)/44.8 = 12 个间隔 + 首行 = 13 行。
+        版面一改那三个数会跟着改，而写死的闸还按旧版面判——静默失效。
+
+        这里就把「跟着变」直接量一遍：同一屏 5 行（分数读得出来，所以挡它的
+        只能是行数这一半），满屏 13 行时挡掉，把满屏改成 5 行之后放行。
+        """
+        script = [ECONOMY, SHORT_BUT_SCORED, ECONOMY, SHORT_BUT_SCORED]
+        navigator, _driver = _navigator(_Game(), read_rows=_scripted(script))
+        with pytest.raises(RankingNotReached):
+            navigator.open_military_ranking()
+
+        monkeypatch.setattr("evo_helper.game.ranking_nav.ROWS_PER_SCREEN", 5)
+        navigator, _driver = _navigator(_Game(), read_rows=_scripted(script))
+
+        assert navigator.open_military_ranking() == SHORT_BUT_SCORED
+
+
 class TestScrollingDownTheBoard:
     def test_a_drag_that_changes_the_rows_reports_scrolled(self) -> None:
         navigator, _driver = _navigator(_Game(tab="military", military=(MILITARY_1, MILITARY_2)))
@@ -466,10 +636,16 @@ class TestComposingWithTheParsingLayer:
         economy = [
             RankingRow(rank=1, name="bot_2_1_1", score=0.0, coordinate=coordinate_of("bot_2_1_1"))
         ]
+        # 满屏 13 行——那道「铺开了没有」的闸要的就是这个（一屏行数由
+        # `ROW_FIRST_Y` / `ROW_LAST_Y` / `ROW_PITCH_PX` 推出来）。
         military = [
             RankingRow(
-                rank=1, name="bot_4_30_12", score=29590.0, coordinate=coordinate_of("bot_4_30_12")
+                rank=rank,
+                name=f"bot_4_30_{rank}",
+                score=29590.0 - rank,
+                coordinate=coordinate_of(f"bot_4_30_{rank}"),
             )
+            for rank in range(1, 14)
         ]
         game = _Game()
         driver = _Driver(game)
@@ -477,6 +653,9 @@ class TestComposingWithTheParsingLayer:
             driver=driver,  # type: ignore[arg-type]
             read_labels=game.labels,
             read_rows=lambda: list(military if game.tab == "military" else economy),
+            # ⚠️ 实机注入的就是这一句（见 `tools.ranking_scan.scan`）。
+            # 上面那些用例喂的是字符串，接不到这条真实的取分数路径。
+            row_has_score=lambda row: row.score is not None,
             say=lambda _message: None,
         )
 

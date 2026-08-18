@@ -168,6 +168,36 @@ MILITARY_TAB = (1084, 212)
 #: 点完页签等榜单换过来。
 TAB_SWITCH_WAIT_S = 1.6
 
+#: 切完页签之后那道「面板铺开了没有」的闸，容许首屏比满屏（`ROWS_PER_SCREEN`）少几行。
+#:
+#: ⚠️ **判的是「渲染好了没有」，不是「我在哪个页签上」**——后面那个判据不存在
+#: （见 `MILITARY_TAB` 上那一大段，以及 `ranking_nav._switch_to_military`）。
+#:
+#: 证据（生产 `system_log` 里 `已切到军事榜（这一屏 N 行…）` 全部 22 条）：
+#:
+#:     13 行   21 次      ← 正常
+#:      5 行    1 次      ← 08-17 17:36:02，头一行是 `name='> <A,'`、`score=None`
+#:
+#: **分布是双峰的，中间没有 8 行、10 行这种灰区**，所以闸放在哪儿都不敏感。
+#: 取 1 而不是 0：`read_rows` 的契约是「认不出的行丢掉」，正常一屏偶尔掉一行
+#: 也属正常，卡在满屏会把好屏挡掉。取 1 而不是更大：那唯一一次坏屏是 5 行，
+#: 离 12 还差 7，容差再放宽几行也照样挡得住——但放宽没有任何好处。
+#:
+#: ⚠️ **这不是偏好项，是标定常量。** 「首屏该有几行」由游戏版面决定，调它不会让
+#: 结果「更适合谁」，只会让这道闸更早或更晚放弃。
+PANEL_READY_ROW_SLACK = 1
+
+#: 首屏没铺开时，整套「关掉 → 重开 → 再切军事」最多走几遍。
+#:
+#: 取 2（也就是「重开一次」）：22 条里只坏过 1 条，而那一条的代价是**盲翻 101 屏、
+#: 白跑约 7 分钟**。重开一次约花十几秒，就把这个代价换掉了；再多试几次挡不住
+#: 别的故障（真断线时第一次重开就会因为读不出标签行而抛），只是让坏掉的一趟
+#: 多空转一会儿。
+#:
+#: 同 `CLOSE_ATTEMPTS` / `READ_ATTEMPTS` / `NAV_MAX_DRAGS`，是「重试几次」这一族
+#: 里的一个，不做成配置项。
+PANEL_REOPEN_ATTEMPTS = 2
+
 #: 玩家 / 联盟页签 (833, 173) / (1086, 173)。**都不点**：面板打开时就在「玩家」上，
 #: 而「联盟」榜是另一套数据。这里只记下位置，好让上面那把「离充值多远」的尺子量得到。
 PLAYER_TAB = (833, 173)
@@ -179,6 +209,23 @@ ALLIANCE_TAB = (1086, 173)
 ROW_FIRST_Y = 257
 ROW_LAST_Y = 795
 ROW_PITCH_PX = 44.8
+
+#: 一屏看得见几行（按当前三个实测像素算出来是 **13**，与实机日志里那 21 次相符）。
+#:
+#: ⚠️ **推出来的，不许写死 13。** 推导只有一步——首行到末行之间有多少个行距，
+#: 再把首行自己算上：
+#:
+#:     (`ROW_LAST_Y` 795 − `ROW_FIRST_Y` 257) / `ROW_PITCH_PX` 44.8 = 12.008 个间隔
+#:     12 个间隔 + 首行本身                                        = 13 行
+#:
+#: （`tests/unit/game/test_ranking_ui_geometry.py` 里那条
+#: `test_the_row_pitch_matches_the_two_ends_that_were_measured` 已经把
+#: 「12.008 ≈ 12」这一步单独钉住了，所以这里 `round` 掉的那 0.008 不是在遮掩什么。）
+#:
+#: 写死的话，版面一改（面板高了、行距变了）上面三个数会跟着改，而
+#: `ranking_nav._switch_to_military` 那道「首屏铺开了没有」的闸还按旧版面判——
+#: 静默失效，日志上看着一切正常。
+ROWS_PER_SCREEN = round((ROW_LAST_Y - ROW_FIRST_Y) / ROW_PITCH_PX) + 1
 
 #: ⚠️⚠️ **自己那一行是「吸附」的，位置会变——所以按 y 排除它是排不掉的。**
 #:
@@ -445,6 +492,8 @@ __all__ = [
     "NAV_LABEL_WORD_GAP_PX",
     "NAV_MAX_DRAGS",
     "PANEL_OPEN_WAIT_S",
+    "PANEL_READY_ROW_SLACK",
+    "PANEL_REOPEN_ATTEMPTS",
     "PLAYER_TAB",
     "RANKING_CLOSE",
     "RANKS_PER_SCROLL_MAX",
@@ -455,6 +504,7 @@ __all__ = [
     "RECHARGE_KEEPOUT_CENTER",
     "RECHARGE_KEEPOUT_PX",
     "REREAD_WAIT_S",
+    "ROWS_PER_SCREEN",
     "ROWS_PER_SCROLL",
     "ROW_FIRST_Y",
     "ROW_LAST_Y",
