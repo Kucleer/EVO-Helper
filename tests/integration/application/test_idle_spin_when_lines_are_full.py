@@ -308,6 +308,30 @@ def test_an_unavoidable_idle_verdict_is_written_once_per_window(  # type: ignore
     assert len(recorded.idle) == 1, f"限流没生效，写了 {len(recorded.idle)} 条"
 
 
+def test_an_unavoidable_idle_verdict_never_disables_the_task(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, clock
+) -> None:
+    """⚠️ **限流不许顺手改成「吵一次就把它关掉」。**
+
+    `MissionIdle` 走的是「不停用、不记失败、下一 tick 重算」，理由写在
+    `_military_command` 的 docstring 里：判成 `MissionParamError` 会调
+    `disable_mission_task`，用户不去页面点「恢复」它就永远不跑——2026-08-18
+    01:00 那一小时因此自动停用 447 次。而这里的空手而归全都是**会自己好起来**
+    的一档：军力榜扫到弱一点的目标就成立了。
+    """
+    a_pool_with_nothing_dispatchable(repository, session_factory)
+    scheduler.start()
+
+    for second in range(30):
+        clock.now = NOW + timedelta(seconds=second)
+        scheduler.tick()
+
+    row = task(repository, MissionKind.BOT)
+    assert row.disabled_reason is None, f"一次正常的间歇被当成配置错误了：{row.disabled_reason}"
+    assert row.disabled_recovery is None
+    assert launcher.spawned == [], "池子一个都挑不出来，却起了 runner"
+
+
 def test_the_idle_line_comes_back_once_the_window_has_passed(  # type: ignore[no-untyped-def]
     scheduler, repository, session_factory, clock, recorded: RecordingLog
 ) -> None:
