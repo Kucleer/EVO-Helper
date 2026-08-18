@@ -252,10 +252,9 @@ CHROME_PX = 270
 
 #: 折行之后那些定宽列合计多宽。
 #:
-#: 962px = 原先八列的 714px（console.css 里量的）+ 「目标军力」那一列 74px。
-#: 新列按**折行之后**的两行量：分数一行，`读于 2026-08-17 03:55:00` 折成两行，
-#: 和左边三个时刻列同宽（74px）。所以下面那条「它必须允许折行」是这个数的前提，
-#: 少了它这一列就是 159px，这里的核算全部不作数。
+#: 788px = 原先八列的 714px（console.css 里量的）+ 「目标军力」那一列 74px。
+#: 新列按**最宽的那种写法**量：`1,234,567` 加一个角标，一行约 70px，留到 74px。
+#: 读数时刻藏在角标的 `title` 里，不占版面——那一格只有一行。
 #:
 #: ⚠️ 这些不是偏好项，是按版面量出来的标定量（同 console.css 里那段警告）。
 FIXED_COLUMNS_PX = 714 + 74
@@ -277,19 +276,20 @@ def _cap_px(viewport_px: int) -> float:
     return min(viewport_px * ratio_vw / 100, viewport_px - reserve_rem * REM_PX)
 
 
-def test_the_new_score_column_may_wrap_like_the_other_timestamp_columns() -> None:
-    """「目标军力」那一列（第 5 列）要能折行，「预计战报」的序号也跟着挪到第 10。
+def test_the_wrapping_columns_follow_the_new_column_order() -> None:
+    """折行名单跟着列序走：「目标军力」是第 5 列，「预计战报」挪到了第 10。
 
-    两条一起才够。前者是上面 `FIXED_COLUMNS_PX` 里 74px 那一项的前提——不许折行
-    的话那一格的 `读于 2026-08-17 03:55:00` 摊开就是 159px，多出来的 85px 直接
-    把表顶出容器。后者钉的是「插列之后别忘了改序号」：留在第 9 列的话，折行会落
-    在「战果」那一格（它本来就折行，看不出异样），而真正需要折行的「预计战报」
-    一声不响地把表撑宽。
+    这一条钉的是「插列之后别忘了改序号」。「预计战报」留在第 9 的话，折行会落在
+    「战果」那一格——它本来就折行，看不出任何异样——而真正需要折行的「预计战报」
+    一声不响地把表撑宽，正是 PR #178 收拾过的那个症状。
+
+    「目标军力」留在名单里是道便宜的保险：那一格现在只有一行（分数 + 角标，
+    时刻藏在 `title` 里），折不折都一样；哪天它再长出内容，宁可折行也不要顶宽。
     """
     css = _console_css()
     wrap_rule = css[css.index("#log-entries th:nth-child(1)") :].split("}")[0]
 
-    assert "nth-child(5)" in wrap_rule, "「目标军力」那一列不许折行，定宽列的核算就不成立"
+    assert "nth-child(5)" in wrap_rule, "「目标军力」那一列被漏出了折行名单"
     assert "nth-child(10)" in wrap_rule, "「预计战报」的序号没跟着插列挪，折行落到了别的列上"
     assert "nth-child(9)" not in wrap_rule, "第 9 列是「战果」，它走 `.log-body`，不该在折行名单里"
 

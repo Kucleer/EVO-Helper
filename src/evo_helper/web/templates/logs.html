@@ -178,10 +178,26 @@
             「这个分数是什么时候读的」，实机 10:30 打过一个读数已经 24 小时前的目标。
           #}
           <td class="score-cell">
-            {{ military_score_text(entry.target_military_score) }}
-            {% if entry.target_military_score is not none and entry.target_military_score_at_utc %}
-              <div class="muted" style="font-size:11px">读于 {{ local_time(entry.target_military_score_at_utc) }}</div>
-            {% endif %}
+            {{ military_score_text(entry.target_military_score) }}{#
+              读数时刻藏在角标的 `title` 里，鼠标停上去才出来。
+
+              ⚠️ **不再平铺成第二行。** 这一页刚为宽度打过两轮（#178 限宽、#183 加列），
+              每一格多一行就是整表多一行高度，而「这个分数什么时候读的」是**排查时**
+              才要的一句，不该常驻占地方。
+
+              ⚠️ **走原生 `title`，不自绘 tooltip。** 零 JS、零 CSS 定位，撞不回宽度那件事；
+              这一页早有先例——收获那几项的误差范围就放在 `title` 上
+              （`display.resource_precision_hint`）。
+
+              ⚠️ **没有快照就整个不出现这个角标**，不是挂一个空的 tooltip：历史行
+              （2026-08-18 之前派出的那些）本来就没有这个观测，摆一个点上去什么都没有的
+              角标，比没有角标更难判断「到底是没记还是没读到」。
+              两列是一起写进去的（`storage.repository.save_attack_intent`），所以判据取
+              时刻那一列——它是 `title` 的全部内容。
+
+              时刻按现实时间 UTC+8，同这一页其它时刻列；tooltip 里没有表头，所以时区
+              要写在文字里。
+            #}{% if entry.target_military_score_at_utc %}<span class="score-tip" title="派出时的读数：{{ local_time(entry.target_military_score_at_utc) }}（现实 UTC+8）">ⓘ</span>{% endif %}
           </td>
           <td class="muted">{{ entry.origin.galaxy }}:{{ entry.origin.system }}:{{ entry.origin.position }}</td>
           <td>

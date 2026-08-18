@@ -20,6 +20,13 @@
   被打空的 bot 军力真的是 0，两者在这一页上必须分得开。
 - 这一列 2026-08-18 才开始记，之前的意图快照是 NULL。**照实显示「—」，不许拿
   现值回填**——补一个看起来合理的数进去，就再也分不出哪几行是真的读到过。
+
+## 读数时刻藏在角标后面
+
+用户口径（2026-08-18）：「增加军力值的内容，还需要一个 tips 角标，hover 效果是
+当时快照的时间」。所以时刻不再平铺成格子里的第二行，改成军力值后面一个 `ⓘ`，
+时刻放在它的原生 `title` 上。第四节钉的是这件事的两半：**有快照才有角标**，
+以及**角标里真的写着那个时刻**。
 """
 
 from __future__ import annotations
@@ -133,6 +140,10 @@ def _dispatch(
 #: 「目标军力」是表头里的第 5 列（1 起数），紧跟在「目标」后面。
 SCORE_COLUMN = 5
 
+#: 读数时刻那个角标的类名。**按类名认，不按字符认**——角标用哪个字符是版面选择
+#: （`ⓘ` / `⏱` 都行），而「有没有这个角标」是判据，两者不该绑在一起。
+TIP_CLASS = 'class="score-tip"'
+
 
 def _score_cell(html: str) -> str:
     """把表格体第一行里「目标军力」那一格的原样 HTML 取出来。
@@ -187,8 +198,8 @@ def test_a_later_rescan_does_not_move_the_number_on_the_log(tmp_path: Path) -> N
 
     assert "31,756" in cell, "日志显示的不是派遣当时的读数——这一列被连成了 `bot_targets` 现值"
     assert "2,616" not in cell, "重扫之后的现值出现在了日志上"
-    # 读于 = OBSERVED（UTC 00:55）换算到现实时间 UTC+8 是 08:55。
-    assert "读于 2026-08-18 08:55:00" in cell
+    # 读数时刻在角标的 `title` 里。OBSERVED（UTC 00:55）换算到现实时间 UTC+8 是 08:55。
+    assert "派出时的读数：2026-08-18 08:55:00" in cell
     assert "2026-08-18 17:55" not in cell, "读数时刻跟着重扫走了"
 
 
@@ -209,7 +220,7 @@ def test_a_target_without_a_reading_shows_a_dash(tmp_path: Path) -> None:
 
     assert "—" in cell, "没有军力读数时这一格该是「—」"
     assert "0" not in cell, "「没读数」被显示成了 0"
-    assert "读于" not in cell, "没有分数就没有读数时刻，不该摆一句空的「读于」"
+    assert TIP_CLASS not in cell, "没有快照却挂了个角标——点上去是一片空白，比没有更难判断"
 
 
 def test_a_real_zero_reading_is_not_a_dash(tmp_path: Path) -> None:
@@ -227,7 +238,7 @@ def test_a_real_zero_reading_is_not_a_dash(tmp_path: Path) -> None:
 
     assert "—" not in cell, "军力 0 被当成了「没读数」"
     assert re.search(r">\s*0\s*<", cell) is not None, "军力 0 没有原样显示出来"
-    assert "读于 2026-08-18 08:55:00" in cell
+    assert "派出时的读数：2026-08-18 08:55:00" in cell
 
 
 # -- 三、历史行不许被回填 --------------------------------------------------------
@@ -257,3 +268,44 @@ def test_rows_written_before_this_column_existed_stay_empty(tmp_path: Path) -> N
     # 页面必须说清这一列从什么时候起才有，否则满屏「—」读起来就是
     # 「那时候的目标都没有军力读数」——和事实正好相反。
     assert "自 2026-08-18 起记录" in html
+
+
+# -- 四、读数时刻藏在角标后面，不再平铺占一行 ------------------------------------
+
+
+def test_the_snapshot_moment_hides_behind_a_hover_badge(tmp_path: Path) -> None:
+    """有快照的行：军力值后面跟一个角标，时刻写在它的 `title` 里。
+
+    ⚠️ **时刻不许再平铺成第二行。** 这一页刚为宽度打过两轮（#178 限宽、#183 加列），
+    每格多一行就是整表多一行高度，而「这个分数什么时候读的」是排查时才要的一句。
+
+    ⚠️ **时区要写进 tooltip 的文字里。** 表格里那几个时刻列靠表头标时区，而 tooltip
+    没有表头——不写的话，UTC+0 的游戏时间和 UTC+8 的墙上时钟在这一格上分不出来，
+    而这一页恰恰两种都在用。
+    """
+    repository, run_id, factory = _factory(tmp_path)
+    _seed_score(repository, SCORE_WHEN_DISPATCHED, OBSERVED)
+    _dispatch(repository, run_id, BOT_TARGET)
+
+    cell = _score_cell(TestClient(create_persistent_app(factory)).get("/logs").text)
+
+    assert TIP_CLASS in cell, "有快照却没有角标，读数时刻就没地方看了"
+    assert 'title="派出时的读数：2026-08-18 08:55:00（现实 UTC+8）"' in cell
+    # 平铺那一行是这次要去掉的东西；它回来了就是又多占一行高度。
+    assert "<div" not in cell, "读数时刻又被平铺成了一行"
+
+
+def test_a_row_without_a_snapshot_has_no_badge_at_all(tmp_path: Path) -> None:
+    """历史行**完全没有角标**，而不是挂一个空的 tooltip。
+
+    2026-08-18 之前派出的那些发次本来就没有这个观测。摆一个点上去什么都没有的角标，
+    比没有角标更难判断——用户会以为是 tooltip 坏了，而不是「当时没记这件事」。
+    """
+    repository, run_id, factory = _factory(tmp_path)
+    _dispatch(repository, run_id, BOT_TARGET)
+
+    cell = _score_cell(TestClient(create_persistent_app(factory)).get("/logs").text)
+
+    assert "—" in cell
+    assert TIP_CLASS not in cell, "没有快照的行挂上了角标——点开是一片空白"
+    assert "派出时的读数" not in cell
