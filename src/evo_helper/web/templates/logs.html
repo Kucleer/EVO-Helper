@@ -174,7 +174,19 @@
             <span class="chip {{ dispatch_tones.get(state, '') }}">
               <span class="glyph" aria-hidden="true">{{ dispatch_glyphs.get(state, '•') }}</span>{{ dispatch_labels.get(state, state) }}{% if state == 'BLOCKED' %} · {{ entry.guard_status }}{% endif %}</span>
           </td>
-          <td>
+          {#
+            限宽 + hover 展开，和系统日志页「正文」那一列同一套类
+            （`.log-body` / `.log-line`，见 console.css）。
+
+            这一格要铺开战损加**12 项**资源（金属/晶体/气体/暗能量、银河素/
+            合金碎片/晶体碎片/能量凝胶、泰坦立方/收割者碎片/银河石碎片/
+            银河石能量），一行摊开量到 945px，把整张表顶到 1933px 宽——
+            用户 2026-08-18 报的横向滚动条就是它。
+
+            ⚠️ **只折叠，不删。** 截断纯粹发生在 CSS 里，HTML 里那 12 项一个不少：
+            用户查故障时最需要的就是这些数字，鼠标停在这一行就全都在。
+          #}
+          <td class="log-body">
             {# 海盗战报只记胜负与战损总数，所以这一格就是战果的全部。 #}
             {#
               ⚠️ **侦察发先分流出去。** 侦察不产生战报（它产出的是侦察报告，走
@@ -202,7 +214,7 @@
                  认不出来的取值照样原样显示，只是没有色也没有字形。 #}
               <span class="chip {{ result_tones.get(entry.outcome, '') }}">
                 <span class="glyph" aria-hidden="true">{{ result_glyphs.get(entry.outcome, '') }}</span>{{ result_labels.get(entry.outcome, entry.outcome) }}</span>
-              <div class="muted" style="font-size:11px">
+              <div class="log-line muted" style="font-size:11px">
                 战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}
                 · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}
               </div>
@@ -239,7 +251,7 @@
               「这一发没捞着东西」，为它专门摆一句话只会挤占真正有收获的那几行。
             #}
             {% if entry.resources %}
-              <div class="muted" style="font-size:11px">
+              <div class="log-line muted" style="font-size:11px">
                 收获
                 {%- for item in entry.resources %}
                   <span title="{{ resource_precision_hint(item) }}">{{ resource_label(item.slot) }} {{ resource_amount_text(item) }}</span>{% if not loop.last %} · {% endif %}
