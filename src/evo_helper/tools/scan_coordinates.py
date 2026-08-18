@@ -514,6 +514,33 @@ def require_chinese_ocr() -> None:
     raise RuntimeError(message)
 
 
+#: `tight` 补的那圈黑边至少这么宽（放大后的像素）。太窄 Tesseract 会把字当成
+#: 贴边噪声，太宽就退回「小字浮在大片空白里」那个病。
+INK_MARGIN_MIN_PX = 8
+
+
+def _crop_to_ink(binary: Any, image_module: Any) -> Any:
+    """二值图裁到白色墨迹的外框，再补一圈黑边。空图原样交回。
+
+    ## 这一步治的是什么
+
+    导航栏值框是 135×33 的一大片黑，数字只占中间一小块。`--psm 7`（单行）在这种
+    「小字浮在大片空白里」的图上会**漏字**——实测二值化后的 `52` 清晰可辨，
+    Tesseract 却只读出 `5`；生产上同一个病表现为 `277` 读成 `77`（`system_navigator
+    .NAV_VALUE_RECIPES` 里记着那 28 次 0% 成功率）。把字撑满画面之后就基本消失。
+
+    边距按字高取（`ink.height // 2`），不是定值：字大边距也要大，否则比例又失衡。
+    """
+    box = binary.getbbox()
+    if box is None:
+        return binary
+    ink = binary.crop(box)
+    margin = max(INK_MARGIN_MIN_PX, ink.height // 2)
+    canvas = image_module.new("L", (ink.width + margin * 2, ink.height + margin * 2), 0)
+    canvas.paste(ink, (margin, margin))
+    return canvas
+
+
 def make_ocr() -> Any:
     import pytesseract
     from PIL import Image
@@ -530,6 +557,7 @@ def make_ocr() -> Any:
         upscale: int,
         resample: str = "lanczos",
         threshold: int | None = None,
+        tight: bool = False,
     ) -> str:
         grey = crop.convert("L")
         # 最近邻放大保住相邻 1 之间那道缝；LANCZOS 会把它插值糊掉。见 COORD_RECIPES。
@@ -537,6 +565,8 @@ def make_ocr() -> Any:
         if threshold is not None:
             # START 是半透明的大字压在星空上，不二值化读不出来。
             grey = grey.point(lambda value: 255 if value > threshold else 0)
+        if tight and threshold is not None:
+            grey = _crop_to_ink(grey, Image)
         if digits:
             # 混合语言下开头的 2 会被读成 e；数字白名单能解决。
             config = f"--psm 7 -c tessedit_char_whitelist={COORD_WHITELIST}"

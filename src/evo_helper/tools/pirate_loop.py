@@ -92,13 +92,16 @@ from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
     NAV_LABEL_ROI,
+    NAV_VALUE_MIN_VOTES,
     NAV_VALUE_RECIPES,
     NAV_VALUE_ROIS,
     PLANET_VIEW_BUTTON,
     VIEW_MENU_BUTTON,
     VIEW_SWITCH_WAIT_S,
     SystemNavigator,
+    agreed_value,
     crop_reader,
+    reads_like_a_dropped_digit,
 )
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -554,6 +557,45 @@ class ReportIngest(Enum):
     UNREADABLE = "读不出来"
 
 
+#: 导航栏三个值框在日志里怎么念。顺序与 `NAV_VALUE_ROIS` 一一对应。
+NAV_BOX_LABELS = ("galaxy", "system", "position")
+
+
+@dataclass(frozen=True)
+class NavBarReading:
+    """导航栏三个值框读回来的结果，**连每套配方的原始读数一起带着**。
+
+    带原始读数不是为了好看：这个缺陷之所以藏了 28 轮没被发现，就是因为日志里
+    只有汇总后的 `('4', '77', '15')`，看不出「`77` 是哪一套配方给的、别的配方
+    读出了什么」。有了 `reads`，「画面不对」和「配方吃了首位」在库里一眼能分开。
+    """
+
+    #: `agreed_value` 汇总后的三个值，汇不拢的那一格是空串。
+    values: tuple[str, str, str]
+    #: 每个框 × 每套配方的原始读数，外层顺序同 `NAV_VALUE_ROIS`、内层同 `NAV_VALUE_RECIPES`。
+    reads: tuple[tuple[str, ...], ...]
+
+    def describe_against(self, expected: Coordinate) -> str:
+        """逐格说清「和期望差在哪」，供日志措辞用。
+
+        ⚠️ **只描述，不裁决。** 「疑似漏位」说明画面很可能是对的、是读错了
+        （生产 2026-08-18 那 28 次全属此类），但它离「就是这个坐标」还差得远，
+        绝不能据此放行采纳——见 `reads_like_a_dropped_digit`。
+        """
+        wanted = (str(expected.galaxy), str(expected.system), str(expected.position))
+        notes = []
+        for label, value, want in zip(NAV_BOX_LABELS, self.values, wanted, strict=True):
+            if value == want:
+                continue
+            if not value:
+                notes.append(f"{label} 读不出")
+            elif reads_like_a_dropped_digit(value, want):
+                notes.append(f"{label} 读作 {value!r}，疑似把 {want!r} 漏了位")
+            else:
+                notes.append(f"{label} 读作 {value!r}，期望 {want!r}")
+        return "；".join(notes) if notes else "三格都对上了"
+
+
 @dataclass(frozen=True)
 class MailRow:
     """列表页上的一行邮件：**没打开之前**能知道的全部。
@@ -931,6 +973,14 @@ class PirateLoop:
     #: 无关。没做成可配置——同 `MAX_COORD_DUMPS`。
     MAX_MAIL_DUMPS: int = 3
 
+    #: 导航栏回读对不上时，最多往 `system_log` 里塞这么多张缩略图（见
+    #: `_record_navigation_bar_mismatch`）。**文字每次都记，只有图封顶。**
+    #:
+    #: 一轮最多触发一次（切出发星球一轮只切一次），所以留 2 是给「同一进程里跑好
+    #: 几轮」留的余量。分类同 `MAX_COORD_DUMPS`：**低优先级旋钮，没做成可配置**——
+    #: 它只影响排障时手上有几张图，不影响任何判据。
+    MAX_NAV_READBACK_FRAMES: int = 2
+
     #: 起点核对不过时最多存这么多张现场图。**封顶的理由和 `MAX_COORD_DUMPS` 一样**，
     #: 只是这里本来就跑不了几张：核不过就停轮，一轮最多存一张。留 2 是给
     #: 「同一进程里被复用」留的余量，不是预期值。
@@ -964,6 +1014,7 @@ class PirateLoop:
         self._coord_dumps = 0
         self._mail_dumps = 0
         self._origin_dumps = 0
+        self._nav_readback_dumps = 0
         #: 本趟开工时刻。本轮派出去的侦察/攻击，其报告一定比它新——
         #: 翻信箱时据此早停（见 `MailRow.is_older_than`）。
         self._started_at = datetime.now(UTC)
@@ -1001,6 +1052,17 @@ class PirateLoop:
         return crop_reader(self._driver.capture(), self._ocr)(
             roi, digits=digits, upscale=upscale, threshold=threshold
         )
+
+    def _frame_reader(self) -> Callable[..., str]:
+        """抓一帧，交出一个「同一帧上想读几块就读几块」的取字函数。
+
+        ⚠️ **和 `_read` 的分工：一次判断要读同一帧的多块时走这里。** `_read` 每调
+        一次就重新截一张图，而导航栏三个值框 × 五套配方是 15 次读屏——那样不但白截
+        15 张，三个框还会来自三个**不同时刻**的画面，而这三个数是要当成一个坐标
+        一起判定的。判据里绝不该混进「读第一个框和读第三个框之间画面变了」这种可能。
+        """
+        self._ensure_geometry()
+        return crop_reader(self._driver.capture(), self._ocr)
 
     def _ensure_geometry(self) -> None:
         """每次读屏前核一次视口尺寸，漂了就调回来。
@@ -3496,27 +3558,82 @@ class PirateLoop:
         照旧 `invalidate()`，也就是今天的行为。顺带地，日志里那行读数会把耦合到底成不
         成立当场记下来——下次谁想省掉这次 OCR，库里就有一整月的证据可查。
         """
-        values = self._navigation_bar_values()
+        reading = self._read_navigation_bar()
+        values = reading.values
         if self._navigator.adopt_readback(origin, values):
             say(f"  导航栏回读 {values}，确认停在 {origin}；同银河的下一个目标少设 1–2 个字段")
             return
-        say(f"  导航栏回读 {values}，对不上 {origin}；清掉导航缓存，下一个目标三个字段全设")
+        say(
+            f"  导航栏回读 {values}，对不上 {origin}（{reading.describe_against(origin)}）；"
+            "清掉导航缓存，下一个目标三个字段全设"
+        )
+        self._record_navigation_bar_mismatch(origin, reading)
 
-    def _navigation_bar_values(self) -> tuple[str, str, str]:
-        """导航栏银河系 / 恒星系 / 行星三个值框的读数；读不出的那一格交空串。
+    def _read_navigation_bar(self) -> NavBarReading:
+        """在**同一帧**上把三个值框 × 全部配方读一遍，汇出读数并留下全部原始证据。
 
-        每个框各自逐套配方试到读出数字为止（`NAV_VALUE_RECIPES`）：同一张画面上
-        三个框的难度并不一样，实拍里出现过「三倍读得出行星、两倍才读得出银河系」。
+        每个框各自跑完全部 `NAV_VALUE_RECIPES`（不再「读出非空就停」），再交给
+        `agreed_value` 裁决。**为什么不能读出非空就停**：`(3,170)` 把 `277` 读成 `77`
+        也是非空，于是它一票通过、后面几套根本没机会跑——那就是这次修的缺陷，
+        整段账在 `NAV_VALUE_RECIPES` 的注释里。
+
+        代价是 15 次 OCR 而不是 3–9 次。实测本机 97 ms/次，合计约 1.5 秒，
+        **一轮只跑一次**；而它省下的是 1–2 个字段、每个 6.6 秒。
         """
-        values: list[str] = []
-        for roi in NAV_VALUE_ROIS:
-            text = ""
-            for upscale, threshold in NAV_VALUE_RECIPES:
-                text = self._read(roi, digits=True, upscale=upscale, threshold=threshold)
-                if text:
-                    break
-            values.append(text)
-        return (values[0], values[1], values[2])
+        read = self._frame_reader()
+        reads = tuple(
+            tuple(
+                read(roi, digits=True, upscale=upscale, threshold=threshold, tight=tight)
+                for upscale, threshold, tight in NAV_VALUE_RECIPES
+            )
+            for roi in NAV_VALUE_ROIS
+        )
+        values = tuple(agreed_value(row) for row in reads)
+        return NavBarReading(values=(values[0], values[1], values[2]), reads=reads)
+
+    def _record_navigation_bar_mismatch(self, origin: Coordinate, reading: NavBarReading) -> None:
+        """回读对不上时把证据落库：三个框 × 每套配方的原始读数，外加封顶的一帧。
+
+        ⚠️ **这条是补上来的，因为缺了它这个缺陷藏了整整一段时间。** 上线以来
+        28 次回读、28 次对不上，而 `payload_json` 是 `{}`、一帧都没留——日志里
+        只有「回读 ('4','77','15')，对不上 4:277:15」这一句，说不出「那到底是画面
+        不对，还是配方把首位吃了」。真相是后者，可从日志里看不出来（CLAUDE.md：
+        判据是「出事时能不能只靠库里的日志定位」）。
+
+        落库不落文件：实机跑在另一台机器上（host `CY-202305011401`），`_dump_frame`
+        存的 PNG 在本机的 `var/logs` 里根本取不到——这条教训写在
+        `record_planet_list_overlay_retry` 上方。
+
+        **文字每轮都记，图封顶。** 这一支一轮最多触发一次（切星球一轮只切一次），
+        不必像 `record_unrecognised_screen` 那样按时间限流；但图要封顶，理由和
+        `MAX_COORD_DUMPS` 一样：几张几乎一样的图对定位没有增量。
+        """
+        payload: dict[str, Any] = {
+            "expected": str(origin),
+            "adopted": list(reading.values),
+            "min_votes": NAV_VALUE_MIN_VOTES,
+            "recipes": [
+                f"{upscale}x/th{threshold}/{'tight' if tight else 'wide'}"
+                for upscale, threshold, tight in NAV_VALUE_RECIPES
+            ],
+            "reads": {
+                label: list(row) for label, row in zip(NAV_BOX_LABELS, reading.reads, strict=True)
+            },
+            "verdict": reading.describe_against(origin),
+            "criterion": (
+                f"agreed_value：同一个值至少 {NAV_VALUE_MIN_VOTES} 票、取最长、"
+                "其余非空读数必须是它漏字后的样子"
+            ),
+        }
+        # 名额只在**真的存下了一张图**时才扣。截不了图（轻量驱动、单元测试桩）时
+        # 白扣一个名额，等于让后面真能截图的那几轮无图可留。
+        capture = getattr(getattr(self, "_driver", None), "capture", None)
+        if callable(capture) and self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
+            self._nav_readback_dumps += 1
+            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
+        record_system_log(
+            "WARNING", "tools.pirate_loop", "导航栏回读对不上出发星球", payload=payload
+        )
 
     # -- 主循环 -------------------------------------------------------------
 

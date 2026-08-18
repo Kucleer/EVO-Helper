@@ -50,6 +50,7 @@ from evo_helper.vision.parsers import (
     GAME_DISPLAY_ZONE,
     ReportKind,
     classify_report_subject,
+    compact_ocr_text,
     parse_report_timestamp,
     parse_versus_block,
 )
@@ -220,9 +221,16 @@ def read_pirate_report(
     if raw_time is None or reported_at is None:
         raise PirateReportUnreadable("报告头里没有可读的时间")
 
-    versus = parse_versus_block(detail.versus_block(), source)
+    versus_text = detail.versus_block()
+    versus = parse_versus_block(versus_text, source)
     if versus is None:
-        raise PirateReportUnreadable("VS 块不完整；拒收单边战报，免得挂到错的目标上")
+        # 原文一起抛出去：坐标那一格会在几套配方平票时返回空串
+        # （`vision.scan_reading.vote_coordinate`），只说「不完整」的话，
+        # 「配方吵架」与「压根没读到字」在日志里长得一模一样。
+        raise PirateReportUnreadable(
+            "VS 块不完整；拒收单边战报，免得挂到错的目标上。"
+            f"当时读到：{compact_ocr_text(versus_text)}"
+        )
 
     losses = _totals(bottom.loss_totals())
     if losses is None:

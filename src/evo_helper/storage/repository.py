@@ -51,6 +51,7 @@ from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import DisabledRecovery, MissionKind
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
+from evo_helper.infrastructure.system_log import record_system_log
 
 from . import models as orm
 from .system_log import SystemLogRepository
@@ -58,6 +59,42 @@ from .system_log import SystemLogRepository
 #: How far a report's timestamp may deviate from the dispatch time and still
 #: count as the same dispatch under the strict origin/target/time match rule.
 MATCH_TIME_TOLERANCE = timedelta(hours=12)
+
+#: 放宽认领时，战报时刻允许落在 `expected_report_at_utc` 的哪一段里
+#: （`[expected - BEFORE, expected + AFTER]`）。
+#:
+#: **这两个不是运维旋钮，是标定常量**（口径见 CLAUDE.md「引入阈值就先判断该不该
+#: 做成可配置」）：取值由「派出时读到的飞行时长有多准」决定，调大调小不会让结果
+#: 变得「更适合谁」，只会让认领变错——调大就开始把邻近的另一发套进来，调小就把
+#: 本来该认的那一发挡在外面。
+#:
+#: **量出来的**（生产库，2026-08-19，113 份已认领战报的 `reported_at_utc −
+#: expected_report_at_utc`）：
+#:
+#: - 整体 −4s … +1498s，中位数 +19s；近 7 天 78 份 −4s … +1138s。
+#: - 直方图上有一道**空档**：+250s 到 +870s 之间一份都没有。窗口的上界落在这道
+#:   空档里，所以它不是拍出来的——±100 秒的挪动不改变任何一份的归属。
+#: - 大于 +870s 的那 37 份是**飞行时长读错**的残骸（`_read_flight_time` 那一侧
+#:   正在修），不是「战报真的来得晚」。放宽认领**不去救它们**：那要靠猜。
+#:
+#: **上界必须远小于「另一发候选有多近」。** 同一目标、时刻相近却是两发不同派遣的
+#: 情形，全库只有 3 例（2026-08-12 的 2:137:1 / :2 / :3），每一例里真正那一发差
+#: −2s…+7s，而另一发差 +1183s…+1193s。300s 的上界离它还有 4 倍余量。
+MATCH_EXPECTED_WINDOW_BEFORE = timedelta(seconds=60)
+MATCH_EXPECTED_WINDOW_AFTER = timedelta(seconds=300)
+
+#: 认领的三档置信度：**如实反映这一份是凭几个字段认下来的**，不因为放宽了判据
+#: 就统一给高分。页面与排障都照着它读，`0.6` 那一档意味着「出发点读数与派遣对不上，
+#: 是靠目标 + 抵达时刻定的人」。
+CONFIDENCE_ORIGIN_TARGET_TIME = 1.0
+CONFIDENCE_EXPECTED_WINDOW = 0.9
+CONFIDENCE_ORIGIN_MISMATCH = 0.6
+
+#: 认不上时，日志里最多列几个候选。全列出来只会把一条日志撑成一屏。
+MAX_LOGGED_CANDIDATES = 8
+
+#: 认领相关日志的 `source`。
+_MATCH_LOG_SOURCE = "storage.report_match"
 
 #: 孤儿行的 `stopped_by`：控制台重启时发现的、上次没走正常关闭路径的子进程。
 STOPPED_BY_UNKNOWN = "UNKNOWN"
@@ -135,6 +172,33 @@ class StoredReportClaim:
     match_status: str | None
     dispatch_id: UUID | None
     dispatched_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class ReportRematchPlan:
+    """**干跑**一次重认的结果：这一行战报会不会被认上、认给谁、凭什么。
+
+    只给 `tools.rematch_reports` 用。存在的理由是「动生产数据之前先能看一眼」——
+    而它跑的是与真写库**完全同一段判据**（`_link_dispatch`），不是另抄一份来估：
+    抄一份的话，干跑说的和真跑做的会各自漂移，而这种漂移只在写坏数据之后才看得见。
+    """
+
+    report_id: UUID
+    reported_at_utc: datetime
+    #: 战报上**读出来的**出发点。与 `dispatch_origin` 不同就意味着 OCR 读错了。
+    report_origin: Coordinate
+    target: Coordinate
+    #: 干跑前库里的状态，`MATCHED` / `AMBIGUOUS` / `UNMATCHED`。
+    previous_status: str | None
+    #: 干跑后会变成什么。
+    status: str
+    dispatch_id: UUID | None
+    dispatch_origin: Coordinate | None
+    match_confidence: float
+
+    @property
+    def claims(self) -> bool:
+        return self.dispatch_id is not None
 
 
 @dataclass(frozen=True)
@@ -604,6 +668,10 @@ class SqlAlchemyRepository:
                 origin=record.attacker_origin,
                 target=record.defender_target,
                 reported_at=record.reported_at_utc,
+                # 入库那一刻认不上，一定要留一条：这一行此后只会被重认那条路碰，
+                # 而那条路只在状态变化时写。没有这一条，「一份战报进来了却没接上」
+                # 在库里就是彻底无声的。每份战报最多走一次，不需要限流。
+                announce_unclaimed=True,
             )
             session.commit()
 
@@ -704,23 +772,74 @@ class SqlAlchemyRepository:
             for report_id, match_status, dispatch_id, dispatched_at in rows
         )
 
+    def plan_unlinked_rematch(self, *, limit: int = 500) -> tuple[ReportRematchPlan, ...]:
+        """**干跑**一次 `rematch_unlinked_reports`：算出会认上哪几份，一个字节都不写。
+
+        跑的是与真写库**同一段判据**（`_link_dispatch`），算完 `rollback()`。
+        另抄一份「预测版判据」是这里唯一真正的坑：抄出来的那份会慢慢和真跑漂开，
+        而漂开的那一刻没有任何症状——干跑说得好好的，写下去却是另一回事。
+
+        ⚠️ 干跑**不写日志**（`record_log=False`）。库里留一条「已认领」而实际什么
+        都没发生，比不写更糟。
+        """
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        plans: list[ReportRematchPlan] = []
+        with self._session_factory() as session:
+            for row in self._unlinked_report_rows(session, limit=limit):
+                previous_status = row.match_status
+                origin = Coordinate(
+                    row.attacker_origin_galaxy,
+                    row.attacker_origin_system,
+                    row.attacker_origin_position,
+                )
+                target = Coordinate(
+                    row.defender_target_galaxy,
+                    row.defender_target_system,
+                    row.defender_target_position,
+                )
+                _link_dispatch(
+                    session,
+                    row,
+                    origin=origin,
+                    target=target,
+                    reported_at=row.reported_at_utc,
+                    record_log=False,
+                )
+                dispatch_origin: Coordinate | None = None
+                if row.dispatch_id is not None:
+                    dispatch_origin = _dispatch_origin(session, row.dispatch_id)
+                plans.append(
+                    ReportRematchPlan(
+                        report_id=row.id,
+                        reported_at_utc=row.reported_at_utc,
+                        report_origin=origin,
+                        target=target,
+                        previous_status=previous_status,
+                        status=row.match_status,
+                        dispatch_id=row.dispatch_id,
+                        dispatch_origin=dispatch_origin,
+                        match_confidence=row.match_confidence,
+                    )
+                )
+            # ⚠️ 干跑的全部意义在这一行上。
+            session.rollback()
+        return tuple(plans)
+
     def rematch_unlinked_reports(self, *, limit: int = 500) -> int:
         """重试认领库中尚未挂到派遣的战报，返回本次补上的数量。
 
         战报可能早于修复后的匹配规则写入；之后信箱去重会阻止它再次入库，
         因而不能指望下一次读邮件自然修好。这里只复用 `_link_dispatch` 的
         唯一候选规则，绝不按最近时间强行猜测归属。
+
+        想先看看会认上哪几份就用 `plan_unlinked_rematch`——同一段判据，只是不落库。
         """
         if limit < 1:
             raise ValueError("limit must be positive")
         matched = 0
         with self._session_factory() as session:
-            rows = session.scalars(
-                select(orm.BattleReportRow)
-                .where(orm.BattleReportRow.dispatch_id.is_(None))
-                .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id)
-                .limit(limit)
-            ).all()
+            rows = self._unlinked_report_rows(session, limit=limit)
             for row in rows:
                 matched += int(
                     _link_dispatch(
@@ -739,8 +858,38 @@ class SqlAlchemyRepository:
                         reported_at=row.reported_at_utc,
                     )
                 )
+            if rows:
+                # 这一趟每轮开工走一次，认不上的那几行**逐行**写日志会变成每次
+                # 启动都刷同样的几十条（CLAUDE.md：每 tick 可能触发的要限流）。
+                # 所以逐行那一侧只在状态变化时写，这里补一条总账。
+                record_system_log(
+                    "INFO",
+                    _MATCH_LOG_SOURCE,
+                    f"批量重认 {len(rows)} 份未认领战报，补上 {matched} 份",
+                    payload={
+                        "retried": len(rows),
+                        "matched": matched,
+                        "still_unmatched": [str(row.id) for row in rows if row.dispatch_id is None][
+                            :MAX_LOGGED_CANDIDATES
+                        ],
+                    },
+                )
             session.commit()
         return matched
+
+    @staticmethod
+    def _unlinked_report_rows(session: Session, *, limit: int) -> Sequence[orm.BattleReportRow]:
+        """还没认领上派遣的那几行战报，新的在前。
+
+        干跑与真跑共用这一把选择器：两边各写一遍 `WHERE` 的话，干跑看的那一批
+        和真跑改的那一批可以是不同的两批，而它们长得一模一样。
+        """
+        return session.scalars(
+            select(orm.BattleReportRow)
+            .where(orm.BattleReportRow.dispatch_id.is_(None))
+            .order_by(orm.BattleReportRow.reported_at_utc.desc(), orm.BattleReportRow.id)
+            .limit(limit)
+        ).all()
 
     # -- 侦察报告 -------------------------------------------------------------
 
@@ -3023,6 +3172,28 @@ def _awaiting_attack_reports(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _DispatchCandidate:
+    """一发**可能**产生了这份战报的派遣，连同它自己的出发星球。
+
+    出发点跟着候选一起带出来，是因为它已经从「查询条件」降级成了「判据之一」：
+    要比对、要在认不上时写进日志，就不能再只留一个 `dispatch_id`。
+    """
+
+    dispatch: orm.AttackDispatchRow
+    origin: Coordinate
+
+    def describe(self) -> dict[str, Any]:
+        """写进日志 `payload_json` 的那一份。排障时要能只看这一条就复现判据。"""
+        expected = self.dispatch.expected_report_at_utc
+        return {
+            "dispatch_id": str(self.dispatch.id),
+            "origin": str(self.origin),
+            "dispatched_at_utc": self.dispatch.dispatched_at_utc.isoformat(),
+            "expected_report_at_utc": None if expected is None else expected.isoformat(),
+        }
+
+
 def _link_dispatch(
     session: Session,
     report_row: orm.BattleReportRow,
@@ -3030,6 +3201,8 @@ def _link_dispatch(
     origin: Coordinate,
     target: Coordinate,
     reported_at: datetime,
+    announce_unclaimed: bool = False,
+    record_log: bool = True,
 ) -> bool:
     """给一行战报认领一发派遣，写回 `dispatch_id` / `match_status`。认上了返回 True。
 
@@ -3037,39 +3210,230 @@ def _link_dispatch(
     **不能各写一份**：判据一分家，重认那条路就会用一套跟入库不同的规则去改
     历史行，而两套规则的差别只会在实机上以「战果列有时空着」的形式露出来。
 
-    ⚠️ **不猜**：候选恰好一个才认领；多于一个记 `AMBIGUOUS`，一个都没有记
-    `UNMATCHED`。写死这三档而不是「认不上就不动」，是为了让重认能把一行从
-    `AMBIGUOUS` 改回 `UNMATCHED`——候选已经全部过期时，那才是真话。
+    ## 判据分三档，`match_confidence` 如实记是哪一档
+
+    1. **出发点 + 目标 + 时刻**恰好定下一发 → `1.0`。绝大多数走这一档。
+    2. 出发点相符的候选**多于一发**，但只有一发落在 `expected_report_at_utc`
+       前后那个窄窗口里 → `0.9`。
+    3. 出发点**一发都不相符**，而按目标 + 抵达窗口恰好定下一发 → `0.6`，
+       并往 `system_log` 写一条「出发点读数与派遣记录不一致」。
+
+    ## 为什么出发点不再是硬条件
+
+    实机（生产库 2026-08-18）第二颗出发星 `9:250:8` 的战报**每一份**都被 OCR 读成
+    `3:250:8`（`[` 与 `9` 在 7× LANCZOS 下糊成一个 `3`，见
+    `vision.optional.report_screens._read_coordinate`），于是 7 份全部认不上——
+    而它们的目标与时刻**分毫不差**（差 −3.4s … −0.46s）。出发点在这里只是一个
+    多余的、且更容易读错的字段：目标坐标写在战报的另一半，时刻是游戏自己盖的章。
+
+    数据依据（生产库全量）：把出发点整个拿掉、只按「目标 + 落在抵达窗口内」找候选，
+    124 份战报里 121 份仍然只有唯一候选，剩下 3 份有两发——而那 3 份里真正那一发
+    差几秒、另一发差 20 分钟，窄窗口一收就只剩一发。**没有一例是靠出发点才分开的。**
+
+    ⚠️ **放宽只发生在「严格判据一发都没认到」时**，而且第 3 档要求候选有
+    `expected_report_at_utc`（飞行时长读到了）。读不到飞行时长的那 13% 派遣
+    没有窄窗口可用，宁可留 `UNMATCHED`。
+
+    ⚠️ **仍然不猜**：任何一档里只要窗口内活下来多于一发，就一发都不认
+    （`AMBIGUOUS`），绝不「挑个最近的」。认错一发比认不上更糟：攻击日志会把战果
+    挂到没打过的那一发头上，而没人会回头核。
+
+    `announce_unclaimed` 只影响**日志**，不影响判据：入库那一刻认不上要留一条，
+    而回头重认是每趟信箱都可能走的路，同一句话不能每趟写一遍（CLAUDE.md：每 tick
+    可能触发的要限流）。所以重认那条路只在 `match_status` **真的变了**时才写。
+
+    `record_log=False` 是**干跑**用的（`plan_unlinked_rematch`）：那一趟算完就
+    回滚，什么都没发生，而一条「已认领」的日志会让库里留下一件没发生过的事。
+    日志说假话比不说更糟。
     """
+    previous_status = report_row.match_status
     close = [
-        dispatch
-        for dispatch in _unmatched_dispatch_candidates(
-            session, origin=origin, target=target, reported_at=reported_at
+        candidate
+        for candidate in _unmatched_dispatch_candidates(
+            session, target=target, reported_at=reported_at
         )
-        if _close_in_time(dispatch.dispatched_at_utc, reported_at)
+        if _close_in_time(candidate.dispatch.dispatched_at_utc, reported_at)
     ]
-    if len(close) == 1:
-        report_row.dispatch_id = close[0].id
+    same_origin = [candidate for candidate in close if candidate.origin == origin]
+    picked: _DispatchCandidate | None = None
+    confidence = 0.0
+    basis = ""
+    narrowed: list[_DispatchCandidate] = []
+    if len(same_origin) == 1:
+        picked = same_origin[0]
+        confidence = CONFIDENCE_ORIGIN_TARGET_TIME
+        basis = "origin+target+time"
+    else:
+        # 出发点相符的先用；一个都不相符时才把出发点降级成「不符也认，但低分」。
+        pool = same_origin or close
+        narrowed = [
+            candidate
+            for candidate in pool
+            if _within_expected_window(candidate.dispatch.expected_report_at_utc, reported_at)
+        ]
+        if len(narrowed) == 1:
+            picked = narrowed[0]
+            if same_origin:
+                confidence = CONFIDENCE_EXPECTED_WINDOW
+                basis = "origin+target+expected"
+            else:
+                confidence = CONFIDENCE_ORIGIN_MISMATCH
+                basis = "target+expected"
+
+    if picked is not None:
+        report_row.dispatch_id = picked.dispatch.id
         report_row.match_status = "MATCHED"
-        report_row.match_confidence = 1.0
+        report_row.match_confidence = confidence
         bot_target = _bot_target_for(session, target)
         if bot_target is not None:
             bot_target.last_report_at_utc = reported_at
+        if record_log:
+            _log_claim(
+                report_row,
+                picked,
+                reported_at=reported_at,
+                report_origin=origin,
+                target=target,
+                confidence=confidence,
+                basis=basis,
+            )
         return True
-    report_row.match_status = "AMBIGUOUS" if len(close) > 1 else "UNMATCHED"
+
+    report_row.match_status = (
+        "AMBIGUOUS" if len(same_origin) > 1 or len(narrowed) > 1 else "UNMATCHED"
+    )
+    if record_log and (announce_unclaimed or report_row.match_status != previous_status):
+        _log_unclaimed(
+            report_row,
+            close,
+            reported_at=reported_at,
+            report_origin=origin,
+            target=target,
+            previous_status=previous_status,
+        )
     return False
+
+
+def _dispatch_origin(session: Session, dispatch_id: UUID) -> Coordinate | None:
+    """那一发派遣是从哪颗星球出发的。干跑要拿它和战报上读出来的那个对照。"""
+    row = session.execute(
+        select(
+            orm.AttackIntentRow.origin_galaxy,
+            orm.AttackIntentRow.origin_system,
+            orm.AttackIntentRow.origin_position,
+        )
+        .join(orm.AttackDispatchRow, orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id)
+        .where(orm.AttackDispatchRow.id == dispatch_id)
+    ).first()
+    return None if row is None else Coordinate(row[0], row[1], row[2])
+
+
+def _within_expected_window(expected_at: datetime | None, reported_at: datetime) -> bool:
+    """战报时刻落在这一发的**预计抵达**时刻附近吗。
+
+    没有 `expected_report_at_utc`（飞行时长没读到）时恒为 False：那一发根本没有
+    可比的钟，放它进来等于用「什么都不知道」换一次认领。
+    """
+    if expected_at is None:
+        return False
+    return (
+        expected_at - MATCH_EXPECTED_WINDOW_BEFORE
+        <= reported_at
+        <= expected_at + MATCH_EXPECTED_WINDOW_AFTER
+    )
+
+
+def _log_claim(
+    report_row: orm.BattleReportRow,
+    picked: _DispatchCandidate,
+    *,
+    reported_at: datetime,
+    report_origin: Coordinate,
+    target: Coordinate,
+    confidence: float,
+    basis: str,
+) -> None:
+    """认上了写一条。**每一行战报最多写一次**：认上之后 `dispatch_id` 非空，
+    这一行再也不会进候选查询，所以这条日志不需要限流。
+    """
+    origin_matched = picked.origin == report_origin
+    payload = {
+        "report_id": str(report_row.id),
+        "target": str(target),
+        "reported_at_utc": reported_at.isoformat(),
+        "basis": basis,
+        "confidence": confidence,
+        "report_origin": str(report_origin),
+        "dispatch_origin": str(picked.origin),
+        "origin_matched": origin_matched,
+        **picked.describe(),
+    }
+    if origin_matched:
+        record_system_log(
+            "INFO",
+            _MATCH_LOG_SOURCE,
+            f"战报 {target} {reported_at:%Y-%m-%d %H:%M:%S} 认领派遣"
+            f"（{basis}，置信度 {confidence}）",
+            payload=payload,
+        )
+        return
+    record_system_log(
+        "WARNING",
+        _MATCH_LOG_SOURCE,
+        f"战报 {target} {reported_at:%Y-%m-%d %H:%M:%S} 的出发点读数 {report_origin} "
+        f"与派遣记录 {picked.origin} 不一致；按目标 + 抵达时刻认领，置信度 {confidence}",
+        payload=payload,
+    )
+
+
+def _log_unclaimed(
+    report_row: orm.BattleReportRow,
+    close: Sequence[_DispatchCandidate],
+    *,
+    reported_at: datetime,
+    report_origin: Coordinate,
+    target: Coordinate,
+    previous_status: str | None,
+) -> None:
+    """认不上写一条，**并且要说清当时看到了什么**。
+
+    只写「认不上」的日志等于没写：2026-08-17 那次整晚空转就是这么拖了两天
+    （CLAUDE.md）。所以候选逐个列出来——各自的出发点、派出时刻、预计抵达——
+    事后只看这一条就能判断是判据太严、是出发点读错，还是那一发压根没记进库。
+    """
+    record_system_log(
+        "WARNING",
+        _MATCH_LOG_SOURCE,
+        f"战报 {target} {reported_at:%Y-%m-%d %H:%M:%S}（出发点读作 {report_origin}）"
+        f"认不上派遣：{len(close)} 个候选 → {report_row.match_status}",
+        payload={
+            "report_id": str(report_row.id),
+            "target": str(target),
+            "reported_at_utc": reported_at.isoformat(),
+            "report_origin": str(report_origin),
+            "previous_status": previous_status,
+            "match_status": report_row.match_status,
+            "candidate_count": len(close),
+            "candidates": [candidate.describe() for candidate in close[:MAX_LOGGED_CANDIDATES]],
+        },
+    )
 
 
 def _unmatched_dispatch_candidates(
     session: Session,
     *,
-    origin: Coordinate,
     target: Coordinate,
     reported_at: datetime,
-) -> list[orm.AttackDispatchRow]:
+) -> list[_DispatchCandidate]:
     """这份战报**可能**属于哪几发派遣。
 
-    除了出发点、目标、`accepted` 与「还没被别的战报认领」，还要排掉三类：
+    ⚠️ **出发点不在这道查询里**（2026-08-19 起）。它降级成了 `_link_dispatch`
+    里的打分项：候选带着自己的出发星球出来，由那一侧先按「相符的」找，找不到才
+    退到「不符也认、但置信度低」。理由与数据依据写在 `_link_dispatch` 上。
+    留在 SQL 里的话，出发点一读错就直接是零候选——连「有几发在时间上对得上」
+    这个事实都拿不到，日志里也就写不出「当时看到了什么」。
+
+    除了目标、`accepted` 与「还没被别的战报认领」，还要排掉三类：
 
     1. **派在这份战报之后的**。战报不可能早于产生它的那一发。
     2. **早到已经被判定「战报永远不会来」的**（派出超过 `MAX_REPORT_AGE`）。
@@ -3116,13 +3480,15 @@ def _unmatched_dispatch_candidates(
     linked = select(orm.BattleReportRow.dispatch_id).where(
         orm.BattleReportRow.dispatch_id.is_not(None)
     )
-    rows = session.scalars(
-        select(orm.AttackDispatchRow)
+    rows = session.execute(
+        select(
+            orm.AttackDispatchRow,
+            orm.AttackIntentRow.origin_galaxy,
+            orm.AttackIntentRow.origin_system,
+            orm.AttackIntentRow.origin_position,
+        )
         .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
         .where(
-            orm.AttackIntentRow.origin_galaxy == origin.galaxy,
-            orm.AttackIntentRow.origin_system == origin.system,
-            orm.AttackIntentRow.origin_position == origin.position,
             orm.AttackIntentRow.target_galaxy == target.galaxy,
             orm.AttackIntentRow.target_system == target.system,
             orm.AttackIntentRow.target_position == target.position,
@@ -3134,7 +3500,10 @@ def _unmatched_dispatch_candidates(
         )
         .order_by(orm.AttackDispatchRow.dispatched_at_utc)
     ).all()
-    return list(rows)
+    return [
+        _DispatchCandidate(dispatch=dispatch, origin=Coordinate(galaxy, system, position))
+        for dispatch, galaxy, system, position in rows
+    ]
 
 
 def _close_in_time(dispatch_at: datetime | None, reported_at: datetime) -> bool:

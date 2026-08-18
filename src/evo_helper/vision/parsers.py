@@ -150,6 +150,17 @@ class UnknownUiVersionError(RuntimeError):
     """Raised when a screen cannot be recognized; callers must stop safely."""
 
 
+def compact_ocr_text(text: str, limit: int = 160) -> str:
+    """把一块 OCR 原文压成能塞进一行日志的样子。
+
+    读不出来时**必须把当时读到的东西一起说出去**（CLAUDE.md：日志的判据是「出事时
+    能不能只靠库里的日志定位」）。而 OCR 原文带着换行、成片的空格和噪声字符，
+    原样塞进日志会把一条记录撑成半屏，于是没人看——压扁再截断，才有人真的会读。
+    """
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else f"{flat[:limit]}…"
+
+
 def parse_coordinate(text: str, source: str, confidence: float = 1.0) -> CoordinateParse | None:
     match = COORDINATE_RE.search(text)
     if match is None:

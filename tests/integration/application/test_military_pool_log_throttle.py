@@ -68,7 +68,7 @@ class RecordingLog:
     def __init__(self) -> None:
         self.entries: list[tuple[str, str, dict[str, object]]] = []
 
-    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None):  # type: ignore[no-untyped-def]
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
         self.entries.append((level, message, dict(payload or {})))
 
     def of(self, prefix: str) -> list[tuple[str, str, dict[str, object]]]:

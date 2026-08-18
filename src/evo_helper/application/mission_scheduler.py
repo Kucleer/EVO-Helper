@@ -1519,6 +1519,7 @@ class MissionScheduler:
             name = task.name or task.kind.value
             self._log_auto_toggle(
                 task_id=row.id,
+                mission_kind=task.kind.value,
                 event="resumed",
                 level="INFO",
                 message=(
@@ -1582,6 +1583,7 @@ class MissionScheduler:
         )
         self._log_auto_toggle(
             task_id=row.id,
+            mission_kind=task.kind.value,
             event="disabled",
             level="WARNING",
             message=f"任务「{name}」已被自动停用：{reason}；{aftermath}",
@@ -1600,6 +1602,7 @@ class MissionScheduler:
         self,
         *,
         task_id: int,
+        mission_kind: str,
         event: str,
         level: str,
         message: str,
@@ -1623,6 +1626,7 @@ class MissionScheduler:
         """
         self._log_a_repeated_line(
             key=(task_id, event),
+            mission_kind=mission_kind,
             signature=(),
             level=level,
             message=message,
@@ -1631,10 +1635,56 @@ class MissionScheduler:
             repeat_noun="跃迁",
         )
 
+    def _log_an_idle_round(self, task: TaskSnapshot, facts: TaskFacts, exc: MissionIdle) -> None:
+        """「这一轮没活干」——**每 tick 都可能触发，所以必须限流。**
+
+        ⚠️ **`has_work` 对齐之后它仍然可达，别以为限流是多余的。** 对齐挡掉的是
+        「航线满了却说有活干」那一类；剩下的一类是**航线有、池子挑不出人**——
+        候选全在保护期里、全在重复攻击间隔里、或者全被军力上限挡在外面。那一档
+        `can_dispatch` 为真、`_military_command` 照样空手而归，而它同样是每 tick
+        一次。`tests/integration/application/test_idle_tick_recompute.py` 里那个
+        `ALL_TOO_STRONG` 夹具就是它。
+
+        **为什么从 `_LOGGER.info` 换成 `record_system_log` 这条路。** 原先那句
+        `_LOGGER.info` 经 `infrastructure.system_log.SystemLogHandler` 落库，
+        那座桥上既没有限流、也认不出是哪个任务（`task_id` 列取的是**进程**身份，
+        而控制台进程不属于任何一轮，于是恒为 NULL）。生产实测
+        （2026-08-18 16:13 → 08-19 00:04）：6,661 行同一句话、占 `system_log`
+        全表 22%、`task_id` **全部为 NULL**——只能靠消息正文里的任务名去认它是谁。
+        走 `_log_a_repeated_line` 两件事一起解决：限流，以及 `task_id` 落到列上。
+
+        **签名覆盖那句话里会变的一切**：任务名、原因（`MissionIdle` 的消息里带
+        出发点坐标）、以及**当时看到的航线余量**。少覆盖一个，「和上一条一样」
+        这句判断就会把一个已经变了的现场压成沉默——而仓库的规矩是
+        「日志说假话比不说更糟」。
+        """
+        reason = str(exc)
+        message = f"{task.name} 这一轮没活干：{reason}"
+        payload: dict[str, Any] = {
+            "task_id": task.task_id,
+            "mission_kind": task.kind.value,
+            "reason": reason,
+            "free_lines": facts.free_lines,
+            # 说清「为什么这不是去收战报」：航线满而战报欠着正是本条最常见的现场，
+            # 而这一档**故意不起轮**（见 `domain.scheduler.has_work`）。
+            "reports_due": facts.reports_due,
+        }
+        self._log_a_repeated_line(
+            key=(task.task_id, "mission_idle"),
+            mission_kind=task.kind.value,
+            signature=_line_signature(message, payload),
+            level="INFO",
+            message=message,
+            payload=payload,
+            now=self._clock(),
+            repeat_noun="判定",
+        )
+
     def _log_a_repeated_line(
         self,
         *,
         key: tuple[int, str],
+        mission_kind: str,
         signature: tuple[object, ...],
         level: str,
         message: str,
@@ -1669,6 +1719,14 @@ class MissionScheduler:
 
         **状态只在内存里**，进程一重启就忘掉——那是对的：重启之后的第一条本来就该
         落库，它是新一轮运行里的第一手事实。
+
+        ⚠️ **`key[0]` 就是 `task_id`，而且它要一路写到 `system_log.task_id` 那一列
+        上去。** 那一列平时由**进程**身份填（`system_log.current_context()`，
+        runner 靠环境变量认领自己那一轮），而控制台进程不属于任何一轮，于是这里
+        每一条本来都落成 NULL——排障时只能从消息正文里的任务名去认「这是谁」，
+        按任务过滤根本做不到（生产实测 2026-08-18：6,661 行「这一轮没活干」的
+        `task_id` **全部为 NULL**）。payload 里那份是给人读的，列上这份是给
+        `WHERE` 用的，两份都要。
         """
         previous = self._repeated_lines.get(key)
         changed = previous is None or previous.signature != signature
@@ -1691,6 +1749,8 @@ class MissionScheduler:
                 "signature_changed": changed,
             },
             logged_at_utc=now,
+            task_id=key[0],
+            mission_kind=mission_kind,
         )
 
     def _log_schedule_window_changes(
@@ -1930,7 +1990,7 @@ class MissionScheduler:
             # 不停用、不记失败、不起进程，**而且本 tick 不再重算**：候选集一个字都
             # 没变，再走一遍必然挑中同一个任务、抛同一个 `MissionIdle`
             # （见 `LaunchOutcome.worth_another_round`）。下一 tick 拿新事实重算。
-            _LOGGER.info("%s 这一轮没活干：%s", task.name, exc)
+            self._log_an_idle_round(task, facts, exc)
             return LaunchOutcome.IDLE
         except MissionParamError as exc:
             # 类别按**异常类型**认，不按那句中文认：`NoFreeLineError` 说的是
@@ -2647,6 +2707,7 @@ class MissionScheduler:
         }
         self._log_a_repeated_line(
             key=(row.id, "military_pool"),
+            mission_kind=MissionKind.BOT.value,
             signature=_line_signature(message, payload),
             level="INFO",
             message=message,
@@ -2696,6 +2757,7 @@ class MissionScheduler:
                 return
             self._log_a_repeated_line(
                 key=key,
+                mission_kind=MissionKind.BOT.value,
                 signature=recovered,
                 level="INFO",
                 message=(
@@ -2737,6 +2799,7 @@ class MissionScheduler:
         }
         self._log_a_repeated_line(
             key=key,
+            mission_kind=MissionKind.BOT.value,
             signature=_line_signature(message, payload),
             level="WARNING",
             message=message,

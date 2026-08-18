@@ -28,7 +28,11 @@ from evo_helper.vision.report_layout import (
     sections_from_banners,
 )
 from evo_helper.vision.resource_digits import read_resource_cell
-from evo_helper.vision.scan_reading import COORD_RECIPES, COORD_WHITELIST, COORDINATE_RE
+from evo_helper.vision.scan_reading import (
+    COORD_RECIPES,
+    COORD_WHITELIST,
+    vote_coordinate,
+)
 
 OCR_LANGUAGES = "chi_sim+eng"
 
@@ -703,7 +707,7 @@ class ImageReportScreens:
         )
 
     def _read_coordinate(self, region: Region) -> str:
-        """逐套配方读坐标，读出合法三元组就采信。
+        """四套配方**各读一遍**，取票数最多的那个三元组。
 
         单套配方在这一行上不够。实测同一屏、同一形状的两个 ROI，守方读出
         `[2:137:14]`，攻方却只读出 `]`——于是 `parse_versus_block` 判成「单边战报」
@@ -712,9 +716,27 @@ class ImageReportScreens:
         两条对策与坐标扫描器那边同源（`vision.scan_reading.COORD_RECIPES`）：
         方括号从白名单里去掉（`]` 会被读成数字，反过来也会吃掉相邻字符），
         放大兼用最近邻（LANCZOS 会把细笔画之间的缝插值糊掉）。
+
+        ⚠️ **不再「第一套读出三元组就采信」。** 那个规则的失效方式是**读错但读得
+        像模像样**：第一套配方给出一个合法三元组，后面三套的一致反对被整个丢掉。
+        实机（生产库 2026-08-18）第二颗出发星 `9:250:8` 的 7 份战报**全部**栽在
+        这里——`[9` 在 7× LANCZOS 下糊成一个 `3`，读出 `3:250:8` / `39:250:8`，
+        而 7n / 3n / 3l 三套都读对。7 份战报因此一份都认不上派遣。
+
+        投票的实测依据（13 份存档面板 × 攻守两侧 = 26 次读数，2026-08-19）：
+
+        - 与「第一套即采信」的结论**只在那 2 次上不同**，而那 2 次正是读错的。
+        - 26 次里**没有一次平票**；也没有一次因为投票而丢掉原本读得出的坐标
+          （只有一套读得出时，1 票就是唯一最高票，仍然采信——上面那条「守方读出、
+          攻方只读出 `]`」的救援因此原样保留）。
+
+        ⚠️ **平票返回空串**，也就是「没读出来」，整份战报被 `parse_versus_block`
+        拒收、下一趟重读。这里**不学 `fleet_counts._plurality` 的「平票取小」**：
+        那边平票的两个值是同一个数量的两种读法，取小是保守；这边平票的两个值是
+        两颗**不同的星球**，取哪个都是在猜，而认错出发点会把战果记到别人头上。
         """
-        for scale, resample in COORD_RECIPES:
-            text = self._read(
+        reads = [
+            self._read(
                 region,
                 OCR_PSM_LINE,
                 language="eng",
@@ -722,9 +744,9 @@ class ImageReportScreens:
                 scale=scale,
                 resample=resample,
             ).strip()
-            if COORDINATE_RE.search(text):
-                return text
-        return text
+            for scale, resample in COORD_RECIPES
+        ]
+        return vote_coordinate(reads)
 
     def _read(
         self,
