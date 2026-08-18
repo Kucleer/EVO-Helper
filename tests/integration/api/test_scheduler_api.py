@@ -1585,9 +1585,6 @@ def test_saving_the_page_clears_a_knob_that_was_left_blank(console: Console) -> 
         # 0 = 取消排除，而候选池按军力降序排。
         ("bot_revisit_hours", 0),
         ("bot_revisit_hours", 169),
-        # 0 = 时间池为空、军力截断在空池上取前 N，这一轮一发都派不出去，
-        # 而页面上只会显示「暂无可打目标」。
-        ("military_time_pool", 0),
     ],
 )
 def test_impossible_pacing_knobs_are_refused_by_the_api(
@@ -1606,13 +1603,17 @@ def test_impossible_pacing_knobs_are_refused_by_the_api(
 #:
 #: ⚠️ **新增旋钮时必须往这里加一行。** 这张表是下面那条用例的全部输入，
 #: 而那条用例是这一页唯一一条「所有旋钮一起送、一起读回」的断言。
+#:
+#: ⚠️ **删旋钮时也要从这里删一行。** 2026-08-18 删掉了 `military_time_pool`
+#: ——它是「按读数时间取前 N 个」那个错误设计的产物（理由在
+#: `domain.target_order` 模块头第 3 步）。留在这张表里的话，这条用例会为一个
+#: 已经不存在的字段红掉，而红的原因看起来像是管线漏了一边。
 _ALL_KNOBS = {
     "blind_scrolls": 30,
     "report_scan_hours": 2,
     "unknown_line_hold_minutes": 45,
     "reconcile_cooldown_minutes": 0,
     "bot_revisit_hours": 6,
-    "military_time_pool": 300,
     "account_line_limit": 6,
     "auto_toggle_log_seconds": 90,
 }

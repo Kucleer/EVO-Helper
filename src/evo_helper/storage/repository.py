@@ -2290,7 +2290,6 @@ class SqlAlchemyRepository:
         unknown_line_hold_minutes: int | None = None,
         reconcile_cooldown_minutes: int | None = None,
         bot_revisit_hours: int | None = None,
-        military_time_pool: int | None = None,
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
@@ -2311,7 +2310,6 @@ class SqlAlchemyRepository:
             row.unknown_line_hold_minutes = unknown_line_hold_minutes
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
             row.bot_revisit_hours = bot_revisit_hours
-            row.military_time_pool = military_time_pool
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
             session.commit()

@@ -65,6 +65,10 @@ STATUS_TONES: dict[str, str] = {
     # 「军力数据未采集」按 warn 上色，和「已完成」（ok）刻意分得远——这一档之所以
     # 存在，就是因为它以前被「已完成」盖住，而那两个词在页面上给人的印象正好相反。
     TaskStatus.MISSING_MILITARY_SCORES.value: "warn",
+    # 「已放宽窗口」同样是 warn，而**不是**「待命」那个空色调：它替换掉的正是
+    # 「待命」，而这一档存在的全部意义就是让「这一轮用的是旧读数」在一页任务里
+    # 一眼看得出来。上不了色就等于又回到「用了旧数据却没人告诉你」。
+    TaskStatus.WIDENED_SCORE_WINDOW.value: "warn",
 }
 
 STATUS_GLYPHS: dict[str, str] = {
@@ -82,6 +86,9 @@ STATUS_GLYPHS: dict[str, str] = {
     # 划掉的圈：目标还在，但一个能用的军力读数都没有。**不能用 ★**（那是
     # 「已完成」的字形），灰度或色盲下字形是唯一的区分。
     TaskStatus.MISSING_MILITARY_SCORES.value: "⊘",
+    # 张开的括号：窗口被撑宽了。**不能用 ●**（那是「待命」的字形）——这一档
+    # 恰恰是从「待命」里分出来的，同一个字形等于白分。
+    TaskStatus.WIDENED_SCORE_WINDOW.value: "⟨⟩",
 }
 
 
