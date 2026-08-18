@@ -362,6 +362,22 @@
     + '定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、'
     + '也不打断正在跑的那一轮。';
 
+  // ---- 通用说明（进 ⓘ，不占行高）-------------------------------------------
+  //
+  // 判据：**在每一行任务里长得一模一样的说明 → 进 ⓘ；只描述这一行自己的事实
+  // （摘要那一句、随行事实那一句）→ 留在页面上。** 这两段从前是每行各铺一遍的
+  // `<div>`，十几行任务就把同一段话铺十几遍，而它们逐字相同——那是纯粹的行高，
+  // 不是信息。
+  //
+  // ⚠️ **文案一个字都没改，只换了呈现方式。** 这里的每一句都在别处有对应的判据
+  // （「窗口门限」不决定打谁、有效期是划一条线而不是取最新的几个、窗口不够用时
+  // 会被放弃），改写就等于让页面和代码分家——而这条链路每一次事故都长这个样子。
+  //
+  // 写法沿用这一页顶上那两个 `.tips`（调度器 / 战报补录）：浏览器原生 `title`。
+  // 这一页没有前端构建，引一个 tooltip 组件就是给部署添一份麻烦。
+  const MILITARY_SELECTION_TIP = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
+  const MILITARY_ORIGIN_TIP = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
+
   const rows = document.getElementById('mission-rows');
   const errorBox = document.getElementById('mission-error');
   const hint = document.getElementById('mission-hint');
@@ -414,6 +430,22 @@
     return input;
   }
 
+  // 通用说明的 ⓘ。和页面顶上那两个（`missions-control-head` 里的）是同一种东西：
+  // `.tips` 的样式在 console.css 里，提示走浏览器原生 `title`。
+  //
+  // ⚠️ `aria-label` 给的是「这是什么的说明」，**完整正文在 `title` 里**——两处
+  // 都要有：读屏软件念 `aria-label`，鼠标悬停看 `title`，少一边就有一类用户读不到。
+  function makeTips(label, text) {
+    const tips = document.createElement('span');
+    tips.className = 'tips';
+    tips.tabIndex = 0;
+    tips.setAttribute('role', 'img');
+    tips.setAttribute('aria-label', label);
+    tips.title = text;
+    tips.textContent = 'ⓘ';
+    return tips;
+  }
+
   // ---- 定时窗口的时区换算 ---------------------------------------------------
   //
   // 库里存 UTC，页面**输入和显示都按 UTC+8**（控件标题上写着）。换算集中在这两个
@@ -433,6 +465,13 @@
     // `toISOString()` 给的是 UTC 的墙上时钟；先把时刻推 8 小时，取到的那串
     // 数字就正好是 UTC+8 的墙上时钟，也就是 `datetime-local` 要的格式。
     return new Date(ms + UTC8_MS).toISOString().slice(0, 16);
+  }
+
+  // 折叠态那一行小字用的人话时刻。走的是和输入框同一个换算（`toWindowInput`），
+  // 所以折着看到的和展开填进去的必然是同一个时刻——各算各的话，两处迟早差 8 小时，
+  // 而那种错静默。留空的那一端念「—」，含义是「这一端不限」，不是 0 点。
+  function windowMoment(iso) {
+    return toWindowInput(iso).replace('T', ' ') || '—';
   }
 
   function fromWindowInput(value) {
@@ -634,7 +673,10 @@
         addOrigin.type = 'button';
         addOrigin.className = 'btn small military-add-origin';
         addOrigin.textContent = '增加出发点';
-        originHead.append(addOrigin);
+        // 这句说明每一行长得一模一样（它讲的是这个功能怎么用，不是这一行的事实），
+        // 所以进 ⓘ 而不是再铺一行 `<div>`。
+        originHead.append(addOrigin, document.createTextNode(' '),
+                          makeTips('多出发点说明', MILITARY_ORIGIN_TIP));
         const origins = document.createElement('div');
         origins.className = 'military-origin-list';
         const save = document.createElement('button');
@@ -642,10 +684,7 @@
         save.className = 'btn primary small military-save';
         save.style.marginTop = '7px';
         save.textContent = '保存军力方案';
-        const note = document.createElement('div');
-        note.className = 'muted'; note.style.fontSize = '11px'; note.style.marginTop = '5px';
-        note.textContent = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
-        militaryDispatch.append(originHead, origins, save, note);
+        militaryDispatch.append(originHead, origins, save);
         dispatch.append(militaryDispatch);
       }
       makeCell(row, dispatch);
@@ -701,21 +740,35 @@
       //    助手会放弃窗口、并在这一行标出「军力读数已放宽窗口」。
       // 同一个数字在页面上和判据里说两件事，正是前三次事故共同的形状。
       const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '只打读数落在这段时间之内的目标。窗口内不足「窗口门限」要的个数时，助手会放弃窗口、改用全部有读数的目标，并在状态里标出「军力读数已放宽窗口」' });
-      settings.append('窗口门限 ', topN, document.createTextNode(' 个　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时'));
-      params.append(settings);
-      // 用户要手动调这两个数，所以最容易搞反的三件事必须看得见：
+      // 用户要手动调这两个数，所以最容易搞反的三件事必须够得着：
       // ① 打谁只由「军力 ÷ 往返小时」定，这一行里没有一个数在决定打谁；
       // ② 有效期是**划一条线**，不是「取最新的几个」——后者带选择偏差，正是 #176 的错；
       // ③ 窗口不够用时会被放弃，而那件事会自己在状态里报出来。
-      const advice = document.createElement('div');
-      advice.className = 'muted';
-      advice.style.fontSize = '11px';
-      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
-      params.append(advice);
+      //
+      // 从前这三件事铺在框下面的一整段 `<div>` 里，每一行任务都逐字重复一遍。
+      // 现在挪进这个 ⓘ（`MILITARY_SELECTION_TIP`，一字未改）：它就贴在这三个框
+      // 旁边，够得着，而不再按任务条数把同一段话乘一遍。
+      settings.append('窗口门限 ', topN, document.createTextNode(' 个　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时 '), makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP));
+      params.append(settings);
     }
     const summary = document.createElement('div');
     summary.className = 'muted mission-summary';
     summary.style.fontSize = '11px';
+    // 摘要讲的是**这一行自己的事实**（出发点/航线、全账号已配几条、有没有超配、
+    // 这一轮按什么口径出击），所以它必须留在页面上——那是用户唯一能一眼看出
+    // 「航线超配了」的地方。
+    //
+    // 但它长短不定（多出发点那一档会列出每颗星球），折起行来一行任务能吃掉三四行。
+    // 所以钉成**一行不折行**，超出部分省略号收掉，完整内容进 `title`。
+    // ⚠️ 省略和 `title` 是一对，**不许只留前者**：截断了又读不到全文，等于把
+    // 「已超出」那三个字藏了起来。渲染那一处两句写在一起，就是为了不让谁只改一边。
+    summary.style.whiteSpace = 'nowrap';
+    summary.style.overflow = 'hidden';
+    summary.style.textOverflow = 'ellipsis';
+    // 表格是 auto 布局：不给上界的话，`nowrap` 会把整列撑到摘要的全长，
+    // 别的列反而被挤窄。这个数**取到参数列本来就有的宽度附近**——给窄了等于
+    // 白白多截几个字，而「全账号已配 N 条」正排在摘要中段，截过头就看不见了。
+    summary.style.maxWidth = '640px';
     summary.textContent = '…';
     makeCell(row, params, summary);
 
@@ -725,10 +778,32 @@
     // 是用户的意志（勾掉就是不想跑），定时窗口只是在它之上再加一道时间闸门。
     // 到点绝不去改那个复选框——改了的话，用户手动开的会被悄悄关掉，而且事后
     // 分不清是谁关的。
+    //
+    // ---- 折叠 ----
+    //
+    // 这一列恒展开着两组日期时间输入，比别的列都高，而**绝大多数任务根本没配
+    // 定时**——那三行高度买到的是两个空框。所以默认折起来，只留一行。
+    //
+    // ⚠️ **配了定时的任务不许藏。** 把一份已经生效的配置折起来，比多占几行危险
+    // 得多：用户看不见它，就会以为定时没生效，然后去改别的东西。这里守两道——
+    // ① 配了定时的行**默认展开**（`render` 里做，因为那时才知道库里有没有值）；
+    // ② 折叠那一行本身把配着的时刻念出来（`.mission-window-state`），
+    //    所以哪怕用户自己把它折回去，「这个任务配了定时」照样一眼看得见。
+    //
+    // 折叠状态**只存在内存里**（`row.dataset`），不落 localStorage、更不落后端。
+    // 理由是它不是配置而是「我这一刻在看什么」：一旦持久化，上一次的折叠记忆就会
+    // 盖过上面那条「配了定时默认展开」——而那正是这里最不能出的错。刷新页面回到
+    // 「按有没有配定时来决定」这个由数据说了算的状态，是更安全的默认。
     const window_ = document.createElement('div');
     window_.className = 'mission-window';
+    window_.hidden = true;
     for (const [className, label] of [['mission-enabled-from', '开启'], ['mission-enabled-until', '关闭']]) {
       const line = document.createElement('div');
+      // 「开启」和它的输入框**必须待在同一行**。默认会折：这一列窄，标签加上
+      // 180px 的输入框差几个像素放不下，于是每一端各占两行——展开一次白吃 58px，
+      // 而那正好是这次要省的东西。表格是 auto 布局，`nowrap` 会让这一列自己
+      // 从别处的余量里要够宽度（实测 217px → 257px，整张表照样没超屏）。
+      line.style.whiteSpace = 'nowrap';
       const text = document.createElement('span');
       text.className = 'inline-label';
       text.textContent = label;
@@ -743,8 +818,26 @@
     windowNote.style.fontSize = '11px';
     // 「不抢停」必须写在页面上：用户看到关闭时刻已过而任务还在跑，不写清楚
     // 就只能理解成「定时没生效」，然后去点强制结束。
+    // 它跟着输入框一起收进折叠区：要看它的人，正是此刻在填这两个框的人。
+    // （同一句话另有一份在表格底下那条常驻说明里，折着也读得到。）
     windowNote.textContent = '留空=不限；到点只挡新的一轮，正在跑的不打断';
-    makeCell(row, window_, windowNote);
+    window_.append(windowNote);
+    const windowToggleLabel = document.createElement('label');
+    windowToggleLabel.className = 'inline-label';
+    windowToggleLabel.style.cursor = 'pointer';
+    const windowToggle = makeInput('mission-window-toggle', {
+      type: 'checkbox', 'aria-label': '展开定时开关的配置',
+    });
+    windowToggleLabel.append(windowToggle, document.createTextNode(' 定时'));
+    // 折叠态的那一行小字：没配就说没配，配了就把两端的时刻念出来。
+    const windowState = document.createElement('span');
+    windowState.className = 'muted mission-window-state';
+    windowState.style.fontSize = '11px';
+    windowState.style.marginLeft = '6px';
+    windowState.textContent = '未设定时';
+    const windowHead = document.createElement('div');
+    windowHead.append(windowToggleLabel, windowState);
+    makeCell(row, windowHead, window_);
 
     // 状态。
     const chip = document.createElement('span');
@@ -863,6 +956,9 @@
       checkbox.disabled = locked;
       for (const input of row.querySelectorAll('input, select')) input.disabled = locked;
       checkbox.disabled = locked;
+      // 折叠开关**不跟着锁**：运行中最想知道的恰恰是「这一轮的定时配的是什么」，
+      // 展开只是去看，里面那两个输入框上一行已经置灰了，看得见改不了。
+      row.querySelector('.mission-window-toggle').disabled = false;
       // 删除只在这条链路还有别的任务时才给。每条链路至少留一行——删光了页面上
       // 就再也建不回来（海盗与扫描连「新建」的入口都没有）。后端也会拒，
       // 但用户不该点下去才发现。
@@ -885,7 +981,12 @@
       chip.querySelector('.mission-status-word').textContent = task.status;
 
       row.querySelector('.mission-detail').textContent = task.detail || '';
-      row.querySelector('.mission-summary').textContent = task.summary || '';
+      // 摘要压成一行、超出用省略号收（建行那一处设的样式），所以**完整内容必须
+      // 同时进 `title`**——这两句写在一起，就是为了不让谁只改一边：只截断不留
+      // `title`，「全账号已配 N 条 · 已超出」这类只在这里露面的事实就被藏了。
+      const summaryLine = row.querySelector('.mission-summary');
+      summaryLine.textContent = task.summary || '';
+      summaryLine.title = task.summary || '';
 
       const newRound = row.querySelector('.mission-new-round');
       // 「已完成」这个判断由服务端给出，页面只认那个词。
@@ -905,6 +1006,25 @@
         defaultsLine.textContent =
           following.length ? `${following.join(' / ')}跟随全局默认` : '';
       }
+
+      // 定时那一列的折叠。**判据是库里到底有没有配定时**，不是页面上那两个框
+      // 里此刻是什么——框里的值只在 prime 那一下写进去，用它来判会在新建的行上
+      // 得出「没配」。
+      const scheduled = Boolean(task.enabled_from_utc || task.enabled_until_utc);
+      // 折叠态那一行小字：把配着的时刻直接念出来。⚠️ **这不是装饰**——用户可以
+      // 自己把一个配了定时的任务折回去，那之后「它配了定时」就只剩这一句在说。
+      row.querySelector('.mission-window-state').textContent = scheduled
+        ? `已配定时 · 开启 ${windowMoment(task.enabled_from_utc)} · 关闭 ${windowMoment(task.enabled_until_utc)}`
+        : '未设定时';
+      const windowToggle = row.querySelector('.mission-window-toggle');
+      // ⚠️ **配了定时就默认展开。** 把一份已经生效的配置藏起来，用户会以为定时
+      // 没生效。只在用户还没自己动过这个开关时替他做主（`windowTouched`），
+      // 动过之后一律听用户的——否则每 2 秒一轮的轮询会把他刚折起来的又掰开。
+      if (!row.dataset.windowTouched) windowToggle.checked = scheduled;
+      row.querySelector('.mission-window').hidden = !windowToggle.checked;
+      // 展开时这句小字就多余了——那两个输入框里摆着的正是同样的两个时刻，
+      // 而它自己也要占一行。折起来的时候它是唯一的信源，那时才需要它。
+      row.querySelector('.mission-window-state').hidden = windowToggle.checked;
 
       // 输入框平时只填一次（每轮都写回去会把用户正在输入的值顶掉），但锁着的
       // 时候没人能输入，那就每轮都跟库走——否则「结束」之后框里留着的可能是
@@ -1261,6 +1381,20 @@
     const row = event.target.closest('.mission-row');
     if (!row) return;
     const taskId = row.dataset.taskId;
+    // 定时那一列的折叠开关。**它什么都不 PATCH**：折不折只是这一刻的视图，
+    // 存进库里就成了一份要跟着任务走的假配置。`windowTouched` 一旦立起来，
+    // 上面 `render` 里那条「配了定时默认展开」就不再替用户做主——否则每 2 秒
+    // 一轮的轮询会把他刚折起来的又掰开。
+    //
+    // ⚠️ 这一支必须排在 `.mission-enabled` **前面**并且自己 return：它和那个
+    // 复选框都是 `input[type=checkbox]`，落到下面任何一支上都会打出一次
+    // PATCH，而「折一下就把任务停了」是这里最糟的一种失败。
+    if (event.target.matches('.mission-window-toggle')) {
+      row.dataset.windowTouched = '1';
+      row.querySelector('.mission-window').hidden = !event.target.checked;
+      row.querySelector('.mission-window-state').hidden = event.target.checked;
+      return;
+    }
     if (event.target.matches('.mission-enabled')) {
       patch(taskId, { enabled: event.target.checked });
       return;
