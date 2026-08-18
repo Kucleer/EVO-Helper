@@ -139,16 +139,24 @@ def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_persistent_app(factory))
 
 
-def _outcome_cell(html: str) -> str:
-    """把表格体里「战果」那一格的原样 HTML 取出来。
+#: 「战果」是表头里的第 8 列（1 起数）。
+OUTCOME_COLUMN = 8
 
-    整页搜会命中顶上那几个下拉框；只看这一格，断言说的才是这一格的事。
+
+def _outcome_cell(html: str) -> str:
+    """把表格体第一行里「战果」那一格的原样 HTML 取出来。
+
+    ⚠️ **按列的位置取，不按类名取。** 整页搜会命中顶上那几个下拉框；而如果这里
+    改成搜 `class="log-body"`，「数据没被删」那两条就会跟着限宽一起红——两组用例
+    说的是两件事，混在一起就分不清是谁坏了。
     """
     start = html.find("<tbody")
     assert start != -1, "页面上没有表格体，这几条用例的前提就不成立"
-    cell = re.search(r'<td class="log-body">(.*?)</td>', html[start:], re.DOTALL)
-    assert cell is not None, '表格体里找不到「战果」那一格（`<td class="log-body">`）'
-    return cell.group(1)
+    row = re.search(r"<tr[^>]*>(.*?)</tr>", html[start:], re.DOTALL)
+    assert row is not None, "表格体里一行都没有，这几条用例的前提就不成立"
+    cells = row.group(1).split("<td")
+    assert len(cells) > OUTCOME_COLUMN, f"这一行只有 {len(cells) - 1} 格，取不到「战果」那一列"
+    return cells[OUTCOME_COLUMN]
 
 
 # -- 一、只折叠，不删 ----------------------------------------------------------
@@ -191,9 +199,9 @@ def test_the_outcome_column_reuses_the_shared_width_cap(tmp_path: Path) -> None:
     三条规则在 console.css 里共用（见那里的注释）。这一格少挂一个类，页面就退回
     2026-08-18 报的那个样子：整张表 1933px 宽，左边六列全被挤出视野。
     """
-    html = _client(tmp_path).get("/logs").text
-    cell = _outcome_cell(html)
+    cell = _outcome_cell(_client(tmp_path).get("/logs").text)
 
+    assert cell.startswith(' class="log-body">'), "「战果」那一格没挂 `.log-body`，列宽就没有上限"
     # 战损与收获两行都要能截断——只收拾其中一行，另一行照样把列撑开。
     assert cell.count('class="log-line muted"') == 2
 
