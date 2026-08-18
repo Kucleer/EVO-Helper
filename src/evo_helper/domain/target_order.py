@@ -1,4 +1,4 @@
-"""挑今晚打谁：**先按读数时间取一池，再在池内按军力截断，最后按距离出击。**
+"""挑今晚打谁：**先按读数新鲜度划一条线，再在线内按军力截断，最后按距离出击。**
 
 用户口径（2026-08-18）敲定的五步，**次序本身就是判据**，不能重排：
 
@@ -6,11 +6,11 @@
 |---|---|---|
 | 1 | 剔除 24h 内已攻击的 + 本轮已走完的 | `application.mission_scheduler._military_candidates` |
 | 2 | 只保留**有军力读数**的目标 | `with_a_military_reading` |
-| 3 | 按读数时间倒序取前 500（可配）＝**时间池** | `newest_readings_first` |
-| 4 | 在时间池里按军力降序取前 100（可配）＝**军力截断** | `strongest_within` |
+| 3 | 只保留读数落在**有效期窗口**内的 | `within_score_window` |
+| 4 | 窗口内按军力降序取前 100（可配）＝**军力截断** | `strongest_within` |
 | 5 | 这 100 个按距离分配出发星、由近到远出击 | `military_attack.assign_by_capacity_and_distance` |
 
-第 2--4 步合起来就是 `recent_then_strongest`；再接上单出发点的第 5 步就是
+第 2--4 步合起来就是 `choose_by_military`；再接上单出发点的第 5 步就是
 `strongest_then_nearest`。
 
 ## 第 1 步为什么必须在最前
@@ -29,28 +29,68 @@
 补位一多，这条链路就退化成「按距离随便打」。整段善后写在
 `domain.military_attack` 的模块头上。
 
-## 第 3 步：时间池——这一版的核心改动
+## 第 3 步：窗口筛选——**这一版修掉的正是上一版的这一步**
 
-**`score_max_age_hours` 从「过滤器」降级成「提示信号」。**
+### 上一版（PR #176）错在哪
 
-旧行为是把超期目标整批滤掉。于是「一个新鲜分数都没有」时，池子退化成
-「按距离补位、军力完全不参与」——2026-08-17 晚上实机连续 2.5 小时就是这个状态，
-而页面上只是一句不痛不痒的话。
+上一版这一步是「按读数时间倒序取前 500 个」，叫「时间池」。它看起来只是
+「优先用新数据」，实际是一道**反向的军力截断**：
 
-改成「按读数时间倒序取前 500」之后：**最新的 500 个总是存在**，哪怕它们全部超期，
-第 4 步的军力截断照样成立。有效期不再挡任何目标，只用来在日志和页面上说一句
-「这批分数已经超期多久」。
+**军力榜是从强到弱扫的，所以「读数最新」系统性地等价于「军力最弱」。**
+生产实测（2026-08-18 07:33--08:53 那一轮扫描，按读数时刻分段）：
 
-排序键是**读数时间**而不是军力：军力最高的那些恰恰读数最旧（榜单按军力降序排、
-扫描也从上往下读），拿军力当排序键等于把时间池变成第二道军力截断，
-「用多新的数据」这件事就没人管了。
+| 读数时段 | 个数 | 均值 | 最高 |
+|---|---|---|---|
+| 07:40 | 190 | 31,756 | 262,899 |
+| 07:50 | 225 | 19,108 | 21,270 |
+| 08:00 | 224 | 13,806 | 17,510 |
+| 08:10 | 236 | 8,045 | 10,560 |
+| 08:20 | 181 | 6,756 | 8,660 |
+| 08:30 | 206 | 4,301 | 5,600 |
+| 08:40 | 231 | 2,938 | 3,250 |
+| 08:50 | 98 | 2,616 | 2,720 |
+
+**单调下降。** 于是「取最新 500 个」＝「取最后扫到的 500 个」＝「取最弱的
+500 个」；再在这批里按军力取前 200，选出来的是 3,200~5,600。实机 2026-08-18
+09:00 那 8 发的军力就是 3,270 / 5,590 / 4,835 / 3,360 / 4,390 / 4,430 / 5,740 / 5,420
+——「军力优先」这条链路选出来的是全库最弱的那一档。
+
+### ⚠️ 窗口筛选和「取最新 N 个」不是一回事，别再判成等价
+
+**这两件事只差一层，而那一层就是全部：**
+
+- **「取最新 N 个」按名次截断。** 名次由读数时间排出来，而读数时间和军力强相关
+  （见上表），所以这一刀**带选择偏差**：它挑走的恰好是军力最弱的那一段。
+- **窗口筛选按时间划一条线。** 线的位置由 `max_age` 定，与「这一批有多少个」
+  「谁排第几」都无关。**同一轮扫描出来的目标要么整批在线内、要么整批在线外**，
+  强的弱的一视同仁——所以它**不带选择偏差**。
+
+上一版就是把这两件事判成了等价才写成那样的。这段话留在这里，是为了下一个人
+不要再判一次。
+
+### 窗口内不足时：**放弃窗口**，不是「按时间往下补」
+
+```
+③ 只保留读数在 max_age 窗口内的
+   ├─ 窗口内的数量 ≥ 军力截断数 K → 就用窗口内这批，进第 4 步
+   └─ 窗口内不足 K → 放弃窗口，在「全部有读数的目标」里按军力截断，并大声告警
+```
+
+**为什么不足时不按时间往下补**：往下补捞到的正是刚出窗口那一批，而按上表，
+那一批恰恰是最弱的——补下去等于把上一版的缺陷换个地方原样复发。放弃窗口之后
+按军力截断，至少拿到的是**全库最强**的那一批。
+
+**放宽必须大声说出来。** 用户口径（2026-08-18）：「今晚这件事的真正问题不是
+『用了旧数据』，而是**用了旧数据却没人告诉你**——你是从攻击日志里一条一条对
+出来的」。所以 `MilitaryChoice.widened` 是这一步的一等结果，不是可选的附注：
+`application` 据它打 WARNING、页面据它显示 `TaskStatus.WIDENED_SCORE_WINDOW`。
 
 ## 第 4 步：军力必须是**截断**，不能是**排序**
 
 第 5 步按距离重排会把排序结果整个抹掉，所以军力只有一次机会生效，就是这一刀。
-实测用户一天只派约 35 发，而时间池 500 个——只有 7% 会被打到，**「谁被打」
-完全由这一刀决定**。填成 ≥ 可用候选数就等于没截（2026-08-18 之前 `top_n` 被填成
-500 而可用候选只有 591，正是这个状态）。
+实测用户一天只派约 35 发，而窗口内常有一千多个——只有百分之几会被打到，
+**「谁被打」完全由这一刀决定**。填成 ≥ 可用候选数就等于没截（2026-08-18 之前
+`top_n` 被填成 500 而可用候选只有 591，正是这个状态）。
 
 ⚠️ 这里刻意**没有**档位阈值。先前写过一版按军力分档（>100K / 20K–100K / …），
 边界取自 2026-08-15 那批数据的分位数，而**那批数据是脏的**：30 个军力值因为丢
@@ -82,7 +122,7 @@ from datetime import datetime, timedelta
 from evo_helper.domain.distance import distance_key
 from evo_helper.domain.models import Coordinate
 
-#: 军力截断：在时间池里按军力取前几个。用户口径（2026-08-18）：100。
+#: 军力截断：在窗口内按军力取前几个。用户口径（2026-08-18）：100。
 #:
 #: 这个数与航路数是两件事：航路数（`scheduler_config.fleet_line_limit`）决定
 #: **同时**在飞几发，而这个数决定**这一轮谁有资格被打**。
@@ -91,31 +131,34 @@ from evo_helper.domain.models import Coordinate
 #: 一次。**填成大于等于可用候选数就完全失效**——2026-08-18 之前它被填成 500，
 #: 而可用候选只有 591，等于军力压根没参与。
 #:
+#: ⚠️ **它同时是第 3 步「够不够」的那把尺子**：窗口内的目标数 < 这个数时窗口
+#: 会被放弃（见模块头第 3 步）。所以调大它不只是「多打几个」，也在让放宽更容易
+#: 触发——两件事同一个数，是因为它们问的本来就是同一句话：「这一轮要挑出几个」。
+#:
 #: 分类：**运维旋钮**，可在任务参数里改（`top_n`）。调小 = 只打最强的，代价是
-#: 可选距离变差；调大 = 军力优先被稀释。没有唯一正确答案。
+#: 可选距离变差、且窗口更不容易被放弃；调大 = 军力优先被稀释、放宽更常触发。
+#: 没有唯一正确答案。
 TOP_BY_MILITARY = 100
 
-#: 时间池大小：按读数时间倒序取前几个。用户口径（2026-08-18）：500。
+#: 军力读数「算不算新」的门槛，也就是第 3 步那扇**窗口**的宽度。
+#: 默认取**一轮军力榜扫描时长的约 2 倍**。
 #:
-#: 它回答的是「**用多新的军力数据**」，与 `TOP_BY_MILITARY`（「只打多强的」）
-#: 各管一件事，**必须分开配**。合成一个数的话，想放宽数据新鲜度就只能连带把
-#: 攻击面一起放宽，反过来也一样。
+#: ⚠️ **2026-08-18 起它重新是一道真的筛选器。** 它的语义换过三次，别按任何一个
+#: 旧版本理解它：
 #:
-#: 分类：**运维旋钮**，可在攻击配置页上改（`military_attack_config.military_time_pool`）。
-#: 调大 = 用到更旧的军力数据、排序可能不准；调小 = 可选面变窄。
-DEFAULT_TIME_POOL = 500
-
-#: 军力读数「算不算新」的默认门槛：**一轮军力榜扫描时长的约 2 倍**。
+#: 1. 最早叫 `rescan_after_hours`，只是一句提示，照样拿旧读数派遣；
+#: 2. 2026-08-17 改成硬判据「超期的整批跳过」——一个新鲜分数都没有的夜里
+#:    军力被整个踢出选靶，实机连续停摆 2.5 小时；
+#: 3. PR #176 又把它降级成提示，选靶交给「时间池」——那一版把最弱的一批选了
+#:    出来（理由整段在模块头第 3 步）；
+#: 4. **现在**：它筛，但**筛不出足够的目标时会放弃窗口并告警**，而不是让这一轮
+#:    空手。第 2 版那种停摆因此不会回来，第 3 版那种偏差也不会长出来。
 #:
-#: ⚠️ **2026-08-18 起它不再挡任何目标。** 它曾经是硬判据（分数过期的整批跳过），
-#: 而那正是 2026-08-17 晚上攻击停摆 2.5 小时的成因：一个新鲜分数都没有时，
-#: 池子退化成「军力完全不参与」。现在超期与否只影响日志和页面上那句
-#: 「这批分数已经超期多久」，选靶交给时间池（`DEFAULT_TIME_POOL`）。
+#: 取值实测生产库的扫描速率（`mission_runs` 对 `bot_targets.military_score_at_utc`）：
+#: 2026-08-17 10:18 那一轮 58.1 分钟采 946 个（16.3 个/分）、09:31 那一轮 41.4 分钟
+#: 采 361 个（8.7 个/分）。用户计划一轮扫 1000 个，也就是**一轮约 61 分钟**，取两倍。
 #:
-#: 取值仍然写在这里，因为那句提示得有个基准。实测生产库的扫描速率
-#: （`mission_runs` 对 `bot_targets.military_score_at_utc`）：2026-08-17 10:18 那一轮
-#: 58.1 分钟采 946 个（16.3 个/分）、09:31 那一轮 41.4 分钟采 361 个（8.7 个/分）。
-#: 用户计划一轮扫 1000 个，也就是**一轮约 61 分钟**，取两倍。
+#: 分类：**运维旋钮**，可在任务参数里改（`score_max_age_hours`）。
 DEFAULT_SCORE_MAX_AGE = timedelta(hours=2)
 
 
@@ -134,14 +177,6 @@ def _coordinate_key(target: ScoredTarget) -> tuple[int, int, int]:
     前 N 个可能不一样，而那会让「上一轮打到哪了」无从谈起，事后拿日志也对不上。
     """
     return (target.coordinate.galaxy, target.coordinate.system, target.coordinate.position)
-
-
-def _reading_time(target: ScoredTarget) -> datetime:
-    """读取时刻。调用前必须已按 `has_a_military_reading` 过滤过。"""
-    moment = target.military_score_at_utc
-    if moment is None:  # pragma: no cover - 上游已过滤，留着是为了别静默按 0 处理
-        raise ValueError("没有读取时刻的目标不该走到时间池")
-    return moment
 
 
 def strongest_first(targets: Iterable[ScoredTarget]) -> list[ScoredTarget]:
@@ -166,9 +201,8 @@ def has_a_military_reading(target: ScoredTarget) -> bool:
 
     - 没有分数 → 从没上过军力榜。用户 2026-08-18 决定这一档不再攻击（实测 628 个，
       占 bot 总数 3604 的 17.4%），理由在模块头。
-    - 有分数却说不清什么时候读的 → 进不了时间池：时间池按读数时间排序，
-      一个没有时刻的目标在那把尺子上没有位置。把它当成「很旧」或者「很新」
-      都是在编一个没量到的数。
+    - 有分数却说不清什么时候读的 → 进不了窗口：窗口按读数时刻划线，一个没有时刻的
+      目标在那把尺子上没有位置。把它当成「很旧」或者「很新」都是在编一个没量到的数。
     """
     return target.military_score is not None and target.military_score_at_utc is not None
 
@@ -178,26 +212,43 @@ def with_a_military_reading(targets: Iterable[ScoredTarget]) -> list[ScoredTarge
     return [target for target in targets if has_a_military_reading(target)]
 
 
-def newest_readings_first(
-    targets: Iterable[ScoredTarget], *, take: int = DEFAULT_TIME_POOL
-) -> tuple[ScoredTarget, ...]:
-    """**第 3 步**：按读数时间倒序取前 `take` 个，也就是**时间池**。
+def score_is_fresh(target: ScoredTarget, *, now: datetime, max_age: timedelta) -> bool:
+    """这一条的军力**分数**读得够不够新。判据**逐目标**，不看池子里别人的读数。
 
-    ⚠️ **排序键是读数时间，不是军力。** 换成军力的话这一步就变成第二道军力截断，
-    而「用多新的数据」这件事再没人管——最新的那批读数会被军力最低的那些顶掉，
-    因为榜单按军力降序扫，先读到的（军力最高的）读数最旧。
+    判据逐目标而不是拿 `min(整池)` 判整池：一条陈旧记录就让整池被判过期，于是
+    警告永远在响，而响的时候并不知道**正要打的那个**新不新。实机 2026-08-17：
+    日志里写着「最旧读数 2026-08-14 21:58」（三天前的某一条），而当时正要打的
+    `4:293:6` 读数是当日 01:50、攻击发生在 05:28——超期 3.6 小时。
 
-    ⚠️ **这一池总是非空**（只要第 2 步还剩东西），哪怕全部超期。这正是它替掉
-    「超期整批跳过」的原因：2026-08-17 晚上实机连续 2.5 小时一个新鲜分数都没有，
-    旧实现于是把军力整个踢出了选靶。
+    边界取「小于」：正好等于有效期的算超期。
 
-    并列（同一时刻读到的，扫描一屏之内很常见）按坐标定序。
+    没有分数、或者读到过分数却没有读取时刻的，在这里恒为假：说不清什么时候读的
+    分数谈不上新不新。这两档在第 2 步（`has_a_military_reading`）就已经出局了。
     """
-    if take < 1:
-        return ()
-    rated = sorted(with_a_military_reading(targets), key=_coordinate_key)
-    rated.sort(key=_reading_time, reverse=True)
-    return tuple(rated[:take])
+    if target.military_score is None:
+        return False
+    scanned_at = target.military_score_at_utc
+    return scanned_at is not None and now - scanned_at < max_age
+
+
+def within_score_window(
+    targets: Iterable[ScoredTarget], *, now: datetime, max_age: timedelta
+) -> tuple[ScoredTarget, ...]:
+    """**第 3 步**：只留下读数落在 `max_age` 窗口内的。次序保持传入的次序。
+
+    ⚠️ **它按时间划一条线，不按名次截断——这是它和「取最新 N 个」的本质区别。**
+    名次截断带选择偏差（军力榜从强到弱扫，「读数最新」系统性地等价于「军力最弱」，
+    实测表在模块头第 3 步）；划线不带：线的位置只由 `max_age` 定，与「这一批有
+    多少个」「谁排第几」无关，同一轮扫描出来的强弱目标一视同仁。
+
+    **上一版就是把这两件事判成了等价**，于是「优先用新数据」实际选出了全库最弱的
+    一批。别再判一次。
+
+    ⚠️ **这一步可能筛空**，而那不是错——`choose_by_military` 负责在窗口内不够时
+    放弃窗口并把这件事说出来。单独看这个函数时别给它补一个「至少留 N 个」的兜底：
+    那个兜底就是「按时间往下补」，而往下补捞到的正是刚出窗口那批最弱的目标。
+    """
+    return tuple(target for target in targets if score_is_fresh(target, now=now, max_age=max_age))
 
 
 def strongest_within(
@@ -231,126 +282,107 @@ def strongest_within(
     return tuple(strongest_first(affordable)[:take])
 
 
-def recent_then_strongest(
+@dataclass(frozen=True)
+class MilitaryChoice:
+    """第 2--4 步这一次的结果，**连「窗口有没有被放弃」一起带出来**。
+
+    做成一个结构而不是只返回一个清单，是因为**放宽窗口这件事必须能被说出来**。
+    用户口径（2026-08-18）：「今晚这件事的真正问题不是『用了旧数据』，而是
+    **用了旧数据却没人告诉你**——你是从攻击日志里一条一条对出来的」。
+
+    只返回 `selected` 的话，调用方能看见的只有「这一轮打了谁」，看不见
+    「凭什么是这几个」；而这两次事故（2026-08-17 的停摆、2026-08-18 的选弱）
+    的共同形状恰恰是**判据在背地里换了，页面和日志照旧**。
+    """
+
+    #: 第 2 步之后：有军力读数的那些。次序保持传入的次序。
+    with_readings: tuple[ScoredTarget, ...]
+    #: 第 3 步划出来的窗口内那批。**放宽与否都记**——「窗口内只有几个」正是
+    #: 告警里最要紧的那个数。
+    in_window: tuple[ScoredTarget, ...]
+    #: 第 4 步真正参与截断的那一池：窗口够就是 `in_window`，不够就是 `with_readings`。
+    considered: tuple[ScoredTarget, ...]
+    #: 第 4 步之后：这一轮真的要打的。
+    selected: tuple[ScoredTarget, ...]
+    #: **这一轮用到了窗口外的读数吗。** 判据是「选中的这批里有没有超期的」，
+    #: 而不是「有没有走放宽那条分支」——两者只在一种情形下不同：窗口内不足 K，
+    #: 但库里本来就只有这些读数（`in_window == with_readings`）。那种情形下放弃
+    #: 窗口一个目标都没多捞到，**没有用到旧数据，也就不该告警**。
+    #: 日志说假话比不说更糟。
+    widened: bool
+
+
+def choose_by_military(
     targets: Iterable[ScoredTarget],
     *,
-    time_pool: int = DEFAULT_TIME_POOL,
+    now: datetime,
+    max_age: timedelta,
     take: int = TOP_BY_MILITARY,
     max_score: float | None = None,
-) -> tuple[ScoredTarget, ...]:
-    """**第 2--4 步合起来**：有读数的 → 读数最新的 `time_pool` 个 → 其中最强的 `take` 个。
+) -> MilitaryChoice:
+    """**第 2--4 步合起来**：有读数的 → 窗口内的 → 其中最强的 `take` 个。
 
-    三步各是一个独立的函数，这里只负责把它们串起来——**串的次序就是判据**，
-    每一步的理由写在各自的 docstring 与模块头上。
+    三步各是一个独立的函数，这里只负责把它们串起来，外加**窗口内不足时那一个
+    决定**——串的次序与那个决定就是判据，理由整段写在模块头第 3 步上。这里只
+    重复最容易搞反的一条：
+
+    **不足时是「放弃窗口」，不是「按时间往下补」。** 往下补捞到的正是刚出窗口
+    那一批，而军力榜从强到弱扫，那一批恰恰是最弱的——补下去等于把 PR #176 的
+    缺陷换个地方原样复发。放弃窗口后在全部有读数的目标里按军力截断，至少拿到的
+    是全库最强的那一批。
     """
-    return strongest_within(
-        newest_readings_first(targets, take=time_pool), take=take, max_score=max_score
+    with_readings = tuple(with_a_military_reading(targets))
+    in_window = within_score_window(with_readings, now=now, max_age=max_age)
+    # 「够不够」的尺子就是军力截断那个数：这一步存在的全部意义是给第 4 步备料，
+    # 备够了就不必动窗口，备不够再放宽也不迟。
+    considered = in_window if len(in_window) >= take else with_readings
+    selected = strongest_within(considered, take=take, max_score=max_score)
+    widened = any(not score_is_fresh(target, now=now, max_age=max_age) for target in selected)
+    return MilitaryChoice(
+        with_readings=with_readings,
+        in_window=in_window,
+        considered=considered,
+        selected=selected,
+        widened=widened,
     )
-
-
-def score_is_fresh(target: ScoredTarget, *, now: datetime, max_age: timedelta) -> bool:
-    """这一条的军力**分数**读得够不够新。判据**逐目标**，不看池子里别人的读数。
-
-    ⚠️ **2026-08-18 起这只是一个提示信号，它不挡任何目标。** 选靶由时间池
-    （`newest_readings_first`）决定；这个判据只用来在日志和页面上说清
-    「正要打的这一批分数已经超期多久」。当成过滤器用的那一版，在
-    「一个新鲜分数都没有」的夜里会把军力整个踢出选靶（2026-08-17 实机 2.5 小时）。
-
-    判据逐目标而不是拿 `min(整池)` 判整池：一条陈旧记录就让整池被判过期，于是
-    警告永远在响，而响的时候并不知道**正要打的那个**新不新。实机 2026-08-17：
-    日志里写着「最旧读数 2026-08-14 21:58」（三天前的某一条），而当时正要打的
-    `4:293:6` 读数是当日 01:50、攻击发生在 05:28——超期 3.6 小时。
-
-    没有分数、或者读到过分数却没有读取时刻的，在这里恒为假：说不清什么时候读的
-    分数谈不上新不新。这两档在第 2 步（`has_a_military_reading`）就已经出局了。
-    """
-    if target.military_score is None:
-        return False
-    scanned_at = target.military_score_at_utc
-    return scanned_at is not None and now - scanned_at < max_age
-
-
-@dataclass(frozen=True)
-class FreshnessSplit:
-    """一批候选按「有没有读数、读数新不新」分成的三堆。次序一律保持传入的次序。
-
-    ⚠️ **2026-08-18 起这张表只用来记账，不再决定谁出局。** 三堆的去向变了：
-
-    | 堆 | 从前 | 现在 |
-    |---|---|---|
-    | `rated`（有分数且新鲜） | 唯一参与按军力排序的 | 进时间池 |
-    | `expired`（有分数但超期） | **整堆跳过** | **照样进时间池**，只是在日志里被点名 |
-    | `unrated`（完全没有分数） | 按距离补位，照打 | **整堆出局**（用户 2026-08-18 决定） |
-
-    两处都反过来了，两处都是踩出来的：超期整批跳过让 2026-08-17 晚上停摆 2.5 小时；
-    没有分数的按距离补位则让「军力优先」在补位多的夜里退化成「随便打」。
-    """
-
-    #: 有分数、且读数还在有效期内。
-    rated: tuple[ScoredTarget, ...]
-    #: 完全没有分数（从没上过军力榜，或者那一格没解析出来）。**不再参与攻击。**
-    unrated: tuple[ScoredTarget, ...]
-    #: 有分数但已经超期，或者说不清什么时候读的。**照样参与**，只是会被日志点名。
-    expired: tuple[ScoredTarget, ...]
-
-
-def split_by_freshness(
-    targets: Iterable[ScoredTarget], *, now: datetime, max_age: timedelta
-) -> FreshnessSplit:
-    """把候选分三堆。**只分堆、只为了记账**，选靶不看它。
-
-    ⚠️ **别把它接回选靶去。** 它曾经是选靶闸门（`expired` 整堆跳过），而这一版
-    刻意把那件事交给了时间池：时间池永远拿得出最新的 N 个，超期与否只影响
-    「日志里怎么说」。接回去等于把 2026-08-17 那晚的停摆重新装上。
-    """
-    rated: list[ScoredTarget] = []
-    unrated: list[ScoredTarget] = []
-    expired: list[ScoredTarget] = []
-    for target in targets:
-        if target.military_score is None:
-            unrated.append(target)
-        elif score_is_fresh(target, now=now, max_age=max_age):
-            rated.append(target)
-        else:
-            expired.append(target)
-    return FreshnessSplit(tuple(rated), tuple(unrated), tuple(expired))
 
 
 def strongest_then_nearest(
     targets: Iterable[ScoredTarget],
     origin: Coordinate,
     *,
-    time_pool: int = DEFAULT_TIME_POOL,
+    now: datetime,
+    max_age: timedelta = DEFAULT_SCORE_MAX_AGE,
     take: int = TOP_BY_MILITARY,
     max_score: float | None = None,
 ) -> tuple[Coordinate, ...]:
-    """第 2--5 步的单出发点版本：`recent_then_strongest` 之后按离 `origin` 由近到远排。
+    """第 2--5 步的单出发点版本：`choose_by_military` 之后按离 `origin` 由近到远排。
 
     多出发点那条路走 `domain.military_attack.assign_by_capacity_and_distance`——
     前四步一模一样，只有第 5 步换成按航线预算分配。**前四步只能有这一份实现**，
     各写一遍的结果是「命令行按新口径算、页面按旧口径显示」，而那种不一致
     2026-08-15 已经撞过一次。
+
+    `now` **没有默认值**，而 `max_age` 有：前者是一个事实，编一个出来（比如
+    `datetime.now()`）会让调用方在测试里量不准、在实机里和调度器的时钟分家；
+    后者是一条策略，代码里本来就有一个说得出理由的默认值。
     """
-    pool = recent_then_strongest(targets, time_pool=time_pool, take=take, max_score=max_score)
-    return tuple(
-        target.coordinate
-        for target in sorted(pool, key=lambda item: distance_key(item.coordinate, origin))
-    )
+    chosen = choose_by_military(targets, now=now, max_age=max_age, take=take, max_score=max_score)
+    nearest_first = sorted(chosen.selected, key=lambda item: distance_key(item.coordinate, origin))
+    return tuple(target.coordinate for target in nearest_first)
 
 
 __all__ = [
     "DEFAULT_SCORE_MAX_AGE",
-    "DEFAULT_TIME_POOL",
     "TOP_BY_MILITARY",
-    "FreshnessSplit",
+    "MilitaryChoice",
     "ScoredTarget",
+    "choose_by_military",
     "has_a_military_reading",
-    "newest_readings_first",
-    "recent_then_strongest",
     "score_is_fresh",
-    "split_by_freshness",
     "strongest_first",
     "strongest_then_nearest",
     "strongest_within",
     "with_a_military_reading",
+    "within_score_window",
 ]

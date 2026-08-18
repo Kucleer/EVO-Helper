@@ -1819,16 +1819,23 @@ def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool(  # type: ignore[no-u
     assert not any(part.startswith("2:141:6") for part in command)
 
 
-# -- 时间池、军力截断、以及降级成提示的有效期 ---------------------------------
+# -- 有效期窗口、军力截断、以及「放宽窗口」那一档 -----------------------------
 #
 # 用户口径（2026-08-18）敲定的五步：① 剔除 24h 内打过的 → ② 只留有军力读数的
-# → ③ 按读数时间倒序取时间池 → ④ 池内按军力截断 → ⑤ 按距离由近到远出击。
+# → ③ 只留读数在有效期窗口内的（不够就放弃窗口并告警）→ ④ 按军力截断
+# → ⑤ 按距离由近到远出击。
 #
-# ⚠️ **这一节整段重写过。** 它从前钉的是「分数过期的目标本轮跳过」（2026-08-17
-# 那一版的硬判据）。那一版的失败方式是：一个新鲜分数都没有时，候选池退化成
-# 「按距离补位、军力完全不参与」——实机 2026-08-17 晚上连续 2.5 小时如此，而页面
-# 上只是一句不痛不痒的状态。时间池换掉了那道闸门：最新的 N 个总是存在，哪怕全部
-# 超期，军力截断照样成立。有效期于是从**过滤器**降级成**提示信号**。
+# ⚠️ **这一节 2026-08-18 整段重写过两次。**
+#
+# 第一次（2026-08-17 那一版 → PR #176）：那时第 3 步是硬判据「分数过期的整批跳过」，
+# 失败方式是「一个新鲜分数都没有时军力完全不参与选靶」——实机连续停摆 2.5 小时。
+#
+# 第二次（PR #176 → 现在，就是这一版）：#176 把第 3 步换成了「按读数时间取前 N 个」
+# ＝时间池。**那一步也是错的，而且错得更隐蔽**：军力榜从强到弱扫，「读数最新」
+# 系统性地等价于「军力最弱」，于是「军力优先」选出的是全库最弱的一批（实机
+# 2026-08-18 09:00 那 8 发只有 3.2K~5.7K；生产实测分段表在 `domain.target_order`
+# 模块头第 3 步）。现在第 3 步换成按有效期**划线**——划线不带选择偏差——
+# 窗口内不够军力截断要的个数时**放弃窗口并打 WARNING**，那道停摆因此也回不来。
 
 BOT_BY_MILITARY_2H = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
 
@@ -1845,20 +1852,20 @@ def _targets_of(command: list[str]) -> list[str]:
 def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory, run_id
 ) -> None:
-    """⚠️ **第 1 步必须在最前，而这一条钉的正是「在最前」这件事本身。**
+    """⚠️ **用例 (f)：第 1 步必须在最前，而这一条钉的正是「在最前」这件事本身。**
 
-    24 小时内打过的那个**同时是军力最高的、也是读数最新的**，而时间池和军力截断
-    都只留 1 个。于是把剔除往后挪**一步都不行**：
-
-    - 挪到时间池之后：时间池先装进那个打过的，剔除再把它拿掉 → 空池；
-    - 挪到军力截断之后：截断先选出那个打过的，剔除再把它拿掉 → 空手。
-
-    两种挪法下 `8000` 那个从头到尾都没机会，而它本该是这一轮唯一该打的。
+    24 小时内打过的那个**同时是军力最高的、也是读数最新的**，而军力截断只留 1 个。
+    于是把剔除挪到截断之后就会：截断先选出那个打过的，剔除再把它拿掉 → 空手，
+    而 `8000` 那个从头到尾都没机会——它本该是这一轮唯一该打的。
 
     `test_military_pool_skips_targets_attacked_within_the_last_24_hours` 守不住
-    这一点：那条的池子装得下两个，先剔后截和先截后剔的结果一样。
+    这一点：那条的截断放得下两个，先剔后截和先截后剔的结果一样。
+
+    ⚠️ **这条用例 2026-08-18 改过：删掉了那句 `military_time_pool=1`。** 那个旋钮
+    随「时间池」这个错误设计一起删了（理由在 `domain.target_order` 模块头第 3 步）。
+    它当时是用来堵「把剔除挪到时间池之后」那条挪法的；那一步已经不存在，判据
+    因此少了一种挪法要堵，其余一个字没改。
     """
-    scheduler._repository.replace_military_attack_tiers("[]", military_time_pool=1)  # noqa: SLF001
     already_attacked = Coordinate(2, 140, 5)
     still_available = Coordinate(2, 141, 6)
     add_bot_target(session_factory, already_attacked, military_score=9_000.0, scanned_at=NOW)
@@ -1919,11 +1926,15 @@ def test_a_pool_where_everything_expired_still_attacks_by_military(  # type: ign
     量到了：当晚一个新鲜分数都没有，闸门于是把**全部**目标滤掉，攻击停摆 2.5 小时；
     而更早那次（`4:293:6` 顶着 3.6 小时前的读数被打出去）真正的害处只是「排序不准」，
     不是「打不动」——用户口径 2026-08-17：bot 最高战力只有 70 多 K，离打不动还很远。
-    所以新规格不再挡它们，只在日志里说一句「这批分数已经超期多久」。
+    所以新规格不让它们把整轮拖死。
 
-    这里三个目标的分数全都超期（3 天 ≫ 配的 2 小时）。旧规格下一发都派不出去；
-    新规格下时间池照样拿得出这三个，军力截断（`top_n=2`）在池内正常生效，
-    `100` 那个落选。
+    ⚠️ **机制 2026-08-18 又换了一次，判据没换。** PR #176 靠「时间池永远拿得出
+    最新的 N 个」保证这一点，而那个池带选择偏差（见本节开头）。现在靠的是
+    **窗口内不足就放弃窗口**：全都超期时窗口是空的，于是在全部有读数的目标里按
+    军力截断——同样不空手，而且拿到的是最强的那批，不是最弱的。
+
+    这里三个目标的分数全都超期（3 天 ≫ 配的 2 小时）。2026-08-17 那一版下一发都
+    派不出去；现在放弃窗口，军力截断（`top_n=2`）正常生效，`100` 那个落选。
     """
     three_days = NOW - timedelta(days=3)
     for coordinate, score in (
@@ -1943,51 +1954,22 @@ def test_a_pool_where_everything_expired_still_attacks_by_military(  # type: ign
     assert _targets_of(launcher.latest.command) == ["2:140:6=BBB"]
 
 
-def test_the_time_pool_takes_the_newest_readings_not_the_strongest(  # type: ignore[no-untyped-def]
+def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """⚠️ **第 3 步按读数时间取，不是按军力取。**
+    """⚠️ **用例 (a)：窗口内够用时，窗口外的再强也不进。**
 
-    换成军力当排序键的话，时间池就变成第二道军力截断，「用多新的数据」这件事
-    再没人管——而最新的那批读数恰恰是军力最低的那些（榜单按军力降序扫，
-    先读到的读数最旧）。
+    ⚠️ **这条用例取代了 `test_the_time_pool_takes_the_newest_readings_not_the_strongest`
+    与 `test_the_military_cut_only_looks_inside_the_time_pool`。** 那两条钉的是
+    「按读数时间取前 N 个」，而那一步整个是错的：军力榜从强到弱扫，「读数最新」
+    系统性地等价于「军力最弱」，所以那一步实际上是一道**反向的军力截断**。
+    它们确实也会挡住 `2:400`，但靠的是错误的理由——留着它们等于把那个错误当成
+    规格钉住，而实机 2026-08-18 已经量到那个规格选出了全库最弱的一批。
 
-    这里军力与读数时间**刻意反着排**：`9000` 读得最旧、`100` 读得最新。
-    时间池只有 2 个，取的该是 `[100, 8000]`；再按军力截断 1 个，出来的是 `8000`。
-    按军力排时间池的话，池子会是 `[9000, 8000]`，出来的是 `9000`。
+    这里 `2:400` 军力最高（99999），读数却是三天前的；窗口内还剩 2 个，够军力
+    截断（1 个）用，所以窗口不必放弃，它进不来。这组夹具只留一条空航线，
+    所以命令行里那一个就是「第一个被派出去的」。
     """
-    scheduler._repository.replace_military_attack_tiers("[]", military_time_pool=2)  # noqa: SLF001
-    add_bot_target(
-        session_factory,
-        Coordinate(2, 400, 5),
-        military_score=9_000.0,
-        scanned_at=NOW - timedelta(hours=5),
-    )
-    add_bot_target(
-        session_factory,
-        Coordinate(2, 401, 6),
-        military_score=8_000.0,
-        scanned_at=NOW - timedelta(hours=1),
-    )
-    add_bot_target(session_factory, Coordinate(2, 402, 7), military_score=100.0, scanned_at=NOW)
-    enable(repository, MissionKind.BOT, params_json='{"by_military": true, "top_n": 1}')
-    only_gap_filler(repository)
-    scheduler.start()
-    scheduler.tick()
-
-    assert _targets_of(launcher.latest.command) == ["2:401:6=BBB"]
-
-
-def test_the_military_cut_only_looks_inside_the_time_pool(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, session_factory
-) -> None:
-    """⚠️ **第 4 步只在时间池里挑，不许回头去看池外的目标。**
-
-    这里 `2:400` 的军力最高（99999），但读数是三天前的，掉出了只有 2 个的时间池。
-    两步倒过来接（先按军力截断、再按读数时间取）的话，它会顶着一份三天前的读数
-    被选出来——而「用多新的数据」要挡的正是这个。
-    """
-    scheduler._repository.replace_military_attack_tiers("[]", military_time_pool=2)  # noqa: SLF001
     add_bot_target(
         session_factory,
         Coordinate(2, 400, 5),
@@ -2008,7 +1990,149 @@ def test_the_military_cut_only_looks_inside_the_time_pool(  # type: ignore[no-un
 
     command = launcher.latest.command
     assert _targets_of(command) == ["2:401:6=BBB"]
-    assert not any(part.startswith("2:400:5") for part in command), "读数掉出时间池的不许被选中"
+    assert not any(part.startswith("2:400:5") for part in command), "窗口外的目标不许被选中"
+
+
+def test_a_short_window_gives_up_the_window_and_says_so_out_loud(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, recorded: RecordingLog
+) -> None:
+    """⚠️ **用例 (b)：窗口内不够时放弃窗口，按军力截断，并且打 WARNING。**
+
+    用户 2026-08-18 的原话：「今晚这件事的真正问题不是『用了旧数据』，而是
+    **用了旧数据却没人告诉你**——你是从攻击日志里一条一条对出来的」。所以这条
+    用例的两半缺一不可：**选对了目标**，而且**说出来了**。
+
+    ⚠️ **级别必须是 WARNING。** 每一轮都会写一条 INFO 的流水线日志；放宽这件事
+    淹在那堆 INFO 里等于没说。降成 INFO 这条用例就会红。
+
+    窗口 2 小时、截断要 2 个，而窗口内只有 1 个（`2:402`）→ 放弃窗口 →
+    在全部 3 个有读数的目标里按军力取前 2 = `[99999, 8000]`，也就是 `2:400`
+    和 `2:401`。这组夹具只留一条空航线，池内按距离排，`2:401` 更近。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 400, 5),
+        military_score=99_999.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 401, 6),
+        military_score=8_000.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    add_bot_target(session_factory, Coordinate(2, 402, 7), military_score=100.0, scanned_at=NOW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert _targets_of(launcher.latest.command) == ["2:401:6=BBB"]
+    widened = [item for item in recorded.warnings() if "放宽窗口" in item[1]]
+    assert len(widened) == 1, "放宽了窗口却没打 WARNING，就是「用了旧数据却没人告诉你」"
+    _, message, payload = widened[0]
+    # 四个数一个都不能少：少了任何一个，看见告警的人还得回库里查才知道该怎么办。
+    assert payload["score_max_age_hours"] == 2.0
+    assert payload["in_window"] == 1
+    assert payload["take"] == 2
+    assert payload["oldest_selected_at_utc"] == (NOW - timedelta(days=3)).isoformat()
+    assert "2.0 小时" in message
+    assert "只有 1 个" in message
+
+
+def test_a_short_window_is_not_topped_up_with_the_next_newest(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """⚠️ **用例 (d)：不足时是「放弃窗口」，不是「按时间往下补」。**
+
+    往下补捞到的正是**刚出窗口**那一批，而按生产实测那一批恰恰是最弱的
+    ——补下去等于把 PR #176 的缺陷换个地方原样复发。
+
+    这里「更新的」和「更强的」刻意分开站，而且**让更强的那个同时也最近**，
+    好让「一条空航线只派得出一发」这件事不至于把判据搅浑：
+
+    | 目标 | 读数 | 军力 | 离出发星 |
+    |---|---|---|---|
+    | `2:402` | 刚读到（窗口内） | 100 | 234 |
+    | `2:400` | 3 小时前（刚出窗口） | 200 | 236 |
+    | `2:140` | 3 天前 | 99999 | **3** |
+
+    窗口内只有 `2:402` 一个，不够截断要的 2 个 → 放弃窗口 → 按军力取
+    `[99999, 200]` → 池内按距离排，派 `2:140`。
+
+    **按时间往下补的话池子是 `[2:402, 2:400]`**，派出去的会是 `2:402`，
+    而 `2:140` 一次都轮不到——这条用例因此会红。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 140, 5),
+        military_score=99_999.0,
+        scanned_at=NOW - timedelta(days=3),
+    )
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 400, 6),
+        military_score=200.0,
+        scanned_at=NOW - timedelta(hours=3),
+    )
+    add_bot_target(session_factory, Coordinate(2, 402, 7), military_score=100.0, scanned_at=NOW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert _targets_of(command) == ["2:140:5=BBB"], "放宽之后该按军力挑，不是按时间"
+    assert not any(part.startswith("2:402:7") for part in command), (
+        "窗口内那个最弱的不该因为「它在窗口内」就保送"
+    )
+
+
+def test_a_widened_window_shows_up_on_the_page_too(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """⚠️ **用例 (c)：放宽这件事在页面事实里也要说得出来，不能只写进日志。**
+
+    任务页是用户每天真的会看的那一页，日志是出事之后才去翻的。只报日志的话，
+    2026-08-18 那件事会原样重演一遍：助手用着 24 小时前的读数在打，而页面上
+    写着「待命」。
+
+    文案与次序由 `tests/unit/domain/test_scheduler_status.py` 那一组守，
+    这里只钉事实本身——两边合起来才是完整的。
+    """
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 400, 5),
+        military_score=9_000.0,
+        scanned_at=NOW - timedelta(days=1),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    bot = task_id(repository, MissionKind.BOT)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert scheduler.snapshot().facts.per_task[bot].scores_window_widened
+
+
+def test_a_round_inside_the_window_says_nothing_about_widening(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory, recorded: RecordingLog
+) -> None:
+    """反向那一半：正常走窗口时**一个字都不许说**。
+
+    少了这条，一个「恒报放宽」的实现会全绿——而每轮都响的告警、每行都标着警告
+    的页面，和不响、不标的一样没用。
+    """
+    add_bot_target(session_factory, Coordinate(2, 400, 5), military_score=9_000.0, scanned_at=NOW)
+    add_bot_target(session_factory, Coordinate(2, 401, 6), military_score=8_000.0, scanned_at=NOW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY_2H)
+    bot = task_id(repository, MissionKind.BOT)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert not scheduler.snapshot().facts.per_task[bot].scores_window_widened
+    assert [item for item in recorded.warnings() if "放宽窗口" in item[1]] == []
 
 
 def test_the_dispatch_order_is_still_nearest_first(  # type: ignore[no-untyped-def]
@@ -2339,14 +2463,20 @@ def test_an_empty_pool_is_never_reported_as_a_starved_one(  # type: ignore[no-un
 def test_a_pool_of_only_stale_scores_is_never_reported_as_starved(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory, clock, recorded: RecordingLog
 ) -> None:
-    """⚠️ **「分数全都超期」是个正常的夜晚，不是故障。**
+    """⚠️ **「分数全都超期」不是「军力数据未采集」——这两句话要说的事完全不同。**
 
     ⚠️ **这条用例是 `test_a_pool_of_only_unrated_targets_is_never_reported_as_starved`
     的翻转。** 那一条说的是「全库都没有分数」照样能打（走补位池），所以不该报警；
     2026-08-18 之后没有分数的一个都不打，那一档**恰恰就是**该报警的那一档
     （钉在 `test_a_pool_starved_for_long_enough_writes_a_warning`）。
-    换过来的是「分数全都超期」：那一档现在照样能打（时间池不看新鲜度），
-    报了的话就是一条假警报，而假警报响几次之后就没人看了。
+    换过来的是「分数全都超期」：那一档现在照样能打（放弃窗口），报「筛不出能打的
+    目标」就是一条假警报，而假警报响几次之后就没人看了。
+
+    ⚠️ **断言 2026-08-18 二次改造时改窄了一点：从「一条 WARNING 都没有」改成
+    「没有『筛不出能打的目标』那一条」。** 这一版超期确实会触发另一条 WARNING
+    ——「放宽窗口」——而那条正是这次改动要的，它响是对的。留着原来那个大而全的
+    断言，就等于让这条用例反过来禁止本次改动最要紧的那一半。放宽那条自己的护栏
+    在 `test_a_short_window_gives_up_the_window_and_says_so_out_loud`。
     """
     add_bot_target(
         session_factory,
@@ -2362,5 +2492,5 @@ def test_a_pool_of_only_stale_scores_is_never_reported_as_starved(  # type: igno
     for _ in range(5):
         scheduler.tick()
 
-    assert recorded.warnings() == []
+    assert [item for item in recorded.warnings() if "筛不出能打的目标" in item[1]] == []
     assert launcher.kinds == [MissionKind.BOT], "分数超期不妨碍它去打"

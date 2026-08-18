@@ -677,31 +677,37 @@
       const settings = document.createElement('div');
       settings.className = 'military-settings';
       // ⚠️ 这一格是**军力截断**，不是「候选数量」：后面按距离重排，所以军力只在
-      // 这一刀生效一次。填成 ≥ 时间池里的目标数就完全失效——2026-08-18 之前它被
+      // 这一刀生效一次。填成 ≥ 窗口内的目标数就完全失效——2026-08-18 之前它被
       // 填成 500 而可用候选只有 591，等于军力压根没参与选靶。
-      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力截断（取前几名）', title: '在「军力时间池」里按军力取前几名。调小=只打最强的，代价是可选距离变差；调大=军力优先被稀释，填成 ≥ 池内目标数就完全失效' });
+      //
+      // ⚠️ 它同时是「窗口够不够用」的那把尺子：窗口内不足这么多个时，助手会
+      // 放弃窗口、在全部有读数的目标里截断，并在页面上标「军力读数已放宽窗口」。
+      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力截断（取前几名）', title: '在有效期窗口内按军力取前几名。调小=只打最强的，代价是可选距离变差；调大=军力优先被稀释，而且更容易触发「放宽窗口」' });
       // ⚠️ 这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
       // 最高战力只有 70 多 K，离打不动还很远），留着是为了哪天 bot 变强。
       // 别以为页面上填了它就在挡什么。
       const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限', title: '实测 bot 最高战力约 70K，这个上限目前挡不掉任何目标；留着备用' });
-      // ⚠️ 这一格的语义换过两次，文案必须跟着走：
+      // ⚠️ 这一格的语义换过三次，文案必须跟着走：
       // ① 最早叫「榜单超过 N 小时提示重扫」，真的只是提示；
       // ② 2026-08-17 改成硬判据（超期的整批跳过）——那一版更糟，「一个新鲜分数都
       //    没有」的夜里军力完全不参与选靶，实机连续停摆 2.5 小时；
-      // ③ 2026-08-18 起选靶交给「军力时间池」（攻击配置页），这一格**不挡任何目标**，
-      //    只用来说「选中的这批分数已经超期多久」。
-      // 同一个数字在页面上和判据里说两件事，正是前两次事故共同的形状。
-      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数超期提示（小时）', title: '只是提示：日志和页面据此说「这批分数已超期多久」，不会挡掉任何目标。真正决定「用多新的数据」的是攻击配置页上的「军力时间池」' });
-      settings.append('军力截断 前 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　分数超期提示 '), maxAge, document.createTextNode(' 小时'));
+      // ③ PR #176 又降级成提示，选靶交给「时间池」（按读数时间取前 N）——那一版
+      //    最糟：军力榜从强到弱扫，「读数最新」等价于「军力最弱」，于是「军力优先」
+      //    选出了全库最弱的一批（实机 2026-08-18 09:00 那 8 发只有 3.2K~5.7K）；
+      // ④ 现在它**真的会挡**，但挡不住整轮：窗口内不够军力截断要的那么多个时，
+      //    助手会放弃窗口、并在这一行标出「军力读数已放宽窗口」。
+      // 同一个数字在页面上和判据里说两件事，正是前三次事故共同的形状。
+      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '只打读数落在这段时间之内的目标。窗口内不足「军力截断」要的个数时，助手会放弃窗口、在全部有读数的目标里按军力截断，并在状态里标出「军力读数已放宽窗口」' });
+      settings.append('军力截断 前 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时'));
       params.append(settings);
       // 用户要手动调这两个数，所以最容易搞反的三件事必须看得见：
       // ① 截断是一刀，不是排序（后面按距离重排）；填满了等于没截；
-      // ② 时间池不在这一行上，在攻击配置页；
-      // ③ 有效期已经不挡目标了，调它不会让助手少打或多打。
+      // ② 有效期是**划一条线**，不是「取最新的几个」——后者带选择偏差，正是 #176 的错；
+      // ③ 窗口不够用时会被放弃，而那件事会自己在状态里报出来。
       const advice = document.createElement('div');
       advice.className = 'muted';
       advice.style.fontSize = '11px';
-      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 按读数时间取「军力时间池」（攻击配置页）→ ④ 在池内按军力截断前 N 名 → ⑤ 按距离由近到远出击。军力只在第 ④ 步生效一次，填成 ≥ 池内目标数就完全失效。「分数超期提示」不挡任何目标，只影响日志措辞。';
+      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 在窗口内按军力截断前 N 名 → ⑤ 按距离由近到远出击。军力只在第 ④ 步生效一次，填成 ≥ 窗口内目标数就完全失效。窗口内不足 N 个时会放弃窗口、在全部有读数的目标里截断，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。';
       params.append(advice);
     }
     const summary = document.createElement('div');

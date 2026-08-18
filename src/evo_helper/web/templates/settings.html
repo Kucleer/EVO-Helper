@@ -117,34 +117,6 @@
   </div>
 </section>
 
-<section class="panel" aria-labelledby="pool-head">
-  <h2 id="pool-head">军力时间池</h2>
-  <p class="muted">
-    「军力优先」的选靶分五步：<strong>① 剔除近 24 小时打过的 → ② 只留有军力读数的 → ③ 按读数时间倒序取前 N 个（＝这一格）
-    → ④ 在这 N 个里按军力取前 M 个（＝任务行上的「军力截断」）→ ⑤ 按距离由近到远出击</strong>。<br>
-    这一格管的是<strong>「用多新的军力数据」</strong>，任务行上那一格管的是<strong>「只打多强的」</strong>——两件事，所以分开配。
-    <strong>留空 = {{ military_time_pool_default }} 个</strong>。
-  </p>
-  <p class="muted">
-    <strong>调大</strong>：可选面更宽、更容易凑出近距离目标；代价是<strong>用到更旧的军力数据</strong>，排序可能不准
-    （军力榜按军力降序扫，军力最高的那些读数最旧，池子越大越容易照着一份过时的军力挑）。
-    填成大于等于「有军力读数的候选数」时这一步就完全不截了。<br>
-    <strong>调小</strong>：只照最新的读数挑，周一 bot 刷新日尤其该调小；代价是<strong>可选面变窄</strong>，
-    军力截断能挑的距离更差，极端情况下凑不满一轮的航线。
-  </p>
-  <p class="muted">
-    ⚠️ <strong>「军力分数有效期」已经不再挡目标了。</strong>它从前会把超期的目标整批滤掉，
-    结果是「一个新鲜分数都没有」的夜里军力完全不参与选靶（实机 2026-08-17 连续停摆 2.5 小时）。
-    现在它只用来在日志和页面上说一句「选中的这批分数已经超期多久」——<strong>调它不会让助手少打或多打</strong>。
-    真正决定「用多新的数据」的是这一格。
-  </p>
-  <div class="filter-bar" style="margin-top:10px">
-    <input id="military-time-pool" type="number" min="1" step="1"
-           placeholder="留空 = {{ military_time_pool_default }}" aria-label="军力时间池">
-    <button class="btn primary small" type="button" id="btn-save-pool">保存军力时间池</button>
-  </div>
-</section>
-
 <section class="panel" aria-labelledby="scan-head">
   <h2 id="scan-head">对账翻信箱时长</h2>
   <p class="muted">
@@ -201,10 +173,6 @@
     { element: document.getElementById('line-hold'), key: 'unknown_line_hold_minutes', label: '航线占用时长' },
     { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
     { element: document.getElementById('bot-revisit'), key: 'bot_revisit_hours', label: 'bot 重复攻击间隔' },
-    // 军力时间池也并进来：它同样是「留空 = 默认值、只判整数、范围交给后端」那一套。
-    // 它自己有一节面板（保存按钮是 `btn-save-pool`），但攻击配置是**整份替换**，
-    // 所有按钮送的都是同一份 payload。
-    { element: document.getElementById('military-time-pool'), key: 'military_time_pool', label: '军力时间池' },
     { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
     { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '自动停用/恢复日志窗口' },
   ];
@@ -319,7 +287,6 @@
   document.getElementById('btn-save-blind').onclick = saveConfig;
   document.getElementById('btn-save-scan').onclick = saveConfig;
   document.getElementById('btn-save-knobs').onclick = saveConfig;
-  document.getElementById('btn-save-pool').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {
     try {
       const input = document.getElementById('new-planet-coordinate');

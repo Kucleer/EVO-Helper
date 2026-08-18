@@ -1368,7 +1368,6 @@ class MissionConsoleService:
         unknown_line_hold_minutes: object = None,
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
-        military_time_pool: object = None,
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
     ) -> MilitaryAttackConfigView:
@@ -1391,7 +1390,6 @@ class MissionConsoleService:
                 reconcile_cooldown_minutes
             )
             revisit = self._scheduler.validate_bot_revisit_hours(bot_revisit_hours)
-            time_pool = self._scheduler.validate_military_time_pool(military_time_pool)
             account_lines = self._scheduler.validate_account_line_limit(account_line_limit)
             toggle_window = self._scheduler.validate_auto_toggle_log_seconds(
                 auto_toggle_log_seconds
@@ -1405,7 +1403,6 @@ class MissionConsoleService:
             unknown_line_hold_minutes=hold,
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
-            military_time_pool=time_pool,
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
         )
@@ -2293,7 +2290,6 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
         "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,
-        "military_time_pool": row.military_time_pool,
         "account_line_limit": row.account_line_limit,
         "auto_toggle_log_seconds": row.auto_toggle_log_seconds,
     }
