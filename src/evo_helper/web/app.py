@@ -43,7 +43,6 @@ from evo_helper.domain.report_wait import (
     UNKNOWN_LINE_HOLD,
 )
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
-from evo_helper.domain.scheduler import DEFAULT_ACCOUNT_LINE_LIMIT
 from evo_helper.domain.target_order import DEFAULT_TIME_POOL
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -660,7 +659,6 @@ def create_app(
                 "bot_revisit_default": int(DEFAULT_BOT_REVISIT.total_seconds() // 3600),
                 "bot_revisit_max": BOT_REVISIT_MAX_HOURS,
                 "military_time_pool_default": DEFAULT_TIME_POOL,
-                "account_line_limit_default": DEFAULT_ACCOUNT_LINE_LIMIT,
                 "account_line_limit_max": ACCOUNT_LINE_LIMIT_MAX,
                 "auto_toggle_log_default": int(AUTO_TOGGLE_LOG_WINDOW.total_seconds()),
                 "auto_toggle_log_max": AUTO_TOGGLE_LOG_MAX_SECONDS,

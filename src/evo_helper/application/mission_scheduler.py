@@ -87,7 +87,6 @@ from evo_helper.domain.report_wait import (
     WaitAction,
 )
 from evo_helper.domain.scheduler import (
-    DEFAULT_ACCOUNT_LINE_LIMIT,
     Action,
     Decision,
     DisabledRecovery,
@@ -882,11 +881,11 @@ class MissionScheduler:
         """校验攻击配置页上那个「自动停用/恢复日志的限流窗口」。留空返回 `None`。"""
         return _auto_toggle_log_seconds(value)
 
-    def account_line_limit(self) -> int:
-        """全账号此刻认的航线上限。页面要显示「已配 X 条 / 上限 Y 条」时读它。
+    def account_line_limit(self) -> int | None:
+        """全账号此刻认的航线上限，**没配就是 `None`**。页面显示那句提示时读它。
 
         公开出来是为了让页面上那句提示和调度判据量**同一把尺子**：页面另读一次
-        默认值的话，用户在攻击配置页把上限改成 6 之后，任务页仍然写着 9，
+        的话，用户在攻击配置页把上限改成 6 之后，任务页可能还写着别的数，
         而那句提示存在的全部意义就是让他一眼看出配超了没有。
         """
         return self._account_line_limit()
@@ -969,26 +968,30 @@ class MissionScheduler:
         )
         return window
 
-    def _account_line_limit(self) -> int:
-        """全账号同时能在飞的舰队上限。**留空 = `DEFAULT_ACCOUNT_LINE_LIMIT`（9）。**
+    def _account_line_limit(self) -> int | None:
+        """全账号同时能在飞的舰队上限。**留空 = 不施加这道闸，而不是某个默认值。**
 
-        用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具
-        情况下最高是到 9 条」——常态 6、开道具 9，取值取决于用户当下的处境，
-        所以它是旋钮不是常量。
+        用户口径（2026-08-18）：「账号的默认权限不应在代码中进行配置，直接用航线
+        限制就可以了，因为实际通过科技升级，使用道具，人为占用，都会影响到留给你的
+        航线数量」。整段理由写在 `domain.scheduler.account_free_lines` 上，这里只重复
+        最要紧的那一条：**别顺手补一个代码默认值**——真实可用航线是浮动的，
+        写死 9 是错的，写死 6 也是错的。
 
-        ⚠️ **不是 `scheduler_config.fleet_line_limit`。** 那一列的含义早已降级成
-        「任务没填航线数时用几条」，两者语义不同，复用会让改任务默认值顺带把
-        账号上限也改掉。
+        ⚠️ **也不是 `scheduler_config.fleet_line_limit`。** 那一列的含义早已降级成
+        「任务没填航线数时用几条」，复用会造出第二份真相。
         """
         limit = self._knob("account_line_limit")
         if limit is None:
-            return DEFAULT_ACCOUNT_LINE_LIMIT
+            return None
         record_knob_override(
             "account_line_limit",
             source=__name__,
+            # `default=None` 是照实说：这个旋钮**没有**代码默认值。所以「用户填了
+            # 一个数」本身就是要留痕的那件事——排障的人得知道助手这一夜是按几条
+            # 在算的，而代码里翻不出这个数。
             effective=limit,
-            default=DEFAULT_ACCOUNT_LINE_LIMIT,
-            detail="全账号同时在飞的舰队上限，与每颗星球各自的航线预算同时生效",
+            default=None,
+            detail="全账号同时在飞的舰队上限；留空则不施加账号那道闸，只按每颗星球的预算算",
         )
         return limit
 
@@ -1007,14 +1010,23 @@ class MissionScheduler:
         )
         return window
 
-    def _account_free_lines(self, now: datetime, *, hold: timedelta, reserved_lines: int) -> int:
-        """全账号这一刻还剩几条航线。**账号那道闸的唯一算处。**
+    def _account_free_lines(
+        self, now: datetime, *, hold: timedelta, reserved_lines: int
+    ) -> int | None:
+        """全账号这一刻还剩几条航线。**账号那道闸的唯一算处。** `None` = 这道闸不生效。
 
         散成两份的话，`has_work` 与 `_launch` 会因为一个多减了 `reserved_lines`、
         另一个没减而慢慢走散——那正是 `_free_lines_from` 的文档一直在说的那件事。
+
+        **没配上限时连查都不查。** `count_inflight_total` 是一次全表 count，而
+        tick 每秒一次；上限留空时那个数不参与任何判据，查了只是白付一次查询。
+        这也让「没配这个旋钮」的库的查询次数与加这道闸之前**完全一致**。
         """
+        limit = self._account_line_limit()
+        if limit is None:
+            return None
         return account_free_lines(
-            account_limit=self._account_line_limit(),
+            account_limit=limit,
             inflight_total=self._repository.count_inflight_total(now_utc=now, hold=hold),
             reserved_lines=reserved_lines,
         )
@@ -1892,10 +1904,14 @@ class MissionScheduler:
         # 全账号那道闸的余量。**一趟只查一次**：它与出发星球无关，按任务查等于
         # 把同一个数乘上任务数，而 tick 每秒一次。没有任何一条派遣链路参与调度时
         # 连查都不查——这一趟本来就没人会用到它。
+        #
+        # ⚠️ **早退那一支必须是 `None`（「这道闸不生效」）而不是 `0`（「一条不剩」）。**
+        # 写 `0` 的话，一旦以后有人把这个早退条件放宽，所有任务的可用航线会被这个
+        # 假的「账号已满」整个压成 0，而症状是助手一发不派、页面上一切正常。
         account_free = (
             self._account_free_lines(now, hold=hold, reserved_lines=config.reserved_lines)
             if any(_participating(task) and not fills_gaps(task.kind) for task in tasks)
-            else 0
+            else None
         )
         inflight: dict[Coordinate, int] = {}
         next_free: dict[Coordinate, datetime | None] = {}
@@ -2671,7 +2687,7 @@ def _origin_budgets(
     origins: Sequence[AttackOrigin],
     *,
     inflight: Mapping[Coordinate, int],
-    account_free: int,
+    account_free: int | None,
 ) -> tuple[AttackOrigin, ...]:
     """每颗出发星球此刻**真的**能派几发。**两道闸同时生效，取小。**
 
@@ -2680,6 +2696,11 @@ def _origin_budgets(
     用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
     最高是到 9 条」「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线数，
     **两者均需要约束**」。
+
+    `account_free` 为 `None` = 用户没在攻击配置页上填账号上限，那道闸整个不生效，
+    只剩每星预算这一道。**这不是「用某个默认值」**——真实可用航线随科技、道具、
+    人为占用浮动，代码里写死哪个数都是错的，整段理由在
+    `domain.scheduler.account_free_lines` 上。
 
     ⚠️ **返回的仍是 `AttackOrigin`，而且这个预算就是要喂给
     `assign_by_capacity_and_distance` 的那一个**，不是原样的
@@ -2692,11 +2713,16 @@ def _origin_budgets(
     """
     return tuple(
         AttackOrigin(
-            item.coordinate,
-            min(max(0, item.fleet_lines - inflight[item.coordinate]), account_free),
+            item.coordinate, _capped(item.fleet_lines - inflight[item.coordinate], account_free)
         )
         for item in origins
     )
+
+
+def _capped(free: int, account_free: int | None) -> int:
+    """`max(0, free)`，再按账号余量收一次（没配上限就不收）。"""
+    available = max(0, free)
+    return available if account_free is None else min(available, account_free)
 
 
 def _free_lines_from(
@@ -2705,7 +2731,7 @@ def _free_lines_from(
     origins: Sequence[AttackOrigin] | None,
     inflight: Mapping[Coordinate, int],
     reserved_lines: int,
-    account_free: int,
+    account_free: int | None,
 ) -> int:
     """这个任务此刻估算还剩几条空闲航线。
 
@@ -2728,6 +2754,10 @@ def _free_lines_from(
     按星球生效；账号那道闸对它同样有效——总数是**所有星球共享**的，海盗那条链路
     一样占里面的位子。
 
+    `account_free` 为 `None` = 用户没填账号上限，那道闸不生效（不是「用默认值」，
+    见 `domain.scheduler.account_free_lines`），于是行为与只有每星预算那一道时
+    完全一致。
+
     `inflight` 由调用方按出发星球缓存好（同一颗星球一次 tick 只查一次），
     `account_free` 也由调用方算好（一次 tick 只查一次全账号在飞数），
     这一层不查库。
@@ -2735,7 +2765,7 @@ def _free_lines_from(
     if origins is not None:
         budgets = _origin_budgets(origins, inflight=inflight, account_free=account_free)
         return max((item.fleet_lines for item in budgets), default=0)
-    return min(
+    return _capped(
         free_lines_for(
             task, inflight_from_origin=inflight[task.origin], reserved_lines=reserved_lines
         ),
@@ -2992,18 +3022,19 @@ def _military_time_pool(value: object) -> int | None:
 
 
 def _account_line_limit(value: object) -> int | None:
-    """全账号同时能在飞的舰队上限。**留空 = `DEFAULT_ACCOUNT_LINE_LIMIT`（9）。**
+    """全账号同时能在飞的舰队上限。**留空 = 不施加这道闸**（不是「用某个默认值」）。
 
-    用户口径（2026-08-18）：「我的总航线数是所有星球共享的，在启动加成道具情况下
-    最高是到 9 条」。
+    用户口径（2026-08-18）：「账号的默认权限不应在代码中进行配置，直接用航线限制
+    就可以了，因为实际通过科技升级，使用道具，人为占用，都会影响到留给你的航线
+    数量」。整段理由在 `domain.scheduler.account_free_lines` 上。
 
     ## 两条边界
 
     - **至少 1。** 0 等于「一发都不许派」，而那是用复选框表达的意思，不该用一个
-      看起来像容量的数字表达；填了 0 之后整台助手会安静地一夜不动。
-    - **最多 `ACCOUNT_LINE_LIMIT_MAX`**，防手滑。它不是策略上的界：游戏那侧的硬
-      上限本就在 9 附近，但助手不该替游戏写死一个数（版本会变、道具会变），
-      所以这里只挡住明显不可能的取值。
+      看起来像容量的数字表达；填了 0 之后整台助手会安静地一夜不动。要「不限制」
+      就留空。
+    - **最多 `ACCOUNT_LINE_LIMIT_MAX`**，防手滑。它不是策略上的界——助手不该替
+      游戏写死一个数（科技会升、道具会开），只挡住明显不可能的取值。
 
     ⚠️ **超过这个数的「已配航线」不在这里拦。** 用户口径（2026-08-18）：
     「星球的航线是我来配置的，我配置时已经手动确认了不会超过总航线数」——他可能
@@ -3016,7 +3047,7 @@ def _account_line_limit(value: object) -> int | None:
     if limit < 1:
         raise MissionParamError(
             "全账号航线上限至少是 1：填 0 等于一发都不许派，而那要用复选框表达；"
-            "要用默认值就把它留空。"
+            "要「不额外限制账号总数」就把它留空。"
         )
     if limit > ACCOUNT_LINE_LIMIT_MAX:
         raise MissionParamError(f"全账号航线上限最多 {ACCOUNT_LINE_LIMIT_MAX} 条；填错了吧？")

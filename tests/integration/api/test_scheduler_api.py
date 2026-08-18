@@ -1376,6 +1376,29 @@ def test_a_military_row_shows_its_real_origins_not_the_stale_task_level_count(
     assert "全账号已配 8 条 / 上限 9 条" in summary
 
 
+def test_the_row_says_no_account_limit_is_set_rather_than_inventing_one(
+    console: Console,
+) -> None:
+    """⚠️ **没填账号上限时页面不许编一个数出来。**
+
+    用户口径（2026-08-18）：「账号的默认权限不应在代码中进行配置……实际通过科技
+    升级，使用道具，人为占用，都会影响到留给你的航线数量」。所以那一档的实话是
+    「已配 8 条 · 未设账号上限」。
+
+    写成「/ 上限 9 条」的话，用户会照着那个 9 去配他的星球——而那个 9 是程序编的，
+    没有任何人知道它对不对。这条同时守住「留空不是 0」：显示成「上限 0 条」
+    或者「已超出」都会让它转红。
+    """
+    task_id = _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+    console.client.patch(f"/api/missions/{task_id}", json={"enabled": True})
+
+    summary = str(console.task("BOT")["summary"])
+
+    assert "全账号已配 8 条 · 未设账号上限" in summary
+    assert "上限 9" not in summary, "没人说过 9，页面不许自己编一个"
+    assert "已超出" not in summary
+
+
 def test_the_row_says_so_when_the_configured_lines_exceed_the_account_limit(
     console: Console,
 ) -> None:

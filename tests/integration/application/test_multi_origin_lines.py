@@ -230,18 +230,63 @@ def test_reserved_lines_come_off_the_account_total(  # type: ignore[no-untyped-d
     assert free_lines(scheduler, bot) == 1
 
 
-def test_the_account_limit_falls_back_to_the_code_default_when_left_blank(  # type: ignore[no-untyped-def]
+def test_leaving_the_account_limit_blank_applies_no_account_gate_at_all(  # type: ignore[no-untyped-def]
     scheduler, repository, session_factory
 ) -> None:
-    """页面上留空 = 跟着代码里的默认值走，不是「没有上限」。
+    """⚠️ **留空 = 不施加账号那道闸，绝不是「回落到某个写死的数」。**
 
-    星球配了 20 条（比默认上限 9 还多），留空时可用就该被压到 9。
+    用户口径（2026-08-18）：「账号的默认权限不应在代码中进行配置，直接用航线限制
+    就可以了，因为实际通过科技升级，使用道具，人为占用，都会影响到留给你的航线
+    数量」。真实可用航线是浮动的，程序里写死 9 是错的，写死 6 也是错的。
+
+    这里把星球配成 **20 条**——比任何一个「像默认值」的数字（6、9、`fleet_line_limit`
+    的 6）都大。留空时可用必须原样是 20：任何一个回落实现都会把它压到那个数上，
+    这条随即转红。这正是「下一个人顺手补一个默认值」唯一的守卫。
     """
     bot = with_lines(repository, session_factory, (FIRST, 20), account_limit=None)
     target_near(session_factory, FIRST, offset=0, score=9_000.0)
     scheduler.start()
 
-    assert free_lines(scheduler, bot) == 9
+    assert free_lines(scheduler, bot) == 20, "留空不该被任何写死的数压住"
+
+
+def test_a_blank_account_limit_never_holds_a_dispatch_back(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory
+) -> None:
+    """行为版：留空时两颗星加起来配了 12 条，照样派得出去、不被停用。
+
+    只钉 `free_lines` 那个数的话，一个「留空时把账号余量算成 0」的实现会在别处
+    露馅而这里看不出来——那种实现会让整台助手一发不派，而页面上一切正常。
+    """
+    bot = with_lines(repository, session_factory, (FIRST, 6), (SECOND, 6), account_limit=None)
+    target_near(session_factory, FIRST, offset=0, score=9_000.0)
+    target_near(session_factory, SECOND, offset=1, score=8_000.0)
+    scheduler.start()
+    scheduler.tick()
+
+    assert launcher.spawned, "留空 = 不额外限制，这一轮当然派得出去"
+    assert row_of(repository, bot).disabled_reason is None
+
+
+def test_reserved_lines_stay_per_planet_when_the_account_limit_is_blank(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory
+) -> None:
+    """留空时账号那一侧整个不参与，但**每星那一侧的保留航线照旧生效**。
+
+    这一条防的是「把账号闸做成可选」时顺手把 `reserved_lines` 一起绕过去：
+    单出发星球那条路上它一直是按星球扣的（`domain.scheduler.free_lines_for`），
+    那个语义一个字都没变。
+    """
+    set_config(session_factory, fleet_line_limit=6, reserved_lines=2)
+    repository.replace_military_attack_tiers("[]", account_line_limit=None)
+    for row in repository.mission_tasks():
+        repository.update_mission_task(row.id, enabled=row.kind == MissionKind.PIRATE.value)
+        if row.kind == MissionKind.PIRATE.value:
+            repository.update_mission_task(row.id, params_json='{"radius": 3}', fleet_lines=6)
+    pirate = task_id(repository, MissionKind.PIRATE)
+    scheduler.start()
+
+    assert free_lines(scheduler, pirate) == 4, "6 条配额减 2 条保留 = 4"
 
 
 # -- (b) 轮换 ------------------------------------------------------------------
