@@ -128,6 +128,24 @@ class BotTargetRow(Base):
     )
     #: 榜单名次。只为事后能拿「降序」这条免费校验和复核军力值（见 domain.records）。
     military_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: **最近一次撞上「没有可执行的任务」那个弹窗的时刻**（保护期的唯一证据）。
+    #:
+    #: 游戏的保护期是 **8 小时**，任何人打过都会触发——所以它**推不出来、只能撞上
+    #: 了才知道**（`game.pirate_ui.DIALOG_NO_MISSION` 上写着）。在这一列出现之前，
+    #: 「撞上了」这件事只存在于 `system_log` 的纯文本里，选靶查不到：实机 2026-08-18
+    #: 20:29 那一轮当场确认四个目标全在保护期、11.5 分钟一发没派，一秒之后的下一轮
+    #: 又把同样的四个挑了出来，如此往复直到 8 小时自然过去。每个目标每轮约 2.9 分钟
+    #: 鼠标时间，而鼠标时间是这台机器真正的瓶颈（一天只有 56% 在干活）。
+    #:
+    #: ⚠️ **这一列记的是「什么时候撞上的」，不是「保护期什么时候结束」。** 两者差着
+    #: 一个未知量：保护可能在撞上之前的任意时刻就开始了。排除到什么时候是**策略**，
+    #: 由 `military_attack_config.protection_exclusion_hours` 那个旋钮回答，
+    #: 判据在 `application.mission_scheduler._military_candidates`。把结束时刻直接
+    #: 存进来等于把那个策略腌进历史数据里，日后调旋钮，旧行不跟。
+    #:
+    #: ⚠️ **可空且没有 `server_default`。** NULL 的含义是「从没撞上过（或者这一行
+    #: 早于这个功能）」，而不是某个具体时刻。
+    protection_seen_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
 
 class AttackIntentRow(Base):
@@ -787,6 +805,28 @@ class MilitaryAttackConfigRow(Base):
     #: 海盗每日 32 发，那个在 `scheduler_config.pirate_daily_quota`）。活动期间
     #: 想多榨几轮就调小，已知 bot 多、想摊得更开就调大。
     bot_revisit_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
+    #: 撞上保护期之后，这个坐标多久之内不再进候选池（小时）。**空 = 8 小时。**
+    #:
+    #: ⚠️ **8 这个数有两个完全不同的身份，别把它们混成一个。**
+    #:
+    #: - 「保护期是 8 小时」是**游戏规则**，是事实，不可配
+    #:   （`game.pirate_ui.DIALOG_NO_MISSION`）。
+    #: - 「撞上之后排除 8 小时」是**策略**，就是这一列。
+    #:
+    #: 之所以是策略：`bot_targets.protection_seen_at_utc` 记的是「在时刻 T 撞上
+    #: 了」，而保护期**什么时候开始的谁也不知道**。按 T+8h 排除必然过度——若保护在
+    #: T 前 7 小时就开始了，其实 1 小时后就能打，却排了 8 小时。**代价不对称，所以
+    #: 宁可过度排除**：过度排除只是少打几个目标，而候选池有 3000+ 个；排除不足则是
+    #: 每个目标每轮白烧约 2.9 分钟鼠标时间，而鼠标时间才是真正的瓶颈。
+    #:
+    #: 旋钮而非标定常量：调小更激进（保护可能早就过了，早点重试能多打几个），
+    #: 调大更保守（宁可漏掉也不白跑），取值取决于用户此刻缺的是目标还是鼠标时间，
+    #: 没有唯一正确答案。上下界与理由在
+    #: `application.mission_scheduler._protection_exclusion_hours`。
+    protection_exclusion_hours: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
 
     # ⚠️ **这里曾经有一个 `military_time_pool`（「军力时间池」），2026-08-18 删掉了。**
     # 迁移 `b1d9e47f2a03`。它的存在本身就是一个错误设计的产物：那一版选靶第 3 步是

@@ -417,6 +417,9 @@ class MilitaryAttackConfigView:
     unknown_line_hold_minutes: int | None = None
     reconcile_cooldown_minutes: int | None = None
     bot_revisit_hours: int | None = None
+    #: 撞上保护期之后排除多久；`None` = 留空 = 默认 8 小时（游戏保护期同为 8 小时，
+    #: 但那是规则、这是策略，见 `mission_scheduler.DEFAULT_PROTECTION_EXCLUSION`）。
+    protection_exclusion_hours: int | None = None
     # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 删掉了（理由在
     # `domain.target_order` 模块头第 3 步）。「用多新的数据」改由任务参数
     # `score_max_age_hours` 划线回答。

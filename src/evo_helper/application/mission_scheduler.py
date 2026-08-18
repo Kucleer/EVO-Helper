@@ -107,7 +107,9 @@ from evo_helper.domain.scheduler import (
     within_schedule_window,
 )
 from evo_helper.domain.target_order import (
+    DEFAULT_PROTECTION_EXCLUSION,
     DEFAULT_SCORE_MAX_AGE,
+    PROTECTION_EXCLUSION_MAX_HOURS,
     TOP_BY_MILITARY,
     MilitaryChoice,
     ScoredTarget,
@@ -320,7 +322,8 @@ class MilitaryPoolReading:
     症状是**一发都不派而且不报错**。
     """
 
-    #: 第 1 步之后：排除近 24 小时打过的与本轮走完的，剩下的全部候选。
+    #: 第 1 步之后：排除本轮走完的、重复攻击间隔内打过的、以及刚撞上过保护期的，
+    #: 剩下的全部候选。
     candidates: tuple[ScoredTarget, ...]
     #: 第 2--4 步的结果，**连「窗口有没有被放弃」一起带**（见
     #: `domain.target_order.MilitaryChoice`）。选靶的每一个中间量都从它里面取，
@@ -1017,6 +1020,10 @@ class MissionScheduler:
         """校验攻击配置页上那个「同一个 bot 多久之内不重复打」。留空返回 `None`。"""
         return _bot_revisit_hours(value)
 
+    def validate_protection_exclusion_hours(self, value: object) -> int | None:
+        """校验攻击配置页上那个「撞上保护期之后排除多久」。留空返回 `None`。"""
+        return _protection_exclusion_hours(value)
+
     def validate_account_line_limit(self, value: object) -> int | None:
         """校验攻击配置页上那个「全账号航线上限」。留空返回 `None`。"""
         return _account_line_limit(value)
@@ -1090,6 +1097,25 @@ class MissionScheduler:
             effective=window,
             default=DEFAULT_BOT_REVISIT,
             detail="这段时间内打过的 bot 坐标不进候选池",
+        )
+        return window
+
+    def _protection_exclusion_window(self) -> timedelta:
+        """撞上保护期之后，这个坐标多久之内不进候选池。
+
+        ⚠️ 它排除的起点是**撞上的时刻**（`bot_targets.protection_seen_at_utc`），
+        不是保护期的起点——后者根本不可知。整段取舍在 `DEFAULT_PROTECTION_EXCLUSION`。
+        """
+        hours = self._knob("protection_exclusion_hours")
+        if hours is None:
+            return DEFAULT_PROTECTION_EXCLUSION
+        window = timedelta(hours=hours)
+        record_knob_override(
+            "protection_exclusion",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_PROTECTION_EXCLUSION,
+            detail="撞上保护期的坐标在这段时间内不进候选池",
         )
         return window
 
@@ -2455,7 +2481,8 @@ class MissionScheduler:
     def _military_assignments(self, row: orm.MissionTaskRow) -> tuple[AssignedTarget, ...]:
         """这一轮打谁、从哪出发。**五步的先后是判据的一部分，不能重排。**
 
-        1. 排除近 24 小时打过的与本轮已走完的（`_military_candidates`）；
+        1. 排除本轮已走完的、重复攻击间隔内打过的、刚撞上过保护期的
+           （`_military_candidates`）；
         2. 只留有军力读数的（`with_a_military_reading`）；
         3. 只留读数落在有效期**窗口**内的（`within_score_window`），窗口内不够
            军力截断要的那么多个时**放弃窗口并告警**（`choose_by_military`）；
@@ -2578,7 +2605,7 @@ class MissionScheduler:
         """
         oldest = reading.oldest_selected_at
         message = (
-            f"军力候选池：排除近 24 小时打过的之后剩 {reading.attackable} 个，"
+            f"军力候选池：排除近期打过的与撞上过保护期的之后剩 {reading.attackable} 个，"
             f"其中 {reading.usable} 个有军力读数（{reading.dropped_unrated} 个从未上榜，不参与）；"
             f"读数在 {reading.max_age.total_seconds() / 3600:.1f} 小时窗口内的有 "
             f"{len(reading.in_window)} 个；"
@@ -2701,14 +2728,28 @@ class MissionScheduler:
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
-        """**第 1 步，必须在最前**：排除本轮与「重复攻击间隔」之内已攻击的 bot。
+        """**第 1 步，必须在最前**：排除本轮已走完的、「重复攻击间隔」之内已攻击的、
+        以及**刚撞上过保护期**的 bot。
 
-        若先拿前 N 再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
-        空集，较低排名、从未攻击的目标永远轮不到。排除必须在时间池与军力截断
-        的前面，随后再由距离给各出发星球分配。
+        若先拿前 N 再排除，首批刚好都打过时军力任务会把候选池缩成空集，较低排名、
+        从未攻击的目标永远轮不到。排除必须在时间池与军力截断的前面，随后再由距离给
+        各出发星球分配。
 
-        间隔默认 24 小时（用户口径 2026-08-15），可在攻击配置页上改——
-        它是策略不是游戏规则，见 `DEFAULT_BOT_REVISIT`。
+        ⚠️ **保护期这一条和 24 小时那一条排在同一处、同一优先级，不是顺手加的。**
+        它俩是同一档判据——「这个坐标此刻打不了」——而把任何一条挪到取前 N 之后，
+        缩成空集的失败模式会原样复发。
+
+        两个窗口都是策略、都可在攻击配置页上改，不是游戏规则：
+        见 `DEFAULT_BOT_REVISIT` 与 `DEFAULT_PROTECTION_EXCLUSION`。
+
+        ## 保护期这一条在修什么
+
+        游戏的保护期是 8 小时，**任何人打过都会触发，而且只能撞上了才知道**
+        （`game.pirate_ui.DIALOG_NO_MISSION`）。在 `bot_targets.protection_seen_at_utc`
+        出现之前，「撞上了」只存在于 `system_log` 的纯文本里，选靶查不到——实机
+        2026-08-18 20:29 那一轮当场确认四个目标全在保护期、11.5 分钟一发没派，
+        20:41 结算完，**一秒之后的下一轮又把同样的四个挑了出来**，直到 8 小时自然
+        过去。每个目标每轮约 2.9 分钟鼠标时间，而鼠标时间才是这台机器的瓶颈。
         """
         targets = self._scored_bot_targets()
         now = self._clock()
@@ -2720,10 +2761,14 @@ class MissionScheduler:
         attacked_last_day = self._repository.attacked_bot_targets_since(
             now - self._bot_revisit_window()
         )
+        protected = self._repository.protected_bot_targets_since(
+            now - self._protection_exclusion_window()
+        )
         return [
             target
             for target in targets
             if target.coordinate not in attacked_last_day
+            and target.coordinate not in protected
             and phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
         ]
 
@@ -3302,6 +3347,35 @@ def _bot_revisit_hours(value: object) -> int | None:
         raise MissionParamError(
             f"bot 重复攻击间隔最多 {BOT_REVISIT_MAX_HOURS} 小时（一周）："
             "再长就跨过了 bot 军力的刷新周期，上一周打过的会一直拦着这一周的候选。"
+        )
+    return hours
+
+
+def _protection_exclusion_hours(value: object) -> int | None:
+    """撞上保护期之后排除多久（小时）。**留空 = 默认 8 小时。**
+
+    ## 两条边界
+
+    - **至少 1 小时。** 0 等于取消排除，而这正是这条功能要修的那个缺陷本身：
+      被排除掉的目标会被每一轮重新挑中、每轮每个白烧约 2.9 分钟鼠标时间，直到
+      保护期自然过去。填 0 的人多半以为自己在「放宽一点」，实际是把它关掉。
+    - **最多 `PROTECTION_EXCLUSION_MAX_HOURS`（24 小时）。** 理由在那个常量上：
+      保护期最长 8 小时，8 以上纯属保守余量；越过 24 就开始和
+      `bot_revisit_hours` 争同一件事。
+    """
+    hours = _optional_int(value, label="保护期排除时长（小时）")
+    if hours is None:
+        return None
+    if hours < 1:
+        raise MissionParamError(
+            "保护期排除时长至少 1 小时：填 0 等于取消排除，而撞上保护期的目标"
+            "会被下一轮原样挑中，每轮每个白跑约 2.9 分钟鼠标时间。"
+        )
+    if hours > PROTECTION_EXCLUSION_MAX_HOURS:
+        raise MissionParamError(
+            f"保护期排除时长最多 {PROTECTION_EXCLUSION_MAX_HOURS} 小时："
+            "游戏的保护期最长 8 小时，再往上只是保守余量；超过一天就和"
+            "「bot 重复攻击间隔」争同一件事，排障时分不清目标是被哪一条挡住的。"
         )
     return hours
 

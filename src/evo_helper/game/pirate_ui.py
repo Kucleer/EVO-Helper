@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 from evo_helper.domain.scout_verdict import (
     PIRATE_TRIGGER_MIN_COUNT,
     PIRATE_TRIGGER_SHIPS,
@@ -186,6 +188,43 @@ DIALOG_LINES_FULL = "同时派遣的舰队数量已达上限"
 
 #: 三个弹窗的封闭词表。
 DIALOG_MESSAGES = (DIALOG_NO_SHIPS, DIALOG_LINES_FULL, DIALOG_NO_MISSION)
+
+
+class DialogKind(Enum):
+    """单按钮弹窗的**处理类别**。三个弹窗，两类，处理方式相反。
+
+    ⚠️ **下游判据一律认这个枚举，不认那句中文。** 仓库里已有同形的规矩
+    （`application.mission_scheduler._launch`：「类别按**异常类型**认，不按那句
+    中文认」）。理由在这里更硬一点：这几句中文是**从屏幕上 OCR 出来再贴回词表**
+    的，字面本来就可能抖（实机把「派遣」读成过「派遗」）；而且「跳过这个目标」
+    与「停下整轮」做反的代价极不对称。谁要新写一个 `== DIALOG_NO_MISSION`，
+    就等于把这条判据的正确性重新押在一句可能变的文案上。
+    """
+
+    #: 「没有可执行的任务。」——目标在保护期里。**只跳过这一个目标**，整轮继续。
+    PROTECTED = "protected"
+    #: 「未选择任何战舰」「同时派遣的舰队数量已达上限。」——资源耗尽。
+    #: **停下整轮**等舰队返航，跳到下一个目标也一样派不出去。
+    EXHAUSTED = "exhausted"
+
+
+#: 文案 → 类别。词表是封闭的，所以这张表也是封闭的：新增弹窗必须同时给它定类别，
+#: 否则 `dialog_kind` 会 `KeyError`——**那正是想要的**。漏掉一个新弹窗的默认行为
+#: 若是「当成没弹窗放行」，症状是 runner 对着一个它没看懂的屏继续点下去。
+_DIALOG_KINDS: dict[str, DialogKind] = {
+    DIALOG_NO_MISSION: DialogKind.PROTECTED,
+    DIALOG_NO_SHIPS: DialogKind.EXHAUSTED,
+    DIALOG_LINES_FULL: DialogKind.EXHAUSTED,
+}
+
+
+def dialog_kind(message: str) -> DialogKind:
+    """已经贴回词表的弹窗文案属于哪一类。
+
+    参数只接受 `snap_dialog` 的输出（词表里的原文），**不接受屏幕原文**：
+    贴词表这件事只做一次，做两次就有两份判据。
+    """
+    return _DIALOG_KINDS[message]
 
 
 def snap_dialog(raw: str, *, max_distance: int = 3) -> str | None:
