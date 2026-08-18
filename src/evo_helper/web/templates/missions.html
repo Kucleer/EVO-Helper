@@ -676,13 +676,16 @@
     if (task.kind === 'BOT') {
       const settings = document.createElement('div');
       settings.className = 'military-settings';
-      // ⚠️ 这一格是**军力截断**，不是「候选数量」：后面按距离重排，所以军力只在
-      // 这一刀生效一次。填成 ≥ 窗口内的目标数就完全失效——2026-08-18 之前它被
-      // 填成 500 而可用候选只有 591，等于军力压根没参与选靶。
+      // ⚠️ **这一格 2026-08-18 换了身份，文案必须跟着走。** 从前它是「军力截断
+      // （取前几名）」，那道硬截断已经取消——现在只有一条判据：`军力 ÷ 往返小时`。
       //
-      // ⚠️ 它同时是「窗口够不够用」的那把尺子：窗口内不足这么多个时，助手会
-      // 放弃窗口、在全部有读数的目标里截断，并在页面上标「军力读数已放宽窗口」。
-      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '军力截断（取前几名）', title: '在有效期窗口内按军力取前几名。调小=只打最强的，代价是可选距离变差；调大=军力优先被稀释，而且更容易触发「放宽窗口」' });
+      // 它现在**只剩一个用途**：当「窗口够不够用」的尺子。窗口内不足这么多个时，
+      // 助手会放弃窗口、改用全部有读数的目标，并在页面上标「军力读数已放宽窗口」。
+      // 所以它**不再决定打谁**，只决定「这一轮肯不肯只信新数据」。
+      //
+      // 存进 params_json 的键仍叫 `top_n`（生产库里存着的就是它，改名要迁移）。
+      // 用户看见的是文案，看不见键名。
+      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '窗口门限（窗口内至少几个）', title: '窗口内至少要有这么多个目标，这一轮才肯只用窗口内的。调大=对「新鲜」要求更苛刻，窗口更常被放弃（照样会打，但会告警）；调小=更愿意只用窗口内那批，代价是可选目标少。它不决定打谁——打谁由「军力 ÷ 往返小时」的得分定' });
       // ⚠️ 这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
       // 最高战力只有 70 多 K，离打不动还很远），留着是为了哪天 bot 变强。
       // 别以为页面上填了它就在挡什么。
@@ -694,20 +697,20 @@
       // ③ PR #176 又降级成提示，选靶交给「时间池」（按读数时间取前 N）——那一版
       //    最糟：军力榜从强到弱扫，「读数最新」等价于「军力最弱」，于是「军力优先」
       //    选出了全库最弱的一批（实机 2026-08-18 09:00 那 8 发只有 3.2K~5.7K）；
-      // ④ 现在它**真的会挡**，但挡不住整轮：窗口内不够军力截断要的那么多个时，
+      // ④ 现在它**真的会挡**，但挡不住整轮：窗口内不够「窗口门限」那么多个时，
       //    助手会放弃窗口、并在这一行标出「军力读数已放宽窗口」。
       // 同一个数字在页面上和判据里说两件事，正是前三次事故共同的形状。
-      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '只打读数落在这段时间之内的目标。窗口内不足「军力截断」要的个数时，助手会放弃窗口、在全部有读数的目标里按军力截断，并在状态里标出「军力读数已放宽窗口」' });
-      settings.append('军力截断 前 ', topN, document.createTextNode(' 名　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时'));
+      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '只打读数落在这段时间之内的目标。窗口内不足「窗口门限」要的个数时，助手会放弃窗口、改用全部有读数的目标，并在状态里标出「军力读数已放宽窗口」' });
+      settings.append('窗口门限 ', topN, document.createTextNode(' 个　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时'));
       params.append(settings);
       // 用户要手动调这两个数，所以最容易搞反的三件事必须看得见：
-      // ① 截断是一刀，不是排序（后面按距离重排）；填满了等于没截；
+      // ① 打谁只由「军力 ÷ 往返小时」定，这一行里没有一个数在决定打谁；
       // ② 有效期是**划一条线**，不是「取最新的几个」——后者带选择偏差，正是 #176 的错；
       // ③ 窗口不够用时会被放弃，而那件事会自己在状态里报出来。
       const advice = document.createElement('div');
       advice.className = 'muted';
       advice.style.fontSize = '11px';
-      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 在窗口内按军力截断前 N 名 → ⑤ 按距离由近到远出击。军力只在第 ④ 步生效一次，填成 ≥ 窗口内目标数就完全失效。窗口内不足 N 个时会放弃窗口、在全部有读数的目标里截断，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。';
+      advice.textContent = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
       params.append(advice);
     }
     const summary = document.createElement('div');
@@ -927,7 +930,7 @@
         row.dataset.militaryPrimed = '1';
         const mode = row.querySelector('.military-enabled');
         mode.checked = task.params.by_military === true;
-        // 没配过时显示后端的默认值（`domain.target_order.TOP_BY_MILITARY`）。
+        // 没配过时显示后端的默认值（`domain.target_order.WINDOW_POOL_FLOOR`）。
         row.querySelector('.military-top-n').value = task.params.top_n ?? 100;
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
         // 旧任务的 params_json 里还存着从前那个键，回显要认得出来，
@@ -1121,7 +1124,7 @@
     const topN = Number(row.querySelector('.military-top-n').value);
     const maxAge = Number(row.querySelector('.military-score-max-age').value);
     const maximumText = row.querySelector('.military-max-score').value.trim();
-    if (!Number.isInteger(topN) || topN < 1) throw new Error('军力截断必须是大于 0 的整数');
+    if (!Number.isInteger(topN) || topN < 1) throw new Error('窗口门限必须是大于 0 的整数');
     if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error('分数超期提示（小时）必须大于 0');
     payload.top_n = topN;
     payload.score_max_age_hours = maxAge;

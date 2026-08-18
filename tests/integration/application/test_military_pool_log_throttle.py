@@ -278,7 +278,7 @@ def test_every_number_in_the_message_is_part_of_the_signature(  # type: ignore[n
     written = 1
     for changed in (
         # 每一个都只动一处，而且都在窗口之内（都是 NOW），压不住才算过。
-        base.__class__(**{**vars(base), "take": base.take + 1}),
+        base.__class__(**{**vars(base), "window_floor": base.window_floor + 1}),
         base.__class__(**{**vars(base), "max_age": base.max_age + timedelta(hours=1)}),
         base.__class__(**{**vars(base), "candidates": base.candidates[:-1]}),
     ):
@@ -309,7 +309,7 @@ def test_the_widened_warning_is_throttled_the_same_way(  # type: ignore[no-untyp
     level, _, payload = recorded.widened[0]
     assert level == "WARNING", "限流不许顺手把告警降级"
     assert payload["in_window"] == 1
-    assert payload["take"] == 2
+    assert payload["window_floor"] == 2
 
 
 def test_a_window_that_recovered_says_so_once(  # type: ignore[no-untyped-def]
