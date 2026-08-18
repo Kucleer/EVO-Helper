@@ -13,8 +13,10 @@ from evo_helper.game.system_navigator import (
     SYSTEM_VIEW_BUTTON,
     VIEW_MENU_BUTTON,
     SystemNavigator,
+    agreed_value,
     crop_reader,
     on_system_view,
+    reads_like_a_dropped_digit,
 )
 
 
@@ -176,3 +178,114 @@ def test_crop_reader_passes_the_recipe_through() -> None:
     assert read((1, 2, 3, 4), digits=True, upscale=5) == "读数"
     assert image.cropped == [(1, 2, 3, 4)]
     assert seen == [("crop(1, 2, 3, 4)", True, 5)]
+
+
+class TestAgreedValue:
+    """`agreed_value`：一个值框在各套配方下的读数怎么汇成一个能采纳的值。
+
+    ## 这条判据是拿实机反例换来的
+
+    老规则是「第一套配方读出非空就采纳」。生产 `system_log` 2026-08-18：这条回读
+    上线以来 **28 次全部对不上**，错法一律是丢掉最左那一位（`277`→`77`、
+    `250`→`50`、`15`→`5`）——第一套配方读出 `77`、非空、当场被采纳，后面几套
+    根本没机会说话。同一种错法在本机实拍上也复现了（`27`→`7`、`52`→`5`）。
+
+    ⚠️ **改这里的每一条都要先想清楚「会不会让读错的值匹配上」。** 认错一次的代价
+    是缓存与导航栏分岔，见 `SystemNavigator` 类注释里 136→9 那次事故：连续 44 个
+    目标核对全不过、13 分钟一发没派。
+    """
+
+    def test_a_value_two_recipes_agree_on_is_adopted(self) -> None:
+        assert agreed_value(["277", "277", "", "", ""]) == "277"
+
+    def test_a_value_only_one_recipe_read_is_refused(self) -> None:
+        """⚠️ **一票不通过。** 这一条就是缺陷本体：老规则等价于一票通过。"""
+        assert agreed_value(["277", "", "", "", ""]) == ""
+
+    def test_the_longer_reading_wins_over_the_ones_that_dropped_a_digit(self) -> None:
+        """生产那三条日志的形状：多数配方漏了首位，够票的完整读数照样该胜出。
+
+        `77` 是 `277` 漏掉一位的样子，所以这份分歧解释得通，不该把整格作废。
+        """
+        assert agreed_value(["277", "277", "77", "77", "77"]) == "277"
+
+    def test_the_winner_is_the_longest_not_whichever_sorts_first(self) -> None:
+        """⚠️ 胜出者按**长度**挑，不许按别的顺序挑。
+
+        `dump-bot-coord-mismatch-123228.png` 的恒星系框就是这个形状：三套读出 `52`、
+        两套漏成 `5`。而 `'5' < '52'`，所以任何「按字典序挑一个」的写法都会挑中 `5`，
+        接着 `52` 解释不成 `5` 漏字、整格作废——功能不会读错，但会一直读不出，
+        也就是这次修之前那个「成功率 0%」的下场。
+        """
+        assert agreed_value(["52", "52", "5", "5"]) == "52"
+
+    def test_a_longer_reading_without_a_second_witness_is_refused(self) -> None:
+        """反过来：只有一套看全了 `277`，其余都读 `77` —— 交空串。
+
+        **方向永远是「拿不准就多设」。** 宁可白设两个字段，也不认一个可能缺位的值。
+        """
+        assert agreed_value(["277", "77", "77", "77", "77"]) == ""
+
+    def test_a_single_recipe_hallucinating_an_extra_digit_cannot_win(self) -> None:
+        """⚠️ 一套配方凭空多读一位（实测 `9` 读成 `93`）既赢不了，也不会被无声吞掉。
+
+        `93` 只有一票当不了候选；而 `9` 当上候选之后 `93` 不是它漏字的样子，
+        于是整格作废。**读空是安全的，读错才是这一块最怕的东西。**
+        """
+        assert agreed_value(["93", "9", "9", "", ""]) == ""
+
+    def test_a_substitution_disagreement_is_refused(self) -> None:
+        """`3` 不是 `9` 漏了位，这份分歧解释不通 —— 交空串。"""
+        assert agreed_value(["3", "9", "", "", ""]) == ""
+
+    def test_two_equally_long_candidates_are_refused(self) -> None:
+        """两个一样长却不同的值都够票 —— 说不清是哪个，交空串。
+
+        管住这一条的是「其余非空必须是漏字」那道闸，不是另开的歧义闸：漏字必然
+        更短，等长的对手永远解释不通。所以这里**没有**单独一道歧义闸（写过，
+        变异测试证明它是死代码）。
+        """
+        assert agreed_value(["12", "12", "13", "13"]) == ""
+
+    def test_nothing_read_comes_back_empty(self) -> None:
+        assert agreed_value(["", "", "", "", ""]) == ""
+
+    def test_non_digit_reads_do_not_vote(self) -> None:
+        """Tesseract 偶尔把白名单里的冒号也吐出来（实拍上见过 `'27 :'`）。
+
+        它不可能等于任何一个坐标分量，所以不参与投票；**但调用方仍要把原文记进
+        日志**——「读成了什么」是下次校准唯一的线索。
+        """
+        assert agreed_value(["27 :", "27", "27", "", ""]) == "27"
+
+    def test_the_vote_threshold_is_honoured(self) -> None:
+        assert agreed_value(["7", "7"], min_votes=3) == ""
+        assert agreed_value(["7", "7", "7"], min_votes=3) == "7"
+
+
+class TestReadsLikeADroppedDigit:
+    """回读对不上时给日志定性用的纯函数。**只描述，不放行采纳。**"""
+
+    def test_the_production_shapes_are_recognised(self) -> None:
+        """生产 2026-08-18 那 28 次的三种形状。"""
+        assert reads_like_a_dropped_digit("77", "277")
+        assert reads_like_a_dropped_digit("50", "250")
+        assert reads_like_a_dropped_digit("5", "15")
+
+    def test_a_genuinely_different_number_is_not_a_dropped_digit(self) -> None:
+        """⚠️ 反向也必须成立：把真的「导航栏在别处」说成「读错了」，会把排障引反。
+
+        这个仓库出过「日志说假话比不说更糟」的事故。
+        """
+        assert not reads_like_a_dropped_digit("166", "277")
+        assert not reads_like_a_dropped_digit("3", "9")
+
+    def test_the_same_value_is_not_a_dropped_digit(self) -> None:
+        assert not reads_like_a_dropped_digit("277", "277")
+
+    def test_an_empty_read_is_not_a_dropped_digit(self) -> None:
+        """读空是另一支（「读不出」），别混进「疑似漏位」里。"""
+        assert not reads_like_a_dropped_digit("", "277")
+
+    def test_a_longer_read_is_not_a_dropped_digit(self) -> None:
+        assert not reads_like_a_dropped_digit("2277", "277")
