@@ -652,6 +652,9 @@ def scan(
         driver=SlowDragDriver(driver),
         read_labels=lambda: nav_label_words(driver.capture(), ocr),
         read_rows=read_rows,
+        # 「这一行的分数解析出来了没有」——`ranking_nav` 拿它判**面板铺开了没有**
+        # （不是判页签，那个判据不存在）。行的形状只有这一层认识，所以由这里注入。
+        row_has_score=lambda row: row.score is not None,
         # 把导航条那 8 条输出也接到同一个出口上；不注入的话它们只走 `print`，
         # 既没有时刻也进不了 `system_log`。
         say=say,

@@ -252,6 +252,8 @@ def test_a_real_navigator_scroll_comes_out_as_one_proper_drag() -> None:
         driver=driver,
         read_labels=list,
         read_rows=lambda: screens.pop(0) if screens else [("b",)],
+        # 这条只走 `scroll_once`，碰不到那道「面板铺开了没有」的闸。
+        row_has_score=lambda _row: True,
         say=lambda _message: None,
     )
 

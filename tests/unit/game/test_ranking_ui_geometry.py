@@ -22,6 +22,7 @@ from evo_helper.game.ranking_ui import (
     NAV_DRAG_TO_X,
     NAV_LABEL_ROI,
     NAV_LABEL_WORD_GAP_PX,
+    PANEL_READY_ROW_SLACK,
     PLAYER_TAB,
     RANKING_CLOSE,
     RANKING_LIST_MAX_Y,
@@ -32,6 +33,7 @@ from evo_helper.game.ranking_ui import (
     ROW_FIRST_Y,
     ROW_LAST_Y,
     ROW_PITCH_PX,
+    ROWS_PER_SCREEN,
     ROWS_PER_SCROLL,
     SCROLL_FROM_Y,
     SCROLL_TO_Y,
@@ -131,6 +133,31 @@ def test_the_row_pitch_matches_the_two_ends_that_were_measured() -> None:
 
     assert round(gaps) == 12
     assert abs(gaps - 12) < 0.1
+
+
+def test_a_screenful_is_thirteen_rows_computed_from_the_three_measured_pixels() -> None:
+    """一屏几行是**推出来的**：首行到末行有多少个行距，再把首行自己算上。
+
+        (795 − 257) / 44.8 = 12.008 个间隔 → 12 个间隔 + 首行 = 13 行
+
+    右边全写字面量（本文件开头那条规矩）：拿 `ROW_FIRST_Y` 当尺子的话，
+    版面几何被改坏时这条会跟着改口。
+
+    13 与生产对得上：`system_log` 里 `已切到军事榜（这一屏 N 行…）` 全部 22 条，
+    21 条是 13 行，另外那 1 条是 08-17 17:36:02 的半渲染屏（5 行）。
+    """
+    assert ROWS_PER_SCREEN == 13
+    assert round((795 - 257) / 44.8) + 1 == 13
+
+
+def test_the_panel_ready_gate_sits_just_below_a_full_screen() -> None:
+    """那道闸卡在 12 行：满屏 13 减 1 行容差。
+
+    容差不能是 0——`read_rows` 的契约是「认不出的行丢掉」，好屏偶尔掉一行。
+    也不必更大——要挡的那一屏只有 5 行，离 12 还差 7，双峰之间没有灰区。
+    """
+    assert PANEL_READY_ROW_SLACK == 1
+    assert ROWS_PER_SCREEN - PANEL_READY_ROW_SLACK == 12
 
 
 def test_one_scroll_advances_less_than_a_screenful_so_no_rank_is_skipped() -> None:
