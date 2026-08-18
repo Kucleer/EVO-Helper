@@ -312,8 +312,8 @@ MAIL_SCAN_ROWS = 6
 #: 一趟信箱最多往下翻几屏（每屏 `MAIL_SCAN_ROWS` 行，所以最远能看到 24 行）。
 #:
 #: 翻屏靠慢拖，而列表的滚动步距**没有标定过**，所以停止条件不能是「拖了几次」。
-#: 这里的停止条件是「这一屏还有没有没见过的行」，行的身份取自它自己的主题+时间
-#: ——和「认报告靠 VS 块里的坐标、不靠行号」同一个道理。拖少了只是重看几行
+#: 这里的停止条件是「这一屏还有没有没见过的行」，行的身份取自它自己的时间那一格
+#: （`MailRow.identity`）——和「认报告靠 VS 块里的坐标、不靠行号」同一个道理。拖少了只是重看几行
 #: （在列表页认出来就跳过，不开封），拖多了漏掉的那几行和今天的行为一样。
 #:
 #: 取 4 的依据是**时长要和改之前持平**：读一屏主题 ≈1–2 秒、翻一屏 ≈2 秒，
@@ -565,15 +565,55 @@ class MailRow:
     kind: ReportKind
 
     @property
-    def identity(self) -> tuple[str, str]:
-        """跨屏认出「这一行我见过」用的身份。
+    def identity(self) -> str | None:
+        """跨屏认出「这一行我见过」用的身份：**只认时间那一格**。
 
-        取主题+时间而不是行号：翻屏之后行号会重来一遍，而同一封邮件的主题和
-        时间不变。时间读不出来时只按主题去重——那会把同一分钟的两封同类报告
-        看成一封，代价是少开一封；反过来（不去重）则是翻屏后把上一屏重开一遍，
-        每重复一封就白花八秒。
+        不取行号：翻屏之后行号会重来一遍，第二屏的「第 0 行」和第一屏的「第 0 行」
+        是两封不同的邮件。**读不出时间时返回 None，那一行一律算「没见过」**，
+        既不会被顶掉、也不会去顶掉别人。
+
+        ## 为什么把主题从身份里拿掉了
+
+        原先取的是「主题 + 时间」，取舍写的是「时间读不出来时只按主题去重，
+        代价是少开一封」——那句话的前提是**主题本身是个能用的键**。它不是：
+        实拍 32 屏 192 行里，主题一字不差的是 **0 行**，而时间读出 **180 行
+        （93.8%）**。面板半透明、背后那一页的字透上来落进同一块 ROI，理由整段在
+        `mail_times_settled`，量法见
+        `tests/integration/vision/test_mail_row_times_live.py`。
+
+        于是那个复合键**从来没有匹配上过任何一行**：它没换来「少开一封」，
+        而是在每一个跨屏重叠的行上照付「重开一封」。实机 2026-08-18 20:35–20:37
+        一趟里同一份战报开了两次：
+
+            20:35:45 第 4 行开封（18/08/2026 09:07:54 '大 sw, 攻击报告 band'）
+            20:36:40 第 0 行开封（18/08/2026 09:07:54 'EN ATR band , £& oe'）
+
+        8 封的预算里 2 封是重复的（≈46 秒），紧接着 20:37:29 就打了「这一趟已经
+        开了 8 封，到上限」——**重开挤掉的正是还没读的战报**。
+
+        ⚠️ **`kind` 也不能拿来兜底。** 上面那两次读数一次认成 `ATTACK`、
+        一次认成 `UNKNOWN`（`classify_report_subject` 是子串判定，噪声吃掉那四个字
+        就认不出了）。把它掺进身份等于把同一个不稳的观测量换个形状再放回来。
+
+        ## 换过来之后还剩的那一份代价，照实说
+
+        同一秒真的会有两封邮件：实拍 `rep-7-mail.png` 上 `08/08/2026 13:07:42`
+        同时是 `远征舰队返回` 和 `远征报告`（舰队落地那一瞬间同时产出通知和报告），
+        192 行里这样的一对出现 1 次。
+
+        - **同屏那一侧是安全的**：`_scan_mail_rows` 先挑出「没见过的」、**再**把它们
+          记进 `seen`，所以同一屏上的两行任何时候都不会互相顶掉（同一屏上行号不同
+          就是两封不同的邮件）。那条顺序是判据的一部分，化简的时候不许并成一步。
+        - **跨屏那一侧顶不掉的办法不存在**：可信的观测量只有时间这一个，同秒两封
+          在观测上就是不可分的。只有当这样一对**正好被屏幕的下边缘切开**（上一屏
+          只露出前一封、下一屏只露出后一封）时，后一封这一趟会被当成重复跳过。
+          它下一趟就能读到（`seen` 每趟从空开始，扫描窗口按时间算），而白花掉的
+          八秒是要不回来的。
+
+        读不出时间的那 6.2% 一律不去重，付的也是「重开一封 ≈ 八秒」而**不是**
+        「少开一封」——与 `may_be`、`is_older_than` 刻意往「开」的一侧倒是同一个方向。
         """
-        return (self.subject, self.raw_time_text or "")
+        return self.raw_time_text
 
     def may_be(self, wanted: ReportKind | Sequence[ReportKind]) -> bool:
         """这一行**值不值得打开**。
@@ -632,8 +672,8 @@ def mail_times_settled(
 ) -> bool:
     """两屏之间「列表没动」吗。**比时间列，不比主题。**
 
-    ⚠️ **这一条是 2026-08-18 那一整天空转的正因。** 原先比的是行身份
-    （`MailRow.identity` = 主题 + 时间），而主题这一格在实机上根本读不稳：
+    ⚠️ **这一条是 2026-08-18 那一整天空转的正因。** 原先比的是主题 + 时间拼起来的
+    行身份（`MailRow.identity` 后来也因此只认时间那一格），而主题这一格在实机上根本读不稳：
     面板是半透明的，背后那一页的字（`-TOTAL CREWS`、`-17003`、`personnel`）
     透上来落进同一块 ROI，于是同一封邮件两次读成
     `'大 Sw GEF攻击报告 bad'` 与 `'EN SEFATing bad Za once'`。
@@ -1739,15 +1779,17 @@ class PirateLoop:
            定位的东西，正是被这句措辞盖住的。
         """
         self._enter_mailbox()
-        seen: set[tuple[str, str]] = set()
+        #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
+        #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
+        seen: set[str] = set()
         scan = MailScan()
         opened = 0
         collected = False
         budget_noted = False
         done = False
         reentries = 0
-        #: 上一屏的行身份。判「拖到底了」只能靠它，见下面 `fresh` 为空那一段。
-        last_identities: list[tuple[str, str]] | None = None
+        #: 上一屏的时间列。判「拖到底了」只能靠它，见下面 `fresh` 为空那一段。
+        last_times: list[str | None] | None = None
         for page in range(max_pages):
             if done:
                 break
@@ -1781,30 +1823,36 @@ class PirateLoop:
                 # 重进之后**不在这里再判一次**：判了就得决定「不成怎么办」，而那正是
                 # 下一轮循环开头那道守卫的活。交给它，重进预算才真的是预算——
                 # 在这里 break 的话，第 2 次重进永远走不到。
-                last_identities = None
+                last_times = None
                 continue
             rows = self._mail_list_rows()
-            identities = [row.identity for row in rows]
-            fresh = [row for row in rows if row.identity not in seen]
+            times = [row.raw_time_text for row in rows]
+            # ⚠️ **挑出「没见过的」要排在「记下见过的」之前。** 同一屏上行号不同就是
+            # 两封不同的邮件，而同一秒真的会有两封（实拍上 `远征舰队返回` 与
+            # `远征报告` 同在 `13:07:42`）；并成一步就会让同屏的那一对互相顶掉。
+            # 整段取舍在 `MailRow.identity`。
+            fresh = [row for row in rows if row.identity is None or row.identity not in seen]
             if not fresh:
                 # ⚠️ **「这一屏没有新邮件」不等于「翻到底了」。** 重进信箱之后画面回到
                 # 顶部，头几屏必然全是见过的——原先在这里 `break`，等于让上面那条
                 # 重进永远走不到新内容，白重进。
                 #
-                # 真正的到底判据是**拖了一下还是同样几封**（与
-                # `domain.planet_switch.list_exhausted` 同一条）。比行身份而不是比
-                # 位置：身份取自主题+时间，拖动带惯性时位置会差几像素，按位置比会
-                # 永远判「还能拖」。
-                if identities and identities == last_identities:
-                    say(f"  第 {page + 1} 屏拖不动了（还是那几封）；不再往下翻")
+                # 真正的到底判据是**拖了一下时间列还是那几个**（与
+                # `domain.planet_switch.list_exhausted` 同形）：比行的内容而不是比
+                # 位置，拖动带惯性时位置会差几像素，按位置比会永远判「还能拖」。
+                # 而**比时间不比主题**，理由整段在 `mail_times_settled`——原先这里
+                # 比的是主题 + 时间拼起来的行身份，而主题一字不差的行是 0 行，
+                # 于是「还是那几封」永远不成立，白拖到翻页上限为止。
+                if mail_times_settled(last_times, times):
+                    say(f"  第 {page + 1} 屏拖不动了（时间列还是那几个）；不再往下翻")
                     break
                 say(f"  第 {page + 1} 屏没有没见过的邮件；接着往下翻")
-                last_identities = identities
+                last_times = times
                 if page + 1 < max_pages:
                     slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
                 continue
-            last_identities = identities
-            seen.update(row.identity for row in fresh)
+            last_times = times
+            seen.update(identity for row in fresh if (identity := row.identity) is not None)
             for row in fresh:
                 if observe is not None:
                     observe(row)
