@@ -178,6 +178,27 @@ class AttackIntentRow(Base):
     target_military_score_at_utc: Mapped[datetime | None] = mapped_column(
         UTCDateTime, nullable=True
     )
+    #: 上面那个分数**是不是插出来的**，同样是写意图那一刻抄下来的快照。
+    #:
+    #: 为真时的含义不是「大概齐」，而是：这一行从榜上读到的分数破坏了降序、被判为
+    #: 不可信丢掉了，显示的数是用上下两个好邻居插出来的中点（判据在
+    #: `tools.ranking_scan`，来历是 2026-08-15 那次丢小数点的事故）。规模不小——
+    #: 2026-08-18 生产库里 3225 个有读数的 bot 中，估算的有 365 个（11.3%）。
+    #:
+    #: ⚠️ **必须快照，绝不许事后现取 `bot_targets.military_score_estimated`。**
+    #: 那一列会被反复重写和清零：每轮采集整行覆盖、`clear_pirate_position_bot_candidates`
+    #: 与 `forget_implausible_military_scores` 都把它清成 `False`（2026-08-18 跑过
+    #: 两次）。现取的话，今天标着「估算」的记录明天会自己变成「实读」——页面会
+    #: 说假话，而且一声不响。
+    #:
+    #: ⚠️ **可空，不是 `default False`。** `False` 的含义是「这个数是实读的」，而
+    #: 存量意图根本不知道当时那个数怎么来的。默认成 `False` 是让历史行冒充实读；
+    #: NULL 才是实话——页面据此既不标「(估算)」、也不声称实读。
+    #:
+    #: ⚠️ 它只回答「这个数是插出来的吗」，**不回答「这个数对不对」**：2026-08-18
+    #: 的反例里，一个 262,000 的脏值因为在它的名次上本来就该是大数，降序判据挑不
+    #: 出来，estimated 照样是 `False`。别拿它当脏数据探测器用。
+    target_military_score_estimated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 class AttackDispatchRow(Base):

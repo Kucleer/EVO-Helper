@@ -495,10 +495,23 @@ class SqlAlchemyRepository:
                     forced_revisit=record.forced_revisit,
                     created_at_utc=record.created_at_utc,
                     target_kind=record.target_kind,
-                    # 没有这一行、或者这一行还没有军力读数时，两列一起留 NULL。
+                    # 没有这一行、或者这一行还没有军力读数时，三列一起留 NULL。
                     target_military_score=None if seen is None else seen.military_score,
                     target_military_score_at_utc=(
                         None if seen is None else seen.military_score_at_utc
+                    ),
+                    # 「这个数是不是插出来的」跟着上面那个数一起抄，同一条 SELECT、
+                    # 同一个事务。**不能事后现取**：`bot_targets` 那一列会被反复重写
+                    # 和清零（每轮采集覆盖、`clear_pirate_position_bot_candidates` 和
+                    # `forget_implausible_military_scores` 都清成 `False`），现取的话
+                    # 今天标着「估算」的记录明天会变成「实读」。
+                    #
+                    # 没有分数时留 NULL 而不是 `False`：`False` 的含义是「这个数是
+                    # 实读的」，而这里根本没有数，说不上实读还是插值。
+                    target_military_score_estimated=(
+                        None
+                        if seen is None or seen.military_score is None
+                        else bool(seen.military_score_estimated)
                     ),
                 )
             )

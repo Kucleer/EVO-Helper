@@ -589,6 +589,12 @@ class PersistentApplicationService:
                     # NULL 原样带出去——历史行没有这个观测，页面显示「—」。
                     target_military_score=intent.target_military_score,
                     target_military_score_at_utc=intent.target_military_score_at_utc,
+                    # 「是不是插出来的」同样直读快照列。**绝不去看 `bot_targets`
+                    # 现在的 `military_score_estimated`**：那一列被反复重写和清零，
+                    # 现取会让日志上的「(估算)」标记自己消失（2026-08-18 的两次
+                    # `forget_implausible_military_scores` 就清掉了一批）。
+                    # NULL 原样带出去——历史行不知道，页面就两边都不声称。
+                    target_military_score_estimated=intent.target_military_score_estimated,
                     preset_name=intent.preset_name,
                     preset_signature=intent.preset_signature,
                     guard_status=intent.guard_status,
