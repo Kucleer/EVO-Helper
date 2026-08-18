@@ -43,8 +43,9 @@ NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 FIRST = Coordinate(4, 277, 15)
 SECOND = Coordinate(9, 250, 8)
 
-#: 军力优先的任务参数。`top_n` 给得足够大，好让「这一轮选中几个」由航线预算决定
-#: 而不是由军力截断决定——这一整个文件量的是航线。
+#: 军力优先的任务参数。`top_n` 现在只是**窗口门限**（第 3 步的尺子），给得足够大
+#: 只有一个后果：窗口更容易被放弃，于是全部有读数的目标都进池——这一整个文件量的
+#: 是航线，池子越大越不会有别的东西悄悄限制发数。
 BY_MILITARY = '{"by_military": true, "top_n": 50}'
 
 
@@ -505,7 +506,7 @@ def test_an_idle_round_neither_disables_the_task_nor_counts_as_a_failure(  # typ
     一次失败都没记**。
     """
     bot = with_lines(repository, session_factory, (FIRST, 6), (SECOND, 6), account_limit=9)
-    # `max_score` 是军力**上限**：军力高于它的一律不进池（`strongest_within`）。
+    # `max_score` 是军力**上限**：军力高于它的一律不进池（`within_max_score`）。
     # 这两颗目标都远高于 100，于是候选池有货、选中的却是空集。
     repository.update_mission_task(
         bot, params_json='{"by_military": true, "top_n": 50, "max_score": 100}'

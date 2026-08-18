@@ -58,7 +58,7 @@ from evo_helper.domain.military_attack import (
     AssignedTarget,
     AttackOrigin,
     MilitaryTier,
-    assign_by_capacity_and_distance,
+    assign_by_capacity_and_value,
 )
 from evo_helper.domain.missions import (
     ORIGIN,
@@ -108,12 +108,12 @@ from evo_helper.domain.scheduler import (
 )
 from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
-    TOP_BY_MILITARY,
+    WINDOW_POOL_FLOOR,
     MilitaryChoice,
     ScoredTarget,
     choose_by_military,
+    most_valuable_first,
     score_is_fresh,
-    strongest_then_nearest,
 )
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -308,7 +308,7 @@ def _merged_note(suppressed: int, span: timedelta, *, repeat_noun: str, changed:
 
 @dataclass(frozen=True)
 class MilitaryPoolReading:
-    """军力候选池这一次的账：**五步流水线每一步之后各剩多少，以及选中的这批有多旧**。
+    """军力候选池这一次的账：**四步流水线每一步之后各剩多少，以及这一池有多旧**。
 
     做成一个结构而不是只返回一个列表，是因为日志得说实话。原先那句
     「军力候选池数据已过期（最旧读数 …）」既不说这一轮还剩多少能打，也不说被跳过
@@ -322,15 +322,18 @@ class MilitaryPoolReading:
 
     #: 第 1 步之后：排除近 24 小时打过的与本轮走完的，剩下的全部候选。
     candidates: tuple[ScoredTarget, ...]
-    #: 第 2--4 步的结果，**连「窗口有没有被放弃」一起带**（见
+    #: 第 2--3 步与安全线的结果，**连「窗口有没有被放弃」一起带**（见
     #: `domain.target_order.MilitaryChoice`）。选靶的每一个中间量都从它里面取，
     #: 这一层不再自己算第二份。
     choice: MilitaryChoice
-    #: 这一次用的军力截断，写进日志好让用户对得上自己配的那个数。
-    #: 它同时是第 3 步「窗口内够不够」的那把尺子。
-    take: int
+    #: 这一次用的**窗口门限**，写进日志好让用户对得上自己配的那个数
+    #: （任务参数里的键仍叫 `top_n`）。
+    #:
+    #: ⚠️ **它不再是「打前几名」。** 2026-08-18 起第 4 步按 `军力 ÷ 往返小时`
+    #: 排序、军力硬截断取消，这个数只剩一个身份：第 3 步「窗口内够不够用」的尺子。
+    window_floor: int
     #: 这一次用的窗口宽度（军力分数有效期）。**2026-08-18 起它真的会挡目标**，
-    #: 只是挡不住整轮：窗口内不足 `take` 个时窗口会被放弃，见 `widened`。
+    #: 只是挡不住整轮：窗口内不足 `window_floor` 个时窗口会被放弃，见 `widened`。
     max_age: timedelta
     #: 算这一次账的时刻。
     now: datetime
@@ -348,13 +351,19 @@ class MilitaryPoolReading:
         return self.choice.in_window
 
     @property
-    def selected(self) -> tuple[ScoredTarget, ...]:
-        """第 4 步之后：这一轮真的要打的。"""
-        return self.choice.selected
+    def eligible(self) -> tuple[ScoredTarget, ...]:
+        """过完安全线之后**这一轮有资格被打的全部**。
+
+        ⚠️ **不是「选中的这几个」。** 军力硬截断 2026-08-18 取消之后，真正打谁由
+        第 4 步按 `军力 ÷ 往返小时` 的得分连同航线预算一起定
+        （`domain.military_attack.assign_by_capacity_and_value`），而那一步要知道
+        从哪颗星球出发，这里还不知道。
+        """
+        return self.choice.eligible
 
     @property
     def widened(self) -> bool:
-        """**这一轮用到了窗口外的旧读数吗。** 判据在 `MilitaryChoice.widened` 上。
+        """**这一轮的池子里混进了窗口外的旧读数吗。** 判据在 `MilitaryChoice.widened` 上。
 
         它同时喂两处：日志里那条 WARNING，和页面上
         `TaskStatus.WIDENED_SCORE_WINDOW` 那一档。**两处必须同源**——
@@ -372,8 +381,8 @@ class MilitaryPoolReading:
     def usable(self) -> int:
         """这一轮**还有多少个能打**：有军力读数的候选数（第 2 步之后）。
 
-        ⚠️ **数的是全库还能打的总数，不是「这一轮选中了几个」。** 后者恒等于
-        军力截断那个数（默认 100），拿它当「还剩几个」会让页面上那个数几乎不动。
+        ⚠️ **数的是全库还能打的总数，不是「这一轮派了几发」。** 后者由航线预算
+        定（一轮几发），拿它当「还剩几个」会让页面上那个数几乎不动。
         页面据此判「有没有活干」（`domain.scheduler.bot_round_complete`），
         而「还有能打的」正是这个量。
 
@@ -390,24 +399,24 @@ class MilitaryPoolReading:
 
     @property
     def stale(self) -> int:
-        """**选中的这批**里有几个分数已经超期，也就是**放宽窗口多捞到了几个**。
+        """**这一池**里有几个分数已经超期，也就是**放宽窗口多捞到了几个**。
 
-        窗口没被放弃时它恒为 0（选靶只在窗口内挑），所以这个数同时是
+        窗口没被放弃时它恒为 0（池子只在窗口内取），所以这个数同时是
         「这一轮偏离了配置多远」的量度：`widened` 说的是「有没有」，它说的是「几个」。
         """
         return sum(
             1
-            for target in self.selected
+            for target in self.eligible
             if not score_is_fresh(target, now=self.now, max_age=self.max_age)
         )
 
     @property
-    def oldest_selected_at(self) -> datetime | None:
-        """选中的这批里最旧的那条读数。"""
+    def oldest_eligible_at(self) -> datetime | None:
+        """这一池里最旧的那条读数。"""
         return min(
             (
                 target.military_score_at_utc
-                for target in self.selected
+                for target in self.eligible
                 if target.military_score_at_utc is not None
             ),
             default=None,
@@ -666,7 +675,7 @@ class MissionScheduler:
         # 时会随调度器对象一同重置。
         self._view_generation = 0
         #: 军力榜正在为哪个 bot 攻击任务采一批目标。榜单一旦开始采这一批，
-        #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够 ``top_n`` 后反过来
+        #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够**窗口门限**（``top_n``）后反过来
         #: 也必须先启动该任务，再交还普通优先级排序。
         self._military_ranking_batch_task_id: int | None = None
         # 点「开始」后军力任务只使用这一份档位；运行中修改全局配置不会让
@@ -964,7 +973,7 @@ class MissionScheduler:
         params = _params(params_json)
         if not _bot_by_military(params_json):
             return
-        if _bot_top_n(params_json) < 1:
+        if _bot_window_floor(params_json) < 1:
             raise MissionParamError("top_n 必须至少为 1")
         maximum = _bot_max_score(params_json)
         if maximum is not None and maximum < 0:
@@ -1868,13 +1877,16 @@ class MissionScheduler:
             batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
             if task.kind is MissionKind.RANKING:
                 # 两个上限，取**小**的那个：任务上配的「扫描数量」是用户给这条
-                # 链路划的天花板（留空 = 不划），军力批次要的 `top_n` 是「这一批
-                # 攻击需要多少个目标」。取大的会越过用户划的线，取任务那个又会
-                # 让批次采不满——`min` 是唯一同时守得住两条的。
+                # 链路划的天花板（留空 = 不划），军力批次要的**窗口门限**是「这一批
+                # 攻击要在窗口内看到多少个目标才肯只信新数据」。取大的会越过用户
+                # 划的线，取任务那个又会让批次采不满——`min` 是唯一同时守得住两条的。
+                #
+                # ⚠️ 窗口门限 2026-08-18 起不再是「打前几名」（军力硬截断取消了），
+                # 但它在这里的用法没变：扫够那么多个，这一轮才不必放弃窗口。
                 command = ranking_command(
                     bot_limit=_smallest_limit(
                         _ranking_bot_limit(row.params_json),
-                        None if batch_task is None else _bot_top_n(batch_task.params_json),
+                        None if batch_task is None else _bot_window_floor(batch_task.params_json),
                     ),
                     blind_scrolls=self._blind_scrolls(),
                 )
@@ -2162,7 +2174,7 @@ class MissionScheduler:
                     if moment is not None:
                         free_moments.append(moment)
                 # ⚠️ 这里算的是**还有多少个能打**（有军力读数的候选数），不是
-                # 「这一轮选中了几个」——后者恒等于军力截断那个数。军力优先这一支的
+                # 「这一轮派了几发」——后者由航线预算定。军力优先这一支的
                 # 「有没有活干」就是这个数（`domain.scheduler.bot_round_complete`），
                 # 于是「候选一个军力读数都没有」自然落成「此刻没活干」，调度器会去跑
                 # 军力榜扫描把池子刷新——而**不是**抛异常。抛出去的话 `_launch` 会把
@@ -2361,7 +2373,7 @@ class MissionScheduler:
         任务被当成没目标，**一发都不派而且不报错**。
         """
         if _bot_by_military(params_json):
-            return strongest_then_nearest(
+            return most_valuable_first(
                 self._scored_bot_targets(),
                 origin,
                 # 时钟与窗口宽度都从这一层喂进去：领域层不许自己去问「现在几点」，
@@ -2369,7 +2381,7 @@ class MissionScheduler:
                 # 而边界上的目标恰恰是最容易两边不一致的那些。
                 now=self._clock(),
                 max_age=_bot_score_max_age(_params(params_json)),
-                take=_bot_top_n(params_json),
+                window_floor=_bot_window_floor(params_json),
                 max_score=_bot_max_score(params_json),
             )
         in_range = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
@@ -2402,7 +2414,7 @@ class MissionScheduler:
         origin = self._origin_taking_its_turn(assignments)
         group = [item for item in assignments if item.origin == origin]
         # `len(group)` 已经被这颗星球的**两道闸预算**卡过一次了
-        # （`_military_assignments` 把预算喂给了 `assign_by_capacity_and_distance`），
+        # （`_military_assignments` 把预算喂给了 `assign_by_capacity_and_value`），
         # 所以这里不必、也不该再去查一次库：再查一次就是第二把尺子。
         budget = min(max_dispatches if max_dispatches is not None else len(group), len(group))
         if budget < 1:
@@ -2422,7 +2434,7 @@ class MissionScheduler:
 
         ## 为什么必须轮换
 
-        原先取的是 `assignments[0].origin`，而 `assign_by_capacity_and_distance`
+        原先取的是 `assignments[0].origin`，而 `assign_by_capacity_and_value`
         末尾按 `(origin, distance)` 排序、`Coordinate` 是 `order=True` 的 dataclass
         ——`4:277:15 < 9:250:8` 恒成立。于是只要 1 号星拿到哪怕一个目标，第一组
         永远是它，**第二颗星永远轮不到**。那不是「优先级」，是结构性不可达。
@@ -2453,23 +2465,24 @@ class MissionScheduler:
         )
 
     def _military_assignments(self, row: orm.MissionTaskRow) -> tuple[AssignedTarget, ...]:
-        """这一轮打谁、从哪出发。**五步的先后是判据的一部分，不能重排。**
+        """这一轮打谁、从哪出发。**四步的先后是判据的一部分，不能重排。**
 
         1. 排除近 24 小时打过的与本轮已走完的（`_military_candidates`）；
         2. 只留有军力读数的（`with_a_military_reading`）；
         3. 只留读数落在有效期**窗口**内的（`within_score_window`），窗口内不够
-           军力截断要的那么多个时**放弃窗口并告警**（`choose_by_military`）；
-        4. 这一池里按军力**截断**（`strongest_within`）；
-        5. 按距离分给各出发星球、由近到远出击（`assign_by_capacity_and_distance`）。
+           **窗口门限**那么多个时**放弃窗口并告警**（`choose_by_military`）；
+        4. 过军力上限这道安全线，按 `军力 ÷ 往返小时` 降序分给各出发星球出击
+           （`assign_by_capacity_and_value`）。
 
-        前四步在 `_military_pool_reading` 里一次算完，这里只取结果——**选靶口径
+        前三步在 `_military_pool_reading` 里一次算完，这里只取结果——**选靶口径
         只能有这一份**。每一步的理由写在 `domain.target_order` 的模块头上，
         这里只重复最容易搞反的两条：
 
         - 第 1 步必须在最前，否则首批刚好都打过时候选池会缩成空集；
-        - 第 4 步是**截断**不是排序，因为第 5 步按距离重排会把排序结果整个抹掉。
+        - 第 4 步只有**一条**判据（得分），不再是「先按军力截断、再按距离出击」
+          那两条——旧的那两条互相矛盾，而它们之间那道墙（`top_n`）是拍出来的。
 
-        ⚠️ **第 5 步吃的是「两道闸算完之后的预算」，不是 `mission_task_origins`
+        ⚠️ **第 4 步吃的是「两道闸算完之后的预算」，不是 `mission_task_origins`
         里那个原样的航线数**（见 `_origin_budgets`）。这一点是「`has_work` 与
         `_launch` 用同一把尺子」的结构性保证：预算为 0 的星球压根拿不到目标，
         于是凡是分到了目标的出发点一定还派得出去。喂原样的航线数进去，
@@ -2485,7 +2498,7 @@ class MissionScheduler:
         # ⚠️ 仍然**不从这里启动 RANKING**：两条链路会争同一只鼠标。刷新交给调度器
         # 的填空隙机制。
         self._log_the_military_pipeline(row, reading)
-        pool = reading.selected
+        pool = reading.eligible
         try:
             tiers_json = self._active_military_tiers_json
             if tiers_json is None:
@@ -2493,7 +2506,7 @@ class MissionScheduler:
             global_tiers = json.loads(tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧已校验
             raise MissionParamError("全局军力档位配置损坏") from exc
-        return assign_by_capacity_and_distance(
+        return assign_by_capacity_and_value(
             pool,
             self._dispatchable_origins(origins),
             fallback_preset=BOT_ATTACK_PRESET,
@@ -2531,14 +2544,14 @@ class MissionScheduler:
         是「军力优先」那一支——2026-08-15 撞过一次，症状是一发都不派而且不报错。
 
         ⚠️ **有效期（`max_age`）在这里是一道真的筛选**，但它挡不住整轮：窗口内
-        不足 `take` 个时 `choose_by_military` 会放弃窗口、在全部有读数的目标里按
-        军力截断，并把这件事记在 `widened` 上。两条历史都写在
-        `domain.target_order` 的模块头第 3 步上——挡整轮的那一版让实机停摆 2.5 小时，
-        换成「取最新 N 个」的那一版把全库最弱的一批选了出来。
+        不足**窗口门限**那么多个时 `choose_by_military` 会放弃窗口、改用全部有读数
+        的目标，并把这件事记在 `widened` 上。两条历史都写在 `domain.target_order`
+        的模块头第 3 步上——挡整轮的那一版让实机停摆 2.5 小时，换成「取最新 N 个」
+        的那一版把全库最弱的一批选了出来。
         """
         params = _params(row.params_json)
         max_age = _bot_score_max_age(params)
-        take = _bot_top_n(row.params_json)
+        window_floor = _bot_window_floor(row.params_json)
         candidates = self._military_candidates(row)
         now = self._clock()
         return MilitaryPoolReading(
@@ -2547,10 +2560,10 @@ class MissionScheduler:
                 candidates,
                 now=now,
                 max_age=max_age,
-                take=take,
+                window_floor=window_floor,
                 max_score=_bot_max_score(row.params_json),
             ),
-            take=take,
+            window_floor=window_floor,
             max_age=max_age,
             now=now,
         )
@@ -2562,8 +2575,12 @@ class MissionScheduler:
 
         判据不是「有没有打日志」，而是**出事时能不能只靠库里的日志复盘
         「为什么打的是这几个」**。所以四个数一个都不能省：剔除后 / 有读数 /
-        窗口内 / 军力截断——少任何一个，读日志的人就分不清是「没候选」「没读数」
-        还是「被截断挡在外面」，而这三种的善后完全不同。
+        窗口内 / 过完安全线——少任何一个，读日志的人就分不清是「没候选」「没读数」
+        「窗口太窄」还是「被军力上限挡在外面」，而这几种的善后完全不同。
+
+        ⚠️ **这一池不等于「这一轮打的那几个」**：真正打谁由第 4 步按得分连同航线
+        预算定，那一步在 `_military_assignments` 里。所以这条日志的措辞是
+        「有资格被打的有几个」，不是「选中了几个」——**日志说假话比不说更糟**。
 
         ⚠️ **限流：状态变了立刻写，没变就一个窗口最多一条**（`_log_a_repeated_line`）。
 
@@ -2576,15 +2593,16 @@ class MissionScheduler:
         ⚠️ 仍然**别把它挪到 `_facts` 里去**：那里页面轮询也会走。限流只是把重复
         压掉，挪过去会让「页面开着」和「页面关着」写出不一样的日志。
         """
-        oldest = reading.oldest_selected_at
+        oldest = reading.oldest_eligible_at
         message = (
             f"军力候选池：排除近 24 小时打过的之后剩 {reading.attackable} 个，"
             f"其中 {reading.usable} 个有军力读数（{reading.dropped_unrated} 个从未上榜，不参与）；"
             f"读数在 {reading.max_age.total_seconds() / 3600:.1f} 小时窗口内的有 "
-            f"{len(reading.in_window)} 个；"
-            f"按军力截断前 {reading.take} 个 → {len(reading.selected)} 个，"
+            f"{len(reading.in_window)} 个（窗口门限 {reading.window_floor}）；"
+            f"过完军力上限之后有资格被打的 {len(reading.eligible)} 个，"
             f"其中 {reading.stale} 个来自窗口外"
-            f"（最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}）"
+            f"（最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}）；"
+            "真正打谁由「军力 ÷ 往返小时」的得分连同航线预算定"
         )
         payload: dict[str, Any] = {
             "task_id": row.id,
@@ -2593,12 +2611,12 @@ class MissionScheduler:
             "with_readings": reading.usable,
             "dropped_unrated": reading.dropped_unrated,
             "in_window": len(reading.in_window),
-            "take": reading.take,
-            "selected": len(reading.selected),
-            "stale_selected": reading.stale,
+            "window_floor": reading.window_floor,
+            "eligible": len(reading.eligible),
+            "stale_eligible": reading.stale,
             "widened": reading.widened,
             "score_max_age_hours": reading.max_age.total_seconds() / 3600,
-            "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
+            "oldest_eligible_at_utc": None if oldest is None else oldest.isoformat(),
         }
         self._log_a_repeated_line(
             key=(row.id, "military_pool"),
@@ -2643,7 +2661,7 @@ class MissionScheduler:
         """
         key = (row.id, "military_widened")
         recovered: tuple[object, ...] = ("recovered",)
-        oldest = reading.oldest_selected_at
+        oldest = reading.oldest_eligible_at
         hours = reading.max_age.total_seconds() / 3600
         if not reading.widened:
             previous = self._repeated_lines.get(key)
@@ -2655,7 +2673,7 @@ class MissionScheduler:
                 level="INFO",
                 message=(
                     f"军力读数放宽窗口：已恢复。{hours:.1f} 小时窗口内有 "
-                    f"{len(reading.in_window)} 个目标，够军力截断要的 {reading.take} 个了，"
+                    f"{len(reading.in_window)} 个目标，够窗口门限要的 {reading.window_floor} 个了，"
                     "这一轮起重新只在窗口内选靶"
                 ),
                 payload={
@@ -2663,7 +2681,7 @@ class MissionScheduler:
                     "mission_kind": MissionKind.BOT.value,
                     "score_max_age_hours": hours,
                     "in_window": len(reading.in_window),
-                    "take": reading.take,
+                    "window_floor": reading.window_floor,
                     "with_readings": reading.usable,
                     "widened": False,
                 },
@@ -2673,9 +2691,9 @@ class MissionScheduler:
             return
         message = (
             f"军力读数放宽窗口：{hours:.1f} 小时窗口内只有 {len(reading.in_window)} 个目标，"
-            f"不够军力截断要的 {reading.take} 个，于是放弃窗口、"
-            f"在全部 {reading.usable} 个有读数的目标里按军力截断。"
-            f"这一轮选中的 {len(reading.selected)} 个里有 {reading.stale} 个来自窗口外，"
+            f"不够窗口门限要的 {reading.window_floor} 个，于是放弃窗口、"
+            f"改用全部 {reading.usable} 个有读数的目标。"
+            f"这一轮有资格被打的 {len(reading.eligible)} 个里有 {reading.stale} 个来自窗口外，"
             f"最旧读数 {'无' if oldest is None else f'{oldest:%Y-%m-%d %H:%M} UTC'}。"
             "要么等军力榜再扫一轮，要么把「军力分数有效期」调大到与扫描周期相称。"
         )
@@ -2684,11 +2702,11 @@ class MissionScheduler:
             "mission_kind": MissionKind.BOT.value,
             "score_max_age_hours": hours,
             "in_window": len(reading.in_window),
-            "take": reading.take,
+            "window_floor": reading.window_floor,
             "with_readings": reading.usable,
-            "selected": len(reading.selected),
-            "stale_selected": reading.stale,
-            "oldest_selected_at_utc": None if oldest is None else oldest.isoformat(),
+            "eligible": len(reading.eligible),
+            "stale_eligible": reading.stale,
+            "oldest_eligible_at_utc": None if oldest is None else oldest.isoformat(),
         }
         self._log_a_repeated_line(
             key=key,
@@ -2703,9 +2721,9 @@ class MissionScheduler:
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
         """**第 1 步，必须在最前**：排除本轮与「重复攻击间隔」之内已攻击的 bot。
 
-        若先拿前 N 再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
-        空集，较低排名、从未攻击的目标永远轮不到。排除必须在时间池与军力截断
-        的前面，随后再由距离给各出发星球分配。
+        若先挑一批再排除已攻击目标，首批刚好都打过时军力任务会把候选池缩成
+        空集，排名靠后、从未攻击的目标永远轮不到。排除必须在窗口筛选与得分排序
+        的前面，随后再按得分给各出发星球分配。
 
         间隔默认 24 小时（用户口径 2026-08-15），可在攻击配置页上改——
         它是策略不是游戏规则，见 `DEFAULT_BOT_REVISIT`。
@@ -3016,7 +3034,7 @@ def _origin_budgets(
     `domain.scheduler.account_free_lines` 上。
 
     ⚠️ **返回的仍是 `AttackOrigin`，而且这个预算就是要喂给
-    `assign_by_capacity_and_distance` 的那一个**，不是原样的
+    `assign_by_capacity_and_value` 的那一个**，不是原样的
     `mission_task_origins.fleet_lines`。这一点是「`has_work` 与 `_launch` 用同一把
     尺子」的结构性保证：预算为 0 的星球拿不到任何目标，于是**凡是分到了目标的
     出发点，一定至少还能派一发**，`_military_command` 那一路不可能再算出
@@ -3421,18 +3439,24 @@ def _bot_by_military(raw: str) -> bool:
     return bool(_params(raw).get("by_military", False))
 
 
-def _bot_top_n(raw: str) -> int:
-    """**军力截断**：在时间池里按军力取前几个。默认 `TOP_BY_MILITARY`（用户口径：100）。
+def _bot_window_floor(raw: str) -> int:
+    """**窗口门限**：窗口内至少要有这么多个目标，这一轮才肯只用窗口内的。
+    默认 `WINDOW_POOL_FLOOR`（用户口径：100）。
 
-    ⚠️ **它是一道截断，不是一次排序。** 后面按距离重排会把排序结果整个抹掉，
-    所以军力只在这里生效一次；填成 ≥ 时间池里的目标数就完全失效
-    （2026-08-18 之前它被填成 500 而可用候选只有 591，正是这个状态）。
+    ⚠️ **它不再决定打谁。** 2026-08-18 之前它是「窗口内按军力取前 N 个」那道硬
+    截断，现在第 4 步换成按 `军力 ÷ 往返小时` 排序，截断随之取消
+    （整段理由在 `domain.target_order` 模块头第 4 步）。**别照着旧名字理解它**。
+
+    参数里的键仍叫 `top_n`：生产库里存着的就是这个键，而它只是 `params_json` 里的
+    一个键、没有 DB 列。改名要么写一次迁移、要么让用户配好的数悄悄回落成默认值，
+    两样都比留着一个旧键贵。**页面上的文案改到位就够了**——用户看见的是文案，
+    看不见键名。
     """
     value = _params(raw).get("top_n")
     return (
         int(value)
         if isinstance(value, int | float | str) and str(value).strip()
-        else TOP_BY_MILITARY
+        else WINDOW_POOL_FLOOR
     )
 
 
