@@ -44,14 +44,23 @@ def database_url(tmp_path: Path) -> str:
     return scratch_database_url(tmp_path, "military-snapshot-migration.db")
 
 
-def test_the_history_has_exactly_one_head() -> None:
-    """整条迁移链只有一个 head，而且就是这一条。
+def test_the_history_has_exactly_one_head_and_this_revision_is_on_it() -> None:
+    """整条迁移链只有一个 head，而且这一条在通往它的路上。
 
     生产靠启动时 `alembic upgrade head` 自升，多一个 head 就是直接起不来。
+
+    ⚠️ **这里不再写死 head 的名字。** 这一条原本断言 head 就是 `c3f7a2b81d54`
+    本身，于是后面每接一条迁移都会把它撞红——而撞红的原因是「链条正常往前走了」，
+    不是「多了一个 head」，读起来正好相反。head 的身份由**最新那条迁移**自己的
+    用例钉（现在是 `test_attack_intent_military_estimated_migration`）；这一条
+    只管两件不随时间变的事：head 唯一，且这条迁移仍在链上。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1
+    head = script.get_heads()[0]
+    chain = {revision.revision for revision in script.iterate_revisions(head, "base")}
+    assert REVISION in chain, "这条迁移从链上掉下来了——真库升到 head 也不会有那两列"
 
 
 def test_upgrade_adds_two_nullable_columns(database_url: str) -> None:
