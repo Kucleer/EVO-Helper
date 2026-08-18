@@ -117,14 +117,20 @@ def test_the_extra_recipes_recover_a_line_the_old_four_could_not_read(ocr, path:
 
 @pytest.mark.parametrize("path", sorted(FULL_SHOTS))
 def test_the_original_four_recipes_really_could_not_read_these(ocr, path: str) -> None:  # type: ignore[no-untyped-def]
-    """把「为什么非补不可」钉住：原来那四套在这两张上确实全军覆没。
+    """把「为什么非补不可」钉住：最早那四套在这两张上确实全军覆没。
 
-    没有这条，日后有人把补的四套删掉会一路绿灯——上一条会因为原来那四套里
+    没有这条，日后有人把补的四套删掉会一路绿灯——上一条会因为最早那四套里
     某一套碰巧读出来而仍然通过。
-    """
-    from evo_helper.game.pirate_ui import FLIGHT_RECIPES as ORIGINAL
 
-    assert _read_flight(ocr, path, ORIGINAL) is None
+    ⚠️ **这四套在这里写死，不再从 `pirate_ui.FLIGHT_RECIPES` 取。** 那个元组
+    2026-08-18 又往后追加了六套（复标的依据在它自己的注释里），而这条用例说的
+    是「2026-08-13 之前那四套」这个历史事实，取当前值会让它随着每次追加而漂。
+    顺带一提：追加的那六套在这两张上也读得对（`(3, None)` 就中），
+    所以拿当前值去断言「读不出来」本身已经不成立了。
+    """
+    original = ((2, 120), (2, 100), (4, 120), (3, 120))
+
+    assert _read_flight(ocr, path, original) is None
 
 
 @pytest.mark.parametrize("path", sorted(FULL_SHOTS))

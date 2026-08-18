@@ -52,6 +52,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
+from evo_helper.domain.flight_estimate import (
+    FlightEstimate,
+    FlightSource,
+    predict_flight,
+    reconcile_flight,
+)
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.pirate_round import (
     PHASE_LABELS,
@@ -1341,61 +1347,189 @@ class PirateLoop:
         )
         return window
 
-    def _read_flight_time(self) -> timedelta | None:
-        """把简报上的飞行时间读下来，**必须在点「出发！」之前**。
+    def _read_arrival_flight(self) -> timedelta | None:
+        """「预计到达时间」减去读屏这一刻 = 还要飞多久。**主来源。**
+
+        那一行是 `16/08/2026 09:31:27`——纯数字加分隔符、**一个中文字都没有**，
+        恰好避开了飞行时间那一行全部失败的成因（`分` 读成 `5)`、`秒` 读成 `%`）。
+        49 张失败现场实测 47/47、零读错，标定证据在 `pirate_ui.ARRIVAL_RECIPES`。
+
+        ⚠️ **必须读两个 ROI 再拼**。实机版面把日期和时分秒排成两行，而本仓取字
+        一律 `--psm 7`（单行）：拿一个两行的框去读，49 张上读出来**全是空串**。
+
+        减法成立是量出来的：47 张实拍上
+        `到达时间 - 存图时刻 - 画面上的飞行时长` 落在 {-1 秒, 0 秒}——
+        到达时间是**每秒重算**的，本机时钟与游戏时钟也是同步的。
+        """
+        for upscale, threshold in pirate_ui.ARRIVAL_RECIPES:
+            # `now` 取在读屏之前：`_read` 每次自己截图，晚取会把 OCR 的耗时
+            # 算进飞行时长里。宁可让结果偏大一点点（多等一会儿去收战报），
+            # 也不要偏小（战报还没出来就去翻信箱）。
+            now = datetime.now(UTC)
+            date_text = self._read(
+                pirate_ui.BRIEFING_ARRIVAL_DATE_ROI, upscale=upscale, threshold=threshold
+            )
+            time_text = self._read(
+                pirate_ui.BRIEFING_ARRIVAL_TIME_ROI, upscale=upscale, threshold=threshold
+            )
+            arrival = parse_report_timestamp(f"{date_text} {time_text}", GAME_DISPLAY_ZONE)
+            if arrival is None:
+                continue
+            remaining = arrival - now
+            if remaining <= timedelta(0):
+                # 到达时间在过去，说明日期或时分秒里有一位读错了（同一张网格里
+                # `3×/None` 就把 `09:26:27` 读成过 `03:26:27`）。丢掉，换下一套。
+                continue
+            return remaining
+        return None
+
+    def _read_flight_time(self, coordinate: Coordinate) -> FlightEstimate:
+        """把简报上的飞行时长定下来，**必须在点「出发！」之前**。
 
         点完出发这一屏就没了，而这个时长是助手松手之后唯一的回程闹钟
-        （见 `domain.report_wait` 的模块头）。对应的那一列此前从来没被写入过——
-        实测库里 4 条派遣全是 NULL，于是整个「派出后松手、到点回来收战报」是死的。
+        （见 `domain.report_wait` 的模块头）。
 
         和任务类型那道闸门一样**要等它铺开**：页面是滑进来的，读一次读不到
         不代表这一行不存在（`_briefing_mission` 的注释记着同一个坑）。
 
-        读不出来返回 None，而**不是**拦下这一发：飞行时间只是闹钟，不是闸门。
-        为它加一道闸门等于让一次 OCR 抖动就废掉一发完全正常的攻击——
-        这条链路已经因为「ROI 与放大倍数不配」白白拦下过四发。
+        定不下来时返回 `flight=None` 的 `FlightEstimate`，而**不是**拦下这一发：
+        飞行时间只是闹钟，不是闸门。为它加一道闸门等于让一次 OCR 抖动就废掉
+        一发完全正常的攻击——这条链路已经因为「ROI 与放大倍数不配」白白拦下过四发。
 
-        读出来但大得离谱的，同样返回 None（见 `MAX_CREDIBLE_FLIGHT`）。
+        ## 2026-08-18：从「一个来源」改成「三个来源」
 
-        ⚠️ **只返回时长，不拼一个 `DispatchBriefing` 出来。** 那个类型带着
-        `mission_type` 与绝对到达时间两个字段，而这里两样都没有证据：任务类型的闸门
-        在这之后才跑，绝对到达时间的 ROI（`BRIEFING_ARRIVAL_ROI`）还没标定。
-        硬填的话 `duration_agrees()` 会变成 `now+flight` 和 `now+flight` 相比——
-        一道交叉校验降级成同义反复，比没有更糟：下一个人会以为它验过了。
-        正因为这里拿不到第二个来源，才需要 `MAX_CREDIBLE_FLIGHT` 那道上界。
+        原先只读飞行时间那一行，实机 24 小时 62 发里读不出 14 发（23%），每次
+        白占约 44 分钟航线。**加配方救不回来**：49 张失败现场上，零读错的配方
+        全部取并集也只覆盖 23/47（详见 `pirate_ui.FLIGHT_RECIPES` 那段复标）。
+        真正的修法是换来源——判据与三者怎么合成写在
+        `domain.flight_estimate`，这里只负责把三样东西读齐。
+
+        ⚠️ 上一版这里写着「不拼 `DispatchBriefing`，因为绝对到达时间的 ROI
+        还没标定」。**那个前提没有了**：ROI 现在标定过了，两个来源都在手上，
+        `duration_agrees()` 那道交叉校验也不再是同义反复。
         """
-        flight: timedelta | None = None
+        arrival_flight: timedelta | None = None
+        duration_flight: timedelta | None = None
+        speed = percent = ""
 
         def read_once() -> bool:
-            nonlocal flight
-            # 逐个配方试。**必须二值化**：这一行是绿字压在蓝底上，灰度化之后
-            # 对比度不够，调用方原先用的默认（3× 不二值化）在实机上读出来是
-            # `'-'`——见 `pirate_ui.FLIGHT_RECIPES` 的注释。
+            nonlocal arrival_flight, duration_flight, speed, percent
+            # 先读飞行时间那一行：它读得出来的时候很便宜（第一套配方就中），
+            # 读不出来才会把整张配方表烧完，而那时到达时间那一路会兜住。
             for upscale, threshold in FLIGHT_RECIPES:
                 text = self._read(
                     pirate_ui.BRIEFING_FLIGHT_ROI, upscale=upscale, threshold=threshold
                 )
-                flight = parse_game_duration(text)
-                if flight is not None:
-                    return True
-            return False
+                duration_flight = parse_game_duration(text)
+                if duration_flight is not None:
+                    break
+            arrival_flight = self._read_arrival_flight()
+            speed = self._read(pirate_ui.BRIEFING_SPEED_ROI)
+            percent = self._read(pirate_ui.BRIEFING_SPEED_PERCENT_ROI)
+            # 判据挂在**到达时间**上而不是「两个都读到」：它是主来源，实测
+            # 47/47；要求两个都读到的话，飞行时间那一行 23% 的失败会把
+            # `_settle` 的重试全烧掉，而那 23% 是**确定性**的失败
+            # （同一像素每次读出同样的乱码），重试一次都救不回来。
+            return arrival_flight is not None
 
-        if not self._settle(read_once, tries=FLIGHT_SETTLE_TRIES) or flight is None:
-            # 一套配方都没读出来时**必须留下像素**。这一行现在是两个钟的唯一来源
-            # （战报到点时刻 + 航线空出时刻），读不出来的代价是那一发按
-            # `UNKNOWN_LINE_HOLD`（90 分钟）占着航线；而只留一句话的话，
-            # 下一次查这件事只能靠猜——2026-08-13 收紧解析判据之后正是如此。
-            say("  简报上读不到飞行时间；这一发照派，回程闹钟留空")
-            self._dump_frame("briefing-flight-unreadable", pirate_ui.BRIEFING_FLIGHT_ROI)
-            return None
-        if flight > MAX_CREDIBLE_FLIGHT:
+        self._settle(read_once, tries=FLIGHT_SETTLE_TRIES)
+
+        if duration_flight is not None and duration_flight > MAX_CREDIBLE_FLIGHT:
             # 宁可白跑一趟，也不要安安静静等一个读错的钟。
             say(
-                f"  简报上的飞行时间读作 {flight}，超过 {MAX_CREDIBLE_FLIGHT} 的上界；"
-                "当读错处理，回程闹钟留空"
+                f"  飞行时间那一行读作 {duration_flight}，"
+                f"超过 {MAX_CREDIBLE_FLIGHT} 的上界；当读错处理"
             )
-            return None
-        return flight
+            duration_flight = None
+        if arrival_flight is not None and arrival_flight > MAX_CREDIBLE_FLIGHT:
+            say(
+                f"  按到达时间算要飞 {arrival_flight}，"
+                f"超过 {MAX_CREDIBLE_FLIGHT} 的上界；当读错处理"
+            )
+            arrival_flight = None
+
+        estimate = reconcile_flight(
+            arrival_flight=arrival_flight,
+            duration_flight=duration_flight,
+            model_flight=predict_flight(
+                coordinate,
+                self._options.origin or origin(),
+                speed=speed,
+                percent=percent,
+            ),
+        )
+        self._record_flight_estimate(coordinate, estimate, speed=speed, percent=percent)
+        return estimate
+
+    def _record_flight_estimate(
+        self,
+        coordinate: Coordinate,
+        estimate: FlightEstimate,
+        *,
+        speed: str,
+        percent: str,
+    ) -> None:
+        """把这一发的时长是**谁给的**留在日志里，读不出来时连像素一起留。
+
+        ⚠️ **只在「不是主来源一口价读出来」时写。** 正常那一路（到达时间读到、
+        与飞行时间吻合）每发都会走到，每发都写就是每 tick 一条——仓库里
+        `record_unrecognised_screen` 的 120 秒限流是同一个道理。
+
+        三类必须留痕，这里覆盖后两类（CLAUDE.md）：判据把一个读数挡掉的那一刻
+        （说清为什么 + 当时三个来源各是什么），以及彻底定不下来的失败
+        （连整帧一起存）。
+        """
+        healthy = (
+            estimate.source is FlightSource.BRIEFING_ARRIVAL
+            and estimate.duration_flight is not None
+        )
+        if healthy:
+            return
+
+        def show(value: timedelta | None) -> str:
+            return "（无）" if value is None else str(value)
+
+        payload = {
+            "target": str(coordinate),
+            "source": None if estimate.source is None else estimate.source.value,
+            "reason": estimate.reason,
+            "arrival_flight_seconds": (
+                None
+                if estimate.arrival_flight is None
+                else int(estimate.arrival_flight.total_seconds())
+            ),
+            "duration_flight_seconds": (
+                None
+                if estimate.duration_flight is None
+                else int(estimate.duration_flight.total_seconds())
+            ),
+            "model_flight_seconds": (
+                None
+                if estimate.model_flight is None
+                else int(estimate.model_flight.total_seconds())
+            ),
+            "speed_raw": speed,
+            "speed_percent_raw": percent,
+            "target_kind": self.TARGET_KIND,
+        }
+        say(
+            f"  飞行时长按 {payload['source'] or '（定不下来）'} 记："
+            f"到达时间 {show(estimate.arrival_flight)}／"
+            f"飞行时间 {show(estimate.duration_flight)}／"
+            f"公式 {show(estimate.model_flight)}；{estimate.reason}"
+        )
+        if estimate.flight is None:
+            # 三个来源都没有值时**必须留下像素**：这一发要按
+            # `UNKNOWN_LINE_HOLD`（90 分钟）占航线，而只留一句话的话，
+            # 下一次查这件事只能靠猜——2026-08-13 收紧解析判据之后正是如此。
+            self._dump_frame("briefing-flight-unreadable", pirate_ui.BRIEFING_FLIGHT_ROI)
+        record_system_log(
+            "WARNING" if estimate.flight is None else "INFO",
+            "tools.pirate_loop",
+            f"{coordinate} 的飞行时长按 {payload['source'] or '（定不下来）'} 记："
+            f"{estimate.reason}",
+            payload=payload,
+        )
 
     def _require_origin_before_dispatch(self, coordinate: Coordinate) -> None:
         """**每一发派遣之前**回读派遣面板的「起点」，与这一轮记账用的出发星比对。
@@ -1581,7 +1715,7 @@ class PirateLoop:
         # `_read_flight_time` 里 `_settle` 的重试（约 3 秒），`_launch` 里还会再走
         # 一遍，于是**每发侦察多花约 6 秒、一轮 4 发就是 24 秒**。那是 ROI 没对上的
         # 症状，不是别的毛病——第一次实机发现侦察变慢，先去核这个 ROI。
-        flight = self._read_flight_time()
+        flight = self._read_flight_time(coordinate)
         if not self._launch(coordinate, "侦察"):
             self._leave_dispatch_list()
             return False
@@ -1649,7 +1783,7 @@ class PirateLoop:
         # ⚠️ **这一行必须留在 `_launch` 之前。** 点完「出发！」简报页就没了，
         # 挪到后面读，四次重试全会落空，飞行时间永久恒为 NULL——而且一声不响，
         # 看起来只是「一直在等」。
-        flight = self._read_flight_time()
+        flight = self._read_flight_time(coordinate)
         timer.lap("简报")
         if not self._launch(coordinate, "攻击"):
             timer.say_total("点不出「出发」")
@@ -3049,17 +3183,22 @@ class PirateLoop:
     def _record_dispatch(
         self,
         intent_id: UUID,
-        flight: timedelta | None,
+        estimate: FlightEstimate,
         *,
         mission_kind: str = MISSION_KIND_ATTACK,
     ) -> None:
-        """记下这一发，并把简报上的飞行时间存成回程闹钟。
+        """记下这一发，并把简报上的飞行时长存成回程闹钟。
 
-        读不到时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
+        定不下来时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
         而不是无限等一个不知道何时抵达的战报。
 
         `mission_kind` 默认攻击。侦察发必须显式传 `SCOUT`：它占航线但不消耗
         当日 32 次的攻击配额，也不会产生战报，三笔账靠这一个字段分开。
+
+        ⚠️ 收的是整个 `FlightEstimate` 而不是一个裸 `timedelta`：**来源要跟着
+        值一起落库**。三个来源的可信度差着数量级，而
+        `docs/预计战报时间-估算方案.md` 第 2 条早就写死了「估算值绝不能长得像
+        实测值」。
         """
         repository, _run_id = self._ensure_run()
         dispatch_id = uuid4()
@@ -3073,7 +3212,9 @@ class PirateLoop:
                 mission_kind=mission_kind,
             )
         )
-        repository.record_flight_time(dispatch_id, flight, dispatched_at)
+        repository.record_flight_time(
+            dispatch_id, estimate.flight, dispatched_at, source=estimate.source
+        )
 
     # -- 会话 ---------------------------------------------------------------
 

@@ -231,6 +231,20 @@ class AttackDispatchRow(Base):
     #: 助手派出后就松手，靠这个时间决定什么时候回来登录收报告。
     #: 读不到飞行时间时为 NULL——那时改为立即尝试收取，而不是无限等待。
     flight_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 下面两个钟是**谁给的**（`domain.flight_estimate.FlightSource` 的取值）。
+    #:
+    #: ⚠️ **`flight_seconds` 只装读出来的数**。来源是 `distance_model` 时这一列
+    #: 是 `distance_model`，而 `flight_seconds` **仍然是 NULL**——那个数是
+    #: `domain.flight_time` 的距离公式**算**出来的，不是从屏幕上量的。这条规矩
+    #: 不是本次发明的，`docs/预计战报时间-估算方案.md` 第 2 条就写着「估算值也
+    #: 不要写进 `flight_seconds` 列，免得污染 `vet_flight_time` 的校准样本」——
+    #: 那一列正是 `MIN_CREDIBLE_ATTACK_FLIGHT` 那道下限赖以标定的样本池，
+    #: 掺进算出来的值，下一次标定就是拿模型的输出去标定模型。
+    #: 要取算出来的那个值，用 `expected_report_at_utc - dispatched_at_utc`。
+    #:
+    #: ⚠️ **可空，不是 `default`。** 存量行不知道当时的数怎么来的，NULL 才是
+    #: 实话——同 `target_military_score_estimated` 那一段的理由。
+    flight_source: Mapped[str | None] = mapped_column(String(24), nullable=True)
     expected_report_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: **第二个钟**：这条航线什么时候空出来（出发 + 飞行时长 × 1 或 × 2，
     #: 见 `domain.report_wait.line_free_at`）。与上面那一列是两个不同的时刻——
