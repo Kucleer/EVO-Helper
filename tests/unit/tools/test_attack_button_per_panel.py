@@ -23,6 +23,8 @@ from evo_helper.tools.bot_loop import BotLoop
 from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop
 
 TARGET = Coordinate(2, 137, 14)
+#: 本轮配的出发星球。派出之前的起点闸门要拿它跟派遣面板的回读比。
+ORIGIN = Coordinate(2, 137, 18)
 
 
 class _Driver:
@@ -48,8 +50,11 @@ def _loop(cls: type, monkeypatch: Any) -> tuple[Any, _Driver]:
     loop._driver = driver
     loop._navigator = _Navigator()
     loop._outcome = Outcome()
-    loop._options = LoopOptions(systems=(), scout=False, attack=True)
+    loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=ORIGIN)
     loop._preset_names = lambda: []
+    # 起点闸门排在选预设之前，读的是派遣面板「起点」那一行。让它读到本轮配的那颗，
+    # 这几条用例才走得到预设那一步；闸门自己另有专文。
+    loop._read_coord_line = lambda _roi, _upscale, _resample: str(ORIGIN)
 
     class _Picker:
         def __init__(self, **_kwargs: Any) -> None:
