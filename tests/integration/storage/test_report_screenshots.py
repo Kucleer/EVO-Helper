@@ -144,6 +144,42 @@ class TestAskingWhichReportsHaveOne:
         assert ReportScreenshotRepository(session_factory).has_screenshots([]) == set()
 
 
+class TestListingEveryImage:
+    """`list_refs` 给离线重跑用：先拿清单，再逐张取字节。"""
+
+    def test_the_refs_come_back_oldest_first(self, session_factory: sessionmaker[Session]) -> None:
+        """顺序固定，两次干跑的输出才对得起来——顺序一变，人就没法对着看。"""
+        repository = ReportScreenshotRepository(session_factory)
+        older = _report(session_factory)
+        newer = _report(session_factory)
+        repository.save(newer, image_bytes=PIXELS, width=520, height=695, captured_at_utc=NOW)
+        repository.save(
+            older,
+            image_bytes=PIXELS,
+            width=520,
+            height=695,
+            captured_at_utc=NOW - timedelta(hours=3),
+        )
+
+        refs = repository.list_refs()
+
+        assert [ref.report_id for ref in refs] == [older, newer]
+
+    def test_the_metadata_is_there_but_the_bytes_are_not(
+        self, session_factory: sessionmaker[Session]
+    ) -> None:
+        """⚠️ 清单里**没有字节**。这张表最多能到近百 MB，数一数不该把它全拉回来。"""
+        repository = ReportScreenshotRepository(session_factory)
+        report_id = _report(session_factory)
+        repository.save(report_id, image_bytes=PIXELS, width=520, height=695, captured_at_utc=NOW)
+
+        ref = repository.list_refs()[0]
+
+        assert (ref.width, ref.height, ref.image_format) == (520, 695, "webp")
+        assert ref.byte_size == len(PIXELS)
+        assert not hasattr(ref, "image_bytes")
+
+
 class TestRetention:
     def _rows(self, session_factory: sessionmaker[Session]) -> int:
         with session_factory() as session:
