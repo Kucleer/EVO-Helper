@@ -13,6 +13,10 @@
 
 CSS 本身在这里测不了（没有浏览器），所以分两条钉：一条钉数据完整，一条钉那一格
 确实挂上了限宽用的类——两条都在，才既没删数据、又真的折叠了。
+
+第三节是 PR #183 加的：新增「目标军力」一列之后，这一页**不许把上面那件事撞回去**。
+没有浏览器量不了真实布局，所以照着 console.css 里那几个标定量把版面**算一遍**——
+定宽列的量值加上「战果」列的上限，在 1280 与 1920 下都要放得进容器。
 """
 
 from __future__ import annotations
@@ -139,8 +143,12 @@ def _client(tmp_path: Path) -> TestClient:
     return TestClient(create_persistent_app(factory))
 
 
-#: 「战果」是表头里的第 8 列（1 起数）。
-OUTCOME_COLUMN = 8
+#: 「战果」是表头里的第 9 列（1 起数）。
+#:
+#: PR #183 在「目标」后面插了「目标军力」，它此前是第 8 列。**这个常量跟着列序走**
+#: ——不跟的话下面三条会去量「预设」那一格，然后以「没挂 `.log-body`」红掉，
+#: 而真正的毛病其实在别处。
+OUTCOME_COLUMN = 9
 
 
 def _outcome_cell(html: str) -> str:
@@ -206,14 +214,8 @@ def test_the_outcome_column_reuses_the_shared_width_cap(tmp_path: Path) -> None:
     assert cell.count('class="log-line muted"') == 2
 
 
-def test_the_shared_truncation_rules_are_actually_in_the_stylesheet(tmp_path: Path) -> None:
-    """光在 HTML 上挂类名没有用：规则不在样式表里，那两个类就只是装饰。
-
-    连同这一页自己的那个收窄值一起钉住——系统日志只有 7 列，它的 46vw 放到这张
-    9 列表上仍然溢出（1920 下量到 1854px > 容器 1650px），所以这一页必须自己给
-    `--log-body-cap` 一个值。
-    """
-    css = (
+def _console_css() -> str:
+    return (
         Path(__file__).resolve().parents[2]
         / "src"
         / "evo_helper"
@@ -222,9 +224,106 @@ def test_the_shared_truncation_rules_are_actually_in_the_stylesheet(tmp_path: Pa
         / "console.css"
     ).read_text(encoding="utf-8")
 
+
+def test_the_shared_truncation_rules_are_actually_in_the_stylesheet(tmp_path: Path) -> None:
+    """光在 HTML 上挂类名没有用：规则不在样式表里，那两个类就只是装饰。
+
+    连同这一页自己的那个收窄值一起钉住——系统日志只有 7 列，它的 46vw 放到这张
+    9 列表上仍然溢出（1920 下量到 1854px > 容器 1650px），所以这一页必须自己给
+    `--log-body-cap` 一个值。
+    """
+    css = _console_css()
+
     assert ".log-body { max-width: var(--log-body-cap" in css
     assert "text-overflow: ellipsis" in css
     assert "tr:hover .log-line" in css
     assert "#log-entries { --log-body-cap:" in css
     # 网格子项默认不肯比内容窄，宽表格会把**整页**顶宽——那是这次的另一半元凶。
     assert "grid-template-columns: minmax(0, 1fr)" in css
+
+
+# -- 三、加了「目标军力」之后，两种屏宽下仍然放得进容器 --------------------------
+
+#: 视口宽减去表格容器宽：左侧导航加内外边距。
+#:
+#: 从 console.css 里那两句量值倒推出来的同一个数——1280 下容器 1010px、1920 下
+#: 1650px，两边都差 270px。它跟着屏宽不变，因为导航是定宽的。
+CHROME_PX = 270
+
+#: 折行之后那些定宽列合计多宽。
+#:
+#: 788px = 原先八列的 714px（console.css 里量的）+ 「目标军力」那一列 74px。
+#: 新列按**最宽的那种写法**量：`1,234,567` 加一个角标，一行约 70px，留到 74px。
+#: 读数时刻藏在角标的 `title` 里，不占版面——那一格只有一行。
+#:
+#: ⚠️ 这些不是偏好项，是按版面量出来的标定量（同 console.css 里那段警告）。
+FIXED_COLUMNS_PX = 714 + 74
+
+#: 「战果」那一列的上限公式里那个百分比（`min(32vw, …)`）。
+_CAP_RULE = re.compile(
+    r"#log-entries \{ --log-body-cap: min\((\d+)vw, calc\(100vw - (\d+)rem\)\); \}"
+)
+
+#: `rem` 相对根元素字号；这一页没有改 `html { font-size }`，所以是浏览器默认的 16px。
+REM_PX = 16
+
+
+def _cap_px(viewport_px: int) -> float:
+    """按 console.css 里那条公式算出「战果」列此刻的上限。"""
+    match = _CAP_RULE.search(_console_css())
+    assert match is not None, "console.css 里找不到 `--log-body-cap` 那条公式，核算无从谈起"
+    ratio_vw, reserve_rem = int(match.group(1)), int(match.group(2))
+    return min(viewport_px * ratio_vw / 100, viewport_px - reserve_rem * REM_PX)
+
+
+def test_the_wrapping_columns_follow_the_new_column_order() -> None:
+    """折行名单跟着列序走：「目标军力」是第 5 列，「预计战报」挪到了第 10。
+
+    这一条钉的是「插列之后别忘了改序号」。「预计战报」留在第 9 的话，折行会落在
+    「战果」那一格——它本来就折行，看不出任何异样——而真正需要折行的「预计战报」
+    一声不响地把表撑宽，正是 PR #178 收拾过的那个症状。
+
+    「目标军力」留在名单里是道便宜的保险：那一格现在只有一行（分数 + 角标，
+    时刻藏在 `title` 里），折不折都一样；哪天它再长出内容，宁可折行也不要顶宽。
+    """
+    css = _console_css()
+    wrap_rule = css[css.index("#log-entries th:nth-child(1)") :].split("}")[0]
+
+    assert "nth-child(5)" in wrap_rule, "「目标军力」那一列被漏出了折行名单"
+    assert "nth-child(10)" in wrap_rule, "「预计战报」的序号没跟着插列挪，折行落到了别的列上"
+    assert "nth-child(9)" not in wrap_rule, "第 9 列是「战果」，它走 `.log-body`，不该在折行名单里"
+
+
+def test_the_ten_column_table_still_fits_at_1280_and_1920() -> None:
+    """定宽列 + 「战果」列上限，在 1280 与 1920 下都放得进容器。
+
+    这是 PR #178 那件事的守卫：加一列而不把 `--log-body-cap` 的预留一起调大，
+    新列的宽度就是白拿的，横向滚动条原样回来。1280 是最紧的那一档——1920 下
+    上限被 32vw 卡住，反而宽松。
+
+    没有浏览器量不了真实布局，所以照着 console.css 自己写下的标定量算一遍：
+    公式从样式表里读，量值写在上面的常量里。有人把预留改回 62rem，这一条当场红。
+    """
+    for viewport in (1280, 1920):
+        cap = _cap_px(viewport)
+        assert cap > 0, f"{viewport} 下「战果」列的上限算成了 {cap}px，那一列会整个塌掉"
+        table = FIXED_COLUMNS_PX + cap
+        container = viewport - CHROME_PX
+        assert table <= container, (
+            f"{viewport} 下整张表 {table:.0f}px 超过容器 {container}px——横向滚动条回来了"
+        )
+
+
+def test_the_score_column_sits_next_to_the_target_column(tmp_path: Path) -> None:
+    """表头是 10 列，且「目标军力」紧跟在「目标」后面。
+
+    位置本身是这一列的用处的一半：它回答的是「当时凭什么打这个坐标」，摆到表尾
+    就得来回扫视。顺带钉住列数——上面那两条按序号算的核算全都建立在它上面。
+    """
+    html = _client(tmp_path).get("/logs").text
+    head = html[html.index("<thead") : html.index("</thead>")]
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", head, re.DOTALL)
+
+    assert len(headers) == 10, f"表头是 {len(headers)} 列，按序号写的那些 CSS 规则要跟着改"
+    assert headers[3].strip() == "目标"
+    assert headers[4].strip() == "目标军力"

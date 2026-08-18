@@ -122,6 +122,12 @@
 #}
 <section class="panel" id="log-entries" data-refresh aria-labelledby="log-table">
   <h2 id="log-table">派遣记录 <span class="muted">（{{ entries | length }} 条）</span></h2>
+  {#
+    「目标军力」是 2026-08-18 才开始记的。在那之前派出去的那些发次没有这个观测，
+    整列显示「—」。**必须在页面上说出来**：不然一屏「—」读起来就是「那时候的
+    目标都没有军力读数」，而实际是「当时没记这件事」——两句话会把复盘引向反方向。
+  #}
+  <p class="muted" style="font-size:12px">「目标军力」是派出那一刻抄下来的读数，<strong>自 2026-08-18 起记录</strong>；更早的发次没有这个观测，显示「—」。</p>
   <div class="table-wrap">
     <table>
       <thead>
@@ -130,6 +136,8 @@
           <th scope="col">发动时间（现实 UTC+8）</th>
           <th scope="col">事件类型</th>
           <th scope="col">目标</th>
+          {# 紧挨着「目标」：这一列回答的是「当时凭什么打它」，隔开就得来回扫视。 #}
+          <th scope="col">目标军力</th>
           <th scope="col">出发</th>
           <th scope="col">预设</th>
           <th scope="col">结果</th>
@@ -152,6 +160,45 @@
               <span class="glyph" aria-hidden="true">{{ kind_glyphs.get(entry.target_kind, '•') }}</span>{{ kind_labels.get(entry.target_kind, entry.target_kind) }}</span>
           </td>
           <td><a href="/targets/{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}?back=%2Flogs">{{ entry.target.galaxy }}:{{ entry.target.system }}:{{ entry.target.position }}</a></td>
+          {#
+            派这一发时看到的目标军力，取自 `attack_intents` 上的**快照**。
+
+            ⚠️ **绝不改成现取 `bot_targets.military_score`。** 那一行每采一次军力榜
+            就被整行覆盖（生产实测 2026-08-18，同一批目标一天内从 31,756 刷到
+            2,616），现取答的是「它现在多强」，而这一格要答的是「当时凭什么打它」。
+
+            ⚠️ **没有读数写「—」，不写 0。** 海盗位在 `bot_targets` 里没有行、
+            还没上过榜的 bot 有行但没读数；而被打空的 bot 军力真的是 0。
+            两者在这一格上必须分得开（判据在 `display.military_score_text`）。
+
+            ⚠️ **2026-08-18 之前的意图没有这个快照，照实显示「—」。** 拿现值回填
+            历史行就是把编造写成观测——表头下面那句话交代了这一列从什么时候起有。
+
+            读数时刻和分数放在一起：只有分数不够。2026-08-17 一整天的排障反复卡在
+            「这个分数是什么时候读的」，实机 10:30 打过一个读数已经 24 小时前的目标。
+          #}
+          <td class="score-cell">
+            {{ military_score_text(entry.target_military_score) }}{#
+              读数时刻藏在角标的 `title` 里，鼠标停上去才出来。
+
+              ⚠️ **不再平铺成第二行。** 这一页刚为宽度打过两轮（#178 限宽、#183 加列），
+              每一格多一行就是整表多一行高度，而「这个分数什么时候读的」是**排查时**
+              才要的一句，不该常驻占地方。
+
+              ⚠️ **走原生 `title`，不自绘 tooltip。** 零 JS、零 CSS 定位，撞不回宽度那件事；
+              这一页早有先例——收获那几项的误差范围就放在 `title` 上
+              （`display.resource_precision_hint`）。
+
+              ⚠️ **没有快照就整个不出现这个角标**，不是挂一个空的 tooltip：历史行
+              （2026-08-18 之前派出的那些）本来就没有这个观测，摆一个点上去什么都没有的
+              角标，比没有角标更难判断「到底是没记还是没读到」。
+              两列是一起写进去的（`storage.repository.save_attack_intent`），所以判据取
+              时刻那一列——它是 `title` 的全部内容。
+
+              时刻按现实时间 UTC+8，同这一页其它时刻列；tooltip 里没有表头，所以时区
+              要写在文字里。
+            #}{% if entry.target_military_score_at_utc %}<span class="score-tip" title="派出时的读数：{{ local_time(entry.target_military_score_at_utc) }}（现实 UTC+8）">ⓘ</span>{% endif %}
+          </td>
           <td class="muted">{{ entry.origin.galaxy }}:{{ entry.origin.system }}:{{ entry.origin.position }}</td>
           <td>
             {# 侦察发与攻击发在这一页混排，而它们等的东西完全不同（见右边那一格）。
@@ -268,7 +315,7 @@
           <td class="muted">{{ local_time(entry.expected_report_at_utc) }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="9" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>
+        <tr><td colspan="10" class="muted">还没有攻击记录。攻击侦查或海盗攻击模式跑起来之后，每一发都会记在这里。</td></tr>
       {% endfor %}
       </tbody>
     </table>

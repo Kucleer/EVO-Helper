@@ -73,6 +73,7 @@ from .display import (
     STATUS_TONES,
     TARGET_KIND_GLYPHS,
     TARGET_KIND_TONES,
+    military_score_text,
     payload_image,
     payload_text,
     resource_amount_text,
@@ -1013,6 +1014,9 @@ def create_app(
                 "mission_kind_glyphs": MISSION_KIND_GLYPHS,
                 # 收获那一行。槽位到名字的翻译**只在这里发生**：库里存的是位置，
                 # 名字是解释（`domain.battle_resources` 模块头）。
+                # 「目标军力」那一列的写法。**没有读数写「—」，绝不写 0**——
+                # 整段理由在 `display.military_score_text` 上。
+                "military_score_text": military_score_text,
                 "resource_label": slot_label,
                 "resource_amount_text": resource_amount_text,
                 "resource_precision_hint": resource_precision_hint,

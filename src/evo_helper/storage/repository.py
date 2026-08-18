@@ -433,6 +433,34 @@ class SqlAlchemyRepository:
             return len(rows)
 
     def save_attack_intent(self, intent: object) -> None:
+        """写下一次攻击意图，**顺手把当时看到的目标军力快照进去**。
+
+        ## 为什么军力必须在这里落一份
+
+        `bot_targets.military_score` 是**当前值**，每采一次军力榜就整行覆盖——
+        生产实测（2026-08-18）同一批目标一天之内从 31,756 刷到 2,616。攻击日志
+        事后拿它去 join，答的是「它现在多强」；而那一列要答的是「当时我凭什么
+        打它」。两者在复盘时恰好相反，所以只能在**做出判断的那一刻**抄一份。
+
+        ## 为什么抄在这里，而不是让调用方传进来
+
+        - **同一个事务、同一份 session**：读 `bot_targets` 与插 `attack_intents`
+          之间没有窗口，扫描线程再快也插不进来。放到调用方去读，中间就多出一段
+          「读完还没写」的空档。
+        - **两条写意图的链路都跑这里**（`tools.pirate_loop._record_intent` 与
+          `application.workflow.IntegrationWorkflow.scan_once`）。搁在调用方，
+          将来新增第三条链路只会静默地少一列，而少的那一列长得和「本来就没读数」
+          一模一样。
+        - `save_dispatch` 早就是这个形状（在同一个 session 里回写
+          `bot_targets.last_dispatch_at_utc`），这里只是照着同一条缝再走一次。
+
+        ## 没有读数就是 NULL
+
+        海盗位在 `bot_targets` 里根本没有行（`is_bot_coordinate` 把 1--4 号位挡在
+        外面），还没上过榜的 bot 有行但 `military_score` 是 NULL。两种都快照成
+        NULL，页面显示「—」。**绝不拿 0 顶替**：被打空的 bot 军力真的是 0，
+        「读数是 0」和「没有读数」在日志上必须分得开。
+        """
         record = _require_type(intent, AttackIntent, "attack intent")
         _require_utc(record.cycle_start_utc, "cycle_start_utc")
         _require_utc(record.created_at_utc, "created_at_utc")
@@ -449,6 +477,7 @@ class SqlAlchemyRepository:
             )
             if existing is not None:
                 raise StorageConflictError("duplicate attack intent for run/target/cycle")
+            seen = _bot_target_for(session, record.target)
             session.add(
                 orm.AttackIntentRow(
                     id=record.intent_id,
@@ -466,6 +495,11 @@ class SqlAlchemyRepository:
                     forced_revisit=record.forced_revisit,
                     created_at_utc=record.created_at_utc,
                     target_kind=record.target_kind,
+                    # 没有这一行、或者这一行还没有军力读数时，两列一起留 NULL。
+                    target_military_score=None if seen is None else seen.military_score,
+                    target_military_score_at_utc=(
+                        None if seen is None else seen.military_score_at_utc
+                    ),
                 )
             )
             session.commit()

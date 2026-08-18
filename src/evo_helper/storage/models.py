@@ -160,6 +160,24 @@ class AttackIntentRow(Base):
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     #: `bot` 或 `pirate`（见 `domain.records.TARGET_KIND_*`）。攻击日志按它分类。
     target_kind: Mapped[str] = mapped_column(String(16), default="bot", server_default="bot")
+    #: **派这一发的那一刻，这个目标的军力读数是多少**，以及那个读数是什么时候读到的。
+    #:
+    #: ⚠️ **这是快照，不是外键。** 值在写意图的同一个事务里从 `bot_targets` 抄过来
+    #: （见 `storage.repository.save_attack_intent`），此后再不跟着变。日志页
+    #: **绝不许**改成现取 `bot_targets.military_score`：那一行每采一次军力榜就整行
+    #: 覆盖（生产实测 2026-08-18，同一批目标一天内从 31,756 刷到 2,616），事后现取
+    #: 答的是「它现在多强」，而这一列要答的是「当时我凭什么打它」。
+    #:
+    #: ⚠️ **NULL 不是 0。** 没有军力读数的目标（海盗位、还没上过榜的 bot）快照为
+    #: NULL；被打空的 bot 军力真的是 0。两者在页面上必须分得开，所以缺省不给值，
+    #: 也**绝不拿现值回填历史行**——那是把编造写成观测。
+    target_military_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: 上面那个分数是什么时候读到的。**只有分数不够**：2026-08-17 一整天的排障
+    #: 反复卡在「这个分数是什么时候读的」，实机 10:30 打过一个读数已经 24 小时前的
+    #: 目标，而日志上完全看不出来。
+    target_military_score_at_utc: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True
+    )
 
 
 class AttackDispatchRow(Base):
