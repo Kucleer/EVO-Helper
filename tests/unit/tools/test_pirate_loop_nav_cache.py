@@ -48,6 +48,9 @@ from evo_helper.game.system_navigator import (
 from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop
 
 TARGET = Coordinate(2, 320, 11)
+#: 这一轮配的出发星球。派出之前那道起点闸门要拿它跟派遣面板的回读比
+#: （`PirateLoop._require_origin_before_dispatch`），所以两边都得给。
+ORIGIN = Coordinate(2, 137, 18)
 
 
 class _Driver:
@@ -72,8 +75,14 @@ def _loop(monkeypatch: Any, *, preset_found: bool) -> tuple[Any, _Navigator]:
     loop._driver = _Driver()  # type: ignore[attr-defined]
     loop._navigator = navigator  # type: ignore[attr-defined]
     loop._outcome = Outcome()  # type: ignore[attr-defined]
-    loop._options = LoopOptions(systems=(), scout=False, attack=True)  # type: ignore[attr-defined]
+    loop._options = LoopOptions(  # type: ignore[attr-defined]
+        systems=(), scout=False, attack=True, origin=ORIGIN
+    )
     loop._preset_names = lambda: []  # type: ignore[attr-defined, assignment]
+    # 起点闸门读的是派遣面板那一行；这里让它读到「就是本轮配的那颗」，
+    # 好让这几条用例照旧走到预设那一步。闸门本身另有专文
+    # （`test_pirate_loop_origin_gate.py`）。
+    loop._read_coord_line = lambda _roi, _upscale, _resample: str(ORIGIN)  # type: ignore[attr-defined, assignment, method-assign]
 
     class _Picker:
         def __init__(self, **_kwargs: Any) -> None:

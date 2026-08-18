@@ -13,6 +13,7 @@ from evo_helper.domain.planet_switch import (
     find_row,
     list_exhausted,
     origin_confirmed,
+    origin_in,
     rows_from_words,
     switch_needed,
 )
@@ -139,6 +140,37 @@ class TestConfirmingTheSwitch:
         assert origin_confirmed("", HOME) is False
         assert origin_confirmed("2137:18", HOME) is False
         assert origin_confirmed("起点", HOME) is False
+
+
+class TestSayingWhichPlanetWasRead:
+    """`origin_in` 把「读到的是哪一颗」单独交出来，判定与日志共用同一个解析器。
+
+    两边各写一遍解析，迟早会出现「判据说对不上、日志说对得上」这种自相矛盾的
+    记录——而那正是 2026-08-17 那条「日志说假话比不说更糟」要防的东西。
+    """
+
+    def test_it_names_the_planet_on_the_line(self) -> None:
+        assert origin_in("2:137:18") == HOME
+
+    def test_it_skips_the_prefix_noise_the_roi_dragged_in(self) -> None:
+        assert origin_in(":2:137:18") == HOME
+
+    def test_unreadable_is_none_not_a_guess(self) -> None:
+        """⚠️ **None 的意思是「读不出」，不是「不是这一颗」。**
+
+        调用方必须把这两件事分开：读不出时该重读几帧，重读仍读不出才按核不过
+        收场；而绝不许当成「对上了」。凑不出三段数字的噪声挑不出一个假坐标来，
+        这一条是那个保证的另一面。
+        """
+        assert origin_in("") is None
+        assert origin_in("2137:18") is None
+        assert origin_in("起点") is None
+        assert origin_in("1 7 5") is None
+
+    def test_the_verdict_is_expressed_in_terms_of_the_same_reading(self) -> None:
+        """判定就是「读到的那一颗等于目标」，不是第二份实现。"""
+        for raw in ("2:137:18", ":2:137:18", "", "起点", "9:250:8"):
+            assert origin_confirmed(raw, HOME) is (origin_in(raw) == HOME)
 
 
 def test_a_row_carries_the_text_it_was_read_from() -> None:

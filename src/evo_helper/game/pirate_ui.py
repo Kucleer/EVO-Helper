@@ -305,6 +305,17 @@ PLANET_SWITCH_WAIT_S = 3.0
 #:
 #: 离线实测（`var/logs/calib-舰队面板-client.png`）：3/4/5/7× × LANCZOS/最近邻
 #: **八套全部读作 `2:137:18`**。所以这里不需要 `COORD_RECIPES` 那种四套并集。
+#:
+#: ⚠️ **同一个 ROI 在「侦察 / 攻击」开出来的派遣面板上一样成立，这是实拍核对过的**
+#: （2026-08-18）：`var/logs/calib-1-dispatch.png`（攻击链路，client 1920×917）与
+#: `var/logs/calib-侦察-2-派遣面板-viewport.png`（侦察链路，viewport 1920×879，
+#: 差的正好是 38px 标题栏）上，「起点: [2:137:18] [奥格瑞玛]」那一行都落在这个框里。
+#: 这句得写下来，因为上面那半段刚说过「ROI 量在哪块面板上就只在哪块面板上成立」——
+#: 三条路径共用同一个框是**核过的事实**，不是顺手推的。
+#:
+#: 派出之前那道起点闸门（`tools.pirate_loop.PirateLoop._require_origin_before_dispatch`）
+#: 读的就是这里。**它必须在展开预设条之前读**：`PRESET_TOGGLE` 就坐在这一行右端，
+#: 条一展开，「预设 2/10」那一栏整个盖住起点行（实拍 `var/logs/atk-2-presets.png`）。
 FLEET_ORIGIN_ROI = (770, 632, 848, 660)
 FLEET_ORIGIN_RECIPES: tuple[tuple[int, str], ...] = ((3, "lanczos"), (4, "nearest"))
 
