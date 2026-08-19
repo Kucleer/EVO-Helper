@@ -917,7 +917,12 @@ def record_planet_list_overlay_retry(
     capture: Callable[[], Any] | None = None,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
-    """把「行星列表读空 → 疑似浮层 → 关掉 → 重读结果」写进 `system_log`。
+    """把行星列表那条链路的诊断现场写进 `system_log`。
+
+    两支会走到这里，都由 `game.planet_list.PlanetSwitcher.record_evidence` 交进来：
+    「读空 → 疑似浮层 → 关掉 → 重读结果」，以及「往回拖满上限、到没到顶判不出来」。
+    两支都是每次切换至多一条，所以文字不必限流。
+
 
     ⚠️ **跨机排障靠的就是这一条。** 2026-08-17 那次实机故障里，日志只留下
     「逐屏读到的是 `[[]]`」——够说明列表读空，却说不出**画面上盖着的是什么**。

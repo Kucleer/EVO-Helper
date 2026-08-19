@@ -788,6 +788,27 @@ class TestReadingAMisreadCoordinate:
 
         assert switcher.switch_to(SECOND) is SwitchResult.NOT_FOUND
         assert driver.in_panel == []
+        # 日志里也不许把它摆成「列表上的一行」：`9:250:88` 不是一颗星球，是一次
+        # 识别失败。摆进去，下一个查这条日志的人会照着它去核用户的配置。
+        read_rows = [text for screen in switcher.screens for text in screen]
+        assert "9:250:88" not in read_rows
+        assert set(read_rows) == {"[4:277:15]", "[4:96:7]"}
+
+    def test_a_row_the_ocr_cut_in_half_is_never_clicked_as_another_planet(self) -> None:
+        """⚠️ **这条才是「读错了照样点下去」最贵的那一半。**
+
+        实拍上出现过 `['[2:137:1', '5]']`——`[2:137:18]` 被拦腰切成两个词。
+        老规则从前一半里挑出 `2:137:1`，而那是**一颗真实存在的坐标**：于是任务
+        配了 2:137:1 的人会被带到 2:137:18 那一行上，真的点下去、真的切过去，
+        而回读也会说「切成了」（起点读的就是那一行）。整轮的台账从此在撒谎。
+
+        右括号不在同一个词里，就说不出这一段是不是完整的——所以什么都不点。
+        """
+        cut_in_half = [(190, "[2:137:1"), (190, "5]"), (420, "[9:250:8]")]
+        switcher, driver, _planets = _switcher([cut_in_half], origin_reads="2:137:1")
+
+        assert switcher.switch_to(Coordinate(2, 137, 1)) is SwitchResult.NOT_FOUND
+        assert driver.in_panel == []
 
     def test_the_rows_that_did_read_cleanly_are_still_usable(self) -> None:
         """一行读坏了不该拖累同一屏上读干净的那几行。"""

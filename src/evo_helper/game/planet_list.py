@@ -160,7 +160,9 @@ class PlanetSwitcher:
     read_origin: Callable[[], str]
     say: Callable[[str], None] = print
     dry_run: bool = False
-    #: 走到「关浮层重读」那一支时留下的现场：`(一句话, 结构化 payload)`。
+    #: 走到诊断支路时留下的现场：`(一句话, 结构化 payload)`。现在有两支会用它——
+    #: 「读空 → 关浮层重读」和「往回拖满上限、到没到顶判不出来」。两支都是
+    #: **每次切换至多写一条**，不会每 tick 刷屏。
     #:
     #: 默认空操作，实机由 `tools.pirate_loop` 接到 `system_log`（还捎一张缩略图）。
     #: 不在这一层直接写库：`game/` 整层都不认识 `infrastructure/`，而且真写进去了
