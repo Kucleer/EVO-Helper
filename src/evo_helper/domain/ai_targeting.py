@@ -330,9 +330,8 @@ def soft_check_picks(
                 f"此刻（{reference.now:%Y-%m-%d %H:%M} UTC）还没过，撞在保护期里",
             )
         last_attack = reference.last_attack_at.get(pick.target)
-        if (
-            last_attack is not None
-            and reference.now - last_attack < timedelta(hours=GAME_PROTECTION_HOURS)
+        if last_attack is not None and reference.now - last_attack < timedelta(
+            hours=GAME_PROTECTION_HOURS
         ):
             add(
                 "rule_attacked_too_recently",

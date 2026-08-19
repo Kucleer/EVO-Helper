@@ -191,7 +191,7 @@ def _strongest_first(target: ScoredTarget) -> tuple[bool, float, Coordinate]:
     return (target.military_score is None, -(target.military_score or 0.0), target.coordinate)
 
 
-def _freshest_first(target: ScoredTarget) -> tuple[bool, datetime, Coordinate]:
+def _freshest_first(target: ScoredTarget) -> tuple[bool, float, Coordinate]:
     """「读数最新」这个抽样键。没读数的排最后。"""
     return (
         target.military_score_at_utc is None,
@@ -436,10 +436,7 @@ def build_prompt(
         ),
         _age_distribution(candidates, now),
         "# 四、飞行时间公式（可用来估算任意候选的往返）",
-        (
-            "- 同银河：D = 1162 + 31.71 × 恒星系环距"
-            f"（恒星系首尾相接，{SYSTEMS_PER_GALAXY} 环）"
-        ),
+        (f"- 同银河：D = 1162 + 31.71 × 恒星系环距（恒星系首尾相接，{SYSTEMS_PER_GALAXY} 环）"),
         f"- 跨银河：D = 20000 × 银河环距（银河 {TOTAL_GALAXIES} 环）",
         "- 单程秒 = 2 + k × √D（k 按出发星球标定）；往返 = 单程 × 2",
         (
@@ -469,10 +466,7 @@ def build_prompt(
         ),
         "- 我方每个坐标上次攻击时刻已标在样本里（保护期内不要选）。",
         f"- 可用预设：{presets_text}。选择你认为该目标量级配得上的那一个。",
-        (
-            "- 每发大约 38–42 秒鼠标开销（撞保护期也一样）——"
-            "这是航线之外的第二种成本。"
-        ),
+        ("- 每发大约 38–42 秒鼠标开销（撞保护期也一样）——这是航线之外的第二种成本。"),
         "# 七、输出（严格 JSON，不要输出任何多余文字）",
         OUTPUT_EXAMPLE,
         "要求：",
@@ -580,11 +574,7 @@ def _pool_sections(
             for origin in origins
         )
         age = target.military_score_at_utc
-        age_text = (
-            "—"
-            if age is None
-            else f"{(now - age).total_seconds() / 3600:.2f}h"
-        )
+        age_text = "—" if age is None else f"{(now - age).total_seconds() / 3600:.2f}h"
         last = last_attack_at.get(target.coordinate)
         last_text = (
             "我方从未打过"
@@ -592,11 +582,7 @@ def _pool_sections(
             else f"我方上次攻击距今 {(now - last).total_seconds() / 3600:.1f}h"
         )
         protected = protected_seen_at.get(target.coordinate)
-        protected_text = (
-            "未知"
-            if protected is None
-            else f"已知撞过保护期（{protected:%H:%M} UTC）"
-        )
+        protected_text = "未知" if protected is None else f"已知撞过保护期（{protected:%H:%M} UTC）"
         score_text = (
             "无读数（军力榜没见过它，不是「很弱」）"
             if target.military_score is None
@@ -690,7 +676,12 @@ class AiShadowObserver:
         """
         if self._availability is available:
             return
+        first_time = self._availability is None
         self._availability = available
+        if first_time and available:
+            # 第一轮就一切正常：没什么可说的。「恢复可用」只在真的**恢复**时才写，
+            # 否则每次进程重启都会多出一条不带信息的 INFO。
+            return
         record_system_log(
             "INFO" if available else "WARNING",
             "application.ai_targeting",
@@ -972,13 +963,10 @@ class AiShadowObserver:
                 payload={"task_id": task_id, "status": status},
             )
             return
-        message = (
-            f"AI 选靶影子：任务 {task_id} 记录为 {status}"
-            + (
-                f"（重合 {overlap}/{budget}，延迟 {latency_ms}ms，软核对 {len(violations)} 条）"
-                if status == AiDecisionStatus.OK.value
-                else f"（预算 {budget}）"
-            )
+        message = f"AI 选靶影子：任务 {task_id} 记录为 {status}" + (
+            f"（重合 {overlap}/{budget}，延迟 {latency_ms}ms，软核对 {len(violations)} 条）"
+            if status == AiDecisionStatus.OK.value
+            else f"（预算 {budget}）"
         )
         record_system_log(
             "WARNING" if status != AiDecisionStatus.OK.value else "INFO",
@@ -1136,9 +1124,7 @@ def _soft_reference(
         for item in candidates
     }
     protected_until: dict[Coordinate, datetime | None] = {
-        coordinate: (
-            None if seen_at is None else seen_at + timedelta(hours=GAME_PROTECTION_HOURS)
-        )
+        coordinate: (None if seen_at is None else seen_at + timedelta(hours=GAME_PROTECTION_HOURS))
         for coordinate, seen_at in protected_seen_at.items()
     }
     return SoftReference(

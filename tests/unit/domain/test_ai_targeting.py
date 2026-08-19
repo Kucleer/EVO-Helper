@@ -193,3 +193,67 @@ class TestSoftCheck:
         reference.last_attack_at[TARGETS[0]] = NOW - timedelta(days=7)  # type: ignore[union-attr]
         violations = soft_check_picks([_pick(TARGETS[0])], reference)
         assert all(item["code"] != "rule_attacked_too_recently" for item in violations)
+
+    def test_the_threshold_is_the_game_rule_not_the_revisit_knob(self) -> None:
+        """★ 10 小时前打过的**不算违规**——判据是游戏规则的 8 小时。
+
+        ⚠️ 需求 5.3 第 2 条专门警告过这一点：**不要用那个 24 小时旋钮**
+        （`bot_revisit_hours`）。10 小时落在两者之间，是唯一能把两个数分开的区间；
+        少了这一条，把 8 悄悄换成 24 不会让任何用例转红（2026-08-19 变异实测）。
+        """
+        reference = _reference()
+        reference.last_attack_at[TARGETS[0]] = NOW - timedelta(hours=10)  # type: ignore[union-attr]
+        violations = soft_check_picks([_pick(TARGETS[0])], reference)
+        assert all(item["code"] != "rule_attacked_too_recently" for item in violations)
+
+    def test_seven_and_a_half_hours_is_still_a_violation(self) -> None:
+        """边界的另一侧：7.5 小时 < 8 小时，仍然违规。"""
+        reference = _reference()
+        reference.last_attack_at[TARGETS[0]] = NOW - timedelta(hours=7, minutes=30)  # type: ignore[union-attr]
+        violations = soft_check_picks([_pick(TARGETS[0])], reference)
+        assert any(item["code"] == "rule_attacked_too_recently" for item in violations)
+
+    def test_the_protection_window_is_eight_hours_after_it_was_seen(self) -> None:
+        """保护期这一条的边界同理：撞上时刻 + 8 小时之后就不再算违规。
+
+        ⚠️ 保护期到什么时候是**估**的：我们只知道「那一刻撞上了」，不知道它什么
+        时候开始（`game.pirate_ui.DIALOG_NO_MISSION`），所以这是上界。
+        """
+        reference = _reference()
+        reference.protected_until[TARGETS[0]] = NOW - timedelta(minutes=1)  # type: ignore[union-attr]
+        violations = soft_check_picks([_pick(TARGETS[0])], reference)
+        assert all(item["code"] != "rule_in_protection" for item in violations)
+
+    def test_a_military_number_for_a_target_with_no_reading_is_caught(self) -> None:
+        """★ 全池里那批**从没上过军力榜**的：AI 给它报一个军力数就是编的。
+
+        ⚠️ 这一条是「喂全池」带来的新失败模式。`eligible` 里每个都有读数，
+        所以这种情形以前不存在；`candidates` 里有一大批没有。只让它们在
+        `military` 映射里缺席的话，核对会当成「无从核对」放过去。
+        """
+        naked = TARGETS[2]
+        reference = SoftReference(
+            military={},
+            reading_age_hours={},
+            round_trip_minutes={naked: {ORIGIN_A: 34.0}},
+            last_attack_at={naked: None},
+            protected_until={naked: None},
+            now=NOW,
+            targets_without_reading=frozenset({naked}),
+        )
+        violations = soft_check_picks([_pick(naked, military=18_550.0)], reference)
+        assert any(item["code"] == "self_consistency_military" for item in violations)
+
+    def test_an_unknown_target_without_that_marker_is_not_accused(self) -> None:
+        """反面：不在「已知没读数」名单里的，缺读数就是「无从核对」，不该记违规。"""
+        naked = TARGETS[2]
+        reference = SoftReference(
+            military={},
+            reading_age_hours={},
+            round_trip_minutes={naked: {ORIGIN_A: 34.0}},
+            last_attack_at={naked: None},
+            protected_until={naked: None},
+            now=NOW,
+        )
+        violations = soft_check_picks([_pick(naked, military=18_550.0)], reference)
+        assert all(item["code"] != "self_consistency_military" for item in violations)

@@ -33,6 +33,14 @@ from evo_helper.application.ai_targeting import AiShadowObserver
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.scheduler import MissionKind
+from evo_helper.infrastructure.system_log import (
+    SystemLogContext,
+    SystemLogRecord,
+    SystemLogSink,
+    current_system_log_sink,
+    install_system_log_sink,
+    shutdown_system_log_sink,
+)
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -382,3 +390,42 @@ def test_the_observer_gets_the_whole_pool_not_the_filtered_one(  # type: ignore[
     assert "candidates" in observer.seen, "observe 的入参还叫 eligible？全池那一改没落到位"
     handed_over = {item.coordinate for item in observer.seen["candidates"]}
     assert stale in handed_over, "喂给 AI 的还是筛完的 eligible，不是全池 candidates"
+
+
+class BoomOnceObserver:
+    """`observe()` 抛异常，用来验调度器一侧那句 `except` 有没有留痕。"""
+
+    def observe(self, **kwargs: object) -> bool:  # noqa: ARG002
+        raise RuntimeError("观测侧炸了")
+
+
+def test_the_scheduler_records_why_it_skipped_the_shadow(  # type: ignore[no-untyped-def]
+    repository, session_factory, launcher, clock
+) -> None:
+    """★ `_observe_ai_shadow` 那两句 `except` **以前一个字都不记**。
+
+    ⚠️ 用户把开关打开、库里什么都没多出来，排障时无从下手——判据不是
+    「有没有打日志」，是**出事时能不能只靠库里的日志定位**，所以异常的类型与
+    消息都要落到 `system_log` 上。
+    """
+    records: list[SystemLogRecord] = []
+    install_system_log_sink(
+        SystemLogSink(records.extend, flush_interval_s=0.01), context=SystemLogContext()
+    )
+    try:
+        scheduler = _make_scheduler(repository, clock, launcher, BoomOnceObserver())
+        _budget_of_two(session_factory)
+        _a_working_pool(repository, session_factory)
+        _turn_the_switch_on(session_factory)
+        row = task(repository, MissionKind.BOT)
+        assert scheduler._military_assignments(row)  # noqa: SLF001 - 派遣照常
+        sink = current_system_log_sink()
+        assert sink is not None
+        assert sink.flush(timeout=5)
+    finally:
+        shutdown_system_log_sink()
+
+    skipped = [item for item in records if "AI 选靶影子" in item.message and "跳过" in item.message]
+    assert skipped, "观测被 except 挡掉却一个字都没记"
+    assert "RuntimeError" in skipped[0].message, "日志没说清是什么异常，排障时定位不了"
+    assert "观测侧炸了" in skipped[0].message
