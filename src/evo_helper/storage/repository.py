@@ -16,7 +16,13 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
-from evo_helper.domain.flight_estimate import FlightSource
+from evo_helper.domain.flight_estimate import (
+    FlightCoefficient,
+    FlightSample,
+    FlightSource,
+    fit_seconds_per_root_unit,
+    line_hold_round_trip,
+)
 from evo_helper.domain.models import Coordinate, RunState
 from evo_helper.domain.pirate_round import AttackFact, PiratePhase, phase_for
 from evo_helper.domain.ports import CoordinateClaim
@@ -55,6 +61,11 @@ from evo_helper.infrastructure.system_log import record_system_log
 
 from . import models as orm
 from .system_log import SystemLogRepository
+
+#: 学系数时最多从库里捞几行。**不是判据**，是防止这张表长大之后把整列拖进内存的
+#: 安全阀——真正的窗口是 `domain.flight_estimate.LEARNING_WINDOW`，而它是在
+#: **筛完之后**才截的（先截就可能一发跨银河样本都剩不下）。取得比它大两个数量级。
+_SAMPLE_FETCH_CAP = 2000
 
 #: How far a report's timestamp may deviate from the dispatch time and still
 #: count as the same dispatch under the strict origin/target/time match rule.
@@ -1216,6 +1227,7 @@ class SqlAlchemyRepository:
         dispatched_at_utc: datetime,
         *,
         source: FlightSource | None = None,
+        fleet_speed: str | None = None,
     ) -> None:
         """存下飞行时长，以及由它派生的**两个钟**。
 
@@ -1261,12 +1273,23 @@ class SqlAlchemyRepository:
                 ),
             )
             row.flight_source = None if flight is None or source is None else source.value
+            # 速度**无论有没有读到飞行时长都记**：它是下一次学系数时的作废信号，
+            # 与这一发自己读没读出来毫无关系。空串按没读到算（`_read` 读不出时
+            # 给的就是空串），NULL 的语义是「不知道」而不是「读到了一个空的」。
+            row.fleet_speed_raw = (fleet_speed or "").strip() or None
+            dispatched = _require_utc(dispatched_at_utc, "dispatched_at_utc")
             if flight is None:
                 row.flight_seconds = None
                 row.expected_report_at_utc = None
                 row.line_free_at_utc = None
+                # 三个来源全军覆没，但**这一发到底要飞多远是知道的**——出发点与
+                # 目标都是我们自己填进去的。拿距离公式算一个保守的往返当兜底，
+                # 免得跨银河那种真要飞两小时的发次按 90 分钟的常数就被当成回港了。
+                # 只写这一列：算出来的值不许进 `flight_seconds`（标定样本池），
+                # 也不许进 `line_free_at_utc`（页面靠它为 NULL 数「时长未知」）。
+                hold = line_hold_round_trip(_intent_target(intent), _intent_origin(intent))
+                row.line_hold_until_utc = None if hold is None else dispatched + hold
             else:
-                dispatched = _require_utc(dispatched_at_utc, "dispatched_at_utc")
                 # ⚠️ **算出来的值不进 `flight_seconds`。** 那一列是
                 # `vet_flight_time` 那道下限的标定样本池；掺进
                 # `domain.flight_time` 公式的输出，下一次标定就变成拿模型的
@@ -1284,6 +1307,61 @@ class SqlAlchemyRepository:
                     preset_name=intent.preset_name,
                 )
             session.commit()
+
+    def flight_coefficient(
+        self, *, origin: Coordinate, mission_kind: str, fleet_speed: str | None
+    ) -> FlightCoefficient | None:
+        """**这颗出发星球**的距离公式系数，从历史实测里学；学不出来返回 None。
+
+        判据全在 `domain.flight_estimate.fit_seconds_per_root_unit`——哪些样本
+        算数（同星球 / 同发次 / 跨银河 / 速度对得上）、取几发、怎么取中位数，
+        一条都不在 SQL 里发明。这里只按「这颗星球的、被接受的、有观测值的」把行
+        捞出来，从新到旧排好交过去。
+
+        **只看飞行时长是读出来的那些**：`flight_seconds` 为 NULL 的没有观测值；
+        来源是 `distance_model` 的那些 `flight_seconds` 本来就写 NULL
+        （见 `record_flight_time`），所以这个查询天然不会拿公式自己的输出去
+        标定公式自己。
+
+        `_SAMPLE_FETCH_CAP` **不是判据**，是一道防止表长大之后把整列拖进内存的
+        安全阀：它取得比 `LEARNING_WINDOW` 大得多，正常情况下截不到任何东西。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackDispatchRow.flight_seconds,
+                    orm.AttackDispatchRow.fleet_speed_raw,
+                    orm.AttackDispatchRow.mission_kind,
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                )
+                .join(
+                    orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id
+                )
+                .where(
+                    _from_origin(origin),
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.flight_seconds.is_not(None),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc.desc())
+                .limit(_SAMPLE_FETCH_CAP)
+            ).all()
+        return fit_seconds_per_root_unit(
+            [
+                FlightSample(
+                    target=Coordinate(row.target_galaxy, row.target_system, row.target_position),
+                    origin=origin,
+                    flight_seconds=float(row.flight_seconds),
+                    mission_kind=row.mission_kind,
+                    fleet_speed=row.fleet_speed_raw,
+                )
+                for row in rows
+            ],
+            origin=origin,
+            mission_kind=mission_kind,
+            fleet_speed=fleet_speed,
+        )
 
     def pending_reports(self, run_id: UUID) -> list[PendingReport]:
         """本次运行已派出的攻击，以及各自是否已闭合。
@@ -2988,6 +3066,16 @@ def _scout_report_exists(session: Session, target: Coordinate, reported_at_utc: 
     ) > 0
 
 
+def _intent_origin(intent: orm.AttackIntentRow) -> Coordinate:
+    """意图行上的出发坐标。三个分量拼一次，抄第二遍就迟早漏一个。"""
+    return Coordinate(intent.origin_galaxy, intent.origin_system, intent.origin_position)
+
+
+def _intent_target(intent: orm.AttackIntentRow) -> Coordinate:
+    """意图行上的目标坐标。"""
+    return Coordinate(intent.target_galaxy, intent.target_system, intent.target_position)
+
+
 def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
     """「这一发是从这颗星球派出去的」。
 
@@ -3009,7 +3097,8 @@ def _still_holding_a_line(now_utc: datetime, hold: timedelta) -> ColumnElement[b
       用户在游戏里数过航线、确认舰队已回港，那是比这两个推算出来的钟更硬的
       证据；放在最前面是因为另外两档全是估算，而它是观测。
     - 航线钟读到了：到点就放手。
-    - 航线钟为 NULL：**照样占着**，直到派出时刻 + `hold`。
+    - 航线钟为 NULL：**照样占着**，直到派出时刻 + `hold`，**或**到
+      `line_hold_until_utc`，两者取晚的那个。
       NULL 的意思是「不知道它什么时候回来」，不是「它没占位」。
 
     ⚠️ 人工放手这一档必须**同时**罩住后两档，所以它是 `and_` 的第一项而不是
@@ -3018,6 +3107,22 @@ def _still_holding_a_line(now_utc: datetime, hold: timedelta) -> ColumnElement[b
 
     `hold` **必填、没有默认值**：漏传就会静默退回到写死的 90 分钟，而那正是
     用户在攻击配置页上刚改掉的那个数——两个调用方各配各的比配不上更难查。
+
+    ## 为什么要与 `line_hold_until_utc` 取大（2026-08-19）
+
+    `hold` 是一个**与目标无关的常数**，而真实往返强烈依赖距离：同恒星系内十几
+    分钟，跨银河两小时出头。实机 2026-08-19 从 9:250:8 打 8:486:12 那三发单程
+    3726 秒、往返 124.2 分钟，而 `hold` 是 90 分钟——于是**第 90 分钟到第 124
+    分钟之间**，调度器与首页都以为有一条空闲航线，而实际没有。用户看到的
+    「星球 2 在等航线」就是这么来的。
+
+    取**晚**的那个而不是换掉：`hold` 是用户在攻击配置页上填得到的旋钮，
+    填了就得听他的；而 `line_hold_until_utc` 是按距离算出来的下界。两者取大，
+    这一档就只会比原先占得更久、绝不会更短——低估的代价（派出去撞游戏的
+    「同时派遣的舰队数量已达上限。」，白跑一整轮）比高估贵得多。
+
+    ⚠️ `line_hold_until_utc` 为 NULL 时这个比较在 SQL 里求值成 NULL、也就是
+    假，于是自动退回只看 `hold` 那一档——**这正是要的**，别改成 `COALESCE`。
     """
     row = orm.AttackDispatchRow
     return and_(
@@ -3026,7 +3131,10 @@ def _still_holding_a_line(now_utc: datetime, hold: timedelta) -> ColumnElement[b
             row.line_free_at_utc > now_utc,
             and_(
                 row.line_free_at_utc.is_(None),
-                row.dispatched_at_utc > now_utc - hold,
+                or_(
+                    row.dispatched_at_utc > now_utc - hold,
+                    row.line_hold_until_utc > now_utc,
+                ),
             ),
         ),
     )

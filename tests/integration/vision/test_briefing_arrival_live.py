@@ -24,10 +24,6 @@ from pathlib import Path
 
 import pytest
 
-from evo_helper.domain.flight_estimate import (
-    CALIBRATED_FLEET_SPEED,
-    CALIBRATED_SPEED_PERCENT,
-)
 from evo_helper.domain.report_wait import parse_game_duration
 from evo_helper.game.pirate_ui import (
     ARRIVAL_RECIPES,
@@ -131,6 +127,12 @@ def _frame(stamp: str):  # type: ignore[no-untyped-def]
     return Image.open(f"var/logs/dump-briefing-flight-unreadable-{stamp}.png")
 
 
+def _truth_flight(stamp: str) -> timedelta:
+    flight = TRUTH[stamp][0]
+    assert flight is not None
+    return timedelta(minutes=flight[0], seconds=flight[1])
+
+
 def _truth_arrival(stamp: str) -> datetime:
     text = TRUTH[stamp][1]
     assert text is not None
@@ -193,6 +195,45 @@ def test_the_flight_line_really_could_not_be_read_on_these_frames(ocr) -> None: 
                 break
     # 补了六套零读错的配方之后是 23/47；换来源那一路是 47/47。
     assert read < len(READABLE) * 0.6, f"飞行时间那一行读出了 {read}/{len(READABLE)}"
+
+
+def test_this_corpus_cannot_see_the_2026_08_19_failure_at_all(ocr) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **这 49 张对 2026-08-19 那个缺陷一个字都说不了——把这件事钉住。**
+
+    那天从 9:250:8 打三个跨银河 bot，飞行时间那一行读出 `'IBY 2分 6秒'`，
+    真值 **1 时 2 分 6 秒**：`1时` 整段被糊成了 `IBY`，而
+    `report_wait._reads_the_whole_duration` 的三条判据对 `IBY ` 一条都不成立
+    （匹配之外没剩数字，紧邻左边也没杵着单位字），于是 126 秒被当成一条合法
+    时长放行。它的 docstring 里写着的那个残留的洞（`ЖЖЖ36分7秒`）就是它。
+
+    这批实拍**结构上盖不到那一档**：
+
+    1. 真值最长 41 分 43 秒，**一张带「时」那一段的都没有**——那时用户还没开始
+       打跨银河目标，而丢掉的正是「时」那一段；
+    2. 于是现行配方在这批图上读出来的 23 张**一张都没读错**——「读错」这件事
+       在这批样本里根本没发生过。
+
+    所以这一次的修法**不能靠加配方或收紧解析来验**，只能靠
+    `domain.flight_estimate.reconcile_flight` 那条「飞行时间比到达时间少一整段
+    就按截断丢掉」的判据，而它的用例在
+    `tests/unit/domain/test_flight_estimate.py`。哪天 `var/logs` 下攒到了带
+    「时」那一段的失败现场，这条要回来改成真的复现。
+    """
+    longest = max(_truth_flight(stamp) for stamp in READABLE)
+    assert longest < timedelta(hours=1), "样本里已经有超过一小时的了，这条该改成真的复现"
+
+    wrong: list[str] = []
+    for stamp in READABLE:
+        crop = _frame(stamp).crop(BRIEFING_FLIGHT_ROI)
+        truth = _truth_flight(stamp)
+        for upscale, threshold in FLIGHT_RECIPES:
+            got = parse_game_duration(ocr(crop, digits=False, upscale=upscale, threshold=threshold))
+            if got is None:
+                continue
+            if got != truth:
+                wrong.append(f"{stamp} {upscale}x/thr{threshold} 读成 {got}，真值 {truth}")
+            break
+    assert wrong == []
 
 
 def test_no_arrival_recipe_ever_produces_a_wrong_timestamp(ocr) -> None:  # type: ignore[no-untyped-def]
@@ -276,16 +317,28 @@ def test_the_arrival_line_is_recomputed_every_second(stamp: str) -> None:
     assert -1 <= drift <= 0, f"{stamp} 差了 {drift} 秒"
 
 
-# -- 第三个来源的适用域闸 ----------------------------------------------------
+# -- 速度：编组变了的探测器 --------------------------------------------------
+
+#: 这 49 张实拍拍摄期间那套编组在简报页上显示的速度与航速百分比。
+#:
+#: ⚠️ **这不是「公式标定值」**——2026-08-19 之后系数按出发星球从历史实测里学
+#: （`domain.flight_estimate.fit_seconds_per_root_unit`），代码里再没有一个
+#: 「正确的速度」。这两个字符串只是**这批样本当时的读数**，用来验「这一格读得出
+#: 来、而且读得稳」。
+SPEED_ON_THESE_FRAMES = "14.520"
+SPEED_PERCENT_ON_THESE_FRAMES = "100%"
 
 
 @pytest.mark.parametrize("stamp", READABLE)
 def test_the_fleet_speed_is_readable_with_the_default_recipe(ocr, stamp: str) -> None:  # type: ignore[no-untyped-def]
     """速度那两格用**默认配方**就读得出来，49 张里 47 张（另 2 张面板没铺开）。
 
-    它存在的唯一理由是给 `domain.flight_estimate.predict_flight` 判一句
-    「这一发还在 `domain.flight_time` 标定过的那套编组上吗」。读不出来时那条
-    判据返回 False、公式弃权——**弃权是安全的那一侧**，只是少一个来源。
+    它存在的理由是给 `domain.flight_estimate.fit_seconds_per_root_unit` 当
+    「编组变了」的探测器：这个数一变，之前学到的系数立刻不算数。读不出来时
+    那一路只是少一个作废信号，**不会**把这一发拦下来。
+
+    ⚠️ 它**不参与任何算术**（`storage.models.AttackDispatchRow.fleet_speed_raw`
+    上写着为什么），所以这里比的是**原文字符串**，不是一个数。
 
     白字压蓝底，和「没有可执行的任务」那个弹窗一样好读，与绿字压蓝底的
     飞行时间正相反。
@@ -293,10 +346,10 @@ def test_the_fleet_speed_is_readable_with_the_default_recipe(ocr, stamp: str) ->
     frame = _frame(stamp)
 
     assert ocr(frame.crop(BRIEFING_SPEED_ROI), digits=False, upscale=3).strip() == (
-        CALIBRATED_FLEET_SPEED
+        SPEED_ON_THESE_FRAMES
     )
     assert ocr(frame.crop(BRIEFING_SPEED_PERCENT_ROI), digits=False, upscale=3).strip() == (
-        CALIBRATED_SPEED_PERCENT
+        SPEED_PERCENT_ON_THESE_FRAMES
     )
 
 
@@ -309,5 +362,5 @@ def test_a_frame_where_the_panel_never_rendered_reads_nothing(ocr, stamp: str) -
     """
     assert _read_arrival(ocr, stamp, ARRIVAL_RECIPES) is None
     assert ocr(_frame(stamp).crop(BRIEFING_SPEED_ROI), digits=False, upscale=3).strip() != (
-        CALIBRATED_FLEET_SPEED
+        SPEED_ON_THESE_FRAMES
     )

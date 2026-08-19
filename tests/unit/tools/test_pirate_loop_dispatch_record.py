@@ -34,12 +34,20 @@ class _RecordingRepository:
         self.saved_dispatch: Any | None = None
         self.flight_calls: list[tuple[UUID, timedelta | None, datetime]] = []
         self.flight_sources: list[Any] = []
+        self.flight_speeds: list[str | None] = []
+        #: 学出来的系数。默认 None = 这颗星球还没学出来，公式那一路弃权。
+        self.coefficient: Any = None
+        self.coefficient_calls: list[tuple[Any, str, str | None]] = []
 
     def save_attack_intent(self, intent: Any) -> None:
         self.saved_intent = intent
 
     def save_dispatch(self, dispatch: Any) -> None:
         self.saved_dispatch = dispatch
+
+    def flight_coefficient(self, *, origin: Any, mission_kind: str, fleet_speed: str | None) -> Any:
+        self.coefficient_calls.append((origin, mission_kind, fleet_speed))
+        return self.coefficient
 
     def record_flight_time(
         self,
@@ -48,9 +56,11 @@ class _RecordingRepository:
         dispatched_at_utc: datetime,
         *,
         source: Any = None,
+        fleet_speed: str | None = None,
     ) -> None:
         self.flight_calls.append((dispatch_id, flight, dispatched_at_utc))
         self.flight_sources.append(source)
+        self.flight_speeds.append(fleet_speed)
 
 
 def _measured(flight: timedelta | None) -> Any:
@@ -174,6 +184,9 @@ def _loop_reading(text: str, *, arrival: str = "", speed: str = "") -> Any:
     loop._options = LoopOptions(systems=(), scout=False, attack=True, origin=ORIGIN)
     loop._read = _read  # type: ignore[attr-defined]
     loop._dump_frame = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    # 没有账本 = 学不出系数 = 公式那一路弃权。这几条守的是**读屏**那一段，
+    # 而公式弃权正是它们要的场面（三个来源只剩两个 OCR）。
+    loop._repository = None  # type: ignore[attr-defined]
     return loop
 
 
@@ -336,6 +349,8 @@ def _attackable_loop(
             return "8分3秒"
         if roi == pirate_ui.BRIEFING_MISSION_ROI:
             return "攻击"
+        if roi == pirate_ui.BRIEFING_SPEED_ROI:
+            return "14.520"
         return ""
 
     loop = module.PirateLoop.__new__(module.PirateLoop)
@@ -374,6 +389,65 @@ def test_the_flight_time_actually_reaches_the_repository_on_a_real_attack(
 ) -> None:
     """顺序对了还不够——读到的那个值要真的落到库里。"""
     repository = _RecordingRepository()
+    loop = _attackable_loop(monkeypatch, [], repository)
+
+    assert loop.attack(Coordinate(2, 137, 14), preset="BBB") is True
+
+    assert [flight for _id, flight, _at in repository.flight_calls] == [
+        timedelta(minutes=8, seconds=3)
+    ]
+
+
+def test_the_fleet_speed_on_the_briefing_reaches_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **屏幕上那个速度必须落库。**
+
+    它是 `domain.flight_estimate.fit_seconds_per_root_unit` 的**作废信号**：
+    系数按出发星球从历史实测里学，而编组一换那些样本立刻不算数——能认出这次
+    变化的只有屏幕上这个数（`preset_name` 与 `preset_signature` 都认不出来，
+    2026-08-17 那天 13 发慢了 26% 就是这么错过去的）。
+
+    不落库就没有「上一发是什么速度」可比，那道作废永远不会触发。
+    """
+    repository = _RecordingRepository()
+    loop = _attackable_loop(monkeypatch, [], repository)
+
+    assert loop.attack(Coordinate(2, 137, 14), preset="BBB") is True
+
+    assert repository.flight_speeds == ["14.520"]
+
+
+def test_the_coefficient_is_asked_for_this_planet_and_this_kind_of_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """问库要系数时，问的是**这一轮的出发星球**和**这一发的类型**。
+
+    问错星球就回到「全局共用一个 k」那个错（9:250:8 与 4:277:15 差 0.7%）；
+    问错类型就会拿侦察去标定攻击，而侦察艇快约 40 倍。
+    """
+    repository = _RecordingRepository()
+    loop = _attackable_loop(monkeypatch, [], repository)
+
+    assert loop.attack(Coordinate(2, 137, 14), preset="BBB") is True
+
+    assert repository.coefficient_calls == [(ORIGIN, MISSION_KIND_ATTACK, "14.520")]
+
+
+def test_a_repository_that_cannot_answer_never_holds_back_the_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **学不出系数只是少一个来源，不许把这一发拦下来。**
+
+    方向与「读不出飞行时间也照派」一致：飞行时间是闹钟不是闸门。这条链路已经
+    因为「ROI 与放大倍数不配」白白拦下过四发完全正常的攻击。
+    """
+    repository = _RecordingRepository()
+
+    def _boom(**_kwargs: Any) -> Any:
+        raise RuntimeError("库连不上")
+
+    repository.flight_coefficient = _boom  # type: ignore[method-assign]
     loop = _attackable_loop(monkeypatch, [], repository)
 
     assert loop.attack(Coordinate(2, 137, 14), preset="BBB") is True

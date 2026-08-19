@@ -41,6 +41,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_dispatches.dispatched_at_utc",
         "attack_dispatches.expected_report_at_utc",
         "attack_dispatches.line_free_at_utc",
+        "attack_dispatches.line_hold_until_utc",
         "attack_dispatches.line_released_at_utc",
         "attack_intents.created_at_utc",
         "attack_intents.cycle_start_utc",
@@ -115,6 +116,8 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "attack_intents.target_military_score_at_utc",
         # b7e4d0c93a15（撞上保护期的时刻）加的，那条迁移里也写着 `timezone=True`。
         "bot_targets.protection_seen_at_utc",
+        # d1a7f4b26c93（航线按距离兜底占到几点）加的，那条迁移里也写着 `timezone=True`。
+        "attack_dispatches.line_hold_until_utc",
     }
 )
 
