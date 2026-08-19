@@ -99,6 +99,13 @@ class ResourceTotal:
     #: 这一格里有没有近似读数（画面上是 `928K` 这样缩写显示的，真值取不回来）。
     #: 页面要标「约」——把近似值渲染得像精确读数是另一回事。
     approximate: bool
+    #: 这一格的最大绝对误差，**逐份战报相加**。
+    #:
+    #: 相加而不是取最大：每份战报各自差 ±500 时，十份加起来最坏就是 ±5,000。
+    #: 取最大会把合计写得比它真的准——而这个数正是页面上「约」字后面那句
+    #: 「误差不超过 ±N」的全部依据（`display.resource_precision_hint`）。
+    #: 精确读到的行这一列是 0，所以全精确的合计照样是 0。
+    uncertainty: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +376,7 @@ class OverviewRepository:
                     func.max(cast(orm.BattleReportResourceRow.approximate, Integer)).label(
                         "approximate"
                     ),
+                    func.sum(orm.BattleReportResourceRow.uncertainty).label("uncertainty"),
                 )
                 .join(
                     orm.BattleReportRow,
@@ -386,6 +394,7 @@ class OverviewRepository:
                 slot=int(row.slot),
                 amount=int(row.amount or 0),
                 approximate=bool(row.approximate),
+                uncertainty=int(row.uncertainty or 0),
             )
             for row in rows
         )

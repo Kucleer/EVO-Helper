@@ -109,6 +109,8 @@ def _report(
     reported_at_utc: datetime,
     dispatch_id: UUID | None = None,
     resources: tuple[tuple[int, int], ...] = (),
+    approximate: bool = False,
+    uncertainty: int = 0,
 ) -> None:
     report_id = uuid4()
     with session_factory() as session:
@@ -129,7 +131,14 @@ def _report(
         session.flush()
         for slot, amount in resources:
             session.add(
-                BattleReportResourceRow(id=uuid4(), report_id=report_id, slot=slot, amount=amount)
+                BattleReportResourceRow(
+                    id=uuid4(),
+                    report_id=report_id,
+                    slot=slot,
+                    amount=amount,
+                    approximate=approximate,
+                    uncertainty=uncertainty,
+                )
             )
         session.commit()
 
@@ -516,6 +525,36 @@ def test_resource_totals_only_cover_reports_that_came_back(
 
     after = overview.resource_totals(start=window[0], end=window[1])
     assert [(item.slot, item.amount) for item in after] == [(5, 166_194), (8, 7_807)]
+
+
+def test_the_error_range_of_a_total_is_the_sum_of_the_reports_that_made_it(
+    overview: OverviewRepository, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ 误差**逐份相加**，不是取最大。
+
+    页面上那句「误差不超过 ±N」是照这一列写的。三份各差 ±500 的战报加出来的
+    合计，最坏差 ±1,500——取最大会把合计说得比它真的准，而这一页的读者正是拿
+    这个数判断今天收成。精确读到的那些这一列是 0，所以全精确的合计照样是 0。
+    """
+    window = (datetime(2026, 8, 18, tzinfo=UTC), datetime(2026, 8, 19, tzinfo=UTC))
+    for amount in (928_000, 501_000, 340_000):
+        _report(
+            session_factory,
+            reported_at_utc=datetime(2026, 8, 18, 12, tzinfo=UTC),
+            resources=((0, amount),),
+            approximate=True,
+            uncertainty=500,
+        )
+    _report(
+        session_factory,
+        reported_at_utc=datetime(2026, 8, 18, 13, tzinfo=UTC),
+        resources=((1, 66),),
+    )
+
+    totals = {item.slot: item for item in overview.resource_totals(start=window[0], end=window[1])}
+
+    assert (totals[0].approximate, totals[0].uncertainty) == (True, 1_500)
+    assert (totals[1].approximate, totals[1].uncertainty) == (False, 0)
 
 
 def test_occupancy_segments_follow_the_three_tier_rule(

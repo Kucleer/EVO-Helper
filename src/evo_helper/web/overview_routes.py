@@ -43,8 +43,8 @@ from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.flight_time import round_trip_hours
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import (
+    BASIC_SLOTS,
     COUNT_STATS_START_UTC,
-    OTHER_SLOTS,
     RARE_SLOTS,
     RESOURCE_STATS_START_UTC,
     Granularity,
@@ -62,13 +62,16 @@ from evo_helper.domain.overview import (
     trim_empty_tail,
     utilisation,
 )
+from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.overview import (
     GalaxyFreshness,
     OriginLineUsage,
     OverviewRepository,
+    ResourceTotal,
     UnreadReports,
 )
+from evo_helper.web.display import resource_amount_text, resource_precision_hint
 from evo_helper.web.persistent_service import MissionConsoleService
 from evo_helper.web.resource_icons import PANEL_SIZE, ResourceIconCache
 
@@ -122,10 +125,39 @@ class LineCard:
 
 @dataclass(frozen=True, slots=True)
 class ResourceCell:
+    """一个槽位在这个周期里的收获，以及它在页面上怎么写。
+
+    ⚠️ **「约」和误差范围不在模板里现写。** 两句话都问
+    `display.resource_amount_text` / `display.resource_precision_hint` 要——
+    攻击日志页那一列也是它们渲染的，同一个概念在两页上写成两种样子，
+    比两页都不标更让人犯迷糊（`logs.html` 那一段的理由）。
+    """
+
     slot: int
     label: str
     amount: int
     approximate: bool
+    #: 最大绝对误差（逐份战报相加，见 `storage.overview.ResourceTotal`）。
+    uncertainty: int = 0
+
+    @property
+    def text(self) -> str:
+        """页面上的那个数。近似值带「约」。"""
+        return resource_amount_text(self._entry)
+
+    @property
+    def hint(self) -> str:
+        """鼠标停上去那句：这个数准到什么程度。"""
+        return resource_precision_hint(self._entry)
+
+    @property
+    def _entry(self) -> BattleResourceEntry:
+        return BattleResourceEntry(
+            slot=self.slot,
+            amount=self.amount,
+            approximate=self.approximate,
+            uncertainty=self.uncertainty,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +170,16 @@ class PoolBucket:
 class TodayCard:
     rare: tuple[ResourceCell, ...]
     yesterday: dict[int, int]
-    others: tuple[ResourceCell, ...]
-    others_total: int
+    #: 金属 / 晶体 / 气体（`BASIC_SLOTS`），三样合在第四张卡里。
+    basics: tuple[ResourceCell, ...]
+    #: 今天这个窗口里**到底有没有收获记录**。
+    #:
+    #: ⚠️ 这个布尔值就是「0」和「不知道」的分界，不许省掉：入库是全有或全无
+    #: （12 格但凡一格读不出，那份战报一行都不写），所以「有若干行、偏偏缺某一格」
+    #: 只有一种解释——那一格读到了，是 0；而**一条收获记录都没有**时，
+    #: 「全 0」与「这条链路根本没读过资源」在库里分不开，那时候写 0 就是拿
+    #: 「不知道」冒充 0（判据与措辞同 `logs.html` 摘要那一段，PR #217 定的）。
+    resources_seen: bool
     dispatches: int
     reports: int
     recovery: float | None
@@ -512,9 +552,9 @@ def _today_card(
     lines: int,
 ) -> TodayCard:
     counts = repository.period_counts(start=today_start, end=now_utc)
-    rare, others = _resource_cells(repository, start=today_start, end=now_utc)
+    haul = _haul(repository, start=today_start, end=now_utc)
     yesterday_start = today_start - timedelta(days=1)
-    yesterday_rare, _ = _resource_cells(repository, start=yesterday_start, end=today_start)
+    yesterday = _haul(repository, start=yesterday_start, end=today_start)
     occupied = occupied_seconds(
         repository.occupancies(start=today_start, end=now_utc, hold=hold, now_utc=now_utc),
         today_start,
@@ -527,10 +567,10 @@ def _today_card(
     )
     ages = repository.score_age_hours_at_dispatch(since=today_start, until=now_utc)
     return TodayCard(
-        rare=rare,
-        yesterday={cell.slot: cell.amount for cell in yesterday_rare},
-        others=others,
-        others_total=sum(cell.amount for cell in others),
+        rare=haul.cells(RARE_SLOTS),
+        yesterday={cell.slot: cell.amount for cell in yesterday.cells(RARE_SLOTS)},
+        basics=haul.cells(BASIC_SLOTS),
+        resources_seen=haul.seen,
         dispatches=counts.dispatches,
         reports=counts.reports,
         recovery=recovery_rate(counts.reports, counts.dispatches),
@@ -543,30 +583,51 @@ def _today_card(
     )
 
 
-def _resource_cells(
-    repository: OverviewRepository, *, start: datetime, end: datetime
-) -> tuple[tuple[ResourceCell, ...], tuple[ResourceCell, ...]]:
-    """稀有三样与其余九种。
+@dataclass(frozen=True, slots=True)
+class _Haul:
+    """一个周期里 12 格的收获，**按槽位存**（名字是渲染时才翻译的解释）。"""
+
+    totals: dict[int, ResourceTotal]
+
+    @property
+    def seen(self) -> bool:
+        """这个周期里到底有没有收获记录。
+
+        ⚠️ **这不等于「收成是 0」。** 库里只存非零的格子，所以一行都没有既可能是
+        12 格全 0，也可能是这些战报根本没读过资源（存量战报全是后者），库里分不开
+        （`storage.models.BattleReportResourceRow` 的注释）。反过来，只要有一行，
+        「缺哪一格」就是确凿的 0——12 格是一起读的，读全了才入库。
+        """
+        return bool(self.totals)
+
+    def cells(self, slots: tuple[int, ...]) -> tuple[ResourceCell, ...]:
+        """挑出这几格。缺的那一格给 0——`seen` 为假时页面不该把这个 0 摆出来。"""
+        return tuple(
+            ResourceCell(
+                slot=slot,
+                label=slot_label(slot),
+                amount=total.amount if total else 0,
+                approximate=bool(total and total.approximate),
+                uncertainty=total.uncertainty if total else 0,
+            )
+            for slot, total in ((slot, self.totals.get(slot)) for slot in slots)
+        )
+
+
+def _haul(repository: OverviewRepository, *, start: datetime, end: datetime) -> _Haul:
+    """这个周期收了些什么。
 
     ⚠️ **资源类走自己那个起点**（`RESOURCE_STATS_START_UTC`，2026-08-18），
     与计数类的 2026-08-17 是两个日期、不许合并成一个常量：那 12 格的识别是
     08-18 才修好的，更早的战报根本没有资源明细。窗口整段落在起点之前时
-    `resource_window` 返回 None，这里给出 0——而同一个周期的**派遣数照常显示**，
-    那正是两个起点分开的可观察后果。
+    `resource_window` 返回 None，这里一行都取不到（`seen` 为假）——而同一个周期的
+    **派遣数照常显示**，那正是两个起点分开的可观察后果。
     """
     window = resource_window(start, end)
-    totals: dict[int, tuple[int, bool]] = {}
-    if window is not None:
-        for item in repository.resource_totals(start=window[0], end=window[1]):
-            totals[item.slot] = (item.amount, item.approximate)
-
-    def cell(slot: int) -> ResourceCell:
-        amount, approximate = totals.get(slot, (0, False))
-        return ResourceCell(
-            slot=slot, label=slot_label(slot), amount=amount, approximate=approximate
-        )
-
-    return tuple(cell(slot) for slot in RARE_SLOTS), tuple(cell(slot) for slot in OTHER_SLOTS)
+    if window is None:
+        return _Haul(totals={})
+    rows = repository.resource_totals(start=window[0], end=window[1])
+    return _Haul(totals={item.slot: item for item in rows})
 
 
 def build_period_rows(
@@ -585,7 +646,7 @@ def build_period_rows(
         if end <= start:
             continue
         counts = repository.period_counts(start=start, end=end)
-        rare, _ = _resource_cells(repository, start=start, end=end)
+        rare = _haul(repository, start=start, end=end).cells(RARE_SLOTS)
         occupied = occupied_seconds(
             repository.occupancies(start=start, end=end, hold=hold, now_utc=now_utc), start, end
         )
@@ -637,8 +698,10 @@ def _empty_now_view(now: datetime) -> NowView:
         today=TodayCard(
             rare=(),
             yesterday={},
-            others=(),
-            others_total=0,
+            # 三样的名字照摆、数写「—」：这一趟根本没查到东西，
+            # `resources_seen` 为假就是「不知道」，绝不是「今天一样没收着」。
+            basics=_Haul(totals={}).cells(BASIC_SLOTS),
+            resources_seen=False,
             dispatches=0,
             reports=0,
             recovery=None,

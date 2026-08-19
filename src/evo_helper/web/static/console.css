@@ -708,17 +708,13 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
 .overview-res { display: flex; align-items: center; gap: 10px; }
 .overview-res img { flex: none; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, .6)); }
 
-/* 「其余九种」默认折起（用户口径：首屏只放稀有三样）。用原生 <details> 而不是
-   自己写一个开合——这一页不引入任何前端框架，而 <details> 的键盘可达性是白拿的。 */
-.overview-others summary {
-  cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  align-items: baseline;
-}
-.overview-others summary .label { margin: 0; }
-.overview-others[open] summary { margin-bottom: 6px; }
+/* 「今天收益」第四张卡里的三样常规资源（金属 / 晶体 / 气体）。
+   ⚠️ **行距比一般的 `.overview-kv` 紧一点，这不是审美。** 这四张卡是同一行
+   CSS Grid，行高由最高的那张决定；按默认的 `padding: 2px 0` 排三行是 66px，
+   而左边那三张稀有卡的内容高是 61.5px（26px 标题 + 26px 大数字那一块），
+   整行会被这一张顶高。收紧到 20px 一行 = 60px，比它们矮一点点——
+   **只许更矮，不许更高**，行高仍旧由稀有那三张定。 */
+.overview-kv.overview-basics { padding: 1px 0; }
 
 .overview-tabs-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .overview-tabs { display: flex; gap: 4px; margin-left: auto; }

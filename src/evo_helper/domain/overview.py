@@ -30,12 +30,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-
-from evo_helper.domain.battle_resources import GAINED_SLOT_COUNT
 
 #: 计数类统计的起点（UTC）。**只管派遣、战报、撞保护期这类计数。**
 #:
@@ -55,11 +53,18 @@ RESOURCE_STATS_START_UTC = datetime(2026, 8, 18, tzinfo=UTC)
 #: 5 = 合金碎片、8 = 泰坦立方、9 = 收割者碎片。
 RARE_SLOTS: tuple[int, ...] = (5, 8, 9)
 
-#: 折叠起来的那九种。由 `RARE_SLOTS` 取补集算出来，不另抄一份：抄一份的那天，
-#: 加一样稀有资源就会让某一格从两边同时消失或者重复计一次。
-OTHER_SLOTS: tuple[int, ...] = tuple(
-    slot for slot in range(GAINED_SLOT_COUNT) if slot not in RARE_SLOTS
-)
+#: 「今天收益」那一行第四张卡上的三样常规资源。用户口径（2026-08-19）：
+#: 「这里改成只显示 金属/晶体/气体，整合进一个标签即可」。
+#:
+#: 0 = 金属、1 = 晶体、2 = 气体。**同 `RARE_SLOTS`，存的是槽位不是名字**，
+#: 而且这三个数只在这里出现一次——模板与查询里不许另抄一份：
+#: `battle_resources.SLOT_LABELS` 的顺序与游戏「太空舱」页**并不一致**
+#: （银河素与合金碎片对调），抄一份出去，日后对不上的症状是「数字全对、
+#: 只是安在了别的资源名下」，页面上一点异样都没有。
+#:
+#: ⚠️ 这一张替掉了原先那张「其余九种」——把九种加总成一个数是把千万级的金属和
+#: 个位数的银河石能量加在一起，量纲都不一样，那个数没有意义。
+BASIC_SLOTS: tuple[int, ...] = (0, 1, 2)
 
 #: 「按天」最多给几行。用户口径（2026-08-19）：「按天最多 7 行」。
 MAX_DAY_ROWS = 7
@@ -404,17 +409,12 @@ def _require_utc(moment: datetime) -> datetime:
     return moment
 
 
-def each_slot() -> Iterator[int]:
-    """12 个槽位，行优先。页面按它铺「其余九种」那一块。"""
-    return iter(range(GAINED_SLOT_COUNT))
-
-
 __all__ = [
+    "BASIC_SLOTS",
     "COUNT_STATS_START_UTC",
     "MAX_DAY_ROWS",
     "MAX_MONTH_ROWS",
     "MAX_WEEK_ROWS",
-    "OTHER_SLOTS",
     "RARE_SLOTS",
     "RESOURCE_STATS_START_UTC",
     "SLOT_FREE",
@@ -425,7 +425,6 @@ __all__ = [
     "RunWindow",
     "available_seconds",
     "day_start",
-    "each_slot",
     "line_slots",
     "month_start",
     "occupancy_end",
