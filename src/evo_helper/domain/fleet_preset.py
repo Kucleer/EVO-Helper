@@ -31,6 +31,25 @@ def composition_signature(counts: Mapping[str, int]) -> str:
     return ",".join(f"{ship}:{count}" for ship, count in sorted(counts.items()))
 
 
+def title_signature(name: str) -> str:
+    """按标题的签名：``预设:{标题}``。
+
+    海盗那条链路（``tools.pirate_loop``）用的就是这一种——**签名就是标题本身**，
+    不展开成舰种清单：预设内容由用户在游戏里维护、随时会改，把当时的内容钉进签名，
+    日后同一个预设就会显示成两个不同的东西。标题才是稳定的那个约定
+    （用户口径：选游戏内预设只认标题）。
+
+    ⚠️ **这不是唯一的一种签名。** 老那条 ``application.workflow`` 路径取的是
+    ``scan_ranges.fleet_preset_signature``，那里存的是 `composition_signature`
+    那种 ``舰种:数量``。两种都可能出现在 ``attack_intents.preset_signature`` 里。
+
+    攻击日志页据此判「签名是不是纯粹从标题推出来的」：是的话它一个字的新信息都
+    没有，不再重复显示（用户口径 2026-08-19：「预设栏出现了重复的预设，保留一个
+    就可以了」）；不是的话就照常显示出来——那才是真的对照。
+    """
+    return f"预设:{name}"
+
+
 #: 本账号里那套一次性的探路组合：探路 = 小型运输船 × 1（实机核对，2026-08-08）。
 DEFAULT_PRESET = FleetPreset(name="探路", signature=composition_signature({"小型运输船": 1}))
 

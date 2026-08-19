@@ -240,8 +240,25 @@
               <span class="chip {{ mission_kind_tones.get(entry.mission_kind, '') }}">
                 <span class="glyph" aria-hidden="true">{{ mission_kind_glyphs.get(entry.mission_kind, '•') }}</span>{{ mission_kind_labels.get(entry.mission_kind, entry.mission_kind) }}</span>
             {% endif %}
-            {{ entry.preset_name }}
-            <div class="muted" style="font-size:11px">{{ entry.preset_signature }}</div>
+            {{ entry.preset_name }}{#
+              签名那一行**只在它不是从标题推出来的时候才出现**。
+
+              用户口径 2026-08-19：「预设栏出现了重复的预设，保留一个就可以了」——
+              这一格此前是 `[✗ 攻击] BBB` 一行、`预设:BBB` 又一行，后者一个字的
+              新信息都没有。
+
+              ⚠️ **留下的是标题（`preset_name`），收起的是签名。** 理由有三：列头
+              本来就写着「预设」，`预设:` 那个前缀等于把表头又念了一遍；上面那个
+              筛选下拉框列的、SQL 里 `WHERE preset_name = ?` 匹配的，都是标题；
+              而签名在海盗那条链路上就是 `预设:{标题}` 拼出来的，删掉它推不出任何
+              信息损失。
+
+              ⚠️ **不是无条件删。** 老那条 `application.workflow` 路径写进去的签名
+              是 `舰种:数量`（`scan_ranges.fleet_preset_signature`），和标题说的是
+              两件事，不一致时正是要看出来的。判据整段在
+              `display.preset_signature_note` 上。
+            #}{% set signature_note = preset_signature_note(entry.preset_name, entry.preset_signature) %}{#
+            #}{% if signature_note %}<div class="muted" style="font-size:11px">{{ signature_note }}</div>{% endif %}
           </td>
           <td>
             {#

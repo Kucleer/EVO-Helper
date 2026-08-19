@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from evo_helper.application.backfill import BACKFILL_KINDS, BackfillPhase
+from evo_helper.domain.fleet_preset import title_signature
 from evo_helper.domain.records import TARGET_KIND_LABELS, BattleResourceEntry
 from evo_helper.domain.scheduler import TaskStatus
 
@@ -143,6 +144,32 @@ def military_score_text(score: float | None) -> str:
     if settled == int(settled):
         return f"{int(settled):,}"
     return f"{settled:,.2f}"
+
+
+def preset_signature_note(name: str, signature: str) -> str | None:
+    """攻击日志「预设」那一格的第二行：**只在签名不是从标题推出来的时候才有**。
+
+    用户口径 2026-08-19：「预设栏出现了重复的预设，保留一个就可以了」。那一格
+    此前长这样——chip 一行写着 `攻击 BBB`，底下再来一行 `预设:BBB`。
+
+    ⚠️ **两个值是不是重复，查过才知道。** 它们出自同一行
+    （`attack_intents.preset_name` / `preset_signature`），但**不是同一条写入路径**：
+
+    - 海盗那条（`tools.pirate_loop`）写的签名就是 `预设:{标题}`，从标题推出来的，
+      一个字的新信息都没有——这才是用户看到的那种重复；
+    - 老那条（`application.workflow`）写的是 `scan_ranges.fleet_preset_signature`，
+      也就是 `舰种:数量` 那种组成签名（`domain.fleet_preset.composition_signature`）。
+      它和标题**说的是两件事**，不一致时正是要看出来的。
+
+    所以这里不是无条件删掉第二行，而是**只把纯推导出来的那一份收起来**。
+    生产库实测（2026-08-19，只读）：1160 条意图，签名全部等于 `预设:{标题}`，
+    也就是今天页面上那一行确实是纯重复；而老那条路径一旦再被启用，或者哪天有人
+    改了 `pirate_loop` 里那个格式，第二行会自己回来。
+
+    ⚠️ **不许简化成「无条件返回 None」。** 那样两值真的不一致时页面也不显示，
+    等于把唯一能发现「派出去的预设和记下的组成对不上」的地方悄悄关掉。
+    """
+    return None if signature == title_signature(name) else signature
 
 
 #: 补录能补的两条链路在界面上的名字。键是 `application.backfill.BACKFILL_KINDS`

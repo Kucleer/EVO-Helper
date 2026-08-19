@@ -82,6 +82,7 @@ from .display import (
     military_score_text,
     payload_image,
     payload_text,
+    preset_signature_note,
     resource_amount_text,
     resource_precision_hint,
 )
@@ -1028,6 +1029,10 @@ def create_app(
                 # 「目标军力」那一列的写法。**没有读数写「—」，绝不写 0**——
                 # 整段理由在 `display.military_score_text` 上。
                 "military_score_text": military_score_text,
+                # 「预设」那一格的第二行：**只在签名不是从标题推出来的时候才有**。
+                # 判据整段在 `display.preset_signature_note` 上——那两个值出自同一
+                # 行、却不是同一条写入路径，所以「重复」这件事是查过才敢断言的。
+                "preset_signature_note": preset_signature_note,
                 "resource_label": slot_label,
                 "resource_amount_text": resource_amount_text,
                 "resource_precision_hint": resource_precision_hint,
