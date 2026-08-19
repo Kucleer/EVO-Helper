@@ -52,6 +52,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
+from evo_helper.domain.fleet_preset import title_signature
 from evo_helper.domain.flight_estimate import (
     FlightCoefficient,
     FlightEstimate,
@@ -4220,8 +4221,13 @@ def _preset_signature(name: str) -> str:
 
     **不展开成舰种清单**：预设内容由用户在游戏里维护，随时会改；把当时的内容
     钉进签名，日后同一个预设就会显示成两个不同的东西。标题才是稳定的那个约定。
+
+    ⚠️ **实现搬到了 `domain.fleet_preset.title_signature`，这里只是转发。**
+    攻击日志页要判「这个签名是不是纯粹从标题推出来的」（是就不重复显示），
+    那条判据和这里写下去的格式必须是同一份——各写一份就会有一天对不上，
+    而症状是页面上凭空多出一列重复的预设名，或者真的对照被静默藏掉。
     """
-    return f"预设:{name}"
+    return title_signature(name)
 
 
 def _tesseract_path() -> Any:

@@ -268,6 +268,17 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 .filter-bar .inline-label { color: var(--text-muted); font-size: 12px; }
 .filter-bar .dash { color: var(--text-faint); }
 .filter-bar .spacer { flex: 1 1 16px; }
+/* 筛选栏底下那一句「只看 X；未按 Y 筛选」。
+ *
+ * 攻击日志把三行筛选合成了一行（用户口径 2026-08-19：「优化筛选栏分布，不要占
+ * 太多高度」），原先挂在三行右边的三句状态也并成了这一句。
+ *
+ * ⚠️ **`margin-top` 小、`margin-bottom` 为 0**：它紧贴着表单，读起来是那一行的
+ * 注脚而不是另一段。`<p>` 默认上下各 1em，不压掉的话省下来的两行又还回去了。 */
+.filter-summary { margin: 5px 0 0; font-size: 12px; }
+/* 「这一页最多 N 条」比前半句次要一档：前半句说的是筛没筛，它说的是取数上限。 */
+.filter-summary .filter-scope { color: var(--text-faint); }
+
 .filter-bar .sep {
   width: 1px;
   align-self: stretch;
@@ -504,6 +515,27 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
    1280 下核算：定宽列 788px + cap(1280−1072=208px) = 996px，容器 1010px。 */
 #log-entries { --log-body-cap: min(32vw, calc(100vw - 67rem)); }
 
+/* 三、行高钉死，**不随内容变**。
+ *
+ * 「预设」那一格原先永远是两行（chip + `预设:BBB`），于是整张表每一行都是两行高、
+ * 高度天然齐平。2026-08-19 把那个重复的签名收起来之后，它变成一行——而「战果」
+ * 那一格是有战报才两行、没战报只一行，两下一凑，同一屏里就会出现两种行高。
+ *
+ * 症状不只是不齐：这一块每 15 秒被自动刷新整块换掉（`data-refresh`），战报一到
+ * 那一行就从一行变两行，下面所有行往下跳——鼠标底下那一行会在点下去之前跑掉。
+ * 「保持列的高度不变」是用户 2026-08-19 对这张表下的原话。
+ *
+ * ⚠️ **这不是偏好项，是按上面那些量值算出来的标定量**（同 `--log-body-cap`）：
+ *   td 上下 padding 5+5 = 10
+ * + chip 一行：12px 字 × 1.5 行高 = 18，加 padding 3×2 = 6、border 1×2 = 2，共 26
+ * + 第二行：11px 字 × 1.5 行高 ≈ 17
+ * = 53，再留 3px 给 inline-flex 的基线对齐，凑整到 56。
+ * 改字号、改 chip 的 padding、给格子加第三行，都要回来重算这个数。
+ *
+ * ⚠️ **`height` 在表格行上是「最小值」，不是「最大值」**——内容真超了照样撑开，
+ * 一个字都不会被裁掉。所以这条规则只负责「不塌下去」，不负责截断。 */
+#log-entries tbody tr { height: 56px; }
+
 /* 「目标军力」那一格：`tabular-nums` 让每一位等宽，否则 `57,180` 和 `2,616`
    的千分位对不上，扫读时看不出量级差。 */
 .score-cell { font-variant-numeric: tabular-nums; }
@@ -517,6 +549,19 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
   cursor: help;
   margin-left: 2px;
 }
+
+/* 估算值那一档：同一个角标染成黄色。
+ *
+ * 用户口径 2026-08-19：「这里目标军力如果是估算的，icon 换成黄色，不要出现中文
+ * 影响页面美观」。此前那一格平铺「(估算)」三个字，加上分数超出列宽、折成两行，
+ * 整行因此比别的行高。
+ *
+ * ⚠️ **只改颜色，不改任何影响尺寸的属性**（字号、粗细、padding、border 一概不动）。
+ * 这一格的全部意义就是不把行撑高，加一条会改尺寸的规则等于把问题原样改回去。
+ *
+ * ⚠️ **黄色取 `--warn`，别在这里写死色值。** 页面上「要留意」只该有一种黄
+ * （`.chip.warn`、「?」未知那些都用它）；同一套控制台上两种黄，读者会以为是两回事。 */
+.score-tip.estimated { color: var(--warn); }
 
 /* 「战果」那一格：收起态固定一行摘要，全文在点开的弹窗里 --------------------
  *

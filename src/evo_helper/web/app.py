@@ -84,6 +84,7 @@ from .display import (
     military_score_text,
     payload_image,
     payload_text,
+    preset_signature_note,
     resource_amount_text,
     resource_precision_hint,
 )
@@ -507,6 +508,34 @@ def _span_label(span: CoordinateRange | None) -> str:
     2:130:14 也在里面」这件事，用户只能从结果里反推。
     """
     return "" if span is None else f"{span.start} – {span.end}"
+
+
+def _coordinate_text(coordinate: Coordinate) -> str:
+    """`4:277:15`——出发星球下拉框里那一档的取值，同时也是它显示的文字。
+
+    取值和显示是同一个字符串，所以链接（`/logs?origin=4:277:15`）自解释：用户把
+    地址栏那一串念出来，就是他在页面上选的那一颗。
+    """
+    return f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
+
+
+def _parse_origin(value: str | None) -> Coordinate | None:
+    """出发星球那一档的取值读回坐标。
+
+    调用之前已经**按候选表核过**（见 `attack_log_page`），所以走到这里的字符串
+    必定是 `_coordinate_text` 拼出来的那一种；解析不动就当没筛，不抛异常——
+    这是一张 HTML 页，一页 JSON 报错读起来就是「控制台坏了」。
+    """
+    if not value:
+        return None
+    parts = value.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        galaxy, system, position = (int(part) for part in parts)
+    except ValueError:
+        return None
+    return Coordinate(galaxy, system, position)
 
 
 # ---- application factory --------------------------------------------------
@@ -998,6 +1027,7 @@ def create_app(
         preset: BlankableStr = None,
         result: BlankableStr = None,
         outcome: BlankableStr = None,
+        origin: BlankableStr = None,
     ) -> HTMLResponse:
         """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
 
@@ -1024,9 +1054,22 @@ def create_app(
         「控制台坏了」。改为照常渲染、在顶上挂一条红字说明「这一页没有按坐标筛」——
         默默地不筛才是最坏的一种，用户会以为下面那些行就是筛出来的结果。
 
-        `preset` / `result` / `outcome` 的**空串一律当「不筛」**（`BlankableStr`）：
-        三个下拉框的「全部」那一项 value 就是空串，浏览器提交表单必然带上
-        `preset=&result=&outcome=`，声明成会解析的类型就是当场 422（PR #74）。
+        `preset` / `result` / `outcome` / `origin` 的**空串一律当「不筛」**
+        （`BlankableStr`）：几个下拉框的「全部」那一项 value 就是空串，浏览器提交
+        表单必然带上 `preset=&result=&outcome=`，声明成会解析的类型就是当场
+        422（PR #74）。
+
+        `origin` 是**出发星球**（用户口径 2026-08-19：「攻击日志增加出发星球快速
+        筛选」）。候选值从库里取，见 `attack_log_options` 里那段——写死会漏掉用户
+        新加的星球，而只看 `mission_task_origins` 会漏掉日志里占七成的那个旧出发点。
+        认不出来的坐标当成没筛，同 `kind` / `result` 那两条。
+
+        **整个筛选栏合成一张表单**（2026-08-19：「优化筛选栏分布，不要占太多高度」）。
+        原先是三张表单，每张都得把另外两张的值抄成 `<input type="hidden">` 带着走，
+        否则一提交就互相清空；合成一张之后那些隐藏字段全部消失，每个筛选各自就是
+        自己那一个控件。**筛选维度一个没少**，右边那三句「未按 X 筛选」也一个没少，
+        只是并成了一句——它们回答的是「我现在看到的是不是全集」，删掉会让人把筛过
+        的一页当成全部。
         """
         service = get_service(request)
         span: CoordinateRange | None = None
@@ -1041,6 +1084,13 @@ def create_app(
         if result not in ATTACK_LOG_RESULTS:
             result = None
         options = service.attack_log_options()
+        origin_options = [_coordinate_text(item) for item in options.origins]
+        # 同上：认不出来的出发星球当成没筛。**按候选表核一遍**而不是只看能不能
+        # 解析——`9:999:9` 解析得动，却一行都筛不出来，而空页读起来就是「那颗
+        # 星球一发没打过」。不在候选里就当没填，页面照常显示全部并在下面那句话
+        # 里说明「未按出发星球筛选」。
+        if origin not in origin_options:
+            origin = None
         entries = service.list_attack_log(
             ATTACK_LOG_LIMIT,
             day_utc=date,
@@ -1049,33 +1099,40 @@ def create_app(
             preset=preset,
             result=result,
             outcome=outcome,
+            origin=_parse_origin(origin),
         )
 
-        def keep(**overrides: str) -> str:
-            """带着当前的其余筛选拼链接——切换任何一档都不该把别的甩掉。"""
-            params: dict[str, str] = {"kind": kind}
-            if date is not None:
-                params["date"] = date.isoformat()
-            if target_start:
-                params["target_start"] = target_start
-            if target_end:
-                params["target_end"] = target_end
-            if preset:
-                params["preset"] = preset
-            if result:
-                params["result"] = result
-            if outcome:
-                params["outcome"] = outcome
-            params.update(overrides)
-            return "/logs?" + urlencode({k: v for k, v in params.items() if v})
+        # `keep()` 那个「拼链接时带上其余筛选」的助手随三张表单一起没了：一张表单
+        # 之后，浏览器提交时本来就把七个控件的值一起发出去，可分享的链接是它生成的
+        # （`/logs?kind=all&origin=4:277:15&preset=AAA…`），不必在服务端再拼一份。
 
+        # 筛选栏底下那一句话。**七个维度全在里面**，筛了的说「只看什么」，没筛的
+        # 逐个点名「未按它筛」——后半句是这句话的重点：它回答的是「我现在看到的
+        # 是不是全集」。原先那是右侧三句各说各的，合成一句只是省了两行高度，
+        # 一个维度都不许从名单里掉出去（用户口径 2026-08-19：不要占太多高度，
+        # 但筛选维度都要留着）。
+        #
+        # **顺序与筛选栏上那排控件一致**：读者是照着上面那一排逐个核对的，
+        # 两处顺序不一样就得来回找。
         chosen: list[str] = []
-        if preset:
-            chosen.append(f"预设 {preset}")
-        if result:
-            chosen.append(f"结果 {DISPATCH_STATE_LABELS.get(result, result)}")
-        if outcome:
-            chosen.append(f"战果 {BATTLE_RESULT_LABELS.get(outcome, outcome)}")
+        unfiltered: list[str] = []
+        (chosen if kind in TARGET_KIND_LABELS else unfiltered).append(
+            f"事件类型 {TARGET_KIND_LABELS[kind]}" if kind in TARGET_KIND_LABELS else "事件类型"
+        )
+        (chosen if origin else unfiltered).append(f"出发星球 {origin}" if origin else "出发星球")
+        (chosen if preset else unfiltered).append(f"预设 {preset}" if preset else "预设")
+        (chosen if result else unfiltered).append(
+            f"结果 {DISPATCH_STATE_LABELS.get(result, result)}" if result else "结果"
+        )
+        (chosen if outcome else unfiltered).append(
+            f"战果 {BATTLE_RESULT_LABELS.get(outcome, outcome)}" if outcome else "战果"
+        )
+        (chosen if date is not None else unfiltered).append(
+            f"游戏日 {date.isoformat()}（UTC+0 00:00–24:00）" if date is not None else "日期"
+        )
+        (chosen if span is not None else unfiltered).append(
+            f"目标坐标 {_span_label(span)}（两端都含）" if span is not None else "目标坐标"
+        )
 
         return templates.TemplateResponse(
             request=request,
@@ -1099,9 +1156,12 @@ def create_app(
                 "result_value": result or "",
                 "outcome_value": outcome or "",
                 "preset_options": options.presets,
+                "origin_value": origin or "",
+                "origin_options": origin_options,
                 "result_options": ATTACK_LOG_RESULTS,
                 "outcome_options": _ordered_outcomes(options.outcomes),
                 "quick_label": " · ".join(chosen),
+                "unfiltered_label": " / ".join(unfiltered),
                 # 「结果」「战果」两列与两个下拉框共用同一套标签、色调、字形，
                 # 页面上不再各写一份中文。
                 "dispatch_labels": DISPATCH_STATE_LABELS,
@@ -1122,6 +1182,10 @@ def create_app(
                 # 「目标军力」那一列的写法。**没有读数写「—」，绝不写 0**——
                 # 整段理由在 `display.military_score_text` 上。
                 "military_score_text": military_score_text,
+                # 「预设」那一格的第二行：**只在签名不是从标题推出来的时候才有**。
+                # 判据整段在 `display.preset_signature_note` 上——那两个值出自同一
+                # 行、却不是同一条写入路径，所以「重复」这件事是查过才敢断言的。
+                "preset_signature_note": preset_signature_note,
                 "resource_label": slot_label,
                 "resource_amount_text": resource_amount_text,
                 "resource_precision_hint": resource_precision_hint,
@@ -1131,10 +1195,11 @@ def create_app(
                 # 就会分家」的亏（见它自己的注释），而这里抄错的症状是「数字全对、
                 # 只是安在了别的资源名下」，页面上一点异样都没有。
                 "rare_slots": RARE_SLOTS,
-                "kind_url": lambda value: keep(kind=value),
-                "clear_date_url": keep(date=""),
-                "clear_target_url": keep(target_start="", target_end=""),
-                "clear_quick_url": keep(preset="", result="", outcome=""),
+                # 一张表单，也就只剩一个「清空」。**没有功能因此消失**：单独取消
+                # 某一档就是把那个下拉框拨回「全部」（或清掉日期 / 坐标框）再提交，
+                # 控件本身就是那个开关。原先三个「全部 X」按钮是三张表单各自的
+                # 复位键，表单合并之后它们连各自的作用域都没有了。
+                "clear_all_url": "/logs",
             },
         )
 
