@@ -49,7 +49,9 @@ class _FakeConfigRow:
     ai_sample_size: int | None = None
     ai_timeout_seconds: int | None = None
     ai_model: str | None = None
-    ai_shadow_enabled: bool | None = None
+    #: ⚠️ **默认 True**：这些用例钉的是限流 / 并发 / 解码，不是开关。开关自己那条
+    #: 用例在 `TestTheSwitchIsCheckedTwice` 里，它显式把这一项关掉。
+    ai_shadow_enabled: bool | None = True
 
 
 class _FakeRepo:
@@ -60,9 +62,9 @@ class _FakeRepo:
         return self.config
 
 
-def _observer(**overrides: Any) -> AiShadowObserver:
+def _observer(repository: Any = None, **overrides: Any) -> AiShadowObserver:
     return AiShadowObserver(
-        _FakeRepo(),
+        repository if repository is not None else _FakeRepo(),
         _settings(),
         sample_size=60,
         timeout_s=5.0,
@@ -71,18 +73,82 @@ def _observer(**overrides: Any) -> AiShadowObserver:
     )
 
 
-class TestEnabled:
+class TestAvailable:
     def test_missing_credentials_disables_the_observer(self) -> None:
         observer = AiShadowObserver(_FakeRepo(), _settings(api_base=None))
-        assert not observer.enabled
+        assert not observer.available
 
     def test_credentials_enable_the_observer(self) -> None:
-        assert _observer().enabled
+        assert _observer().available
 
     def test_an_explicitly_injected_httpx_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = SimpleNamespace(post=lambda *a, **k: _raise())
         monkeypatch.setattr("evo_helper.application.ai_targeting.httpx", fake)
-        assert _observer().enabled
+        assert _observer().available
+
+    def test_available_says_nothing_about_the_switch(self) -> None:
+        """⚠️ `available` **只看凭据与依赖**，开关关着它照样是 True。
+
+        钉这一条是因为「observer.enabled」这个名字太容易被当成「整条功能开着」
+        的保险来用——它从来不是。真正的开关判断有两处：调度器一侧，以及
+        `observe()` 里 `_read_knobs` 那一次。
+        """
+        repository = _FakeRepo()
+        repository.config.ai_shadow_enabled = False
+        observer = _observer(repository)
+        assert observer.available is True
+
+
+class TestTheSwitchIsCheckedTwice:
+    def test_the_observer_refuses_when_the_switch_is_off(self) -> None:
+        """⚠️ 调度器一侧已经判过开关，observer **自己再判一次**。
+
+        只有一个调用点时它是冗余的；多一个调用点、或者哪天有人在别处直接调
+        `observe()`，这一条就是唯一挡得住「开关关着却真发了请求」的东西。
+        用的是 `_read_knobs` 本来就要读的那一行，不多花一次查询。
+        """
+        repository = _FakeRepo()
+        repository.config.ai_shadow_enabled = False
+        launched = _observer(repository).observe(
+            task_id=2,
+            now=NOW,
+            run_id=None,
+            budget=2,
+            candidates=_scored(),
+            origins=[ORIGIN_A],
+            configured_lines={ORIGIN_A: 4},
+            budgets_by_origin={ORIGIN_A: 2},
+            account_inflight=0,
+            account_limit=None,
+            hold=timedelta(minutes=90),
+            presets=frozenset({"BBB"}),
+            assignments=[],
+        )
+        assert launched is False
+
+    def test_a_missing_config_row_counts_as_off(self) -> None:
+        """配置行读不到时按「关」处理——宁可什么都不发。"""
+
+        class _Broken(_FakeRepo):
+            def military_attack_config(self) -> _FakeConfigRow:
+                raise ValueError("配置行不存在")
+
+        launched = _observer(_Broken()).observe(
+            task_id=2,
+            now=NOW,
+            run_id=None,
+            budget=2,
+            candidates=_scored(),
+            origins=[ORIGIN_A],
+            configured_lines={ORIGIN_A: 4},
+            budgets_by_origin={ORIGIN_A: 2},
+            account_inflight=0,
+            account_limit=None,
+            hold=timedelta(minutes=90),
+            presets=frozenset({"BBB"}),
+            assignments=[],
+        )
+        assert launched is False
 
 
 class FakeResponse:
@@ -108,7 +174,7 @@ class TestObserveZeroCost:
             now=NOW,
             run_id=None,
             budget=2,
-            eligible=_scored(),
+            candidates=_scored(),
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 4},
             budgets_by_origin={ORIGIN_A: 2},
@@ -126,7 +192,7 @@ class TestObserveZeroCost:
             now=NOW,
             run_id=None,
             budget=0,
-            eligible=_scored(),
+            candidates=_scored(),
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 0},
             budgets_by_origin={ORIGIN_A: 0},
@@ -143,7 +209,7 @@ class TestObserveZeroCost:
             now=NOW,
             run_id=None,
             budget=2,
-            eligible=[],
+            candidates=[],
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 4},
             budgets_by_origin={ORIGIN_A: 2},
@@ -166,7 +232,7 @@ class TestRateLimitAndConcurrency:
             now=NOW,
             run_id=None,
             budget=2,
-            eligible=_scored(),
+            candidates=_scored(),
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 4},
             budgets_by_origin={ORIGIN_A: 2},
@@ -181,7 +247,7 @@ class TestRateLimitAndConcurrency:
             now=NOW,
             run_id=None,
             budget=2,
-            eligible=_scored(),
+            candidates=_scored(),
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 4},
             budgets_by_origin={ORIGIN_A: 2},
@@ -206,7 +272,7 @@ class TestRateLimitAndConcurrency:
             now=NOW,
             run_id=None,
             budget=2,
-            eligible=_scored(),
+            candidates=_scored(),
             origins=[ORIGIN_A],
             configured_lines={ORIGIN_A: 4},
             budgets_by_origin={ORIGIN_A: 2},
@@ -305,9 +371,63 @@ class TestDecodeAndCheck:
 
 
 def test_stratified_samples_never_exceeds_the_size_and_keeps_every_cell() -> None:
-    eligible = tuple(_scored() + _scored(base=40_000))
-    samples = stratified_samples(eligible, [ORIGIN_A], sample_size=4)
-    assert len(samples) <= 4
-    # 样本里的坐标必须来自 eligible。
-    coordinates = {item.coordinate for item in samples}
-    assert coordinates <= {item.coordinate for item in eligible}
+    candidates = tuple(_scored() + _scored(base=40_000))
+    sample = stratified_samples(candidates, [ORIGIN_A], sample_size=4)
+    assert len(sample.targets) <= 4
+    # 样本里的坐标必须来自候选池。
+    coordinates = {item.coordinate for item in sample.targets}
+    assert coordinates <= {item.coordinate for item in candidates}
+
+
+class TestSamplingNeverDropsAKey:
+    """⚠️ **两个抽样键（最强 / 最新）一个都不许丢。**
+
+    用「最强 / 最新」而不是现有得分 `军力 ÷ 往返`，本身就是为了不把要验证的那条
+    公式的答案泄露给 AI（方案 2.2）。旧版的降配阶梯最后一级是「每格只取军力最高
+    1 个」，在生产量级上恰恰是常态——那一级把「最新」整个丢掉了，等于丢掉这个设计。
+    """
+
+    #: 8 个格子（每个银河一格），每格 4 个目标。
+    #:
+    #: **格内军力序与新鲜度序刻意相反**：position 1 是这一格军力最高的（读数最旧），
+    #: position 4 是读数最新的（军力最低）。两个抽样键因此指向不同的行——
+    #: 指向同一行的话，丢掉一个键也看不出来。
+    CELLS = 8
+    STRONGEST_POSITION = 1
+    FRESHEST_POSITION = 4
+
+    def _pool(self) -> list[ScoredTarget]:
+        return [
+            ScoredTarget(
+                coordinate=Coordinate(galaxy, 120, rank + 1),
+                military_score=float(9_000 - rank * 1_000),
+                military_score_at_utc=NOW - timedelta(hours=4 - rank),
+            )
+            for galaxy in range(1, self.CELLS + 1)
+            for rank in range(4)
+        ]
+
+    def test_even_one_per_cell_keeps_both_keys(self) -> None:
+        """★ 预算紧到「每格只发得起一个」时，两个键**都**要在样本里露面。
+
+        这一条就是旧实现的死穴：它降到「每格只取军力最高 1 个」，
+        `FRESHEST_POSITION` 一个都不会出现。
+        """
+        sample = stratified_samples(self._pool(), [ORIGIN_A], sample_size=self.CELLS)
+        assert sample.cells_total == self.CELLS
+        assert sample.max_per_cell == 1, "预算只够每格一个"
+        positions = {item.coordinate.position for item in sample.targets}
+        assert self.STRONGEST_POSITION in positions, "「军力最高」这个键在样本里没了"
+        assert self.FRESHEST_POSITION in positions, "「读数最新」这个键在样本里没了"
+
+    def test_the_reported_shape_matches_what_was_actually_taken(self) -> None:
+        """`cells_covered` / `max_per_cell` 必须与真取到的一致——prompt 照它说话。"""
+        sample = stratified_samples(self._pool(), [ORIGIN_A], sample_size=self.CELLS)
+        assert sample.cells_covered == self.CELLS
+        assert sample.max_per_cell == 1
+        roomy = stratified_samples(self._pool(), [ORIGIN_A], sample_size=1000)
+        assert roomy.max_per_cell > 1, "预算宽裕时每格该拿到不止一个"
+
+    def test_the_sample_size_is_a_hard_ceiling(self) -> None:
+        sample = stratified_samples(self._pool(), [ORIGIN_A, ORIGIN_B], sample_size=5)
+        assert len(sample.targets) == 5
