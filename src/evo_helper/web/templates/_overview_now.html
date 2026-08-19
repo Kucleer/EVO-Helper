@@ -121,20 +121,50 @@
         <img src="/api/overview/resource-icon/{{ cell.slot }}" alt="" width="36" height="30"
              onerror="this.remove()">
         <div>
-          <div class="value tone-rare">{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</div>
+          {# 「约」与误差范围都问 `display.resource_amount_text` /
+             `resource_precision_hint` 要（经 `ResourceCell.text` / `.hint`），
+             模板里不另写一遍：把近似值渲染得像精确读数是另一回事，而这条规则
+             在攻击日志页上已经有一份了。误差按有效位数算，所以进 `title`。 #}
+          <div class="value tone-rare" title="{{ cell.hint }}">{{ cell.text }}</div>
           <div class="overview-note">昨天 {{ '{:,}'.format(now.today.yesterday.get(cell.slot, 0)) }}</div>
         </div>
       </div>
     </div>
   {% endfor %}
+  {#
+    第四张卡：三样常规资源（`domain.overview.BASIC_SLOTS`）合在一张里。
+    用户口径 2026-08-19 抄在那个常量上，**这里不复述它点的资源名**——理由见下一段。
+
+    ⚠️ **槽位与资源名都不许写进这个模板**（有用例读这份源码盯着）。槽位从
+    `BASIC_SLOTS` 来、名字由 `battle_resources.slot_label` 翻译：库里存的是位置，
+    名字只是解释。那张对照表的顺序与游戏「太空舱」页并不一致，抄一份出来的症状是
+    「数字全对、只是安在了别的资源名下」——页面上一点异样都没有。
+
+    ⚠️ **它替掉的是原先那张「其余九种」，那个加总数没有意义**：那九格里最大的一格
+    是千万级、最小的一格是个位数，量纲都不一样，加起来不回答任何问题。
+
+    ⚠️ **这张卡不许比左边三张高。** 四张卡是一行 CSS Grid，行高由最高的那张决定
+    （用户这次点名「保持高度」）。所以这里只有「标题 + 三行」，没有大字号的
+    `.value`、没有图标、也没有 `.overview-note`；行距的补偿在 `.overview-basics`
+    那条 CSS 上，理由写在那里。
+  #}
   <div class="tile overview-card">
-    <details class="overview-others">
-      <summary><span class="label">其余九种</span>
-        <span class="value muted">{{ '{:,}'.format(now.today.others_total) }}</span></summary>
-      {% for cell in now.today.others %}
-        <div class="overview-kv"><span>{{ cell.label }}</span><b>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</b></div>
-      {% endfor %}
-    </details>
+    {#
+      「0」和「—」的分界写在标题的 `title` 上，不占一行高度。判据与措辞同攻击
+      日志页那段摘要（PR #217）：入库是全有或全无，所以有若干行、偏偏缺某一格，
+      那一格就是确凿的 0；而一条收获记录都没有时，「全 0」与「根本没读过资源」
+      在库里分不开，那时候写 0 就是拿「不知道」冒充 0。
+    #}
+    <div class="label" title="12 格是一起读的、读全了才入库，所以某一样没有那一行就是它真的是 0；反过来，一条收获记录都没有时写「—」——那种情况分不出「全 0」和「没读过资源」">常规资源</div>
+    {% for cell in now.today.basics %}
+      <div class="overview-kv overview-basics"><span>{{ cell.label }}</span>
+        {%- if now.today.resources_seen -%}
+          <b title="{{ cell.hint }}">{{ cell.text }}</b>
+        {%- else -%}
+          <b class="muted" title="今天一条收获记录都没有：可能真的一无所获，也可能这些战报根本没读过资源——库里分不开，所以不写 0">—</b>
+        {%- endif -%}
+      </div>
+    {% endfor %}
   </div>
 </div>
 

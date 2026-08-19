@@ -22,7 +22,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from evo_helper.application.mission_freeze import MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
+from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.overview import BASIC_SLOTS
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.models import (
@@ -35,6 +37,8 @@ from evo_helper.storage.models import (
     ScanPlan,
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.web import app as web_package
+from evo_helper.web import overview_routes
 from evo_helper.web.app import create_persistent_app
 from support.database import scratch_database_url
 
@@ -190,6 +194,8 @@ def _report(
     reported_at_utc: datetime,
     dispatch_id: UUID | None = None,
     resources: tuple[tuple[int, int], ...] = (),
+    approximate: bool = False,
+    uncertainty: int = 0,
 ) -> None:
     report_id = uuid4()
     with factory() as session:
@@ -209,7 +215,16 @@ def _report(
         session.flush()
         for slot, amount in resources:
             session.add(
-                BattleReportResourceRow(id=uuid4(), report_id=report_id, slot=slot, amount=amount)
+                BattleReportResourceRow(
+                    id=uuid4(),
+                    report_id=report_id,
+                    slot=slot,
+                    amount=amount,
+                    # 画面上超过一千的值是缩写显示的（`928K`），真值取不回来；
+                    # `uncertainty` 记的是那一格差多少（半个末位刻度）。
+                    approximate=approximate,
+                    uncertainty=uncertainty,
+                )
             )
         session.commit()
 
@@ -220,6 +235,40 @@ def _slot_classes(html: str) -> list[list[str]]:
         re.findall(r'class="slot-(\w+)"', block)
         for block in re.findall(r'<div class="overview-slots".*?</div>', html, re.S)
     ]
+
+
+#: 「此刻 / 今天收益」那个片段的模板。有一条用例读它的**源码**——
+#: 「模板里不许抄槽位和资源名」这件事在渲染结果上看不出来。
+_NOW_TEMPLATE = Path(web_package.__file__).parent / "templates" / "_overview_now.html"
+
+#: 控制台的样式表。第四张卡的高度预算压在里面那条 `.overview-basics` 上。
+_CONSOLE_CSS = Path(web_package.__file__).parent / "static" / "console.css"
+
+_HAUL_ROW = '<div class="overview-grid overview-grid-four">'
+
+
+def _today_haul_row(html: str) -> str:
+    """「今天收益」那一行四张卡（稀有三样 + 常规资源）。
+
+    下一行（利用率 / 派遣 / 撞保护期 / 读数龄）用的是同一个类名，所以按第二个
+    出现位置截断，而不是截到片段末尾。
+    """
+    start = html.index(_HAUL_ROW, html.index("今天收益"))
+    return html[start : html.index(_HAUL_ROW, start + 1)]
+
+
+def _basics_card(html: str) -> str:
+    """那一行里的第四张卡——三样常规资源。"""
+    section = _today_haul_row(html)
+    head = section.rindex('<div class="tile overview-card">', 0, section.index("常规资源"))
+    return section[head:]
+
+
+def _basic_rows(card: str) -> dict[str, str]:
+    """那张卡上的「资源名 → 页面上写的那个数」。"""
+    return {
+        name: value for name, value in re.findall(r"<span>([^<]+)</span><b[^>]*>([^<]*)</b>", card)
+    }
 
 
 # -- 页面能打开 -----------------------------------------------------------------
@@ -552,19 +601,138 @@ def test_the_page_never_ships_a_game_asset_from_the_repository(client: TestClien
     assert not re.search(r'/static/[^"\']*\.(png|jpe?g|webp|gif)', html)
 
 
-# -- 折叠 -----------------------------------------------------------------------
+# -- 第四张卡：三样常规资源 ------------------------------------------------------
 
 
-def test_the_other_nine_resources_are_folded_away(client: TestClient, planets: None) -> None:
-    """用户口径：首屏只放稀有三样，其余九种折叠。"""
+def test_the_fourth_card_holds_the_three_basic_resources_together(
+    client: TestClient, planets: None
+) -> None:
+    """用户口径（2026-08-19）：「只显示 金属/晶体/气体，**整合进一个标签**」。
+
+    所以是**一张**卡里三个数，不是拆成三张——「今天收益」那一行仍旧只有四张卡。
+    原先那张「其余九种」连同它那个加总数一起没了：把千万级的金属和个位数的
+    银河石能量加在一起，量纲都不一样，那个数不回答任何问题。
+    """
     html = client.get("/overview").text
+    section = _today_haul_row(html)
 
-    assert "其余九种" in html
-    assert '<details class="overview-others">' in html
-    # 九种全在里面，一样不少——折叠不等于丢掉。
-    folded = html[html.index("其余九种") : html.index("</details>")]
-    for label in ("金属", "晶体", "气体", "暗能量", "银河素", "晶体矿石"):
-        assert label in folded
+    assert section.count('<div class="tile overview-card">') == 4
+    assert "其余九种" not in html
+    assert "<details" not in html
+
+    card = _basics_card(html)
+    positions = [card.index(slot_label(slot)) for slot in BASIC_SLOTS]
+    assert positions == sorted(positions), "三样的次序和 `BASIC_SLOTS` 对不上"
+
+
+def test_the_basic_card_writes_a_zero_for_a_slot_the_haul_does_not_mention(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ 缺项的口径照 PR #217，**别另立一套**。
+
+    入库是全有或全无：12 格但凡一格读不出来，那份战报一行都不写。所以
+    「有若干行、偏偏缺 slot 1」只有一种解释——那一格读到了，就是 0。
+    这里种一份只有金属与气体的战报，晶体那一行必须是 `0` 而不是「—」。
+    """
+    _report(factory, reported_at_utc=NOW - timedelta(hours=1), resources=((0, 900), (2, 700)))
+
+    card = _basics_card(client.get("/overview").text)
+    rows = _basic_rows(card)
+
+    assert rows == {slot_label(0): "900", slot_label(1): "0", slot_label(2): "700"}
+
+
+def test_the_basic_card_writes_a_dash_when_there_is_no_haul_at_all(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ 反过来，**一条收获记录都没有时不许写 0**（同 PR #217）。
+
+    那种情况库里分不开「12 格全 0」和「这些战报根本没读过资源」（存量战报全是
+    后者）。写 0 就是拿「不知道」冒充 0，而这一页的读者正是拿它判断今天收成。
+    这里种一份没有任何资源行的战报——三样全写「—」。
+    """
+    _report(factory, reported_at_utc=NOW - timedelta(hours=1))
+
+    card = _basics_card(client.get("/overview").text)
+    rows = _basic_rows(card)
+
+    assert rows == {slot_label(slot): "—" for slot in BASIC_SLOTS}
+
+
+def test_the_basic_amounts_keep_the_approximate_word_and_the_error_range(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ **近似值一律带「约」，误差范围放在 `title` 上。**
+
+    画面上超过一千的值是缩写显示的（`928K`），真值取不回来了。用户接受这个精度，
+    但接受误差不等于可以把近似值渲染得像精确读数（先例 `military_score_estimated`）。
+    误差按当初显示了几位有效数字算，所以它不能只写一个「约」了事。
+    """
+    for amount in (900_000, 28_000):
+        _report(
+            factory,
+            reported_at_utc=NOW - timedelta(hours=1),
+            resources=((0, amount),),
+            approximate=True,
+            uncertainty=500,
+        )
+
+    card = _basics_card(client.get("/overview").text)
+
+    assert _basic_rows(card)[slot_label(0)] == "约 928,000"
+    # 两份各 ±500，合计最坏就是 ±1,000——误差是累加的，不是取最大。
+    assert 'title="画面上是缩写显示的，误差不超过 ±1,000"' in card
+
+
+def test_the_basic_card_stays_within_the_height_of_the_rare_cards(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ **这一区是四张等高卡并排，行高由最高的那张决定。**
+
+    用户这次点名「保持高度」。所以第四张卡只能是「标题 + 三行紧凑行」：
+    多一行说明、换成 26px 的大字号 `.value`、或者添一张图标，整行都会跟着长高。
+    """
+    _report(factory, reported_at_utc=NOW - timedelta(hours=1), resources=((0, 900),))
+
+    card = _basics_card(client.get("/overview").text)
+
+    assert card.count("overview-kv") == 3
+    assert 'class="value' not in card
+    assert "<img" not in card
+    assert "overview-note" not in card
+    # 三行按默认的 `.overview-kv` 行距排是 66px，比稀有卡那 61.5px 高——
+    # 补偿的那条 CSS 一旦被顺手删掉，整行就长高几个像素。⚠️ 这里只守得住
+    # 「那条规则还在」，**真正的像素高度没有自动化手段量**（跑不起浏览器）。
+    assert ".overview-kv.overview-basics" in _CONSOLE_CSS.read_text(encoding="utf-8")
+
+
+def test_neither_the_slots_nor_the_resource_names_are_copied_into_the_template() -> None:
+    """⚠️ 槽位从 `BASIC_SLOTS` 来、名字由 `SLOT_LABELS` 翻译，**模板里一份都不许抄**。
+
+    那张对照表的顺序与游戏「太空舱」页并不一致（银河素与合金碎片对调）。抄一份
+    出去，日后对不上的症状是「数字全对、只是安在了别的资源名下」——页面上一点
+    异样都没有，谁也不会发现。
+    """
+    source = _NOW_TEMPLATE.read_text(encoding="utf-8")
+
+    for slot in BASIC_SLOTS:
+        assert slot_label(slot) not in source
+    assert "0, 1, 2" not in source
+
+
+def test_the_card_follows_the_constant_instead_of_a_copy_of_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, planets: None
+) -> None:
+    """⚠️ 上一条只管模板；**这一条管页面那一侧有没有抄第二份**。
+
+    把常量换成另外两格，卡片必须跟着换。查询里写死 `(0, 1, 2)` 的话，渲染结果
+    和现在一模一样——那种「抄一份」在任何断言里都看不出来，除非把常量动一动。
+    """
+    monkeypatch.setattr(overview_routes, "BASIC_SLOTS", (3, 4))
+
+    card = _basics_card(client.get("/overview").text)
+
+    assert set(_basic_rows(card)) == {slot_label(3), slot_label(4)}
 
 
 def test_the_review_only_amber_explainers_are_gone(client: TestClient, planets: None) -> None:

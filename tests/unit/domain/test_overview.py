@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from evo_helper.domain.overview import (
+    BASIC_SLOTS,
     COUNT_STATS_START_UTC,
     RARE_SLOTS,
     RESOURCE_STATS_START_UTC,
@@ -413,3 +414,21 @@ def test_the_rare_slots_are_the_three_the_user_watches() -> None:
 
     assert RARE_SLOTS == (5, 8, 9)
     assert [slot_label(slot) for slot in RARE_SLOTS] == ["合金碎片", "泰坦立方", "收割者碎片"]
+
+
+def test_the_basic_slots_are_the_three_regular_resources() -> None:
+    """⚠️ 「今天收益」第四张卡上那三样，**槽位号只有这一份**。
+
+    0 = 金属、1 = 晶体、2 = 气体（`SLOT_LABELS`）。这条钉的是「有没有抄错、
+    有没有少一样」：`SLOT_LABELS` 的顺序与游戏「太空舱」页并不一致，另抄一份
+    `(0, 1, 2)` 出去，日后对不上的症状是「数字全对、只是安在了别的资源名下」，
+    页面上一点异样都没有。
+
+    ⚠️ 三样**都要**：用户口径是「金属/晶体/气体」，少一样就不是他要的那张卡。
+    """
+    from evo_helper.domain.battle_resources import slot_label
+
+    assert BASIC_SLOTS == (0, 1, 2)
+    assert [slot_label(slot) for slot in BASIC_SLOTS] == ["金属", "晶体", "气体"]
+    # 和稀有那三样不许重叠：一格同时出现在两张卡上就等于被数了两遍。
+    assert not set(BASIC_SLOTS) & set(RARE_SLOTS)
