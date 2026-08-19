@@ -922,6 +922,86 @@ class MilitaryAttackConfigRow(Base):
         Integer, nullable=True, default=None
     )
 
+    # -- AI 选靶影子观测（2026-08-19，一期）-----------------------------------
+    #
+    # 四项**一律可空、一律不给 server_default**：NULL = 「跟着代码里的默认值走」。
+    # 给了默认值就分不开「没配」和「恰好配成当前默认」，日后调默认值时所有老行
+    # 都被钉死在旧数上——而它们表达的其实是「跟着默认走」（先例是 `blind_scrolls`）。
+
+    #: 影子模式的开关。**默认关**（同 `AUTO_ENABLED` 的惯例）：开着才组 prompt、
+    #: 调 LLM，关着**零开销**（不建线程、不组 prompt、不查库）。
+    ai_shadow_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    #: 覆盖代码里的默认模型名。**历史记录里存了 model 才对得上账**——
+    #: 换模型答案就变，而「这一轮是哪个模型给的」必须答得上。
+    ai_model: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    #: 单次 LLM 往返的超时上限（秒）。调小省钱但丢样本；调大占线程。
+    ai_timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    #: 喂给 LLM 的候选样本数。调大它看得更全、更贵；调小可能把好目标裁掉。
+    ai_sample_size: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    #: `ai_target_decisions` 保留多少天。控制台每次启动清一次早于这个期限的行。
+    #: 0 或负数表示**不清理**（口径同 `system_log_retention_days`）。默认 90 天。
+    ai_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
+
+class AiTargetDecisionRow(Base):
+    """AI 选靶（影子）的每一轮记录：算法选了谁、AI 选了谁、以及两者的对账。
+
+    ⚠️ **这张表只读不写任何判据。** 一期是影子观测：调度器照常用
+    `assign_by_capacity_and_value` 派遣，这份记录是给页面对比与后续 A/B 用的。
+    迁移合进 `main` 后由生产自己升，开发一侧一次都不许跑 `alembic upgrade`。
+
+    ⚠️ **`prompt_text` / `response_text` 原样存**：模型换版本答案就变，
+    这是事后唯一能对账的东西。记 `prompt_text` 时确认 API key 不在里面
+    （凭据只走环境变量，本来就不进 prompt）。
+
+    ⚠️ **`ai_picks_json` 为 NULL 不等于「AI 没选」。** 超时 / HTTP 错误 / 坏 JSON
+    / 硬校验不过都会留一行，靠 `status` 区分（`ok` / `timeout` / `http_error`
+    / `invalid_json` / `schema_violation`），失败那几档的 `ai_picks_json` 就是 NULL。
+    """
+
+    __tablename__ = "ai_target_decisions"
+    __table_args__ = (
+        Index("ix_ai_target_decisions_decided_at_id", "decided_at_utc", "id"),
+        Index("ix_ai_target_decisions_task_decided", "task_id", "decided_at_utc"),
+    )
+
+    #: `BigInteger().with_variant(Integer, "sqlite")` 同 `SystemLogRow.id`，
+    #: 理由见那一列。
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    #: **产生时刻**，不是入库时刻——fire-and-forget 线程里组装 prompt 与落库
+    #: 之间隔着一次网络往返，拿入库时刻当产生时刻会把时间线扭曲。
+    decided_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: 哪个任务触发的一轮。可空（手工直跑没有任务），不加外键（同 `mission_runs`）。
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: 哪一轮调度。可空，不带 CASCADE（同 `system_log.run_id`）。
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    #: 本周期起点（本周一 00:00 UTC），便于按周内相位分组。
+    cycle_start_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 这一轮的可派发数（两道闸算完之后的真实预算）。
+    budget: Mapped[int] = mapped_column(Integer)
+    #: 现有算法选中的目标（`algorithm_picks_json`），原样 JSON。
+    algorithm_picks_json: Mapped[str] = mapped_column(Text)
+    #: AI 选中的目标（解析后），原样 JSON。失败那几档为 NULL，见模块注释。
+    ai_picks_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: 按 target 算的重合数。**它只是诊断**——重合率高不代表好、低不代表坏。
+    overlap: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: prompt 原文。⚠️ 原样存，不截断。
+    prompt_text: Mapped[str] = mapped_column(Text)
+    #: 模型返回的原文。⚠️ 原样存，不截断。
+    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: 模型名与版本（这一轮实际用的是哪个）。
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 成本与延迟。`latency_ms` 是发起到返回的整段耗时（含重试）。
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: `ok` / `timeout` / `http_error` / `invalid_json` / `schema_violation`。
+    status: Mapped[str] = mapped_column(String(24))
+    #: 硬校验与软核对的结果（JSON 数组）。`ok` 那一档可能是空数组或软核对记录。
+    violations_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class MissionRunRow(Base):
     """调度器每起一个子进程记一行。"""

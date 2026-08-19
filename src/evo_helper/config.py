@@ -1,5 +1,6 @@
 """Application configuration with safety-preserving defaults."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from evo_helper.domain.fleet_preset import DEFAULT_PRESET
@@ -115,6 +116,20 @@ class Settings(BaseSettings):
     #:
     #: 换账号就要改。留空则不剔除（自己那一行会被当成榜单行重复入库）。
     player_name: str = "Kucleer"
+
+    # -- AI 选靶（影子）凭据 ---------------------------------------------------
+    #
+    # ⚠️ **这是全仓第一个对外网络调用。** 凭据只走环境变量，**不进库、不进代码、
+    # 不进日志**（本仓库是公开的，`database_url` 那段注释已经写死了这条口径）。
+    # 记 `prompt_text` 时也要确认 key 不在里面——本来就不进 prompt，但防御一次
+    # 不贵。
+    #
+    # ⚠️ **alias 故意写成用户 .env 里实际的键名。** 三个键是 2026-08-19 用户放进
+    # `.env` 的（`EVO_HELPER_API` / `EVO_HELPER_Model` / `EVO_HELPER_API_key`），
+    # 大小写也是原样——pydantic-settings 的 env 读取按 alias 精确匹配大小写。
+    ai_api_base: str | None = Field(default=None, validation_alias="EVO_HELPER_API")
+    ai_model: str | None = Field(default=None, validation_alias="EVO_HELPER_Model")
+    ai_api_key: str | None = Field(default=None, validation_alias="EVO_HELPER_API_key")
 
     @property
     def origin_coordinate(self) -> Coordinate:

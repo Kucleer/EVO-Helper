@@ -14,6 +14,7 @@ from sqlalchemy import CursorResult, and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
+from evo_helper.domain.ai_targeting import AiTargetDecision, InflightLine
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.flight_estimate import (
@@ -3031,6 +3032,186 @@ class SqlAlchemyRepository:
             session.commit()
             return True
 
+    # -- AI 选靶影子观测 ---------------------------------------------------------
+    #
+    # 一期只读不判：调度照常用算法派遣，这一节是「存下来给页面对比」的唯一写口。
+    # 迁移合进 `main` 后由生产自己升，开发一侧一次都不许跑 `alembic upgrade`。
+
+    def save_ai_target_decision(self, record: AiTargetDecision) -> None:
+        """把一轮影子观测原样落库。**任何失败都不许从这里冒出去。**
+        调用方（后台线程）已经吞掉了 LLM 侧的错误；这里再抛只会把线程弄死。
+        """
+        _require_utc(record.decided_at_utc, "decided_at_utc")
+        with self._session_factory() as session:
+            session.add(
+                orm.AiTargetDecisionRow(
+                    decided_at_utc=record.decided_at_utc,
+                    task_id=record.task_id,
+                    run_id=record.run_id,
+                    cycle_start_utc=record.cycle_start_utc,
+                    budget=record.budget,
+                    algorithm_picks_json=record.algorithm_picks_json,
+                    ai_picks_json=record.ai_picks_json,
+                    overlap=record.overlap,
+                    prompt_text=record.prompt_text,
+                    response_text=record.response_text,
+                    model=record.model,
+                    prompt_tokens=record.prompt_tokens,
+                    completion_tokens=record.completion_tokens,
+                    latency_ms=record.latency_ms,
+                    status=record.status,
+                    violations_json=record.violations_json,
+                )
+            )
+            session.commit()
+
+    def recent_ai_target_decisions(self, *, limit: int) -> list[orm.AiTargetDecisionRow]:
+        """最近的影子观测，新的在前。页面「最近 N 轮」那一块读它。"""
+        with self._session_factory() as session:
+            return list(
+                session.scalars(
+                    select(orm.AiTargetDecisionRow)
+                    .order_by(
+                        orm.AiTargetDecisionRow.decided_at_utc.desc(),
+                        orm.AiTargetDecisionRow.id.desc(),
+                    )
+                    .limit(limit)
+                ).all()
+            )
+
+    def purge_ai_target_decisions(self, older_than: datetime) -> int:
+        """清掉早于 `older_than` 的记录。返回删了几行。
+
+        保留期口径同 `system_log`：**早于期限的删、其余全留**。0 或负保留天数
+        表示不清理，由调用方判断，这里不做「全删」语义。
+        """
+        older_than = _require_utc(older_than, "older_than")
+        with self._session_factory() as session:
+            rows = list(
+                session.scalars(
+                    select(orm.AiTargetDecisionRow).where(
+                        orm.AiTargetDecisionRow.decided_at_utc < older_than
+                    )
+                ).all()
+            )
+            for row in rows:
+                session.delete(row)
+            session.commit()
+            return len(rows)
+
+    def inflight_lines(
+        self, *, now_utc: datetime, origin: Coordinate, hold: timedelta
+    ) -> list[InflightLine]:
+        """这颗出发星球上**还占着航线**的每一发，供 prompt 的航线预算那块用。
+
+        ⚠️ **判据必须复用 `_still_holding_a_line`，不许另算。** 它把人工放手、
+        航线钟、兜底时长三档合在一处；另写一份的后果是「prompt 说的空闲」和
+        「调度器实际数的空闲」分家（数据概览页那个版本踩过，见方案 2.1）。
+
+        `line_free_at_utc` 为 None 的**时长未知**那一档单独返回（由调用方在
+        prompt 里标注），它按 `hold` 占位、实际可能早就回来了。
+        """
+        now_utc = _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackDispatchRow.line_free_at_utc,
+                )
+                .join(
+                    orm.AttackIntentRow,
+                    orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                )
+                .where(
+                    _from_origin(origin),
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    _still_holding_a_line(now_utc, hold),
+                )
+            ).all()
+        return [
+            InflightLine(dispatched_at_utc=dispatched, line_free_at_utc=line_free)
+            for dispatched, line_free in rows
+        ]
+
+    def last_bot_attack_at(
+        self, coordinates: Sequence[Coordinate]
+    ) -> dict[Coordinate, datetime | None]:
+        """每个坐标我方**最近一次被游戏接受的攻击**是什么时候。
+
+        ⚠️ **绝不读 `bot_targets.last_attack_at_utc`**——那一列从来没有被任何代码
+        写过（2026-08-18 调查：全表 10,747 行非空 0 行），读它恒得「从未打过」。
+        这里从 `attack_dispatches`（accepted）现算，判据同
+        `attacked_bot_targets_since` 那一路，只是不带 `since` 下界。
+
+        ⚠️ **只认 bot 攻击发**（`mission_kind = ATTACK`）。侦察发不产生战报，
+        也不该把「我方刚碰过它」算进保护期判据。
+        """
+        if not coordinates:
+            return {}
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    func.max(orm.AttackDispatchRow.dispatched_at_utc),
+                )
+                .join(
+                    orm.AttackDispatchRow,
+                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                )
+                .where(
+                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    or_(*(_intent_is_target(c) for c in coordinates)),
+                )
+                .group_by(
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                )
+            ).all()
+        result: dict[Coordinate, datetime | None] = {coordinate: None for coordinate in coordinates}
+        for galaxy, system, position, moment in rows:
+            result[Coordinate(galaxy, system, position)] = moment
+        return result
+
+    def bot_target_protection_seen_at(
+        self, coordinates: Sequence[Coordinate]
+    ) -> dict[Coordinate, datetime | None]:
+        """每个坐标已知的「撞上保护期」时刻（`bot_targets.protection_seen_at_utc`）。
+
+        ⚠️ **它是「撞上」不是「保护期开始」**：保护期什么时候开始没人知道，
+        只知道此刻撞上了（`game.pirate_ui.DIALOG_NO_MISSION`）。AI 的软核对判据
+        用「撞上时刻 + 游戏规则 8 小时」估计保护期到什么时候（`domain.target_order`
+        的 `DEFAULT_PROTECTION_EXCLUSION` 是策略、不是规则，这里不能用）。
+        查不到的行返回 None（「从没撞过」，不是「没在保护期」）。
+        """
+        if not coordinates:
+            return {}
+        target = orm.BotTargetRow
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(target.galaxy, target.system, target.position, target.protection_seen_at_utc)
+                .where(
+                    or_(
+                        *(
+                            and_(
+                                target.galaxy == c.galaxy,
+                                target.system == c.system,
+                                target.position == c.position,
+                            )
+                            for c in coordinates
+                        )
+                    )
+                )
+            ).all()
+        result: dict[Coordinate, datetime | None] = {coordinate: None for coordinate in coordinates}
+        for galaxy, system, position, seen_at in rows:
+            result[Coordinate(galaxy, system, position)] = seen_at
+        return result
+
 
 def _mission_task(session: Session, task_id: int) -> orm.MissionTaskRow:
     row = session.get(orm.MissionTaskRow, task_id)
@@ -3087,6 +3268,15 @@ def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
         orm.AttackIntentRow.origin_galaxy == origin.galaxy,
         orm.AttackIntentRow.origin_system == origin.system,
         orm.AttackIntentRow.origin_position == origin.position,
+    )
+
+
+def _intent_is_target(target: Coordinate) -> ColumnElement[bool]:
+    """「这一发打的是 target 这颗星球」。同 `_from_origin`，抽出来免得漏分量。"""
+    return and_(
+        orm.AttackIntentRow.target_galaxy == target.galaxy,
+        orm.AttackIntentRow.target_system == target.system,
+        orm.AttackIntentRow.target_position == target.position,
     )
 
 
