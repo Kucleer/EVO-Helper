@@ -29,6 +29,7 @@ from evo_helper.application.backfill import (
     BackfillCoordinator,
     BackfillCounts,
     BackfillMeasurement,
+    BackfillPhase,
     BackfillRequest,
     BackfillState,
     SqlAlchemyBackfillCounts,
@@ -909,14 +910,18 @@ class MissionScheduler:
         # 「开始」这一下本身就是「放任务出来」的意思，所以它顺带确认掉上一批
         # 补录的摘要。不确认的话，手动补完、看完、直接点「开始」的用户会撞上一
         # 台开着却一个任务都不起的调度器，而页面上唯一的解释是另一个按钮。
+        acknowledged_from = self._backfill.state()
         self._backfill.acknowledge()
+        self._log_backfill_transition(acknowledged_from, "用户点了「开始」，顺带确认上一批摘要")
         if reconcile:
+            requested_from = self._backfill.state()
             self._backfill.request_batch(
                 [
                     BackfillRequest(kind=kind, since=default_since(now), reason=REASON_STARTUP)
                     for kind in BACKFILL_KINDS
                 ]
             )
+            self._log_backfill_transition(requested_from, "用户点了「开始」，先排一批启动对账")
             self._advance_backfill()
 
     def stop(self) -> None:
@@ -944,7 +949,7 @@ class MissionScheduler:
             self._started_at_utc = None
             self._active_military_tiers_json = None
             self._finish(self._supervisor.stop(StopReason.SHUTDOWN))
-            self._backfill.cancel(self._measure_backfill)
+            self._cancel_backfill("控制台关闭时清场")
 
     def force_kill(self) -> None:
         """页面顶部那条红条上的「强制结束」。
@@ -959,7 +964,7 @@ class MissionScheduler:
         """
         with self._lock:
             self.stop()
-            self._backfill.cancel(self._measure_backfill)
+            self._cancel_backfill("用户点了红条上的「强制结束」")
             self._repository.mark_orphan_mission_runs(ended_at_utc=self._clock())
             self._orphan_pid = None
 
@@ -1328,7 +1333,9 @@ class MissionScheduler:
             with self._lock:
                 self._finish(self._supervisor.poll())
             # 锁外：收到退出码那一次要量两个 `COUNT(*)` 外加批量 bot 阶段查询。
+            before = self._backfill.state()
             self._backfill.poll(self._measure_backfill)
+            self._log_backfill_transition(before, "补录子进程自己退了")
             self._advance_backfill()
             if not self._enabled:
                 return
@@ -1366,17 +1373,77 @@ class MissionScheduler:
         就该看见「补录中」，正在跑扫描时那一下就该把扫描抢占掉。差的那一秒
         本身无所谓，但「点了之后页面上什么都没变」会让人再点一次。
         """
+        before = self._backfill.state()
         self._backfill.request(request)
+        self._log_backfill_transition(before, "用户点了「开始补录」")
         self._advance_backfill()
         return self._backfill.state()
 
     def cancel_backfill(self) -> BackfillState:
         """排队中就撤销，跑着就杀掉。取消之后立刻放行。"""
-        return self._backfill.cancel(self._measure_backfill)
+        return self._cancel_backfill("用户点了「取消补录」")
 
     def acknowledge_backfill(self) -> BackfillState:
         """用户看过摘要，点了「继续任务」。**这一下才放行。**"""
-        return self._backfill.acknowledge()
+        before = self._backfill.state()
+        state = self._backfill.acknowledge()
+        self._log_backfill_transition(before, "用户点了「继续任务」")
+        return state
+
+    # -- 补录的痕迹 ------------------------------------------------------------
+    #
+    # ⚠️ **这一段是踩出来的**（2026-08-19）。那天一趟正在跑的手动补录变成了
+    # 「已取消」，事后翻库想知道是谁把它取消的——`system_log` 里一条都没有。
+    # 补录会独占游戏窗口十几分钟、会拦下所有任务、还有三个按钮能改它的态
+    # （取消 / 继续 / 强制结束），却整条链路一行日志都不留，于是「它为什么停了」
+    # 这个问题只能靠猜。判据是 CLAUDE.md 那条：**出事时能不能只靠库里的日志定位。**
+    #
+    # 只在**态真的变了**的那一刻写（同 `_log_schedule_window_changes`）：
+    # `_advance_backfill` 每秒被调一次，每 tick 刷一行的话一晚上几万行，
+    # 真正要看的那几条会被淹掉。
+
+    def _cancel_backfill(self, trigger: str) -> BackfillState:
+        """取消，并留下**是谁按的**。三个入口各有各的口径，混作一条就白记了。"""
+        before = self._backfill.state()
+        state = self._backfill.cancel(self._measure_backfill)
+        self._log_backfill_transition(before, trigger)
+        return state
+
+    def _log_backfill_transition(self, before: BackfillState, trigger: str) -> None:
+        """态变了就记一条，附上足够复现的那份证据。"""
+        after = self._backfill.state()
+        if (
+            after.phase is before.phase
+            and after.queued == before.queued
+            # 「确认」不动 phase，只翻这一位——而它正是放不放任务出来的那一下。
+            and after.acknowledged == before.acknowledged
+        ):
+            return
+        summary = after.summary
+        record_system_log(
+            "WARNING" if after.phase is BackfillPhase.FAILED else "INFO",
+            "application.mission_scheduler",
+            f"战报补录 {before.phase.value} → {after.phase.value}（{trigger}）",
+            payload={
+                "trigger": trigger,
+                "phase_from": before.phase.name,
+                "phase_to": after.phase.name,
+                "kind": after.kind,
+                "since": None if after.since is None else after.since.isoformat(),
+                "reason": after.reason,
+                "queued": after.queued,
+                "pid": after.pid,
+                "exit_code": after.exit_code,
+                "acknowledged": after.acknowledged,
+                # 任务此刻起不起得来，就看这一位。
+                "blocking": after.blocking,
+                "log_path": None if after.log_path is None else str(after.log_path),
+                "reports_ingested": None if summary is None else summary.reports_ingested,
+                "dispatches_claimed": None if summary is None else summary.dispatches_claimed,
+                "bot_targets_settled": None if summary is None else summary.bot_targets_settled,
+            },
+            logged_at_utc=self._clock(),
+        )
 
     def _advance_backfill(self) -> None:
         """把补录往前推一格：抢占扫描 / 等海盗跑完 / 窗口空了就起。
@@ -1414,7 +1481,9 @@ class MissionScheduler:
                 if running.kind is not MissionKind.SCAN:
                     return
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
+            was = self._backfill.state()
             self._backfill.launch_if_pending(before)
+            self._log_backfill_transition(was, "窗口空出来了，起补录子进程")
 
     def _measure_backfill(self) -> BackfillMeasurement:
         """补录前后各量一次的那份底数。**只读。**
