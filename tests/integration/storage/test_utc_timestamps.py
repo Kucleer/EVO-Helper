@@ -8,11 +8,7 @@
 from __future__ import annotations
 
 import importlib.util
-import os
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import ModuleType
 from uuid import uuid4
@@ -208,42 +204,50 @@ def test_a_naive_value_is_refused_rather_than_guessed() -> None:
 def test_a_naive_result_is_labelled_utc_not_read_as_local_time() -> None:
     """SQLite（以及尚未迁移的 Postgres 列）返回 naive 值，一律**贴** UTC 标签。
 
-    ⚠️ 这条必须在**非 UTC** 的本地时区下跑才有意义：把 ``replace(tzinfo=UTC)``
-    写成 ``astimezone(UTC)``（即「naive 当本地时间」）在 UTC 主机上是同一个函数，
-    差别一点也看不出来，而 CI 恰好跑在 UTC 的 Linux 上。所以这里先把本地时区
-    掰到 UTC+8 再验——掰不动才退回去只验标签。
+    「贴标签」和「按本地时间换算」在 UTC 主机上是同一个函数：把 ``replace(tzinfo=UTC)``
+    写成 ``astimezone(UTC)``，在 CI 那台 UTC 的 Linux 上一点差别也看不出来。
+
+    所以这里不去掰进程的本地时区——掰得动与否取决于操作系统（Windows 没有
+    ``time.tzset()``），那样判据就落在「开发机恰好在 UTC+8」这种机器设置上，
+    换一台设成 UTC 的机器会直接红。改成把**输入值**换成探针：谁按本地时间换算它，
+    谁就当场炸掉，与主机时区无关。
     """
-    with _local_timezone_shifted() as shifted:
-        result = UTCDateTime().process_result_value(
-            datetime(2026, 8, 11, 19, 4, 5), sqlite.dialect()
-        )
-        assert shifted, "既没有 tzset、本机又在 UTC 上：这条在此环境下无从区分"
+    naive = _NaiveLocalTimeProbe(2026, 8, 11, 19, 4, 5)
+
+    result = UTCDateTime().process_result_value(naive, sqlite.dialect())
 
     assert result == datetime(2026, 8, 11, 19, 4, 5, tzinfo=UTC)
     assert result is not None and result.utcoffset() == timedelta(0)
 
 
-@contextmanager
-def _local_timezone_shifted() -> Iterator[bool]:
-    """把进程的本地时区掰到非 UTC，退出时还原。
+def test_the_naive_probe_still_catches_a_local_time_conversion() -> None:
+    """探针得是活的：它哑了，上面那条就退化成「在任何主机上都什么也没验」。"""
+    with pytest.raises(AssertionError, match="本地时间"):
+        _NaiveLocalTimeProbe(2026, 8, 11, 19, 4, 5).astimezone(UTC)
 
-    POSIX 上靠 ``TZ`` + ``time.tzset()``；Windows 没有 ``tzset``，那就看本机
-    自己是不是已经不在 UTC 上（开发机在 UTC+8）。两条都不成立时返回 False。
+    with pytest.raises(AssertionError, match="本地时间"):
+        _NaiveLocalTimeProbe(2026, 8, 11, 19, 4, 5).timestamp()
+
+
+class _NaiveLocalTimeProbe(datetime):
+    """一个 naive 时刻：凡是「拿本地时区去解释它」的动作都在这里当场炸掉。
+
+    naive 的 ``datetime`` 只有两条路会去问本地时区——``astimezone()`` 和
+    ``timestamp()``——两条都堵上，就把「贴标签 vs. 换算」这个判据从主机时区里摘了出来。
+    贴完标签（``replace(tzinfo=UTC)``）之后它就是 aware 的，再换算是正当的，放行。
     """
-    if not hasattr(time, "tzset"):
-        yield datetime.now().astimezone().utcoffset() != timedelta(0)
-        return
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = "Asia/Shanghai"
-    time.tzset()
-    try:
-        yield True
-    finally:
-        if previous is None:
-            del os.environ["TZ"]
-        else:
-            os.environ["TZ"] = previous
-        time.tzset()
+
+    def astimezone(self, tz: tzinfo | None = None) -> datetime:
+        if self.tzinfo is None:
+            raise AssertionError(
+                "naive 值被当成了本地时间：应当贴 UTC 标签（replace）而不是 astimezone 换算"
+            )
+        return super().astimezone(tz)
+
+    def timestamp(self) -> float:
+        if self.tzinfo is None:
+            raise AssertionError("naive 值被当成了本地时间去取 POSIX 时间戳")
+        return super().timestamp()
 
 
 def test_a_shifted_result_is_converted_not_relabelled() -> None:
