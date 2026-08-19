@@ -45,7 +45,7 @@ import argparse
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -53,6 +53,7 @@ from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
 from evo_helper.domain.flight_estimate import (
+    FlightCoefficient,
     FlightEstimate,
     FlightSource,
     predict_flight,
@@ -1445,7 +1446,9 @@ class PirateLoop:
             return remaining
         return None
 
-    def _read_flight_time(self, coordinate: Coordinate) -> FlightEstimate:
+    def _read_flight_time(
+        self, coordinate: Coordinate, *, mission_kind: str = MISSION_KIND_ATTACK
+    ) -> FlightEstimate:
         """把简报上的飞行时长定下来，**必须在点「出发！」之前**。
 
         点完出发这一屏就没了，而这个时长是助手松手之后唯一的回程闹钟
@@ -1469,6 +1472,20 @@ class PirateLoop:
         ⚠️ 上一版这里写着「不拼 `DispatchBriefing`，因为绝对到达时间的 ROI
         还没标定」。**那个前提没有了**：ROI 现在标定过了，两个来源都在手上，
         `duration_agrees()` 那道交叉校验也不再是同义反复。
+
+        ## 2026-08-19：公式那一路的系数改成**按出发星球现学**
+
+        上一版拿「屏幕上的速度逐字等于 14.520」当准入闸，而用户口径
+        （2026-08-19）是**「每个球的速度都会有点不一样的」**——那道闸结构上
+        只可能对一颗星球放行。实机那天从 9:250:8 起飞的每一发都读到 `14.720`，
+        于是公式**对整颗星球一次都不生效**，三个来源当场少一个。
+
+        现在改成问库要（`repository.flight_coefficient`）：按这颗出发星球的历史
+        实测学一个系数，学不出来才弃权。速度**仍然读、仍然记**，但降级成
+        「编组变了」的探测器（落在 `attack_dispatches.fleet_speed_raw`）。
+
+        ⚠️ **读不到系数不拦这一发**，和读不到飞行时间一样：查库出任何岔子都
+        当成「这一路弃权」，理由与本方法开头那条相同。
         """
         arrival_flight: timedelta | None = None
         duration_flight: timedelta | None = None
@@ -1510,18 +1527,47 @@ class PirateLoop:
             )
             arrival_flight = None
 
-        estimate = reconcile_flight(
-            arrival_flight=arrival_flight,
-            duration_flight=duration_flight,
-            model_flight=predict_flight(
-                coordinate,
-                self._options.origin or origin(),
-                speed=speed,
-                percent=percent,
+        launch_origin = self._options.origin or origin()
+        coefficient = self._flight_coefficient(
+            launch_origin, mission_kind=mission_kind, fleet_speed=speed
+        )
+        estimate = replace(
+            reconcile_flight(
+                arrival_flight=arrival_flight,
+                duration_flight=duration_flight,
+                model_flight=predict_flight(coordinate, launch_origin, coefficient=coefficient),
             ),
+            fleet_speed=speed,
+            coefficient=coefficient,
         )
         self._record_flight_estimate(coordinate, estimate, speed=speed, percent=percent)
         return estimate
+
+    def _flight_coefficient(
+        self, launch_origin: Coordinate, *, mission_kind: str, fleet_speed: str
+    ) -> FlightCoefficient | None:
+        """这颗出发星球的距离公式系数，问库要；问不到就弃权。
+
+        ⚠️ **查库出任何岔子都只是「少一个来源」，不许把这一发拦下来。**
+        方向与 `_read_flight_time` 开头那条一致：飞行时间是闹钟不是闸门，
+        而这一路本来就是三个来源里最靠后的那个。
+
+        ⚠️ **不为了学系数去新建一条数据库连接**（所以这里用 `self._repository`
+        而不是 `_ensure_run()`）。两条链路走到这一步时账本一定已经开着——
+        `attack()` 与 `scout()` 都先 `_record_intent()` 才读简报。而反过来
+        主动去连，代价是在没有库的场合（用例、以及实机上库刚好连不上的那一刻）
+        白等一次连接超时，然后才走到这条 `except`。
+        """
+        repository = self._repository
+        if repository is None:
+            return None
+        try:
+            return repository.flight_coefficient(
+                origin=launch_origin, mission_kind=mission_kind, fleet_speed=fleet_speed
+            )
+        except Exception as error:  # noqa: BLE001 - 见 docstring：问不到就弃权
+            say(f"  学不出 {launch_origin} 的距离公式系数（{error}）；公式这一路弃权")
+            return None
 
     def _record_flight_estimate(
         self,
@@ -1572,13 +1618,32 @@ class PirateLoop:
             ),
             "speed_raw": speed,
             "speed_percent_raw": percent,
+            # 公式那一路用的是**哪颗星球的系数、基于几发学的**。
+            # ⚠️ 这两个字段是硬要求：k 是个拟合参数，不是代码里写死的常数，
+            # 事后问「公式为什么给出这个数」时，没有它们就只能靠猜——
+            # 而 CLAUDE.md 那条判据是「出事时能不能只靠库里的日志定位」。
+            "coefficient_origin": str(self._options.origin or origin()),
+            "seconds_per_root_unit": (
+                None if estimate.coefficient is None else estimate.coefficient.seconds_per_root_unit
+            ),
+            "coefficient_samples": (
+                None if estimate.coefficient is None else estimate.coefficient.samples
+            ),
             "target_kind": self.TARGET_KIND,
         }
+        fit = (
+            "（没学出来）"
+            if estimate.coefficient is None
+            else (
+                f"k={estimate.coefficient.seconds_per_root_unit:.4f}"
+                f"（{payload['coefficient_origin']}，{estimate.coefficient.samples} 发）"
+            )
+        )
         say(
             f"  飞行时长按 {payload['source'] or '（定不下来）'} 记："
             f"到达时间 {show(estimate.arrival_flight)}／"
             f"飞行时间 {show(estimate.duration_flight)}／"
-            f"公式 {show(estimate.model_flight)}；{estimate.reason}"
+            f"公式 {show(estimate.model_flight)} {fit}；{estimate.reason}"
         )
         if estimate.flight is None:
             # 三个来源都没有值时**必须留下像素**：这一发要按
@@ -1777,7 +1842,7 @@ class PirateLoop:
         # `_read_flight_time` 里 `_settle` 的重试（约 3 秒），`_launch` 里还会再走
         # 一遍，于是**每发侦察多花约 6 秒、一轮 4 发就是 24 秒**。那是 ROI 没对上的
         # 症状，不是别的毛病——第一次实机发现侦察变慢，先去核这个 ROI。
-        flight = self._read_flight_time(coordinate)
+        flight = self._read_flight_time(coordinate, mission_kind=MISSION_KIND_SCOUT)
         if not self._launch(coordinate, "侦察"):
             self._leave_dispatch_list()
             return False
@@ -3275,7 +3340,11 @@ class PirateLoop:
             )
         )
         repository.record_flight_time(
-            dispatch_id, estimate.flight, dispatched_at, source=estimate.source
+            dispatch_id,
+            estimate.flight,
+            dispatched_at,
+            source=estimate.source,
+            fleet_speed=estimate.fleet_speed,
         )
 
     # -- 会话 ---------------------------------------------------------------

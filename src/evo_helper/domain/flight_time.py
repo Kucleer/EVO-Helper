@@ -110,9 +110,31 @@ def distance_units(target: Coordinate, origin: Coordinate) -> float:
     )
 
 
-def one_way_seconds(target: Coordinate, origin: Coordinate) -> float:
-    """单程飞行秒数。**只在标定那套编组上是真的**，见模块头。"""
-    return LAUNCH_OVERHEAD_SECONDS + SECONDS_PER_ROOT_UNIT * sqrt(distance_units(target, origin))
+def one_way_seconds(
+    target: Coordinate,
+    origin: Coordinate,
+    *,
+    seconds_per_root_unit: float = SECONDS_PER_ROOT_UNIT,
+) -> float:
+    """单程飞行秒数。默认系数**只在标定那套编组上是真的**，见模块头。
+
+    ⚠️ `seconds_per_root_unit` 可以传，是因为**每颗出发星球的舰速都不一样**
+    （用户口径 2026-08-19：「每个球的速度都会有点不一样的」）。生产库回测
+    （2026-08-19，跨银河那一档）：
+
+        4:277:15  n=56  k = 26.5165
+        9:250:8   n=19  k = 26.3327
+        2:137:18  n=5   k = 26.5165
+
+    谁来给这个 k，以及它凭什么可信，全写在
+    `domain.flight_estimate.fit_seconds_per_root_unit`。**这里只负责算术**：
+    这个模块不知道也不该知道那个数是从哪张表里学出来的。
+
+    不传就是模块头上那个标定值——`domain.target_order` 用它给同一轮里的目标
+    排先后，那个用途只要**同一轮用同一个系数**就够了（比值是真的），
+    绝对值准不准无关紧要。
+    """
+    return LAUNCH_OVERHEAD_SECONDS + seconds_per_root_unit * sqrt(distance_units(target, origin))
 
 
 def round_trip_hours(target: Coordinate, origin: Coordinate) -> float:
