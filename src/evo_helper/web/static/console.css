@@ -510,3 +510,127 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
   cursor: help;
   margin-left: 2px;
 }
+
+/* ---- 数据概览 -------------------------------------------------------- */
+
+/* 色调工具类。同全站规矩：**色永远不是唯一的载体**——这一页每个上色的格子
+   旁边都写着数字与单位，色只用来把「该留意的」推到眼前。 */
+.tone-ok { color: var(--ok); }
+.tone-warn { color: var(--warn); }
+.tone-danger { color: var(--danger); }
+.tone-accent { color: var(--accent); }
+/* 稀有三样单独一个色：它们不是一种「状态」，用 ok/warn 会把「今天收了很多
+   合金碎片」读成「一切正常」。同 `--pirate` 那一条的理由。 */
+.tone-rare { color: #b79cf0; }
+
+.overview-sub { color: var(--text-muted); font-size: 12px; margin: 0 0 4px; }
+.overview-sub b { color: var(--warn); font-weight: 600; }
+
+.overview-heading {
+  font-size: 13px;
+  color: var(--accent);
+  margin: 0 0 10px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.overview-heading span {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.overview-grid { display: grid; gap: 12px; margin-bottom: 14px; }
+.overview-grid-lines { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.overview-grid-three { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.overview-grid-four { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.overview-card { padding: 12px 14px; }
+.overview-card .label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.overview-unit { font-size: 12px; color: var(--text-muted); font-weight: 400; margin-left: 3px; }
+.overview-note { color: var(--text-faint); font-size: 11px; margin-top: 6px; }
+.overview-kv { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; font-size: 12px; }
+.overview-kv span:first-child { color: var(--text-muted); }
+
+.overview-run { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+.overview-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 99px;
+  background: var(--text-faint);
+  flex: none;
+}
+.overview-dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(78, 201, 138, .18); }
+
+/* 航线格子。⚠️ 格子数恒等于**配置的**航线数（需求文档 8.3）：原型第一版按
+   「在飞 + 时长未知」画，一颗配了 4 条的星球画出了 7 格——那张图在说这颗星球
+   有 7 条航线。 */
+.overview-slots { display: flex; gap: 5px; margin: 8px 0 2px; }
+.overview-slots i {
+  flex: 1;
+  height: 24px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-style: normal;
+}
+.overview-slots .slot-fly { background: var(--accent-dim); color: var(--accent); border: 1px solid #1c6c74; }
+.overview-slots .slot-unk { background: #3a3112; color: var(--warn); border: 1px solid #6d5a19; }
+.overview-slots .slot-free { border: 1px dashed var(--border-strong); color: var(--text-faint); }
+
+.overview-res { display: flex; align-items: center; gap: 10px; }
+.overview-res img { flex: none; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, .6)); }
+
+/* 「其余九种」默认折起（用户口径：首屏只放稀有三样）。用原生 <details> 而不是
+   自己写一个开合——这一页不引入任何前端框架，而 <details> 的键盘可达性是白拿的。 */
+.overview-others summary {
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+.overview-others summary .label { margin: 0; }
+.overview-others[open] summary { margin-bottom: 6px; }
+
+.overview-tabs-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.overview-tabs { display: flex; gap: 4px; margin-left: auto; }
+/* 粒度切换是**链接**不是按钮：可收藏、可分享、后退键能用，服务端渲染（同
+   星球列表与系统日志的筛选）。做成 JS 切换的话，刷新之后会跳回「按天」。 */
+.overview-tab {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 11px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--bg-input);
+  text-decoration: none;
+}
+.overview-tab:hover { border-color: var(--accent); color: var(--text); }
+.overview-tab.on { color: #06202a; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+
+.overview-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.overview-table th, .overview-table td {
+  padding: 6px 9px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.overview-table thead th {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.overview-table th:first-child, .overview-table td:first-child { text-align: left; }
+.overview-table tbody th { font-weight: 500; }
+.overview-table tbody tr:last-child td, .overview-table tbody tr:last-child th { border-bottom: none; }
+.overview-table .overview-total th, .overview-table .overview-total td {
+  background: var(--bg-panel-raised);
+  font-weight: 600;
+}

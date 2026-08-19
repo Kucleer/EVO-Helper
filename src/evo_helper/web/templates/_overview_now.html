@@ -1,0 +1,168 @@
+{#
+  「此刻」与「今天收益」。这一块每几秒重取一次（见 overview.html 底部的脚本），
+  所以它是一个**能单独渲染**的片段：整页重取会把周期统计那几趟聚合查询也按
+  5 秒一次地跑起来。
+
+  ⚠️ 页面上的时刻一律走 `local_time()`（UTC+8，全站同一口径），而统计切天按
+  UTC+0。两者并存是用户定的，页首那一行写明了，这里不再逐处解释——用户口径
+  2026-08-19：「不留小字」。
+#}
+{% if now.failed %}
+  <p class="error">这一趟没读到数据（查询失败，已记进系统日志）。下面这些格子不是事实，等下一轮刷新。</p>
+{% endif %}
+
+<h2 class="overview-heading">此刻 <span>实时 · {{ local_time(now.now_utc) }}</span></h2>
+
+<div class="overview-grid overview-grid-lines">
+  {# 调度器放第一位（用户口径 2026-08-19）。 #}
+  <div class="tile overview-card">
+    <div class="label">调度器</div>
+    <div class="overview-run">
+      <span class="overview-dot {% if now.scheduler.running %}on{% endif %}"></span>
+      <span class="value {% if now.scheduler.running %}tone-ok{% else %}muted{% endif %}"
+            style="font-size: 20px">{{ '运行中' if now.scheduler.running else '已停止' }}</span>
+      {% if now.scheduler.started_at_utc %}
+        <span class="muted">自 {{ local_time(now.scheduler.started_at_utc) }}</span>
+      {% endif %}
+    </div>
+    <div class="overview-kv"><span>当前任务</span><b>{{ now.scheduler.current_label or '—' }}</b></div>
+    <div class="overview-kv"><span>本轮进度</span><b>{{ now.scheduler.current_detail or '—' }}</b></div>
+    <div class="overview-kv"><span>上一轮</span><b class="muted">
+      {%- if now.scheduler.last_run_label -%}
+        {{ now.scheduler.last_run_label }} · {{ local_time(now.scheduler.last_run_ended_at_utc) }} ·
+        {{ now.scheduler.last_run_outcome }}
+      {%- else -%}—{%- endif -%}
+    </b></div>
+  </div>
+
+  {% for line in now.lines %}
+    <div class="tile overview-card">
+      <div class="label">航线 · {{ line.origin }} <span class="muted">配置 {{ line.configured_lines }} 条</span></div>
+      <div class="value {% if line.full %}tone-warn{% else %}tone-accent{% endif %}">
+        {{ line.holding }}<span class="overview-unit">/ {{ line.configured_lines }} 条占用{% if line.full %}（满）{% endif %}</span>
+      </div>
+      {# ⚠️ 格子数恒等于「配置的航线数」，不按占用数画（需求文档 8.3）。 #}
+      <div class="overview-slots" role="img"
+           aria-label="{{ line.configured_lines }} 条航线，占用 {{ line.holding }} 条">
+        {% for slot in line.slots %}<i class="slot-{{ slot }}">{{
+          {'fly': '飞', 'unk': '?', 'free': '空'}[slot] }}</i>{% endfor %}
+      </div>
+      {% if line.overflow %}
+        <div class="overview-note tone-warn">超出配置 {{ line.overflow }} 条——航线是跨任务共享的，海盗与 bot 抢同一批</div>
+      {% endif %}
+      {% if line.unknown_duration %}
+        <div class="overview-note"><b class="tone-warn">{{ line.unknown_duration }} 条是「时长未知」</b>——飞行时间没读出来，按兜底时长占着</div>
+      {% endif %}
+      <div class="overview-note">最早空出
+        {% if line.next_free_at_utc %}
+          <b class="tone-accent">{{ local_time(line.next_free_at_utc) }}</b>
+        {% else %}
+          <b class="muted">—</b>
+        {% endif %}
+      </div>
+    </div>
+  {% else %}
+    <div class="tile overview-card">
+      <div class="label">航线</div>
+      <div class="value muted">—</div>
+      <div class="overview-note">没有配着出发星球的军力攻击任务</div>
+    </div>
+  {% endfor %}
+</div>
+
+<div class="overview-grid overview-grid-three">
+  <div class="tile overview-card">
+    <div class="label">未读战报 <span class="muted">当天派出、还没回读的</span></div>
+    <div class="value {% if now.unread.unread %}tone-danger{% else %}tone-ok{% endif %}">
+      {{ now.unread.unread }}<span class="overview-unit">发到点未读</span>
+    </div>
+    <div class="overview-kv"><span>当天已派出</span><b>{{ now.unread.dispatched_today }} 发</b></div>
+    <div class="overview-kv"><span>还在飞（正常）</span><b>{{ now.unread.in_flight }} 发</b></div>
+    <div class="overview-kv"><span>飞行时间没读出来</span><b class="{% if now.unread.unknown_eta %}tone-warn{% endif %}">{{ now.unread.unknown_eta }} 发</b></div>
+    <div class="overview-kv"><span>最老一发到点于</span><b>
+      {%- if now.unread.oldest_expected_at_utc -%}
+        {{ local_time(now.unread.oldest_expected_at_utc) }}
+      {%- else -%}—{%- endif -%}</b></div>
+  </div>
+
+  <div class="tile overview-card">
+    <div class="label">候选池按往返时长 <span class="muted">共 {{ now.pool_total }} 个</span></div>
+    {% for bucket in now.pool_buckets %}
+      <div class="overview-kv"><span>{{ bucket.label }}</span><b class="{% if loop.last %}tone-accent{% elif bucket.count == 0 %}muted{% endif %}">{{ bucket.count }} 个</b></div>
+    {% else %}
+      <div class="overview-note">没有配着出发星球，算不出往返时长</div>
+    {% endfor %}
+    {% if now.pool_unscored %}
+      <div class="overview-kv"><span>其中没有军力读数</span><b class="muted">{{ now.pool_unscored }} 个</b></div>
+    {% endif %}
+  </div>
+
+  <div class="tile overview-card">
+    <div class="label">各银河 6 小时内新鲜读数</div>
+    {% for entry in now.galaxies %}
+      <div class="overview-kv"><span>{{ entry.galaxy }} 系</span><b>{{ entry.fresh }}</b></div>
+    {% else %}
+      <div class="overview-note">6 小时内一个新鲜读数都没有</div>
+    {% endfor %}
+  </div>
+</div>
+
+<h2 class="overview-heading">今天收益
+  <span>UTC+0 · {{ '%04d-%02d-%02d'|format(now.now_utc.year, now.now_utc.month, now.now_utc.day) }} 00:00 起</span>
+</h2>
+
+<div class="overview-grid overview-grid-four">
+  {% for cell in now.today.rare %}
+    <div class="tile overview-card">
+      <div class="label">{{ cell.label }}</div>
+      <div class="overview-res">
+        {# 图标是运行时从库里的战报面板切出来的；切不出来时接口返回 204，
+           这个 <img> 自己消失（见 web/resource_icons.py 的模块说明）。 #}
+        <img src="/api/overview/resource-icon/{{ cell.slot }}" alt="" width="36" height="30"
+             onerror="this.remove()">
+        <div>
+          <div class="value tone-rare">{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</div>
+          <div class="overview-note">昨天 {{ '{:,}'.format(now.today.yesterday.get(cell.slot, 0)) }}</div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  <div class="tile overview-card">
+    <details class="overview-others">
+      <summary><span class="label">其余九种</span>
+        <span class="value muted">{{ '{:,}'.format(now.today.others_total) }}</span></summary>
+      {% for cell in now.today.others %}
+        <div class="overview-kv"><span>{{ cell.label }}</span><b>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</b></div>
+      {% endfor %}
+    </details>
+  </div>
+</div>
+
+<div class="overview-grid overview-grid-four">
+  <div class="tile overview-card">
+    <div class="label">航线利用率</div>
+    <div class="value {% if now.today.utilisation is none %}muted{% elif now.today.utilisation >= 0.8 %}tone-ok{% else %}tone-warn{% endif %}">
+      {% if now.today.utilisation is none %}—{% else %}{{ '%.1f'|format(now.today.utilisation * 100) }}<span class="overview-unit">%</span>{% endif %}
+    </div>
+    <div class="overview-note">占用 {{ '%.1f'|format(now.today.occupied_hours) }} / 可用 {{ '%.1f'|format(now.today.available_hours) }} 航线小时</div>
+  </div>
+  <div class="tile overview-card">
+    <div class="label">派遣 / 战报</div>
+    <div class="value">{{ now.today.dispatches }}<span class="overview-unit">发</span>
+      <span class="muted">/ {{ now.today.reports }}<span class="overview-unit">份</span></span></div>
+    <div class="overview-note">今日回收率
+      {% if now.today.recovery is none %}—{% else %}{{ '%.0f'|format(now.today.recovery * 100) }}%{% endif %}</div>
+  </div>
+  <div class="tile overview-card">
+    <div class="label">撞保护期</div>
+    <div class="value {% if now.today.protection_hits %}tone-warn{% else %}tone-ok{% endif %}">{{ now.today.protection_hits }}<span class="overview-unit">次</span></div>
+  </div>
+  <div class="tile overview-card">
+    <div class="label">派出时读数龄</div>
+    <div class="value {% if now.today.score_age_median is none %}muted{% endif %}">
+      {% if now.today.score_age_median is none %}—{% else %}{{ '%.1f'|format(now.today.score_age_median) }}<span class="overview-unit">小时（中位）</span>{% endif %}
+    </div>
+    <div class="overview-note">最大
+      {% if now.today.score_age_max is none %}—{% else %}{{ '%.1f'|format(now.today.score_age_max) }}h{% endif %}</div>
+  </div>
+</div>
