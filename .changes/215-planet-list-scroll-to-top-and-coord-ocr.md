@@ -1,5 +1,5 @@
 ---
-issue: 214
+issue: 215
 agent: vision-game
 type: Fixed
 date: 2026-08-19
