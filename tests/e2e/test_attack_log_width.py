@@ -4,8 +4,10 @@
 「发动时间 / 事件类型 / 目标 / 出发 / 预设 / 结果」全被挤到看不全。量出来的元凶
 就是这一列——战损一行加**12 项**资源摊开是 945px，把整张表顶到 1933px。
 
-做法照系统日志页（`/system-log`，PR #170）那一套：同样的 `.log-body` /
-`.log-line` 两个类，同样的 `tr:hover` 展开。
+限宽照系统日志页（`/system-log`，PR #170）那一套：同一个 `.log-body`。
+**展开不照它**——那一页 `tr:hover` 换行展开，而这一列展开是浮层
+（用户 2026-08-19：「像 tips 那种 hover 效果，而不是这种增加列高的」）。
+浮层那一套自己的判据在 `test_attack_log_outcome_popover.py`。
 
 ⚠️ **这一页的判据是「只折叠、不删」。** 截断纯粹发生在 CSS 里，HTML 里那 12 项
 必须一项不少——用户查故障时最需要的就是这些数字，鼠标停在那一行就要全都在。
@@ -173,9 +175,9 @@ def _outcome_cell(html: str) -> str:
 def test_the_whole_haul_survives_the_fold(tmp_path: Path) -> None:
     """12 项资源与战损两个数**全部**留在 HTML 里。
 
-    ⚠️ 这一条钉的就是「别真去截字符串」。折叠只许发生在 CSS 里（`.log-line` 的
-    省略号 + `tr:hover` 展开）；只要有人图省事在模板或视图里把正文截短，页面
-    看着一样清爽，而用户排查时要的那几个数字就永远拿不回来了。
+    ⚠️ 这一条钉的就是「别真去截字符串」。折叠只许发生在 CSS 里（收起态那一行
+    摘要 + 浮层里的全文）；只要有人图省事在模板或视图里把正文截短，页面看着
+    一样清爽，而用户排查时要的那几个数字就永远拿不回来了。
     """
     cell = _outcome_cell(_client(tmp_path).get("/logs").text)
 
@@ -201,17 +203,20 @@ def test_the_fold_does_not_swallow_the_precision_marks(tmp_path: Path) -> None:
 
 
 def test_the_outcome_column_reuses_the_shared_width_cap(tmp_path: Path) -> None:
-    """「战果」那一格用的是系统日志页同一套类，不是另起的一份。
+    """「战果」那一格仍然挂着系统日志页那个限宽类，不是另起的一份。
 
-    `.log-body` 限死列宽、`.log-line` 单行省略号、`tr:hover .log-line` 展开——
-    三条规则在 console.css 里共用（见那里的注释）。这一格少挂一个类，页面就退回
+    `.log-body` 限死列宽（console.css 里两页共用）。这一格少挂它，页面就退回
     2026-08-18 报的那个样子：整张表 1933px 宽，左边六列全被挤出视野。
+
+    ⚠️ **只有限宽是共用的，展开不是。** 这一格不许再出现 `.log-line`——那个类
+    带着 `tr:hover` 换行展开，正是 2026-08-19 那个「一行被撑到半屏」的来源。
     """
     cell = _outcome_cell(_client(tmp_path).get("/logs").text)
 
-    assert cell.startswith(' class="log-body">'), "「战果」那一格没挂 `.log-body`，列宽就没有上限"
-    # 战损与收获两行都要能截断——只收拾其中一行，另一行照样把列撑开。
-    assert cell.count('class="log-line muted"') == 2
+    assert cell.startswith(' class="log-body log-outcome">'), (
+        "「战果」那一格没挂 `.log-body`，列宽就没有上限"
+    )
+    assert "log-line" not in cell, "「战果」那一格又挂回了 `.log-line`，hover 会把这一行撑高"
 
 
 def _console_css() -> str:
@@ -226,18 +231,22 @@ def _console_css() -> str:
 
 
 def test_the_shared_truncation_rules_are_actually_in_the_stylesheet(tmp_path: Path) -> None:
-    """光在 HTML 上挂类名没有用：规则不在样式表里，那两个类就只是装饰。
+    """光在 HTML 上挂类名没有用：规则不在样式表里，那个类就只是装饰。
 
     连同这一页自己的那个收窄值一起钉住——系统日志只有 7 列，它的 46vw 放到这张
     9 列表上仍然溢出（1920 下量到 1854px > 容器 1650px），所以这一页必须自己给
     `--log-body-cap` 一个值。
+
+    末一条钉的是「别顺手把两页统一掉」：`tr:hover .log-line` 是**系统日志**那一列
+    的展开方式，它那一格里的 base64 缩略图本来就靠 hover 放大（`.log-shot`）。
+    攻击日志改成浮层时把它一并删掉，系统日志的正文就再也展不开了。
     """
     css = _console_css()
 
     assert ".log-body { max-width: var(--log-body-cap" in css
     assert "text-overflow: ellipsis" in css
-    assert "tr:hover .log-line" in css
     assert "#log-entries { --log-body-cap:" in css
+    assert "tr:hover .log-line" in css, "系统日志那一列的展开被一起删了"
     # 网格子项默认不肯比内容窄，宽表格会把**整页**顶宽——那是这次的另一半元凶。
     assert "grid-template-columns: minmax(0, 1fr)" in css
 
