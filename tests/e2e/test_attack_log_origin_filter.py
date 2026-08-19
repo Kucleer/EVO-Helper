@@ -7,9 +7,9 @@
 
 ⚠️ **这不是想出来的，是生产库只读实测**（2026-08-19）：
 
-- `mission_task_origins` 里配着两颗；
-- `attack_intents` 里真正出现过的出发点是**三个**——占日志七成的那一个从来
-  没进过 `mission_task_origins`。
+- `mission_task_origins` 里配着 2 颗；
+- `attack_intents` 里真正出现过的出发点是 **3 个**——其中条数最多的那一个
+  （占全部意图的 72%）从来没进过 `mission_task_origins`。
 
 于是两种偷懒各有一种失败：
 
