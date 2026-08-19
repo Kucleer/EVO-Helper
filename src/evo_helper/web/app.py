@@ -34,6 +34,7 @@ from evo_helper.config import Settings
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_span
 from evo_helper.domain.models import Coordinate, CoordinateRange
+from evo_helper.domain.overview import RARE_SLOTS
 from evo_helper.domain.reconcile_cooldown import RECONCILE_COOLDOWN
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.report_wait import (
@@ -1030,6 +1031,12 @@ def create_app(
                 "resource_label": slot_label,
                 "resource_amount_text": resource_amount_text,
                 "resource_precision_hint": resource_precision_hint,
+                # 收起态那行摘要只摆这三样（用户口径 2026-08-19：「收货 12 项，
+                # 改成核心 3 资源数量」）。**从 `domain.overview.RARE_SLOTS` 取，
+                # 不在模板里另写一遍 `(5, 8, 9)`**——那张表已经吃过一次「抄一份
+                # 就会分家」的亏（见它自己的注释），而这里抄错的症状是「数字全对、
+                # 只是安在了别的资源名下」，页面上一点异样都没有。
+                "rare_slots": RARE_SLOTS,
                 "kind_url": lambda value: keep(kind=value),
                 "clear_date_url": keep(date=""),
                 "clear_target_url": keep(target_start="", target_end=""),
