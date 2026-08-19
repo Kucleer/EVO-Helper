@@ -38,6 +38,7 @@ from evo_helper.storage.models import (
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web import app as web_package
+from evo_helper.web import overview_routes
 from evo_helper.web.app import create_persistent_app
 from support.database import scratch_database_url
 
@@ -239,6 +240,9 @@ def _slot_classes(html: str) -> list[list[str]]:
 #: 「此刻 / 今天收益」那个片段的模板。有一条用例读它的**源码**——
 #: 「模板里不许抄槽位和资源名」这件事在渲染结果上看不出来。
 _NOW_TEMPLATE = Path(web_package.__file__).parent / "templates" / "_overview_now.html"
+
+#: 控制台的样式表。第四张卡的高度预算压在里面那条 `.overview-basics` 上。
+_CONSOLE_CSS = Path(web_package.__file__).parent / "static" / "console.css"
 
 _HAUL_ROW = '<div class="overview-grid overview-grid-four">'
 
@@ -696,6 +700,10 @@ def test_the_basic_card_stays_within_the_height_of_the_rare_cards(
     assert 'class="value' not in card
     assert "<img" not in card
     assert "overview-note" not in card
+    # 三行按默认的 `.overview-kv` 行距排是 66px，比稀有卡那 61.5px 高——
+    # 补偿的那条 CSS 一旦被顺手删掉，整行就长高几个像素。⚠️ 这里只守得住
+    # 「那条规则还在」，**真正的像素高度没有自动化手段量**（跑不起浏览器）。
+    assert ".overview-kv.overview-basics" in _CONSOLE_CSS.read_text(encoding="utf-8")
 
 
 def test_neither_the_slots_nor_the_resource_names_are_copied_into_the_template() -> None:
@@ -710,6 +718,21 @@ def test_neither_the_slots_nor_the_resource_names_are_copied_into_the_template()
     for slot in BASIC_SLOTS:
         assert slot_label(slot) not in source
     assert "0, 1, 2" not in source
+
+
+def test_the_card_follows_the_constant_instead_of_a_copy_of_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, planets: None
+) -> None:
+    """⚠️ 上一条只管模板；**这一条管页面那一侧有没有抄第二份**。
+
+    把常量换成另外两格，卡片必须跟着换。查询里写死 `(0, 1, 2)` 的话，渲染结果
+    和现在一模一样——那种「抄一份」在任何断言里都看不出来，除非把常量动一动。
+    """
+    monkeypatch.setattr(overview_routes, "BASIC_SLOTS", (3, 4))
+
+    card = _basics_card(client.get("/overview").text)
+
+    assert set(_basic_rows(card)) == {slot_label(3), slot_label(4)}
 
 
 def test_the_review_only_amber_explainers_are_gone(client: TestClient, planets: None) -> None:
