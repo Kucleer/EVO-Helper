@@ -288,6 +288,28 @@ def test_each_planet_draws_exactly_its_configured_number_of_line_cells(
     assert "超出配置 2 条" in html
 
 
+def test_the_page_follows_the_configured_unknown_line_hold(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """⚠️ **`hold` 不许写死 90 分钟**（需求文档 8.1）。
+
+    它是用户在攻击配置页上改的那个值。这里种一发 60 分钟前派出、飞行时间没读
+    出来的：按默认 90 分钟它还占着航线，把闸门调到 45 分钟之后它就该放手了。
+    写死 90 的话，第二次请求仍然画着一个「飞」格——用户改了设置，页面纹丝不动。
+    """
+    _dispatch(factory, run_id, origin=HOME, dispatched_at_utc=NOW - timedelta(minutes=60))
+
+    assert _slot_classes(client.get("/overview").text)[0].count("unk") == 1
+
+    repository.replace_military_attack_tiers("[]", unknown_line_hold_minutes=45)
+
+    assert _slot_classes(client.get("/overview").text)[0].count("unk") == 0
+
+
 def test_the_unknown_duration_lines_are_shown_apart_from_the_flying_ones(
     client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
 ) -> None:

@@ -176,7 +176,11 @@ def test_the_hold_comes_from_the_caller_so_a_shorter_setting_releases_sooner(
 def test_a_manually_released_line_is_free_even_when_the_clock_says_otherwise(
     overview: OverviewRepository, session_factory: sessionmaker[Session], run_id: UUID
 ) -> None:
-    """人工放手那一档罩住另外两档：用户在游戏里数过航线，那是观测不是推算。"""
+    """人工放手那一档罩住另外两档：用户在游戏里数过航线，那是观测不是推算。
+
+    **「最早空出」也不许再拿它当闹钟**：用户刚把航线清干净，页面却还写着
+    「最早 12:00 空出」——那句话既是假的，也正好是他按那个按钮想消掉的东西。
+    """
     _dispatch(
         session_factory,
         run_id,
@@ -185,7 +189,10 @@ def test_a_manually_released_line_is_free_even_when_the_clock_says_otherwise(
         line_released_at_utc=NOW - timedelta(minutes=1),
     )
 
-    assert overview.line_usage(now_utc=NOW, hold=HOLD, origins=[(HOME, 5)])[0].holding == 0
+    usage = overview.line_usage(now_utc=NOW, hold=HOLD, origins=[(HOME, 5)])[0]
+
+    assert usage.holding == 0
+    assert usage.next_free_at_utc is None
 
 
 def test_a_rejected_dispatch_never_held_a_line(

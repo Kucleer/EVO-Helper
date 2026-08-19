@@ -28,7 +28,11 @@ from sqlalchemy.sql.elements import ColumnElement
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import Occupancy, RunWindow, occupancy_end
 from evo_helper.storage import models as orm
-from evo_helper.storage.repository import _from_origin, _still_holding_a_line
+from evo_helper.storage.repository import (
+    SqlAlchemyRepository,
+    _from_origin,
+    _still_holding_a_line,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +114,9 @@ class OverviewRepository:
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
+        # 「最早空出」直接问调度器自己那个查询要（`next_line_free_at`），不另写一遍。
+        # 见 `line_usage` 的说明。
+        self._repository = SqlAlchemyRepository(session_factory)
 
     # -- 此刻 ------------------------------------------------------------------
 
@@ -123,26 +130,38 @@ class OverviewRepository:
         """按出发星球给出航线账。`origins` 是「坐标 + 配着几条」，由调用方从
         `MissionScheduler.configured_line_origins()` 取——这里不自己去读那张表，
         `planet_id` 与坐标快照谁优先这条规则只该有一份。
+
+        ⚠️ **「最早空出」调 `SqlAlchemyRepository.next_line_free_at`，页面不自己
+        算**（需求文档 8.2 + 8.7）。那个函数本来就是调度器用来把「等航线」锚在一个
+        真会发生的事件上的，判据里带着 `line_free_at_utc > now`——原型第一版自己写
+        了个 `min(line_free_at_utc)`，取到一个**早就过去**的时刻，页面上显示成
+        「23:26:48，约 21 分钟后」而当时已是次日 09:54。
+
+        两个数（占用、时长未知）另走一趟聚合，因为它们要按 `hold` 判，而
+        `next_line_free_at` 不吃 `hold`（它只看有航线钟的那一档）。
         """
         holding = _still_holding_a_line(now_utc, hold)
         with self._session_factory() as session:
-            return tuple(
-                self._usage_for(session, origin, lines, holding=holding, now_utc=now_utc)
-                for origin, lines in origins
+            counts = [self._counts_for(session, origin, holding=holding) for origin, _ in origins]
+        return tuple(
+            OriginLineUsage(
+                origin=origin,
+                configured_lines=lines,
+                holding=held,
+                unknown_duration=unknown,
+                next_free_at_utc=self._repository.next_line_free_at(now_utc=now_utc, origin=origin),
             )
+            for (origin, lines), (held, unknown) in zip(origins, counts, strict=True)
+        )
 
     @staticmethod
-    def _usage_for(
-        session: Session,
-        origin: Coordinate,
-        configured_lines: int,
-        *,
-        holding: ColumnElement[bool],
-        now_utc: datetime,
-    ) -> OriginLineUsage:
-        """三个数一趟查询取齐，而不是查三遍：它们必须来自**同一个 `now`**，
-        分三次查会让「占着 3 条、其中 2 条时长未知、最早 10:58 空出」在毫秒级
-        边界上自相矛盾。
+    def _counts_for(
+        session: Session, origin: Coordinate, *, holding: ColumnElement[bool]
+    ) -> tuple[int, int]:
+        """「占着几条」与「其中几条时长未知」。
+
+        一趟查询取齐而不是查两遍：它们必须来自同一个 `now`，分两次查会让
+        「占着 3 条、其中 4 条时长未知」这种自相矛盾在边界上真的发生。
         """
         row = session.execute(
             select(
@@ -151,12 +170,6 @@ class OverviewRepository:
                 func.count()
                 .filter(orm.AttackDispatchRow.line_free_at_utc.is_(None))
                 .label("unknown"),
-                # ⚠️ `FILTER (WHERE line_free_at_utc > now)` 不能省（需求文档 8.2）：
-                # 少了它，`min()` 会取到一个早就过去的时刻，页面上那句「约 N 分钟后」
-                # 就成了一个负数。
-                func.min(orm.AttackDispatchRow.line_free_at_utc)
-                .filter(orm.AttackDispatchRow.line_free_at_utc > now_utc)
-                .label("next_free"),
             )
             .select_from(orm.AttackDispatchRow)
             .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
@@ -166,13 +179,7 @@ class OverviewRepository:
                 holding,
             )
         ).one()
-        return OriginLineUsage(
-            origin=origin,
-            configured_lines=configured_lines,
-            holding=int(row.holding or 0),
-            unknown_duration=int(row.unknown or 0),
-            next_free_at_utc=_as_utc(row.next_free),
-        )
+        return int(row.holding or 0), int(row.unknown or 0)
 
     def unread_reports(self, *, now_utc: datetime, day_start_utc: datetime) -> UnreadReports:
         """当天（UTC+0）派出去、还没回读战报的那些，切成三档。
