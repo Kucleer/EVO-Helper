@@ -10,24 +10,58 @@
 <section class="panel compact" aria-labelledby="log-filter">
   <h2 id="log-filter" class="visually-hidden">筛选</h2>
   {#
-    快速筛选：预设 / 结果 / 战果，就是表头上那三列。
+    **七个筛选合成一张表单**，底下一句话交代当前生效的是哪几档。
 
-    **一行就是一次派遣，所以按这一行自己的值筛**——不套情报中心那套「按最近
-    一次派遣判目标星球」的口径，那一页筛的是星球。
+    用户口径 2026-08-19：「攻击日志增加出发星球快速筛选，优化筛选栏分布，不要占
+    太多高度」。原先是三张 `filter-bar` 各占一行，右边各挂一句「未按 X 筛选」，
+    连表头都还没开始就吃掉三行。
+
+    ⚠️ **合并的前提是隐藏字段全部消失。** 三张表单时代，每一张都得把另外两张的
+    值抄成 `<input type="hidden">` 带着走，否则提交任何一张就把另外两张清空——
+    那是十一个隐藏字段。一张表单之后，每个筛选各自就是自己那一个控件，
+    「切换任一档不甩掉其余」由浏览器自己保证。
+
+    ⚠️ **压高度不许靠删维度。** 事件类型 / 出发星球 / 预设 / 结果 / 战果 / 日期 /
+    目标坐标，七个一个不少；底下那句话也把七个全点了一遍（见它自己的注释）。
+
+    ⚠️ **别横着堆到溢出。** 这一页为宽度收拾过两轮（#178、#183）。`.filter-bar`
+    是 `flex-wrap: wrap`，放不下会自己折行——所以窄屏不会溢出，只会变回两行；
+    1920 下量到约 1290px，容器约 1650px，是一行。再往里加控件前先量。
 
     三个下拉框的「全部」那一项 value 是空串，也就是「不筛」。筛选一律下推到
     SQL（见 `attack_log_page` 的注释）：这一页只取最近若干条，在内存里筛某个
     预设会得到空页，而空页读起来就是「那个预设没打过」。
+
+    日期按游戏时间 UTC+0 的自然日切，和表格第一列同口径。**时区必须写在标签上**，
+    不能只留在底下那句话里：现实时间 UTC+8 的「今天」和游戏日差八小时，而那八小时
+    正好压着海盗每日配额的边界。
+
+    目标坐标区间两端都可以只写到星系（`2:130`）——起点补 :1、终点补 :999，
+    所以 `2:130` – `2:140` 是「这十一个星系的所有位号」。只填一端时另一端跟着它。
   #}
   <form class="filter-bar" method="get" action="/logs">
-    <input type="hidden" name="date" value="{{ day_value }}">
-    <input type="hidden" name="target_start" value="{{ target_start_value }}">
-    <input type="hidden" name="target_end" value="{{ target_end_value }}">
     <label class="inline-label" for="log-kind">事件类型</label>
     <select id="log-kind" name="kind">
       <option value="all" {% if kind == 'all' %}selected{% endif %}>全部</option>
       {% for value, label in kind_labels.items() %}
         <option value="{{ value }}" {% if kind == value %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    {#
+      出发星球。**候选值从库里取，一个都不许写死**（用户口径 2026-08-19：这一档
+      是给「随时会加的星球」用的）。名单是「日志里出现过的 ∪ 现在配着的
+      （`mission_task_origins`）」，两边缺一不可——整段理由在
+      `persistent_service._attack_log_origins` 上。
+
+      做成下拉框而不是一排快速按钮：按钮数量随用户加星球增长，而这一页为宽度
+      收拾过两轮，一排会长的按钮迟早把筛选栏顶出容器；下拉框无论几颗都是同一个
+      宽度，且和旁边四档长得一样，读起来是同一类东西。
+    #}
+    <label class="inline-label" for="log-origin">出发星球</label>
+    <select id="log-origin" name="origin">
+      <option value="">全部</option>
+      {% for value in origin_options %}
+        <option value="{{ value }}" {% if value == origin_value %}selected{% endif %}>{{ value }}</option>
       {% endfor %}
     </select>
     <label class="inline-label" for="log-preset">预设</label>
@@ -52,59 +86,35 @@
         <option value="{{ value }}" {% if value == outcome_value %}selected{% endif %}>{{ result_labels.get(value, value) }}</option>
       {% endfor %}
     </select>
-    <button class="btn small primary" type="submit">筛选</button>
-    <a class="btn small" href="{{ clear_quick_url }}">全部</a>
-    <span class="spacer"></span>
-    <span class="muted">
-      {% if quick_label %}只看 {{ quick_label }}{% else %}未按预设 / 结果 / 战果筛选{% endif %}
-    </span>
-  </form>
-
-  {# 日期按游戏时间 UTC+0 的自然日切，和表格第一列同口径；清空即不筛。 #}
-  <form class="filter-bar" method="get" action="/logs">
-    <input type="hidden" name="kind" value="{{ kind }}">
-    <input type="hidden" name="target_start" value="{{ target_start_value }}">
-    <input type="hidden" name="target_end" value="{{ target_end_value }}">
-    <input type="hidden" name="preset" value="{{ preset_value }}">
-    <input type="hidden" name="result" value="{{ result_value }}">
-    <input type="hidden" name="outcome" value="{{ outcome_value }}">
     <label class="inline-label" for="log-date">日期（游戏 UTC+0）</label>
     <input type="date" id="log-date" name="date" value="{{ day_value }}">
+    <label class="inline-label" for="log-target-start">目标坐标</label>
+    <input id="log-target-start" name="target_start" value="{{ target_start_value }}"
+           placeholder="2:130" size="8" aria-label="目标坐标范围起点">
+    <span class="dash">–</span>
+    <input id="log-target-end" name="target_end" value="{{ target_end_value }}"
+           placeholder="2:140" size="8" aria-label="目标坐标范围终点">
     <button class="btn small primary" type="submit">筛选</button>
-    <a class="btn small" href="{{ clear_date_url }}">全部日期</a>
-    <span class="spacer"></span>
-    <span class="muted">
-      {% if day_value %}只看 {{ day_value }} 这一个游戏日（UTC+0 00:00–24:00）{% else %}未按日期筛选{% endif %}
-    </span>
+    {# 一个「清空」。单独取消某一档就是把那个控件拨回「全部」（或清空日期 /
+       坐标框）再提交——控件本身就是那个开关，没有功能因此消失。 #}
+    <a class="btn small" href="{{ clear_all_url }}">清空</a>
   </form>
 
   {#
-    目标坐标区间。两端都可以只写到星系（`2:130`）——起点补 :1、终点补 :999，
-    所以 `2:130` – `2:140` 是「这十一个星系的所有位号」。只填一端时另一端跟着它，
-    也就是「只看这一个星系」。
+    ⚠️ **这一句是筛选栏的一部分，不是装饰。**
 
-    筛选下推到 SQL（见 `attack_log_page` 的注释）：这一页只取最近若干条，
-    在内存里筛坐标的话，查一个旧坐标必得空页，而空页读起来就是「没打过」。
+    它回答的是「我现在看到的是不是全集」。原先那是三句「未按 X 筛选」分别挂在三行
+    右边；合成一句只是省了两行高度，**七个维度一个都不许从名单里掉出去**——
+    少了哪一档，用户就会把筛过的一页当成全部，而页面上一点异样都没有。
+
+    没筛的那些逐个点名（「未按 事件类型 / 出发星球 … 筛选」），不是笼统写一句
+    「其余未筛」：用户要确认的往往正是某一档，笼统的写法答不了他的问题。
   #}
-  <form class="filter-bar" method="get" action="/logs">
-    <input type="hidden" name="kind" value="{{ kind }}">
-    <input type="hidden" name="date" value="{{ day_value }}">
-    <input type="hidden" name="preset" value="{{ preset_value }}">
-    <input type="hidden" name="result" value="{{ result_value }}">
-    <input type="hidden" name="outcome" value="{{ outcome_value }}">
-    <label class="inline-label" for="log-target-start">目标坐标</label>
-    <input id="log-target-start" name="target_start" value="{{ target_start_value }}"
-           placeholder="2:130" size="10" aria-label="目标坐标范围起点">
-    <span class="dash">–</span>
-    <input id="log-target-end" name="target_end" value="{{ target_end_value }}"
-           placeholder="2:140" size="10" aria-label="目标坐标范围终点">
-    <button class="btn small primary" type="submit">筛选</button>
-    <a class="btn small" href="{{ clear_target_url }}">全部坐标</a>
-    <span class="spacer"></span>
-    <span class="muted">
-      {% if span_label %}只看 {{ span_label }}（两端都含）{% else %}未按坐标筛选{% endif %}
-    </span>
-  </form>
+  <p class="filter-summary muted">
+    {% if quick_label %}只看 <strong>{{ quick_label }}</strong>；{% endif %}
+    {% if unfiltered_label %}未按 {{ unfiltered_label }} 筛选{% else %}七档全部筛过{% endif %}
+    <span class="filter-scope">· 这一页最多 {{ limit }} 条</span>
+  </p>
 
   {% if span_error %}
     {# 解析失败时**照常显示全部记录**，但必须说清楚这一页没有按坐标筛过——

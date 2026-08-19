@@ -238,14 +238,24 @@ def test_switching_event_kind_keeps_the_chosen_target_range(tmp_path: Path) -> N
     assert 'name="target_end" value="2:140"' in body
 
 
-def test_the_date_form_carries_the_target_range_along(tmp_path: Path) -> None:
-    """两个筛选是两张表单，各自都得把对方的值带上，否则一提交就互相清空。"""
+def test_the_date_and_target_filters_live_in_one_form_now(tmp_path: Path) -> None:
+    """日期与坐标同在一张表单里，所以「带上对方的值」不再需要隐藏字段。
+
+    这一页原先是三张 `filter-bar`，每张都得把另外两张的值抄成
+    `<input type="hidden">`（十一个），否则提交任何一张就把另外两张清空。
+    2026-08-19 压筛选栏高度时合成一张，那些抄件随之消失——**判据仍是同一件事**：
+    提交坐标那一档不许把日期甩掉。
+    """
     _, client = _seed(tmp_path)
 
-    body = client.get("/logs", params={"target_start": "2:130", "target_end": "2:140"}).text
+    body = client.get(
+        "/logs", params={"target_start": "2:130", "target_end": "2:140", "date": "2026-08-09"}
+    ).text
 
-    assert '<input type="hidden" name="target_start" value="2:130">' in body
-    assert '<input type="hidden" name="target_end" value="2:140">' in body
+    assert '<input type="hidden"' not in body, "还在抄隐藏字段——表单没有真的合并"
+    assert 'name="target_start" value="2:130"' in body
+    assert 'name="target_end" value="2:140"' in body
+    assert 'name="date" value="2026-08-09"' in body
 
 
 def test_the_target_range_composes_with_the_date_filter(tmp_path: Path) -> None:

@@ -268,6 +268,17 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 .filter-bar .inline-label { color: var(--text-muted); font-size: 12px; }
 .filter-bar .dash { color: var(--text-faint); }
 .filter-bar .spacer { flex: 1 1 16px; }
+/* 筛选栏底下那一句「只看 X；未按 Y 筛选」。
+ *
+ * 攻击日志把三行筛选合成了一行（用户口径 2026-08-19：「优化筛选栏分布，不要占
+ * 太多高度」），原先挂在三行右边的三句状态也并成了这一句。
+ *
+ * ⚠️ **`margin-top` 小、`margin-bottom` 为 0**：它紧贴着表单，读起来是那一行的
+ * 注脚而不是另一段。`<p>` 默认上下各 1em，不压掉的话省下来的两行又还回去了。 */
+.filter-summary { margin: 5px 0 0; font-size: 12px; }
+/* 「这一页最多 N 条」比前半句次要一档：前半句说的是筛没筛，它说的是取数上限。 */
+.filter-summary .filter-scope { color: var(--text-faint); }
+
 .filter-bar .sep {
   width: 1px;
   align-self: stretch;

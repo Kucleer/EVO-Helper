@@ -55,8 +55,9 @@ from evo_helper.web.service import ScanRangeView
 from support.database import scratch_database_url
 from support.runs import seed_run_instance
 
-ORIGIN = Coordinate(2, 137, 18)
-BOT_TARGET = Coordinate(2, 137, 9)
+#: 坐标一律是编出来的：这个仓是公开的，夹具里不放真实坐标。
+ORIGIN = Coordinate(5, 311, 12)
+BOT_TARGET = Coordinate(5, 311, 9)
 CYCLE = datetime(2026, 8, 3, tzinfo=UTC)
 DISPATCHED = datetime(2026, 8, 18, 3, 55, tzinfo=UTC)
 
@@ -83,9 +84,7 @@ def _factory(
         window_start=time(8),
         window_end=time(20),
         ranges=(
-            ScanRangeView(
-                Coordinate(2, 137, 1), BOT_TARGET, ORIGIN, PRESET_NAME, signature, 0
-            ),
+            ScanRangeView(Coordinate(5, 311, 1), BOT_TARGET, ORIGIN, PRESET_NAME, signature, 0),
         ),
     )
     run_id = seed_run_instance(
@@ -188,7 +187,9 @@ def test_the_kept_value_is_the_one_the_filters_key_on(tmp_path: Path) -> None:
 
     assert PRESET_NAME in cell
     assert "预设:" not in cell, "留下的是签名而不是标题——它和筛选下拉框里的词对不上"
-    assert f'<option value="{PRESET_NAME}"' in html, "筛选下拉框里的候选值不是标题，这条用例的前提不成立"
+    assert f'<option value="{PRESET_NAME}"' in html, (
+        "筛选下拉框里的候选值不是标题，这条用例的前提不成立"
+    )
 
 
 # -- 二、推不出来的那一份照常显示 ------------------------------------------------

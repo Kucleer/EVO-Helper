@@ -326,6 +326,19 @@ class AttackLogOptions:
     presets: tuple[str, ...]
     #: 含 `AWAITING`（还没收到战报的那些行），当且仅当库里真有这样一行。
     outcomes: tuple[str, ...]
+    #: 出发星球的候选值：**日志里出现过的**并上**当前配着的**（`mission_task_origins`）。
+    #:
+    #: ⚠️ **两边缺一不可，这是查出来的，不是想出来的。** 生产库 2026-08-19 只读实测：
+    #: `mission_task_origins` 里只有 `4:277:15` 与 `9:250:8`，而 `attack_intents`
+    #: 里真正出现过的出发点是 `2:137:18`（836 条）、`4:277:15`（270 条）、
+    #: `9:250:8`（54 条）——只取前者的话，占日志七成的那个出发点根本筛不出来，
+    #: 而页面上看不出少了它，用户只会觉得「筛选坏了」。
+    #:
+    #: 反过来只取日志里出现过的，用户新加一颗星球、还没派出第一发之前那颗就不在
+    #: 候选里——而「随时会加」正是这个筛选要跟上的事（用户口径 2026-08-19）。
+    #: 这一档因此会出现「筛出来 0 行」的选项，但那 0 行本身就是答案：**配了，
+    #: 一发还没打出去**。
+    origins: tuple[Coordinate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -620,6 +633,7 @@ class ApplicationService(Protocol):
         preset: str | None = None,
         result: str | None = None,
         outcome: str | None = None,
+        origin: Coordinate | None = None,
     ) -> list[AttackLogView]: ...
     def attack_log_options(self) -> AttackLogOptions: ...
     def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None: ...
@@ -959,6 +973,7 @@ class FakeApplicationService:
         preset: str | None = None,
         result: str | None = None,
         outcome: str | None = None,
+        origin: Coordinate | None = None,
     ) -> list[AttackLogView]:
         """Fake 服务不模拟派遣，所以攻击日志恒为空。
 
@@ -970,9 +985,9 @@ class FakeApplicationService:
     def attack_log_options(self) -> AttackLogOptions:
         """同上：没有派遣记录，也就没有预设与战果可供筛选。
 
-        两个空元组让筛选器只剩「全部」一项，而不是摆出一串筛不出东西的档位。
+        三个空元组让筛选器只剩「全部」一项，而不是摆出一串筛不出东西的档位。
         """
-        return AttackLogOptions(presets=(), outcomes=())
+        return AttackLogOptions(presets=(), outcomes=(), origins=())
 
     def report_screenshot(self, report_id: UUID) -> ReportScreenshot | None:
         """同上：Fake 服务没有战报，也就没有战报截图。返回 None 让接口 404。"""

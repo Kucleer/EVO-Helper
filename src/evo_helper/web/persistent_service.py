@@ -458,6 +458,7 @@ class PersistentApplicationService:
         preset: str | None = None,
         result: str | None = None,
         outcome: str | None = None,
+        origin: Coordinate | None = None,
     ) -> list[AttackLogView]:
         """攻击日志：每条意图一行，派出去的带上派遣事实。
 
@@ -471,7 +472,7 @@ class PersistentApplicationService:
         战报按 `dispatch_id` 接——那是仓储层做过时间与坐标核对之后写下的匹配结果，
         在这里按坐标重新配一次，等于把同一条判据写第二份。
 
-        **六个筛选全部下推到 SQL**，不许在取回 `limit` 条之后再挑：日志页只取最近
+        **七个筛选全部下推到 SQL**，不许在取回 `limit` 条之后再挑：日志页只取最近
         若干条，在内存里筛等于「先砍掉历史再问历史」——查三天前那天、或者查某个
         坐标，会得到空页，而空页读起来和「那天/那里一发没打」一模一样。海盗每日
         32 次配额是按游戏日算的，一天的记录必须能整天取全。
@@ -487,6 +488,10 @@ class PersistentApplicationService:
           外连接下没有战报行时 `BattleReportRow.outcome` 就是 NULL，所以
           `IS NULL` 一条同时覆盖「没战报」和「战报没读出胜负」——页面上这两种
           也都显示「待战报」，两边必须是同一条判据。
+        - `origin`：出发星球，精确匹配 `attack_intents` 上那三列出发坐标。
+          **不走 `mission_task_origins` 的 id**：那张表配的是「现在从哪儿打」，
+          而日志答的是「当时从哪儿打的」；用户把一颗星球从任务里撤下来之后，
+          按 id 关联的历史行会整批查不到。
 
         **这一行就是一次派遣，所以三个新筛选一律按这一行自己的值判**，不套情报
         中心那套「按最近一次派遣判目标星球」的口径——那一页筛的是星球，这一页
@@ -533,6 +538,12 @@ class PersistentApplicationService:
                 )
             if preset is not None:
                 statement = statement.where(orm.AttackIntentRow.preset_name == preset)
+            if origin is not None:
+                statement = statement.where(
+                    orm.AttackIntentRow.origin_galaxy == origin.galaxy,
+                    orm.AttackIntentRow.origin_system == origin.system,
+                    orm.AttackIntentRow.origin_position == origin.position,
+                )
             if result is not None:
                 statement = statement.where(_dispatch_result_clause(result))
             if outcome is not None:
@@ -661,7 +672,7 @@ class PersistentApplicationService:
         return ReportScreenshotRepository(self._session_factory).load(report_id)
 
     def attack_log_options(self) -> AttackLogOptions:
-        """攻击日志上「预设」「战果」两档的候选值，从库里现有的记录取。
+        """攻击日志上「预设」「出发星球」「战果」三档的候选值，从库里现有的记录取。
 
         写死字面量会漏掉用户新建的预设——预设是他自己在游戏里维护的，助手这边
         只是读到什么记什么。战果同理：库里存的是战斗详情页上的画面原文。
@@ -708,7 +719,57 @@ class PersistentApplicationService:
             ).first()
             if awaiting is not None:
                 outcomes.append(RESULT_AWAITING)
-        return AttackLogOptions(presets=presets, outcomes=tuple(outcomes))
+            origins = self._attack_log_origins(session)
+        return AttackLogOptions(presets=presets, outcomes=tuple(outcomes), origins=tuple(origins))
+
+    @staticmethod
+    def _attack_log_origins(session: Session) -> list[Coordinate]:
+        """出发星球那一档的候选值：**日志里出现过的** ∪ **当前配着的**。
+
+        ⚠️ **两张表缺一不可，这是查出来的，不是想出来的。** 生产库 2026-08-19 只读
+        实测：`mission_task_origins` 里只有 `4:277:15` 和 `9:250:8`，而
+        `attack_intents` 里真正出现过的出发点是 `2:137:18`（836 条）、
+        `4:277:15`（270 条）、`9:250:8`（54 条）。
+
+        - 只取 `mission_task_origins`：占日志七成的 `2:137:18` 根本筛不出来。页面
+          上看不出少了它——下拉框里没有的那一档，用户不会知道它本来该在。
+        - 只取日志里出现过的：用户新加一颗星球、还没派出第一发之前，那颗不在候选里。
+          而「用户随时会加」正是这个筛选要跟上的事（口径 2026-08-19）。
+
+        并起来的代价是**可能出现筛不出行的一档**（配了但一发没打）。这里接受它：
+        那 0 行本身就是答案。这和「战果」那一档的口径相反（那边只摆真有记录的），
+        因为战果是读到什么记什么，而出发星球是用户**主动配的**——他配了却查不到，
+        比查出来是空更让人怀疑控制台。
+
+        ⚠️ **停用的出发点照样进候选。** `mission_task_origins.enabled=False` 说的是
+        「现在不从这儿打」，不是「从这儿打过的那些不算数」；历史行还在日志里。
+        """
+        seen: list[Coordinate] = []
+        rows: list[tuple[int, int, int]] = [
+            (row[0], row[1], row[2])
+            for row in session.execute(
+                select(
+                    orm.AttackIntentRow.origin_galaxy,
+                    orm.AttackIntentRow.origin_system,
+                    orm.AttackIntentRow.origin_position,
+                ).distinct()
+            ).all()
+        ]
+        rows.extend(
+            (row[0], row[1], row[2])
+            for row in session.execute(
+                select(
+                    orm.MissionTaskOriginRow.galaxy,
+                    orm.MissionTaskOriginRow.system,
+                    orm.MissionTaskOriginRow.position,
+                ).distinct()
+            ).all()
+        )
+        for galaxy, system, position in rows:
+            coordinate = Coordinate(galaxy, system, position)
+            if coordinate not in seen:
+                seen.append(coordinate)
+        return sorted(seen, key=lambda item: (item.galaxy, item.system, item.position))
 
     def request_revisit(
         self, scope: str, reason: str, target_coordinate: Coordinate | None

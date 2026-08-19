@@ -187,7 +187,11 @@ def test_empty_quick_filters_mean_no_filter_instead_of_422(tmp_path: Path) -> No
     body = response.text
     for target in (WON, LOST, FLYING, REJECTED, NEVER_LEFT):
         assert _link(target) in body
-    assert "未按预设 / 结果 / 战果筛选" in body
+    # 筛选栏底下那一句话把没筛的维度逐个点名（三行合成一行之后，三句状态并成了
+    # 这一句——见 `logs.html` 里那段注释）。少了哪一档，用户会把筛过的一页当全部。
+    for dimension in ("事件类型", "出发星球", "预设", "结果", "战果", "日期", "目标坐标"):
+        assert f"{dimension}" in body
+    assert "未按 " in body and " 筛选" in body
 
 
 # ---- 三个筛选各自筛对 -----------------------------------------------------
@@ -280,17 +284,22 @@ def test_the_quick_filters_compose_with_the_existing_ones(tmp_path: Path) -> Non
         assert _link(dropped) not in body
 
 
-def test_switching_event_kind_carries_the_quick_filters_along(tmp_path: Path) -> None:
-    """切换任一档都不该把其余的甩掉，否则每种视图都没有可分享的链接。"""
+def test_switching_one_filter_carries_the_others_along(tmp_path: Path) -> None:
+    """切换任一档都不该把其余的甩掉，否则每种视图都没有可分享的链接。
+
+    ⚠️ **七个筛选合成了一张表单**（2026-08-19 压筛选栏高度），所以「带上其余的值」
+    不再靠隐藏字段、也不靠服务端预先拼好的链接，而是靠那几个控件**自己保持着当前
+    的选择**——提交时浏览器把整张表单一起发出去，可分享的链接就是它生成的那一条。
+    判据因此从「有没有 hidden」改成「控件是不是选中着」，问的仍是同一件事。
+    """
     _, client = _seed(tmp_path)
 
     body = client.get("/logs", params={"preset": "AAA", "result": "SENT"}).text
 
-    assert "preset=AAA" in body
-    assert "result=SENT" in body
-    # 另外两张表单也得把这三个值带上，否则一提交就互相清空。
-    assert '<input type="hidden" name="preset" value="AAA">' in body
-    assert '<input type="hidden" name="result" value="SENT">' in body
+    assert 'value="AAA" selected' in body
+    assert 'value="SENT" selected' in body
+    # 隐藏字段一个都不该剩：合并表单的全部意义就是不再抄第二份。
+    assert '<input type="hidden"' not in body
 
 
 # ---- 筛选真的下推了 SQL ---------------------------------------------------
@@ -359,8 +368,9 @@ def test_an_unknown_quick_filter_value_does_not_return_an_error_page(tmp_path: P
     response = client.get("/logs", params={"result": "NEVER"})
 
     assert response.status_code == 200
-    # `NEVER` 在这一页不存在（一行就是一次派遣意图），当成没筛。
-    assert "未按预设 / 结果 / 战果筛选" in response.text
+    # `NEVER` 在这一页不存在（一行就是一次派遣意图），当成没筛——而且必须说出来。
+    assert "未按 " in response.text
+    assert "结果" in response.text
 
 
 # ---- 事件类型的配色 -------------------------------------------------------
