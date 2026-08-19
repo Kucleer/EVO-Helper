@@ -33,6 +33,18 @@
 
 「这一屏读到的和上一屏一样」= 拖到底了（`list_exhausted`）。仍没找到就什么都不点。
 
+## 每一趟都要先回到顶部
+
+⚠️ **关掉再打开，列表并不复位。** 实机 2026-08-19（生产 `system_log`）：
+13:48:41 那一趟从第一屏 `['4:277:15', '9:250:88', '4:96:7']` 一路拖到
+`['7:228:15', '1:55:6', '9:411:17']`；紧接着 13:49:11 与 13:49:40 两趟**第一屏
+读到的就是那个底部**。而找那一行的方向只有一个（往下翻），于是排在顶部的
+`4:277:15`、`9:250:8` 再也够不着——一屏就判 `list_exhausted`，直接 `NOT_FOUND`。
+**这个缺陷会自我延续**：一次拖到底之后，后面每一趟都从底部开始，全部失败。
+
+所以开列表之后先回顶（`game.planet_list.PlanetSwitcher._scroll_to_top`），
+停止判据是 `reached_top`——**「拖了一下坐标还是那几个」，不是「拖够几次」**。
+
 ## 切没切成，只认回读
 
 `origin_confirmed` 是**唯一**一份「真的换过去了吗」的判据。点完就当切成了是不行的：
@@ -48,9 +60,40 @@ from dataclasses import dataclass
 
 from evo_helper.domain.models import Coordinate
 
-#: 一行里的坐标形如 `[2:137:18]`，方括号在 OCR 白名单里被去掉了（`]` 会被读成 `3`，
-#: 见 `vision.scan_reading.COORD_RECIPES`），所以这里只认三段数字。
+#: 派遣面板「起点」那一行里的坐标。那个 ROI 用的是纯数字白名单，中文与方括号都会
+#: 被压成零星数字，所以这里只认三段数字、从噪声里挑出第一个来。
+#:
+#: ⚠️ **行星列表那一列不用这一条**，用下面那条带方括号的，理由见 `_PLANET_ROW_RE`。
 _COORDINATE_RE = re.compile(r"(\d{1,3}):(\d{1,3}):(\d{1,3})")
+
+#: 行星列表那一列的一行，**必须连方括号一起认出来**：`[2:137:18]`。
+#:
+#: ## 这一对方括号是「读多一位」的正因，实拍上量出来的
+#:
+#: 实机 2026-08-19：`9:250:8` 读成 `9:250:88`，于是 `find_row` 精确匹配不上，
+#: 用户配的两颗出发星球一颗都切不过去。离线复现（`var/logs/` 三张行星列表实拍，
+#: `dump-planet-list-unreadable-153847.png` 的第一屏与那天日志逐字相同）：
+#:
+#:     纯数字白名单  4x/LANCZOS  →  '14:277:15'   词框 (1129, 1189)
+#:     带括号白名单  4x/LANCZOS  →  '[4:277:15]'  词框 (1129, 1189)
+#:
+#: **同一块像素、同一个词框**。词框从来都是罩着方括号的（三行一律 1130→1190），
+#: 而白名单里没有 `[` `]`，Tesseract 只能给它们挑一个数字顶上——`[`→`1`/`5`、
+#: `]`→`3`/`8`、连隔壁那行「行星大小」的 `/` 也被顶成 `7`（`158/200`→`1587200`）。
+#: 顶出来的那一位再被宽松正则粘进相邻的一段，就是「多读一位」。
+#:
+#: 所以对策是**反过来**：把方括号放进白名单（`pirate_ui.PLANET_LIST_COORD_WHITELIST`），
+#: 让 Tesseract 有地方安放它们，再要求一行必须是**成对括起来**的三段数字。
+#: 方向由此变成「宁可读不出，不可读错」：括号一旦被顶成数字，这条正则就不匹配，
+#: 那一行直接不成行——走的是「什么都不点」那条安全路径，而不是认到另一颗星球。
+#:
+#: 顺带挡掉了另一种实测错法：词被拦腰切开（`['[2:137:1', '5]']`）。老规则会把
+#: `[2:137:1` 认成 `2:137:1`——**一颗真实存在的别的星球**。
+#:
+#: ⚠️ 括起来之后仍挡不住**括号内部**的替换（实拍上 3× LANCZOS 把 `[9:250:8]` 读成
+#: `[8:250:8]`）。那一套本来就不在配方池里，凭据钉在
+#: `tests/integration/vision/test_planet_switch_live.py`；这里只说清楚它没被这一条盖住。
+_PLANET_ROW_RE = re.compile(r"\[(\d{1,3}):(\d{1,3}):(\d{1,3})\]")
 
 
 @dataclass(frozen=True)
@@ -75,6 +118,16 @@ class PlanetRow:
     name_row_y: int
 
 
+def reads_as_a_planet_row(text: str) -> bool:
+    """这个词框是不是一行**认得出来的**星球坐标（`[2:137:18]` 这个样子）？
+
+    单独拆出来是为了让「哪一套配方算读出来了」（`tools.pirate_loop._planet_rows`）
+    与「哪些词成得了行」（`rows_from_words`）共用同一个判据。两边各写一遍的话，
+    迟早会出现「配方被采信了，可它给出的一行都不成行」这种自相矛盾的记录。
+    """
+    return _PLANET_ROW_RE.search(text) is not None
+
+
 def rows_from_words(words: Iterable[tuple[int, str]]) -> tuple[PlanetRow, ...]:
     """把坐标列的 OCR 词框 `(中心 y, 文字)` 拧成一屏的行清单，按 y 从上到下排。
 
@@ -82,12 +135,16 @@ def rows_from_words(words: Iterable[tuple[int, str]]) -> tuple[PlanetRow, ...]:
     但不知道是哪颗星球」的东西，而那正是会被按行号点出去的那种东西。
 
     同一屏上真实会混进来的噪声（实测于 `var/logs/calib-切换星球-基准.png`）：
-    行星大小 `155/223` 读作 `155223`、图标排漏出来的零星 `5` / `75`。
-    三段数字这条规则把它们全挡在外面——它们连一个冒号都没有。
+    行星大小 `155/223` 读作 `155223` 或 `1587200`、图标排漏出来的零星 `5` / `75`。
+    它们连一对方括号都凑不齐，`_PLANET_ROW_RE` 全挡得住。
+
+    ⚠️ **必须成对括起来才算一行**，理由整段在 `_PLANET_ROW_RE`：那一对方括号既是
+    「这一位是不是多出来的」的唯一凭据，也是「读不出」与「读成别的星球」之间
+    唯一的那道闸。
     """
     rows: list[PlanetRow] = []
     for center_y, text in words:
-        match = _COORDINATE_RE.search(text)
+        match = _PLANET_ROW_RE.search(text)
         if match is None:
             continue
         galaxy, system, position = (int(part) for part in match.groups())
@@ -134,6 +191,29 @@ def list_exhausted(previous: Sequence[PlanetRow], current: Sequence[PlanetRow]) 
     按 y 比会永远判「还能拖」，于是拖满上限次才罢休。
     """
     return [row.coordinate for row in previous] == [row.coordinate for row in current]
+
+
+def reached_top(previous: Sequence[PlanetRow] | None, current: Sequence[PlanetRow]) -> bool:
+    """往回拖了一下，列表还是原样 → 已经在顶部，别再往回拖了。
+
+    比的是**坐标序列**，和 `list_exhausted` 同一个尺子——那正是信箱那条链路
+    （`tools.pirate_loop._scroll_mail_list_to_top`）踩过的坑的反面：那边比的是
+    邮件主题，而主题 OCR 在实拍上一字不差的是 0 行，于是「拖不动了」永远不成立，
+    每一趟都白拖满 40 次上限（一次约 5.8 秒）。坐标比主题稳得多，但**也不是不会
+    读错**（见 `_PLANET_ROW_RE`），所以读错的那一行现在压根不成行。
+
+    两条各挡一种误判，都不许合并掉：
+
+    - **`current` 一屏读空不算到顶。** 空的时候两屏的坐标序列都是 `[]`，直接比
+      会当成「没动」而停手——而读空的意思是「这一帧没认出来」，多半是浮层盖着或
+      OCR 失手，列表滚到哪根本无从谈起。信箱那条链路的注释里写死了同一条。
+    - **头一次读（`previous is None`）不算到顶。** 那一屏是「拖之前」的样子，
+      没有任何证据说明它就是顶部；当成到顶就等于「打开列表之后不回顶」，
+      也就是这次要修的那个缺陷本身。
+    """
+    if not current or previous is None:
+        return False
+    return list_exhausted(previous, current)
 
 
 def origin_in(raw_text: str) -> Coordinate | None:
@@ -184,6 +264,8 @@ __all__ = [
     "list_exhausted",
     "origin_confirmed",
     "origin_in",
+    "reached_top",
+    "reads_as_a_planet_row",
     "rows_from_words",
     "switch_needed",
 ]

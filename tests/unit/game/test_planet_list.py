@@ -33,7 +33,9 @@ FLEET_PANEL = (920, 862)
 #: y 用量出来的整数 190 / 420 / 650。实机 OCR 给出的词框中心是 191 / 421 / 651
 #: （差 1px，见 `tests/unit/domain/test_planet_switch.py` 里那份真实读数）——
 #: 那一像素点在哪个图标上都不影响，这里取整是为了让下面的期望像素读起来就是量出来的那几个。
-BASELINE = [(190, "2:137:18"), (211, "155223"), (420, "9:250:8"), (650, "4:96:7")]
+#:
+#: ⚠️ 坐标连方括号一起读回来，理由在 `domain.planet_switch._PLANET_ROW_RE`。
+BASELINE = [(190, "[2:137:18]"), (211, "155223"), (420, "[9:250:8]"), (650, "[4:96:7]")]
 
 #: 第 1/2/3 行的「前往此处」。**量出来的绝对坐标**，不是算出来的。
 GOTO_ROW_1 = (1166, 250)
@@ -45,15 +47,18 @@ EXPAND_ROW_1 = (1166, 320)
 
 
 class _List:
-    """一列可以往下滚的行星清单。`screens` 从上到下排开，两端夹住。
+    """一列**上下都能滚**的行星清单。`screens` 从上到下排开，两端夹住。
 
     读一屏只交出**那一屏**的词框——测试里唯一的位置来源。实现要是从别处变出
     坐标来（缓存上一屏、按行号外推），下面的断言就接不上。
+
+    `starts_at` 就是「打开列表时它停在第几屏」。⚠️ **实机上这个值不是 0**：
+    2026-08-19 关掉再打开，列表停在上一趟拖到的位置上——这正是要修的缺陷。
     """
 
-    def __init__(self, screens: list[list[tuple[int, str]]]) -> None:
+    def __init__(self, screens: list[list[tuple[int, str]]], *, starts_at: int = 0) -> None:
         self.screens = screens
-        self.at = 0
+        self.at = min(starts_at, len(screens) - 1)
         self.reads = 0
 
     def read(self) -> list[tuple[int, str]]:
@@ -62,6 +67,9 @@ class _List:
 
     def scroll(self) -> None:
         self.at = min(len(self.screens) - 1, self.at + 1)
+
+    def scroll_back(self) -> None:
+        self.at = max(0, self.at - 1)
 
 
 class _FlakyList(_List):
@@ -98,8 +106,26 @@ class _Driver:
         return self.points.count(CLOSE_OVERLAY)
 
     def drag_vertical(self, x: int, from_y: int, to_y: int, *, label: str = "") -> None:
+        """往上拖（松手点更高）= 内容上移 = 往下翻；往下拖 = 往回翻。
+
+        方向由起止点自己决定，不看 `label`：实现改了标签而方向搞反时，
+        这里必须跟着错，否则「回顶」那几条用例会在一个方向反了的实现上照样绿。
+        """
         self.drags.append((x, from_y, to_y, label))
-        self._planets.scroll()
+        if to_y < from_y:
+            self._planets.scroll()
+        else:
+            self._planets.scroll_back()
+
+    @property
+    def back_drags(self) -> list[tuple[int, int, int, str]]:
+        """往回拖（回顶）的那几下。"""
+        return [drag for drag in self.drags if drag[2] > drag[1]]
+
+    @property
+    def forward_drags(self) -> list[tuple[int, int, int, str]]:
+        """往下翻找目标的那几下。"""
+        return [drag for drag in self.drags if drag[2] < drag[1]]
 
     def wait(self, seconds: float) -> None:
         del seconds
@@ -144,14 +170,19 @@ def _switcher(
     *,
     origin_reads: str = "2:137:18",
     dry_run: bool = False,
+    starts_at: int = 0,
+    evidence: list[tuple[str, dict[str, object]]] | None = None,
+    said: list[str] | None = None,
 ) -> tuple[PlanetSwitcher, _Driver, _List]:
-    planets = _List(screens)
+    planets = _List(screens, starts_at=starts_at)
     driver = _Driver(planets)
+    recorded = evidence if evidence is not None else []
     switcher = PlanetSwitcher(
         driver=driver,  # type: ignore[arg-type]
         read_rows=planets.read,
         read_origin=lambda: origin_reads,
-        say=lambda _message: None,
+        say=said.append if said is not None else (lambda _message: None),
+        record_evidence=lambda message, payload: recorded.append((message, payload)),
         dry_run=dry_run,
     )
     return switcher, driver, planets
@@ -232,7 +263,7 @@ class TestClickingOnlyTheGoToColumn:
         """复核读到的 y 变了 = 列表还在动。这时点下去点的是「刚才那个位置」。"""
         planets = _List([BASELINE])
         driver = _Driver(planets)
-        answers = [BASELINE, [(310, "2:137:18")], BASELINE, [(310, "2:137:18")]]
+        answers = [BASELINE, [(310, "[2:137:18]")], BASELINE, [(310, "[2:137:18]")]]
 
         def read() -> list[tuple[int, str]]:
             return answers.pop(0) if answers else []
@@ -371,7 +402,7 @@ class TestClosingOverlaysWhenTheListReadsBlank:
         message, payload = evidence[0]
         assert "浮层" in message
         assert payload["screens_before"] == [[]], "读空那一遍原样留下"
-        assert payload["screens_after"] == [["2:137:18", "9:250:8", "4:96:7"]]
+        assert payload["screens_after"] == [["[2:137:18]", "[9:250:8]", "[4:96:7]"]]
         assert payload["close_clicks"] == 1, "浮层关掉之后 ✕ 就没了，不该继续点"
         assert payload["close_button_recognised"] is True
         assert payload["recovered"] is True
@@ -507,8 +538,8 @@ def test_coordinate_words_turns_an_ocr_timeout_into_a_safe_empty_read() -> None:
 class TestDraggingThroughTheList:
     def test_a_planet_further_down_is_found_after_dragging(self) -> None:
         screens = [
-            [(190, "2:137:18"), (420, "9:250:8")],
-            [(190, "4:96:7"), (420, "3:300:5")],
+            [(190, "[2:137:18]"), (420, "[9:250:8]")],
+            [(190, "[4:96:7]"), (420, "[3:300:5]")],
         ]
         switcher, driver, _planets = _switcher(screens, origin_reads="3:300:5")
 
@@ -526,14 +557,31 @@ class TestDraggingThroughTheList:
         偷偷用了 190/420/650 里的任何一个，这条就红。
         """
         screens = [
-            [(300, "2:137:18"), (530, "9:250:8"), (760, "4:96:7")],
-            [(190, "3:300:5")],
+            [(300, "[2:137:18]"), (530, "[9:250:8]"), (760, "[4:96:7]")],
+            [(190, "[3:300:5]")],
         ]
         switcher, driver, _planets = _switcher(screens, origin_reads="3:300:5")
 
         switcher.switch_to(MISSING)
 
-        assert [(x, from_y) for x, from_y, _to, _label in driver.drags] == [(961, 760)]
+        assert [(x, from_y) for x, from_y, _to, _label in driver.forward_drags] == [(961, 760)]
+
+    def test_the_drag_back_to_the_top_presses_on_this_screens_rows_too(self) -> None:
+        """回顶那一下的起止点同样只能来自当前这一屏：按下 `rows[0]`、松手 `rows[-1]`。
+
+        这一屏的行在 300/530/760，都不在基准图那三个高度上——实现要是写死了
+        190/420/650 里的任何一个，这条就红。写死的代价与往下翻那一下完全一样：
+        横向中点只在星球名那一行是空白，往下 60px 就是图标上排。
+        """
+        screens = [
+            [(300, "[2:137:18]"), (530, "[9:250:8]"), (760, "[4:96:7]")],
+            [(190, "[3:300:5]")],
+        ]
+        switcher, driver, _planets = _switcher(screens, origin_reads="3:300:5")
+
+        switcher.switch_to(MISSING)
+
+        assert [(x, a, b) for x, a, b, _label in driver.back_drags] == [(961, 300, 760)]
 
     def test_two_identical_screens_end_the_search_without_a_click(self) -> None:
         """「这一屏读到的和上一屏一样」= 到底了。仍没找到就什么都不点。"""
@@ -541,15 +589,224 @@ class TestDraggingThroughTheList:
 
         assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
         assert driver.in_panel == []
-        assert len(driver.drags) == 1, "确认到底之后不该再拖"
+        assert len(driver.forward_drags) == 1, "确认到底之后不该再往下拖"
 
     def test_the_dragging_is_bounded(self) -> None:
         """每一屏都不一样时也必须停下来，否则一条读坏的清单能把整轮拖没。"""
-        screens = [[(190 + step, f"5:{step + 1}:1")] for step in range(40)]
+        screens = [[(190 + step, f"[5:{step + 1}:1]")] for step in range(40)]
         switcher, driver, _planets = _switcher(screens)
 
         assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
         assert len(driver.drags) <= 8
+        assert driver.in_panel == []
+
+
+#: 一列六颗星球、每屏三行，从顶到底四屏——用户 2026-08-19 的清单形状。
+#: 顶上那两颗正是他配的两个出发星球。
+SIX_PLANETS = [
+    [(190, "[4:277:15]"), (420, "[9:250:8]"), (650, "[4:96:7]")],
+    [(190, "[9:250:8]"), (420, "[4:96:7]"), (650, "[7:228:15]")],
+    [(190, "[4:96:7]"), (420, "[7:228:15]"), (650, "[1:55:6]")],
+    [(190, "[7:228:15]"), (420, "[1:55:6]"), (650, "[9:411:17]")],
+]
+TOP_PLANET = Coordinate(4, 277, 15)
+BOTTOM_PLANET = Coordinate(9, 411, 17)
+
+
+class TestGettingBackToTheTopBeforeSearching:
+    """⚠️ **实机 2026-08-19：7 次切换失败里至少 2 次倒在这上面。**
+
+    生产 `system_log` 三条并排就能看出来：
+
+        13:48:41  第1屏 ['4:277:15','9:250:88','4:96:7'] … 一路拖到
+                  第4屏 ['7:228:15','1:55:6','9:411:17'] （判到底）
+        13:49:11  找 4:277:15；第1屏读到的就是 ['7:228:15','1:55:6','9:411:17']
+        13:49:40  找 9:250:8； 第1屏读到的还是那三颗
+
+    **关掉再打开，列表停在上一趟拖到的位置上。** 而找目标只会往下翻，排在顶部的
+    那两颗出发星球于是永远够不着。这个缺陷会**自我延续**：拖到底一次之后，
+    后面每一趟都从底部开始，全部失败。
+    """
+
+    def test_a_planet_at_the_top_is_found_even_when_the_list_reopens_at_the_bottom(self) -> None:
+        """本文件这一节的重点：先回顶，再往下找。
+
+        列表停在最后一屏（上一趟拖到的地方），而目标排在第一屏。不回顶的实现
+        会在第一屏就判 `list_exhausted`、返回 `NOT_FOUND`——那正是 13:49:11 的样子。
+        """
+        switcher, driver, _planets = _switcher(SIX_PLANETS, starts_at=3, origin_reads="4:277:15")
+
+        assert switcher.switch_to(TOP_PLANET) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_1]
+
+    def test_the_second_starting_planet_is_reachable_again_too(self) -> None:
+        """13:49:40 那一趟找的是 9:250:8，它在第一屏的第二行。"""
+        switcher, driver, _planets = _switcher(SIX_PLANETS, starts_at=3, origin_reads="9:250:8")
+
+        assert switcher.switch_to(SECOND) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_2]
+
+    def test_a_planet_at_the_bottom_is_still_reachable_after_going_back_to_the_top(self) -> None:
+        """回顶不许把往下翻那条路弄丢：排在最底下那颗照样要找得到。"""
+        switcher, driver, _planets = _switcher(SIX_PLANETS, starts_at=3, origin_reads="9:411:17")
+
+        assert switcher.switch_to(BOTTOM_PLANET) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_3]
+
+    def test_the_drags_back_stop_as_soon_as_the_list_stops_moving(self) -> None:
+        """停止判据是「拖了一下坐标还是那几个」，不是「拖够几次」。
+
+        从最后一屏回到第一屏要 3 下，再多 1 下确认拖不动了——**一共 4 下**。
+        写死次数的实现（比如照信箱那次的老样子拖 3 下）会少一下或多好几下，
+        而多拖一下就是一秒多，少拖一下就是这次的缺陷复发。
+        """
+        switcher, driver, _planets = _switcher(SIX_PLANETS, starts_at=3, origin_reads="4:277:15")
+
+        switcher.switch_to(TOP_PLANET)
+
+        assert len(driver.back_drags) == 4
+
+    def test_a_list_that_never_settles_still_stops(self) -> None:
+        """⚠️ **上界不许缺。** 每一屏都不一样时也得停下来。
+
+        这一列每拖一下都换一批坐标（实机上「拖不动了」判不出来就是这个样子），
+        没有上界的实现会在这里永远拖下去，把整个攻击进程挂在开工阶段。
+        """
+        never_settles = [
+            [(190, f"[5:{step + 1}:1]"), (420, f"[5:{step + 2}:1]"), (650, f"[5:{step + 3}:1]")]
+            for step in range(60)
+        ]
+        switcher, driver, _planets = _switcher(never_settles, starts_at=59)
+
+        assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
+        assert len(driver.back_drags) <= 6, "回顶必须有上界"
+
+    def test_walking_into_the_bound_says_so_instead_of_claiming_the_top(self) -> None:
+        """⚠️ **走满上限时不许说「已经在顶部」。**
+
+        信箱那条链路上就是这句话说过谎：走满上限的 17 趟里用户当场核对过，
+        进邮箱本来就在顶部，而日志却断言「看到的不是最新的几封」。仓库口径写在
+        CLAUDE.md 上——**日志说假话比不说更糟**。到没到顶不知道就说不知道。
+
+        这一句同时是「上界该不该做成可配置」的凭据：库里出现它，才说明
+        `PLANET_LIST_TO_TOP_MAX_DRAGS` 真的不够用了。
+        """
+        said: list[str] = []
+        evidence: list[tuple[str, dict[str, object]]] = []
+        never_settles = [
+            [(190, f"[5:{step + 1}:1]"), (420, f"[5:{step + 2}:1]"), (650, f"[5:{step + 3}:1]")]
+            for step in range(60)
+        ]
+        switcher, _driver, _planets = _switcher(
+            never_settles, starts_at=59, said=said, evidence=evidence
+        )
+
+        switcher.switch_to(MISSING)
+
+        spoken = "\n".join(said)
+        assert "到没到顶判不出来" in spoken
+        assert "到顶" not in spoken.replace("到没到顶判不出来", "")
+        assert len(evidence) == 1
+        assert evidence[0][1]["max_drags"] == 6
+
+    def test_two_rows_are_needed_to_press_and_release_on(self) -> None:
+        """一屏只认出一行时**一下都不拖**：按下和松手都必须落在识别出来的名字行上。
+
+        认不出行就没有安全的按下点——那个 x 在星球名那一行是空白，往下 60px
+        就是图标上排。这时安静退出，后面照原样走到「读不出 / 找不到」。
+        """
+        switcher, driver, _planets = _switcher([[(190, "[2:137:18]")]])
+
+        assert switcher.switch_to(HOME) is SwitchResult.SWITCHED
+        assert driver.back_drags == []
+
+    def test_a_blank_screen_never_counts_as_the_top(self) -> None:
+        """⚠️ **整屏读空不算到顶。**
+
+        空的时候两屏的坐标序列都是 `[]`，「和上一屏一样」照样成立——就此停手
+        等于把一次识别失败当成了一个位置事实。这里前两帧读空（列表刚展开时的
+        真实抖动），正确实现要读到内容之后再判，于是照样回得了顶、切得过去。
+        """
+        planets = _FlakyList(SIX_PLANETS, blank_times=2)
+        planets.at = 3
+        driver = _Driver(planets)
+        switcher = PlanetSwitcher(
+            driver=driver,  # type: ignore[arg-type]
+            read_rows=planets.read,
+            read_origin=lambda: "4:277:15",
+            say=lambda _message: None,
+        )
+
+        assert switcher.switch_to(TOP_PLANET) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_1]
+
+    def test_the_verdict_still_separates_unreadable_from_missing(self) -> None:
+        """⚠️ **回顶读到的行不许算进「读得出来吗」那道闸。**
+
+        `screens`（往下找那几屏）是 `UNREADABLE` 与 `NOT_FOUND` 之间唯一的证据。
+        把回顶那几屏掺进去，「回顶读得到、找的时候一行都读不出」就会被判成
+        `NOT_FOUND`，于是日志指着用户的配置说一句它并不知道的话，调用方还会照
+        「不会自己好」把这一轮计成永久失败（`Outcome.busy_is_permanent`）。
+
+        这里回顶时读得到内容，`_locate` 一开始就再也读不出——结局必须是
+        `UNREADABLE`。
+        """
+        answers = [BASELINE, BASELINE]
+
+        def read() -> list[tuple[int, str]]:
+            return answers.pop(0) if answers else []
+
+        driver = _Driver(_List([BASELINE]))
+        said: list[str] = []
+        switcher = PlanetSwitcher(
+            driver=driver,  # type: ignore[arg-type]
+            read_rows=read,
+            read_origin=lambda: "",
+            say=said.append,
+        )
+
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
+        assert driver.in_panel == []
+        assert "找不到" not in "\n".join(said)
+
+
+class TestReadingAMisreadCoordinate:
+    """⚠️ **实机 2026-08-19：`9:250:8` 读成 `9:250:88`，方括号被顶成了数字。**
+
+    量法与凭据在 `domain.planet_switch._PLANET_ROW_RE`。这一节守的是**后果**：
+    读错的那一行必须走「什么都不点」，不能变成一次真实点击。
+    """
+
+    def test_a_row_whose_bracket_became_a_digit_is_never_clicked(self) -> None:
+        """`9:250:88` 这一行认不出来 → 一下都不点。
+
+        方向只能是这一个：读不出的代价是这一轮不派，而读错的代价是**点在另一颗
+        星球那一行上**——而那一行右边同一个 x 上还坐着「扩张」。
+        """
+        misread = [(190, "[4:277:15]"), (420, "9:250:88"), (650, "[4:96:7]")]
+        switcher, driver, _planets = _switcher([misread], origin_reads="9:250:8")
+
+        assert switcher.switch_to(SECOND) is SwitchResult.NOT_FOUND
+        assert driver.in_panel == []
+
+    def test_the_rows_that_did_read_cleanly_are_still_usable(self) -> None:
+        """一行读坏了不该拖累同一屏上读干净的那几行。"""
+        misread = [(190, "[4:277:15]"), (420, "9:250:88"), (650, "[4:96:7]")]
+        switcher, driver, _planets = _switcher([misread], origin_reads="4:277:15")
+
+        assert switcher.switch_to(TOP_PLANET) is SwitchResult.SWITCHED
+        assert driver.in_panel == [GOTO_ROW_1]
+
+    def test_a_misread_screen_is_not_confused_with_a_covered_one(self) -> None:
+        """整屏都读坏 = 一行都没成行 = `UNREADABLE`，**不是** `NOT_FOUND`。
+
+        读坏和被盖住在这一层是同一件事：都说不出列表里有什么。而「翻通了、
+        里面确实没有这颗」才是 `NOT_FOUND`，那一档要指着用户的配置说话。
+        """
+        all_misread = [(190, "14:277:15"), (420, "9:250:88"), (650, "[2:137:1")]
+        switcher, driver, _planets = _switcher([all_misread])
+
+        assert switcher.switch_to(HOME) is SwitchResult.UNREADABLE
         assert driver.in_panel == []
 
 
@@ -599,7 +856,7 @@ class TestDryRun:
 
         spoken = "\n".join(said)
         assert "(1166, 480)" in spoken
-        assert "9:250:8" in spoken
+        assert "[9:250:8]" in spoken
 
     def test_dry_run_does_not_open_the_fleet_panel_either(self) -> None:
         """回读要开派遣面板。演一遍时连它也不开——那一档是给人看的，不该改画面状态。"""

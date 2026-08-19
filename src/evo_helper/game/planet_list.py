@@ -50,6 +50,7 @@ from evo_helper.domain.planet_switch import (
     find_row,
     list_exhausted,
     origin_confirmed,
+    reached_top,
     rows_from_words,
 )
 from evo_helper.game.overlay import OVERLAY_CLOSE_ATTEMPTS, dismiss_overlays
@@ -67,6 +68,7 @@ from evo_helper.game.pirate_ui import (
     PLANET_LIST_MAX_DRAGS,
     PLANET_LIST_MIN_DRAG_PX,
     PLANET_LIST_OPEN_WAIT_S,
+    PLANET_LIST_TO_TOP_MAX_DRAGS,
     PLANET_SWITCH_WAIT_S,
 )
 
@@ -170,12 +172,22 @@ class PlanetSwitcher:
     #: 桩）走的是「从不关浮层」，而不是「照旧盲点」。判据本身在 `game.overlay`，
     #: 实机由 `tools.pirate_loop` 接到 `LiveDriver.capture()`。
     see_close_button: Callable[[], bool] = lambda: False
-    #: 每一屏读到的行，按顺序记下来，找不到时原样说出去（照 `PresetNotFound` 的做法）。
+    #: **找目标时**每一屏读到的行，按顺序记下来，找不到时原样说出去
+    #: （照 `PresetNotFound` 的做法）。
+    #:
+    #: ⚠️ **回顶那几屏不记在这里**（它们在 `top_screens`）。这两份不能混：
+    #: `screens` 是「读不出」与「翻通了但没有」之间那道闸的唯一证据
+    #: （`_read_nothing_at_all`），把回顶读到的行掺进来，就等于让「回顶时读到过
+    #: 内容、找目标时一行都没读出来」这种情形被判成 `NOT_FOUND`——那句话会指着
+    #: 用户的配置说一件它并不知道的事。
     screens: list[list[str]] = field(default_factory=list)
+    #: 回顶那几屏读到的行，只进日志与证据，不进任何判据。
+    top_screens: list[list[str]] = field(default_factory=list)
 
     def switch_to(self, target: Coordinate) -> SwitchResult:
         """切到 `target`，返回结局。**任何一步认不出都不点**。"""
         self.screens = []
+        self.top_screens = []
         row = self._open_and_locate(target)
         if row is None and self._read_nothing_at_all():
             row = self._retry_behind_overlays(target)
@@ -187,7 +199,12 @@ class PlanetSwitcher:
                 self.say(f"  行星列表一行都没读出来；说不出里面有没有 {target}；什么都不点")
                 self._close()
                 return SwitchResult.UNREADABLE
-            self.say(f"  行星列表上找不到 {target}；逐屏读到的是 {self.screens}；什么都不点")
+            # 回顶那几屏也说出来。2026-08-19 那三条日志缺的正是这一句：只看到
+            # 「逐屏读到的是 [[底部那三颗]]」，看不出列表压根没回过顶。
+            self.say(
+                f"  行星列表上找不到 {target}；回顶逐屏 {self.top_screens}、"
+                f"往下逐屏 {self.screens}；什么都不点"
+            )
             self._close()
             return SwitchResult.NOT_FOUND
         point = (PLANET_GOTO_COLUMN_X, row.name_row_y + PLANET_ICON_ROW_OFFSET_Y)
@@ -210,10 +227,91 @@ class PlanetSwitcher:
     # -- 开列表、找那一行 ---------------------------------------------------
 
     def _open_and_locate(self, target: Coordinate) -> PlanetRow | None:
-        """点开行星列表浮层，然后一屏一屏找。找不到返回 None。"""
+        """点开行星列表浮层 → **先拖回顶部** → 然后一屏一屏往下找。找不到返回 None。
+
+        ⚠️ **回顶这一步不许省。** 实机 2026-08-19：关掉再打开，列表停在上一趟拖到的
+        位置上，而 `_locate` 只会往下翻——排在顶部的两颗出发星球于是永远够不着，
+        一屏就判到底、`NOT_FOUND`，「这一轮一发都不派」。整段账在
+        `domain.planet_switch.reached_top` 与模块头。
+        """
         self.driver.click(*NAV_PLANET, label="行星列表")
         self.driver.wait(PLANET_LIST_OPEN_WAIT_S)
+        self._scroll_to_top()
         return self._locate(target)
+
+    def _scroll_to_top(self) -> None:
+        """把列表拖回顶部：**拖到拖不动为止**，不是拖固定次数。
+
+        判据是 `domain.planet_switch.reached_top`（往回拖了一下，这一屏的坐标序列
+        和上一屏一样）。这一条从信箱那条链路上学了两件事，都写在 `reached_top` 里：
+        比的必须是**读出来的内容**，而**整屏读空不算到顶**。
+
+        上界 `PLANET_LIST_TO_TOP_MAX_DRAGS` 只是兜底，保证一定会停。走满上限时
+        **不许说「已经在顶部」**——那时到没到顶就是不知道，照 CLAUDE.md 那条
+        「日志说假话比不说更糟」，只说拖了几次、最后一屏读到了什么。
+
+        读不出行时**一下都不拖**：按下点必须落在这一屏识别出来的星球名那一行上
+        （`domain.planet_switch.PlanetRow`），认不出行就没有安全的按下点。
+        这时安静退出，后面 `_locate` 会照原样走到「读不出」那条路。
+        """
+        previous: Sequence[PlanetRow] | None = None
+        for drag in range(PLANET_LIST_TO_TOP_MAX_DRAGS):
+            rows = rows_from_words(self._read_rows_confirming())
+            self.top_screens.append([row.text for row in rows])
+            if reached_top(previous, rows):
+                self.say(f"  列表往回拖了 {drag} 次到顶；顶上是 {self.top_screens[-1]}")
+                return
+            previous = rows
+            if not self._drag_back_once(rows):
+                self.say(f"  没有可以按下的星球名行（这一屏读到 {self.top_screens[-1]}）；不往回拖")
+                return
+        self._say_scroll_to_top_gave_up()
+
+    def _say_scroll_to_top_gave_up(self) -> None:
+        """走满上限时**如实**描述，并把证据留下。
+
+        照信箱那条链路 `_say_scroll_to_top_gave_up` 的教训写：只说能证明的三样
+        ——拖了多少次、最后一屏读到了什么、判据为什么没停下来。**到没到顶不知道
+        就说不知道**，绝不写成「已经在顶部」。
+
+        这一句同时是「该不该把上界做成可配置」的凭据：库里出现它，才说明
+        `PLANET_LIST_TO_TOP_MAX_DRAGS` 真的不够用了。
+        """
+        self.say(
+            f"  往回拖满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 次，两屏之间的坐标一直在变；"
+            f"最后一屏读到 {self.top_screens[-1] if self.top_screens else []}。"
+            "到没到顶判不出来，这一趟就从这里往下翻"
+        )
+        self.record_evidence(
+            f"行星列表往回拖满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 次仍没停下来；到没到顶判不出来",
+            {
+                "max_drags": PLANET_LIST_TO_TOP_MAX_DRAGS,
+                "top_screens": [list(screen) for screen in self.top_screens],
+                "criterion": "reached_top：逐屏比坐标序列，读空不算到顶",
+            },
+        )
+
+    def _drag_back_once(self, rows: Sequence[PlanetRow]) -> bool:
+        """按住**这一屏最上面那一行的名字高度**往下拖，露出上面的行；拖不动返回 False。
+
+        起止点都取自当前这一屏识别出来的名字行：按下在 `rows[0]`、松手在 `rows[-1]`。
+        `_drag_once` 往下翻时用的是同一套几何，只是方向相反——两端都落在星球名
+        那一行上，也就是用户点过头的那个「横向中点是空白」的高度
+        （`game.pirate_ui.PLANET_LIST_DRAG_X` 的注释）。
+
+        ⚠️ **不写死绝对 y。** 同 `_drag_once`：横向中点只在星球名那一行是空白，
+        往下 60px 就是图标上排，同一个 x 上坐着「部署」；而按下再拖起来，
+        行程太短的话游戏可能当成点击。行程不够 `PLANET_LIST_MIN_DRAG_PX` 就不拖。
+        """
+        if len(rows) < 2:
+            return False
+        anchor = rows[0].name_row_y
+        release = rows[-1].name_row_y
+        if release - anchor < PLANET_LIST_MIN_DRAG_PX:
+            return False
+        self.driver.drag_vertical(PLANET_LIST_DRAG_X, anchor, release, label="行星列表回顶")
+        self.driver.wait(PLANET_LIST_DRAG_WAIT_S)
+        return True
 
     def _read_nothing_at_all(self) -> bool:
         """逐屏一行都没认出来吗？——这才是「疑似有浮层盖住」的证据。
@@ -227,6 +325,10 @@ class PlanetSwitcher:
         注意「一行都没有」用的是 `screens`，也就是 `rows_from_words` **认出来的
         坐标行**，不是 OCR 的原始词框。行星大小 `155/223`、图标漏出来的零星 `5`
         这些噪声算不得「读到了列表」。
+
+        ⚠️ **`top_screens` 不算数**（见那个字段的注释）：回顶那几屏读到过内容，
+        并不说明找目标的时候读到了。掺进来的话，「回顶读得到、找的时候读不出」
+        会被判成 `NOT_FOUND`——又是一句指着用户配置说的假话。
         """
         return bool(self.screens) and all(not screen for screen in self.screens)
 
@@ -378,8 +480,12 @@ def coordinate_words(
     与 `preset_picker.name_words` 同形，只是那边要 x（横着找预设）、这边要 y
     （竖着找星球）。用词框而不是整行文本：**那个 y 就是待会儿要点、要按的地方**。
 
-    白名单里没有方括号（`]` 会被读成 `3`，见 `vision.scan_reading.COORD_RECIPES`），
-    所以 `[2:137:18]` 读回来是 `2:137:18`。
+    ⚠️ **这条竖条的白名单里有方括号**（`pirate_ui.PLANET_LIST_COORD_WHITELIST`），
+    所以 `[2:137:18]` 原样读回来、连括号一起。这与战报坐标行那一份
+    （`vision.scan_reading.COORD_WHITELIST`，去掉方括号）方向相反，不是笔误：
+    在这块 ROI 上词框本来就罩着方括号，白名单里没有它们时 Tesseract 会拿数字
+    顶上，多顶的那一位就是 2026-08-19 那次 `9:250:8` → `9:250:88`。
+    整段量法与凭据在 `domain.planet_switch._PLANET_ROW_RE`。
     """
     from PIL import Image
 
