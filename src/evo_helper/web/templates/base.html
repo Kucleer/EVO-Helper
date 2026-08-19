@@ -179,6 +179,9 @@
 <div class="shell">
   <nav class="sidenav" aria-label="主导航">
     <div class="brand">EVO&nbsp;HELPER</div>
+    {# 「数据概览」放**最上面**（用户口径 2026-08-19）：它是一眼看全现状的那一页，
+       而排在第一位正是「先看这里」这句话在导航上的写法。 #}
+    <a href="/overview" {% if active == 'overview' %}aria-current="page"{% endif %}>数据概览</a>
     <a href="/missions" {% if active == 'missions' %}aria-current="page"{% endif %}>任务中心</a>
     <a href="/settings" {% if active == 'settings' %}aria-current="page"{% endif %}>攻击配置</a>
     {# 「情报中心」的导航入口已隐藏（用户口径 2026-08-17：「隐藏掉入口，新功能可以

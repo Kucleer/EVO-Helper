@@ -1,0 +1,49 @@
+{#
+  周期统计。每分钟重取一次（比「此刻」慢一个量级：这几趟是聚合查询，而它们
+  一分钟之内不会有肉眼可见的变化）。
+
+  ⚠️ **「读回战报」与「回收率」必须和资源列并排**（需求文档 8.4）。资源列只统计
+  已读回的战报，而战报是滞后读回来的——实测 08-18 这一天，隔 11 小时从 33 份 /
+  67,594 变成 61 份 / 166,194。少了这两列，用户明天再看同一天的数会以为出了 bug。
+#}
+{% if periods_failed %}
+  <p class="error">周期统计这一趟没读到数据（查询失败，已记进系统日志）。</p>
+{% endif %}
+<div class="table-wrap">
+  <table class="overview-table">
+    <thead>
+      <tr>
+        <th scope="col">周期</th>
+        <th scope="col">派遣</th>
+        <th scope="col">读回战报</th>
+        <th scope="col">回收率</th>
+        {% for cell in (rows[0].rare if rows else []) %}
+          <th scope="col">{{ cell.label }}</th>
+        {% endfor %}
+        <th scope="col">利用率</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        <tr {% if row.is_total %}class="overview-total"{% endif %}>
+          <th scope="row">{{ row.label }}</th>
+          <td>{{ row.dispatches }}</td>
+          <td>{{ row.reports }}</td>
+          <td class="{% if row.recovery is none %}muted{% elif row.recovery >= 0.75 %}tone-ok{% elif row.recovery >= 0.3 %}tone-warn{% else %}tone-danger{% endif %}">
+            {% if row.recovery is none %}—{% else %}{{ '%.0f'|format(row.recovery * 100) }}%{% endif %}
+          </td>
+          {% for cell in row.rare %}
+            <td>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
+          {% endfor %}
+          {# 超过 100% 照实显示、不截断：那是「派出去的活比开机时间还多」，
+             也就是关机太早、舰队回来时没人接（docs/数据概览-方案.md 第二节 C）。 #}
+          <td class="{% if row.utilisation is none %}muted{% elif row.utilisation > 1 %}tone-warn{% elif row.utilisation >= 0.8 %}tone-ok{% endif %}">
+            {% if row.utilisation is none %}—{% else %}{{ '%.0f'|format(row.utilisation * 100) }}%{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="muted">这一档没有数据</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

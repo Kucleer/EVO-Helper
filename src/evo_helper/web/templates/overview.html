@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}数据概览 · EVO-Helper{% endblock %}
+{% block heading %}数据概览{% endblock %}
+
+{#
+  这一页是**纯只读视图**：没有任何写操作、不触发游戏动作、调度器停着时照常打开。
+
+  ⚠️ 时区：**统计按 UTC+0 切天，时刻按 UTC+8 显示。** 这会让某一天的数和用户按
+  `AT TIME ZONE 'Asia/Shanghai'` 手查的对不上（合计一样、只有日切位置不同），
+  这不是 bug。页首那一行写明了，页面里不再逐处解释（用户口径 2026-08-19：
+  「不留小字」）。
+
+  两个统计起点也写在页首：计数类 2026-08-17、资源类 2026-08-18。它们不是同一天
+  开始有数的，见 `domain/overview.py`。
+#}
+{% block content %}
+
+<p class="overview-sub">
+  时刻按 UTC+8 · 统计按 <b>UTC+0</b> 切天 ·
+  计数类起点 {{ '%04d-%02d-%02d'|format(count_start.year, count_start.month, count_start.day) }} ·
+  <b>资源类起点 {{ '%04d-%02d-%02d'|format(resource_start.year, resource_start.month, resource_start.day) }}</b>
+</p>
+
+<section class="panel" id="overview-now" aria-label="此刻">
+  {% include "_overview_now.html" %}
+</section>
+
+<section class="panel" aria-label="周期统计">
+  <div class="overview-tabs-head">
+    <h2 class="overview-heading">周期统计 <span>UTC+0 切天 · 资源列只统计已读回的战报</span></h2>
+    <nav class="overview-tabs" aria-label="统计粒度">
+      {% for value, label in [('day', '按天'), ('week', '按周'), ('month', '按月'), ('total', '总计')] %}
+        <a class="overview-tab {% if granularity.value == value %}on{% endif %}"
+           href="/overview?granularity={{ value }}"
+           {% if granularity.value == value %}aria-current="page"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </nav>
+  </div>
+  <div id="overview-periods">
+    {% include "_overview_periods.html" %}
+  </div>
+</section>
+
+<script>
+  // 两块各刷各的：「此刻」几秒一轮，周期统计一分钟一轮。
+  //
+  // 不用 base.html 的 `autoRefresh()`：那一套整页重取、单一周期，套在这里会把
+  // 周期统计那几趟聚合查询也按 5 秒一次地跑起来。轮询的纪律照抄它那一段——
+  // 每一条都是「少了它就会烧掉带宽或者惹恼用户」的：
+  //
+  //   1. 页面不可见就**真的停表**，不是发了请求再丢掉。这一页会被挂在后台一整夜。
+  //   2. 上一次没回来就不发下一次，否则库忙的时候请求会越堆越多。
+  //   3. 只换标了 id 的那一块，其余（包括粒度选中态）一律不动。
+  //   4. 失败不弹窗、不停表：控制台常在服务重启期间开着，下一轮多半就好了。
+  (function () {
+    const NOW_MS = 5000;
+    const PERIODS_MS = 60000;
+    const search = new URLSearchParams(window.location.search);
+    const granularity = search.get('granularity') || 'day';
+
+    function swapper(id, fragment) {
+      let inFlight = false;
+      return async function () {
+        const target = document.getElementById(id);
+        if (!target || inFlight || document.visibilityState !== 'visible') return;
+        inFlight = true;
+        try {
+          const url = `/overview?granularity=${encodeURIComponent(granularity)}`
+            + `&fragment=${fragment}`;
+          const response = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+          if (!response.ok) return;
+          target.innerHTML = await response.text();
+        } catch (_) {
+          // 下一轮会重试。
+        } finally {
+          inFlight = false;
+        }
+      };
+    }
+
+    const refreshNow = swapper('overview-now', 'now');
+    const refreshPeriods = swapper('overview-periods', 'periods');
+    let timers = [];
+
+    function start() {
+      stop();
+      if (document.visibilityState !== 'visible') return;
+      timers = [
+        window.setInterval(refreshNow, NOW_MS),
+        window.setInterval(refreshPeriods, PERIODS_MS),
+      ];
+    }
+
+    function stop() {
+      for (const timer of timers) window.clearInterval(timer);
+      timers = [];
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      // 回到前台先补一次：挂了一夜之后，页面上摆着的是离开时那一份。
+      if (document.visibilityState === 'visible') { refreshNow(); refreshPeriods(); }
+      start();
+    });
+    start();
+  })();
+</script>
+{% endblock %}

@@ -1101,8 +1101,69 @@ class MissionScheduler:
         公开出来是给「清理航线占用」那条路用的（`web.persistent_service`）：
         它和 `count_inflight` 必须量同一把尺子，否则页面上写着「占着 3 条」、
         按钮却报「放开了 0 条」，而那个数字是这个按钮唯一的可见回执。
+
+        数据概览页也读它：那一页画的航线格子必须按调度器认的 `hold` 去判占用，
+        写死 90 分钟的话，用户在攻击配置页把它改成 45 之后，页面会继续把一批
+        早该放手的派遣画成「占着」。
         """
         return self._unknown_line_hold()
+
+    def configured_line_origins(self) -> tuple[ConfiguredOrigin, ...]:
+        """**参与调度的军力攻击任务**此刻配着的那几颗出发星球，含停用的。
+        **读侧的公开入口**，同 `unknown_line_hold`。
+
+        公开出来是给数据概览页画航线格子用的（需求文档 8.3）：格子数必须按
+        **每颗星球各自配置的航线数**画，而那个数只有一个来源
+        （`mission_task_origins.fleet_lines`，实测 `4:277:15` 是 5 条、
+        `9:250:8` 是 4 条）。⚠️ 页面**不许**按占用数画格子——原型第一版按
+        「在飞 + 时长未知」画，于是一颗配了 4 条的星球画出了 7 格；也**不许**
+        自己去读那张表，`planet_id` 与坐标快照谁优先这条规则只该有一份
+        （见 `_configured_origins`）。
+
+        同一颗星球被两个任务配着时，航线数**相加**：它们抢的是同一颗星球上的
+        同一批航线，分成两行画等于把一条航线画两遍。眼下只有一个军力任务，
+        这一条是为多任务那天先把语义定死。
+
+        按坐标排序，好让页面上的卡片次序不随库里的行序抖动。
+        """
+        merged: dict[Coordinate, ConfiguredOrigin] = {}
+        for row in self._repository.mission_tasks():
+            if MissionKind(row.kind) is not MissionKind.BOT or not _bot_by_military(
+                row.params_json
+            ):
+                continue
+            for item in self._configured_origins(row):
+                seen = merged.get(item.coordinate)
+                if seen is None:
+                    merged[item.coordinate] = item
+                    continue
+                merged[item.coordinate] = ConfiguredOrigin(
+                    coordinate=item.coordinate,
+                    fleet_lines=seen.fleet_lines + item.fleet_lines,
+                    # 任一处启用就算启用：停用的那一份不该把另一个任务真的会派
+                    # 舰的那颗星球说成「没在用」。
+                    enabled=seen.enabled or item.enabled,
+                )
+        return tuple(
+            merged[key]
+            for key in sorted(merged, key=lambda item: (item.galaxy, item.system, item.position))
+        )
+
+    def military_candidate_pool(self) -> tuple[ScoredTarget, ...]:
+        """此刻**还打得动**的那些 bot 目标。**读侧的公开入口**，同上。
+
+        公开出来是给数据概览页那块「候选池」用的。⚠️ 页面**不许**自己写一遍
+        筛选（需求文档 8.7）：排除近期打过的、刚撞过 8 小时保护期的、本轮已走
+        完的，这三条都是策略（两个窗口都能在攻击配置页上改），页面另算一份的话
+        它显示的池子和调度器下一轮真的会挑的那批不是同一个东西。
+
+        没有军力攻击任务时返回空元组——那是「没有这条链路」，不是「池子空了」，
+        页面上要分得开。
+        """
+        for row in self._repository.mission_tasks():
+            if MissionKind(row.kind) is MissionKind.BOT and _bot_by_military(row.params_json):
+                return tuple(self._military_candidates(row))
+        return ()
 
     def _report_grace_minutes(self) -> int:
         """库里当下的战报宽限期。配置行还没建出来时按默认 30 分钟算——

@@ -1461,6 +1461,7 @@ def create_persistent_app(
 ) -> FastAPI:
     """Build the local Web UI against the SQLite-backed management service."""
     from .intel_routes import register_intel_routes
+    from .overview_routes import register_overview_routes
     from .ranking_routes import register_ranking_routes
     from .system_log_routes import register_system_log_routes
 
@@ -1512,6 +1513,9 @@ def create_persistent_app(
     register_intel_routes(app, session_factory)
     register_ranking_routes(app, session_factory)
     register_system_log_routes(app, session_factory)
+    # 数据概览要读真的调度器（`hold`、航线配置、候选池），所以和任务路由一样
+    # 只在持久化 app 上注册；它本身是**只读**的，不参与任何起停。
+    register_overview_routes(app, session_factory)
     return app
 
 
