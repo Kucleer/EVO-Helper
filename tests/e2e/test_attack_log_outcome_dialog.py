@@ -424,7 +424,10 @@ def test_the_flip_script_is_gone(tmp_path: Path) -> None:
     page = _page(tmp_path)
 
     assert "data-drop" not in page, "翻转脚本还在页面上"
-    assert "data-drop" not in _console_css_raw(), '配套那条 `[data-drop="up"]` 规则还在'
+    # ⚠️ 判 CSS 一律先剥注释，**「不许出现」这一向也不例外**：不剥的话，一句
+    # 解释「那条 `[data-drop="up"]` 为什么删掉了」的注释就会把这条判红——
+    # 于是下一个人只好把那句解释也删掉，而那正是最该留下的一句话。
+    assert "data-drop" not in _console_css(), '配套那条 `[data-drop="up"]` 规则还在'
     assert "offsetHeight" not in page, "还在量浮层高度——那是翻转脚本才需要的"
 
 
