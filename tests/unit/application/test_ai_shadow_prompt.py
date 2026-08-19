@@ -203,10 +203,30 @@ class TestTheFactsEachCandidateNeeds:
         )
         assert "已知撞过保护期" in prompt
 
-    def test_a_target_without_a_reading_is_not_called_weak(self) -> None:
+    def test_a_target_without_a_reading_says_so_in_its_row(self) -> None:
         """⚠️ 没读数 ≠ 军力接近 0。说成「很弱」AI 会整格跳过，而真相是我们不知道。"""
         prompt = _prompt(candidates=_pool(12, without_reading=12))
-        assert NO_READING_BUCKET in prompt
+        assert "不是「很弱」" in prompt
+
+    def test_the_cross_table_gives_no_reading_its_own_bucket(self) -> None:
+        """★ 交叉表里「无读数」必须是**独立一档**，不许并进 `<10K`。
+
+        ⚠️ 这一条和上面那条不是重复：样本行说的是**某一行**怎么写，这一条说的是
+        **分桶**。并进 `<10K` 时样本行照样写着「无读数」，但摘要表会告诉 AI
+        「这一格里全是 10K 以下的弱鸡」——那是句假话，AI 会整格跳过。
+        （2026-08-19 变异实测：只有上面那条时，把分桶改回 `<10K` 一条都不红。）
+        """
+        prompt = _prompt(candidates=_pool(12, without_reading=12))
+        # 交叉表那几行长这样：`    银河 4 | 往返 <30分 | 军力 无读数: 7 个，…`
+        # ⚠️ 只认「银河」开头的那些——样本行里也有「| 军力 」，混进来会让断言失效。
+        summary_rows = [
+            line
+            for line in prompt.splitlines()
+            if line.strip().startswith("银河 ") and "军力" in line
+        ]
+        assert summary_rows, "交叉表整个不见了"
+        buckets = {line.split("| 军力 ")[1].split(":")[0] for line in summary_rows}
+        assert buckets == {NO_READING_BUCKET}, f"全是没读数的候选，交叉表却把它们分进了 {buckets}"
         assert "不是「很弱」" in prompt
 
 
