@@ -187,12 +187,25 @@ def _coordinator(tmp_path: Path) -> BackfillCoordinator:
 
 
 @pytest.mark.parametrize("written_as", ["utf-8", "cp936"])
-def test_the_log_tail_hands_back_chinese(written_as: str, tmp_path: Path) -> None:
+def test_the_log_tail_hands_back_chinese(
+    written_as: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """页面读的就是这个方法。它出来是问号，面板上就是问号。
 
     两种编码都过一遍：`cp936` 那一支代表修复之前留下的日志，`utf-8` 那一支
     代表修复之后的——**面板不该知道自己读的是哪一茬**。
+
+    ⚠️ **那句 monkeypatch 不是多余的，别删。** `log_tail()` 这条路不传
+    `legacy_encoding`，吃的是 `LEGACY_LOG_ENCODING`——本机首选编码。在中文
+    Windows 上它恰好就是 `cp936`，于是这条用例在开发机上**看着**是绿的；
+    到了 CI 的 Linux 上它是 `UTF-8`，GBK 字节被 `errors="replace"` 一路吞成
+    U+FFFD，当场红（2026-08-19 实测，PR #222 第一次 CI 就挂在这里）。
+
+    「历史那半截是 GBK」是这条用例自己的前提，就得写在用例里，而不是指望跑它的
+    机器碰巧是那个代码页。生产上那个默认值是对的（写日志的子进程和读日志的
+    控制台在同一台机器上），改的从来不是它。
     """
+    monkeypatch.setattr(mission_supervisor, "LEGACY_LOG_ENCODING", "cp936")
     coordinator = _coordinator(tmp_path)
     path = coordinator.state().log_path
     assert path is not None

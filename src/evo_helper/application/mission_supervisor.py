@@ -197,7 +197,7 @@ def child_log_environment(base: Mapping[str, str] | None = None) -> dict[str, st
     return env
 
 
-def decode_log_text(raw: bytes, *, legacy_encoding: str = LEGACY_LOG_ENCODING) -> str:
+def decode_log_text(raw: bytes, *, legacy_encoding: str | None = None) -> str:
     """把日志文件的字节解成文本。**先 UTF-8，逐行回退到历史字符集。**
 
     为什么要回退：日志按链路分文件、一直追加，从不轮转。上面那条修复落地之后，
@@ -208,13 +208,21 @@ def decode_log_text(raw: bytes, *, legacy_encoding: str = LEGACY_LOG_ENCODING) -
     次序不能反。GBK 的字节序列几乎不可能同时是合法 UTF-8，所以「先试 UTF-8」
     不会把老行认错；反过来先试 GBK 则会把新写的中文一律解成乱码——GBK 几乎
     什么字节都收得下，它不会失败，也就不会回退。
+
+    ⚠️ **`legacy_encoding` 的默认值在调用时才解析，不写进函数签名。**
+    写成 `legacy_encoding: str = LEGACY_LOG_ENCODING` 的话，那个值在 import
+    那一刻就被冻进默认值里了，此后 monkeypatch 模块常量对它一律无效——于是
+    「历史那半截是 GBK」这个前提**只能靠跑用例的机器碰巧是 cp936** 来满足。
+    实测（2026-08-19）：本机（中文 Windows，cp936）绿，CI（Linux，UTF-8）红。
+    生产行为一个字都没变，变的只是这个前提能不能写进用例自己。
     """
+    fallback = LEGACY_LOG_ENCODING if legacy_encoding is None else legacy_encoding
     lines: list[str] = []
     for line in raw.split(b"\n"):
         try:
             lines.append(line.decode(LOG_ENCODING))
         except UnicodeDecodeError:
-            lines.append(line.decode(legacy_encoding, errors="replace"))
+            lines.append(line.decode(fallback, errors="replace"))
     return "\n".join(lines)
 
 
