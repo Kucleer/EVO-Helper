@@ -1,8 +1,9 @@
 """FastAPI application factory for the local EVO-Helper management UI."""
 
 import asyncio
+import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from pydantic import BeforeValidator
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import Lifespan
 
+from evo_helper.application.ai_targeting import AiShadowObserver
 from evo_helper.application.backfill import default_since
 from evo_helper.application.mission_freeze import DEFAULT_FREEZE_LOG, MissionFreezeLog
 from evo_helper.application.mission_scheduler import (
@@ -303,6 +305,84 @@ def _revisit_out(revisit: RevisitView) -> RevisitOut:
             _coordinate_out(revisit.target_coordinate) if revisit.target_coordinate else None
         ),
     )
+
+
+# -- AI 选靶（影子）的展示转换 -----------------------------------------------
+
+
+def _ai_decision_view(row: Any) -> dict[str, object]:
+    """一条影子记录翻成页面能直接渲染的样子。
+
+    JSON 列原样存、这里原样解析：**不截断、不改写**——模型换版本答案就变，
+    「当时喂进去的是什么、模型回的是什么」是这张表存在的全部理由。
+    """
+    return {
+        "id": row.id,
+        "decided_at_utc": row.decided_at_utc,
+        "task_id": row.task_id,
+        "budget": row.budget,
+        "overlap": row.overlap,
+        "status": row.status,
+        "latency_ms": row.latency_ms,
+        "model": row.model,
+        "algorithm_picks": _safe_json_list(row.algorithm_picks_json),
+        "ai_picks": _safe_json_list(row.ai_picks_json),
+        "violations": _safe_json_list(row.violations_json),
+        "prompt_text": row.prompt_text,
+        "response_text": row.response_text,
+    }
+
+
+def _safe_json_list(text: str | None) -> list[Any]:
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _ai_health(rows: Sequence[Any]) -> dict[str, object]:
+    """诊断页顶部那四个数。**没有数据时全给 None**（页面显示「—」，不显示 0%）。
+
+    口径（需求文档第九节）：
+    - JSON 通过率 = 不是 `invalid_json` 的比例；
+    - 硬校验通过率 = `status == ok` 的比例（硬校验不过整份作废）；
+    - 数字自洽率 = `ok` 那批里没有 `self_consistency_*` violation 的比例；
+    - 平均重合率 = `ok` 那批的 overlap/budget 平均。
+
+    ⚠️ **重合率不是好坏判据**，页面文案必须把它写出来（需求文档第九节）。
+    """
+    total = len(rows)
+    if total == 0:
+        return {
+            "json_rate": None,
+            "hard_rate": None,
+            "self_consistency_rate": None,
+            "avg_overlap": None,
+        }
+    ok = [row for row in rows if row.status == "ok"]
+    json_ok = [row for row in rows if row.status != "invalid_json"]
+    consistent = [
+        row
+        for row in ok
+        if not any(
+            str(item.get("code", "")).startswith("self_consistency_")
+            for item in _safe_json_list(row.violations_json)
+        )
+    ]
+    overlaps = [row.overlap for row in ok if row.overlap is not None and row.budget]
+    return {
+        "json_rate": round(len(json_ok) / total, 3),
+        "hard_rate": round(len(ok) / total, 3),
+        "self_consistency_rate": (
+            round(len(consistent) / len(ok), 3) if ok else None
+        ),
+        "avg_overlap": (
+            round(sum(overlaps) / len(overlaps), 3) if overlaps else None
+        ),
+    }
 
 
 #: 攻击日志一页显示多少条。日志是给人翻的，不是给人滚的。
@@ -1047,12 +1127,19 @@ def create_app(
     @app.get("/diagnostics", response_class=HTMLResponse)
     async def diagnostics_page(request: Request) -> HTMLResponse:
         service = get_service(request)
+        # AI 选靶（影子）块只在常驻 app 上出现（要真 repository 与调度器），
+        # 假服务那条路没有这些记录，取不到就渲染空表。
+        console = getattr(request.app.state, "mission_console", None)
+        ai_rows = [] if console is None else console.recent_ai_decisions(limit=30)
         return templates.TemplateResponse(
             request=request,
             name="diagnostics.html",
             context={
                 "events": [_event_out(event) for event in service.list_events(200)],
                 "revisits": [_revisit_out(r) for r in service.list_revisits()],
+                "ai_enabled": console is not None,
+                "ai_decisions": [_ai_decision_view(row) for row in ai_rows],
+                "ai_health": _ai_health(ai_rows),
             },
         )
 
@@ -1484,6 +1571,10 @@ def create_persistent_app(
         # 那个）只留在内存里——往仓库里写文件必须是组装点明确决定的事，
         # 否则每一次跑测试都会在工作区里落下一个文件。
         freeze_log=MissionFreezeLog(DEFAULT_FREEZE_LOG),
+        # AI 选靶（影子）观测器也在这里建：它要真的 repository 和 Settings。
+        # 开关默认关（`military_attack_config.ai_shadow_enabled`），开着才会
+        # 真的发起 LLM 调用。
+        ai_shadow=AiShadowObserver(SqlAlchemyRepository(session_factory), resolved),
     )
 
     @asynccontextmanager
