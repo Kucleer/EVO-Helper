@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import locale
+import os
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -26,6 +28,21 @@ from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, MissionKind
 
 #: 子进程日志的落脚处。
 LOG_DIR = Path("var/logs")
+
+#: 子进程日志文件的字符集。**读的那一侧先按它解**（`decode_log_text`）。
+#:
+#: ⚠️ **这不是偏好项。** 它得和 `child_log_environment()` 塞给子进程的
+#: `PYTHONIOENCODING` 是同一个值——两处分家的那一刻，日志里的中文就变成问号，
+#: 而那种错不报任何异常。
+LOG_ENCODING = "utf-8"
+
+#: 这条修复**之前**写下的那些日志是什么字符集。只用于回退解码。
+#:
+#: ⚠️ **这同样不是偏好项。** 取值由「以前的子进程实际写进文件的是哪些字节」
+#: 决定：Windows 上重定向到文件的 `sys.stdout` 用的是机器的 ANSI 代码页
+#: （简体中文机器上是 cp936/GBK），而写日志的进程和读日志的控制台在同一台机器上，
+#: 所以这里问一次本机的首选编码正好就是那一个。调它只会让历史那半截换一种乱法。
+LEGACY_LOG_ENCODING = locale.getpreferredencoding(False)
 
 #: `terminate()` 之后等它收尾的秒数。等不到就放手——一个不肯死的子进程不该让
 #: 整个控制台卡住，页面上还有「强制结束」这条退路。
@@ -157,18 +174,74 @@ def log_path_for(kind: MissionKind, *, log_dir: Path = LOG_DIR) -> Path:
     return log_dir / f"mission-{kind.value.lower()}.log"
 
 
+def child_log_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """子进程的环境变量，**钉死它写日志用的字符集**。
+
+    ⚠️ 这一条是踩出来的（2026-08-19，「战报补录」面板整片乱码）。日志文件由父进程
+    `open(..., encoding="utf-8")` 打开，但那个 `encoding` **只管父进程自己写的字节**
+    ——子进程拿到的是继承来的文件描述符，写什么字节由**它自己的** `sys.stdout` 决定。
+    而在 Windows 上，重定向到文件的 `sys.stdout` 用的是机器的 ANSI 代码页
+    （简体中文机器上是 cp936/GBK），不是 UTF-8。于是：
+
+    - 子进程按 GBK 写「补录bot战报」；
+    - 控制台按 UTF-8 读回来 → 中文全变成 `?`，而 GBK 的低位字节落在 ASCII 区，
+      于是还会掺进 `u`、`'`、`S` 这类凭空冒出来的字母；
+    - 一个字都不报错。页面上那份日志尾巴是补录跑十几分钟里唯一的进度来源，
+      它变成乱码等于用户什么都看不到。
+
+    编码不能编到命令行里（`-X utf8` 会连 `open()` 的默认值一起改，波及子进程读写的
+    模板与截图路径），所以走 `PYTHONIOENCODING`——它**只**管三条标准流。
+    """
+    env = dict(os.environ if base is None else base)
+    env["PYTHONIOENCODING"] = LOG_ENCODING
+    return env
+
+
+def decode_log_text(raw: bytes, *, legacy_encoding: str | None = None) -> str:
+    """把日志文件的字节解成文本。**先 UTF-8，逐行回退到历史字符集。**
+
+    为什么要回退：日志按链路分文件、一直追加，从不轮转。上面那条修复落地之后，
+    同一个 `backfill-bot.log` 里前半截是 GBK、后半截是 UTF-8。整份文件挑一种编码
+    解都会有一半是乱码，所以**逐行**判：这一行是合法 UTF-8 就按 UTF-8，
+    不是就按历史字符集解。
+
+    次序不能反。GBK 的字节序列几乎不可能同时是合法 UTF-8，所以「先试 UTF-8」
+    不会把老行认错；反过来先试 GBK 则会把新写的中文一律解成乱码——GBK 几乎
+    什么字节都收得下，它不会失败，也就不会回退。
+
+    ⚠️ **`legacy_encoding` 的默认值在调用时才解析，不写进函数签名。**
+    写成 `legacy_encoding: str = LEGACY_LOG_ENCODING` 的话，那个值在 import
+    那一刻就被冻进默认值里了，此后 monkeypatch 模块常量对它一律无效——于是
+    「历史那半截是 GBK」这个前提**只能靠跑用例的机器碰巧是 cp936** 来满足。
+    实测（2026-08-19）：本机（中文 Windows，cp936）绿，CI（Linux，UTF-8）红。
+    生产行为一个字都没变，变的只是这个前提能不能写进用例自己。
+    """
+    fallback = LEGACY_LOG_ENCODING if legacy_encoding is None else legacy_encoding
+    lines: list[str] = []
+    for line in raw.split(b"\n"):
+        try:
+            lines.append(line.decode(LOG_ENCODING))
+        except UnicodeDecodeError:
+            lines.append(line.decode(fallback, errors="replace"))
+    return "\n".join(lines)
+
+
 def launch_mission(kind: MissionKind, command: Sequence[str], log_path: Path) -> Process:
     """真的拉起一个 runner。**测试里绝不调它。**
 
     `stderr` 并进 `stdout`：两条流分开写同一个文件会互相截断，而这份日志是
     出事之后唯一能看的东西。
+
+    `env` 不是可有可无的：少了它，子进程会按机器的 ANSI 代码页写这份日志，
+    而读的那一侧按 UTF-8 解——中文全变问号。整段理由在 `child_log_environment`。
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = log_path.open("a", encoding="utf-8")
+    handle = log_path.open("a", encoding=LOG_ENCODING)
     return subprocess.Popen(  # noqa: S603 - 命令行全由 `domain.missions` 构造
         list(command),
         stdout=handle,
         stderr=subprocess.STDOUT,
+        env=child_log_environment(),
     )
 
 

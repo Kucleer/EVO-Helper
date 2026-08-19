@@ -1,0 +1,255 @@
+"""补录日志从子进程写下去、到页面读回来，中文得还是中文。
+
+## 这一条修的是什么
+
+2026-08-19：「战报补录」面板下方那片日志流整片乱码——
+
+```
+16:02:02 ??%botu????UTC 2026-08-19 ????? 12 ?????? 60 ??:??%g'????????
+```
+
+中文全变成 `?`，而时间戳、`VICTORY`、日期这些 ASCII 是好的。
+
+编码在**起子进程**那一环丢的，不在传输、也不在页面：
+
+- 日志文件由父进程 `open(..., encoding="utf-8")` 打开，但那个 `encoding`
+  **只管父进程自己写的字节**；
+- 子进程拿到的是继承来的文件描述符，写什么字节由**它自己的** `sys.stdout` 决定，
+  而 Windows 上重定向到文件的 `sys.stdout` 用机器的 ANSI 代码页（cp936/GBK）；
+- 读的那一侧 `read_text(encoding="utf-8", errors="replace")` 把 GBK 字节全换成
+  U+FFFD——GBK 的低位字节又落在 ASCII 区，于是还掺进 `u`、`'`、`S` 这类凭空冒出来
+  的字母，正是面板上看到的那副样子。
+
+实证：修复前那台机器上留下的 `var/logs/backfill-pirate.log`，按 cp936 解得出
+「补录pirate战报：UTC 2026-08-12 起，…」，按 UTF-8 解全是替换符。
+
+## 两条判据
+
+- **写**：子进程的环境里必须钉着 `PYTHONIOENCODING=utf-8`；
+- **读**：同一个文件里前后两种编码都得读对——修复落地之后，那些一直追加、
+  从不轮转的 `backfill-*.log` 前半截是 GBK、后半截是 UTF-8。
+
+## ⚠️ 这一整个文件里，「历史那半截是什么编码」一律显式写出来
+
+CI 跑在 Linux（首选编码 UTF-8），开发机是中文 Windows（cp936）。
+`LEGACY_LOG_ENCODING` 取的是**本机**首选编码——在开发机上它恰好就是这些用例
+想要的那一个，于是「忘了声明前提」在本地看不出来。PR #222 第一次 CI 就是这么
+挂的：唯一没显式声明的那条（端到端那条走 `log_tail()`，不传 `legacy_encoding`）
+本地绿、CI 红。
+
+所以：**要么传 `legacy_encoding=`，要么 monkeypatch `LEGACY_LOG_ENCODING`。**
+一条都不许靠「跑它的机器碰巧是那个代码页」。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from evo_helper.application import mission_supervisor
+from evo_helper.application.backfill import (
+    BackfillCoordinator,
+    BackfillRequest,
+    launch_backfill,
+)
+from evo_helper.application.mission_supervisor import (
+    child_log_environment,
+    decode_log_text,
+    launch_mission,
+)
+from evo_helper.domain.scheduler import MissionKind
+
+NOW = datetime(2026, 8, 19, 8, 2, tzinfo=UTC)
+
+#: 面板上那一行的原文（坐标换成假的，本仓是公开仓）。
+CHINESE_LINE = "16:02:02 补录bot战报：UTC 2026-08-19 起，最多翻 12 屏、开 60 封"
+#: 同一行里 ASCII 那半截——它在乱码里是好的，所以光断言「有中文」还不够，
+#: 得连它一起断言，否则「整行都没读到」也能蒙混过去。
+ASCII_PART = "16:02:02"
+
+
+class _FakeProcess:
+    pid = 4321
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+# -- 写：子进程按什么编码写 -----------------------------------------------------
+
+
+def test_the_child_is_told_to_write_utf8() -> None:
+    """少了这一条，Windows 上的子进程按 ANSI 代码页写日志，中文全变问号。"""
+    assert child_log_environment({"PATH": "/usr/bin"})["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_the_rest_of_the_environment_survives() -> None:
+    """只钉编码，别的一个都不动：子进程要靠环境里的库路径、凭据、任务身份跑起来。"""
+    env = child_log_environment({"PATH": "/usr/bin", "EVO_HELPER_RUN_ID": "abc"})
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["EVO_HELPER_RUN_ID"] == "abc"
+
+
+@pytest.mark.parametrize("launcher", ["backfill", "mission"])
+def test_both_launchers_pin_the_child_encoding(
+    launcher: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """两个进程管理器各起各的子进程，**两边都要钉**。
+
+    补录那一侧最要紧（页面上那份日志尾巴是它跑十几分钟里唯一的进度来源），
+    但任务那一侧的 `mission-*.log` 同样是人出事之后要读的东西。
+
+    ⚠️ 这里把 `subprocess.Popen` 换掉，**绝不真的起一个子进程**。
+    """
+    seen: dict[str, Any] = {}
+
+    def fake_popen(command: Sequence[str], **kwargs: Any) -> _FakeProcess:
+        seen.update(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr(mission_supervisor.subprocess, "Popen", fake_popen)
+    log_path = tmp_path / "logs" / "child.log"
+
+    if launcher == "backfill":
+        from evo_helper.application import backfill as backfill_module
+
+        monkeypatch.setattr(backfill_module.subprocess, "Popen", fake_popen)
+        launch_backfill(["python", "-c", "pass"], log_path)
+    else:
+        launch_mission(MissionKind.BOT, ["python", "-c", "pass"], log_path)
+
+    assert seen["env"]["PYTHONIOENCODING"] == "utf-8"
+
+
+# -- 读：同一个文件里两种编码都得读对 -------------------------------------------
+
+
+def test_utf8_lines_come_back_as_chinese() -> None:
+    assert decode_log_text(CHINESE_LINE.encode("utf-8"), legacy_encoding="cp936") == CHINESE_LINE
+
+
+def test_legacy_gbk_lines_come_back_as_chinese() -> None:
+    """修复之前写下的那些日志。不回退的话，它们会永远显示成一片问号。"""
+    decoded = decode_log_text(CHINESE_LINE.encode("cp936"), legacy_encoding="cp936")
+
+    assert decoded == CHINESE_LINE
+    assert "�" not in decoded
+
+
+def test_a_file_with_both_encodings_reads_right_on_both_halves() -> None:
+    """日志按链路分文件、一直追加、从不轮转，所以修复之后必然出现混编文件。
+
+    整份挑一种编码解都会有一半是乱码——**只有逐行判**才能两边都对。
+    """
+    old = "16:02:02 旧的一行，GBK 写的".encode("cp936")
+    new = "16:03:03 新的一行，UTF-8 写的".encode()
+
+    decoded = decode_log_text(old + b"\n" + new, legacy_encoding="cp936")
+
+    assert decoded.splitlines() == ["16:02:02 旧的一行，GBK 写的", "16:03:03 新的一行，UTF-8 写的"]
+
+
+def test_utf8_wins_when_a_line_could_be_read_either_way() -> None:
+    """次序不能反：**先试 UTF-8**，失败才回退。
+
+    GBK 收得下的字节范围比 UTF-8 宽得多，一段 UTF-8 中文常常也是一段合法 GBK
+    ——只是意思全变了。先试 GBK 的话它不报错、也就永远回退不到 UTF-8，新写的
+    中文会一律被解成乱码。
+
+    这里挑的正是这样一行：`'补录完成'` 的 UTF-8 字节按 GBK 解得出 `'琛ュ綍瀹屾垚'`
+    ——**不抛异常**。随手挑一句中文多半会撞上 GBK 解不了的字节，那种句子无论
+    次序怎么排都能过，这条用例也就什么都不守了。
+    """
+    line = "16:03:22 补录完成"
+    assert line.encode("utf-8").decode("cp936") != line, "挑的这一行 GBK 解不了，守不住次序"
+
+    assert decode_log_text(line.encode("utf-8"), legacy_encoding="cp936") == line
+
+
+def test_undecodable_bytes_do_not_blow_up() -> None:
+    """日志读不出来不能报错：一次读文件失败把状态接口打成 500，页面连「在跑」
+    都显示不出来了。
+    """
+    assert decode_log_text(b"\xff\xfe abc", legacy_encoding="ascii").endswith(" abc")
+
+
+def test_the_fallback_encoding_is_resolved_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不传 `legacy_encoding` 时，回退用的是**调用那一刻**的 `LEGACY_LOG_ENCODING`。
+
+    ⚠️ **这条用例守的是「这个修复本身守不守得住」。**
+
+    写成 `def decode_log_text(..., legacy_encoding: str = LEGACY_LOG_ENCODING)` 的话，
+    那个值在 import 那一刻就被求值、冻进函数的默认值里了；此后 monkeypatch 模块
+    常量对它一律无效。后果不是「行为错了」，而是**这个前提没法写进任何用例**——
+    于是端到端那条只能靠跑它的机器碰巧是 cp936，本地绿、CI 红（PR #222）。
+
+    故意 patch 成 `latin-1` 而不是 `cp936`：本机（中文 Windows）的默认值本来就是
+    cp936，patch 成它等于什么都没验——把默认值冻回去，用例照样是绿的。`latin-1`
+    在两个平台上都不等于默认值，所以这条用例在 Windows 和 Linux 上守的是同一件事。
+    """
+    monkeypatch.setattr(mission_supervisor, "LEGACY_LOG_ENCODING", "latin-1")
+    # GBK 字节，既不是合法 UTF-8（所以一定会走回退），按 latin-1 解又和按 cp936
+    # 解明显不同（所以看得出回退到底听了谁的）。
+    raw = "补录完成".encode("cp936")
+
+    decoded = decode_log_text(raw)
+
+    assert decoded == raw.decode("latin-1")
+    assert decoded != "补录完成", "回退没跟着 monkeypatch 走，默认值多半又被冻住了"
+
+
+# -- 端到端：写进文件的中文，从状态里读出来还是中文 -----------------------------
+
+
+def _coordinator(tmp_path: Path) -> BackfillCoordinator:
+    coordinator = BackfillCoordinator(
+        launch=lambda command, log_path: _FakeProcess(),
+        clock=lambda: NOW,
+        log_dir=tmp_path / "logs",
+    )
+    coordinator.request(BackfillRequest(kind="bot", since=NOW.date()))
+    return coordinator
+
+
+@pytest.mark.parametrize("written_as", ["utf-8", "cp936"])
+def test_the_log_tail_hands_back_chinese(
+    written_as: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """页面读的就是这个方法。它出来是问号，面板上就是问号。
+
+    两种编码都过一遍：`cp936` 那一支代表修复之前留下的日志，`utf-8` 那一支
+    代表修复之后的——**面板不该知道自己读的是哪一茬**。
+
+    ⚠️ **那句 monkeypatch 不是多余的，别删。** `log_tail()` 这条路不传
+    `legacy_encoding`，吃的是 `LEGACY_LOG_ENCODING`——本机首选编码。在中文
+    Windows 上它恰好就是 `cp936`，于是这条用例在开发机上**看着**是绿的；
+    到了 CI 的 Linux 上它是 `UTF-8`，GBK 字节被 `errors="replace"` 一路吞成
+    U+FFFD，当场红（2026-08-19 实测，PR #222 第一次 CI 就挂在这里）。
+
+    「历史那半截是 GBK」是这条用例自己的前提，就得写在用例里，而不是指望跑它的
+    机器碰巧是那个代码页。生产上那个默认值是对的（写日志的子进程和读日志的
+    控制台在同一台机器上），改的从来不是它。
+    """
+    monkeypatch.setattr(mission_supervisor, "LEGACY_LOG_ENCODING", "cp936")
+    coordinator = _coordinator(tmp_path)
+    path = coordinator.state().log_path
+    assert path is not None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(CHINESE_LINE.encode(written_as))
+
+    tail = coordinator.log_tail()
+
+    assert tail == CHINESE_LINE
+    assert ASCII_PART in tail
+    assert "?" not in tail
