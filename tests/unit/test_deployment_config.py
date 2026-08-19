@@ -20,7 +20,15 @@ from evo_helper.domain.models import Coordinate
 
 class TestTesseractPath:
     def test_the_default_is_the_usual_windows_install(self) -> None:
-        assert Settings().tesseract_path == r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        """⚠️ 判据落在**字段默认值**上，不是 `Settings().tesseract_path`。
+
+        `env_file=".env"` 会盖掉它，而 Tesseract 路径正是「装到别处就要改」的那类
+        配置：改过的开发机上这条必红，CI 没有 `.env` 却永远绿——绿得毫无意义。
+        同 `tests/safety/test_defaults.py` 里 `database_url` 那条。
+        """
+        default = Settings.model_fields["tesseract_path"].default
+
+        assert default == r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
     def test_it_follows_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("EVO_HELPER_TESSERACT_PATH", r"D:\ocr\tesseract.exe")
@@ -141,8 +149,15 @@ class TestOrigin:
 
         领域层保留默认值是刻意的：`domain` 不许 import `config`，否则纯领域
         层就绑死在配置上。所以两边只能靠这条测试对齐。
+
+        ⚠️ 默认主星取**字段默认值**，不取 `Settings().origin`：换过账号的开发机
+        `.env` 里写着自己的主星，拿它来比这条必红，而 CI 没有 `.env` 永远绿。
+        默认值仍要过一遍 `origin_coordinate`——这条真正钉住的是
+        `Coordinate.__str__` 写出来的串还能被解析器读回同一个坐标。
         """
-        assert Settings().origin_coordinate == ORIGIN
+        default = Settings.model_fields["origin"].default
+
+        assert Settings(origin=default).origin_coordinate == ORIGIN
 
     def test_it_follows_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("EVO_HELPER_ORIGIN", "3:42:7")

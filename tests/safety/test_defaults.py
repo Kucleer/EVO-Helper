@@ -4,12 +4,22 @@ from evo_helper.config import Settings
 
 
 def test_the_console_listens_on_the_lan_by_default() -> None:
-    """局域网可访问是明确需求；端口刻意避开 8000。"""
-    settings = Settings()
+    """局域网可访问是明确需求；端口刻意避开 8000。
 
-    assert settings.host == "0.0.0.0"  # noqa: S104 - 见 Settings.host 的说明
-    assert settings.port == 8770
-    assert settings.lan_exposed is True
+    ⚠️ 判据落在**字段默认值**上，不是 `Settings()`：`.env.example` 里写的是
+    `EVO_HELPER_HOST=127.0.0.1`、`EVO_HELPER_PORT=8000`，所以照它建过 `.env` 的
+    开发机上 `Settings()` 读到的是被覆盖后的值，这条在本地必红；而 CI 没有 `.env`，
+    永远绿。同 `database_url` 那条，方向相反、同一个病。
+
+    `lan_exposed` 这条仍要走一次实例：判据是「默认那个 host 会被判成已暴露」，
+    而不只是「默认值等于某个字符串」。host 用显式关键字传进去，`.env` 盖不着它。
+    """
+    host = Settings.model_fields["host"].default
+    port = Settings.model_fields["port"].default
+
+    assert host == "0.0.0.0"  # noqa: S104 - 见 Settings.host 的说明
+    assert port == 8770
+    assert Settings(host=host).lan_exposed is True
 
 
 def test_a_missing_env_file_does_not_fall_back_to_an_empty_sqlite_file() -> None:
