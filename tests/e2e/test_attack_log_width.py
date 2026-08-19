@@ -220,7 +220,13 @@ def test_the_outcome_column_reuses_the_shared_width_cap(tmp_path: Path) -> None:
 
 
 def _console_css() -> str:
-    return (
+    """样式表，**注释先剥掉**。
+
+    ⚠️ 这个仓库里注释比代码长，而注释里成段引用着规则本身（`tr:hover .log-line`
+    在 2026-08-19 那次改动之后就被引用了两处）。不剥的话，「这条规则还在不在」
+    的断言会被一句谈论它的注释喂饱——真把规则删了也照样绿，用例说的是假话。
+    """
+    css = (
         Path(__file__).resolve().parents[2]
         / "src"
         / "evo_helper"
@@ -228,6 +234,7 @@ def _console_css() -> str:
         / "static"
         / "console.css"
     ).read_text(encoding="utf-8")
+    return re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
 
 
 def test_the_shared_truncation_rules_are_actually_in_the_stylesheet(tmp_path: Path) -> None:

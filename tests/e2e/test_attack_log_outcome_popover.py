@@ -361,7 +361,7 @@ def test_the_precision_marks_survive_the_move_into_the_popover(tmp_path: Path) -
 # -- 四、hover 不许再改变行高 -----------------------------------------------------
 
 
-def _console_css() -> str:
+def _console_css_raw() -> str:
     return (
         Path(__file__).resolve().parents[2]
         / "src"
@@ -372,14 +372,19 @@ def _console_css() -> str:
     ).read_text(encoding="utf-8")
 
 
-def _rule_block(css: str, selector: str) -> str:
-    """把某条规则的声明块取出来（含选择器那一行），**注释先剥掉**。
+def _console_css() -> str:
+    """样式表，**注释先剥掉**。
 
-    这个仓库里注释比代码长，而注释里成段引用着 `display: none` 这类写法。不剥的话
-    「这条规则里不许出现 X」的断言会被一句解释 X 为什么不能用的注释判红——
-    用例说了假话，比不说更糟。
+    ⚠️ 这个仓库里注释比代码长，而注释里成段引用着规则本身（`display: none`、
+    `tr:hover .log-line` 都被引用了不止一处）。不剥的话两头都会说假话：
+    「这条规则还在」会被一句谈论它的注释喂饱，「这条规则里不许出现 X」会被一句
+    解释 X 为什么不能用的注释判红。
     """
-    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    return re.sub(r"/\*.*?\*/", "", _console_css_raw(), flags=re.DOTALL)
+
+
+def _rule_block(css: str, selector: str) -> str:
+    """把某条规则的声明块取出来（含选择器那一行）。"""
     start = css.find(selector)
     assert start != -1, f"console.css 里找不到 `{selector}`"
     end = css.find("}", start)
