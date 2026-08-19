@@ -150,12 +150,20 @@ def test_a_file_with_both_encodings_reads_right_on_both_halves() -> None:
 
 
 def test_utf8_wins_when_a_line_could_be_read_either_way() -> None:
-    """次序不能反。GBK 几乎什么字节都收得下、从不失败，先试它就永远回退不到
-    UTF-8——新写的中文会一律被解成乱码。
-    """
-    raw = "掠回 4160／3330".encode()
+    """次序不能反：**先试 UTF-8**，失败才回退。
 
-    assert decode_log_text(raw, legacy_encoding="cp936") == "掠回 4160／3330"
+    GBK 收得下的字节范围比 UTF-8 宽得多，一段 UTF-8 中文常常也是一段合法 GBK
+    ——只是意思全变了。先试 GBK 的话它不报错、也就永远回退不到 UTF-8，新写的
+    中文会一律被解成乱码。
+
+    这里挑的正是这样一行：`'补录完成'` 的 UTF-8 字节按 GBK 解得出 `'琛ュ綍瀹屾垚'`
+    ——**不抛异常**。随手挑一句中文多半会撞上 GBK 解不了的字节，那种句子无论
+    次序怎么排都能过，这条用例也就什么都不守了。
+    """
+    line = "16:03:22 补录完成"
+    assert line.encode("utf-8").decode("cp936") != line, "挑的这一行 GBK 解不了，守不住次序"
+
+    assert decode_log_text(line.encode("utf-8"), legacy_encoding="cp936") == line
 
 
 def test_undecodable_bytes_do_not_blow_up() -> None:
