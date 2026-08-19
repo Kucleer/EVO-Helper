@@ -1,4 +1,4 @@
-"""`attack_dispatches.flight_source`：可空、无默认值，而且它就是当前的 head。
+"""`attack_dispatches.line_hold_until_utc`：可空、无默认值，而且它就是当前的 head。
 
 本地测试用 `Base.metadata.create_all` 建表，所以模型和迁移可以静默分叉：一路全绿，
 只有真实的库会在启动时炸。这里两边对着比一遍。
@@ -22,10 +22,10 @@ from sqlalchemy import create_engine, inspect
 from alembic import command
 from support.database import scratch_database_url
 
-REVISION = "c4f8a2e51b07"
-DOWN_REVISION = "b7e4d0c93a15"
+REVISION = "d1a7f4b26c93"
+DOWN_REVISION = "c4f8a2e51b07"
 TABLE = "attack_dispatches"
-COLUMN = "flight_source"
+COLUMN = "line_hold_until_utc"
 
 
 def _config(database_url: str) -> Config:
@@ -39,7 +39,7 @@ def _config(database_url: str) -> Config:
 
 @pytest.fixture
 def database_url(tmp_path: Path) -> str:
-    return scratch_database_url(tmp_path, "flight-source-migration.db")
+    return scratch_database_url(tmp_path, "line-hold-migration.db")
 
 
 def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
@@ -48,37 +48,33 @@ def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
     }
 
 
-def test_this_revision_is_on_the_one_and_only_chain() -> None:
-    """整条迁移链只有一个 head，而这一条在那条链上。
+def test_this_revision_is_the_only_head() -> None:
+    """整条迁移链只有一个 head，而且就是这一条（眼下最新的那一条）。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前
-    一个字都看不出来。合并时若发现别的分支也挂在 `b7e4d0c93a15` 上，
+    一个字都看不出来。合并时若发现别的分支也挂在 `c4f8a2e51b07` 上，
     **后进的那条改自己的 `down_revision`**。
-
-    ⚠️ 这条不再断言「head 就是我」：后面又接了新的迁移
-    （`d1a7f4b26c93`），「谁是 head」这句话只该由**最新那一条**的用例来说，
-    否则每加一条迁移都要回来改一次这里，而改多了就没人再当真。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert len(script.get_heads()) == 1
-    assert REVISION in {revision.revision for revision in script.walk_revisions()}
+    assert list(script.get_heads()) == [REVISION]
 
 
 def test_the_column_is_nullable_with_no_default(database_url: str) -> None:
     """⚠️ **可空，而且一个默认值都不许给。**
 
-    存量 838 行根本不知道当时那个数怎么来的。默认成 `briefing_duration` 是让
-    历史行冒充实读，而这一列存在的全部意义就是分得开「读出来的」和
-    「算出来的」——同 `attack_intents.target_military_score_estimated` 那一段。
+    存量行没有这个估算。给个 `server_default` 就等于替历史行编一个看起来像
+    算过的兜底时刻，而这一列的全部意义是「算得出来就用它，算不出来就退回那个
+    常数」——NULL 才是「算不出来」的说法（判据在
+    `storage.repository._still_holding_a_line`，NULL 参与比较得 NULL、也就是假）。
     """
     command.upgrade(_config(database_url), "head")
 
     columns = _columns(database_url, TABLE)
     assert COLUMN in columns
     assert columns[COLUMN]["nullable"] is True
-    assert columns[COLUMN]["default"] is None, "有了默认值，存量行就会冒充实读"
+    assert columns[COLUMN]["default"] is None, "有了默认值，存量行就会凭空多出一个兜底时刻"
 
 
 def test_downgrade_removes_only_the_new_column(database_url: str) -> None:
@@ -89,8 +85,8 @@ def test_downgrade_removes_only_the_new_column(database_url: str) -> None:
 
     assert COLUMN not in _columns(database_url, TABLE)
     # 上一条迁移的成果还在：这条不该把别人的列一起带走。
-    assert "protection_seen_at_utc" in _columns(database_url, "bot_targets")
-    assert "flight_seconds" in _columns(database_url, TABLE)
+    assert "flight_source" in _columns(database_url, TABLE)
+    assert "line_free_at_utc" in _columns(database_url, TABLE)
 
 
 def test_upgrade_is_replayable_after_a_downgrade(database_url: str) -> None:
@@ -119,7 +115,7 @@ def test_the_migration_matches_the_orm_model(database_url: str, tmp_path: Path) 
 
     # 另开一个库：迁移建的那份和 `create_all` 建的那份必须互不干扰，
     # 不然后建的那次 `checkfirst` 会直接跳过，比出来永远相等。
-    orm_engine = create_engine(scratch_database_url(tmp_path, "orm-flight-source.db"))
+    orm_engine = create_engine(scratch_database_url(tmp_path, "orm-line-hold.db"))
     Base.metadata.create_all(orm_engine)
     created = {
         column["name"]: (str(column["type"]), column["nullable"])

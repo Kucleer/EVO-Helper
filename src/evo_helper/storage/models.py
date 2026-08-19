@@ -255,6 +255,36 @@ class AttackDispatchRow(Base):
     #: `domain.report_wait.UNKNOWN_LINE_HOLD` 为止（早先的「NULL 不计入在飞数」
     #: 已被实机推翻，判据见 `storage.repository._still_holding_a_line`）。
     line_free_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 派出这一刻简报页上写着的**舰队速度原文**（例如 `'14.520'`）。
+    #:
+    #: ⚠️ **它不参与任何算术，只做「一样 / 不一样」这个是非题。**
+    #: `domain.flight_estimate.fit_seconds_per_root_unit` 按出发星球从历史实测里
+    #: 学距离公式的系数，而那个系数是「这颗星球 + 这套编组」的属性；编组一换，
+    #: 旧样本立刻不算数，而屏幕上这个数**第一发就变了**（`preset_name` 与
+    #: `preset_signature` 都抓不住那次变化——2026-08-17 就是这么错的）。
+    #:
+    #: 按速度比去缩放系数是**错的**，别顺手加：实测 9:250:8 的 k ÷ 4:277:15 的 k
+    #: = 0.9931，而速度比 14.520/14.720 = 0.98641，差 0.7%。存成字符串而不是
+    #: float，正是为了让下一个人写不出那个乘法。
+    #:
+    #: ⚠️ **可空**：2026-08-19 之前的存量行没记过。NULL 的语义是「不知道」，
+    #: 不是「不一样」——学系数时照收，靠 `LEARNING_WINDOW` 让它们随时间老去。
+    fleet_speed_raw: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: **航线钟为 NULL 时的兜底占用截止时刻**：飞行时长一个来源都定不下来时，
+    #: 这条航线**至少**占到这一刻。算不出来（同一个恒星系内，见
+    #: `domain.flight_estimate.line_hold_round_trip`）时为 NULL。
+    #:
+    #: ⚠️ **它不取代 `UNKNOWN_LINE_HOLD` 那一档，而是与它取大**（判据在
+    #: `storage.repository._still_holding_a_line`）。用户在攻击配置页上填的
+    #: `unknown_line_hold_minutes` 照旧在**查询时**生效，填多了照样听用户的；
+    #: 这一列只负责把「跨银河那种真要飞两小时的发次」从 90 分钟里捞出来。
+    #:
+    #: ⚠️ **它是算出来的，不是读出来的**，所以它既不进 `flight_seconds`
+    #: （那是 `vet_flight_time` 的标定样本池），也不进 `line_free_at_utc`
+    #: （那一列是观测推出来的返航时刻，页面上「时长未知」那一格正是靠它为
+    #: NULL 才数得出来）。理由与 `flight_source` 那一段同源：估算值不许长得
+    #: 像实测值。
+    line_hold_until_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     #: **人工放手的时刻**：用户在游戏里看过、确认这一发的舰队已经回港，于是在
     #: 调度台上把这条航线占用清掉。非 NULL 就是「不管上面那个钟怎么说，这条
     #: 航线现在是空的」。

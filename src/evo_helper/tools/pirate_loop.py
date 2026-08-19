@@ -45,7 +45,7 @@ import argparse
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -53,6 +53,7 @@ from uuid import UUID, uuid4
 
 from evo_helper.config import Settings
 from evo_helper.domain.flight_estimate import (
+    FlightCoefficient,
     FlightEstimate,
     FlightSource,
     predict_flight,
@@ -917,7 +918,12 @@ def record_planet_list_overlay_retry(
     capture: Callable[[], Any] | None = None,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
-    """把「行星列表读空 → 疑似浮层 → 关掉 → 重读结果」写进 `system_log`。
+    """把行星列表那条链路的诊断现场写进 `system_log`。
+
+    两支会走到这里，都由 `game.planet_list.PlanetSwitcher.record_evidence` 交进来：
+    「读空 → 疑似浮层 → 关掉 → 重读结果」，以及「往回拖满上限、到没到顶判不出来」。
+    两支都是每次切换至多一条，所以文字不必限流。
+
 
     ⚠️ **跨机排障靠的就是这一条。** 2026-08-17 那次实机故障里，日志只留下
     「逐屏读到的是 `[[]]`」——够说明列表读空，却说不出**画面上盖着的是什么**。
@@ -1118,27 +1124,38 @@ class PirateLoop:
     def _planet_rows(self) -> list[tuple[int, str]]:
         """行星列表浮层坐标列上，这一屏每个词框的 `(中心 y, 文字)`。
 
-        逐套配方试到**读出至少一个三段坐标**为止。理由与
+        逐套配方试到**读出至少一行成对括起来的坐标**为止。理由与
         `vision.scan_reading.read_panel_confirming` 同形：粘连是读不出，不是没翻到，
         在同一张截图上换配方比重新拖一屏便宜得多；而这里换配方还有第二个理由——
         实测 3× LANCZOS 会把 `9` 读成 `8`（见 `pirate_ui.PLANET_LIST_COORD_RECIPES`），
         错的那一套给出的不是空结果而是**另一颗星球**。
 
+        ⚠️ **白名单里必须有方括号，采信判据也必须要求方括号**
+        （`pirate_ui.PLANET_LIST_COORD_WHITELIST` / `reads_as_a_planet_row`）。
+        去掉括号的那一版会让 Tesseract 拿数字顶替它们，多顶出来的那一位再粘进
+        相邻的一段——2026-08-19 的 `9:250:8` → `9:250:88` 就是这么来的，量出来的
+        凭据在 `domain.planet_switch._PLANET_ROW_RE`。这里两处必须用同一个判据：
+        用宽松的那条去挑配方，等于让一套「括号已经化成数字」的读数当选。
+
         一套都读不出来就交空清单出去，调用方于是什么都不点。
         """
         import pytesseract
 
+        from evo_helper.domain.planet_switch import reads_as_a_planet_row
         from evo_helper.game.planet_list import coordinate_words
-        from evo_helper.vision.scan_reading import COORD_WHITELIST, COORDINATE_RE
 
         # 视口漂了的话坐标列 ROI 框的是别处的像素，而这里读出来的 y 是要拿去点的。
         self._ensure_geometry()
         image = self._driver.capture()
         for upscale, resample in pirate_ui.PLANET_LIST_COORD_RECIPES:
             words = coordinate_words(
-                image, pytesseract, upscale=upscale, resample=resample, whitelist=COORD_WHITELIST
+                image,
+                pytesseract,
+                upscale=upscale,
+                resample=resample,
+                whitelist=pirate_ui.PLANET_LIST_COORD_WHITELIST,
             )
-            if any(COORDINATE_RE.search(text) for _y, text in words):
+            if any(reads_as_a_planet_row(text) for _y, text in words):
                 return words
         # 空行会安全地挡住派遣，但不能只留下 ``[[]]``：实机上同一套配方在手工
         # 截图里读得到三颗星球，运行时读空就说明画面时序或 tesseract 配置变了。
@@ -1445,7 +1462,9 @@ class PirateLoop:
             return remaining
         return None
 
-    def _read_flight_time(self, coordinate: Coordinate) -> FlightEstimate:
+    def _read_flight_time(
+        self, coordinate: Coordinate, *, mission_kind: str = MISSION_KIND_ATTACK
+    ) -> FlightEstimate:
         """把简报上的飞行时长定下来，**必须在点「出发！」之前**。
 
         点完出发这一屏就没了，而这个时长是助手松手之后唯一的回程闹钟
@@ -1469,6 +1488,20 @@ class PirateLoop:
         ⚠️ 上一版这里写着「不拼 `DispatchBriefing`，因为绝对到达时间的 ROI
         还没标定」。**那个前提没有了**：ROI 现在标定过了，两个来源都在手上，
         `duration_agrees()` 那道交叉校验也不再是同义反复。
+
+        ## 2026-08-19：公式那一路的系数改成**按出发星球现学**
+
+        上一版拿「屏幕上的速度逐字等于 14.520」当准入闸，而用户口径
+        （2026-08-19）是**「每个球的速度都会有点不一样的」**——那道闸结构上
+        只可能对一颗星球放行。实机那天从 9:250:8 起飞的每一发都读到 `14.720`，
+        于是公式**对整颗星球一次都不生效**，三个来源当场少一个。
+
+        现在改成问库要（`repository.flight_coefficient`）：按这颗出发星球的历史
+        实测学一个系数，学不出来才弃权。速度**仍然读、仍然记**，但降级成
+        「编组变了」的探测器（落在 `attack_dispatches.fleet_speed_raw`）。
+
+        ⚠️ **读不到系数不拦这一发**，和读不到飞行时间一样：查库出任何岔子都
+        当成「这一路弃权」，理由与本方法开头那条相同。
         """
         arrival_flight: timedelta | None = None
         duration_flight: timedelta | None = None
@@ -1510,18 +1543,47 @@ class PirateLoop:
             )
             arrival_flight = None
 
-        estimate = reconcile_flight(
-            arrival_flight=arrival_flight,
-            duration_flight=duration_flight,
-            model_flight=predict_flight(
-                coordinate,
-                self._options.origin or origin(),
-                speed=speed,
-                percent=percent,
+        launch_origin = self._options.origin or origin()
+        coefficient = self._flight_coefficient(
+            launch_origin, mission_kind=mission_kind, fleet_speed=speed
+        )
+        estimate = replace(
+            reconcile_flight(
+                arrival_flight=arrival_flight,
+                duration_flight=duration_flight,
+                model_flight=predict_flight(coordinate, launch_origin, coefficient=coefficient),
             ),
+            fleet_speed=speed,
+            coefficient=coefficient,
         )
         self._record_flight_estimate(coordinate, estimate, speed=speed, percent=percent)
         return estimate
+
+    def _flight_coefficient(
+        self, launch_origin: Coordinate, *, mission_kind: str, fleet_speed: str
+    ) -> FlightCoefficient | None:
+        """这颗出发星球的距离公式系数，问库要；问不到就弃权。
+
+        ⚠️ **查库出任何岔子都只是「少一个来源」，不许把这一发拦下来。**
+        方向与 `_read_flight_time` 开头那条一致：飞行时间是闹钟不是闸门，
+        而这一路本来就是三个来源里最靠后的那个。
+
+        ⚠️ **不为了学系数去新建一条数据库连接**（所以这里用 `self._repository`
+        而不是 `_ensure_run()`）。两条链路走到这一步时账本一定已经开着——
+        `attack()` 与 `scout()` 都先 `_record_intent()` 才读简报。而反过来
+        主动去连，代价是在没有库的场合（用例、以及实机上库刚好连不上的那一刻）
+        白等一次连接超时，然后才走到这条 `except`。
+        """
+        repository = self._repository
+        if repository is None:
+            return None
+        try:
+            return repository.flight_coefficient(
+                origin=launch_origin, mission_kind=mission_kind, fleet_speed=fleet_speed
+            )
+        except Exception as error:  # noqa: BLE001 - 见 docstring：问不到就弃权
+            say(f"  学不出 {launch_origin} 的距离公式系数（{error}）；公式这一路弃权")
+            return None
 
     def _record_flight_estimate(
         self,
@@ -1572,13 +1634,32 @@ class PirateLoop:
             ),
             "speed_raw": speed,
             "speed_percent_raw": percent,
+            # 公式那一路用的是**哪颗星球的系数、基于几发学的**。
+            # ⚠️ 这两个字段是硬要求：k 是个拟合参数，不是代码里写死的常数，
+            # 事后问「公式为什么给出这个数」时，没有它们就只能靠猜——
+            # 而 CLAUDE.md 那条判据是「出事时能不能只靠库里的日志定位」。
+            "coefficient_origin": str(self._options.origin or origin()),
+            "seconds_per_root_unit": (
+                None if estimate.coefficient is None else estimate.coefficient.seconds_per_root_unit
+            ),
+            "coefficient_samples": (
+                None if estimate.coefficient is None else estimate.coefficient.samples
+            ),
             "target_kind": self.TARGET_KIND,
         }
+        fit = (
+            "（没学出来）"
+            if estimate.coefficient is None
+            else (
+                f"k={estimate.coefficient.seconds_per_root_unit:.4f}"
+                f"（{payload['coefficient_origin']}，{estimate.coefficient.samples} 发）"
+            )
+        )
         say(
             f"  飞行时长按 {payload['source'] or '（定不下来）'} 记："
             f"到达时间 {show(estimate.arrival_flight)}／"
             f"飞行时间 {show(estimate.duration_flight)}／"
-            f"公式 {show(estimate.model_flight)}；{estimate.reason}"
+            f"公式 {show(estimate.model_flight)} {fit}；{estimate.reason}"
         )
         if estimate.flight is None:
             # 三个来源都没有值时**必须留下像素**：这一发要按
@@ -1777,7 +1858,7 @@ class PirateLoop:
         # `_read_flight_time` 里 `_settle` 的重试（约 3 秒），`_launch` 里还会再走
         # 一遍，于是**每发侦察多花约 6 秒、一轮 4 发就是 24 秒**。那是 ROI 没对上的
         # 症状，不是别的毛病——第一次实机发现侦察变慢，先去核这个 ROI。
-        flight = self._read_flight_time(coordinate)
+        flight = self._read_flight_time(coordinate, mission_kind=MISSION_KIND_SCOUT)
         if not self._launch(coordinate, "侦察"):
             self._leave_dispatch_list()
             return False
@@ -3275,7 +3356,11 @@ class PirateLoop:
             )
         )
         repository.record_flight_time(
-            dispatch_id, estimate.flight, dispatched_at, source=estimate.source
+            dispatch_id,
+            estimate.flight,
+            dispatched_at,
+            source=estimate.source,
+            fleet_speed=estimate.fleet_speed,
         )
 
     # -- 会话 ---------------------------------------------------------------

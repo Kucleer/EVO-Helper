@@ -59,6 +59,7 @@ def _dispatch(
     accepted: bool = True,
     line_free_at_utc: datetime | None = None,
     line_released_at_utc: datetime | None = None,
+    line_hold_until_utc: datetime | None = None,
     expected_report_at_utc: datetime | None = None,
     score_at_utc: datetime | None = None,
 ) -> UUID:
@@ -94,6 +95,7 @@ def _dispatch(
                 accepted=accepted,
                 line_free_at_utc=line_free_at_utc,
                 line_released_at_utc=line_released_at_utc,
+                line_hold_until_utc=line_hold_until_utc,
                 expected_report_at_utc=expected_report_at_utc,
             )
         )
@@ -171,6 +173,34 @@ def test_the_hold_comes_from_the_caller_so_a_shorter_setting_releases_sooner(
         overview.line_usage(now_utc=NOW, hold=timedelta(minutes=45), origins=[(HOME, 5)])[0].holding
         == 0
     )
+
+
+def test_the_page_holds_a_far_away_line_past_the_flat_constant(
+    overview: OverviewRepository, session_factory: sessionmaker[Session], run_id: UUID
+) -> None:
+    """⚠️ **首页那一侧不许自己判，跟着 `_still_holding_a_line` 一起走。**
+
+    实机 2026-08-19：从 9:250:8 打跨银河 bot，真实往返 124.2 分钟，而 `hold`
+    是 90 分钟——第 90 到第 124 分钟之间，首页与调度器都以为有一条空闲航线。
+    用户看到的「星球 2 在等航线」就是这么来的。
+
+    这一发的 `line_hold_until_utc` 按距离算到 NOW 之后，所以哪怕 `hold` 早就
+    过了，页面上它**照样占着**，而且仍然记在「时长未知」那一格里（它的
+    `line_free_at_utc` 依旧是 NULL——那是观测，兜底不许冒充它）。
+    """
+    _dispatch(
+        session_factory,
+        run_id,
+        origin=SECOND,
+        dispatched_at_utc=NOW - timedelta(minutes=100),
+        line_hold_until_utc=NOW + timedelta(minutes=25),
+    )
+
+    usage = overview.line_usage(now_utc=NOW, hold=HOLD, origins=[(SECOND, 5)])[0]
+
+    assert usage.holding == 1
+    assert usage.unknown_duration == 1
+    assert usage.next_free_at_utc is None
 
 
 def test_a_manually_released_line_is_free_even_when_the_clock_says_otherwise(

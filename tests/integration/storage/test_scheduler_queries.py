@@ -7,9 +7,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from math import sqrt
 from uuid import uuid4
 
+import pytest
+
 from evo_helper.domain.fleet_preset import PROBE_PRESET_NAME
+from evo_helper.domain.flight_estimate import FlightSource
+from evo_helper.domain.flight_time import LAUNCH_OVERHEAD_SECONDS, distance_units
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -451,6 +456,107 @@ def test_a_dispatch_with_no_flight_time_lets_go_after_the_hold_expires(repositor
     assert repository.count_inflight(now_utc=now, origin=HOME) == 0
 
 
+def test_a_far_away_dispatch_with_no_flight_time_holds_past_the_flat_constant(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    """⚠️ **兜底占用要按距离算，不能是一个与目标无关的常数。**
+
+    实机 2026-08-19，从 9:250:8 打三个跨银河 bot，单程 3726 秒、往返 124.2 分钟，
+    而 `UNKNOWN_LINE_HOLD` 是 90 分钟：
+
+        派出后第 90 分钟  →  航线被判为空出来了
+        实际第 124 分钟   →  舰队才回港
+        中间那 34 分钟    →  调度器与首页都以为有空闲航线，而实际没有
+
+    用户看到的「星球 2 在等航线」就是这么来的。这里那一发从 2 号星打去 2 银河，
+    公式算出来的保守往返接近 4 小时，所以过了 90 分钟它必须**照样占着**。
+    把 `_still_holding_a_line` 里那一支去掉、或把 `record_flight_time` 里那句
+    `line_hold_until_utc` 删掉，这条就红。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=27,
+        dispatched_at=now - UNKNOWN_LINE_HOLD - timedelta(minutes=1),
+        origin=SECOND,
+    )
+    repository.record_flight_time(dispatch_id, None, now - UNKNOWN_LINE_HOLD - timedelta(minutes=1))
+
+    assert repository.count_inflight(now_utc=now, origin=SECOND) == 1
+
+
+def test_the_distance_fallback_still_lets_go_once_the_round_trip_is_over(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    """按距离兜底也要封顶——它是一段时长，不是一张永久占位券。
+
+    没有这一条，「一律返回还占着」也能让上面那条变绿。
+    """
+    now = datetime.now(UTC)
+    long_ago = now - timedelta(hours=6)
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=127,
+        dispatched_at=long_ago,
+        origin=SECOND,
+    )
+    repository.record_flight_time(dispatch_id, None, long_ago)
+
+    assert repository.count_inflight(now_utc=now, origin=SECOND) == 0
+
+
+def test_a_hold_the_user_configured_still_wins_when_it_is_the_longer_one(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    """⚠️ **用户填了 `unknown_line_hold_minutes` 就得听用户的。**
+
+    按距离算出来的兜底与这个旋钮**取大**，不是取代它。同一个恒星系内那一档
+    公式弃权（`line_hold_round_trip` 返回 None），那时这条航线完全由旋钮说了算——
+    把 `hold` 那一支从判据里删掉，这条就红。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=28,
+        dispatched_at=now - timedelta(hours=3),
+    )
+    repository.record_flight_time(dispatch_id, None, now - timedelta(hours=3))
+
+    assert repository.count_inflight(now_utc=now, origin=HOME) == 0
+    assert repository.count_inflight(now_utc=now, origin=HOME, hold=timedelta(hours=4)) == 1
+
+
+def test_the_distance_fallback_does_not_pretend_the_flight_time_was_read(  # type: ignore[no-untyped-def]
+    repository, run_id
+) -> None:
+    """⚠️ **算出来的数不许长得像量出来的。**
+
+    兜底只写 `line_hold_until_utc` 一列。写进 `flight_seconds` 会污染
+    `domain.report_wait.vet_flight_time` 那道下限的标定样本池；写进
+    `line_free_at_utc` 会让首页那格「时长未知」凭空归零（它正是靠这一列为 NULL
+    数出来的），也会让 `next_line_free_at` 拿一个估算值去当返航闹钟。
+    """
+    now = datetime.now(UTC)
+    dispatch_id = _dispatch(
+        repository, run_id, TARGET_KIND_BOT, position=29, dispatched_at=now, origin=SECOND
+    )
+    repository.record_flight_time(dispatch_id, None, now)
+
+    row = _dispatch_row(repository, dispatch_id)
+    assert row.flight_seconds is None
+    assert row.expected_report_at_utc is None
+    assert row.line_free_at_utc is None
+    assert row.flight_source is None
+    assert row.line_hold_until_utc is not None
+    assert repository.next_line_free_at(now_utc=now, origin=SECOND) is None
+
+
 def test_the_next_free_line_ignores_dispatches_with_no_flight_time(repository, run_id) -> None:  # type: ignore[no-untyped-def]
     """航线钟为 NULL 的那些不给「下一条航线什么时候空」当闹钟。
 
@@ -730,6 +836,179 @@ def _pending(repository, target_kind: str, now: datetime, origin: Coordinate = H
     )
 
 
+# -- 距离公式的系数：按出发星球从历史实测里学 --------------------------------
+#
+# 用户口径（2026-08-19）：「每个球的速度都会有点不一样的」。判据本身在
+# `domain.flight_estimate.fit_seconds_per_root_unit`，这里守的是「取样这一步
+# 有没有把对的行捞出来」。
+
+
+#: 跨银河的目标：距离公式唯一站得住的那一档（同银河那两档一律弃权）。
+FAR_GALAXY = Coordinate(5, 279, 14)
+
+#: 生产库回测（2026-08-19，跨银河那一档）反解出来的两颗星球各自的系数。
+HOME_K = 26.5165
+SECOND_K = 26.3327
+
+
+def _flew(origin: Coordinate, k: float, target: Coordinate = FAR_GALAXY) -> timedelta:
+    """一发正好落在 `单程秒 = 2 + k·√D` 上的实测。"""
+    return timedelta(seconds=LAUNCH_OVERHEAD_SECONDS + k * sqrt(distance_units(target, origin)))
+
+
+def _flew_and_recorded(  # type: ignore[no-untyped-def]
+    repository,
+    run_id,
+    *,
+    position: int,
+    origin: Coordinate,
+    k: float,
+    at: datetime,
+    fleet_speed: str | None = None,
+) -> None:
+    dispatch_id = _dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        position=position,
+        dispatched_at=at,
+        origin=origin,
+        target=FAR_GALAXY,
+    )
+    repository.record_flight_time(dispatch_id, _flew(origin, k), at, fleet_speed=fleet_speed)
+
+
+def test_the_coefficient_is_learned_from_this_planets_own_history(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **系数按出发星球各学一个，不许全局共用。**
+
+    用户口径（2026-08-19）：**「每个球的速度都会有点不一样的」**。生产库回测
+    （跨银河那一档）：4:277:15 的 k 是 26.5165，9:250:8 是 26.3327。
+
+    这里给两颗星球各种三发**互相矛盾**的样本，然后分别问它们要系数：拿错星球的
+    样本混进来，学出来的就不是这一颗的 k 了。
+    """
+    now = datetime.now(UTC)
+    for index, (origin, k) in enumerate(
+        [(HOME, HOME_K)] * 3 + [(SECOND, SECOND_K)] * 3  # noqa: RUF005
+    ):
+        _flew_and_recorded(
+            repository,
+            run_id,
+            position=200 + index,
+            origin=origin,
+            k=k,
+            at=now - timedelta(minutes=index),
+        )
+
+    home = repository.flight_coefficient(
+        origin=HOME, mission_kind=MISSION_KIND_ATTACK, fleet_speed="14.520"
+    )
+    second = repository.flight_coefficient(
+        origin=SECOND, mission_kind=MISSION_KIND_ATTACK, fleet_speed="14.520"
+    )
+
+    assert home is not None and second is not None
+    assert (home.samples, second.samples) == (3, 3)
+    # `flight_seconds` 是整数列，实测秒数落库时会截掉小数——所以这里给 0.01 的
+    # 容差，而不是逐位相等。两颗星球的 k 差着 0.18，远大于这个容差。
+    assert home.seconds_per_root_unit == pytest.approx(HOME_K, abs=0.01)
+    assert second.seconds_per_root_unit == pytest.approx(SECOND_K, abs=0.01)
+
+
+def test_a_planet_with_too_little_history_has_no_coefficient(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """样本不够就答不上来，**不许拿全局那个常数顶上**。"""
+    now = datetime.now(UTC)
+    _flew_and_recorded(repository, run_id, position=210, origin=SECOND, k=SECOND_K, at=now)
+
+    assert (
+        repository.flight_coefficient(
+            origin=SECOND, mission_kind=MISSION_KIND_ATTACK, fleet_speed="14.520"
+        )
+        is None
+    )
+
+
+def test_a_computed_flight_time_never_becomes_a_sample(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **公式自己的输出不许回头去标定公式自己。**
+
+    来源是 `distance_model` 的那些 `flight_seconds` 本来就写 NULL
+    （`record_flight_time`），而这个查询只取有观测值的行——两条判据合起来，
+    这条闭环就断在源头。把那个三元改成无条件写值，这条就红。
+    """
+    now = datetime.now(UTC)
+    for index in range(4):
+        at = now - timedelta(minutes=index)
+        dispatch_id = _dispatch(
+            repository,
+            run_id,
+            TARGET_KIND_BOT,
+            position=220 + index,
+            dispatched_at=at,
+            origin=SECOND,
+            target=FAR_GALAXY,
+        )
+        repository.record_flight_time(
+            dispatch_id, _flew(SECOND, SECOND_K), at, source=FlightSource.DISTANCE_MODEL
+        )
+
+    assert (
+        repository.flight_coefficient(
+            origin=SECOND, mission_kind=MISSION_KIND_ATTACK, fleet_speed="14.520"
+        )
+        is None
+    )
+
+
+def test_the_fleet_speed_is_recorded_even_when_the_flight_time_was_not(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **速度无论有没有读到飞行时长都要记。**
+
+    它是下一次学系数时的作废信号，与这一发自己读没读出来毫无关系。空串按
+    没读到算——`_read` 读不出时给的就是空串，而 NULL 的语义是「不知道」。
+    """
+    now = datetime.now(UTC)
+    unreadable = _dispatch(
+        repository, run_id, TARGET_KIND_BOT, position=230, dispatched_at=now, origin=SECOND
+    )
+    blank = _dispatch(
+        repository, run_id, TARGET_KIND_BOT, position=231, dispatched_at=now, origin=SECOND
+    )
+    repository.record_flight_time(unreadable, None, now, fleet_speed="14.720")
+    repository.record_flight_time(blank, None, now, fleet_speed="  ")
+
+    assert _dispatch_row(repository, unreadable).fleet_speed_raw == "14.720"
+    assert _dispatch_row(repository, blank).fleet_speed_raw is None
+
+
+def test_samples_flown_at_another_speed_are_dropped(repository, run_id) -> None:  # type: ignore[no-untyped-def]
+    """速度一变，之前学到的东西立刻作废。
+
+    这里三发记着旧速度、三发记着新速度，问的是新速度：旧的那三发一发都不许算。
+    没有这一条，换一次编组之后那颗星球会拿着一个偏差 26% 的系数继续裁读数
+    （2026-08-17 那天正是如此）。
+    """
+    now = datetime.now(UTC)
+    for index, (speed, k) in enumerate(
+        [("11.480", 33.5400)] * 3 + [("14.520", HOME_K)] * 3  # noqa: RUF005
+    ):
+        _flew_and_recorded(
+            repository,
+            run_id,
+            position=240 + index,
+            origin=HOME,
+            k=k,
+            at=now - timedelta(minutes=index),
+            fleet_speed=speed,
+        )
+
+    learned = repository.flight_coefficient(
+        origin=HOME, mission_kind=MISSION_KIND_ATTACK, fleet_speed="14.520"
+    )
+
+    assert learned is not None
+    assert learned.samples == 3
+    assert learned.seconds_per_root_unit == pytest.approx(HOME_K, abs=0.01)
+
+
 def _dispatch(  # type: ignore[no-untyped-def]
     repository,
     run_id,
@@ -741,8 +1020,14 @@ def _dispatch(  # type: ignore[no-untyped-def]
     preset_name: str = "AAA",
     mission_kind: str = MISSION_KIND_ATTACK,
     origin: Coordinate = HOME,
+    target: Coordinate | None = None,
 ):
-    """一条意图 + 一条派遣。返回派遣 id，好让调用方补写飞行时间。"""
+    """一条意图 + 一条派遣。返回派遣 id，好让调用方补写飞行时间。
+
+    `target` 不传就落在主星那个恒星系里（`2:137:position`）——航线记账那些
+    用例只关心「占没占」，目标是谁无所谓。学系数那几条要跨银河的目标，
+    所以能显式指定。
+    """
     intent_id = uuid4()
     dispatch_id = uuid4()
     repository.save_attack_intent(
@@ -750,7 +1035,7 @@ def _dispatch(  # type: ignore[no-untyped-def]
             intent_id=intent_id,
             run_id=run_id,
             origin=origin,
-            target=Coordinate(2, 137, position),
+            target=target or Coordinate(2, 137, position),
             preset=FleetPresetRef(name=preset_name, signature="sig"),
             cycle_start_utc=dispatched_at,
             created_at_utc=dispatched_at,
