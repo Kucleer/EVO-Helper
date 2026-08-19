@@ -132,6 +132,21 @@
     进度来源——「点了没反应」正是这一块要防的。
   #}
   <pre id="backfill-log" class="log-tail" hidden aria-label="补录日志的最后几十行"></pre>
+  {#
+    完整日志的路径。**这个节点不能省。**
+
+    ⚠️ 2026-08-16 那次「面板紧凑化」把它连同外面那段说明文字一起删了，却把脚本里
+    那句 `getElementById('backfill-log-path').textContent = ...` 留在原地——从用户
+    点下「开始补录」的那一刻起（有了路径，那句就不再被跳过），每一次渲染都抛
+    `TypeError: Cannot set properties of null`，页面上一片红。整段见脚本里
+    `setText()` 上面那段。
+
+    只在真有路径时才出现，所以紧凑化的本意（闲着时不占地方）仍然成立。
+    尾巴只有 40 行，翻更早的只能靠这条路径。
+  #}
+  <p class="muted" style="margin:6px 0 0;font-size:11px" id="backfill-log-path-line" hidden>
+    完整日志：<span class="coord" id="backfill-log-path"></span>
+  </p>
 </section>
 {% endif %}
 </div>
@@ -1158,11 +1173,40 @@
   // （谁先谁后、什么时候能起任务）全在服务端。页面上抄一份就会出现「页面说在
   // 等任务、调度器其实已经在补录」。
 
-  const backfillBox = document.getElementById('backfill-phase');
   const backfillError = document.getElementById('backfill-error');
 
-  function showBackfillError(message) {
+  //
+  // ⚠️ **这一段的每一次 DOM 写入都必须是「写得进就写，写不进就算了」。**
+  //
+  // 2026-08-19 那次事故的全过程：面板紧凑化删掉了 `backfill-log-path` 那个节点，
+  // 而 `renderBackfill` 仍然无条件去拿它。用户点下「开始补录」的那一刻状态里
+  // 就有了 `log_path`，于是**此后每一次渲染**都在 `null` 上写 `textContent`：
+  // 面板上一片红，用户以为补录坏了，自己把它取消掉——一次正在正常翻信箱的补录
+  // 就这么没了。
+  //
+  // 补录本身完全不看 DOM（判据全在服务端），所以少一个展示节点最多是少显示
+  // 一行字，绝不该有能力打断一次数据补录。`setText` / `setHidden` 就是这条
+  // 不变量的落地：缺节点时静静跳过，渲染函数因此**不会抛**，后面的 `refresh()`
+  // 照常走完。
+  //
+  function setText(id, value) {
+    const node = document.getElementById(id);
+    if (node) node.textContent = value;
+    return node;
+  }
+
+  function setHidden(id, hidden) {
+    const node = document.getElementById(id);
+    if (node) node.hidden = hidden;
+    return node;
+  }
+
+  function showBackfillError(error) {
     if (!backfillError) return;
+    // `.catch(showBackfillError)` 会把 Error 对象原样递进来，直接写进 textContent
+    // 就成了「TypeError: ...」这种给不了用户任何行动的字面量。后端那句中文说明
+    // 在 `detail` 里，优先用它。
+    const message = !error ? '' : (error.detail || error.message || String(error));
     backfillError.textContent = message;
     backfillError.hidden = !message;
   }
@@ -1170,41 +1214,46 @@
   function renderBackfill(state) {
     latestBackfill = state;
     const tone = BACKFILL_TONES[state.phase] || '';
-    backfillBox.className = `chip ${tone}`.trim();
-    backfillBox.querySelector('.glyph').textContent = BACKFILL_GLYPHS[state.phase] || '·';
+    const box = document.getElementById('backfill-phase');
+    if (box) {
+      box.className = `chip ${tone}`.trim();
+      const glyph = box.querySelector('.glyph');
+      if (glyph) glyph.textContent = BACKFILL_GLYPHS[state.phase] || '·';
+    }
     // 链路与起始日期跟在状态后面：「补录完成」不说补的是哪条链路，就是一个
     // 没有主语的对勾。
     const scope = state.label ? `${state.label} · 起自 ${state.since} · ${state.reason}` : '';
-    document.getElementById('backfill-word').textContent =
-      scope ? `${state.phase}（${scope}）` : state.phase;
-    document.getElementById('backfill-detail').textContent = state.detail || '';
+    setText('backfill-word', scope ? `${state.phase}（${scope}）` : state.phase);
+    setText('backfill-detail', state.detail || '');
 
     // 排着或跑着时不给再排一趟：一个游戏窗口，一只鼠标。后端也会 409，
     // 但用户不该点下去才发现。
     const busy = state.blocking && !state.awaiting_ack;
-    document.getElementById('btn-backfill').disabled = busy;
-    document.getElementById('btn-backfill-cancel').hidden = !busy;
-    document.getElementById('btn-backfill-resume').hidden = !state.awaiting_ack;
+    const startButton = document.getElementById('btn-backfill');
+    if (startButton) startButton.disabled = busy;
+    setHidden('btn-backfill-cancel', !busy);
+    setHidden('btn-backfill-resume', !state.awaiting_ack);
 
     const summary = state.summary;
-    const summaryBox = document.getElementById('backfill-summary');
-    summaryBox.hidden = !summary;
+    setHidden('backfill-summary', !summary);
     if (summary) {
-      document.getElementById('backfill-reports').textContent = summary.reports_ingested;
-      document.getElementById('backfill-claimed').textContent = summary.dispatches_claimed;
-      document.getElementById('backfill-settled').textContent = summary.bot_targets_settled;
+      setText('backfill-reports', summary.reports_ingested);
+      setText('backfill-claimed', summary.dispatches_claimed);
+      setText('backfill-settled', summary.bot_targets_settled);
       // 「量了 0 个」和「一个都没变」不是一回事：没有参与调度的 bot 任务时，
       // 那个 0 的意思是没量，写成「0 个不用再打」是一句假话。
-      document.getElementById('backfill-measured').textContent =
+      setText(
+        'backfill-measured',
         summary.bot_targets_measured
           ? `／ 共 ${summary.bot_targets_measured} 个`
-          : '（没有参与调度的 bot 任务，这一项没量）';
+          : '（没有参与调度的 bot 任务，这一项没量）',
+      );
     }
 
-    const log = document.getElementById('backfill-log');
-    log.hidden = !state.log_tail;
-    log.textContent = state.log_tail || '';
-    if (state.log_path) document.getElementById('backfill-log-path').textContent = state.log_path;
+    setHidden('backfill-log', !state.log_tail);
+    setText('backfill-log', state.log_tail || '');
+    setHidden('backfill-log-path-line', !state.log_path);
+    setText('backfill-log-path', state.log_path || '');
   }
 
   function refreshBackfill() {
@@ -1217,7 +1266,7 @@
     return EVOHelper.post(endpoint)
       .then(renderBackfill)
       .then(refresh)
-      .catch((error) => showBackfillError(error.detail || error.message));
+      .catch(showBackfillError);
   }
 
   function patch(taskId, payload) {
@@ -1299,7 +1348,7 @@
       return EVOHelper.post('/api/backfill', payload)
         .then(renderBackfill)
         .then(refresh)
-        .catch((error) => showBackfillError(error.detail || error.message));
+        .catch(showBackfillError);
     };
     document.getElementById('btn-backfill-cancel').onclick =
       () => backfillCommand('/api/backfill/cancel');

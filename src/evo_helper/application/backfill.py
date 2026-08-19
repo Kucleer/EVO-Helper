@@ -77,7 +77,14 @@ from typing import Protocol
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.application.mission_supervisor import LOG_DIR, TERMINATE_TIMEOUT_S, Process
+from evo_helper.application.mission_supervisor import (
+    LOG_DIR,
+    LOG_ENCODING,
+    TERMINATE_TIMEOUT_S,
+    Process,
+    child_log_environment,
+    decode_log_text,
+)
 from evo_helper.storage import models as orm
 
 #: 能补录的两条链路。取值就是 CLI 的 `--kind`，页面上那个下拉框也用同一批词——
@@ -385,13 +392,18 @@ def launch_backfill(command: Sequence[str], log_path: Path) -> Process:
 
     照 `mission_supervisor.launch_mission` 长：`stderr` 并进 `stdout`，
     两条流分开写同一个文件会互相截断，而这份日志是出事之后唯一能看的东西。
+
+    `env` 同样照它长，而且**这条链路上它最要紧**：页面上那份日志尾巴是补录跑
+    十几分钟里唯一的进度来源，少了它整片都是问号。整段理由在
+    `mission_supervisor.child_log_environment`。
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = log_path.open("a", encoding="utf-8")
+    handle = log_path.open("a", encoding=LOG_ENCODING)
     return subprocess.Popen(  # noqa: S603 - 命令行全由 `build_command` 构造
         list(command),
         stdout=handle,
         stderr=subprocess.STDOUT,
+        env=child_log_environment(),
     )
 
 
@@ -454,15 +466,20 @@ class BackfillCoordinator:
 
         补录跑十几分钟，页面上除了这个没有别的进度来源，所以**读不到不能报错**
         ——一次读文件失败把整个状态接口打成 500，页面连「在跑」都显示不出来了。
+
+        ⚠️ **读字节、交给 `decode_log_text` 解，不要在这里写死一个 `encoding`。**
+        原先这里是 `read_text(encoding="utf-8", errors="replace")`，而子进程当时
+        按机器的 ANSI 代码页（GBK）在写——中文整片变问号，一个错都不报。
+        修复之后同一个文件里前后两种编码都有，只有逐行判才能都读对。
         """
         path = self.state().log_path
         if path is None:
             return ""
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
         except OSError:
             return ""
-        return "\n".join(text.splitlines()[-lines:])
+        return "\n".join(decode_log_text(raw).splitlines()[-lines:])
 
     # -- 写 --------------------------------------------------------------------
 
