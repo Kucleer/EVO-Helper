@@ -245,18 +245,28 @@
               <span class="glyph" aria-hidden="true">{{ dispatch_glyphs.get(state, '•') }}</span>{{ dispatch_labels.get(state, state) }}{% if state == 'BLOCKED' %} · {{ entry.guard_status }}{% endif %}</span>
           </td>
           {#
-            限宽 + hover 展开，和系统日志页「正文」那一列同一套类
-            （`.log-body` / `.log-line`，见 console.css）。
+            限宽（`.log-body`，和系统日志页「正文」那一列同一个类）+ **浮层展开**
+            （`.outcome-*`，这一列自己一套，见 console.css）。
 
             这一格要铺开战损加**12 项**资源（金属/晶体/气体/暗能量、银河素/
             合金碎片/晶体碎片/能量凝胶、泰坦立方/收割者碎片/银河石碎片/
             银河石能量），一行摊开量到 945px，把整张表顶到 1933px 宽——
             用户 2026-08-18 报的横向滚动条就是它。
 
+            ⚠️ **展开走浮层，不许把行撑高。** 用户口径 2026-08-19：「这里的效果
+            我希望是像 tips 那种 hover 效果，而不是这种增加列高的」。此前这一格
+            用的是 `.log-line` + `tr:hover` 换行展开，一行能被撑到十几行高、
+            半个屏幕，整张表跟着跳。现在收起态固定「chip 一行 + 摘要一行」，
+            全文放在一块绝对定位的浮层里——**浮层不占版面，所以每一行等高**。
+
+            ⚠️ **`.log-line` 没跟着改，它还留给系统日志页。** 那一页的「正文」列
+            里是 `payload_json` 加一张 base64 缩略图，缩略图本来就靠 hover 放大；
+            塞进浮层反而把最该看的那张图变小了。症状看着一样，要的东西不一样。
+
             ⚠️ **只折叠，不删。** 截断纯粹发生在 CSS 里，HTML 里那 12 项一个不少：
             用户查故障时最需要的就是这些数字，鼠标停在这一行就全都在。
           #}
-          <td class="log-body">
+          <td class="log-body log-outcome">
             {# 海盗战报只记胜负与战损总数，所以这一格就是战果的全部。 #}
             {#
               ⚠️ **侦察发先分流出去。** 侦察不产生战报（它产出的是侦察报告，走
@@ -284,10 +294,6 @@
                  认不出来的取值照样原样显示，只是没有色也没有字形。 #}
               <span class="chip {{ result_tones.get(entry.outcome, '') }}">
                 <span class="glyph" aria-hidden="true">{{ result_glyphs.get(entry.outcome, '') }}</span>{{ result_labels.get(entry.outcome, entry.outcome) }}</span>
-              <div class="log-line muted" style="font-size:11px">
-                战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }}
-                · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}
-              </div>
             {% endif %}
             {#
               战报截图。读战报那一刻截的整块面板（双方名称、两侧坐标、战斗详情），
@@ -320,18 +326,61 @@
               没有条目就什么都不显示：库里只存非零的格子，「没有行」就是
               「这一发没捞着东西」，为它专门摆一句话只会挤占真正有收获的那几行。
             #}
-            {% if entry.resources %}
-              <div class="log-line muted" style="font-size:11px">
-                收获
-                {%- for item in entry.resources %}
-                  <span title="{{ resource_precision_hint(item) }}">{{ resource_label(item.slot) }} {{ resource_amount_text(item) }}</span>{% if not loop.last %} · {% endif %}
-                {%- endfor %}
-              </div>
-            {% endif %}
-            {% if entry.report_screenshot %}
-              <div style="font-size:11px">
-                <a href="/api/reports/{{ entry.report_id }}/screenshot" target="_blank" rel="noopener">查看战报截图</a>
-              </div>
+            {#
+              收起态那一行摘要，以及展开之后的浮层。
+
+              ⚠️ **战损只在有战果的行上出现。** 侦察发（上面已分流）和还没战报的
+              行都读不到这两个数，摆一行「战损 我 — · 敌 —」等于给一个不会来的
+              东西留位置。
+            #}
+            {% set show_losses = entry.mission_kind != 'SCOUT' and entry.outcome is not none %}
+            {#
+              ⚠️ **有东西可展开才做成触发元素。** 既没收获也没截图时，摘要就是
+              一行普通文字，不挂 `tabindex`、不挂浮层——摆一个点上去什么都没有的
+              「ⓘ」，比没有它更难判断「到底是没捞着还是没记」（同「目标军力」那一
+              格里角标的理由）。
+            #}
+            {% set has_detail = entry.resources or entry.report_screenshot %}
+            {% set losses_text %}战损 我 {{ entry.attacker_losses if entry.attacker_losses is not none else '—' }} · 敌 {{ entry.defender_losses if entry.defender_losses is not none else '—' }}{% endset %}
+            {% set peek_text %}
+              {%- if show_losses %}{{ losses_text }}{% endif -%}
+              {%- if entry.resources %}{% if show_losses %} · {% endif %}收获 {{ entry.resources | length }} 项{% endif -%}
+              {%- if entry.report_screenshot %}{% if show_losses or entry.resources %} · {% endif %}有战报截图{% endif -%}
+            {% endset %}
+            {% if has_detail %}
+              {#
+                ⚠️ **浮层必须是触发元素的后代。** 面板里有「查看战报截图」这个
+                链接；浮层若挂在触发元素之外（哪怕只是它的兄弟），鼠标从摘要走向
+                面板的路上 `:hover` 就断了，面板消失，那个链接**永远点不着**。
+                CSS 那边靠 `.outcome-detail:hover > .outcome-pop` 与
+                `:focus-within` 两条一起把它撑住，两条都要求这层嵌套关系。
+
+                ⚠️ **`tabindex="0"`，照 `.tips` 那套（`missions.html` 里那几个 ⓘ）。**
+                只能 hover 拿到的信息，键盘用户拿不到；`:focus-within` 在焦点落到
+                这个 span 上时就成立，于是面板先露出来，下一次 Tab 才能走进里面
+                那个链接。少了这个属性，整块内容对键盘就是不存在的。
+              #}
+              <span class="outcome-detail" tabindex="0">
+                <span class="outcome-peek">{{ peek_text }}<span class="outcome-more" aria-hidden="true">ⓘ</span></span>
+                <span class="outcome-pop">
+                  {% if show_losses %}<span class="outcome-pop-line">{{ losses_text }}</span>{% endif %}
+                  {% if entry.resources %}
+                    <span class="outcome-pop-title">收获</span>
+                    <span class="outcome-haul">
+                      {%- for item in entry.resources %}
+                      <span class="outcome-haul-item" title="{{ resource_precision_hint(item) }}">{{ resource_label(item.slot) }} {{ resource_amount_text(item) }}</span>
+                      {%- endfor %}
+                    </span>
+                  {% endif %}
+                  {% if entry.report_screenshot %}
+                    <span class="outcome-pop-line">
+                      <a href="/api/reports/{{ entry.report_id }}/screenshot" target="_blank" rel="noopener">查看战报截图</a>
+                    </span>
+                  {% endif %}
+                </span>
+              </span>
+            {% elif show_losses %}
+              <span class="outcome-peek muted">{{ peek_text }}</span>
             {% endif %}
           </td>
           {# 预计战报按现实时间显示：这一格的用途是「我几点回来收战报」，而人是按墙上时钟等的。 #}
@@ -344,5 +393,40 @@
     </table>
   </div>
 </section>
+
+{#
+  「战果」浮层的开口方向。
+
+  **展开本身是纯 CSS 的**（`.outcome-detail:hover` / `:focus-within`），这一段
+  只多做一件事：下面放不下时把面板翻上去。表格装在 `.table-wrap` 里，那是个
+  `overflow: auto` 的滚动容器——浮层再怎么绝对定位也会被它裁掉，而被裁掉一半的
+  面板比不展开更糟。脚本挂了也只是回到「一律向下开」，展开与链接照常。
+
+  ⚠️ **走事件委托，而且这段 `<script>` 必须待在 `#log-entries` 外面。**
+  那一块每 15 秒被自动刷新整个换掉（`innerHTML`，见 `base.html`）：绑在行上的
+  监听会一起没，而 `innerHTML` 塞进来的 `<script>` 浏览器根本不执行。
+#}
+<script>
+(() => {
+  function place(event) {
+    const node = event.target;
+    if (!node || typeof node.closest !== 'function') return;
+    // 已经展开、鼠标正走进面板里：**不许重算**。这时候翻个面等于把面板从
+    // 鼠标底下抽走，`:hover` 当场断掉，里面那个链接就点不着了。
+    if (node.closest('.outcome-pop')) return;
+    const detail = node.closest('.outcome-detail');
+    if (!detail) return;
+    const pop = detail.querySelector('.outcome-pop');
+    if (!pop) return;
+    const wrap = detail.closest('.table-wrap');
+    const limit = wrap ? wrap.getBoundingClientRect().bottom : window.innerHeight;
+    // 收起态用的是 `visibility` 而不是 `display: none`，所以这时候也量得出高度。
+    detail.dataset.drop =
+      detail.getBoundingClientRect().bottom + pop.offsetHeight > limit ? 'up' : 'down';
+  }
+  document.addEventListener('mouseover', place);
+  document.addEventListener('focusin', place);
+})();
+</script>
 
 {% endblock %}
