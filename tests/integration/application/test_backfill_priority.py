@@ -545,3 +545,133 @@ def test_a_repository_backed_scheduler_still_reports_no_backfill(  # type: ignor
     assert plain.backfill_state().phase is BackfillPhase.IDLE
     assert plain.backfill_state().blocking is False
     assert task_id(repository, MissionKind.SCAN) is not None
+
+
+# -- 痕迹 ----------------------------------------------------------------------
+#
+# ⚠️ **这一段是踩出来的**（2026-08-19）。那天一趟正在跑的手动补录变成了「已取消」，
+# 事后翻生产库想知道是谁把它取消的——`system_log` 里关于补录一条都没有，
+# 16:00–16:20 那二十分钟里只有排行榜扫描在说话。补录会独占游戏窗口十几分钟、
+# 会拦下所有任务、还有三个按钮能改它的态，却整条链路一行日志都不留，于是
+# 「它为什么停了」这个问题只能靠猜。判据是 CLAUDE.md 那条：**出事时能不能只靠
+# 库里的日志定位。**
+
+
+class RecordingLog:
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, str, dict[str, object]]] = []
+
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
+        self.entries.append((level, message, dict(payload or {})))
+
+    @property
+    def backfill(self) -> list[tuple[str, str, dict[str, object]]]:
+        return [item for item in self.entries if item[1].startswith("战报补录")]
+
+
+@pytest.fixture
+def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
+    log = RecordingLog()
+    monkeypatch.setattr(
+        "evo_helper.application.mission_scheduler.record_system_log", log, raising=True
+    )
+    return log
+
+
+def test_a_cancel_says_which_button_did_it(scheduler, repository, recorded):  # type: ignore[no-untyped-def]
+    """三个入口都能取消（「取消补录」、「强制结束」、控制台关闭），三条口径不一样。
+
+    混作一条日志就白记了——2026-08-19 事后要回答的正是「是人点的，还是控制台
+    自己收的」。
+    """
+    enable(repository, MissionKind.SCAN)
+    ask(scheduler)
+    scheduler.start()
+    recorded.entries.clear()
+
+    scheduler.cancel_backfill()
+
+    assert len(recorded.backfill) == 1
+    _level, message, payload = recorded.backfill[0]
+    assert payload["trigger"] == "用户点了「取消补录」"
+    assert payload["phase_to"] == "CANCELLED"
+    assert BackfillPhase.CANCELLED.value in message
+
+
+def test_force_kill_is_told_apart_from_the_cancel_button(scheduler, repository, recorded):  # type: ignore[no-untyped-def]
+    """红条上那一下的口径是「全停」，和补录自己那个「取消」不是同一件事。"""
+    enable(repository, MissionKind.SCAN)
+    ask(scheduler)
+    scheduler.start()
+    recorded.entries.clear()
+
+    scheduler.force_kill()
+
+    assert [payload["trigger"] for _, _, payload in recorded.backfill] == [
+        "用户点了红条上的「强制结束」"
+    ]
+
+
+def test_the_whole_life_of_a_backfill_leaves_a_trail(  # type: ignore[no-untyped-def]
+    scheduler, repository, backfill_launcher, recorded
+):
+    """排上 → 起进程 → 自己退 → 用户放行，四段各留一条，次序就是发生的次序。"""
+    enable(repository, MissionKind.SCAN)
+    ask(scheduler)
+    scheduler.start()
+    scheduler.tick()
+    backfill_launcher.spawned[0].exit_code = 0
+    scheduler.tick()
+    scheduler.acknowledge_backfill()
+
+    assert [payload["phase_to"] for _, _, payload in recorded.backfill] == [
+        "PENDING",
+        "RUNNING",
+        "DONE",
+        "DONE",
+    ]
+    # 最后那一条 phase 没动，动的是「放行了没有」——而那正是任务起不起得来的开关。
+    assert recorded.backfill[-1][2]["acknowledged"] is True
+    assert recorded.backfill[-1][2]["blocking"] is False
+
+
+def test_a_failed_backfill_is_a_warning_and_carries_the_evidence(  # type: ignore[no-untyped-def]
+    scheduler, repository, backfill_launcher, recorded
+):
+    """补录失败意味着数据仍然不全，而「拿不全的数据做决策」正是这整件事要防的。
+
+    所以它是 WARNING，而且退出码与日志路径都得在 payload 里——排障的人在另一台
+    机器上，本地那份 `var/logs` 他取不到。
+    """
+    enable(repository, MissionKind.SCAN)
+    ask(scheduler)
+    scheduler.start()
+    scheduler.tick()
+    backfill_launcher.spawned[0].exit_code = 3
+    scheduler.tick()
+
+    level, _message, payload = recorded.backfill[-1]
+    assert level == "WARNING"
+    assert payload["exit_code"] == 3
+    assert payload["kind"] == "pirate"
+    assert str(payload["log_path"]).endswith("backfill-pirate.log")
+
+
+def test_a_quiet_tick_writes_nothing(  # type: ignore[no-untyped-def]
+    scheduler, repository, backfill_launcher, recorded
+):
+    """tick 每秒一次。态没变就一个字都不写——每 tick 刷一行的话一晚上几万行，
+    真正要看的那几条会被淹掉（`_log_schedule_window_changes` 是同一条判据）。
+    """
+    enable(repository, MissionKind.SCAN)
+    ask(scheduler)
+    scheduler.start()
+    scheduler.tick()
+    recorded.entries.clear()
+
+    for _ in range(5):
+        scheduler.tick()
+
+    assert recorded.backfill == []

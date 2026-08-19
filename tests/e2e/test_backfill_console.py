@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -201,3 +202,98 @@ def test_the_page_still_renders_without_a_console(tmp_path: Path) -> None:
     assert 'id="backfill-head"' not in html
     assert 'id="btn-backfill"' not in html
     assert "调度器" in html
+
+
+# -- 展示层报错 ≠ 业务中断 -------------------------------------------------------
+#
+# 2026-08-19 的事故：面板紧凑化（7924bd4）删掉了 `backfill-log-path` 那个节点，
+# 却把脚本里那句无条件的 `getElementById('backfill-log-path').textContent = ...`
+# 留在原地。用户点下「开始补录」的那一刻状态里就有了 `log_path`，于是**此后每一次
+# 渲染**都在 `null` 上写 `textContent`，面板上一片红：
+#
+#     TypeError: Cannot set properties of null (setting 'textContent')
+#
+# 补录本身完全不看 DOM，所以那条异常一发都没少补；但用户看到的是一块红着的面板，
+# 于是把一趟正在正常翻信箱的补录取消掉了。
+
+
+def _missions_script(html: str) -> str:
+    """**这一页自己**那段脚本。
+
+    `_page_body` 从第一个 `<script>` 起算，里面还裹着 `base.html` 那段共用脚本；
+    共用脚本服务的是所有页面，它去拿的节点本来就不该在这一页上都有（比如
+    「每 15 秒自动刷新」那个开关，攻击日志与系统日志两页才挂）。拿它一起判，
+    这条用例第一天就是红的。
+    """
+    return html[html.rindex("<script>") :]
+
+
+def _referenced_ids(script: str) -> set[str]:
+    """脚本要去页面上拿的每一个 id。
+
+    三种拿法都要认：直接 `getElementById('x')`、经 `setText`/`setHidden`，
+    以及 `for (const id of ['a', 'b'])` 那种循环——只认第一种的话，改用辅助函数
+    的那一天这条用例会静静地什么都不再守。
+    """
+    ids = set(re.findall(r"(?:getElementById|setText|setHidden)\(\s*'([A-Za-z0-9_-]+)'", script))
+    for block in re.findall(r"for \(const id of \[([^\]]+)\]\)", script):
+        ids |= set(re.findall(r"'([A-Za-z0-9_-]+)'", block))
+    return ids
+
+
+def test_every_element_the_script_reaches_for_actually_exists(client: TestClient) -> None:
+    """**这条用例就是钉那次事故的。**
+
+    脚本去拿一个页面上没有的节点，在 JS 里不是「拿到空值」而是 `null`——
+    往它身上写一个字就当场抛异常。删一个纯展示用的节点因此有能力把整块面板打红。
+    """
+    html = client.get("/missions").text
+    declared = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
+
+    missing = sorted(_referenced_ids(_missions_script(html)) - declared)
+
+    assert not missing, f"脚本要拿这些节点，页面上却没有：{missing}"
+
+
+def test_the_log_path_node_is_back(client: TestClient) -> None:
+    """日志尾巴只有 40 行，翻更早的只能靠这条路径——所以是把节点补回来，
+    不是把那句赋值删掉。
+    """
+    html = client.get("/missions").text
+
+    assert 'id="backfill-log-path"' in html
+    assert "log_path" in _page_body(html)
+
+
+def test_display_writes_go_through_the_forgiving_helper(client: TestClient) -> None:
+    """补录那一段里不许再出现「拿到就写」的裸赋值。
+
+    判据不是「这次补上了那个节点」——下一次紧凑化会删掉另一个。判据是**缺一个
+    展示节点最多少显示一行字**，而那要靠 `setText` / `setHidden` 里那句判空。
+
+    认的是「拿到就往上写」这个形状（`getElementById(...).随便什么`），
+    不是「出现过 textContent」——先落一个局部变量、判过空再写，正是要提倡的写法。
+    """
+    body = _missions_script(client.get("/missions").text)
+    start = body.index("function renderBackfill")
+    block = body[start : body.index("function refreshBackfill")]
+
+    chained = re.findall(r"getElementById\([^)]*\)\s*\.\s*[A-Za-z]", block)
+
+    assert not chained, f"renderBackfill 里还有「拿到就写」的裸赋值：{chained}"
+    assert "setText(" in block
+
+
+def test_reading_the_state_never_moves_it(client: TestClient) -> None:
+    """页面每 2 秒 `GET /api/backfill` 一次，渲染出错时也照旧在轮询。
+
+    **读状态不许改状态。** 这条守的是「展示层出什么事都不该动到那一趟补录」的
+    另一半：页面那一侧不发取消，服务端这一侧也不因为被反复问而改主意。
+    """
+    client.post("/api/backfill", json={"kind": "bot", "since": "2026-08-12"})
+    before = client.get("/api/backfill").json()
+
+    for _ in range(5):
+        assert client.get("/api/backfill").json()["phase"] == before["phase"]
+
+    assert before["phase"] != BackfillPhase.CANCELLED.value
