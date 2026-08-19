@@ -63,6 +63,24 @@ All notable changes to this project are documented in this file.
   colour alone. （原文还有一句 "`dry_run` is displayed as a lock with no toggle"；那个锁
   随 #35 一起消失，任务中心本身也被 #33 的常驻调度器取代。）
 
+- **AI 选靶一期（影子模式）**（#208）：把局面组成 prompt → 调 LLM → 拿到它选的
+  目标 → 存 `ai_target_decisions` → 诊断页对比。**绝不影响派遣**——调度照常用
+  `assign_by_capacity_and_value`，AI 的选择只是记录。观测挂
+  `_military_assignments` 算完之后、组命令行之前，fire-and-forget（后台线程，
+  同时 1 个、每任务 60 秒间隔），开关默认关、关掉零开销；失败静默降级，LLM 挂掉
+  调度照常（用例钉死「返回逐字不变」）。prompt 给航线预算（含「时长未知」标注）、
+  候选池（**全池 `candidates`，不是四步筛完的 `eligible`**）三维交叉表 + 分层样本
+  （抽样键是「最强/最新」不是得分公式，**按格子轮转填、两个键都不会被预算挤掉**）、
+  全池读数龄分布（中位/p90/最大/多少个没读数）、收益模型
+  `0.141 × 军力 × exp(−0.068×龄)`（n=74 R²=0.781）、游戏规则与证据强度——**五个
+  旋钮的值、单位数量、账号名一律不给**。输出严格 JSON，硬校验（picks 数=预算、
+  集合约束、无重复、预算不超）不过整份作废，软核对（军力精确相等、龄 ±0.1h、
+  往返 ±1 分钟、保护期 8h、距上次攻击 8h）只记录。凭据走环境变量
+  （`EVO_HELPER_API` / `EVO_HELPER_Model` / `EVO_HELPER_API_key`），`httpx` 进主
+  依赖——全仓第一个对外网络调用。五个旋钮在 `military_attack_config`
+  （`ai_shadow_enabled` 默认关 / `ai_model` / `ai_timeout_seconds` 30 /
+  `ai_sample_size` 120 / `ai_retention_days` 90），迁移 `61eb261c5a09` 建表加列。
+
 - **报告读取分阶段计时与统一日志**（#19）：`read_report` 按 `header` / `versus` /
   `fleet` / `rounds` 计时并挂在返回值上——只给总时长只能说明「慢」，分阶段才指得出该
   优化哪一次 OCR 调用；**失败时也记已耗时**，一次跑了三十秒才失败的读取正是这条日志要抓

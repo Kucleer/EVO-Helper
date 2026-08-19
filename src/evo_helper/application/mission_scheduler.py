@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from evo_helper.application.ai_targeting import AiShadowObserver
 from evo_helper.application.backfill import (
     BACKFILL_KINDS,
     REASON_STARTUP,
@@ -639,10 +640,15 @@ class MissionScheduler:
         watchdog: StallWatchdog | None = None,
         backfill: BackfillCoordinator | None = None,
         backfill_counts: BackfillCounts | None = None,
+        ai_shadow: AiShadowObserver | None = None,
     ) -> None:
         self._repository = repository
         self._supervisor = supervisor
         self._clock = clock
+        #: AI 选靶影子观测器。**组装点注入**（`web.app.create_persistent_app`
+        #: 拿真 repository 和 Settings 建）：默认 None = 整条观测不存在，
+        #: `_observe_ai_shadow` 第一行就返回，零开销（需求第八节第 5 条）。
+        self._ai_shadow = ai_shadow
         #: 手动战报补录。**它优先于所有任务**，理由写在 `application.backfill`
         #: 的模块头上（一句话：补录改的正是任务读来做决策的那批数据）。
         #: 默认那一份一直停在 `IDLE`，除非有人真的请求过一次，所以给它一个真的
@@ -2873,12 +2879,129 @@ class MissionScheduler:
             global_tiers = json.loads(tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧已校验
             raise MissionParamError("全局军力档位配置损坏") from exc
-        return assign_by_capacity_and_value(
+        dispatchable = self._dispatchable_origins(origins)
+        assignments = assign_by_capacity_and_value(
             pool,
-            self._dispatchable_origins(origins),
+            dispatchable,
             fallback_preset=BOT_ATTACK_PRESET,
             tiers=self.validate_military_tiers(global_tiers),
         )
+        # AI 选靶（影子）观测：在 `assign_by_capacity_and_value` 算完之后、组命令行
+        # 之前插一次。**只读，返回值一个字不动**——这一行是纯观测，AI 挂掉、
+        # 超时、返回垃圾都不影响派遣（需求第八节，用例钉死「逐字不变」）。
+        self._observe_ai_shadow(row, reading, origins, dispatchable, assignments)
+        return assignments
+
+    def _observe_ai_shadow(
+        self,
+        row: orm.MissionTaskRow,
+        reading: MilitaryPoolReading,
+        origins: Sequence[AttackOrigin],
+        dispatchable: Sequence[AttackOrigin],
+        assignments: Sequence[AssignedTarget],
+    ) -> None:
+        """把这一轮喂给影子观测器。**任何路径都不许改 `assignments` 或抛异常。**
+
+        ## 喂进去的是 `candidates`（全池），不是 `eligible`
+
+        ⚠️ **这一点是整个一期成不成立的地方。** `eligible` 是四步流水线筛完的
+        结果：第 3 步按 `score_max_age_hours` 的窗口和 `top_n` 门限裁过，第 4 步
+        过了 `max_score` 军力上限。而这三个旋钮的**数值一个都没进 prompt**——
+        方案第一节的整段理由就是「AI 不该参考旋钮，AI 就是去调这些旋钮的」。
+        喂 `eligible` 等于旋钮的值不给、筛选效果照给，**把答案先塞给它**的另一种
+        形态。所以这里取 `reading.candidates`。
+
+        （`candidates` 本身仍带着第 1 步的两条排除——`bot_revisit_hours` 与
+        保护期排除窗口。那两条不是「哪个目标更值」的判据，而是「这个坐标此刻
+        打不了」，属于事实一侧；而且第 1 步的结果就是需求文档 §3 点名要给的
+        那一份。）
+
+        ## 关掉时的开销
+
+        ⚠️ **「零开销」指的是不组 prompt、不起线程、不发任何网络请求**，
+        **不是「一次库都不查」**：这里要读一行 `military_attack_config` 才知道
+        开关的状态。那张表在同一次派遣里本来就要读好几次（每个旋钮一次，见
+        `_knob`），多这一行读不出量级差别；而把它缓存起来会让「用户在页面上
+        点开开关」延迟生效，那才是真正会误事的。
+        """
+        if self._ai_shadow is None:
+            return
+        if not self._ai_shadow_enabled():
+            return
+        now = reading.now
+        hold = self._unknown_line_hold()
+        dispatchable_list = list(dispatchable)
+        total_budget = sum(item.fleet_lines for item in dispatchable_list)
+        if total_budget < 1:
+            return
+        account_limit = self._account_line_limit()
+        try:
+            account_inflight = self._repository.count_inflight_total(now_utc=now, hold=hold)
+        except Exception as error:  # noqa: BLE001 - 影子观测查库失败只跳过，不动派遣
+            self._log_the_ai_shadow_was_skipped(row, "count_inflight_total 查询失败", error, now)
+            return
+        try:
+            self._ai_shadow.observe(
+                task_id=row.id,
+                now=now,
+                run_id=self._run_id,
+                budget=total_budget,
+                candidates=reading.candidates,
+                origins=[item.coordinate for item in origins],
+                configured_lines={item.coordinate: item.fleet_lines for item in origins},
+                budgets_by_origin={item.coordinate: item.fleet_lines for item in dispatchable_list},
+                account_inflight=account_inflight,
+                account_limit=account_limit,
+                hold=hold,
+                presets=_ai_presets(assignments),
+                assignments=assignments,
+            )
+        except Exception as error:  # noqa: BLE001 - 观测侧的异常绝不连锁到派遣
+            self._log_the_ai_shadow_was_skipped(row, "observe() 抛异常", error, now)
+            return
+
+    def _log_the_ai_shadow_was_skipped(
+        self, row: orm.MissionTaskRow, what: str, error: BaseException, now: datetime
+    ) -> None:
+        """影子观测被一句 `except` 挡掉时留个痕。
+
+        ⚠️ **这两条路以前一个字都不记。** 用户把开关打开、库里什么都没多出来，
+        排障时无从下手——正是 CLAUDE.md 那条「日志不说话，故障拖了两天」的
+        复发形态。判据不是「有没有打日志」，是**出事时能不能只靠库里的日志定位**，
+        所以异常的 `repr` 要带上。
+
+        ⚠️ **限流走 `_log_a_repeated_line`**：这一段每一轮派遣都会走到，
+        一个反复失败的查询能在一夜里刷出上万行。签名里带上异常类型，
+        **换了一种失败立刻写一条**（状态跃迁不受窗口约束）。
+        """
+        detail = f"{type(error).__name__}: {error}"
+        self._log_a_repeated_line(
+            key=(row.id, "ai_shadow_skipped"),
+            mission_kind=row.kind,
+            signature=(what, type(error).__name__),
+            level="WARNING",
+            message=(
+                f"AI 选靶影子：任务「{row.name}」这一轮跳过——{what}（{detail}）。"
+                "派遣不受影响，照常按算法进行。"
+            ),
+            payload={"task": row.name, "what": what, "error": detail},
+            now=now,
+            repeat_noun="跳过",
+        )
+
+    def _ai_shadow_enabled(self) -> bool:
+        """AI 影子观测的开关。**默认关**（同 `AUTO_ENABLED` 的惯例），
+        没配 / 表没初始化一律当关。
+
+        ⚠️ **它读一行库。** `_observe_ai_shadow` 的文档串里写清了为什么不缓存。
+        observer 自己在 `_read_knobs` 里还会再确认一次同一个开关——那是
+        防御性的第二道，用的是它本来就要读的同一行，不多花查询。
+        """
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return False
+        return bool(row.ai_shadow_enabled)
 
     def _dispatchable_origins(self, origins: Sequence[AttackOrigin]) -> tuple[AttackOrigin, ...]:
         """各出发点此刻**真的**能派几发，两道闸都算过（见 `_origin_budgets`）。
@@ -3508,6 +3631,11 @@ def _free_lines_from(
 def _known(kind: str) -> bool:
     """库里出现不认识的 kind（手改或旧版本留下的）就跳过，不让调度器崩掉。"""
     return kind in {item.value for item in MissionKind}
+
+
+def _ai_presets(assignments: Sequence[AssignedTarget]) -> frozenset[str]:
+    """AI 只能从本轮算法实际用到的预设里选——那些才在游戏的预设条上。"""
+    return frozenset(item.preset for item in assignments)
 
 
 def _params(raw: str) -> dict[str, Any]:

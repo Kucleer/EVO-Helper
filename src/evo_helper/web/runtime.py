@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 import socket
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from alembic.config import Config
 from fastapi import FastAPI
 
 from alembic import command
+from evo_helper.application.ai_targeting import DEFAULT_AI_RETENTION_DAYS
 from evo_helper.config import Settings
 from evo_helper.infrastructure.system_log import attach_system_log_handler
 from evo_helper.infrastructure.system_log_db import install_database_system_log, purge_system_log
@@ -66,12 +69,39 @@ def create_runtime_app(
     purge_report_screenshots(
         session_factory, retention_days=actual_settings.report_screenshot_retention_days
     )
+    # AI 选靶（影子）记录照同一条路子清。保留天数旋钮在攻击配置页上
+    # （`military_attack_config.ai_retention_days`，NULL = 代码默认 90 天），
+    # 不在 Settings——它和别的攻击旋钮住在同一张表。
+    _purge_ai_target_decisions(session_factory)
     # 旧版把每个 `bot_<g>_<s>_<position>` 都纳入候选；固定海盗位 1--4
     # 因而被错误固化。保留原始扫描/榜单记录，只撤销派遣候选资格。
     SqlAlchemyRepository(session_factory).clear_pirate_position_bot_candidates()
     app = create_persistent_app(session_factory, settings=actual_settings, local_token=local_token)
     app.state.database_engine = engine
     return app
+
+
+def _purge_ai_target_decisions(session_factory: Any) -> int:
+    """清掉早于保留期的 AI 选靶影子记录。保留期从 `military_attack_config` 读。
+
+    0 或负数 = 不清理（同 `system_log_retention_days` 的口径，不是「全删」）。
+    表没初始化 / 配置行不存在时直接返回 0——这是旁路数据，清不到不影响任何事。
+    """
+    repository = SqlAlchemyRepository(session_factory)
+    try:
+        row = repository.military_attack_config()
+    except ValueError:
+        return 0
+    days = row.ai_retention_days
+    if days is None:
+        days = DEFAULT_AI_RETENTION_DAYS
+    if days <= 0:
+        return 0
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    try:
+        return repository.purge_ai_target_decisions(cutoff)
+    except Exception:  # noqa: BLE001 - 保留期清理失败不影响服务启动
+        return 0
 
 
 def lan_address() -> str | None:
