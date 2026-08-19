@@ -179,14 +179,18 @@ def test_an_empty_window_still_says_how_old_the_data_is(tmp_path: Path) -> None:
     stale = NOW - timedelta(days=3)
     repository.save_ranking_targets([RankingTarget(Coordinate(4, 30, 12), 29_590.0, stale)])
 
+    # ⚠️ 接口里的窗口边界用的是**真实时钟**，而 `NOW` 是模块导入那一刻的。
+    # 所以判据不能是「离 NOW-24h 不超过 X」——那个 X 实际约束的是**整个测试套件
+    # 跑到这一条要多久**，CI 上 2026-08-19 就因为跑了 61 秒而红了一次（容差 1 分钟）。
+    # 改成把请求夹在两次实时读数之间：不留容差常量，也就不会再随套件变慢而失败。
+    before = datetime.now(UTC)
     payload = client.get("/api/military-rankings").json()
+    after = datetime.now(UTC)
 
     assert payload["total"] == 0
     assert datetime.fromisoformat(payload["refreshed_at_utc"]) == stale
-    # 走接口时窗口用的是真实时钟（`NOW` 是模块导入那一刻），差的是用例自己跑的
-    # 那几秒，所以比的是「离 24 小时前不到一分钟」而不是相等。
     window_start = datetime.fromisoformat(payload["window_start_utc"])
-    assert abs(window_start - (NOW - timedelta(hours=24))) < timedelta(minutes=1)
+    assert before - timedelta(hours=24) <= window_start <= after - timedelta(hours=24)
 
 
 def test_an_unknown_sort_key_is_refused_instead_of_reaching_the_sql(tmp_path: Path) -> None:
