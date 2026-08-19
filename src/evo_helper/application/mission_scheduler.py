@@ -87,6 +87,7 @@ from evo_helper.domain.report_wait import (
     ReportWaitPlanner,
     WaitAction,
 )
+from evo_helper.domain.rules import cycle_start_utc
 from evo_helper.domain.scheduler import (
     Action,
     Decision,
@@ -397,8 +398,29 @@ class MilitaryPoolReading:
 
     @property
     def dropped_unrated(self) -> int:
-        """第 2 步剔掉了几个：从没上过军力榜、或说不清什么时候读的。"""
-        return self.attackable - self.usable
+        """第 2 步里**「从没上过军力榜、或说不清什么时候读的」**剔掉了几个。
+
+        ⚠️ **上周期那一批不算在内**（`dropped_last_cycle` 单独数）。写成
+        `attackable - usable` 的话，周一凌晨这个数会把一整库读过分数的目标算成
+        「从未上榜」，而日志正文里写的就是「N 个从未上榜」——**那是句假话**，
+        而且它会把人引到完全错的善后上（去查军力榜为什么漏了这些 bot，
+        而真相只是该重扫一轮了）。
+        """
+        return self.attackable - self.usable - self.dropped_last_cycle
+
+    @property
+    def dropped_last_cycle(self) -> int:
+        """第 2 步按**周期边界**剔掉了几个：读到过分数，只是那份读数属于上一个周期。
+
+        bot 军力每周一 UTC+0 刷新，刷新那一刻全库读数同时作废
+        （`domain.target_order.reading_is_from_this_cycle`）。
+        """
+        return len(self.choice.from_previous_cycles)
+
+    @property
+    def cycle_start(self) -> datetime:
+        """本周期的起点（本周一 00:00 UTC）。只用于日志，让人对得上「作废的是哪一批」。"""
+        return cycle_start_utc(self.now)
 
     @property
     def stale(self) -> int:
@@ -427,7 +449,20 @@ class MilitaryPoolReading:
 
     @property
     def starved(self) -> bool:
-        """有候选，却一个有军力读数的都没有——**军力榜还没扫到它们**。
+        """有候选，却一个**本周期**的军力读数都没有。
+
+        ⚠️ **2026-08-19 起它有两个成因，善后不同，日志里必须分开说**
+        （`starved_by_the_cycle_boundary` 就是用来分的）：
+
+        1. **从没上过军力榜**——军力榜还没扫到它们；
+        2. **读数全属于上一个周期**——bot 军力每周一 UTC+0 刷新，刷新那一刻全库
+           读数同时作废（`domain.target_order` 模块头第 2 步）。周一凌晨整池都是
+           这一档。
+
+        两者的补救其实是同一件事（等军力榜扫一轮），所以页面上共用
+        `TaskStatus.MISSING_MILITARY_SCORES` 这一档；但**日志必须说清是哪一种**，
+        否则周一凌晨那条会写着「N 个从未上榜」——一句假话，而且会把人引到
+        「军力榜为什么漏了这些 bot」这条错路上。
 
         ⚠️ **和「一个候选都没有」必须分开。** 后者是完全正常的一档（已知 bot 全在
         24 小时冷却里或还在飞），拿它去报「军力榜没跟上」是句假话。
@@ -444,6 +479,16 @@ class MilitaryPoolReading:
         「军力数据未采集」，用户于是去等一轮扫描，而助手其实正在正常派遣。
         """
         return self.attackable > 0 and self.usable == 0
+
+    @property
+    def starved_by_the_cycle_boundary(self) -> bool:
+        """整池被挡光了，**而且挡它的是「读数早于本周期起点」这一条**。
+
+        判据带上 `dropped_last_cycle > 0`，是为了不去替另一个成因说话：一池纯粹
+        「从没上过军力榜」的候选也会 `starved`，那时报「上周期的读数作废了」
+        就是在描述一件没发生过的事。
+        """
+        return self.starved and self.dropped_last_cycle > 0
 
 
 @dataclass(frozen=True)
@@ -1475,6 +1520,7 @@ class MissionScheduler:
         self._log_schedule_window_changes(snapshots, now)
         facts = self._facts(snapshots, config, now)
         self._log_a_starved_military_pool(snapshots, now)
+        self._log_a_pool_stalled_on_the_cycle_boundary(now)
         running = self._supervisor.running
         batch_decision = self._military_batch_decision(snapshots, facts, running)
         if batch_decision is not None:
@@ -1880,11 +1926,15 @@ class MissionScheduler:
         榜单页读不出来、军力榜任务被停用），这个状态会一直维持，而页面上只有一句
         不痛不痒的状态：**攻击悄悄停摆一整夜，没人知道。**
 
-        ⚠️ 这一档 2026-08-18 起**只可能由「从没上过军力榜」造成**：超期的分数不再
-        挡任何目标（选靶交给时间池），所以措辞也跟着从「分数全都过期、扫描跟不上
-        有效期」改成「一个军力读数都没有、军力榜还没扫到它们」。
-        **不改的话这条警告会指着一个不存在的原因**，而用户照它去把有效期调长，
-        调完照样一发不派。
+        ⚠️ 这一档 2026-08-18 起不再由「分数全都过期」造成：超期的分数不再挡任何
+        目标（窗口不够就放宽），所以措辞跟着从「分数全都过期、扫描跟不上有效期」
+        改成「一个军力读数都没有」。**不改的话这条警告会指着一个不存在的原因**，
+        而用户照它去把有效期调长，调完照样一发不派。
+
+        ⚠️ **2026-08-19 起它有两个成因，措辞必须跟着分岔**（`cause` 那一段）：
+        「从没上过军力榜」和「读数全属于上一个周期」——后者是周一 UTC+0 刷新那一刻
+        全库读数同时作废造成的。两者在 `usable == 0` 上长得一模一样，而说错的代价
+        是把人引到「军力榜为什么漏了这些 bot」这条错路上。**日志说假话比不说更糟。**
 
         ⚠️ 顺带记一笔：**这条警告在 2026-08-18 之前一次都没响过。** 那时
         `usable = 有读数的 + 没读数的`，而库里从来都有没读数的行（实测 628 个），
@@ -1914,23 +1964,123 @@ class MissionScheduler:
                 continue
             self._stale_pool_warned_at[task_id] = now
             task = by_id.get(task_id)
+            # ⚠️ **成因必须说对。** 「上周期的读数整批作废」和「军力榜还没扫到
+            # 它们」在 `usable == 0` 上长得一模一样，而后一句会把人引到
+            # 「军力榜为什么漏了这些 bot」这条错路上——真相只是该重扫一轮了。
+            cause = (
+                f"{reading.dropped_last_cycle} 个的军力读数早于本周期起点 "
+                f"{reading.cycle_start:%Y-%m-%d %H:%M} UTC（每周一 UTC+0 刷新时全部作废）、"
+                f"另有 {reading.dropped_unrated} 个从未上榜，本周期一条新读数都没有"
+                if reading.starved_by_the_cycle_boundary
+                else "一个军力读数都没有，军力榜还没扫到它们"
+            )
             record_system_log(
                 "WARNING",
                 "application.mission_scheduler",
                 f"「{task.name if task else task_id}」的军力候选池已连续 "
                 f"{rounds} 轮（自 {since:%Y-%m-%d %H:%M} UTC 起）"
-                f"筛不出能打的目标：{reading.attackable} 个候选一个军力读数都没有，"
-                f"军力榜还没扫到它们。攻击已停在这里，请确认军力榜扫描是否还在跑",
+                f"筛不出能打的目标：{reading.attackable} 个候选{cause}。"
+                "攻击已停在这里，请确认军力榜扫描是否还在跑",
                 payload={
                     "task_id": task_id,
                     "mission_kind": MissionKind.BOT.value,
                     "attackable": reading.attackable,
                     "with_readings": 0,
                     "dropped_unrated": reading.dropped_unrated,
+                    "dropped_last_cycle": reading.dropped_last_cycle,
+                    "cycle_start_utc": reading.cycle_start.isoformat(),
                     "starved_since_utc": since.isoformat(),
                     "starved_rounds": rounds,
                 },
                 logged_at_utc=now,
+            )
+
+    def _log_a_pool_stalled_on_the_cycle_boundary(self, now: datetime) -> None:
+        """**「读数早于本周期起点」这一条把整池挡光了的那一刻，留一条痕。**
+
+        为什么这条日志非有不可，而上面那两条都盖不住它：
+
+        - `_log_the_military_pipeline`（每一步余量那条）只在**组命令行**时才写，
+          而整池被挡光时这条链路根本轮不到组命令行（`has_work` 已经是假），
+          于是那一刻在库里一个字都没有；
+        - `_log_a_starved_military_pool` 要**连续半小时**才开口——周一凌晨那半小时
+          正是最该看清「刚才发生了什么」的半小时。
+
+        说清三件事：**本周期起点是什么时候、被筛掉多少条、剩多少**。少任何一个，
+        看见日志的人还是得回库里查——而那正是「没人告诉你」的另一种写法。
+
+        ⚠️ **限流：判定变了立刻写，没变就一个窗口最多一条**（`_log_a_repeated_line`）。
+        这一条位于**每 tick 都走**的那条路上（`_facts` → `_military_pool_reading`
+        每 tick 算一次账），不限流的话它就是下一个 PR #188——那次两条日志占了
+        `system_log` 全表的 44%。
+
+        ⚠️ **只在整池被挡光时才开口**，不是「丢掉一条就说一句」。周一上午军力榜
+        一边扫一边把这个数往下带，逐条报会把一整个上午刷满，而那期间攻击本来就在
+        正常跑——**每轮都响的告警和不响的一样没用**。
+
+        ⚠️ **恢复时补一条 INFO 收口，且只补一条。** 只报开头不报结尾的话，翻日志的
+        人读不出这一段停了多久——而那正是判断「军力榜扫得够不够快」的那个数。
+        收口只在跃迁那一下写，不吃窗口兜底，否则一个长期正常的任务会每
+        `REPEATED_LOG_WINDOW` 刷一句「已恢复」。
+        """
+        for task_id, reading in self._military_pool_readings.items():
+            key = (task_id, "military_cycle")
+            cleared: tuple[object, ...] = ("cleared",)
+            if not reading.starved_by_the_cycle_boundary:
+                previous = self._repeated_lines.get(key)
+                # 没报过就不必「恢复」：没响过的告警去收口，读日志的人只会以为
+                # 刚才出过事。
+                if previous is None or previous.signature == cleared:
+                    continue
+                self._log_a_repeated_line(
+                    key=key,
+                    mission_kind=MissionKind.BOT.value,
+                    signature=cleared,
+                    level="INFO",
+                    message=(
+                        f"军力读数跨周期作废：已恢复。本周期（{reading.cycle_start:%Y-%m-%d %H:%M}"
+                        f" UTC 起）已经采到 {reading.usable} 个读数，这一轮起重新打得出去"
+                    ),
+                    payload={
+                        "task_id": task_id,
+                        "mission_kind": MissionKind.BOT.value,
+                        "cycle_start_utc": reading.cycle_start.isoformat(),
+                        "attackable": reading.attackable,
+                        "with_readings": reading.usable,
+                        "dropped_last_cycle": reading.dropped_last_cycle,
+                        "stalled": False,
+                    },
+                    now=now,
+                    repeat_noun="告警",
+                )
+                continue
+            message = (
+                f"军力读数跨周期作废：本周期起点是 {reading.cycle_start:%Y-%m-%d %H:%M} UTC"
+                f"（bot 军力每周一 UTC+0 刷新，刷新那一刻上周的读数全部作废）。"
+                f"{reading.attackable} 个候选里 {reading.dropped_last_cycle} 个的读数早于这个时刻、"
+                f"另有 {reading.dropped_unrated} 个从未上榜，"
+                f"本周期读到的只剩 {reading.usable} 个——这一轮一个都打不了。"
+                f"等军力榜扫过一轮就会自己恢复"
+            )
+            payload: dict[str, Any] = {
+                "task_id": task_id,
+                "mission_kind": MissionKind.BOT.value,
+                "cycle_start_utc": reading.cycle_start.isoformat(),
+                "attackable": reading.attackable,
+                "with_readings": reading.usable,
+                "dropped_last_cycle": reading.dropped_last_cycle,
+                "dropped_unrated": reading.dropped_unrated,
+                "stalled": True,
+            }
+            self._log_a_repeated_line(
+                key=key,
+                mission_kind=MissionKind.BOT.value,
+                signature=_line_signature(message, payload),
+                level="WARNING",
+                message=message,
+                payload=payload,
+                now=now,
+                repeat_noun="告警",
             )
 
     def _forget_a_starved_military_pool(self, task_id: int) -> None:
@@ -2722,9 +2872,14 @@ class MissionScheduler:
         """把这一轮选靶的**每一步余量**写进 `system_log`。
 
         判据不是「有没有打日志」，而是**出事时能不能只靠库里的日志复盘
-        「为什么打的是这几个」**。所以四个数一个都不能省：剔除后 / 有读数 /
-        窗口内 / 过完安全线——少任何一个，读日志的人就分不清是「没候选」「没读数」
-        「窗口太窄」还是「被军力上限挡在外面」，而这几种的善后完全不同。
+        「为什么打的是这几个」**。所以这几个数一个都不能省：剔除后 / 有本周期读数 /
+        从未上榜的 / 读数属于上周期的 / 窗口内 / 过完安全线——少任何一个，读日志的人
+        就分不清是「没候选」「没读数」「读数上周就作废了」「窗口太窄」还是
+        「被军力上限挡在外面」，而这几种的善后完全不同。
+
+        ⚠️ **「从未上榜」和「读数属于上一个周期」必须各占一个数。** 合成一个的话，
+        周一凌晨这条日志会写着「N 个从未上榜」，而那是句假话——它会把人引到
+        「军力榜为什么漏了这些 bot」这条错路上，真相只是该重扫一轮了。
 
         ⚠️ **这一池不等于「这一轮打的那几个」**：真正打谁由第 4 步按得分连同航线
         预算定，那一步在 `_military_assignments` 里。所以这条日志的措辞是
@@ -2744,7 +2899,10 @@ class MissionScheduler:
         oldest = reading.oldest_eligible_at
         message = (
             f"军力候选池：排除近期打过的与撞上过保护期的之后剩 {reading.attackable} 个，"
-            f"其中 {reading.usable} 个有军力读数（{reading.dropped_unrated} 个从未上榜，不参与）；"
+            f"其中 {reading.usable} 个有本周期军力读数"
+            f"（{reading.dropped_unrated} 个从未上榜，"
+            f"{reading.dropped_last_cycle} 个的读数早于本周期起点 "
+            f"{reading.cycle_start:%Y-%m-%d %H:%M} UTC，都不参与）；"
             f"读数在 {reading.max_age.total_seconds() / 3600:.1f} 小时窗口内的有 "
             f"{len(reading.in_window)} 个（窗口门限 {reading.window_floor}）；"
             f"过完军力上限之后有资格被打的 {len(reading.eligible)} 个，"
@@ -2758,6 +2916,8 @@ class MissionScheduler:
             "attackable": reading.attackable,
             "with_readings": reading.usable,
             "dropped_unrated": reading.dropped_unrated,
+            "dropped_last_cycle": reading.dropped_last_cycle,
+            "cycle_start_utc": reading.cycle_start.isoformat(),
             "in_window": len(reading.in_window),
             "window_floor": reading.window_floor,
             "eligible": len(reading.eligible),

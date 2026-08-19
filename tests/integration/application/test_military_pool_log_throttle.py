@@ -110,18 +110,25 @@ def a_healthy_pool(repository: SqlAlchemyRepository, session_factory) -> orm.Mis
 
 
 def a_widened_pool(repository: SqlAlchemyRepository, session_factory) -> orm.MissionTaskRow:  # type: ignore[no-untyped-def]
-    """窗口内只有 1 个、截断要 2 个：**放弃窗口**，那条 WARNING 该响。"""
+    """窗口内只有 1 个、截断要 2 个：**放弃窗口**，那条 WARNING 该响。
+
+    ⚠️ **两条旧读数刻意只旧 3 小时，不是 3 天。** `NOW` 是周二，而选靶第 2 步有一条
+    按「本周期起点（周一 00:00 UTC）」划的线（`domain.target_order` 模块头第 2 步）
+    ——3 天前的读数会先被那条线整个丢掉，于是池子里只剩 1 个、放宽根本捞不到东西，
+    这一组量的「放宽窗口那条告警」就一次都不会响。3 小时前的读数在本周期之内、
+    只是出了 2 小时的窗口，那才是这一组要摆的局面。
+    """
     add_bot_target(
         session_factory,
         Coordinate(2, 400, 5),
         military_score=99_999.0,
-        scanned_at=NOW - timedelta(days=3),
+        scanned_at=NOW - timedelta(hours=3),
     )
     add_bot_target(
         session_factory,
         Coordinate(2, 401, 6),
         military_score=8_000.0,
-        scanned_at=NOW - timedelta(days=3),
+        scanned_at=NOW - timedelta(hours=3),
     )
     add_bot_target(session_factory, Coordinate(2, 402, 7), military_score=100.0, scanned_at=NOW)
     enable(repository, MissionKind.BOT, params_json=BY_MILITARY)

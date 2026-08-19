@@ -5,7 +5,7 @@
 | 步 | 做什么 | 住在哪 |
 |---|---|---|
 | 1 | 剔除 24h 内已攻击的 + 刚撞过保护期的 + 本轮走完的 | `mission_scheduler._military_candidates` |
-| 2 | 只保留**有军力读数**的目标 | `with_a_military_reading` |
+| 2 | 只保留**有本周期军力读数**的目标 | `with_a_military_reading` |
 | 3 | 只保留读数落在**有效期窗口**内的（不够就放弃窗口并告警） | `within_score_window` |
 | 4 | 过军力上限这道安全线，按 **军力 ÷ 往返小时** 降序出击 | `military_attack` |
 
@@ -38,6 +38,38 @@
 放弃这 17.4% 换来的是「军力优先」这个模式真的成立：补位不参与按军力排序，
 补位一多，这条链路就退化成「按距离随便打」。整段善后写在
 `domain.military_attack` 的模块头上。
+
+### 第 2 步的另一半：**读数早于本周期起点的，一律当作「没有读数」**
+
+**bot 军力每周一 UTC+0 随机刷新**（用户口径 2026-08-14，记在
+`docs/军力攻击优化-开发交接.md`）。刷新那一刻，**全库的军力读数同时作废**——
+它们描述的是上周的 bot，不是这周的。用户口径（2026-08-19）：「周一刷新那一刻，
+全部 bot 的军力读数同时作废」。
+
+判据是 `reading_is_from_this_cycle`：读取时刻 `>=` `domain.rules.cycle_start_utc(now)`。
+**周一边界由 `cycle_start_utc` 算，不许在这里自己算一次**——`attack_intents`
+那一列用的就是它，两份实现迟早分家。
+
+⚠️ **为什么放在第 2 步，而不是在第 3 步「放宽窗口」那里补一个 `if`。**
+第 3 步窗口内不足门限时会**放弃窗口、改用 `with_readings`**。周一凌晨窗口内是
+0 个，上周期的读数若还留在 `with_readings` 里，放宽之后捞回来的**全是失效数据**，
+而页面上只会显示「军力读数已放宽窗口」这句正常告警——**比不打还糟，因为它看起来
+在正常工作**。判据放在第 2 步，`with_readings` 本身就不含它们，放宽也捞不回来。
+这是「把判据放在正确的那一层」。
+
+⚠️ **周期边界和 `max_age` 是两条独立的判据，都生效，取更严的那个。** 周期边界不
+替代有效期窗口：周二读到的数在周二仍然会因为 2 小时窗口过期、走放宽那条路。
+反过来，窗口再宽也拉不回上周期的读数。
+
+⚠️ **它不是旋钮，是游戏规则**（周一 UTC+0 刷新）。按 CLAUDE.md 的判据
+「改这个值会让结果变『更适合我』还是变『错』」——是后者，所以**不做成可配置**。
+
+**这一档筛空整池时会发生什么**：`with_readings` 为空 → `application` 那边
+`MilitaryPoolReading.usable` 为 0 → `domain.scheduler.bot_round_complete` 为真 →
+BOT 说「没活干」→ 填空隙的军力榜任务自然拿到时间片，扫出这周的读数。
+「先扫再打」因此是现成的行为，**不要另写一条**。页面那一半由
+`TaskFacts.scores_are_missing` 说出来（不然它会显示成「已完成」，一句听起来顺利、
+实际相反的话）。
 
 ## 第 3 步：窗口筛选
 
@@ -173,6 +205,7 @@ from datetime import datetime, timedelta
 
 from evo_helper.domain.flight_time import round_trip_hours
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.rules import cycle_start_utc
 
 #: 第 3 步的**窗口门限**：窗口内至少要有这么多个目标，这一轮才肯只用窗口内的。
 #: 用户口径（2026-08-18）：100。任务参数里的键仍叫 `top_n`（生产库里存着的就是
@@ -317,22 +350,73 @@ def value_key(target: ScoredTarget, origin: Coordinate) -> tuple[bool, float, in
     return (value is None, -(value or 0.0), *_coordinate_key(target))
 
 
-def has_a_military_reading(target: ScoredTarget) -> bool:
-    """**第 2 步的判据**：这一条有没有一份能用的军力读数。
+def reading_is_from_this_cycle(target: ScoredTarget, *, now: datetime) -> bool:
+    """这一条的军力读数**是不是本周期（本周一 UTC+0 之后）读到的**。
 
-    要求**分数和读取时刻两样都在**：
+    ⚠️ **这不是偏好项，是游戏规则。** bot 军力每周一 UTC+0 随机刷新（用户口径
+    2026-08-14），刷新那一刻全库的读数同时作废——它们描述的是上周的 bot。
+    所以这条线的位置不许做成旋钮：改它不会让结果「更适合我」，只会让它变错。
+
+    ⚠️ **周一边界一律问 `domain.rules.cycle_start_utc`，不许在这里自己算。**
+    `attack_intents.cycle_start_utc` 那一列用的就是它；各算一份的结果是两处对同一
+    个周一给出不同答案，而那种分家在页面上一点异常都看不出来。
+
+    边界取「大于等于」：正好落在周一 00:00:00 UTC 那一秒读到的算**本周期**。
+
+    没有读取时刻的恒为假——说不清什么时候读的，就谈不上「是这周读的」。
+    """
+    scanned_at = target.military_score_at_utc
+    return scanned_at is not None and scanned_at >= cycle_start_utc(now)
+
+
+def has_a_military_reading(target: ScoredTarget, *, now: datetime) -> bool:
+    """**第 2 步的判据**：这一条有没有一份**本周期**能用的军力读数。
+
+    要求**分数、读取时刻、以及「读于本周期」三样都在**：
 
     - 没有分数 → 从没上过军力榜。用户 2026-08-18 决定这一档不再攻击（实测 628 个，
       占 bot 总数 3604 的 17.4%），理由在模块头。
     - 有分数却说不清什么时候读的 → 进不了窗口：窗口按读数时刻划线，一个没有时刻的
       目标在那把尺子上没有位置。把它当成「很旧」或者「很新」都是在编一个没量到的数。
+    - 读数早于本周期起点 → **描述的是上周的 bot，已经作废**
+      （`reading_is_from_this_cycle`）。
+
+    ⚠️ **第三档必须挡在这一步，不能挪到第 3 步「放宽窗口」那里去补。** 挪过去的话，
+    周一凌晨窗口内是 0 个、放宽之后捞回来的全是上周期的失效读数，而页面只显示
+    「军力读数已放宽窗口」这句正常告警——**比不打还糟，因为它看起来在正常工作**。
+    整段理由在模块头第 2 步。
     """
-    return target.military_score is not None and target.military_score_at_utc is not None
+    return (
+        target.military_score is not None
+        and target.military_score_at_utc is not None
+        and reading_is_from_this_cycle(target, now=now)
+    )
 
 
-def with_a_military_reading(targets: Iterable[ScoredTarget]) -> list[ScoredTarget]:
-    """**第 2 步**：只留下有军力读数的。次序保持传入的次序（排序是第 4 步的事）。"""
-    return [target for target in targets if has_a_military_reading(target)]
+def with_a_military_reading(
+    targets: Iterable[ScoredTarget], *, now: datetime
+) -> list[ScoredTarget]:
+    """**第 2 步**：只留下有本周期军力读数的。次序保持传入的次序（排序是第 4 步的事）。
+
+    `now` **没有默认值**：周期边界要拿它算，而编一个出来（`datetime.now()`）会让
+    调用方在测试里量不准、在实机里和调度器的时钟分家——正好跨在周一边界上的那一批
+    目标恰恰是最容易两边不一致的。
+    """
+    return [target for target in targets if has_a_military_reading(target, now=now)]
+
+
+def from_a_previous_cycle(target: ScoredTarget, *, now: datetime) -> bool:
+    """这一条**读到过分数，只是那份读数属于上一个周期**——本周期算它「没有读数」。
+
+    它和「从没上过军力榜」在第 2 步的结果上一模一样（都出局），但**成因与善后完全
+    不同**，所以要分得开：前者等军力榜再扫一轮就好，后者是这个 bot 从来没被扫到过。
+    日志与页面据此说清「这一轮为什么一个都打不了」——**日志说假话比不说更糟**。
+    """
+    return (
+        target.military_score is not None
+        and target.military_score_at_utc is not None
+        and not reading_is_from_this_cycle(target, now=now)
+    )
 
 
 def score_is_fresh(target: ScoredTarget, *, now: datetime, max_age: timedelta) -> bool:
@@ -414,8 +498,15 @@ class MilitaryChoice:
     的共同形状恰恰是**判据在背地里换了，页面和日志照旧**。
     """
 
-    #: 第 2 步之后：有军力读数的那些。次序保持传入的次序。
+    #: 第 2 步之后：有**本周期**军力读数的那些。次序保持传入的次序。
     with_readings: tuple[ScoredTarget, ...]
+    #: 第 2 步按**周期边界**丢掉的那些：读到过分数，只是那份读数属于上一个周期。
+    #:
+    #: ⚠️ **它必须和「从没上过军力榜」分得开。** 两者在 `with_readings` 上的结果
+    #: 一模一样（都不在里面），而善后完全不同：这一档等军力榜再扫一轮就好，
+    #: 另一档是这个 bot 从来没被扫到过。合起来只报一个数的话，周一凌晨的日志会说
+    #: 「N 个从未上榜」——而那是句假话。
+    from_previous_cycles: tuple[ScoredTarget, ...]
     #: 第 3 步划出来的窗口内那批。**放宽与否都记**——「窗口内只有几个」正是
     #: 告警里最要紧的那个数。
     in_window: tuple[ScoredTarget, ...]
@@ -444,7 +535,7 @@ def choose_by_military(
     window_floor: int = WINDOW_POOL_FLOOR,
     max_score: float | None = None,
 ) -> MilitaryChoice:
-    """**第 2--3 步加上安全线**：有读数的 → 窗口内的 → 打得动的。
+    """**第 2--3 步加上安全线**：有本周期读数的 → 窗口内的 → 打得动的。
 
     两步各是一个独立的函数，这里只负责把它们串起来，外加**窗口内不足时那一个
     决定**——串的次序与那个决定就是判据，理由整段写在模块头第 3 步上。这里只
@@ -454,12 +545,20 @@ def choose_by_military(
     那一批，而军力榜从强到弱扫，那一批恰恰是最弱的——补下去等于把 PR #176 的
     缺陷换个地方原样复发。
 
+    ⚠️ **周期边界（第 2 步）在放宽之前就把上周期的读数筛掉了，这是判据的一部分。**
+    留到放宽那里再补一个 `if` 的话，周一凌晨窗口内是 0 个、放宽之后捞回来的全是
+    失效读数，而页面只会说一句「已放宽窗口」——看起来完全正常。整段理由在模块头
+    第 2 步。
+
     ⚠️ **这里不排序、也不截断。** 排序要知道从哪颗星球出发（往返时间是
     (目标, 出发星球) 的函数），而那是第 4 步才知道的事。2026-08-18 之前这里还
     做一道军力硬截断，那道截断已经取消——`window_floor` 现在只用来回答
     「窗口够不够用」这一个问题。
     """
-    with_readings = tuple(with_a_military_reading(targets))
+    # 先落成元组：`targets` 可能是个只走一遍的生成器，而下面要数两趟。
+    pool = tuple(targets)
+    with_readings = tuple(with_a_military_reading(pool, now=now))
+    from_previous_cycles = tuple(item for item in pool if from_a_previous_cycle(item, now=now))
     in_window = within_score_window(with_readings, now=now, max_age=max_age)
     # 「够不够」的尺子就是窗口门限：窗口内备够了就不必动它，备不够再放宽也不迟。
     considered = in_window if len(in_window) >= window_floor else with_readings
@@ -467,6 +566,7 @@ def choose_by_military(
     widened = any(not score_is_fresh(target, now=now, max_age=max_age) for target in eligible)
     return MilitaryChoice(
         with_readings=with_readings,
+        from_previous_cycles=from_previous_cycles,
         in_window=in_window,
         considered=considered,
         eligible=eligible,
@@ -509,8 +609,10 @@ __all__ = [
     "ScoredTarget",
     "attack_value",
     "choose_by_military",
+    "from_a_previous_cycle",
     "has_a_military_reading",
     "most_valuable_first",
+    "reading_is_from_this_cycle",
     "score_is_fresh",
     "value_key",
     "with_a_military_reading",
