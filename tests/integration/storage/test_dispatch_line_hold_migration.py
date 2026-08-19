@@ -49,16 +49,21 @@ def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
 
 
 def test_this_revision_is_the_only_head() -> None:
-    """整条迁移链只有一个 head，而且就是这一条（眼下最新的那一条）。
+    """整条迁移链只有一个 head，而这一条在那条链上。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前
-    一个字都看不出来。合并时若发现别的分支也挂在 `c4f8a2e51b07` 上，
-    **后进的那条改自己的 `down_revision`**。
+    一个字都看不出来。
+
+    ⚠️ 这里**只数个数，不钉是哪一条**：钉住的话，每加一条迁移都要回来改这个
+    与自己毫无关系的文件（本文件就是这么被 `61eb261c5a09` 改红的）。
+    「head 就是最新那一条」由**最新那条迁移自己的用例**钉住——
+    见 `test_ai_target_decisions.py::TestMigration::test_this_revision_is_the_head`。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1, script.get_heads()
+    assert REVISION in {revision.revision for revision in script.walk_revisions()}
 
 
 def test_the_column_is_nullable_with_no_default(database_url: str) -> None:

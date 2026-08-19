@@ -33,6 +33,9 @@ SHANGHAI = timezone(timedelta(hours=8))
 #: 反推出来的清单会跟着模型一起变，那样这条断言永远成立，也就永远不告诉你任何事。
 EXPECTED_TIMESTAMP_COLUMNS = frozenset(
     {
+        # 61eb261c5a09（AI 选靶影子观测）随表建的，那条迁移里写着 `timezone=True`。
+        "ai_target_decisions.decided_at_utc",
+        "ai_target_decisions.cycle_start_utc",
         "artifacts.created_at_utc",
         "attack_dispatches.dispatched_at_utc",
         "attack_dispatches.expected_report_at_utc",
@@ -98,6 +101,9 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
 #: 会静默截掉 tzinfo，正是这一整个文件要防的那件事。
 POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
     {
+        # 61eb261c5a09（AI 选靶影子观测）随新表建的，那条迁移里也写着 `timezone=True`。
+        "ai_target_decisions.decided_at_utc",
+        "ai_target_decisions.cycle_start_utc",
         "attack_dispatches.line_released_at_utc",
         "battle_report_screenshots.captured_at_utc",
         "planet_scout_alerts.delivered_at_utc",

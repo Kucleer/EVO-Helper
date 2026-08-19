@@ -1610,6 +1610,14 @@ class MissionConsoleService:
         views.reverse()
         return views[:limit]
 
+    def recent_ai_decisions(self, *, limit: int = 20) -> list[orm.AiTargetDecisionRow]:
+        """AI 选靶（影子）记录的近况，新的在前。诊断页「最近 N 轮」读它。
+
+        直接交 ORM 行：这一块在诊断页上要展示 prompt / 返回的**原文**，
+        拼成视图类只会多一层转手，而这里没有任何判据要翻译。
+        """
+        return self._repository.recent_ai_target_decisions(limit=limit)
+
     def _freeze_view(
         self, record: MissionConfigFreeze, previous: MissionConfigFreeze | None
     ) -> ConfigFreezeView:

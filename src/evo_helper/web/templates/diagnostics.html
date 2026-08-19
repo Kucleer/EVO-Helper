@@ -89,4 +89,89 @@
     </table>
   </div>
 </section>
+
+<section class="panel" aria-labelledby="ai-shadow" {% if not ai_enabled %}style="display:none"{% endif %}>
+  <h2 id="ai-shadow">AI 选靶（影子）</h2>
+  <p class="muted" style="margin:0 0 12px;font-size:12px">
+    一期为纯观测：调度照常用算法派遣，这里只记录并对比 AI 的选择。
+    <strong>重合率不是好坏的判据</strong>——它只能用来发现「AI 压根没在按规则做事」。
+  </p>
+
+  <div class="filter-bar" style="margin:0 0 12px">
+    <span class="chip" title="拿到回答的比例（分母：全部记录）。超时与 HTTP 错误只减这一个，不算进后面几项。">调用成功率 {{ "—" if ai_health.call_rate is none else (ai_health.call_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="分母是「拿到回答的那些」，不是全部记录。">JSON 通过率 {{ "—" if ai_health.json_rate is none else (ai_health.json_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="分母是「JSON 解析成功的那些」。超时与 HTTP 错误不算作硬校验没过。">硬校验通过率 {{ "—" if ai_health.hard_rate is none else (ai_health.hard_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip">数字自洽率 {{ "—" if ai_health.self_consistency_rate is none else (ai_health.self_consistency_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="ok 那批里「AI 与算法选中同一个坐标」的平均个数——不是百分比，也不是好坏的判据。">平均重合数 {{ "—" if ai_health.avg_overlap is none else ai_health.avg_overlap }}</span>
+  </div>
+
+  {% if not ai_decisions %}
+    <p class="muted">还没有影子观测记录（开关未开、或还没有军力攻击轮次）。</p>
+  {% else %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">时间（UTC+8）</th><th scope="col">任务</th>
+          <th scope="col">预算</th><th scope="col">重合</th><th scope="col">状态</th>
+          <th scope="col">延迟</th><th scope="col">模型</th><th scope="col"></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for decision in ai_decisions %}
+        <tr>
+          <td>{{ local_time(decision.decided_at_utc) }}</td>
+          <td class="muted">{{ decision.task_id or "—" }}</td>
+          <td>{{ decision.budget }}</td>
+          <td>
+            {%- if decision.overlap is none -%}—
+            {%- else -%}{{ decision.overlap }}/{{ decision.budget }}{%- endif -%}
+          </td>
+          <td>
+            <span class="chip {{ 'ok' if decision.status == 'ok' else 'warn' }}">
+              {{ decision.status }}
+            </span>
+          </td>
+          <td>{{ decision.latency_ms or "—" }} ms</td>
+          <td class="muted">{{ decision.model or "—" }}</td>
+          <td>
+            <details>
+              <summary class="muted" style="cursor:pointer">展开</summary>
+              <div style="margin-top:8px">
+                <h3 style="font-size:12px">算法选中（{{ decision.algorithm_picks|length }}）</h3>
+                <p class="muted" style="font-size:12px">
+                  {%- for pick in decision.algorithm_picks -%}
+                    {{ pick.target }}（{{ pick.preset }}）{% if not loop.last %} · {% endif %}
+                  {%- else -%}—{%- endfor -%}
+                </p>
+                <h3 style="font-size:12px;margin-top:8px">AI 选中（{{ (decision.ai_picks or [])|length }}）</h3>
+                <p class="muted" style="font-size:12px">
+                  {%- if decision.ai_picks -%}
+                    {%- for pick in decision.ai_picks -%}
+                      {{ pick.target }}（{{ pick.origin }} / {{ pick.preset }}）{% if not loop.last %} · {% endif %}
+                    {%- endfor -%}
+                  {%- else -%}—{%- endif -%}
+                </p>
+                <h3 style="font-size:12px;margin-top:8px">校验与核对</h3>
+                <ul class="muted" style="font-size:12px;margin:4px 0">
+                  {%- for violation in decision.violations -%}
+                    <li>{{ violation.code }}：{{ violation.detail }}</li>
+                  {%- else -%}
+                    <li>无</li>
+                  {%- endfor -%}
+                </ul>
+                <h3 style="font-size:12px;margin-top:8px">prompt 原文</h3>
+                <pre class="muted" style="white-space:pre-wrap;font-size:11px">{{ decision.prompt_text }}</pre>
+                <h3 style="font-size:12px;margin-top:8px">模型返回原文</h3>
+                <pre class="muted" style="white-space:pre-wrap;font-size:11px">{{ decision.response_text or "—" }}</pre>
+              </div>
+            </details>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
 {% endblock %}
