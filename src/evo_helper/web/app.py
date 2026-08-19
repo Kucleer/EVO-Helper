@@ -343,27 +343,44 @@ def _safe_json_list(text: str | None) -> list[Any]:
         return []
 
 
+#: 「这一轮压根没拿到回答」的两档。它们是**传输失败**，不是模型答错。
+_AI_TRANSPORT_FAILURES = frozenset({"timeout", "http_error"})
+
+
 def _ai_health(rows: Sequence[Any]) -> dict[str, object]:
-    """诊断页顶部那四个数。**没有数据时全给 None**（页面显示「—」，不显示 0%）。
+    """诊断页顶部那几个数。**没有数据时全给 None**（页面显示「—」，不显示 0%）。
 
-    口径（需求文档第九节）：
-    - JSON 通过率 = 不是 `invalid_json` 的比例；
-    - 硬校验通过率 = `status == ok` 的比例（硬校验不过整份作废）；
-    - 数字自洽率 = `ok` 那批里没有 `self_consistency_*` violation 的比例；
-    - 平均重合率 = `ok` 那批的 overlap/budget 平均。
+    ## ⚠️ 每个比率的分母都不一样，这是刻意的
 
-    ⚠️ **重合率不是好坏判据**，页面文案必须把它写出来（需求文档第九节）。
+    2026-08-19 审查抓到的口径错误：原先「硬校验通过率」按 `status == ok` 除以
+    **全部记录**算，于是**超时和 HTTP 错误被算成「硬校验没过」**——LLM 服务挂了
+    一晚上，页面上显示的是「模型不守规则」，而这两件事的善后完全相反
+    （一个去查网络和额度，一个去改 prompt）。
+
+    分成四层，每层只问自己那一问：
+
+    - **调用成功率** = 拿到回答的比例（分母：全部）。传输层的账。
+    - **JSON 通过率** = 拿到的回答里能解析成合法 JSON 的比例
+      （分母：**拿到回答的那些**）。
+    - **硬校验通过率** = 解析出来的那些里过了硬校验的比例
+      （分母：**JSON 解析成功的那些**，即 `ok` + `schema_violation`）。
+    - **数字自洽率** = `ok` 那批里没有 `self_consistency_*` 的比例（分母：`ok`）。
+    - **平均重合数** = `ok` 那批的 overlap 平均。
+
+    ⚠️ **重合率不是好坏判据**，页面文案必须把这句写出来（需求文档第九节）。
     """
     total = len(rows)
     if total == 0:
         return {
+            "call_rate": None,
             "json_rate": None,
             "hard_rate": None,
             "self_consistency_rate": None,
             "avg_overlap": None,
         }
-    ok = [row for row in rows if row.status == "ok"]
-    json_ok = [row for row in rows if row.status != "invalid_json"]
+    answered = [row for row in rows if row.status not in _AI_TRANSPORT_FAILURES]
+    parsed = [row for row in answered if row.status != "invalid_json"]
+    ok = [row for row in parsed if row.status == "ok"]
     consistent = [
         row
         for row in ok
@@ -374,14 +391,11 @@ def _ai_health(rows: Sequence[Any]) -> dict[str, object]:
     ]
     overlaps = [row.overlap for row in ok if row.overlap is not None and row.budget]
     return {
-        "json_rate": round(len(json_ok) / total, 3),
-        "hard_rate": round(len(ok) / total, 3),
-        "self_consistency_rate": (
-            round(len(consistent) / len(ok), 3) if ok else None
-        ),
-        "avg_overlap": (
-            round(sum(overlaps) / len(overlaps), 3) if overlaps else None
-        ),
+        "call_rate": round(len(answered) / total, 3),
+        "json_rate": round(len(parsed) / len(answered), 3) if answered else None,
+        "hard_rate": round(len(ok) / len(parsed), 3) if parsed else None,
+        "self_consistency_rate": (round(len(consistent) / len(ok), 3) if ok else None),
+        "avg_overlap": (round(sum(overlaps) / len(overlaps), 3) if overlaps else None),
     }
 
 

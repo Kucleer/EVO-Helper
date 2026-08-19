@@ -2902,10 +2902,27 @@ class MissionScheduler:
     ) -> None:
         """把这一轮喂给影子观测器。**任何路径都不许改 `assignments` 或抛异常。**
 
-        ⚠️ **开关关掉时这一整段零开销**：`_ai_shadow is None` 或开关没勾，
-        直接 return，不查库、不组 prompt、不起线程（需求第八节第 5 条）。
-        开关的读取在这里、不在 observer 里，是为了让「开关」这一项零成本——
-        observer 自己还要读其余旋钮，那一步要在确认开关开着之后才做。
+        ## 喂进去的是 `candidates`（全池），不是 `eligible`
+
+        ⚠️ **这一点是整个一期成不成立的地方。** `eligible` 是四步流水线筛完的
+        结果：第 3 步按 `score_max_age_hours` 的窗口和 `top_n` 门限裁过，第 4 步
+        过了 `max_score` 军力上限。而这三个旋钮的**数值一个都没进 prompt**——
+        方案第一节的整段理由就是「AI 不该参考旋钮，AI 就是去调这些旋钮的」。
+        喂 `eligible` 等于旋钮的值不给、筛选效果照给，**把答案先塞给它**的另一种
+        形态。所以这里取 `reading.candidates`。
+
+        （`candidates` 本身仍带着第 1 步的两条排除——`bot_revisit_hours` 与
+        保护期排除窗口。那两条不是「哪个目标更值」的判据，而是「这个坐标此刻
+        打不了」，属于事实一侧；而且第 1 步的结果就是需求文档 §3 点名要给的
+        那一份。）
+
+        ## 关掉时的开销
+
+        ⚠️ **「零开销」指的是不组 prompt、不起线程、不发任何网络请求**，
+        **不是「一次库都不查」**：这里要读一行 `military_attack_config` 才知道
+        开关的状态。那张表在同一次派遣里本来就要读好几次（每个旋钮一次，见
+        `_knob`），多这一行读不出量级差别；而把它缓存起来会让「用户在页面上
+        点开开关」延迟生效，那才是真正会误事的。
         """
         if self._ai_shadow is None:
             return
@@ -2920,7 +2937,8 @@ class MissionScheduler:
         account_limit = self._account_line_limit()
         try:
             account_inflight = self._repository.count_inflight_total(now_utc=now, hold=hold)
-        except Exception:  # noqa: BLE001 - 影子观测查库失败只跳过，不动派遣
+        except Exception as error:  # noqa: BLE001 - 影子观测查库失败只跳过，不动派遣
+            self._log_the_ai_shadow_was_skipped(row, "count_inflight_total 查询失败", error, now)
             return
         try:
             self._ai_shadow.observe(
@@ -2928,7 +2946,7 @@ class MissionScheduler:
                 now=now,
                 run_id=self._run_id,
                 budget=total_budget,
-                eligible=reading.eligible,
+                candidates=reading.candidates,
                 origins=[item.coordinate for item in origins],
                 configured_lines={item.coordinate: item.fleet_lines for item in origins},
                 budgets_by_origin={item.coordinate: item.fleet_lines for item in dispatchable_list},
@@ -2938,12 +2956,47 @@ class MissionScheduler:
                 presets=_ai_presets(assignments),
                 assignments=assignments,
             )
-        except Exception:  # noqa: BLE001 - 观测侧的异常绝不连锁到派遣
+        except Exception as error:  # noqa: BLE001 - 观测侧的异常绝不连锁到派遣
+            self._log_the_ai_shadow_was_skipped(row, "observe() 抛异常", error, now)
             return
+
+    def _log_the_ai_shadow_was_skipped(
+        self, row: orm.MissionTaskRow, what: str, error: BaseException, now: datetime
+    ) -> None:
+        """影子观测被一句 `except` 挡掉时留个痕。
+
+        ⚠️ **这两条路以前一个字都不记。** 用户把开关打开、库里什么都没多出来，
+        排障时无从下手——正是 CLAUDE.md 那条「日志不说话，故障拖了两天」的
+        复发形态。判据不是「有没有打日志」，是**出事时能不能只靠库里的日志定位**，
+        所以异常的 `repr` 要带上。
+
+        ⚠️ **限流走 `_log_a_repeated_line`**：这一段每一轮派遣都会走到，
+        一个反复失败的查询能在一夜里刷出上万行。签名里带上异常类型，
+        **换了一种失败立刻写一条**（状态跃迁不受窗口约束）。
+        """
+        detail = f"{type(error).__name__}: {error}"
+        self._log_a_repeated_line(
+            key=(row.id, "ai_shadow_skipped"),
+            mission_kind=row.kind,
+            signature=(what, type(error).__name__),
+            level="WARNING",
+            message=(
+                f"AI 选靶影子：任务「{row.name}」这一轮跳过——{what}（{detail}）。"
+                "派遣不受影响，照常按算法进行。"
+            ),
+            payload={"task": row.name, "what": what, "error": detail},
+            now=now,
+            repeat_noun="跳过",
+        )
 
     def _ai_shadow_enabled(self) -> bool:
         """AI 影子观测的开关。**默认关**（同 `AUTO_ENABLED` 的惯例），
-        没配 / 表没初始化一律当关。"""
+        没配 / 表没初始化一律当关。
+
+        ⚠️ **它读一行库。** `_observe_ai_shadow` 的文档串里写清了为什么不缓存。
+        observer 自己在 `_read_knobs` 里还会再确认一次同一个开关——那是
+        防御性的第二道，用的是它本来就要读的同一行，不多花查询。
+        """
         try:
             row = self._repository.military_attack_config()
         except ValueError:

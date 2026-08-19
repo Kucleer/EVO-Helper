@@ -27,9 +27,11 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -68,8 +70,38 @@ MAX_CONCURRENT_WORKERS = 1
 #: 不节流就是每秒一发 API 请求。60 秒：一轮约 4 发、跑几分钟，够密了。
 AI_SHADOW_MIN_INTERVAL_S = 60.0
 
-#: 默认样本量。需求文档第七节：默认 60。
-DEFAULT_AI_SAMPLE_SIZE = 60
+#: 默认样本量。**需求文档第七节写的是 60，这里是 120——刻意调大的。**
+#:
+#: ⚠️ 60 那个数是按「`eligible` 量级」估的。喂进去的池子换成 `candidates` 全池
+#: 之后，交叉表的格子从约 40 涨到约 80（合成 3,788 个候选、两个出发点实测：
+#: 80 个非空格子），而 60 连「每格一个代表」都不够——旧的降配阶梯会一路退到
+#: 「每格只取军力最高 1 个」，**「读数最新」这个抽样键整个消失**。两个键刻意
+#: 用「最强 / 最新」正是为了不把现有得分公式的答案泄露给 AI，丢掉一个就等于
+#: 丢掉这个设计（方案 2.2）。
+#:
+#: 分类：**运维旋钮**（`military_attack_config.ai_sample_size`）。调大它看得更全、
+#: prompt 更贵；调小会先减少每格的第二、第三个代表，格子覆盖率也跟着掉——
+#: 掉到什么程度 prompt 会照实说（见 `_pool_sections`）。
+DEFAULT_AI_SAMPLE_SIZE = 120
+
+#: 每个格子每个抽样键最多取几个。**两个键各自的上限，不是合计。**
+PER_CELL_PER_KEY = 3
+
+#: 跳过路径的日志限流窗口（秒）。抄 `record_unrecognised_screen` 与
+#: `mission_scheduler.REPEATED_LOG_WINDOW` 的 120 秒先例——同一类问题：
+#: 一个每一轮攻击都可能触发的东西，不限流就把 `system_log` 淹掉。
+#:
+#: ⚠️ 「可用 ↔ 不可用」那一档**不走这个窗口**：它是状态跃迁，变了就立刻写
+#: （同 `_log_a_repeated_line` 的两条规则）。
+SKIP_LOG_THROTTLE_S = 120.0
+
+#: 输出示例里用的坐标。**故意是不存在的 0 号银河**——本仓库是公开的，
+#: prompt 模板会进 git，**模板里不许出现任何真实坐标当例子**（需求 4.4）。
+#:
+#: 它顺带是一道免费的检验：模型要是照抄示例，硬校验的 `unknown_target` /
+#: `unknown_origin` 会当场把整份作废，而不是让一个假坐标混进记录里。
+EXAMPLE_TARGET = "0:0:1"
+EXAMPLE_ORIGIN = "0:0:2"
 
 #: 默认单次 LLM 往返超时。需求文档第七节：默认 30 秒。
 DEFAULT_AI_TIMEOUT_S = 30.0
@@ -101,9 +133,19 @@ def _trip_bucket(minutes: float) -> str:
     return "≥120分"
 
 
+#: 「军力榜从来没见过它」那一档的档名。
+#:
+#: ⚠️ **不许把没读数的并进 `<10K`。** 喂给 AI 的是 `candidates` 全池，里面本来
+#: 就有一批从没上过军力榜的坐标；把它们算成「军力接近 0」是句假话，AI 会据此
+#: 断定那一格全是弱鸡而整格跳过——而真相是**我们不知道**。
+NO_READING_BUCKET = "无读数"
+
+
 def _score_bucket(score: float | None) -> str:
     """军力分档（prompt 里的交叉表用）。**只是描述性分桶，不是选靶旋钮。**"""
-    value = score or 0.0
+    if score is None:
+        return NO_READING_BUCKET
+    value = score
     if value < 10_000:
         return "<10K"
     if value < 20_000:
@@ -144,65 +186,161 @@ def _median_hours(moments: Sequence[datetime], now: datetime) -> float:
 _MIN_AGE_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def _strongest_first(target: ScoredTarget) -> tuple[bool, float, Coordinate]:
+    """「军力最高」这个抽样键。没读数的排最后（不知道 ≠ 等于 0）。"""
+    return (target.military_score is None, -(target.military_score or 0.0), target.coordinate)
+
+
+def _freshest_first(target: ScoredTarget) -> tuple[bool, datetime, Coordinate]:
+    """「读数最新」这个抽样键。没读数的排最后。"""
+    return (
+        target.military_score_at_utc is None,
+        -_epoch(target.military_score_at_utc),
+        target.coordinate,
+    )
+
+
+def _epoch(moment: datetime | None) -> float:
+    """排序用的时刻数值。`_freshest_first` 要取负号，所以不能直接排 datetime。"""
+    return _MIN_AGE_UTC.timestamp() if moment is None else moment.timestamp()
+
+
+@dataclass(frozen=True)
+class StratifiedSample:
+    """分层抽样的结果，**外加它到底是怎么取的**。
+
+    ⚠️ 后面那几个数不是装饰：prompt 里必须照实说每格实际取了几个、覆盖了几个
+    格子。写死一句「每格取军力最高 3 + 读数最新 3」而实际降配成了别的，
+    就是对模型说假话——而这个仓库的规矩是「日志说假话比不说更糟」，
+    对 prompt 一样成立。
+    """
+
+    targets: tuple[ScoredTarget, ...]
+    #: 交叉表里非空格子的总数。
+    cells_total: int
+    #: 真的分到了至少一个代表的格子数。
+    cells_covered: int
+    #: 单个格子里实际取到的最多几个。
+    max_per_cell: int
+
+
 def stratified_samples(
-    eligible: Sequence[ScoredTarget],
+    candidates: Sequence[ScoredTarget],
     origins: Sequence[Coordinate],
     *,
     sample_size: int,
-) -> list[ScoredTarget]:
-    """从 `eligible` 里取分层样本：每个 (出发点, 银河, 往返档, 军力档) 格子里
-    军力最高 + 读数最新各若干，去重，总量钳到 `sample_size`。
+) -> StratifiedSample:
+    """从**全池**里取分层样本：每个 (出发点, 银河, 往返档, 军力档) 格子里
+    按「军力最高」与「读数最新」两个键各取至多 `PER_CELL_PER_KEY` 个。
 
     ⚠️ **抽样键刻意是「最强 / 最新」两个，不是现有得分。** 按 `军力 ÷ 往返`
     排序后取前 N 等于把要验证的那条公式的答案泄露给它（需求 4.2）。
-    两个键都不是那条公式。
 
-    `sample_size` 不足时逐级降配：每格 3+3 → 1+1 → 只取最强 1，仍超就按
-    首次出现顺序截断。降配保证**每个非空格子至少有一个代表**。
+    ## 预算紧的时候先砍什么
+
+    旧版按「3+3 → 1+1 → 只取最强 1」逐级降配，**最后那一级把「读数最新」这个键
+    整个丢掉了**——而在生产量级上它就是常态：合成 3,788 个候选、两个出发点，
+    交叉表有 80 个非空格子，`sample_size=60` 恰好落在最后一级，样本里一个
+    「最新」都没有。丢掉一个键 = 丢掉「不泄露答案」这个设计本身。
+
+    这一版改成**按格子轮转填**：先给每个格子发第一个代表，还有余量再发第二个，
+    以此类推。于是预算紧时先减少的是「每格的第 2、3 个」，**两个键始终都在**：
+    格子之间轮流由「最强」和「最新」领头（偶数格最强领头、奇数格最新领头），
+    所以哪怕每格只发得起一个，样本里两个键也各占约一半。
+
+    `sample_size` 是**硬上限**，`targets` 绝不会超过它；覆盖不到的格子在摘要
+    交叉表里仍然逐格列着个数与中位数，AI 看得见它们存在。
     """
     if sample_size < 1:
         raise ValueError("sample_size must be at least 1")
 
-    def collect(strong: int, fresh: int) -> list[ScoredTarget]:
-        cells: dict[tuple[Coordinate, int, str, str], list[ScoredTarget]] = {}
-        for target in eligible:
-            for origin in origins:
-                cells.setdefault(_cell_key(origin, target), []).append(target)
-        picked: list[ScoredTarget] = []
-        seen: set[Coordinate] = set()
-        for items in cells.values():
-            ordered: list[ScoredTarget] = []
-            if strong:
-                ordered += sorted(
-                    items,
-                    key=lambda t: (
-                        t.military_score is None,
-                        -(t.military_score or 0.0),
-                        t.coordinate,
-                    ),
-                )[:strong]
-            if fresh:
-                ordered += sorted(
-                    items,
-                    key=lambda t: (
-                        t.military_score_at_utc is None,
-                        t.military_score_at_utc or _MIN_AGE_UTC,
-                        t.coordinate,
-                    ),
-                )[:fresh]
-            for item in ordered:
-                if item.coordinate not in seen:
-                    seen.add(item.coordinate)
-                    picked.append(item)
-        return picked
+    cells: dict[tuple[Coordinate, int, str, str], list[ScoredTarget]] = {}
+    for target in candidates:
+        for origin in origins:
+            cells.setdefault(_cell_key(origin, target), []).append(target)
 
-    # 逐级降配。**重新收集而不是在上一批上截断**：截断会让排在后面的格子
-    # 整个没有代表。
-    for strong, fresh in ((3, 3), (1, 1), (1, 0)):
-        result = collect(strong, fresh)
-        if len(result) <= sample_size:
-            return result
-    return collect(1, 0)[:sample_size]
+    lanes: list[list[ScoredTarget]] = []
+    for index, key in enumerate(sorted(cells)):
+        items = cells[key]
+        strong = sorted(items, key=_strongest_first)[:PER_CELL_PER_KEY]
+        fresh = sorted(items, key=_freshest_first)[:PER_CELL_PER_KEY]
+        leading, trailing = (strong, fresh) if index % 2 == 0 else (fresh, strong)
+        lane: list[ScoredTarget] = []
+        in_lane: set[Coordinate] = set()
+        for depth in range(PER_CELL_PER_KEY):
+            for source in (leading, trailing):
+                if depth < len(source) and source[depth].coordinate not in in_lane:
+                    in_lane.add(source[depth].coordinate)
+                    lane.append(source[depth])
+        lanes.append(lane)
+
+    picked: list[ScoredTarget] = []
+    seen: set[Coordinate] = set()
+    per_lane = [0] * len(lanes)
+    depth = 0
+    while len(picked) < sample_size and any(len(lane) > depth for lane in lanes):
+        for index, lane in enumerate(lanes):
+            if len(picked) >= sample_size:
+                break
+            if depth >= len(lane) or lane[depth].coordinate in seen:
+                continue
+            seen.add(lane[depth].coordinate)
+            picked.append(lane[depth])
+            per_lane[index] += 1
+        depth += 1
+    return StratifiedSample(
+        targets=tuple(picked),
+        cells_total=len(lanes),
+        cells_covered=sum(1 for count in per_lane if count),
+        max_per_cell=max(per_lane) if per_lane else 0,
+    )
+
+
+def _age_distribution(candidates: Sequence[ScoredTarget], now: datetime) -> str:
+    """全池读数龄的分布：中位 / p90 / 最大 / 有多少个根本没读数（方案 2.3）。
+
+    ⚠️ **这一段以前只有一句「下面是全池读数龄分布」而后面什么都没有。**
+    对模型说「有」而实际没有，比不说更糟：它会以为自己漏读了，或者干脆
+    编一个分布出来。
+    """
+    ages = sorted(
+        (now - target.military_score_at_utc).total_seconds() / 3600
+        for target in candidates
+        if target.military_score_at_utc is not None
+    )
+    missing = len(candidates) - len(ages)
+    if not ages:
+        return (
+            f"- 全池读数龄分布：**{missing} 个候选一个军力读数都没有**"
+            f"（全池 {len(candidates)} 个），算不出分布"
+        )
+    median = _median(ages)
+    p90 = ages[min(len(ages) - 1, max(0, math.ceil(0.9 * len(ages)) - 1))]
+    return (
+        f"- 全池读数龄分布：中位 {median:.2f}h / p90 {p90:.2f}h / 最大 {ages[-1]:.2f}h；"
+        f"其中 **{missing} 个候选根本没有读数**（全池 {len(candidates)} 个）"
+    )
+
+
+#: 输出格式的示例。⚠️ **坐标是 `EXAMPLE_*` 那两个占位值，不是任何真实星球。**
+#: 这个常量抽出来是为了让「模板里没有真实坐标」这件事**能被用例断言**，
+#: 而不只是靠人读一遍代码（用例见 `tests/unit/application/test_ai_shadow_prompt.py`）。
+OUTPUT_EXAMPLE = (
+    "{\n"
+    '  "picks": [\n'
+    f'    {{"target": "{EXAMPLE_TARGET}", "origin": "{EXAMPLE_ORIGIN}",'
+    ' "preset": "<预设名>", "rank": 1,\n'
+    '      "military": 12345, "reading_age_hours": 0.3, "round_trip_minutes": 125,\n'
+    '      "reason": "为什么是它——引用上面给过的军力 / 读数龄 / 往返"}\n'
+    "  ],\n"
+    '  "pool_warnings": [\n'
+    '    {"severity": "high", "finding": "……", "suggested_check": "……"}\n'
+    "  ],\n"
+    '  "confidence": "high|medium|low",\n'
+    '  "notes": "一句话说清这一轮的主要取舍"\n'
+    "}\n"
+    "⚠️ 上面的坐标与数字是**占位示例**（0 号银河并不存在），照抄会被当场作废。"
+)
 
 
 def _algorithm_picks_json(assignments: Sequence[Any]) -> str:
@@ -233,7 +371,7 @@ def build_prompt(
     budgets_by_origin: Mapping[Coordinate, int],
     account_limit: int | None,
     account_inflight: int,
-    eligible: Sequence[ScoredTarget],
+    candidates: Sequence[ScoredTarget],
     presets: frozenset[str],
     last_attack_at: Mapping[Coordinate, datetime | None],
     protected_seen_at: Mapping[Coordinate, datetime | None],
@@ -241,9 +379,18 @@ def build_prompt(
 ) -> str:
     """组装 prompt。**账号名 / 玩家名 / 单位数量 / 五个旋钮的值一律不出现在这里。**
 
-    `last_attack_at` / `protected_seen_at` 只用来标样本行，让 AI 别去挑
-    保护期里 / 刚打过的目标。`sample_size` 是那个运维旋钮
-    （`military_attack_config.ai_sample_size`，默认 60）。
+    ⚠️ **`candidates` 是选靶第 1 步之后的全池，不是 `eligible`。** 喂 `eligible`
+    等于把答案先塞给它：那一批已经过了 `score_max_age_hours`（读数窗口）、
+    `top_n`（窗口门限）和 `max_score`（军力上限）三道旋钮，**旋钮的数值没进
+    prompt，筛选效果却原样加在它能看到的池子上**——而这几个旋钮恰恰是这一期
+    要让 AI 去替代的东西（方案第一节）。
+
+    `last_attack_at` / `protected_seen_at` 用来给每个样本行标「我方上次攻击距今
+    多久」「是否撞过保护期及时刻」，这是它判断保护期与攻击间隔的原始事实。
+    ⚠️ `last_attack_at` 必须由 `attack_dispatches` 算出来——
+    `bot_targets.last_attack_at_utc` 那一列从来没被写过。
+
+    `sample_size` 是那个运维旋钮（`military_attack_config.ai_sample_size`）。
     """
     total_budget = sum(budgets_by_origin.values())
     budget_text = _budget_section(
@@ -254,8 +401,8 @@ def build_prompt(
         account_limit=account_limit,
         account_inflight=account_inflight,
     )
-    summary_text, samples_text, sample_count, pool_total = _pool_sections(
-        eligible=eligible,
+    summary_text, samples_text, sampling_note = _pool_sections(
+        candidates=candidates,
         origins=origins,
         now=now,
         last_attack_at=last_attack_at,
@@ -278,18 +425,16 @@ def build_prompt(
         ),
         "# 二、候选池（⚠️ 这是分层抽样，不是全池）",
         summary_text,
-        (
-            "样本（每个非空格子取「军力最高 3 个 + 读数最新 3 个」，去重，共 "
-            f"{sample_count} 个；全池 {pool_total} 个）：\n{samples_text}"
-        ),
+        f"{sampling_note}\n{samples_text}",
         "# 三、时间",
         f"- 本周期起点（军力每周一 UTC+0 刷新）：{cycle_start:%Y-%m-%d %H:%M} UTC",
         (
             "- 现在是刷新后第 "
             f"{int((now - cycle_start).total_seconds() // 86400)} 天、第 "
             f"{int((now - cycle_start).total_seconds() // 3600)} 小时\n"
-            "- 下面是每个样本自己的读数龄（小时）与全池读数龄分布。读数越旧越不可信。"
+            "- 每个样本自己的读数龄（小时）标在上面那张样本表里。读数越旧越不可信。"
         ),
+        _age_distribution(candidates, now),
         "# 四、飞行时间公式（可用来估算任意候选的往返）",
         (
             "- 同银河：D = 1162 + 31.71 × 恒星系环距"
@@ -329,20 +474,7 @@ def build_prompt(
             "这是航线之外的第二种成本。"
         ),
         "# 七、输出（严格 JSON，不要输出任何多余文字）",
-        (
-            "{\n"
-            '  "picks": [\n'
-            '    {"target": "3:98:12", "origin": "4:277:15", "preset": "BBB", "rank": 1,\n'
-            '      "military": 31820, "reading_age_hours": 0.3, "round_trip_minutes": 125,\n'
-            '      "reason": "军力 31,820、读数龄 0.3h、往返 125 分；折算后是本轮最高"}\n'
-            '  ],\n'
-            '  "pool_warnings": [\n'
-            '    {"severity": "high", "finding": "……", "suggested_check": "……"}\n'
-            "  ],\n"
-            '  "confidence": "high|medium|low",\n'
-            '  "notes": "一句话说清这一轮的主要取舍"\n'
-            "}"
-        ),
+        OUTPUT_EXAMPLE,
         "要求：",
         f"1. picks **恰好** {total_budget} 个，不多不少。",
         "2. target / origin / preset 只能来自上面给过的集合。",
@@ -396,21 +528,24 @@ def _budget_section(
 
 
 def _pool_sections(
-    eligible: Sequence[ScoredTarget],
+    candidates: Sequence[ScoredTarget],
     origins: Sequence[Coordinate],
     *,
     now: datetime,
     last_attack_at: Mapping[Coordinate, datetime | None],
     protected_seen_at: Mapping[Coordinate, datetime | None],
     sample_size: int = DEFAULT_AI_SAMPLE_SIZE,
-) -> tuple[str, str, int, int]:
-    """候选池的交叉表摘要 + 样本清单。返回 (summary, samples_text, sample_count, pool_total)。
+) -> tuple[str, str, str]:
+    """候选池的交叉表摘要 + 样本清单。返回 (summary, samples_text, sampling_note)。
 
     交叉表按**每个出发点各一份**：往返时间是 (目标, 出发星球) 的函数，同一目标
     从不同星出发落在不同往返档里。
+
+    `sampling_note` 说的是**这一次实际怎么抽的**——每格取了几个、覆盖了几个格子。
+    ⚠️ 不许写死「每格 3+3」：抽样会按预算降配，写死就是对模型说假话。
     """
     cells: dict[tuple[Coordinate, int, str, str], list[ScoredTarget]] = {}
-    for target in eligible:
+    for target in candidates:
         for origin in origins:
             cells.setdefault(_cell_key(origin, target), []).append(target)
 
@@ -437,9 +572,9 @@ def _pool_sections(
                 f"军力中位 {score_text}，龄中位 {age_text}"
             )
 
-    samples = stratified_samples(eligible, origins, sample_size=sample_size)
+    sample = stratified_samples(candidates, origins, sample_size=sample_size)
     sample_lines: list[str] = []
-    for target in samples:
+    for target in sample.targets:
         trip_text = " / ".join(
             f"从{origin} {round_trip_hours(target.coordinate, origin) * 60:.0f}分"
             for origin in origins
@@ -462,11 +597,26 @@ def _pool_sections(
             if protected is None
             else f"已知撞过保护期（{protected:%H:%M} UTC）"
         )
+        score_text = (
+            "无读数（军力榜没见过它，不是「很弱」）"
+            if target.military_score is None
+            else f"{target.military_score:,.0f}"
+        )
         sample_lines.append(
-            f"    {target.coordinate} | 军力 {target.military_score:,.0f} | 龄 {age_text} | "
+            f"    {target.coordinate} | 军力 {score_text} | 龄 {age_text} | "
             f"往返 {trip_text} | {last_text} | 保护期 {protected_text}"
         )
-    return "\n".join(summary_lines), "\n".join(sample_lines), len(samples), len(eligible)
+    note = (
+        f"样本（分层抽样，**不是全池**：每个非空格子按「军力最高」与「读数最新」"
+        f"两个键各取至多 {PER_CELL_PER_KEY} 个，格子之间轮流由「最强」和「最新」领头，"
+        f"再按格子轮转填到上限。\n"
+        f"本次实取 {len(sample.targets)} 个，覆盖 {sample.cells_covered}/{sample.cells_total} "
+        f"个非空格子，单格最多 {sample.max_per_cell} 个；全池共 {len(candidates)} 个候选。\n"
+        f"⚠️ 样本之外的候选我们没有给出坐标，所以这一轮只能从下面这张表里选；"
+        f"但上面那张交叉表给的是**全池真实总数**——样本数不等于可选目标数，"
+        f"发现某一格明显被抽样漏掉了，写进 pool_warnings。）："
+    )
+    return "\n".join(summary_lines), "\n".join(sample_lines), note
 
 
 class AiShadowObserver:
@@ -502,15 +652,72 @@ class AiShadowObserver:
         #: 是否真能发请求。缺 httpx 时整条观测降级为不可用。
         self._httpx = httpx
         self._disabled_reason = None if httpx is not None else "httpx 未安装"
+        #: 上一次记过的「可用 / 不可用」。None = 还没记过任何一条。
+        #: **只在跃迁时写日志**，同 `mission_scheduler._log_a_repeated_line` 的规矩。
+        self._availability: bool | None = None
+        #: 各种「这一下跳过了」上一次落库的单调时刻，按 `SKIP_LOG_THROTTLE_S` 限流。
+        self._skip_logged_at: dict[str, float] = {}
 
     # -- 供调度器 --------------------------------------------------------------
 
     @property
-    def enabled(self) -> bool:
-        """开关 + 凭据 + 依赖三样齐了才叫可用。关着时 `observe` 零开销返回。"""
+    def available(self) -> bool:
+        """**凭据 + 依赖**齐了没有。⚠️ **它不看开关。**
+
+        开关（`military_attack_config.ai_shadow_enabled`）由调度器一侧判
+        （`MissionScheduler._ai_shadow_enabled`），因为「开关关掉时不组 prompt、
+        不起线程」这条要在调用之前就成立。`observe()` 自己也会再确认一次开关
+        （用的是 `_read_knobs` 本来就要读的那一行，不多花一次查询）——
+        **这里返回 True 不代表这一轮会真的发请求。**
+        """
         if self._disabled_reason is not None:
             return False
         return bool(self._settings.ai_api_base and self._settings.ai_api_key)
+
+    #: 旧名。`available` 才说得准它管的是什么（不含开关），保留这个别名是因为
+    #: 「observer.enabled」读起来太像「整条功能开着」，正是要避免的误解。
+    @property
+    def enabled(self) -> bool:
+        """⚠️ **已改名为 `available`**：它只看凭据与依赖，**不看开关**。"""
+        return self.available
+
+    def _note_availability(self, available: bool, reason: str) -> None:
+        """「可用 ↔ 不可用」的跃迁记一条。**只在变化时写**，不受限流窗口约束。
+
+        ⚠️ 这条是补 2026-08-19 审查发现的那个洞：用户把开关打开、`.env` 少一个键
+        或者 `httpx` 没装，**页面上什么都不会发生，而库里一个字都查不到原因**。
+        这正是 CLAUDE.md 里「日志不说话把故障拖了两天」的复发形态。
+        """
+        if self._availability is available:
+            return
+        self._availability = available
+        record_system_log(
+            "INFO" if available else "WARNING",
+            "application.ai_targeting",
+            (
+                "AI 选靶影子：观测恢复可用（凭据与依赖都齐了）"
+                if available
+                else f"AI 选靶影子：开关开着但观测不可用——{reason}；这一轮不会发起任何调用"
+            ),
+            payload={"available": available, "reason": None if available else reason},
+        )
+
+    def _note_skip(self, code: str, message: str, payload: dict[str, Any], at: float) -> None:
+        """「这一下跳过了」的限流日志。同一个 `code` 每 `SKIP_LOG_THROTTLE_S` 一条。
+
+        ⚠️ 时刻由调用方传进来，**不在这里再读一次单调钟**：`observe()` 一次只该
+        取一次时刻，注入假钟的用例才数得清。
+        """
+        last = self._skip_logged_at.get(code)
+        if last is not None and at - last < SKIP_LOG_THROTTLE_S:
+            return
+        self._skip_logged_at[code] = at
+        record_system_log(
+            "INFO",
+            "application.ai_targeting",
+            message,
+            payload={**payload, "skip_code": code},
+        )
 
     def observe(
         self,
@@ -519,7 +726,7 @@ class AiShadowObserver:
         now: datetime,
         run_id: UUID | None,
         budget: int,
-        eligible: Sequence[ScoredTarget],
+        candidates: Sequence[ScoredTarget],
         origins: Sequence[Coordinate],
         configured_lines: Mapping[Coordinate, int],
         budgets_by_origin: Mapping[Coordinate, int],
@@ -531,23 +738,53 @@ class AiShadowObserver:
     ) -> bool:
         """同步入口。返回「这一下真的发起了一个观测」。
 
-        开关关掉、没有凭据、样本为空、线程已满、该任务还在冷却内，都返回 False
-        且**不产生任何副作用**（需求第八节「开关关掉时零开销」）。
+        开关关掉、没有凭据、池子为空、线程已满、该任务还在冷却内，都返回 False
+        且**不发起任何调用**（需求第八节）。
+
+        ⚠️ **每一条返回 False 的路都要在库里留下痕迹**（限流之后）：用户把开关
+        打开却什么都不发生，必须能从 `system_log` 里查出是哪一条把它挡掉的。
+        唯一不记的是 `budget < 1` / 池子为空——那是「这一轮本来就没活干」，
+        调度器自己的日志已经说清楚了。
         """
-        if not self.enabled:
+        if not self.available:
+            self._note_availability(False, self._disabled_reason or "缺少 AI API 凭据")
             return False
+        self._note_availability(True, "")
         if budget < 1:
             return False
-        if not eligible:
+        if not candidates:
             return False
-        # 开关已确认开着，才读三个行为旋钮（改动即生效）。这一步有库查询，
-        # 所以必须排在 enabled / budget / eligible 三个零成本检查之后。
-        sample_size, timeout_s, model = self._read_knobs()
+        # 凭据已确认齐了，才读那一行配置（开关 + 三个行为旋钮，一次查询全拿到）。
+        # ⚠️ 开关在这里**再确认一次**：调度器一侧已经判过，但 observer 不该把
+        # 「调用方一定判过」当成自己的保险——多一个调用点就会破。
+        sample_size, timeout_s, model, switch_on = self._read_knobs()
         with self._lock:
-            if self._active >= MAX_CONCURRENT_WORKERS:
-                return False
             now_m = self._monotonic()
+            if not switch_on:
+                self._note_skip(
+                    "switch_off",
+                    "AI 选靶影子：开关（military_attack_config.ai_shadow_enabled）没开，跳过",
+                    {"task_id": task_id},
+                    now_m,
+                )
+                return False
+            if self._active >= MAX_CONCURRENT_WORKERS:
+                self._note_skip(
+                    "workers_busy",
+                    f"AI 选靶影子：已有 {self._active} 个观测线程在跑"
+                    f"（上限 {MAX_CONCURRENT_WORKERS}），任务 {task_id} 这一轮跳过",
+                    {"task_id": task_id, "active": self._active},
+                    now_m,
+                )
+                return False
             if now_m - self._last_request_at.get(task_id, float("-inf")) < AI_SHADOW_MIN_INTERVAL_S:
+                self._note_skip(
+                    f"throttled:{task_id}",
+                    f"AI 选靶影子：任务 {task_id} 距上次发起不足 "
+                    f"{AI_SHADOW_MIN_INTERVAL_S:.0f} 秒，这一轮跳过（限流，不是故障）",
+                    {"task_id": task_id, "min_interval_s": AI_SHADOW_MIN_INTERVAL_S},
+                    now_m,
+                )
                 return False
             self._last_request_at[task_id] = now_m
             self._active += 1
@@ -558,7 +795,7 @@ class AiShadowObserver:
                 now,
                 run_id,
                 budget,
-                tuple(eligible),
+                tuple(candidates),
                 tuple(origins),
                 dict(configured_lines),
                 dict(budgets_by_origin),
@@ -576,11 +813,15 @@ class AiShadowObserver:
         ).start()
         return True
 
-    def _read_knobs(self) -> tuple[int, float, str]:
-        """实时读三个行为旋钮（`ai_sample_size` / `ai_timeout_seconds` / `ai_model`）。
+    def _read_knobs(self) -> tuple[int, float, str, bool]:
+        """一次查询读出开关与三个行为旋钮（改动即生效）。
 
-        读不到（表没初始化 / 配置行不存在）就回落 `__init__` 里的默认值——
-        开关已经确认开着，回落只会让这一轮用默认参数，不会让调度受影响。
+        返回 `(sample_size, timeout_s, model, switch_on)`。⚠️ **开关也从这里读**：
+        调度器一侧已经判过一次，但那是调用方的事；observer 自己再确认一次，
+        用的是本来就要读的同一行，**不多花一次查询**。
+
+        读不到（表没初始化 / 配置行不存在）就回落 `__init__` 里的默认值，
+        **开关按「关」处理**——没配置行时宁可什么都不发。
         """
         sample_size = self._sample_size
         timeout_s = self._timeout_s
@@ -588,14 +829,14 @@ class AiShadowObserver:
         try:
             row = self._repository.military_attack_config()
         except ValueError:
-            return sample_size, timeout_s, model
+            return sample_size, timeout_s, model, False
         if row.ai_sample_size is not None:
             sample_size = int(row.ai_sample_size)
         if row.ai_timeout_seconds is not None:
             timeout_s = float(row.ai_timeout_seconds)
         if row.ai_model:
             model = row.ai_model
-        return sample_size, timeout_s, model
+        return sample_size, timeout_s, model, bool(row.ai_shadow_enabled)
 
     def _worker(self, *args: Any) -> None:
         try:
@@ -617,7 +858,7 @@ class AiShadowObserver:
         now: datetime,
         run_id: UUID | None,
         budget: int,
-        eligible: tuple[ScoredTarget, ...],
+        candidates: tuple[ScoredTarget, ...],
         origins: tuple[Coordinate, ...],
         configured_lines: dict[Coordinate, int],
         budgets_by_origin: dict[Coordinate, int],
@@ -637,9 +878,12 @@ class AiShadowObserver:
             inflight[origin] = self._repository.inflight_lines(
                 now_utc=now, origin=origin, hold=hold
             )
-        sample_targets = [item.coordinate for item in eligible]
-        last_attack = self._repository.last_bot_attack_at(sample_targets)
-        protected = self._repository.bot_target_protection_seen_at(sample_targets)
+        # ⚠️ 这两份事实要覆盖**整个候选池**，不能只覆盖被抽到的样本：硬校验允许
+        # AI 从全池里挑，软核对（保护期 / 距上次攻击 8 小时）就得对全池都答得出来。
+        # 池子有三四千个，两个查询在仓库里已按块拆开发（见 `last_bot_attack_at`）。
+        pool_coordinates = [item.coordinate for item in candidates]
+        last_attack = self._repository.last_bot_attack_at(pool_coordinates)
+        protected = self._repository.bot_target_protection_seen_at(pool_coordinates)
 
         prompt = build_prompt(
             task_id=task_id,
@@ -651,14 +895,14 @@ class AiShadowObserver:
             budgets_by_origin=budgets_by_origin,
             account_limit=account_limit,
             account_inflight=account_inflight,
-            eligible=eligible,
+            candidates=candidates,
             presets=presets,
             last_attack_at=last_attack,
             protected_seen_at=protected,
             sample_size=sample_size,
         )
         algorithm_picks_json = _algorithm_picks_json(assignments)
-        reference = _soft_reference(eligible, origins, last_attack, protected, now)
+        reference = _soft_reference(candidates, origins, last_attack, protected, now)
 
         started = time.monotonic()
         response_text: str | None
@@ -692,7 +936,7 @@ class AiShadowObserver:
         if status == AiDecisionStatus.OK.value and response_text is not None:
             status, violations, ai_picks_json, overlap = self._decode_and_check(
                 response_text,
-                eligible,
+                candidates,
                 origins,
                 budgets_by_origin,
                 budget,
@@ -786,7 +1030,7 @@ class AiShadowObserver:
     def _decode_and_check(
         self,
         response_text: str,
-        eligible: tuple[ScoredTarget, ...],
+        candidates: tuple[ScoredTarget, ...],
         origins: tuple[Coordinate, ...],
         budgets_by_origin: dict[Coordinate, int],
         budget: int,
@@ -835,7 +1079,7 @@ class AiShadowObserver:
             picks.append(parsed)
 
         vocabulary = PickVocabulary(
-            targets=frozenset(item.coordinate for item in eligible),
+            targets=frozenset(item.coordinate for item in candidates),
             origins=frozenset(origins),
             presets=_preset_names(assignments),
             budget_by_origin=budgets_by_origin,
@@ -863,17 +1107,25 @@ class AiShadowObserver:
 
 
 def _soft_reference(
-    eligible: tuple[ScoredTarget, ...],
+    candidates: tuple[ScoredTarget, ...],
     origins: tuple[Coordinate, ...],
     last_attack_at: Mapping[Coordinate, datetime | None],
     protected_seen_at: Mapping[Coordinate, datetime | None],
     now: datetime,
 ) -> SoftReference:
-    """软核对要的我方事实。`last_attack_at` / `protected_seen_at` 在线程里查好传入。"""
+    """软核对要的我方事实。`last_attack_at` / `protected_seen_at` 在线程里查好传入。
+
+    ⚠️ **全池里有一批根本没有军力读数**（`candidates` 不像 `eligible` 那样要求
+    有读数），它们要单独记一份：只把它们从 `military` 里漏掉的话，AI 给它们
+    编一个军力数会被当成「无从核对」放过去。
+    """
     military: dict[Coordinate, float] = {}
     ages: dict[Coordinate, float] = {}
-    for item in eligible:
-        if item.military_score is not None:
+    without_reading: set[Coordinate] = set()
+    for item in candidates:
+        if item.military_score is None:
+            without_reading.add(item.coordinate)
+        else:
             military[item.coordinate] = item.military_score
         if item.military_score_at_utc is not None:
             ages[item.coordinate] = (now - item.military_score_at_utc).total_seconds() / 3600
@@ -881,7 +1133,7 @@ def _soft_reference(
         item.coordinate: {
             origin: round_trip_hours(item.coordinate, origin) * 60 for origin in origins
         }
-        for item in eligible
+        for item in candidates
     }
     protected_until: dict[Coordinate, datetime | None] = {
         coordinate: (
@@ -896,6 +1148,7 @@ def _soft_reference(
         last_attack_at=last_attack_at,
         protected_until=protected_until,
         now=now,
+        targets_without_reading=frozenset(without_reading),
     )
 
 
@@ -935,6 +1188,13 @@ __all__ = [
     "DEFAULT_AI_RETENTION_DAYS",
     "DEFAULT_AI_SAMPLE_SIZE",
     "DEFAULT_AI_TIMEOUT_S",
+    "EXAMPLE_ORIGIN",
+    "EXAMPLE_TARGET",
+    "NO_READING_BUCKET",
+    "OUTPUT_EXAMPLE",
+    "PER_CELL_PER_KEY",
+    "SKIP_LOG_THROTTLE_S",
+    "StratifiedSample",
     "build_prompt",
     "stratified_samples",
 ]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -3145,36 +3145,42 @@ class SqlAlchemyRepository:
 
         ⚠️ **只认 bot 攻击发**（`mission_kind = ATTACK`）。侦察发不产生战报，
         也不该把「我方刚碰过它」算进保护期判据。
+
+        ⚠️ **按块发**（`_COORDINATE_CHUNK`）：调用方喂进来的是**整个候选池**，
+        生产上三四千个坐标。一次性拼成一个几千项的 `OR` 会撞上 SQLite 的表达式
+        树深度上限与绑定参数上限，而那是「本机测试好好的、实机一上来就炸」
+        的经典形态。
         """
         if not coordinates:
             return {}
-        with self._session_factory() as session:
-            rows = session.execute(
-                select(
-                    orm.AttackIntentRow.target_galaxy,
-                    orm.AttackIntentRow.target_system,
-                    orm.AttackIntentRow.target_position,
-                    func.max(orm.AttackDispatchRow.dispatched_at_utc),
-                )
-                .join(
-                    orm.AttackDispatchRow,
-                    orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
-                )
-                .where(
-                    orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
-                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
-                    orm.AttackDispatchRow.accepted.is_(True),
-                    or_(*(_intent_is_target(c) for c in coordinates)),
-                )
-                .group_by(
-                    orm.AttackIntentRow.target_galaxy,
-                    orm.AttackIntentRow.target_system,
-                    orm.AttackIntentRow.target_position,
-                )
-            ).all()
         result: dict[Coordinate, datetime | None] = {coordinate: None for coordinate in coordinates}
-        for galaxy, system, position, moment in rows:
-            result[Coordinate(galaxy, system, position)] = moment
+        with self._session_factory() as session:
+            for chunk in _in_chunks(coordinates):
+                rows = session.execute(
+                    select(
+                        orm.AttackIntentRow.target_galaxy,
+                        orm.AttackIntentRow.target_system,
+                        orm.AttackIntentRow.target_position,
+                        func.max(orm.AttackDispatchRow.dispatched_at_utc),
+                    )
+                    .join(
+                        orm.AttackDispatchRow,
+                        orm.AttackDispatchRow.intent_id == orm.AttackIntentRow.id,
+                    )
+                    .where(
+                        orm.AttackIntentRow.target_kind == TARGET_KIND_BOT,
+                        orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                        orm.AttackDispatchRow.accepted.is_(True),
+                        or_(*(_intent_is_target(c) for c in chunk)),
+                    )
+                    .group_by(
+                        orm.AttackIntentRow.target_galaxy,
+                        orm.AttackIntentRow.target_system,
+                        orm.AttackIntentRow.target_position,
+                    )
+                ).all()
+                for galaxy, system, position, moment in rows:
+                    result[Coordinate(galaxy, system, position)] = moment
         return result
 
     def bot_target_protection_seen_at(
@@ -3187,29 +3193,36 @@ class SqlAlchemyRepository:
         用「撞上时刻 + 游戏规则 8 小时」估计保护期到什么时候（`domain.target_order`
         的 `DEFAULT_PROTECTION_EXCLUSION` 是策略、不是规则，这里不能用）。
         查不到的行返回 None（「从没撞过」，不是「没在保护期」）。
+
+        ⚠️ **按块发**，理由同 `last_bot_attack_at`：调用方喂的是整个候选池。
         """
         if not coordinates:
             return {}
         target = orm.BotTargetRow
+        result: dict[Coordinate, datetime | None] = {coordinate: None for coordinate in coordinates}
         with self._session_factory() as session:
-            rows = session.execute(
-                select(target.galaxy, target.system, target.position, target.protection_seen_at_utc)
-                .where(
-                    or_(
-                        *(
-                            and_(
-                                target.galaxy == c.galaxy,
-                                target.system == c.system,
-                                target.position == c.position,
+            for chunk in _in_chunks(coordinates):
+                rows = session.execute(
+                    select(
+                        target.galaxy,
+                        target.system,
+                        target.position,
+                        target.protection_seen_at_utc,
+                    ).where(
+                        or_(
+                            *(
+                                and_(
+                                    target.galaxy == c.galaxy,
+                                    target.system == c.system,
+                                    target.position == c.position,
+                                )
+                                for c in chunk
                             )
-                            for c in coordinates
                         )
                     )
-                )
-            ).all()
-        result: dict[Coordinate, datetime | None] = {coordinate: None for coordinate in coordinates}
-        for galaxy, system, position, seen_at in rows:
-            result[Coordinate(galaxy, system, position)] = seen_at
+                ).all()
+                for galaxy, system, position, seen_at in rows:
+                    result[Coordinate(galaxy, system, position)] = seen_at
         return result
 
 
@@ -3269,6 +3282,23 @@ def _from_origin(origin: Coordinate) -> ColumnElement[bool]:
         orm.AttackIntentRow.origin_system == origin.system,
         orm.AttackIntentRow.origin_position == origin.position,
     )
+
+
+#: 「按坐标列表查」时一次最多塞几个坐标进 `OR`。
+#:
+#: ⚠️ **这是标定常量，不是偏好项。** 取值由 SQLite 的两条硬上限定：表达式树深度
+#: 默认 1000，绑定参数默认上限也在千这个量级；每个坐标占 3 个参数、一层 `AND`，
+#: 200 个 = 600 个参数、深度两百出头，离两条线都还有一倍余量。
+#: 调大它不会让结果「更适合我」，只会让某一天的某个池子把语句撑爆。
+_COORDINATE_CHUNK = 200
+
+
+def _in_chunks(
+    coordinates: Sequence[Coordinate], size: int = _COORDINATE_CHUNK
+) -> Iterator[Sequence[Coordinate]]:
+    """把坐标列表切块。见 `_COORDINATE_CHUNK` 上的理由。"""
+    for start in range(0, len(coordinates), size):
+        yield coordinates[start : start + size]
 
 
 def _intent_is_target(target: Coordinate) -> ColumnElement[bool]:

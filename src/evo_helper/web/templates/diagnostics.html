@@ -98,10 +98,11 @@
   </p>
 
   <div class="filter-bar" style="margin:0 0 12px">
-    <span class="chip">JSON 通过率 {{ "—" if ai_health.json_rate is none else (ai_health.json_rate * 100)|round(1) ~ "%" }}</span>
-    <span class="chip">硬校验通过率 {{ "—" if ai_health.hard_rate is none else (ai_health.hard_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="拿到回答的比例（分母：全部记录）。超时与 HTTP 错误只减这一个，不算进后面几项。">调用成功率 {{ "—" if ai_health.call_rate is none else (ai_health.call_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="分母是「拿到回答的那些」，不是全部记录。">JSON 通过率 {{ "—" if ai_health.json_rate is none else (ai_health.json_rate * 100)|round(1) ~ "%" }}</span>
+    <span class="chip" title="分母是「JSON 解析成功的那些」。超时与 HTTP 错误不算作硬校验没过。">硬校验通过率 {{ "—" if ai_health.hard_rate is none else (ai_health.hard_rate * 100)|round(1) ~ "%" }}</span>
     <span class="chip">数字自洽率 {{ "—" if ai_health.self_consistency_rate is none else (ai_health.self_consistency_rate * 100)|round(1) ~ "%" }}</span>
-    <span class="chip">平均重合率 {{ "—" if ai_health.avg_overlap is none else ai_health.avg_overlap }}</span>
+    <span class="chip" title="ok 那批里「AI 与算法选中同一个坐标」的平均个数——不是百分比，也不是好坏的判据。">平均重合数 {{ "—" if ai_health.avg_overlap is none else ai_health.avg_overlap }}</span>
   </div>
 
   {% if not ai_decisions %}

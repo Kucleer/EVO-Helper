@@ -109,6 +109,13 @@ class SoftReference:
     #: target -> 保护期到什么时候（`protection_seen_at_utc` + 8 小时）。None = 没撞过。
     protected_until: Mapping[Coordinate, datetime | None]
     now: datetime
+    #: 已知**根本没有军力读数**的候选。
+    #:
+    #: ⚠️ **「查不到」和「已知没有」必须分开。** 喂给 AI 的是全池
+    #: （`MilitaryPoolReading.candidates`），里面本来就有一批军力榜从没见过的坐标。
+    #: 只让它们在 `military` 里缺席的话，AI 给它们编一个军力数会被当成
+    #: 「无从核对」放过去——而那恰恰是最该抓的一种编数字。
+    targets_without_reading: frozenset[Coordinate] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -282,6 +289,16 @@ def soft_check_picks(
                 "self_consistency_military",
                 f"{_coordinate_text(pick.target)}：AI 报军力 {pick.military:,.0f}，"
                 f"我方读数 {expected_military:,.0f}（军力必须精确相等）",
+            )
+        if (
+            pick.military is not None
+            and expected_military is None
+            and pick.target in reference.targets_without_reading
+        ):
+            add(
+                "self_consistency_military",
+                f"{_coordinate_text(pick.target)}：AI 报军力 {pick.military:,.0f}，"
+                f"而我方对它**没有任何军力读数**（prompt 里这一行写的就是「无读数」）",
             )
         expected_age = reference.reading_age_hours.get(pick.target)
         if (
