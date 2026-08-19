@@ -28,6 +28,17 @@
 - **写**：子进程的环境里必须钉着 `PYTHONIOENCODING=utf-8`；
 - **读**：同一个文件里前后两种编码都得读对——修复落地之后，那些一直追加、
   从不轮转的 `backfill-*.log` 前半截是 GBK、后半截是 UTF-8。
+
+## ⚠️ 这一整个文件里，「历史那半截是什么编码」一律显式写出来
+
+CI 跑在 Linux（首选编码 UTF-8），开发机是中文 Windows（cp936）。
+`LEGACY_LOG_ENCODING` 取的是**本机**首选编码——在开发机上它恰好就是这些用例
+想要的那一个，于是「忘了声明前提」在本地看不出来。PR #222 第一次 CI 就是这么
+挂的：唯一没显式声明的那条（端到端那条走 `log_tail()`，不传 `legacy_encoding`）
+本地绿、CI 红。
+
+所以：**要么传 `legacy_encoding=`，要么 monkeypatch `LEGACY_LOG_ENCODING`。**
+一条都不许靠「跑它的机器碰巧是那个代码页」。
 """
 
 from __future__ import annotations
@@ -171,6 +182,31 @@ def test_undecodable_bytes_do_not_blow_up() -> None:
     都显示不出来了。
     """
     assert decode_log_text(b"\xff\xfe abc", legacy_encoding="ascii").endswith(" abc")
+
+
+def test_the_fallback_encoding_is_resolved_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不传 `legacy_encoding` 时，回退用的是**调用那一刻**的 `LEGACY_LOG_ENCODING`。
+
+    ⚠️ **这条用例守的是「这个修复本身守不守得住」。**
+
+    写成 `def decode_log_text(..., legacy_encoding: str = LEGACY_LOG_ENCODING)` 的话，
+    那个值在 import 那一刻就被求值、冻进函数的默认值里了；此后 monkeypatch 模块
+    常量对它一律无效。后果不是「行为错了」，而是**这个前提没法写进任何用例**——
+    于是端到端那条只能靠跑它的机器碰巧是 cp936，本地绿、CI 红（PR #222）。
+
+    故意 patch 成 `latin-1` 而不是 `cp936`：本机（中文 Windows）的默认值本来就是
+    cp936，patch 成它等于什么都没验——把默认值冻回去，用例照样是绿的。`latin-1`
+    在两个平台上都不等于默认值，所以这条用例在 Windows 和 Linux 上守的是同一件事。
+    """
+    monkeypatch.setattr(mission_supervisor, "LEGACY_LOG_ENCODING", "latin-1")
+    # GBK 字节，既不是合法 UTF-8（所以一定会走回退），按 latin-1 解又和按 cp936
+    # 解明显不同（所以看得出回退到底听了谁的）。
+    raw = "补录完成".encode("cp936")
+
+    decoded = decode_log_text(raw)
+
+    assert decoded == raw.decode("latin-1")
+    assert decoded != "补录完成", "回退没跟着 monkeypatch 走，默认值多半又被冻住了"
 
 
 # -- 端到端：写进文件的中文，从状态里读出来还是中文 -----------------------------
