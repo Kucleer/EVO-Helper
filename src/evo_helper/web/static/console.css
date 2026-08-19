@@ -439,11 +439,12 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
    攻击日志（`/logs`）的「战果」列。
 
    ⚠️ **但「怎么展开」两页各走各的。** `.log-line` 那套 `tr:hover` 换行展开
-   **只剩系统日志在用**；攻击日志改成了浮层（往下看 `.outcome-*`），因为
+   **只剩系统日志在用**；攻击日志改成了点开弹窗（往下看 `.outcome-*`），因为
    `tr:hover` 展开会把一行撑到十几行高（用户 2026-08-19 报）。
    两页症状看着一样，要的东西不一样：系统日志那一列里是 `payload_json` 加一张
-   base64 缩略图，而缩略图**本来就靠 hover 放大**（`.log-shot`）——把它塞进一块
-   定宽浮层，最该看的那张图反而更小了。所以这里刻意留两套，不要「统一」掉。 */
+   base64 缩略图，而缩略图**本来就靠 hover 放大**（`.log-shot`）——把它挪进要
+   点一下才出来的弹窗，最该扫一眼的那张图反而多了一次点击。
+   所以这里刻意留两套，不要「统一」掉。 */
 .log-body { max-width: var(--log-body-cap, 46vw); }
 .log-line {
   overflow: hidden;
@@ -517,20 +518,27 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
   margin-left: 2px;
 }
 
-/* 「战果」那一格：收起态固定一行摘要，全文浮在表格之上 --------------------
+/* 「战果」那一格：收起态固定一行摘要，全文在点开的弹窗里 --------------------
  *
- * 用户口径 2026-08-19：「这里的效果我希望是像 tips 那种 hover 效果，而不是
- * 这种增加列高的」。此前这一列跟系统日志共用 `tr:hover .log-line`——hover 时
- * 换行展开，战损加 12 项收获把那一行撑到十几行高、占掉半个屏幕，下面的行整片
- * 往下跳，想点的那一行已经不在鼠标底下了。
+ * 用户口径 2026-08-19：「保持列的高度不变」。此前这一列跟系统日志共用
+ * `tr:hover .log-line`——hover 时换行展开，战损加 12 项收获把那一行撑到十几行
+ * 高、占掉半个屏幕，下面的行整片往下跳，想点的那一行已经不在鼠标底下了。
  *
- * ⚠️ **这一整套的验收标准就一条：任何状态下都不改变版面。** 浮层
- * `position: absolute`（脱离文档流）、摘要 `white-space: nowrap`（永远一行），
+ * ⚠️ **这一整套的验收标准就一条：任何状态下都不改变版面。** 详情整块装在
+ * `<template>` 里（内容根本不参与渲染），摘要 `white-space: nowrap`（永远一行），
  * 所以这一格量到的高度永远是「chip 一行 + 摘要一行」，与它装了多少内容无关。
  * **别给这里任何一条规则加上会改变尺寸的 hover 效果**——那就是原样把问题改回去。
  *
- * ⚠️ **一个字都不许少。** 12 项收获、战损、截图链接全都在 DOM 里，只是默认
- * 不可见；折叠仍然纯粹发生在 CSS 里（判据在 `tests/e2e/test_attack_log_width.py`）。
+ * ⚠️ **展开从 hover 浮层换成了点击弹窗（原生 `<dialog>`）。** 换掉不是因为点击
+ * 比 hover 好，而是因为**战报截图要内嵌进来**：一块 420px、鼠标一挪就没的
+ * hover 面板放不下 520×695 的图，也没法在里面滚动。顺带白拿了 ESC 关闭、
+ * 焦点陷阱、以及「不受祖先 `overflow` 裁剪」——上一版为了躲 `.table-wrap` 的
+ * 裁剪写的那段翻转脚本因此整段删掉了。
+ *
+ * ⚠️ **一个字都不许少。** 12 项收获、战损、截图全都在 DOM 里（`<template>` 里也
+ * 是 DOM），摘要缩到三样是摘要，不是删数据
+ * （判据在 `tests/e2e/test_attack_log_width.py` 与
+ * `tests/e2e/test_attack_log_outcome_popover.py`）。
  */
 
 /* 收起态两行不等高时靠上对齐，免得 chip 被推到格子中间。 */
@@ -545,77 +553,86 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
   font-size: 11px;
   color: var(--text-muted);
 }
+/* 摘要里那三样各自是一小段，各自挂着自己的 `title`（近似值的误差范围 / 缺项
+   为什么算 0）。**不许 `display: block`**——一样一行就是三行，行高又变了。 */
+.outcome-peek-item { cursor: help; }
 
-/* 触发元素。
- *
- * ⚠️ **`position: relative` 在这里是必需的，不是装饰**：浮层的定位祖先必须是
- * 它自己。挂到 `td` 或者别处去，浮层就跑到触发区之外——鼠标从摘要走向面板的
- * 路上 `:hover` 断掉，面板消失，里面那个「查看战报截图」永远点不着。 */
+/* 触发元素是个 `<button>`，这里只是把它按钮的外观全部剥掉，
+   让它在表格里读起来仍旧是一行普通摘要文字。 */
 .outcome-detail {
-  position: relative;
   display: block;
   max-width: 100%;
-  cursor: help;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 .outcome-detail:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* 「这里还有东西可看」的唯一提示：一条虚下划线加一个 ⓘ。 */
 .outcome-detail > .outcome-peek { border-bottom: 1px dotted var(--border-strong); }
+.outcome-detail:hover > .outcome-peek { border-bottom-color: var(--accent); }
 .outcome-more { margin-left: 3px; color: var(--text-faint); }
 
-.outcome-pop {
-  position: absolute;
-  z-index: 5;
-  /* ⚠️ **紧贴摘要下沿，中间不留缝。** 哪怕 2px 的间距，鼠标走过去的那一瞬
-     `:hover` 就断了，面板消失——里面那个链接就点不着了。要留白就往
-     `padding` 上加，别往这里加。 */
-  top: 100%;
-  /* 「战果」是 10 列里的第 9 列，右边只剩「预计战报」，所以面板向左展开。 */
-  right: 0;
-  width: max-content;
-  max-width: 420px;
-  padding: 8px 10px;
-  background: var(--bg-panel-raised);
+/* 弹窗本身。
+ *
+ * ⚠️ **`padding: 0` 是功能性的**：内容整块包在 `.outcome-dialog-frame` 里，
+ * 于是「点击的 target 就是 dialog 自己」只可能是点在背景上——`logs.html`
+ * 那段「点背景关闭」正是这么判的。往 dialog 上加内边距，那圈内边距就变成了
+ * 一条点了会关窗的死区。要留白往 frame 上加。 */
+.outcome-dialog {
+  padding: 0;
+  max-width: min(680px, 92vw);
+  /* 图有 695px 高，加上头部和收获两栏；超出就在 frame 里滚，不许顶破屏幕。 */
+  max-height: 88vh;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: 0 6px 18px rgba(4, 8, 13, 0.55);
-  /* `td` 全局是 `nowrap`，面板里要能折行。 */
-  white-space: normal;
-  font-size: 11px;
-  line-height: 1.6;
-  color: var(--text-muted);
-  cursor: auto;
-  /* ⚠️ **收起用 `visibility` 而不是 `display: none`。** 两条理由：
-     一、`display: none` 的元素量不出高度，`logs.html` 末尾那段「下面放不下就
-     翻上去」的脚本就没法判断；二、`display: none` 里的链接不可聚焦，而
-     `:focus-within` 正是靠「焦点先落在触发元素上 → 面板露出来 → 下一次 Tab
-     才走得进那个链接」这个次序成立的。 */
-  visibility: hidden;
-  opacity: 0;
-  pointer-events: none;
+  background: var(--bg-panel-raised);
+  color: var(--text);
+  box-shadow: 0 18px 48px rgba(4, 8, 13, 0.65);
 }
-
-/* ⚠️ **`:focus-within` 和 `:hover` 是一对，缺一不可。** 只有 hover 的话，
-   键盘用户拿不到这块内容；而 `:focus-within`（不是 `:focus`）才能在焦点从触发
-   元素移进面板里那个链接之后仍然把面板撑住。 */
-.outcome-detail:hover > .outcome-pop,
-.outcome-detail:focus-within > .outcome-pop {
-  visibility: visible;
-  opacity: 1;
-  pointer-events: auto;
+.outcome-dialog::backdrop { background: rgba(4, 8, 13, 0.62); }
+.outcome-dialog-frame {
+  display: flex;
+  flex-direction: column;
+  max-height: 88vh;
 }
+.outcome-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.outcome-dialog-head h2 { margin: 0; font-size: 14px; }
+/* 只有这一块滚：头部那行「战果详情 / 关闭」要一直在，图很长时尤其。 */
+.outcome-dialog-body { overflow: auto; padding: 12px 14px; }
 
-/* 下面放不下时翻上去（`logs.html` 末尾那段脚本设的；脚本挂了就一律向下开）。 */
-.outcome-detail[data-drop="up"] > .outcome-pop { top: auto; bottom: 100%; }
-
+.outcome-pop { display: block; font-size: 12px; line-height: 1.6; color: var(--text-muted); }
 .outcome-pop-line { display: block; color: var(--text); }
-.outcome-pop-title { display: block; margin-top: 4px; color: var(--text-faint); }
-/* 12 项收获排成两列：竖着摊 12 行会让面板比表格还高，横着摊一行又要 945px。 */
+.outcome-pop-title { display: block; margin-top: 8px; color: var(--text-faint); }
+/* 12 项收获排成两列：竖着摊 12 行会让弹窗比屏幕还高，横着摊一行又要 945px。 */
 .outcome-haul {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 14px;
 }
 .outcome-haul-item { white-space: nowrap; }
+
+/* 内嵌的战报截图。原图 520×695，按弹窗宽度缩，绝不放大——放大只会让 OCR 读
+   过的那些小字更糊。要看细节就走下面那个「在新标签页看原图」。 */
+.outcome-shot { display: block; margin-top: 6px; }
+.outcome-shot img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.outcome-shot a { display: inline-block; margin-top: 6px; font-size: 11px; }
 
 /* ---- 数据概览 -------------------------------------------------------- */
 
