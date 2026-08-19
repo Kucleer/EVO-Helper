@@ -917,7 +917,12 @@ def record_planet_list_overlay_retry(
     capture: Callable[[], Any] | None = None,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
-    """把「行星列表读空 → 疑似浮层 → 关掉 → 重读结果」写进 `system_log`。
+    """把行星列表那条链路的诊断现场写进 `system_log`。
+
+    两支会走到这里，都由 `game.planet_list.PlanetSwitcher.record_evidence` 交进来：
+    「读空 → 疑似浮层 → 关掉 → 重读结果」，以及「往回拖满上限、到没到顶判不出来」。
+    两支都是每次切换至多一条，所以文字不必限流。
+
 
     ⚠️ **跨机排障靠的就是这一条。** 2026-08-17 那次实机故障里，日志只留下
     「逐屏读到的是 `[[]]`」——够说明列表读空，却说不出**画面上盖着的是什么**。
@@ -1118,27 +1123,38 @@ class PirateLoop:
     def _planet_rows(self) -> list[tuple[int, str]]:
         """行星列表浮层坐标列上，这一屏每个词框的 `(中心 y, 文字)`。
 
-        逐套配方试到**读出至少一个三段坐标**为止。理由与
+        逐套配方试到**读出至少一行成对括起来的坐标**为止。理由与
         `vision.scan_reading.read_panel_confirming` 同形：粘连是读不出，不是没翻到，
         在同一张截图上换配方比重新拖一屏便宜得多；而这里换配方还有第二个理由——
         实测 3× LANCZOS 会把 `9` 读成 `8`（见 `pirate_ui.PLANET_LIST_COORD_RECIPES`），
         错的那一套给出的不是空结果而是**另一颗星球**。
 
+        ⚠️ **白名单里必须有方括号，采信判据也必须要求方括号**
+        （`pirate_ui.PLANET_LIST_COORD_WHITELIST` / `reads_as_a_planet_row`）。
+        去掉括号的那一版会让 Tesseract 拿数字顶替它们，多顶出来的那一位再粘进
+        相邻的一段——2026-08-19 的 `9:250:8` → `9:250:88` 就是这么来的，量出来的
+        凭据在 `domain.planet_switch._PLANET_ROW_RE`。这里两处必须用同一个判据：
+        用宽松的那条去挑配方，等于让一套「括号已经化成数字」的读数当选。
+
         一套都读不出来就交空清单出去，调用方于是什么都不点。
         """
         import pytesseract
 
+        from evo_helper.domain.planet_switch import reads_as_a_planet_row
         from evo_helper.game.planet_list import coordinate_words
-        from evo_helper.vision.scan_reading import COORD_WHITELIST, COORDINATE_RE
 
         # 视口漂了的话坐标列 ROI 框的是别处的像素，而这里读出来的 y 是要拿去点的。
         self._ensure_geometry()
         image = self._driver.capture()
         for upscale, resample in pirate_ui.PLANET_LIST_COORD_RECIPES:
             words = coordinate_words(
-                image, pytesseract, upscale=upscale, resample=resample, whitelist=COORD_WHITELIST
+                image,
+                pytesseract,
+                upscale=upscale,
+                resample=resample,
+                whitelist=pirate_ui.PLANET_LIST_COORD_WHITELIST,
             )
-            if any(COORDINATE_RE.search(text) for _y, text in words):
+            if any(reads_as_a_planet_row(text) for _y, text in words):
                 return words
         # 空行会安全地挡住派遣，但不能只留下 ``[[]]``：实机上同一套配方在手工
         # 截图里读得到三颗星球，运行时读空就说明画面时序或 tesseract 配置变了。
