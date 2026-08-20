@@ -282,6 +282,19 @@ def _row_order(html: str) -> list[str]:
     return re.findall(r'<th scope="row">([\d:]+)', html)
 
 
+def _headers(html: str) -> list[str]:
+    """表头那一排列名。
+
+    ⚠️ **必须按表头判，不能只搜文字**：页脚那几段说明里也写着「回收率」「在岗」
+    这些词，光搜文字的话，把那一列整个删掉用例照样是绿的（这一条是变异测试第
+    6a 组抓出来的）。
+    """
+    return [
+        re.sub(r"<[^>]+>", "", cell).strip()
+        for cell in re.findall(r'<th scope="col"[^>]*>(.*?)</th>', html, re.S)
+    ]
+
+
 def _cells(html: str, origin: Coordinate) -> list[str]:
     """某一行的各个格子（不含最左边的星球名）。"""
     match = re.search(rf'<th scope="row">{re.escape(str(origin))}.*?</th>(.*?)</tr>', html, re.S)
@@ -410,7 +423,18 @@ def test_the_recovery_column_sits_next_to_the_efficiency_columns(
 
     html = _fragment(client)
 
-    assert "回收率" in html
+    # 表头这一整排都钉住：少一列、或者调了次序，这一条就红。
+    assert _headers(html) == [
+        "出发星球",
+        "派出",
+        "读回战报",
+        "回收率",
+        "稀有三样",
+        "航线",
+        "在岗",
+        "每线",
+        "每线小时",
+    ]
     # 2 发派出、1 发读回 = 50%。
     assert "50%" in _cells(html, EARLY)
 
