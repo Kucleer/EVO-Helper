@@ -2386,12 +2386,20 @@ def test_a_pool_without_readings_lets_the_ranking_scan_take_the_mouse(  # type: 
 
 
 class RecordingLog:
-    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。
+
+    ⚠️ **挂机心跳写的行一律不收**（同 `test_line_shortage_recovery.RecordingLog`，
+    理由整段写在那里）：这里钉的是「某一条链路写了几条」，而这几条用例都会把时钟
+    往前跳十分钟，正好跳过心跳的断线阈值。心跳自己那份留痕由
+    `test_scheduler_uptime_heartbeat.py` 钉着。
+    """
 
     def __init__(self) -> None:
         self.entries: list[tuple[str, str, dict[str, object]]] = []
 
     def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
+        if message.startswith("挂机心跳"):
+            return
         self.entries.append((level, message, dict(payload or {})))
 
     def warnings(self) -> list[tuple[str, str, dict[str, object]]]:

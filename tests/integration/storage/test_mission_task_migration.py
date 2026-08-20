@@ -60,6 +60,8 @@ EXPECTED_MISSION_RUN_COLUMNS = frozenset(
         "exit_code",
         "stopped_by",
         "log_path",
+        # a3c81f5d2b64：那一轮开始时账号一共配着几条航线。可空，NULL = 不知道。
+        "configured_lines",
     }
 )
 

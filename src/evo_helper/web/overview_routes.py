@@ -11,6 +11,18 @@
    `MissionScheduler.military_candidate_pool()`。这一页凡是自己算过一遍的地方，
    原型评审时都算错过。
 
+## 航线利用率与挂机运行时长是一对
+
+分母自 2026-08-20 起是「**周期总时长 × 航线数**」（用户口径反转了 08-17 那条
+「任务实际运行时间 × 航线数」）。于是分母不再替用户解释「为什么低」，
+**「那段时间到底开没开工」改由「挂机运行时长」直说**（`domain.uptime`）。
+两个数一起看才读得懂，所以它们在同一个 `_capacity` 里算出来、在页面上挨着摆。
+
+⚠️ **线数分「真值」和「下界推算」两种，页面必须区分。** 真值来自
+`mission_runs.configured_lines`（2026-08-20 才加的列）；那一列为空的历史天用
+「当天最大并发在飞数」当下界，于是**分母偏小、利用率偏高**，页面上给那种格子
+标一个「≤」并在悬停里说明方向。宁可说「这个数不准」，也不能让它假装准。
+
 ## 时区
 
 **统计按 UTC+0 切天，页面上的时刻按 UTC+8 显示**（用户口径 2026-08-19）。
@@ -48,6 +60,7 @@ from evo_helper.domain.overview import (
     RARE_SLOTS,
     RESOURCE_STATS_START_UTC,
     Granularity,
+    LineCount,
     available_seconds,
     day_start,
     line_slots,
@@ -56,6 +69,7 @@ from evo_helper.domain.overview import (
     parse_granularity,
     period_end,
     period_label,
+    period_lines,
     period_starts,
     recovery_rate,
     resource_window,
@@ -63,6 +77,7 @@ from evo_helper.domain.overview import (
     utilisation,
 )
 from evo_helper.domain.records import BattleResourceEntry
+from evo_helper.domain.uptime import partially_observed, uptime_seconds
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.overview import (
     GalaxyFreshness,
@@ -187,6 +202,13 @@ class TodayCard:
     utilisation: float | None
     occupied_hours: float
     available_hours: float
+    #: 分母按几条航线算，以及那个数是真值还是下界（见 `_Capacity`）。
+    lines: int
+    lines_exact: bool
+    #: 挂机运行时长（小时）。**None = 这一段没有心跳观测**，页面写「—」而不是 0。
+    uptime_hours: float | None
+    #: 这一段只有一部分有心跳观测，因此挂机时长是下界。
+    uptime_partial: bool
     score_age_median: float | None
     score_age_max: float | None
 
@@ -199,6 +221,15 @@ class PeriodRow:
     recovery: float | None
     rare: tuple[ResourceCell, ...]
     utilisation: float | None
+    #: 分母按几条航线算。
+    lines: int
+    #: ⚠️ **那个线数是真值还是下界。** 页面必须把两种天分开标：下界那些天的利用率
+    #: 是**上界**（线数偏小 ⇒ 分母偏小 ⇒ 比值偏大），混在一起就是让一个不准的数
+    #: 假装准。
+    lines_exact: bool
+    #: 挂机运行时长（小时）。**None = 那一段没有心跳观测**，写「—」不写 0。
+    uptime_hours: float | None
+    uptime_partial: bool
     is_total: bool
 
     @property
@@ -431,13 +462,7 @@ def build_now_view(
         pool_buckets=pool_buckets,
         pool_unscored=pool_unscored,
         galaxies=repository.galaxy_freshness(now_utc=now_utc, window=FRESHNESS_WINDOW),
-        today=_today_card(
-            repository,
-            now_utc=now_utc,
-            today_start=today_start,
-            hold=hold,
-            lines=sum(lines for _, lines in origins),
-        ),
+        today=_today_card(repository, now_utc=now_utc, today_start=today_start, hold=hold),
     )
 
 
@@ -543,27 +568,87 @@ def _minutes(hours: float) -> int:
     return int(round(hours * 60))
 
 
+@dataclass(frozen=True, slots=True)
+class _Capacity:
+    """一个周期的航线产能账：占用多久、可用多久、按几条线算、以及机器开了多久。
+
+    ⚠️ **这四样必须一起算、一起摆。** 分母自 2026-08-20 起是「周期总时长 × 航线
+    数」（`domain.overview.available_seconds`），于是它不再替用户解释「为什么低」；
+    「开没开工」改由挂机时长直说。少了后者，低利用率就分不出是「航线闲着」还是
+    「机器根本没开」——而那正是旧口径拿运行时长当分母想要避免的事。
+    """
+
+    occupied_hours: float
+    available_hours: float
+    lines: LineCount
+    utilisation: float | None
+    uptime_hours: float | None
+    uptime_partial: bool
+
+
+def _capacity(
+    repository: OverviewRepository,
+    *,
+    start: datetime,
+    end: datetime,
+    hold: timedelta,
+    now_utc: datetime,
+    observed_since: datetime | None,
+) -> _Capacity:
+    """一个周期的产能账。**「今天」那张卡和周期统计那张表走同一份实现。**
+
+    ⚠️ 两处各算一遍的话，页面上会出现「今天 43%、按天那一行 91%」这种自相矛盾
+    ——同一天、同一个名字、两个数（需求文档 8.7 那条「页面不许自己造判据」正是
+    为这种事写的）。
+    """
+    occupancies = repository.occupancies(start=start, end=end, hold=hold, now_utc=now_utc)
+    occupied = occupied_seconds(occupancies, start, end)
+    lines = period_lines(
+        # ⚠️ 真值只认 `mission_runs.configured_lines`；那一列为空时**不许**拿此刻
+        # 配着的条数去顶（用户当天把 4 条加到 9 条），退回下界推算。
+        recorded=repository.recorded_lines(start=start, end=end),
+        occupancies=occupancies,
+        window_start=start,
+        window_end=end,
+    )
+    available = available_seconds(window_start=start, window_end=end, lines=lines.lines)
+    uptime = uptime_seconds(
+        repository.uptime_segments(start=start, end=end),
+        observed_since=observed_since,
+        window_start=start,
+        window_end=end,
+    )
+    return _Capacity(
+        occupied_hours=occupied / 3600.0,
+        available_hours=available / 3600.0,
+        lines=lines,
+        utilisation=utilisation(occupied, available),
+        uptime_hours=None if uptime is None else uptime / 3600.0,
+        uptime_partial=partially_observed(observed_since=observed_since, window_start=start),
+    )
+
+
 def _today_card(
     repository: OverviewRepository,
     *,
     now_utc: datetime,
     today_start: datetime,
     hold: timedelta,
-    lines: int,
 ) -> TodayCard:
     counts = repository.period_counts(start=today_start, end=now_utc)
     haul = _haul(repository, start=today_start, end=now_utc)
     yesterday_start = today_start - timedelta(days=1)
     yesterday = _haul(repository, start=yesterday_start, end=today_start)
-    occupied = occupied_seconds(
-        repository.occupancies(start=today_start, end=now_utc, hold=hold, now_utc=now_utc),
-        today_start,
-        now_utc,
-    )
-    available = available_seconds(
-        repository.run_windows(start=today_start, end=now_utc, now_utc=now_utc, lines=lines),
-        today_start,
-        now_utc,
+    capacity = _capacity(
+        repository,
+        start=today_start,
+        # 右边界钳到「现在」，不是今天 24:00：占用段也只算到现在
+        # （`storage.overview.occupancies`），两边不同源的话，早上八点打开页面
+        # 会看到一个「除以 24 小时」的假低值。
+        end=now_utc,
+        hold=hold,
+        now_utc=now_utc,
+        observed_since=repository.first_uptime_beat(),
     )
     ages = repository.score_age_hours_at_dispatch(since=today_start, until=now_utc)
     return TodayCard(
@@ -575,9 +660,13 @@ def _today_card(
         reports=counts.reports,
         recovery=recovery_rate(counts.reports, counts.dispatches),
         protection_hits=counts.protection_hits,
-        utilisation=utilisation(occupied, available),
-        occupied_hours=occupied / 3600.0,
-        available_hours=available / 3600.0,
+        utilisation=capacity.utilisation,
+        occupied_hours=capacity.occupied_hours,
+        available_hours=capacity.available_hours,
+        lines=capacity.lines.lines,
+        lines_exact=capacity.lines.exact,
+        uptime_hours=capacity.uptime_hours,
+        uptime_partial=capacity.uptime_partial,
         score_age_median=statistics.median(ages) if ages else None,
         score_age_max=max(ages) if ages else None,
     )
@@ -637,9 +726,14 @@ def build_period_rows(
     granularity: Granularity,
     now_utc: datetime,
 ) -> list[PeriodRow]:
-    """周期统计那张表。**比率一律先把分子分母各自求和再相除**（`recovery_rate`）。"""
+    """周期统计那张表。**比率一律先把分子分母各自求和再相除**（`recovery_rate`）。
+
+    ⚠️ 利用率与「今天」那张卡走**同一个** `_capacity`：口径改了一处没改另一处，
+    页面上就会出现「今天 43%、按天第一行 91%」这种自相矛盾。
+    """
     hold = scheduler.unknown_line_hold()
-    lines = sum(item.fleet_lines for item in scheduler.configured_line_origins() if item.enabled)
+    # 「心跳从什么时候起才有」是全库唯一的一条线，每行再问一次纯属白付。
+    observed_since = repository.first_uptime_beat()
     rows: list[PeriodRow] = []
     for start in period_starts(now_utc, granularity):
         end = min(period_end(start, granularity, now=now_utc), now_utc)
@@ -647,11 +741,13 @@ def build_period_rows(
             continue
         counts = repository.period_counts(start=start, end=end)
         rare = _haul(repository, start=start, end=end).cells(RARE_SLOTS)
-        occupied = occupied_seconds(
-            repository.occupancies(start=start, end=end, hold=hold, now_utc=now_utc), start, end
-        )
-        available = available_seconds(
-            repository.run_windows(start=start, end=end, now_utc=now_utc, lines=lines), start, end
+        capacity = _capacity(
+            repository,
+            start=start,
+            end=end,
+            hold=hold,
+            now_utc=now_utc,
+            observed_since=observed_since,
         )
         rows.append(
             PeriodRow(
@@ -660,7 +756,11 @@ def build_period_rows(
                 reports=counts.reports,
                 recovery=recovery_rate(counts.reports, counts.dispatches),
                 rare=rare,
-                utilisation=utilisation(occupied, available),
+                utilisation=capacity.utilisation,
+                lines=capacity.lines.lines,
+                lines_exact=capacity.lines.exact,
+                uptime_hours=capacity.uptime_hours,
+                uptime_partial=capacity.uptime_partial,
                 is_total=granularity is Granularity.TOTAL,
             )
         )
@@ -709,6 +809,14 @@ def _empty_now_view(now: datetime) -> NowView:
             utilisation=None,
             occupied_hours=0.0,
             available_hours=0.0,
+            lines=0,
+            # 这一趟什么都没查到，所以线数「不是真值」——页面照旧标它是推算的，
+            # 而不是摆出一个像真值的 0。
+            lines_exact=False,
+            # ⚠️ None 而不是 0.0：0 小时的意思是「那段时间没开机」，而这里的事实
+            # 是「这一趟没读到」。
+            uptime_hours=None,
+            uptime_partial=False,
             score_age_median=None,
             score_age_max=None,
         ),

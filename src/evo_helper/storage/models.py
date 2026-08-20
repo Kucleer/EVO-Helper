@@ -1085,6 +1085,36 @@ class MissionRunRow(Base):
     #: `USER` / `SELF` / `PREEMPTED` / `SHUTDOWN` / `UNKNOWN`
     stopped_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
     log_path: Mapped[str] = mapped_column(String(255))
+    #: 这一轮开始时，**账号一共配着几条航线**（各出发星球 `fleet_lines` 之和，
+    #: 只数启用的那些）。数据概览页的「航线利用率」按它算分母。
+    #:
+    #: ⚠️ **可空，而且 NULL 就是「不知道」。** 这一列是 2026-08-20 才加的，
+    #: 之前的行永远为 NULL。**不许填 0，也不许回填「此刻配着几条」**：航线数会变
+    #: （用户当天把 4 条加到 9 条），拿现在的值去顶历史行，等于把 08-15 那天
+    #: （当时 4 条）的利用率低估到 44%，而页面上看不出任何异样。NULL 的那些天
+    #: 改用「当天最大并发在飞数」当下界，判据在 `domain.overview.period_lines`。
+    configured_lines: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class SchedulerUptimeRow(Base):
+    """调度器「开着」的一段。**一段一行，每拍把末端往前推。**
+
+    这就是「挂机运行时长」的全部数据来源。为什么必须新增而不能拿 `mission_runs`
+    或 `state_events` 凑，整段理由在 `domain.uptime` 的模块头上（要点：轮次覆盖
+    会把「开着但没活干」误报成关机，实测那种空档一天有 6 小时）。
+
+    ⚠️ **没有「结束时刻」这一列，这是刻意的。** 进程被杀时不会有人来写它。
+    `last_beat_at_utc` 是**最后一拍**，进程一死这一行就停在那里，挂机时长不会
+    继续涨——这条性质有用例钉着。
+    """
+
+    __tablename__ = "scheduler_uptime_segments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    #: 这一段的第一拍。索引：读侧按「与窗口有交集」取行。
+    started_at_utc: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    #: 这一段的最后一拍。**不是「停止时刻」。**
+    last_beat_at_utc: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
 
 
 class SchedulerConfigRow(Base):

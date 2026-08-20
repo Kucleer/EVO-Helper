@@ -20,11 +20,12 @@ from evo_helper.domain.overview import (
     SLOT_FREE,
     SLOT_UNKNOWN,
     Granularity,
+    LineSource,
     Occupancy,
-    RunWindow,
     available_seconds,
     day_start,
     line_slots,
+    max_concurrent_lines,
     month_start,
     occupancy_end,
     occupied_seconds,
@@ -33,6 +34,7 @@ from evo_helper.domain.overview import (
     parse_granularity,
     period_end,
     period_label,
+    period_lines,
     period_start,
     period_starts,
     recovery_rate,
@@ -309,31 +311,156 @@ def test_parallel_lines_are_added_up_not_merged() -> None:
     assert occupied_seconds(both, *window) == 2 * 3600
 
 
-def test_available_hours_come_from_runner_uptime_times_the_line_count() -> None:
-    """⚠️ 分母不能用「24 小时 × 当前航线数」。
+def test_available_hours_are_the_whole_period_times_the_line_count() -> None:
+    """⚠️ **分母是「周期总时长 × 航线数」，不是「运行时长 × 航线数」。**
 
-    调度器停着的那段不该算进产能——关一晚上机器、第二天利用率腰斩，
-    而那不是「资源闲着」，是「本来就没开工」。
+    用户口径（2026-08-20）反转了他自己 08-17 定的那条。旧分母只把调度器真的在跑
+    的那几个小时算成产能，于是「关了一晚上」和「开着一整天但一发没派」在页面上
+    长得一模一样（都接近 100%）。新分母把整个周期都算成产能——那段没开工的时间
+    因此**显示成损失**，而「到底开没开工」由「挂机运行时长」单独回答。
+
+    这一条按 24 小时 × 5 条断言：只要有人把分母改回「运行时长 × 线数」，
+    这里就会红。
     """
-    window = (datetime(2026, 8, 19, tzinfo=UTC), datetime(2026, 8, 20, tzinfo=UTC))
-    runs = (
-        RunWindow(
-            start=datetime(2026, 8, 19, 1, tzinfo=UTC),
-            end=datetime(2026, 8, 19, 3, tzinfo=UTC),
-            lines=5,
-        ),
-    )
+    start = datetime(2026, 8, 19, tzinfo=UTC)
+    end = datetime(2026, 8, 20, tzinfo=UTC)
 
-    assert available_seconds(runs, *window) == 2 * 3600 * 5
+    assert available_seconds(window_start=start, window_end=end, lines=5) == 24 * 3600 * 5
+
+
+def test_a_partial_period_only_counts_the_hours_that_have_passed() -> None:
+    """当前那个周期的右边界是「现在」，不是今天 24:00。
+
+    占用段也只算到现在（`storage.overview.occupancies`）。两边不同源的话，
+    早上八点打开页面会看到一个「除以 24 小时」的假低值。
+    """
+    start = datetime(2026, 8, 19, tzinfo=UTC)
+    now = datetime(2026, 8, 19, 8, tzinfo=UTC)
+
+    assert available_seconds(window_start=start, window_end=now, lines=4) == 8 * 3600 * 4
+
+
+def test_a_period_with_no_lines_has_no_denominator_instead_of_a_zero_ratio() -> None:
+    """线数为 0（当天既没有记下真值、也一发没派）时分母是 0，利用率给「—」。
+
+    编一个正数分母出来等于凭空发明产能。
+    """
+    start = datetime(2026, 8, 19, tzinfo=UTC)
+    end = datetime(2026, 8, 20, tzinfo=UTC)
+
+    assert available_seconds(window_start=start, window_end=end, lines=0) == 0.0
+    assert utilisation(0.0, 0.0) is None
 
 
 def test_utilisation_over_one_hundred_percent_is_reported_not_truncated() -> None:
-    """实测 2026-08-15：只开了 3 小时、派了 42 发，算出来 243%。
+    """⚠️ **超过 100% 不许截断。**
 
-    那是个真信号（关机太早、舰队回来时没人接），截成 100% 就把它抹掉了。
+    换成新分母之后这一条仍然会发生，只是来历变了：配置中途被改小，或者在飞数
+    真的超过配置数（航线跨任务共享，海盗与 bot 抢同一批）。截成 100% 就把真信号
+    抹掉了。
     """
     assert utilisation(2430.0, 1000.0) == pytest.approx(2.43)
     assert utilisation(1.0, 0.0) is None
+
+
+# -- 那一天配着几条航线 ---------------------------------------------------------
+
+
+def _window(*, hours: int = 24) -> tuple[datetime, datetime]:
+    start = datetime(2026, 8, 15, tzinfo=UTC)
+    return start, start + timedelta(hours=hours)
+
+
+def _occupancy(*, start_hour: int, hours: int) -> Occupancy:
+    day = datetime(2026, 8, 15, tzinfo=UTC)
+    return Occupancy(
+        start=day + timedelta(hours=start_hour), end=day + timedelta(hours=start_hour + hours)
+    )
+
+
+def test_a_recorded_line_count_is_used_as_the_truth() -> None:
+    """`mission_runs.configured_lines` 有值时就用它，那是真值。"""
+    start, end = _window()
+
+    count = period_lines(
+        recorded=9,
+        occupancies=(_occupancy(start_hour=1, hours=2),),
+        window_start=start,
+        window_end=end,
+    )
+
+    assert (count.lines, count.source, count.exact) == (9, LineSource.RECORDED, True)
+
+
+def test_a_missing_line_count_falls_back_to_the_peak_concurrency_not_the_current_config() -> None:
+    """⚠️ **那一列为空时不许拿此刻的配置去顶。**
+
+    用户 2026-08-20 把航线从 4 条加到 9 条。按 9 条去算 08-15（当时 4 条）会把那天
+    低估到 44%——而页面上一点异样都看不出来。为空时只能用**当天观测到的最大并发
+    在飞数**这个下界（用户选定的方案 C）。
+
+    这一条同时钉住「为空不许当成 0」：当成 0 分母就是 0，那天整段变成「—」，
+    真打出去的活被抹掉。
+    """
+    start, end = _window()
+    # 同一时刻最多 4 条在飞——那一天真的配着 4 条。
+    occupancies = tuple(_occupancy(start_hour=1, hours=2) for _ in range(4))
+
+    count = period_lines(recorded=None, occupancies=occupancies, window_start=start, window_end=end)
+
+    assert (count.lines, count.source, count.exact) == (4, LineSource.LOWER_BOUND, False)
+
+
+def test_the_peak_concurrency_does_not_merge_the_overlapping_segments() -> None:
+    """⚠️ **合并重叠区间等于把并行的航线算成一条。**
+
+    合并之后最大并发恒等于 1，分母缩到 1/N，利用率被高估成好几倍。
+    """
+    start, end = _window()
+    parallel = tuple(_occupancy(start_hour=3, hours=1) for _ in range(5))
+
+    assert max_concurrent_lines(parallel, start, end) == 5
+
+
+def test_the_peak_concurrency_counts_touching_segments_as_one_line() -> None:
+    """首尾相接的两段（一条航线刚放开、下一发立刻派出）是先后两条，不是同时两条。"""
+    start, end = _window()
+    back_to_back = (_occupancy(start_hour=1, hours=1), _occupancy(start_hour=2, hours=1))
+
+    assert max_concurrent_lines(back_to_back, start, end) == 1
+
+
+def test_the_peak_concurrency_ignores_segments_outside_the_window() -> None:
+    """窗口之外的占用段不算——它说的是别的那一天配着几条。"""
+    start, end = _window(hours=4)
+    outside = (_occupancy(start_hour=10, hours=2),)
+
+    assert max_concurrent_lines(outside, start, end) == 0
+
+
+def test_the_lower_bound_line_count_keeps_utilisation_at_or_below_one_hundred_percent() -> None:
+    """⚠️ **这是方案 C 的自检性质：用最大并发当线数时，利用率在构造上 ≤ 100%。**
+
+    任一时刻最多 M 条在忙 ⇒ 占用 ≤ M × 窗口长度。历史天算出 >100% 就是实现有 bug
+    （最典型的写法错误正是把重叠区间合并了）。
+    """
+    start, end = _window()
+    # 三条航线各占一段，长短与起点都不一样，还有一段跨出窗口右边界。
+    occupancies = (
+        _occupancy(start_hour=0, hours=6),
+        _occupancy(start_hour=2, hours=20),
+        _occupancy(start_hour=5, hours=3),
+        _occupancy(start_hour=20, hours=2),
+    )
+    count = period_lines(recorded=None, occupancies=occupancies, window_start=start, window_end=end)
+
+    occupied = occupied_seconds(occupancies, start, end)
+    ratio = utilisation(
+        occupied, available_seconds(window_start=start, window_end=end, lines=count.lines)
+    )
+
+    assert ratio is not None
+    assert ratio <= 1.0
 
 
 # -- 表格行 ---------------------------------------------------------------------

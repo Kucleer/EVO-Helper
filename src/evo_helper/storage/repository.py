@@ -2930,6 +2930,7 @@ class SqlAlchemyRepository:
         started_at_utc: datetime,
         log_path: str,
         run_id: UUID | None = None,
+        configured_lines: int | None = None,
     ) -> UUID:
         """起了一个子进程，记一行。返回的 id 用来在它结束时回填。
 
@@ -2939,6 +2940,11 @@ class SqlAlchemyRepository:
         `run_id` 可以由调用方先定好：子进程要在**起之前**就通过环境变量拿到本轮
         的 id，才能把自己的 `system_log` 行挂到这一轮上（见
         `infrastructure.system_log.child_environment`）。不传就照旧自己生成。
+
+        `configured_lines` 是「这一轮开始时账号一共配着几条航线」，数据概览页的
+        利用率按它算分母。⚠️ **默认 None，而 None 就是「不知道」**——不传的调用方
+        （用例夹具、补录路径）不该让这一列冒充一个真读数，理由整段写在
+        `models.MissionRunRow.configured_lines` 上。
         """
         _require_utc(started_at_utc, "started_at_utc")
         run_id = run_id or uuid4()
@@ -2954,6 +2960,7 @@ class SqlAlchemyRepository:
                     pid=pid,
                     started_at_utc=started_at_utc,
                     log_path=log_path,
+                    configured_lines=configured_lines,
                 )
             )
             session.commit()
@@ -3021,6 +3028,36 @@ class SqlAlchemyRepository:
                 row.stopped_by = STOPPED_BY_UNKNOWN
             session.commit()
             return len(rows)
+
+    # -- 挂机心跳 --------------------------------------------------------------
+    #
+    # 「挂机运行时长」的写侧。判据（该不该落一拍、要不要另开一段）全在
+    # `domain.uptime`，这里只落行。
+
+    def open_uptime_segment(self, *, now_utc: datetime) -> int:
+        """另开一段挂机运行段，返回它的 id。返回值由调用方拿在手上往前推末端。"""
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            row = orm.SchedulerUptimeRow(started_at_utc=now_utc, last_beat_at_utc=now_utc)
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def beat_uptime_segment(self, segment_id: int, *, now_utc: datetime) -> bool:
+        """把这一段的末端推到 `now_utc`。行不在了返回 False（调用方另开一段）。
+
+        ⚠️ **只往前推、不许往回缩**：时钟被调回去过的话，缩回来就等于把已经观测到
+        的挂机时长凭空削掉。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            row = session.get(orm.SchedulerUptimeRow, segment_id)
+            if row is None:
+                return False
+            if now_utc > row.last_beat_at_utc:
+                row.last_beat_at_utc = now_utc
+                session.commit()
+            return True
 
     def last_mission_starts(self) -> dict[int, datetime]:
         """每个**任务**上一次启动的时刻，按 `task_id` 挂，供重启冷却判据用。

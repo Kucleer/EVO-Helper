@@ -21,18 +21,24 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Integer, and_, cast, func, select
+from sqlalchemy import Integer, and_, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.overview import Occupancy, RunWindow, occupancy_end
+from evo_helper.domain.overview import Occupancy, occupancy_end
+from evo_helper.domain.uptime import UptimeSegment
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import (
     SqlAlchemyRepository,
     _from_origin,
     _still_holding_a_line,
 )
+
+#: 找「那一轮配着几条航线」时往窗口之前多看多久。一轮子进程不会真的跑过一天，
+#: 而被 kill 掉、还没闭合的孤儿行（`ended_at_utc IS NULL`）如果不卡这个下界，
+#: 就会把它当时的线数一路借给之后的每一天。见 `recorded_lines`。
+_RUN_LOOKBACK = timedelta(days=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,41 +452,73 @@ class OverviewRepository:
             segments.append(Occupancy(start=began, end=finished))
         return tuple(segments)
 
-    def run_windows(
-        self, *, start: datetime, end: datetime, now_utc: datetime, lines: int
-    ) -> tuple[RunWindow, ...]:
-        """与 `[start, end)` 有交集的调度器运行段，重叠的已经并好。
+    def recorded_lines(self, *, start: datetime, end: datetime) -> int | None:
+        """这个周期里，`mission_runs` 记下来的「账号配着几条航线」。**没有就 None。**
 
-        `lines` 由调用方给（此刻配着的航线总数）。⚠️ **这是一个已知的近似**：
-        `mission_runs` 里没有记当时的航线数，而航线数会变（道具能提升）。旧方案
-        本来打算从「本轮固化记录」取，但那份记录落在控制台机器的一个 JSONL 文件
-        里、不在库里，跨机读不到。所以越往前的周期这个分母越可能不准，
-        页面上的「利用率」因此是趋势指标，不是精确值。
+        ⚠️ **None 是「不知道」，不是 0。** 那一列是 2026-08-20 才加的，更早的行
+        永远为 NULL。返回 0 会让分母变成 0（整段利用率显示成「—」，把那天真打出去
+        的活抹掉），返回「此刻配着几条」则是拿现在的配置去顶历史（用户当天把
+        4 条加到 9 条，08-15 那天会被低估到 44%）。两种都是拿假话当数据用；
+        None 的那些天改走下界推算，判据在 `domain.overview.period_lines`。
 
-        还没结束的那一轮（`ended_at_utc IS NULL`）按「到现在为止」算，不按整段算：
-        否则一轮刚起来，当天的可用航线时长就凭空多出几个小时。
+        取**最大值**：一天之内配置可能被改（4 → 9），取大的那个让分母不至于偏小，
+        也就不会把利用率写得比真实高。
+
+        取「与窗口有交集的那些轮」而不是「窗口内开始的那些轮」：跨零点还在跑的
+        那一轮同样说明了当时配着几条。⚠️ `ended_at_utc IS NULL` 的行（被 kill 掉、
+        还没被 `mark_orphan_mission_runs` 闭合的孤儿）**必须连同 `started_at_utc`
+        一起卡住下界**，否则三天前那个孤儿会把它那时的线数一路借给之后每一天——
+        那正是这个函数存在的意义（不许拿别的时候的线数顶）。一轮不会真的跑过一天。
         """
-        floor = start - timedelta(days=31)
+        floor = start - _RUN_LOOKBACK
+        with self._session_factory() as session:
+            value = session.scalar(
+                select(func.max(orm.MissionRunRow.configured_lines)).where(
+                    orm.MissionRunRow.configured_lines.is_not(None),
+                    orm.MissionRunRow.started_at_utc >= floor,
+                    orm.MissionRunRow.started_at_utc < end,
+                    or_(
+                        orm.MissionRunRow.ended_at_utc.is_(None),
+                        orm.MissionRunRow.ended_at_utc >= start,
+                    ),
+                )
+            )
+        return None if value is None else int(value)
+
+    def uptime_segments(self, *, start: datetime, end: datetime) -> tuple[UptimeSegment, ...]:
+        """与 `[start, end)` 有交集的挂机运行段。
+
+        不需要像 `occupancies` 那样放宽下界再钳：这张表的每一行都自带两端
+        （第一拍与最后一拍），跨零点那一段按 `last_beat_at_utc >= start` 就取得到。
+        """
         with self._session_factory() as session:
             rows = session.execute(
                 select(
-                    orm.MissionRunRow.started_at_utc,
-                    orm.MissionRunRow.ended_at_utc,
+                    orm.SchedulerUptimeRow.started_at_utc,
+                    orm.SchedulerUptimeRow.last_beat_at_utc,
                 ).where(
-                    orm.MissionRunRow.started_at_utc >= floor,
-                    orm.MissionRunRow.started_at_utc < end,
+                    orm.SchedulerUptimeRow.started_at_utc < end,
+                    orm.SchedulerUptimeRow.last_beat_at_utc >= start,
                 )
             ).all()
-        windows: list[RunWindow] = []
-        for started, ended in rows:
+        segments: list[UptimeSegment] = []
+        for started, last_beat in rows:
             began = _as_utc(started)
-            if began is None:
+            beat = _as_utc(last_beat)
+            if began is None or beat is None:
                 continue
-            finished = min(_as_utc(ended) or now_utc, now_utc)
-            if finished <= began:
-                continue
-            windows.append(RunWindow(start=began, end=finished, lines=lines))
-        return _merge_run_windows(windows, lines)
+            segments.append(UptimeSegment(start=began, last_beat=max(beat, began)))
+        return tuple(segments)
+
+    def first_uptime_beat(self) -> datetime | None:
+        """库里**最早**那一拍。一拍都没有则 None。
+
+        它就是「挂机时长从什么时候起才有观测」这条线。⚠️ 心跳之前的那些天必须
+        显示「无数据」而**不是 0**（显示 0 等于说「那天没开机」，那是假话），
+        而分界只能由这个时刻来划——判据在 `domain.uptime.uptime_seconds`。
+        """
+        with self._session_factory() as session:
+            return _as_utc(session.scalar(select(func.min(orm.SchedulerUptimeRow.started_at_utc))))
 
     # -- 资源图标 ---------------------------------------------------------------
 
@@ -520,28 +558,6 @@ def _target_key() -> ColumnElement[int]:
         + orm.AttackIntentRow.target_system * 1_000
         + orm.AttackIntentRow.target_position
     )
-
-
-def _merge_run_windows(windows: list[RunWindow], lines: int) -> tuple[RunWindow, ...]:
-    """把重叠的运行段并起来。
-
-    ⚠️ **不并的话分母会翻倍。** 同一时刻可以有好几行 `mission_runs`（军力榜扫描
-    与 bot 攻击并存，抢占切换时前后两轮还会短暂重叠），而「可用航线时长」问的是
-    **这台机器开着工的那段时间**乘航线数——同一分钟被两轮各算一次，产能就凭空
-    多出一倍，利用率随之腰斩。
-    """
-    if not windows:
-        return ()
-    ordered = sorted(windows, key=lambda item: item.start)
-    merged: list[RunWindow] = [ordered[0]]
-    for window in ordered[1:]:
-        last = merged[-1]
-        if window.start <= last.end:
-            if window.end > last.end:
-                merged[-1] = RunWindow(start=last.start, end=window.end, lines=lines)
-            continue
-        merged.append(window)
-    return tuple(merged)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

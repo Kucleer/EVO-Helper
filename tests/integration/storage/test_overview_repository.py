@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import day_start
+from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.models import (
     AttackDispatchRow,
     AttackIntentRow,
@@ -26,6 +27,7 @@ from evo_helper.storage.models import (
     BotTargetRow,
 )
 from evo_helper.storage.overview import OverviewRepository
+from evo_helper.storage.repository import SqlAlchemyRepository
 
 NOW = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
 HOLD = timedelta(minutes=90)
@@ -628,3 +630,175 @@ def test_score_age_at_dispatch_reads_the_snapshot_column(
     ages = overview.score_age_hours_at_dispatch(since=day_start(NOW), until=NOW)
 
     assert ages == (pytest.approx(3.0),)
+
+
+# -- 那一天配着几条航线（`mission_runs.configured_lines`） -----------------------
+
+
+def _run(
+    repository: SqlAlchemyRepository,
+    *,
+    started_at_utc: datetime,
+    ended_at_utc: datetime | None,
+    configured_lines: int | None,
+) -> None:
+    """一轮子进程记录。`configured_lines=None` 就是升级前那些行的形状。"""
+    run = repository.begin_mission_run(
+        MissionKind.BOT,
+        task_id=None,
+        command=["python"],
+        pid=None,
+        started_at_utc=started_at_utc,
+        log_path="var/logs/mission-bot.log",
+        configured_lines=configured_lines,
+    )
+    if ended_at_utc is not None:
+        repository.finish_mission_run(
+            run, ended_at_utc=ended_at_utc, exit_code=0, stopped_by="SELF"
+        )
+
+
+def test_the_recorded_line_count_comes_back_for_the_day_it_was_written(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """写了真值的那一天就用真值。"""
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=9,
+    )
+
+    assert overview.recorded_lines(start=day_start(NOW), end=NOW) == 9
+
+
+def test_a_day_whose_runs_never_recorded_the_count_reports_none_not_zero(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """⚠️ **升级之前的行永远为 NULL，而 NULL 是「不知道」。**
+
+    返回 0 会让那天的分母变成 0（页面整段显示成「—」，真打出去的活被抹掉）；
+    返回「此刻配着几条」是拿现在的配置去顶历史（4 条改成 9 条之后，08-15 会被
+    低估到 44%）。所以只能返回 None，由上层退回下界推算。
+    """
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=None,
+    )
+
+    assert overview.recorded_lines(start=day_start(NOW), end=NOW) is None
+
+
+def test_the_line_count_of_another_day_does_not_leak_into_this_one(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """⚠️ 昨天那一轮记的是 4 条，今天那一轮记的是 9 条——两天各算各的。
+
+    这就是这一列存在的理由：航线数会变，而利用率的分母现在只乘这一个数。
+    """
+    yesterday = day_start(NOW) - timedelta(days=1)
+    _run(
+        repository,
+        started_at_utc=yesterday + timedelta(hours=3),
+        ended_at_utc=yesterday + timedelta(hours=4),
+        configured_lines=4,
+    )
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=9,
+    )
+
+    assert overview.recorded_lines(start=yesterday, end=day_start(NOW)) == 4
+    assert overview.recorded_lines(start=day_start(NOW), end=NOW) == 9
+
+
+def test_a_run_that_straddles_midnight_still_speaks_for_both_days(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """跨零点还在跑的那一轮同样说明了两天各配着几条。"""
+    _run(
+        repository,
+        started_at_utc=day_start(NOW) - timedelta(hours=1),
+        ended_at_utc=day_start(NOW) + timedelta(hours=1),
+        configured_lines=7,
+    )
+
+    assert overview.recorded_lines(start=day_start(NOW), end=NOW) == 7
+
+
+def test_a_stale_orphan_run_does_not_lend_its_line_count_to_every_later_day(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """⚠️ 被 kill 掉、`ended_at_utc` 还空着的孤儿行不许一路借出它的线数。
+
+    不卡下界的话，三天前那个孤儿会让之后每一天都「有真值」——而那个值正是
+    「别的时候配着几条」，也就是这一列想要避免的那种错。
+    """
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(days=3),
+        ended_at_utc=None,
+        configured_lines=4,
+    )
+
+    assert overview.recorded_lines(start=day_start(NOW), end=NOW) is None
+
+
+# -- 挂机心跳 -------------------------------------------------------------------
+
+
+def test_a_heartbeat_segment_grows_at_its_last_beat_only(
+    overview: OverviewRepository, repository: SqlAlchemyRepository
+) -> None:
+    """一段的右端就是最后一拍，`beat_uptime_segment` 只推那一列。"""
+    start = NOW - timedelta(hours=2)
+    segment = repository.open_uptime_segment(now_utc=start)
+    assert repository.beat_uptime_segment(segment, now_utc=start + timedelta(minutes=30)) is True
+
+    segments = overview.uptime_segments(start=day_start(NOW), end=NOW)
+
+    assert [(item.start, item.last_beat) for item in segments] == [
+        (start, start + timedelta(minutes=30))
+    ]
+
+
+def test_a_beat_never_pulls_the_last_beat_backwards(
+    repository: SqlAlchemyRepository, overview: OverviewRepository
+) -> None:
+    """时钟被调回去过时不许把已经观测到的挂机时长削掉。"""
+    start = NOW - timedelta(hours=2)
+    segment = repository.open_uptime_segment(now_utc=start)
+    repository.beat_uptime_segment(segment, now_utc=start + timedelta(minutes=30))
+
+    repository.beat_uptime_segment(segment, now_utc=start + timedelta(minutes=10))
+
+    segments = overview.uptime_segments(start=day_start(NOW), end=NOW)
+    assert segments[0].last_beat == start + timedelta(minutes=30)
+
+
+def test_beating_a_segment_that_is_gone_says_so_instead_of_raising(
+    repository: SqlAlchemyRepository,
+) -> None:
+    """行没了（换库、被清过）时返回 False，调用方另开一段——不许抛异常把 tick 弄死。"""
+    assert repository.beat_uptime_segment(4242, now_utc=NOW) is False
+
+
+def test_the_first_beat_ever_is_what_tells_no_data_from_zero(
+    repository: SqlAlchemyRepository, overview: OverviewRepository
+) -> None:
+    """⚠️ 「无观测」和「0 小时」的分界只能由**最早那一拍**来划。
+
+    一拍都没有时它是 None，于是每一档都写「—」；有了之后，更早的那些天才敢
+    说「那天没开机」。
+    """
+    assert overview.first_uptime_beat() is None
+
+    first = NOW - timedelta(hours=5)
+    repository.open_uptime_segment(now_utc=first)
+    repository.open_uptime_segment(now_utc=NOW - timedelta(hours=1))
+
+    assert overview.first_uptime_beat() == first
