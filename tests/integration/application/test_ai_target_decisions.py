@@ -57,13 +57,23 @@ def _decision(*, status: str = "ok", decided_at: datetime = NOW) -> AiTargetDeci
 
 
 class TestMigration:
-    def test_this_revision_is_the_head(self) -> None:
-        """我的迁移是新链的 head：生产重启 bat 会升到它。"""
+    def test_this_revision_is_on_the_one_and_only_chain(self) -> None:
+        """整条迁移链只有一个 head，而这一条在那条链上。
+
+        生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
+        多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前
+        一个字都看不出来。
+
+        ⚠️ 这条**不再断言「head 就是我」**：后面又接了新的迁移
+        （`d4b6e0f19c73`）。「谁是 head」这句话只该由**最新那一条**的用例来说，
+        否则每加一条迁移都要回来改一次这个与自己毫无关系的文件，而改多了就没人
+        再当真。抄的是 `test_dispatch_flight_source_migration.py` 的同名用例。
+        """
         root = Path(__file__).resolve().parents[3]
         config = Config(str(root / "alembic.ini"))
         config.set_main_option("script_location", str(root / "alembic"))
         script = ScriptDirectory.from_config(config)
-        assert script.get_heads() == [REVISION]
+        assert len(script.get_heads()) == 1, script.get_heads()
         assert REVISION in {revision.revision for revision in script.walk_revisions()}
 
     def test_the_new_table_and_knobs_exist_after_upgrade(self, database_url: str) -> None:

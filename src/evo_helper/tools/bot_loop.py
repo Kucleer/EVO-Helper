@@ -85,13 +85,15 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, DispatchFact, phase_of
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import TARGET_KIND_BOT
+from evo_helper.domain.target_order import DEFAULT_UNREADABLE_EXCLUSION
 from evo_helper.game import pirate_ui
+from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.tools.pirate_loop import (
     LoopOptions,
     PirateLoop,
@@ -113,6 +115,9 @@ from evo_helper.tools.scan_coordinates import (
     say,
 )
 from evo_helper.vision.parsers import ReportKind
+
+if TYPE_CHECKING:  # pragma: no cover - 只为类型；运行时那条 import 仍然是懒加载的
+    from evo_helper.vision.scan_reading import PlanetPanel
 
 
 @dataclass
@@ -178,6 +183,12 @@ class BotLoop(PirateLoop):
             ),
         )
         self._bot = options
+        #: 最近一次 `check_target` 读到的面板，按坐标存。
+        #:
+        #: `_goto_checked` 会在认不出时复位画面重试一次，所以善后必须看**最后那一次**
+        #: 读数——第一次读不出、复位之后读通了的那种，一个字都不该记（那正是自愈
+        #: 该干的事）。判据在 `_note_check_failure`。
+        self._last_panel: dict[Coordinate, PlanetPanel] = {}
 
     # -- 识别 ---------------------------------------------------------------
 
@@ -199,6 +210,9 @@ class BotLoop(PirateLoop):
 
         requested = f"{coordinate.galaxy}:{coordinate.system}:{coordinate.position}"
         panel = read_panel_confirming(crop_reader(self._driver.capture(), self._ocr), requested)
+        # 留给 `_note_check_failure` 当证据。存的是**这一次**的读数，复位重试会覆盖
+        # 掉上一次——善后只看最后那一次，见 `self._last_panel` 上的注释。
+        self._last_panel[coordinate] = panel
         if not panel.confirms(requested):
             say(f"  坐标核对不过：面板读作 {panel.coordinate_text!r}，请求的是 {requested}")
             self._dump_coord_mismatch("bot-coord-mismatch")
@@ -208,6 +222,187 @@ class BotLoop(PirateLoop):
             say(f"  {coordinate} 不是 bot（面板名 {panel.display_name!r}）")
             return TargetCheck.ABSENT
         return TargetCheck.CONFIRMED
+
+    # -- 认不出之后的善后 ---------------------------------------------------
+
+    def _note_check_failure(self, coordinate: Coordinate, check: TargetCheck) -> None:
+        """自愈也救不回来的一次认不出：**把它落库**，让下一轮选靶排除得掉。
+
+        ## 修的是什么
+
+        生产库实测（2026-08-20，近 24 小时）：「不是 bot（面板名 None）」出现 40 次、
+        **只涉及 3 个坐标**（军力 39,030 / 20,960 / 20,630），而「不是 bot」但真读出了
+        名字的 **0 次**——这个判据 100% 是在报识别失败。这 3 个坐标历史上成功派出 0 次。
+
+        循环是这样闭合的：军力高 → 排在候选池最前 → 站过去读不出 → 跳过 → 这一轮
+        0 发 → `came_back_empty` 让 `waiting_for_a_line` 把那颗球压到下一条航线空出
+        （实测一次 117 分钟）→ **失败没有留下任何记录**，下一轮候选池一个字没变，
+        又挑中同一个。65 轮里 16 轮空手而归（25%）。
+
+        ⚠️ **「读不出」和「真的不是 bot」必须分开，代价相反。**
+
+        - `display_name is None` = **识别失败**：面板名没读出来（也可能读成了
+          「荒芜行星」/「未知」这类占位）。成因未知，重试可能就好了，所以记一笔、
+          排除几小时、到点放回来。
+        - `display_name` 有值、只是不以 `bot_` 开头 = **事实变了**：这一位现在住着
+          别人。那该由坐标扫描去更新 `bot_targets.is_bot`，记成「识别失败」等于
+          往识别层的统计里掺假数据——而用户正是要靠那个统计判断识别层坏得多厉害。
+
+        实测目前 100% 是前者，**但代码不许假设永远如此**。
+
+        ⚠️ `MISMATCH`（坐标核对不过）不归这里管：那是导航漂了，`_goto_checked` 自己
+        有自愈，且它和「这一位上住着谁」根本是两码事。
+
+        ⚠️ **不限流。** 一轮里每个目标最多走到这里一次，而每一次都对应 21--44 秒
+        白烧掉的鼠标时间外加一次可能的空轮——正是要能一条一条数出来的东西。
+        （限流管的是每 tick 都可能重复的那一档，先例是 `record_unrecognised_screen`。）
+        """
+        if check is not TargetCheck.ABSENT:
+            return
+        panel = self._last_panel.get(coordinate)
+        if panel is None:
+            # 走不到这里：`_goto_checked` 判 ABSENT 就一定读过一次面板。真的到了，
+            # 说明结构变了——说出来，别静默当成「读不出」记一笔假的。
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 判为「不是 bot」，但没有对应的面板读数可查；这一次没记下来",
+                payload={
+                    "event": "panel_reading_missing",
+                    "coordinate": str(coordinate),
+                    "target_kind": self.TARGET_KIND,
+                },
+            )
+            return
+        if panel.display_name is not None:
+            # 真的不是 bot：读出来了，只是这一位上住着别人。**不记进「读不出」那一列。**
+            say(
+                f"  {coordinate} 面板名读得出（{panel.display_name!r}），"
+                "只是不是 bot；不计入识别失败"
+            )
+            record_system_log(
+                "INFO",
+                "tools.bot_loop",
+                f"{coordinate} 面板名读作 {panel.display_name!r}，不是 bot；"
+                "这是事实变了（该由坐标扫描更新 is_bot），不是识别失败",
+                payload={
+                    # `event` 是**给统计用的键**，不是装饰：`say()` 也会把控制台那行
+                    # 双写进 `system_log`，所以按正文 `LIKE` 去数会把它一起数进来。
+                    # 有了它，「识别失败几次 / 真不是 bot 几次」就是一句 group by。
+                    "event": "not_a_bot",
+                    "coordinate": str(coordinate),
+                    "target_kind": self.TARGET_KIND,
+                    "panel_display_name": panel.display_name,
+                    "panel_layout": panel.layout,
+                    "recorded_as_unreadable": False,
+                },
+            )
+            return
+        self._note_unreadable_panel(coordinate, panel)
+
+    def _note_unreadable_panel(self, coordinate: Coordinate, panel: PlanetPanel) -> None:
+        """面板名读不出：落库 + 说清「为什么 + 当时看到了什么 + 排除到什么时候」。"""
+        repository, _run_id = self._ensure_run()
+        seen_at = datetime.now(UTC)
+        window = self._unreadable_exclusion_window()
+        note = repository.note_unreadable_panel(coordinate, seen_at_utc=seen_at)
+        payload: dict[str, Any] = {
+            # 统计入口，见 `not_a_bot` 那条上的注释。
+            "event": "unreadable_panel",
+            "coordinate": str(coordinate),
+            "target_kind": self.TARGET_KIND,
+            "seen_at_utc": seen_at.isoformat(),
+            "exclusion_hours": window.total_seconds() / 3600,
+            "excluded_until_utc": (seen_at + window).isoformat(),
+            "attempts": None if note is None else note.attempts,
+            "military_score": None if note is None else note.military_score,
+            "recorded": note is not None,
+            # 「当时看到了什么」。三个原始读数一起留：`display_name` 为 None 有三种
+            # 长相（名字行整个空、贴成了「荒芜行星」/「未知」占位、有主/无主布局
+            # 走岔了），事后只有靠它们才分得开，而分开正是查根因的第一步。
+            "panel_layout": panel.layout,
+            "panel_coordinate_text": panel.coordinate_text,
+            "panel_owner_raw": panel.owner,
+            "panel_planet_name_raw": panel.planet_name,
+        }
+        if note is None:
+            # 说实话的那一档：`bot_targets` 里没有这一行（海盗位、或者还没被扫到过），
+            # 这一次**没有落库**，下一轮选靶排除不掉它。默不作声的话日志看起来像是
+            # 记上了——而「日志说假话比不说更糟」。
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 面板名读不出，但 bot_targets 里没有这一行，没能记下来；"
+                "下一轮选靶排除不掉它",
+                payload=payload,
+            )
+            return
+        record_system_log(
+            "WARNING",
+            "tools.bot_loop",
+            f"{coordinate} 面板名读不出（连续第 {note.attempts} 次）；"
+            f"排除到 {seen_at + window:%Y-%m-%d %H:%M} UTC"
+            f"（读不出的时刻 + {window.total_seconds() / 3600:.0f} 小时）",
+            payload=payload,
+        )
+
+    def _clear_unreadable(self, coordinate: Coordinate) -> None:
+        """这次读通了：连续失败归零、排除标记撤掉。**只在真的清掉了什么时才写日志。**
+
+        没有这一步，一个「第一次读不出、复位重试之后读通了」的坐标会被排除掉好几个
+        小时——而它明明是能打的。归零同时让 `unreadable_attempts` 保持「连续」的语义：
+        累计数会把「上个月坏过三次、现在好了」和「一直坏着」混成同一个数。
+
+        写日志的判据是**状态跃迁**（从「坏着」变成「好了」），不是每次读通都写——
+        后者每轮每个目标一条，纯噪音。
+        """
+        repository, _run_id = self._ensure_run()
+        cleared = repository.clear_unreadable_panel(coordinate)
+        if cleared == 0:
+            return
+        say(f"  {coordinate} 面板名这次读通了；连续 {cleared} 次读不出就此清零")
+        record_system_log(
+            "INFO",
+            "tools.bot_loop",
+            f"{coordinate} 面板名读通了，连续 {cleared} 次读不出清零；排除标记一并撤掉",
+            payload={
+                "event": "unreadable_cleared",
+                "coordinate": str(coordinate),
+                "target_kind": self.TARGET_KIND,
+                "cleared_attempts": cleared,
+            },
+        )
+
+    def _unreadable_exclusion_window(self) -> timedelta:
+        """面板名读不出之后排除多久。**留空 / 读不到都走代码里的默认值。**
+
+        和 `PirateLoop._protection_exclusion_window` 同一套写法与同一条理由：值取自
+        全局攻击配置（`military_attack_config.unreadable_exclusion_hours`），
+        **不走命令行**；读不到就用默认值而不是抛异常——一个查不出来的配置说明不了
+        「用户想改它」，为它把整轮任务弄死不成比例。
+
+        ⚠️ **runner 这一侧只拿它写日志里那句「排除到什么时候」。** 真正的排除在选靶
+        （`application.mission_scheduler._military_candidates`）现读同一列。所以读不到
+        时退回默认值最多让日志里那句预告偏一点，不会让排除本身失效。
+        """
+        try:
+            repository, _run_id = self._ensure_run()
+            hours = repository.military_attack_config().unreadable_exclusion_hours
+        except Exception as error:  # noqa: BLE001 - 见 docstring：读不到就走默认值
+            fallback = DEFAULT_UNREADABLE_EXCLUSION
+            say(f"  读不到「面板名读不出」的排除时长（{error}）；按代码默认的 {fallback} 算")
+            return fallback
+        if hours is None:
+            return DEFAULT_UNREADABLE_EXCLUSION
+        window = timedelta(hours=int(hours))
+        record_knob_override(
+            "unreadable_exclusion",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_UNREADABLE_EXCLUSION,
+            detail="面板名读不出的坐标在这段时间内不进候选池",
+        )
+        return window
 
     # -- 收战报 -------------------------------------------------------------
 
@@ -407,8 +602,11 @@ class BotLoop(PirateLoop):
         没有分别**——打法完全一样，分开写只会多一处可能和判态那边分家的地方。
         「还能不能再打」的判定只有 `phase_of` 一处。
         """
-        if self._goto_checked(coordinate) is not TargetCheck.CONFIRMED:
+        check = self._goto_checked(coordinate)
+        if check is not TargetCheck.CONFIRMED:
+            self._note_check_failure(coordinate, check)
             return False
+        self._clear_unreadable(coordinate)
         self._outcome.pirates.append(coordinate)
         if not self._bot.attack:
             return False

@@ -163,6 +163,9 @@ def _confirming_loop(monkeypatch: Any, *, confirms: bool) -> tuple[Any, list[str
     loop._ocr = None  # type: ignore[attr-defined]
     loop._coord_dumps = 0  # type: ignore[attr-defined]
     loop._navigator = _Navigator()  # type: ignore[attr-defined]
+    # `check_target` 会把这一次的读数存进来，留给 `_note_check_failure` 当证据
+    # （「面板名读不出」和「读出来了只是不是 bot」靠它分开）。
+    loop._last_panel = {}  # type: ignore[attr-defined]
     loop._dump_frame = lambda name, roi=None: dumped.append(name)  # type: ignore[assignment, method-assign]
     return loop, dumped, confirmed
 

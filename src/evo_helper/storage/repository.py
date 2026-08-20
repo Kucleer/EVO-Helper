@@ -240,6 +240,21 @@ class DailyAttackStatus:
 
 
 @dataclass(frozen=True)
+class UnreadablePanelNote:
+    """记下一次「面板名读不出」之后，库里那一行的样子。**只为写日志而存在。**
+
+    军力值一起带回来，是因为排障的第一个问题一定是「这个白跑的目标值不值得救」
+    ——实测那 3 个坐标军力 39,030 / 20,960 / 20,630，正因为高才排在候选池最前、
+    才每轮都被重新挑中。为它再查一次库不值当，反正这一行本来就在手上。
+    """
+
+    #: **连续**第几次读不出（读通一次归零）。
+    attempts: int
+    #: 库里记着的军力值；None = 军力榜从没见过这个坐标。
+    military_score: float | None
+
+
+@dataclass(frozen=True)
 class PirateProgress:
     """一个海盗目标在某段时间里走到哪一步了，供控制台一行一行显示。
 
@@ -2195,6 +2210,84 @@ class SqlAlchemyRepository:
             ).all()
         return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
 
+    def note_unreadable_panel(
+        self, coordinate: Coordinate, *, seen_at_utc: datetime
+    ) -> UnreadablePanelNote | None:
+        """记下「这个坐标在这一刻面板名读不出」，并返回**连续第几次** + 它的军力值。
+
+        没有对应行时返回 `None`（**没记上**），调用方据此把话说清楚。
+
+        这是「读不出」唯一会落库的地方。在这一列出现之前，识别失败只存在于
+        `system_log` 的纯文本里，选靶查不到——生产库实测（2026-08-20，近 24 小时）：
+        「不是 bot（面板名 None）」40 次、只涉及 3 个坐标，而这 3 个坐标历史上成功
+        派出 0 次；每一轮都把同样的几个重新挑出来，65 轮里 16 轮空手而归。
+
+        ⚠️ **只更新已有行，绝不插新行**，同 `note_protection_period`：`bot_targets`
+        的行由坐标扫描和军力榜建，凭一次「读不出」就插一行，等于用一个我们**解释不了
+        的判据**去断言「这坐标是个目标」。
+
+        ⚠️ **计数是「连续」的**：读通一次由 `clear_unreadable_panel` 归零。累计数会
+        把「上个月坏过三次、现在好了」和「一直坏着」混成同一个数，而用户要区分的
+        恰恰是这两者。
+
+        ⚠️ **写的是「什么时候读不出的」，不是「排除到什么时候」。** 排除多久是策略，
+        由 `military_attack_config.unreadable_exclusion_hours` 那个旋钮回答。
+        """
+        seen_at_utc = _require_utc(seen_at_utc, "seen_at_utc")
+        with self._session_factory() as session:
+            target = _bot_target_for(session, coordinate)
+            if target is None:
+                return None
+            target.unreadable_seen_at_utc = seen_at_utc
+            # `or 0` 兜住迁移之前建的行：那些行这一列可能还没被 ORM 填过。
+            target.unreadable_attempts = (target.unreadable_attempts or 0) + 1
+            note = UnreadablePanelNote(
+                attempts=target.unreadable_attempts, military_score=target.military_score
+            )
+            session.commit()
+            return note
+
+    def clear_unreadable_panel(self, coordinate: Coordinate) -> int:
+        """面板名这次读通了：把连续失败清零，并撤掉排除标记。返回**清掉了几次**。
+
+        返回 0 表示本来就没有标记（常态），调用方据此**只在状态真的变了时才写日志**
+        ——这是一次状态跃迁，不是每 tick 都会发生的那一类。
+
+        ⚠️ **清零这件事本身是判据的一部分，不是顺手打扫。** `_goto_checked` 会在
+        读不出时复位画面重试一次；没有这一步的话，一个「第一次读不出、复位之后就读
+        通了」的坐标会被排除掉好几个小时——而它明明是能打的。同理，`unreadable_attempts`
+        不清零就退化成累计数，看不出「现在还坏不坏」。
+        """
+        with self._session_factory() as session:
+            target = _bot_target_for(session, coordinate)
+            if target is None:
+                return 0
+            cleared = target.unreadable_attempts or 0
+            if cleared == 0 and target.unreadable_seen_at_utc is None:
+                return 0
+            target.unreadable_seen_at_utc = None
+            target.unreadable_attempts = 0
+            session.commit()
+            return cleared
+
+    def unreadable_bot_targets_since(self, since: datetime) -> set[Coordinate]:
+        """`since` 之后面板名读不出过的坐标。选靶第 ① 步据此排除它们。
+
+        与 `protected_bot_targets_since` / `attacked_bot_targets_since` 同形，
+        **故意的**：三条排除是同一档判据（「这个坐标现在打不了」），排在同一处、
+        量同一把尺子。
+        """
+        since = _require_utc(since, "since")
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                ).where(orm.BotTargetRow.unreadable_seen_at_utc >= since)
+            ).all()
+        return {Coordinate(galaxy, system, position) for galaxy, system, position in rows}
+
     def pirate_progress(
         self,
         *,
@@ -2624,6 +2717,7 @@ class SqlAlchemyRepository:
         reconcile_cooldown_minutes: int | None = None,
         bot_revisit_hours: int | None = None,
         protection_exclusion_hours: int | None = None,
+        unreadable_exclusion_hours: int | None = None,
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
@@ -2645,6 +2739,7 @@ class SqlAlchemyRepository:
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
             row.bot_revisit_hours = bot_revisit_hours
             row.protection_exclusion_hours = protection_exclusion_hours
+            row.unreadable_exclusion_hours = unreadable_exclusion_hours
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
             session.commit()
