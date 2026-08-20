@@ -119,14 +119,24 @@ if scan_cooldown_verdict(task, facts).blocks:      # ← 这一行
   | 安全阀恒真（`below_floor` 写成 `<=`） | `test_a_pool_exactly_at_its_floor_still_counts_as_having_stock`、`test_a_healthy_window_pool_leaves_the_cooldown_in_force` |
   | `military_window=None` 当成「窗口空了」 | `test_no_military_task_at_all_is_not_the_same_as_an_empty_window`、`test_no_military_task_means_no_valve` |
   | 没配时回落成 2 小时默认值 | `test_an_unconfigured_cooldown_never_blocks_anything`、`..._empty_cooldown_lets_the_scan_come_straight_back`、`test_an_empty_box_parses_to_no_cooldown_at_all`（3 参数） |
-  | 冷却把已开始的批次卡住（`_military_batch_decision` 改问 RANKING 的 `has_work`） | `test_the_attack_batch_hands_over_even_while_the_scan_is_cooling` |
+  | 批次闸门被冷却卡成 `IDLE` | `test_the_attack_batch_hands_over_even_while_the_scan_is_cooling` |
+  | 冷却做成 `_step` 里的全局早退（谁都不许起） | 同上 |
   | 挡住时顺手 `stop()` 掉正在跑的那一轮 | `test_the_cooldown_never_interrupts_a_scan_that_is_already_running` |
-  | 挡掉时不写日志 | `test_being_held_back_is_written_down_with_the_numbers` |
-  | 日志签名改回 `_line_signature`（限流失效） | `test_the_held_back_line_is_throttled_instead_of_written_every_tick` |
-  | 安全阀放行时不写日志 / 降成 INFO | `test_a_starving_window_pool_makes_the_cooldown_step_aside` |
+  | 挡掉时不写日志 | 4 条（含两条日志用例、两条安全阀用例） |
+  | 日志签名改回 `_line_signature`（限流失效） | 12 条 |
+  | 安全阀放行时不写日志 | `test_a_starving_window_pool_makes_the_cooldown_step_aside`、`test_the_valve_opening_is_written_the_moment_it_happens` |
+  | 安全阀那条降成 INFO | `test_a_starving_window_pool_makes_the_cooldown_step_aside` |
   | 边界那条不写 | `test_a_round_that_outlived_its_own_cooldown_leaves_a_trace` |
-  | 旋钮从任务级退化成全局（`task_snapshot` 改按 kind 取第一条 RANKING 的参数） | `test_two_ranking_tasks_keep_their_own_cooldowns` |
-  | 页面状态掉回兜底的「等航线」 | `test_a_held_back_scan_says_so_instead_of_claiming_to_wait_for_a_line` |
+  | 旋钮从任务级退化成全局（`_snapshots` 给所有 RANKING 套同一个值） | `test_two_ranking_tasks_keep_their_own_cooldowns` |
+  | 页面状态掉回兜底的「等航线」 | `test_a_held_back_scan_says_so_instead_of_claiming_to_wait_for_a_line` 等 3 条 |
+
+  ⚠️ **有一个变异存活了，而它不是漏网。** 第一次写「批次卡在半途」这条时，改的是
+  让 `_military_batch_decision` 在冷却期内**清掉批次标记并返回 `None`**——用例全绿。
+  查下来是对的：返回 `None` 之后会落回普通 `decide()`，而 BOT 有活干、又不是填空隙
+  的那一种，照样被起起来。**那个改动并不会让攻击停下**，所以没有用例该为它转红
+  （它丢的是「批次不许被插队」这条**另一件事**的保护，那由别处的用例守）。
+  改成真的返回 `Decision(Action.IDLE)`、以及改成 `_step` 里的全局早退之后，
+  两次都当场转红。
 - Safety: **不新增任何点击、任何派遣、任何网络调用。** 它只会让军力榜**少**起几轮，
   永远不会多起一轮（安全阀只是把闸门抬回加这个旋钮之前的状态，不催任何人）。
   正在跑的那一轮一个字都不碰——这一层是纯判据、动不了子进程。留空时行为与
