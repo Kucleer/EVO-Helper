@@ -1,0 +1,132 @@
+{#
+  「按星球效率」。回答的是用户 2026-08-20 那句：「我想知道今天哪个星球的效率
+  最高，用按天、按星球的资源收益去除他的航线数」。
+
+  这是一个**能单独渲染**的片段，由 `/overview/origin-efficiency` 提供，
+  `overview.html` 里那个容器载入后 fetch 一次（见那边的脚本）。自己一条路由是
+  刻意的——理由在 `web/origin_efficiency.py` 头上。
+
+  ⚠️ **四件事必须并列在表里，不许做成小字：**
+
+  1. **回收率**。分子只数已读回的战报，所以回收率就是分子的覆盖率。08-17 某颗
+     星球 39 发只读回 13 发（33%），08-16 是 2 发读回 0 发——**那两天不是没赚，
+     是战报没读回来**。少了这一列，用户会得出「08-17 效率崩了」这个错结论。
+  2. **在岗时长**。只看线数会罚晚开工的星球：实测 2026-08-20 一颗只跑了
+     11.7 小时、另两颗跑了 21 小时。
+  3. **停用状态**。停用的星球照样在表里——它当天真把活打出去了。
+  4. **「每线」与「每线小时」两列都要**。名次以「每线小时」为准（表按它排序）。
+
+  ⚠️ 时刻走 `local_time()`（UTC+8），日切按 UTC+0，同整页口径。
+#}
+{% if origins.failed %}
+  <p class="error">「按星球效率」这一趟没读到数据（查询失败，已记进系统日志）。下面这些格子不是事实，等下一轮刷新。</p>
+{% endif %}
+
+<div class="overview-tabs-head">
+  <h2 class="overview-heading">按星球效率
+    <span>{{ origins.day_label }} · UTC+0 切天 · 按<b>派出日</b>归属</span></h2>
+  <nav class="overview-tabs" aria-label="选择日期">
+    {% for choice in origins.days %}
+      <a class="overview-tab {% if choice.selected %}on{% endif %}"
+         href="/overview?origin_day={{ choice.value }}"
+         {% if choice.selected %}aria-current="page"{% endif %}>{{ choice.label }}</a>
+    {% endfor %}
+  </nav>
+</div>
+
+<div class="table-wrap">
+  <table class="overview-table">
+    <thead>
+      <tr>
+        <th scope="col">出发星球</th>
+        <th scope="col">派出</th>
+        <th scope="col">读回战报</th>
+        <th scope="col">回收率</th>
+        <th scope="col" title="{{ origins.rare_labels|join(' + ') }}">稀有三样</th>
+        <th scope="col">航线</th>
+        <th scope="col" title="当天首发 → 现在。停用过的那几个小时也算在里面，见表下说明">在岗</th>
+        <th scope="col">每线</th>
+        <th scope="col" title="每线 ÷ 在岗小时。表按这一列排序">每线小时</th>
+        {# 「≤」和利用率那一列的同一个标记同源、方向相反着读：那边线数取下界 ⇒ 分母
+           偏小 ⇒ 利用率取上界；这边线数取下界 ⇒ 分母偏小 ⇒ 效率同样取上界。 #}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in origins.rows %}
+        {# 第一行就是名次第一（`domain.origin_efficiency.rank_rows` 按「每线小时」
+           倒序排好了），但只有它真有名次时才标——一行「—」标成第一是句假话。 #}
+        <tr {% if loop.first and row.per_line_hour is not none and not row.untrustworthy %}class="overview-total"{% endif %}>
+          <th scope="row">{{ row.origin }}{% if row.in_config and not row.enabled %}
+            <span class="muted" title="当前配置里这颗星球是停用状态；它当天真派出过，所以照样列在这里">（已停用）</span>
+          {% endif %}{% if not row.in_config %}
+            <span class="tone-warn" title="当前配置里已经没有这颗星球了；它当天真派出过，所以照样列在这里">（已移除）</span>
+          {% endif %}</th>
+          <td>{{ row.dispatches }}</td>
+          <td>{{ row.reports }}</td>
+          <td class="{% if row.recovery is none %}muted{% elif row.untrustworthy %}tone-danger{% elif row.recovery >= 0.75 %}tone-ok{% else %}tone-warn{% endif %}">
+            {% if row.recovery is none %}—{% else %}{{ '%.0f'|format(row.recovery * 100) }}%{% endif %}
+          </td>
+          <td title="{{ row.rare_hint }}">{{ row.rare_text }}</td>
+          <td {% if not row.lines_exact %}class="tone-warn"
+              title="那一天没有记下这颗星球配着几条（`mission_runs.configured_lines` 记的是账号总数，而它和此刻配置的总数对不上或者压根没记），用的是当天观测到的最大并发在飞数（{{ row.lines }} 条）当下界：分母偏小，所以真实效率不高于右边那两个数"{% endif %}>
+            {% if row.lines %}{{ '≥ ' if not row.lines_exact }}{{ row.lines }} 条{% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td>{{ '%.1f'|format(row.on_duty_hours) }} h</td>
+          <td class="{% if row.untrustworthy %}tone-danger{% endif %}">
+            {% if row.per_line is none %}<span class="muted">—</span>
+            {% else %}{{ '≤ ' if not row.lines_exact }}{{ '{:,}'.format(row.per_line|round|int) }}{% endif %}
+          </td>
+          <td class="{% if row.untrustworthy %}tone-danger{% endif %}">
+            {% if row.per_line_hour is none %}<span class="muted">—</span>
+            {% else %}{{ '≤ ' if not row.lines_exact }}{{ '{:,}'.format(row.per_line_hour|round|int) }}{% endif %}
+            {% if row.untrustworthy %}
+              {# `data-untrustworthy` 是给用例认的：页脚那段说明里也写着「不可信」
+                 三个字，光搜文字分不出「这一行被标了」和「页面解释了这个标记」。 #}
+              <b class="tone-danger" data-untrustworthy
+                 title="回收率低于 {{ '%.0f'|format(origins.low_recovery_threshold * 100) }}%，分子至少缺了这么多，这个数不足以排名次">不可信</b>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="9" class="muted">这一天没有派遣记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{#
+  三条限制写在表下面，一条都不许删——它们各自对应一个会让人得出错结论的读法。
+#}
+<p class="overview-note">
+  <b>按派出日归属</b>：一发的收获记在它<b>派出</b>那一天，即使战报是隔天读回来的。
+  代价是<b>今天的数永远不完整</b>——还有战报没回来，所以「回收率」和效率并列在表里；
+  低于 {{ '%.0f'|format(origins.low_recovery_threshold * 100) }}% 时效率数标成<b class="tone-danger">不可信</b>。
+</p>
+<p class="overview-note">
+  <b>在岗时长</b>＝当天<b>首发 → 现在</b>。它会在两种情形下失真，都<b>只标注、不修正</b>：
+  当天被停用过的星球，停用那几个小时照样进分母（库里没有启用/停用的历史）；
+  首发之前的空转看不见，所以「很晚才开工」的星球这个数偏小、效率偏高。
+</p>
+<p class="overview-note">
+  <b>航线数</b>：<code>mission_runs.configured_lines</code> 记的是<b>账号总数</b>，
+  不是每颗星球各自的数。所以只有「那一天记下的账号总数」和此刻配置的总数一致时，
+  才按此刻这颗星球的 <code>fleet_lines</code> 算；否则退到
+  <b>当天最大并发在飞数</b>这个下界，那几格带「≥」，右边两列跟着带「≤」（分母偏小＝效率是上界）。
+  盲点：账号总数没变、只是星球之间重新分配过，这里看不出来。
+</p>
+<p class="overview-note">
+  分子<b>只算稀有三样</b>（{{ origins.rare_labels|join(' / ') }}）。
+  {{ origins.basic_labels|join('/') }}<b>不进这个指标</b>：它们由我方货舱容量决定、与目标无关
+  （实测同一预设 6 条战报的变异系数 0.0001），掺进来会让「预设大的星球」无脑领先。
+</p>
+{#
+  ⚠️ **一个已知偏差，只记在这里，页面上不修正、也不解释。**
+
+  本以为「往返越远、回收率越低」（战报回来得晚），2026-08-20 的数据**不支持**：
+  往返 42 分的那颗回收率 89%、113 分的 72%、120 分的 83%——**比 113 分那颗更远，
+  回收率却更高**。方向上应该存在，但当天不是主因（113 分那颗中途被自动停用过，
+  战报因此滞后）。
+
+  所以这一段**不做任何距离归一化**。没有证据支撑的修正比不修正更糟：加一个
+  凭猜想拟的系数，页面上的名次会变，而没人能说清它为什么变。
+#}
