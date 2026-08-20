@@ -2100,8 +2100,30 @@ def ranking_scan_summary(params: dict[str, Any]) -> str:
     """
     limit = params.get("bot_limit")
     if limit is None or (isinstance(limit, str) and not limit.strip()):
-        return "扫描数量留空 = 全扫（一趟翻到底）"
-    return f"本趟最多采 {limit} 个 bot（留空 = 全扫）"
+        scope = "扫描数量留空 = 全扫（一趟翻到底）"
+    else:
+        scope = f"本趟最多采 {limit} 个 bot（留空 = 全扫）"
+    return f"{scope}；{_scan_cooldown_summary(params)}"
+
+
+def _scan_cooldown_summary(params: dict[str, Any]) -> str:
+    """扫描间隔那一格的人话回显。**「留空 = 不限」必须写在页面上。**
+
+    同「留空 = 全扫」那一句：一个空的数字框自己说不出它是什么意思。而这一格
+    比那一格更需要它——**留空的行为（不限）与填任何一个数的行为差别很大**，
+    而这个功能上线之前所有任务的这一格都是空的，用户第一次看见它时最该确认的
+    就是「空着和以前一样」。
+
+    安全阀那句也摆在这里：它会在窗口内候选低于门限时越过这个间隔，
+    而一个说不出这件事的页面会让用户以为自己填的数被忽略了。
+    """
+    hours = params.get("scan_cooldown_hours")
+    if hours is None or (isinstance(hours, str) and not hours.strip()):
+        return "扫描间隔留空 = 不限（有空隙就扫）"
+    return (
+        f"两轮扫描至少隔 {hours} 小时（从上一轮开始算；留空 = 不限）"
+        "；窗口内候选低于门限时会越过这个间隔"
+    )
 
 
 def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:

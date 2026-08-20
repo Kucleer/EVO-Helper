@@ -173,7 +173,10 @@ def test_the_console_row_says_that_an_empty_box_means_a_full_scan() -> None:
     """
     assert "留空 = 全扫" in ranking_scan_summary({})
     assert "留空 = 全扫" in ranking_scan_summary({"bot_limit": ""})
-    assert ranking_scan_summary({"bot_limit": 30}) == "本趟最多采 30 个 bot（留空 = 全扫）"
+    # 2026-08-20 起这句回显后面还跟着「扫描间隔」那一格的话（同一行两个框，
+    # 一句回显把两件事都说了），所以量的是开头而不是整句。间隔那一半由
+    # `test_ranking_scan_cooldown.py` 自己量。
+    assert ranking_scan_summary({"bot_limit": 30}).startswith("本趟最多采 30 个 bot（留空 = 全扫）")
 
 
 def test_the_missions_page_gives_the_ranking_row_a_count_box() -> None:

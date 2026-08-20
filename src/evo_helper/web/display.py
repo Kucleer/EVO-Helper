@@ -37,6 +37,7 @@ PARAM_LABELS: dict[str, str] = {
     "first_system": "起始系号",
     "last_system": "结束系号",
     "bot_limit": "扫描数量",
+    "scan_cooldown_hours": "扫描间隔（小时）",
 }
 
 
@@ -63,6 +64,10 @@ STATUS_TONES: dict[str, str] = {
     # 不是故障也不是警告。区别全靠那句话本身和字形。
     TaskStatus.BEFORE_WINDOW.value: "",
     TaskStatus.AFTER_WINDOW.value: "",
+    # 「扫描间隔未到」和「冷却中」同色（都是空色调）：两者都是「等一会儿就好」，
+    # 不是故障也不是警告。区别全靠那句话本身和字形——而它们**必须**区别得开，
+    # 用户能改的只有其中一个（扫描间隔是他自己填的，重启冷却是代码定的）。
+    TaskStatus.SCAN_COOLDOWN.value: "",
     # 「军力数据未采集」按 warn 上色，和「已完成」（ok）刻意分得远——这一档之所以
     # 存在，就是因为它以前被「已完成」盖住，而那两个词在页面上给人的印象正好相反。
     TaskStatus.MISSING_MILITARY_SCORES.value: "warn",
@@ -84,6 +89,9 @@ STATUS_GLYPHS: dict[str, str] = {
     # 沙漏的两个方向：还没到 = 沙子在上，已经过 = 沙子在下。
     TaskStatus.BEFORE_WINDOW.value: "⧗",
     TaskStatus.AFTER_WINDOW.value: "⧖",
+    # 循环箭头：轮到下一趟还得等。**不能用 ◴**（那是「冷却中」的字形）——
+    # 这两档在灰度下就只剩字形能区分，而它们该让用户去做的事完全不同。
+    TaskStatus.SCAN_COOLDOWN.value: "↻",
     # 划掉的圈：目标还在，但一个能用的军力读数都没有。**不能用 ★**（那是
     # 「已完成」的字形），灰度或色盲下字形是唯一的区分。
     TaskStatus.MISSING_MILITARY_SCORES.value: "⊘",

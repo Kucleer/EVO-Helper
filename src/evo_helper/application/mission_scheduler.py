@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -94,8 +94,10 @@ from evo_helper.domain.scheduler import (
     Action,
     Decision,
     DisabledRecovery,
+    MilitaryWindowPool,
     MissionKind,
     RunningProcess,
+    ScanCooldown,
     SchedulerFacts,
     TaskFacts,
     TaskSnapshot,
@@ -106,6 +108,7 @@ from evo_helper.domain.scheduler import (
     has_work,
     looks_like_an_environment_fault,
     quota_day_start_utc,
+    scan_cooldown_verdict,
     tasks_failing_together,
     within_schedule_window,
 )
@@ -1596,6 +1599,7 @@ class MissionScheduler:
         facts = self._facts(snapshots, config, now)
         self._log_a_starved_military_pool(snapshots, now)
         self._log_a_pool_stalled_on_the_cycle_boundary(now)
+        self._log_the_scan_cooldown(snapshots, facts)
         running = self._supervisor.running
         batch_decision = self._military_batch_decision(snapshots, facts, running)
         if batch_decision is not None:
@@ -2164,6 +2168,146 @@ class MissionScheduler:
         self._stale_pool_rounds.pop(task_id, None)
         self._stale_pool_warned_at.pop(task_id, None)
 
+    # -- 扫描间隔 ----------------------------------------------------------------
+
+    def _log_the_scan_cooldown(
+        self, snapshots: Sequence[TaskSnapshot], facts: SchedulerFacts
+    ) -> None:
+        """扫描间隔**把活儿挡掉的那一刻**、以及**安全阀让路的那一刻**，各留一条痕。
+
+        判据不是「有没有打日志」，而是**出事时能不能只靠库里的日志说清
+        「军力榜这一夜为什么只扫了两轮」**。所以两个时刻都要写，而且两条都要说清
+        「为什么 + 当时看到了什么」：上一轮什么时候开始的、冷却配了多久、还差多久、
+        窗口内当时还剩几个、门限是多少。少任何一个，读日志的人都得回去查库。
+
+        - **挡掉**（`BLOCKING`）：INFO。它是这个旋钮**正常工作**的样子，不是异常。
+        - **安全阀让路**（`OVERRIDDEN`）：WARNING。用户口径里这一条最要紧——它意味着
+          上一轮扫描失败或被打断，池子正在饿，再挡下去选靶就要回落到上周期的陈旧
+          读数（整段理由在 `domain.scheduler.scan_cooldown_verdict` 上）。淹在 INFO
+          里等于没说。
+
+        ⚠️ **限流走 `_log_a_repeated_line`**：`has_work` 每 tick 都会走这条判据，
+        而 `_step` 一个 tick 里会转好几圈（先例与实测数字在 `REPEATED_LOG_WINDOW`
+        与 `record_unrecognised_screen` 上）。不限流的话，一个配了 2 小时间隔的
+        军力榜任务能在两小时里写出七千行同一句话。
+
+        ⚠️ **签名只认「状态」，不认「还差几分钟」。** 那个数每 tick 都在变，
+        放进签名等于让限流整个失效（`_line_signature` 覆盖消息里的每一个数，
+        而那正是它平时该做的事）。这里改喂一个显式签名：
+        `(挡不挡, 从哪一刻起算, 冷却多长)`——它们全变了才叫状态变了。
+        代价是被压掉的那一段里「还差几分钟」在减少而库里不记，那没有信息量：
+        起算时刻和冷却时长都在同一条日志里，差多少一减就有。
+
+        ⚠️ **写在 `_step` 里，不在 `_facts` 或 `has_work` 里。** 后两者页面轮询也会
+        走（`snapshot`），挪过去会让「页面开着」和「页面关着」写出不一样的日志。
+        """
+        for task in snapshots:
+            if task.kind is not MissionKind.RANKING or not _participating(task):
+                continue
+            verdict = scan_cooldown_verdict(task, facts)
+            if verdict.state is ScanCooldown.BLOCKING:
+                level, headline, noun = "INFO", "扫描间隔生效", "判定"
+            elif verdict.state is ScanCooldown.OVERRIDDEN:
+                level, headline, noun = "WARNING", "扫描间隔让路", "告警"
+            else:
+                # 没配、或者已经过完了。**一个字都不写**：每轮都响的日志和不响的
+                # 一样没用，而「这一轮放行了」由 `mission_runs` 里那条记录说得更准。
+                continue
+            assert verdict.cooldown is not None  # noqa: S101 - 这两档必然配了冷却
+            assert verdict.last_started_at_utc is not None  # noqa: S101 - 也必然跑过
+            hours = verdict.cooldown.total_seconds() / 3600
+            pool = verdict.pool
+            message = (
+                f"{headline}：上次扫描开始于 {verdict.last_started_at_utc:%Y-%m-%d %H:%M} UTC"
+                f"（{_spoken_span(verdict.elapsed)}前），扫描间隔配的是 {hours:.1f} 小时，"
+                f"还差 {_spoken_span(verdict.remaining)}；"
+                + (
+                    "此刻没有军力优先的攻击任务在等这份读数"
+                    if pool is None
+                    else f"窗口内还有 {pool.in_window} 个候选、窗口门限 {pool.floor} 个"
+                )
+                + (
+                    "。窗口内已经低于门限，再挡下去选靶就会放弃窗口、回落到"
+                    "上一周期的陈旧读数，所以这一轮放行"
+                    if verdict.state is ScanCooldown.OVERRIDDEN
+                    else "，够用，这一轮不开新的扫描"
+                )
+            )
+            self._log_a_repeated_line(
+                key=(task.task_id, "scan_cooldown"),
+                mission_kind=MissionKind.RANKING.value,
+                signature=(
+                    verdict.state.value,
+                    verdict.last_started_at_utc.isoformat(),
+                    round(verdict.cooldown.total_seconds()),
+                ),
+                level=level,
+                message=message,
+                payload={
+                    "task_id": task.task_id,
+                    "mission_kind": MissionKind.RANKING.value,
+                    "last_started_at_utc": verdict.last_started_at_utc.isoformat(),
+                    "cooldown_hours": hours,
+                    "elapsed_minutes": round(verdict.elapsed.total_seconds() / 60, 1),
+                    "remaining_minutes": round(verdict.remaining.total_seconds() / 60, 1),
+                    "in_window_count": None if pool is None else pool.in_window,
+                    "window_floor": None if pool is None else pool.floor,
+                    "safety_valve_released": verdict.state is ScanCooldown.OVERRIDDEN,
+                },
+                now=facts.now_utc,
+                repeat_noun=noun,
+            )
+
+    def _log_a_scan_round_that_outlived_its_cooldown(self, exited: MissionExit) -> None:
+        """**边界留痕**：这一轮扫描本身就跑得比扫描间隔还久。
+
+        冷却从「上一轮开始」算（用户明确要的，理由在
+        `domain.scheduler.TaskSnapshot.scan_cooldown` 上），所以一旦某一轮的时长
+        追平了冷却，这道闸门在它结束的那一刻就已经过完——**等于没有生效**。
+        那不是缺陷，是这个起算点必然的推论；但它必须查得出来，否则用户看着
+        「间隔 1 小时」却发现扫描一轮接一轮，只会以为旋钮坏了。
+
+        实测均值 19.3 分钟、最长 29 分钟（`domain.target_order.DEFAULT_SCORE_MAX_AGE`
+        那一段记的采集速率），离 1 小时还远，所以这条日常一条都不该出现。
+
+        ⚠️ **不限流，因为它一轮最多一条**——`_finish` 每个子进程只走一次。
+        套上 `_log_a_repeated_line` 反而会把「连着三轮都超时」压成一条。
+        """
+        row = self._repository.mission_task(exited.task_id)
+        if row is None:
+            return
+        try:
+            cooldown = _ranking_scan_cooldown(row.params_json)
+        except MissionParamError:
+            # 参数这会儿填错了不该顺带把收退出码这条路搞崩。那件事由页面校验与
+            # `_launch` 各自负责，这里只是记账。
+            return
+        if cooldown is None:
+            return
+        duration = exited.ended_at_utc - exited.started_at_utc
+        if duration < cooldown:
+            return
+        hours = cooldown.total_seconds() / 3600
+        record_system_log(
+            "WARNING",
+            "application.mission_scheduler",
+            f"军力榜这一轮扫描耗时 {_spoken_span(duration)}，已经不短于配置的扫描间隔 "
+            f"{hours:.1f} 小时——间隔是从「上一轮开始」算的，所以它在这一轮结束时就已经"
+            "过完，下一轮不会被它挡住。要真的拉开两轮之间的距离，得把间隔调到比一轮"
+            "扫描的时长更大",
+            payload={
+                "task_id": exited.task_id,
+                "mission_kind": MissionKind.RANKING.value,
+                "started_at_utc": exited.started_at_utc.isoformat(),
+                "ended_at_utc": exited.ended_at_utc.isoformat(),
+                "duration_minutes": round(duration.total_seconds() / 60, 1),
+                "cooldown_hours": hours,
+            },
+            logged_at_utc=exited.ended_at_utc,
+            task_id=exited.task_id,
+            mission_kind=MissionKind.RANKING.value,
+        )
+
     def _act(self, decision: Decision, facts: SchedulerFacts) -> bool:
         """把决策落地，返回「值得再算一次吗」。**只有这里动子进程，所以只有这里要锁。**
 
@@ -2329,6 +2473,8 @@ class MissionScheduler:
                 exit_code=exited.exit_code,
                 stopped_by=exited.stopped_by.value,
             )
+        if exited.kind is MissionKind.RANKING:
+            self._log_a_scan_round_that_outlived_its_cooldown(exited)
         if (
             exited.kind is MissionKind.RANKING
             and self._military_ranking_batch_task_id is not None
@@ -2601,6 +2747,11 @@ class MissionScheduler:
         self._military_pool_readings = readings
         return SchedulerFacts(
             now_utc=now,
+            # 扫描间隔那道安全阀读的就是它。**用的是这一趟已经算好的
+            # `MilitaryPoolReading`，不另查一遍库**：选靶口径只能有一份，
+            # 各算一份的结果是安全阀在「其实还够用」时乱放行（或者反过来），
+            # 而两种走样在页面上都看不出来。
+            military_window=_most_starved_window(readings.values()),
             pirate_dispatches_today=(
                 self._repository.count_dispatches_since(
                     TARGET_KIND_PIRATE, since=quota_day_start_utc(now)
@@ -3358,6 +3509,11 @@ class MissionScheduler:
         if kind is MissionKind.SCAN:
             return scan_command()
         if kind is MissionKind.RANKING:
+            # ⚠️ **扫描间隔不上命令行，仍然要在这里量一遍。** 页面保存参数之前那道
+            # 校验走的正是 `command_for`（`web.persistent_service._validate`）；
+            # 不量，一个填错的值就会静默落库，而它下一次现身是在**每个 tick** 的
+            # `task_snapshot` 里抛出来——那时错的是调度循环，不是那一次保存。
+            _ranking_scan_cooldown(params_json)
             return ranking_command(
                 bot_limit=_ranking_bot_limit(params_json),
                 blind_scrolls=self._blind_scrolls(),
@@ -3490,6 +3646,30 @@ class MissionScheduler:
         )
 
 
+def _most_starved_window(readings: Iterable[MilitaryPoolReading]) -> MilitaryWindowPool | None:
+    """这一趟里**最饿的**那一池：`窗口内个数 - 窗口门限` 最小的那一个。
+
+    扫描间隔的安全阀防的是「整池归零」，而最先归零的就是余量最小的那一个。
+    取最饿的（而不是求和、也不是取第一个）是唯一守得住这句话的选法：求和会让
+    一个宽裕的任务把另一个已经见底的任务盖过去，取第一个则取决于任务的排列顺序
+    ——那个顺序换一次查询就会变。
+
+    `None` 表示**这一趟一个军力优先的 bot 任务都没参与调度**：那时没人等这份
+    读数，冷却该照常生效。⚠️ 别回落成 `MilitaryWindowPool(0, 0)`——那个值的
+    `below_floor` 是假（`0 < 0` 不成立），看起来结果一样，但它是在陈述一个
+    「量到了、窗口内 0 个」的事实，而实际上一次都没量。
+    """
+    pools = [
+        MilitaryWindowPool(in_window=len(reading.in_window), floor=reading.window_floor)
+        for reading in readings
+    ]
+    # 空清单先早退，不用 `min(..., default=None)`：那个重载会把 `key` 里的形参
+    # 推成 `MilitaryWindowPool | None`，strict mypy 当场报 union-attr。
+    if not pools:
+        return None
+    return min(pools, key=lambda pool: pool.in_window - pool.floor)
+
+
 def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: int) -> TaskSnapshot:
     """一行 `mission_tasks` → 领域层认识的那个不可变快照。
 
@@ -3500,10 +3680,17 @@ def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: i
     `origin` 与 `fleet_lines` 是**解析完默认值之后**的取值，由调用方传进来
     （`MissionScheduler._snapshots`）：那两条回落规则要用到 Settings 与
     `scheduler_config`，而这个函数不该去碰它们中的任何一个。
+
+    ⚠️ **扫描间隔在这里解析，而不是在调度器里另读一遍 `params_json`。**
+    页面算状态（`web.persistent_service._view`）和调度器判「起不起」走的是同一个
+    `TaskSnapshot`，各读一份的结果必然是「页面说待命、调度器在按住它」。
+    只对 `RANKING` 解析：`SCAN` 压根不吃参数，两条攻击链路的 `params_json` 里
+    也不该长出一个不生效的键。
     """
+    kind = MissionKind(row.kind)
     return TaskSnapshot(
         task_id=row.id,
-        kind=MissionKind(row.kind),
+        kind=kind,
         name=row.name,
         enabled=row.enabled,
         priority=row.priority,
@@ -3512,6 +3699,9 @@ def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: i
         disabled_reason=row.disabled_reason,
         enabled_from_utc=row.enabled_from_utc,
         enabled_until_utc=row.enabled_until_utc,
+        scan_cooldown=(
+            _ranking_scan_cooldown(row.params_json) if kind is MissionKind.RANKING else None
+        ),
     )
 
 
@@ -3689,6 +3879,54 @@ def _ranking_bot_limit(raw: str) -> int | None:
     if limit < 1:
         raise MissionParamError("扫描数量至少是 1；要全扫就把它留空，别填 0")
     return limit
+
+
+def _ranking_scan_cooldown(raw: str) -> timedelta | None:
+    """两轮军力榜扫描之间至少隔多久，**从上一轮开始的那一刻算起**。留空 = 不限。
+
+    用户口径（2026-08-20）：「比如在周四，我会把 bot 攻击的军力范围选择为 6 小时。
+    但是我又不希望太多的扫描打断派出攻击。所以我会设定扫描间隔为 2 小时。当新的
+    扫描发起时，检查上次开始扫描的时候是否大于 2 小时。当周一时，我会将军力范围
+    选择为 2 小时，扫描冷却为 1 小时，这样尽快的轮转。」
+
+    ## 为什么住在 `mission_tasks.params_json`，而不是 `military_attack_config`
+
+    ⚠️ **它是任务级的，和 `score_max_age_hours` 同一层。** 两条理由都来自用户
+    2026-08-20 那段话：
+
+    1. 用户按**周内相位**来回调（周一 1 小时、周四 2 小时），而它和同样按相位调的
+       「军力分数有效期」是配套的一对——两个数分居两张表，改一次要跑两个页面，
+       而漏改一个的后果恰恰是本函数的安全阀在救的那件事。
+    2. 扫描任务将来可能不止一个，全局值配不了「这个扫得勤、那个扫得稀」。
+
+    ## 为什么没有代码默认值
+
+    ⚠️ **留空 = 不施加冷却，行为与加这个旋钮之前逐字相同。** 理由照抄
+    `military_attack_config.blind_scrolls` 那一列：给了默认值就分不开「没配」
+    和「恰好配成当前默认」，而这两件事在默认值将来被改动时的处置完全相反——
+    前者该跟着新默认走，后者该纹丝不动。
+
+    ⚠️ **`0` 与负数一律拒掉，不当成「不限」。** 同 `_ranking_bot_limit` 那个 0：
+    「不限」有一个明明白白的表达方式（把框留空），用一个看起来像时长的数字去
+    表达它，只会让下一个读库的人分不清那是「用户想不限」还是「用户填错了」。
+
+    没有为它加数据库列：它和 `bot_limit` 一样是任务参数，住在 `params_json` 里
+    （见 `storage.models` 那一行的注释）。
+    """
+    value = _params(raw).get("scan_cooldown_hours")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）：`True` 会被当成
+    # 冷却 1 小时，而用户敲进去的根本不是一个时长。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("扫描间隔必须是小时数；不想限制就把它留空")
+    try:
+        hours = float(value)
+    except ValueError as exc:
+        raise MissionParamError(f"扫描间隔不是数字：{value!r}") from exc
+    if hours <= 0:
+        raise MissionParamError("扫描间隔必须大于 0 小时；不想限制就把它留空，别填 0")
+    return timedelta(hours=hours)
 
 
 def _blind_scrolls(value: object) -> int | None:
