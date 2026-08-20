@@ -115,7 +115,9 @@ from evo_helper.domain.scheduler import (
 from evo_helper.domain.target_order import (
     DEFAULT_PROTECTION_EXCLUSION,
     DEFAULT_SCORE_MAX_AGE,
+    DEFAULT_UNREADABLE_EXCLUSION,
     PROTECTION_EXCLUSION_MAX_HOURS,
+    UNREADABLE_EXCLUSION_MAX_HOURS,
     WINDOW_POOL_FLOOR,
     MilitaryChoice,
     ScoredTarget,
@@ -1092,6 +1094,10 @@ class MissionScheduler:
         """校验攻击配置页上那个「撞上保护期之后排除多久」。留空返回 `None`。"""
         return _protection_exclusion_hours(value)
 
+    def validate_unreadable_exclusion_hours(self, value: object) -> int | None:
+        """校验攻击配置页上那个「面板名读不出之后排除多久」。留空返回 `None`。"""
+        return _unreadable_exclusion_hours(value)
+
     def validate_account_line_limit(self, value: object) -> int | None:
         """校验攻击配置页上那个「全账号航线上限」。留空返回 `None`。"""
         return _account_line_limit(value)
@@ -1245,6 +1251,26 @@ class MissionScheduler:
             effective=window,
             default=DEFAULT_PROTECTION_EXCLUSION,
             detail="撞上保护期的坐标在这段时间内不进候选池",
+        )
+        return window
+
+    def _unreadable_exclusion_window(self) -> timedelta:
+        """面板名读不出之后，这个坐标多久之内不进候选池。
+
+        ⚠️ 起点是**读不出的那一刻**（`bot_targets.unreadable_seen_at_utc`）。
+        整段取舍（为什么是 6 小时、为什么排除有尽头）在
+        `domain.target_order.DEFAULT_UNREADABLE_EXCLUSION`。
+        """
+        hours = self._knob("unreadable_exclusion_hours")
+        if hours is None:
+            return DEFAULT_UNREADABLE_EXCLUSION
+        window = timedelta(hours=hours)
+        record_knob_override(
+            "unreadable_exclusion",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_UNREADABLE_EXCLUSION,
+            detail="面板名读不出的坐标在这段时间内不进候选池",
         )
         return window
 
@@ -3374,21 +3400,22 @@ class MissionScheduler:
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
         """**第 1 步，必须在最前**：排除本轮已走完的、「重复攻击间隔」之内已攻击的、
-        以及**刚撞上过保护期**的 bot。
+        **刚撞上过保护期**的、以及**刚刚面板名读不出**的 bot。
 
         若先挑一批再排除，首批刚好都打过时军力任务会把候选池缩成空集，排名靠后、
         从未攻击的目标永远轮不到。排除必须在窗口筛选与得分排序的前面，随后再按得分
         给各出发星球分配。
 
-        ⚠️ **保护期这一条和 24 小时那一条排在同一处、同一优先级，不是顺手加的。**
-        它俩是同一档判据——「这个坐标此刻打不了」——而把任何一条挪到**航线预算花掉
-        之后**，缩成空集的失败模式会原样复发：保护期里的高分目标先把航线占满，
+        ⚠️ **这三条排除和 24 小时那一条排在同一处、同一优先级，不是顺手加的。**
+        它们是同一档判据——「这个坐标此刻打不了」——而把任何一条挪到**航线预算花掉
+        之后**，缩成空集的失败模式会原样复发：打不了的高分目标先把航线占满，
         再被筛掉，这一轮一发不派，而排在它后面那些明明能打。
         （PR #194 合并第 ④⑤ 步之前，这句话说的是「挪到取前 N 之后」——那道硬截断
         没有了，收窄候选池的闸口换成了航线预算，不变量本身没有放宽。）
 
-        两个窗口都是策略、都可在攻击配置页上改，不是游戏规则：
-        见 `DEFAULT_BOT_REVISIT` 与 `DEFAULT_PROTECTION_EXCLUSION`。
+        三个窗口都是策略、都可在攻击配置页上改，不是游戏规则：
+        见 `DEFAULT_BOT_REVISIT`、`DEFAULT_PROTECTION_EXCLUSION` 与
+        `DEFAULT_UNREADABLE_EXCLUSION`。
 
         ## 保护期这一条在修什么
 
@@ -3398,6 +3425,20 @@ class MissionScheduler:
         2026-08-18 20:29 那一轮当场确认四个目标全在保护期、11.5 分钟一发没派，
         20:41 结算完，**一秒之后的下一轮又把同样的四个挑了出来**，直到 8 小时自然
         过去。每个目标每轮约 2.9 分钟鼠标时间，而鼠标时间才是这台机器的瓶颈。
+
+        ## 「面板名读不出」这一条在修什么
+
+        **同一个形状，第二次。** 站到目标星球上，面板归属名有时读不出来，判据只能
+        说「这不是 bot」，于是这一发不派——而这件事同样一个字都没落库。生产库实测
+        （2026-08-20，近 24 小时）：「不是 bot（面板名 None）」40 次、**只涉及 3 个
+        坐标**，而「不是 bot」但真读出了名字的 **0 次**；这 3 个坐标历史上成功派出
+        0 次。军力高（39,030 / 20,960 / 20,630）→ 排在候选池最前 → 读不出 → 跳过 →
+        这一轮 0 发 → `came_back_empty` 让 `waiting_for_a_line` 把那颗球压到下一条
+        航线空出（实测一次 117 分钟）→ 候选池一个字没变，下一轮又挑中同一个。
+        65 轮里 16 轮空手而归（25%）。
+
+        ⚠️ **这一条只修「失败不留记录」，不碰面板名为什么读不出**（识别层，根因
+        未知，要实机才查得动）。也不碰 `waiting_for_a_line`——它有它的道理。
         """
         targets = self._scored_bot_targets()
         now = self._clock()
@@ -3412,11 +3453,15 @@ class MissionScheduler:
         protected = self._repository.protected_bot_targets_since(
             now - self._protection_exclusion_window()
         )
+        unreadable = self._repository.unreadable_bot_targets_since(
+            now - self._unreadable_exclusion_window()
+        )
         return [
             target
             for target in targets
             if target.coordinate not in attacked_last_day
             and target.coordinate not in protected
+            and target.coordinate not in unreadable
             and phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
         ]
 
@@ -4116,6 +4161,37 @@ def _protection_exclusion_hours(value: object) -> int | None:
             f"保护期排除时长最多 {PROTECTION_EXCLUSION_MAX_HOURS} 小时："
             "游戏的保护期最长 8 小时，再往上只是保守余量；超过一天就和"
             "「bot 重复攻击间隔」争同一件事，排障时分不清目标是被哪一条挡住的。"
+        )
+    return hours
+
+
+def _unreadable_exclusion_hours(value: object) -> int | None:
+    """面板名读不出之后排除多久（小时）。**留空 = 默认 6 小时。**
+
+    ## 两条边界
+
+    - **至少 1 小时。** 0 等于取消排除，而这正是这条功能要修的缺陷本身：读不出的
+      坐标会被每一轮重新挑中，每轮白花 21--44 秒鼠标时间，更贵的是整轮空手而归
+      之后 `waiting_for_a_line` 把那颗球压住 1--2 小时。填 0 的人多半以为自己在
+      「放宽一点」，实际是把它关掉。而且实测那几个坐标约**每小时**就会被重新挑中
+      一次，窗口不明显大于 1 小时等于没排。
+    - **最多 `UNREADABLE_EXCLUSION_MAX_HOURS`（24 小时）。** 理由在那个常量上：
+      越过一天就和 `bot_revisit_hours` 争同一件事；而且「读不出」的根因至今不明，
+      按一个还没查清的现象把高军力目标锁掉超过一天，赌的是一个没有证据的结论。
+    """
+    hours = _optional_int(value, label="面板名读不出排除时长（小时）")
+    if hours is None:
+        return None
+    if hours < 1:
+        raise MissionParamError(
+            "面板名读不出排除时长至少 1 小时：填 0 等于取消排除，而读不出的坐标会被"
+            "下一轮原样挑中，白跑一趟之后整轮空手而归、把那颗球的航线压住一两个小时。"
+        )
+    if hours > UNREADABLE_EXCLUSION_MAX_HOURS:
+        raise MissionParamError(
+            f"面板名读不出排除时长最多 {UNREADABLE_EXCLUSION_MAX_HOURS} 小时："
+            "超过一天就和「bot 重复攻击间隔」争同一件事；而且面板名为什么读不出至今"
+            "没查清，按它把一个高军力目标锁掉一整天，赌的是一个还没有证据的结论。"
         )
     return hours
 

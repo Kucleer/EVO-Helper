@@ -1442,6 +1442,7 @@ class MissionConsoleService:
         reconcile_cooldown_minutes: object = None,
         bot_revisit_hours: object = None,
         protection_exclusion_hours: object = None,
+        unreadable_exclusion_hours: object = None,
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
     ) -> MilitaryAttackConfigView:
@@ -1467,6 +1468,9 @@ class MissionConsoleService:
             protection = self._scheduler.validate_protection_exclusion_hours(
                 protection_exclusion_hours
             )
+            unreadable = self._scheduler.validate_unreadable_exclusion_hours(
+                unreadable_exclusion_hours
+            )
             account_lines = self._scheduler.validate_account_line_limit(account_line_limit)
             toggle_window = self._scheduler.validate_auto_toggle_log_seconds(
                 auto_toggle_log_seconds
@@ -1481,6 +1485,7 @@ class MissionConsoleService:
             reconcile_cooldown_minutes=cooldown,
             bot_revisit_hours=revisit,
             protection_exclusion_hours=protection,
+            unreadable_exclusion_hours=unreadable,
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
         )
@@ -2404,6 +2409,7 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
         "bot_revisit_hours": row.bot_revisit_hours,
         "protection_exclusion_hours": row.protection_exclusion_hours,
+        "unreadable_exclusion_hours": row.unreadable_exclusion_hours,
         "account_line_limit": row.account_line_limit,
         "auto_toggle_log_seconds": row.auto_toggle_log_seconds,
     }

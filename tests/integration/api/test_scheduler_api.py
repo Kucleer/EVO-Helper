@@ -1585,6 +1585,9 @@ def test_saving_the_page_clears_a_knob_that_was_left_blank(console: Console) -> 
         # 0 = 取消排除，而候选池按军力降序排。
         ("bot_revisit_hours", 0),
         ("bot_revisit_hours", 169),
+        # 0 = 取消排除，而那正是「面板名读不出」这条功能要修的缺陷本身。
+        ("unreadable_exclusion_hours", 0),
+        ("unreadable_exclusion_hours", 25),
     ],
 )
 def test_impossible_pacing_knobs_are_refused_by_the_api(
@@ -1615,6 +1618,7 @@ _ALL_KNOBS = {
     "reconcile_cooldown_minutes": 0,
     "bot_revisit_hours": 6,
     "protection_exclusion_hours": 4,
+    "unreadable_exclusion_hours": 3,
     "account_line_limit": 6,
     "auto_toggle_log_seconds": 90,
 }
@@ -1642,6 +1646,39 @@ def test_every_knob_survives_a_single_save(console: Console) -> None:
     for field, value in _ALL_KNOBS.items():
         assert body[field] == value, f"{field} 没能原样存下来（读回 {body[field]!r}）"
     assert body["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+
+
+def test_the_settings_page_renders_every_knob(console: Console) -> None:
+    """攻击配置页真的渲染得出来，而且每个旋钮都有那个 `id`。
+
+    ⚠️ **这一页只有这一条覆盖。** 六文件管线的另一头是 `settings.html`：模板里
+    少一个上下文键、或者 `id` 和 JS 里那张表对不上，接口用例一条都不会红——它们
+    根本不渲染页面，而用户只会看到一个存不进去的框。
+
+    默认值与上界也一起断言：它们从常量传进模板（不在 HTML 里手抄），
+    抄一遍之后调常量页面不跟，而页面上那几句话正是用户判断「填多少」的唯一依据。
+    """
+    response = console.client.get("/settings")
+
+    assert response.status_code == 200, response.text
+    body = response.text
+    for knob_id in (
+        "blind-scrolls",
+        "report-scan-hours",
+        "line-hold",
+        "reconcile-cooldown",
+        "bot-revisit",
+        "protection-exclusion",
+        "unreadable-exclusion",
+        "account-line-limit",
+        "auto-toggle-log",
+    ):
+        assert f'id="{knob_id}"' in body, f"{knob_id} 那个框没渲染出来"
+        assert f"getElementById('{knob_id}')" in body, f"{knob_id} 没接进保存那张表"
+    # ⚠️ 断言的是**带标签的那一句**，不是光秃秃的 `留空 = 6`——后者和「翻信箱
+    # 往回读几小时」那一格的默认值撞号，撞上了这条就什么都没验。
+    assert "面板名读不出排除时长（小时，默认 6）" in body, "默认值没从常量传进模板"
+    assert "上限 24 小时——超过一天" in body, "上界没从常量传进模板"
 
 
 def test_every_knob_is_blank_on_a_fresh_database(console: Console) -> None:

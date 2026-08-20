@@ -48,8 +48,10 @@ from evo_helper.domain.report_wait import (
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.domain.target_order import (
     DEFAULT_PROTECTION_EXCLUSION,
+    DEFAULT_UNREADABLE_EXCLUSION,
     GAME_PROTECTION_HOURS,
     PROTECTION_EXCLUSION_MAX_HOURS,
+    UNREADABLE_EXCLUSION_MAX_HOURS,
 )
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -791,6 +793,10 @@ def create_app(
                     DEFAULT_PROTECTION_EXCLUSION.total_seconds() // 3600
                 ),
                 "protection_exclusion_max": PROTECTION_EXCLUSION_MAX_HOURS,
+                "unreadable_exclusion_default": int(
+                    DEFAULT_UNREADABLE_EXCLUSION.total_seconds() // 3600
+                ),
+                "unreadable_exclusion_max": UNREADABLE_EXCLUSION_MAX_HOURS,
                 "game_protection_hours": GAME_PROTECTION_HOURS,
                 "account_line_limit_max": ACCOUNT_LINE_LIMIT_MAX,
                 "auto_toggle_log_default": int(REPEATED_LOG_WINDOW.total_seconds()),
@@ -1323,6 +1329,7 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
         reconcile_cooldown_minutes=view.reconcile_cooldown_minutes,
         bot_revisit_hours=view.bot_revisit_hours,
         protection_exclusion_hours=view.protection_exclusion_hours,
+        unreadable_exclusion_hours=view.unreadable_exclusion_hours,
         account_line_limit=view.account_line_limit,
         auto_toggle_log_seconds=view.auto_toggle_log_seconds,
     )
@@ -1393,6 +1400,7 @@ def register_mission_routes(app: FastAPI) -> None:
                 reconcile_cooldown_minutes=payload.reconcile_cooldown_minutes,
                 bot_revisit_hours=payload.bot_revisit_hours,
                 protection_exclusion_hours=payload.protection_exclusion_hours,
+                unreadable_exclusion_hours=payload.unreadable_exclusion_hours,
                 account_line_limit=payload.account_line_limit,
                 auto_toggle_log_seconds=payload.auto_toggle_log_seconds,
             )

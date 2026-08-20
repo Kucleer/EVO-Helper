@@ -102,6 +102,38 @@
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
+    <label for="unreadable-exclusion">面板名读不出排除时长（小时，默认 {{ unreadable_exclusion_default }}）</label>
+    <input id="unreadable-exclusion" type="number" min="1" max="{{ unreadable_exclusion_max }}" step="1"
+           placeholder="留空 = {{ unreadable_exclusion_default }}" aria-label="面板名读不出排除时长（小时）">
+  </div>
+  <p class="muted">
+    站到目标星球上，行星面板上的<strong>归属名有时读不出来</strong>。判据只能说「这不是 bot」，于是这一发不派。
+    撞上一次之后，这个坐标在这里配的时长内不再进候选池。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>这一格和上面那个「保护期排除时长」是两回事，刻意分开。</strong>
+    保护期是<strong>读得懂的事实</strong>（游戏弹窗明说了「没有可执行的任务」）；
+    「面板名读不出」是<strong>根因还没查清的现象</strong>——可能是画面没加载完、窗口失焦，也可能这个坐标就是读不出。
+    两者该排多久没有理由相同。
+  </p>
+  <p class="muted">
+    实机（2026-08-20，近 24 小时）：这条判据触发 <strong>40 次、只涉及 3 个坐标</strong>，
+    而「真读出了名字、只是不匹配」<strong>0 次</strong>——也就是它 100% 是在报识别失败。
+    那 3 个坐标军力 39,030 / 20,960 / 20,630，排在候选池最前，历史上<strong>成功派出 0 次</strong>。
+    每撞一次白花 21--44 秒鼠标时间；更贵的是<strong>整轮空手而归</strong>（65 轮里 16 轮，25%），
+    之后「等一条航线空出」会把那颗球压住 1--2 小时（实测一次 117 分钟）。
+  </p>
+  <p class="muted">
+    <strong>调小</strong>：读不出可能只是一次抖动，早点重试能救回一个高军力目标；代价是它会更早回到候选池，
+    而实测那几个坐标约<strong>每小时</strong>就会被重新挑中一次——填得太小等于没排。<br>
+    <strong>调大</strong>：几乎不会再为它白跑；代价是万一只是偶发，一个高军力目标要闲置这么久。<br>
+    <strong>排除是有尽头的，故意的</strong>：窗口一过它就回到候选池，同时库里记着<strong>连续第几次读不出</strong>，
+    日志每次都会写。想知道某个坐标是偶发还是无可救药，看那个数字，不用去数日志行数。
+    上限 {{ unreadable_exclusion_max }} 小时——超过一天就和上面那个「bot 重复攻击间隔」争同一件事，
+    而且根因至今没查清，按它把一个高军力目标锁掉一整天，赌的是一个还没有证据的结论。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
     <label for="account-line-limit">全账号航线上限（留空 = 不额外限制）</label>
     <input id="account-line-limit" type="number" min="1" max="{{ account_line_limit_max }}" step="1"
            placeholder="留空 = 不额外限制" aria-label="全账号航线上限">
@@ -203,6 +235,7 @@
     { element: document.getElementById('reconcile-cooldown'), key: 'reconcile_cooldown_minutes', label: '翻信箱冷却' },
     { element: document.getElementById('bot-revisit'), key: 'bot_revisit_hours', label: 'bot 重复攻击间隔' },
     { element: document.getElementById('protection-exclusion'), key: 'protection_exclusion_hours', label: '保护期排除时长' },
+    { element: document.getElementById('unreadable-exclusion'), key: 'unreadable_exclusion_hours', label: '面板名读不出排除时长' },
     { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
     { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '调度器重复日志窗口' },
   ];

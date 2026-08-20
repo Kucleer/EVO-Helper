@@ -209,6 +209,9 @@ def test_the_loop_dispatches_with_the_bot_attack_preset(monkeypatch: pytest.Monk
     loop._outcome = Outcome()
     loop._goto_checked = lambda _c: TargetCheck.CONFIRMED
     loop.attack = lambda coordinate, *, preset=None: presets.append(preset) or True
+    # 读通之后的清零要查库，而这一条问的只是「交出去的预设是哪个」。
+    # 清零本身另有用例：`test_unreadable_panel_exclusion` 的第 ② 组。
+    loop._clear_unreadable = lambda _c: None
 
     loop._attack_once(TARGET)
 

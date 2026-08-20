@@ -147,6 +147,48 @@ class BotTargetRow(Base):
     #: 早于这个功能）」，而不是某个具体时刻。
     protection_seen_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
+    #: **最近一次站上去、面板归属名读不出来的时刻**（`vision.scan_reading.
+    #: PlanetPanel.display_name is None`）。
+    #:
+    #: 与 `protection_seen_at_utc` 是同一个形状、同一档问题：识别失败没落库，选靶
+    #: 查不到，于是下一轮把同一个坐标原样挑出来。生产库实测（2026-08-20，近 24
+    #: 小时）：「不是 bot」出现 40 次、只涉及 3 个坐标，**没有一次是真读出了名字**；
+    #: 这 3 个坐标历史上成功派出 0 次。每撞一次 21--44 秒鼠标时间，而更贵的是整轮
+    #: 空手而归（65 轮里 16 轮）之后 `waiting_for_a_line` 把那颗球压住 1--2 小时。
+    #:
+    #: ⚠️ **只记「读不出」，不记「读出来了但不是 bot」。** 两者结论相同（这一发不
+    #: 派）、成因完全相反：前者是识别层的毛病，重试可能就好了；后者是事实变了
+    #: （bot 搬走 / 星球换了主），该由坐标扫描去更新 `is_bot`，而不是记一笔「识别
+    #: 失败」。实测目前 100% 是前者，但代码不许假设永远如此——判据在
+    #: `tools.bot_loop.BotLoop._note_check_failure`。
+    #:
+    #: ⚠️ **这一列记的是「什么时候读不出的」，不是「排除到什么时候」**，理由同
+    #: `protection_seen_at_utc`：排除多久是策略，由
+    #: `military_attack_config.unreadable_exclusion_hours` 那个旋钮回答，判据在
+    #: `application.mission_scheduler._military_candidates`。
+    #:
+    #: ⚠️ **可空且没有 `server_default`。** NULL = 「从没读不出过（或者这一行早于
+    #: 这个功能）」，不是某个具体时刻。给个默认时刻会把全库存量目标一次性排除掉。
+    unreadable_seen_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+    #: **连续**几轮站上去都读不出面板名。读通一次就归零（`clear_unreadable_panel`）。
+    #:
+    #: 它回答的是用户真正要问的那个问题：**这个坐标是偶尔读不出，还是永远读不出？**
+    #: 排除窗口一到就把坐标放回候选池（`DEFAULT_UNREADABLE_EXCLUSION` 上写着为什么
+    #: 不永久拉黑），所以「无可救药」这件事必须能从数据里看出来，而不是靠人去数
+    #: 日志行数。一个连续失败 40 次、一次都没读通过的坐标，和一个偶尔失败一次的，
+    #: 在这一列上一眼就分得开。
+    #:
+    #: **连续而不是累计**：累计数会把「上个月坏过三次、现在好了」和「一直坏着」混成
+    #: 同一个数。归零点是 `check_target` 判 `CONFIRMED` 的那一刻——包括**复位重试之后
+    #: 才读通**的那一次，所以自愈得了的抖动最终不会计数、也不会留下排除标记。
+    #:
+    #: ⚠️ **非空、`server_default="0"`。** 这里 0 对存量行是**真话**（「还没失败过」），
+    #: 与上面那个时刻列的情形不同——那一列没有一个诚实的默认时刻可给。
+    unreadable_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
 
 class AttackIntentRow(Base):
     __tablename__ = "attack_intents"
@@ -869,6 +911,22 @@ class MilitaryAttackConfigRow(Base):
     #: 没有唯一正确答案。上下界与理由在
     #: `application.mission_scheduler._protection_exclusion_hours`。
     protection_exclusion_hours: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
+    #: 面板名读不出之后，这个坐标多久之内不再进候选池（小时）。**空 = 6 小时。**
+    #:
+    #: 和上面那一格是同一个形状、不同的成因，**刻意分成两个旋钮**：保护期是**读得懂
+    #: 的事实**（游戏弹窗明说了「没有可执行的任务」），而「面板名读不出」是一个
+    #: **根因还没查清的现象**。两者该排多久没有理由相同，合成一个旋钮之后，用户为了
+    #: 治其中一个而调的数会同时改掉另一个，排障时也分不清目标是被哪一条挡住的。
+    #:
+    #: 旋钮而非标定常量：调小更激进（读不出可能只是画面没加载完，早点重试能救回一个
+    #: 高军力目标），调大更保守（宁可丢掉这个目标也不再白跑一轮空的）。取值取决于
+    #: 用户此刻缺的是目标还是鼠标时间，没有唯一正确答案。上下界与整段取舍在
+    #: `domain.target_order.DEFAULT_UNREADABLE_EXCLUSION` 与
+    #: `application.mission_scheduler._unreadable_exclusion_hours`。
+    unreadable_exclusion_hours: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=None
     )
 

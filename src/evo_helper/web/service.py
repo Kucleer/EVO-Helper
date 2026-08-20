@@ -433,6 +433,9 @@ class MilitaryAttackConfigView:
     #: 撞上保护期之后排除多久；`None` = 留空 = 默认 8 小时（游戏保护期同为 8 小时，
     #: 但那是规则、这是策略，见 `mission_scheduler.DEFAULT_PROTECTION_EXCLUSION`）。
     protection_exclusion_hours: int | None = None
+    #: 面板名读不出之后排除多久；`None` = 留空 = 默认 6 小时
+    #: （见 `domain.target_order.DEFAULT_UNREADABLE_EXCLUSION`）。
+    unreadable_exclusion_hours: int | None = None
     # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 删掉了（理由在
     # `domain.target_order` 模块头第 3 步）。「用多新的数据」改由任务参数
     # `score_max_age_hours` 划线回答。
