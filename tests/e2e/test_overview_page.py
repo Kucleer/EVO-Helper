@@ -229,6 +229,52 @@ def _report(
         session.commit()
 
 
+def _run(
+    repository: SqlAlchemyRepository,
+    *,
+    started_at_utc: datetime,
+    ended_at_utc: datetime | None = None,
+    configured_lines: int | None = None,
+) -> None:
+    """一轮子进程记录。
+
+    `configured_lines=None` 就是 2026-08-20 之前那些行的形状——那一列还不存在，
+    所以那些天的航线数只能推算。
+    """
+    run = repository.begin_mission_run(
+        MissionKind.BOT,
+        task_id=None,
+        command=["python"],
+        pid=None,
+        started_at_utc=started_at_utc,
+        log_path="var/logs/mission-bot.log",
+        configured_lines=configured_lines,
+    )
+    if ended_at_utc is not None:
+        repository.finish_mission_run(
+            run, ended_at_utc=ended_at_utc, exit_code=0, stopped_by="SELF"
+        )
+
+
+def _uptime(repository: SqlAlchemyRepository, *, start: datetime, last_beat: datetime) -> None:
+    """一段挂机心跳。右端是**最后一拍**，不是「停止时刻」。"""
+    segment = repository.open_uptime_segment(now_utc=start)
+    repository.beat_uptime_segment(segment, now_utc=last_beat)
+
+
+def _period_cells(html: str, label: str) -> list[str]:
+    """周期统计表里那一行的各个格子（不含最左边的周期名）。"""
+    row = re.search(rf"<tr[^>]*>\s*<th scope=\"row\">{re.escape(label)}</th>(.*?)</tr>", html, re.S)
+    assert row is not None, f"周期统计表里没有 {label} 这一行"
+    return re.findall(r"<td[^>]*>\s*([^<]*?)\s*</td>", row.group(1))
+
+
+def _utilisation_card(html: str) -> str:
+    """「今天收益」下面那一行的第一张卡——航线利用率。"""
+    head = html.rindex('<div class="tile overview-card">', 0, html.index("航线利用率"))
+    return html[head : html.index('<div class="tile overview-card">', head + 1)]
+
+
 def _slot_classes(html: str) -> list[list[str]]:
     """每一张航线卡片上的格子，按出现顺序。"""
     return [
@@ -407,11 +453,15 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
         "合金碎片",
         "泰坦立方",
         "收割者碎片",
+        "挂机",
         "利用率",
     ]
     # 并排，不是分在两张表里。
     assert columns.index("读回战报") < columns.index("合金碎片")
     assert columns.index("回收率") < columns.index("合金碎片")
+    # ⚠️ 「挂机」必须紧挨着「利用率」：分母换成「周期总时长 × 线数」之后，
+    # 「为什么低」这个问题的答案就在挂机那一列里。分开摆等于把一对数拆散。
+    assert columns.index("挂机") == columns.index("利用率") - 1
 
 
 def test_the_period_table_reports_the_measured_numbers(
@@ -768,3 +818,239 @@ def test_the_task_row_kind_is_not_needed_for_the_page_to_render(
 
     assert response.status_code == 200
     assert "没有配着出发星球的军力攻击任务" in response.text
+
+
+# -- 利用率的分母：周期总时长 × 航线数（用户口径 2026-08-20） ---------------------
+#
+# ⚠️ 这一节整体反转了 08-17 那条「任务实际运行时间 × 航线数」。旧口径下「关了
+# 一晚上」和「开着一整天却一发没派」在页面上长得一样（都接近 100%）；新口径把
+# 没开工的那段显示成损失，而「到底开没开工」由「挂机」那一列单独回答。
+
+
+def test_the_utilisation_denominator_is_the_whole_period_not_the_run_time(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """今天已过 10 小时、配着 5 条线、占了 1 条线 1 小时 ⇒ 1 / (10 × 5) = 2%。
+
+    ⚠️ 换回旧分母（那一轮只跑了 1 小时 × 5 条 = 5 航线小时）会算出 20%，
+    这一条立刻转红。
+    """
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=5,
+    )
+    _dispatch(
+        factory,
+        run_id,
+        dispatched_at_utc=NOW - timedelta(hours=2),
+        line_free_at_utc=NOW - timedelta(hours=1),
+    )
+
+    html = client.get("/overview").text
+
+    assert _period_cells(html, "08-19 今天")[-1] == "2%"
+
+
+def test_a_period_whose_line_count_was_recorded_is_not_marked_as_a_bound(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """有真值的那一行照实写百分比，不加「≤」。"""
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=5,
+    )
+    _dispatch(
+        factory,
+        run_id,
+        dispatched_at_utc=NOW - timedelta(hours=2),
+        line_free_at_utc=NOW - timedelta(hours=1),
+    )
+
+    cells = _period_cells(client.get("/overview").text, "08-19 今天")
+
+    assert "≤" not in cells[-1]
+
+
+def test_a_period_without_a_recorded_line_count_falls_back_to_the_peak_and_says_so(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """⚠️ **历史天：线数用「当天最大并发在飞数」当下界，页面必须标出来。**
+
+    两发并行各占 1 小时 ⇒ 最大并发 2 ⇒ 分母 10 × 2 = 20 航线小时 ⇒ 2 / 20 = 10%。
+    方向是**线数偏小 ⇒ 分母偏小 ⇒ 利用率偏高**，所以写「≤ 10%」：真实值不高于它。
+
+    ⚠️ 换成「用此刻配着的 9 条」会算出 2%，换成「填 0」会变成「—」，
+    两种都会让这一条转红。
+    """
+    for _ in range(2):
+        _dispatch(
+            factory,
+            run_id,
+            dispatched_at_utc=NOW - timedelta(hours=2),
+            line_free_at_utc=NOW - timedelta(hours=1),
+        )
+
+    html = client.get("/overview").text
+    cells = _period_cells(html, "08-19 今天")
+
+    assert cells[-1] == "≤ 10%"
+    # 方向必须写在页面上，不只是写在注释里。
+    assert "利用率因此偏高" in html
+
+
+def test_a_period_estimated_from_the_peak_never_exceeds_one_hundred_percent(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """⚠️ **方案 C 的自检性质**：用最大并发当线数时，利用率在构造上 ≤ 100%。
+
+    这里派的全是「时长未知」那一档（航线钟为 NULL，按 hold 兜底占 90 分钟），
+    起点各不相同、互相重叠 —— 最容易把并发算错的形状。算出 >100% 就是实现有 bug
+    （最典型的是把重叠区间合并了，那会让最大并发恒等于 1）。
+    """
+    for minutes in (0, 20, 40, 60, 80, 100):
+        _dispatch(
+            factory, run_id, dispatched_at_utc=NOW - timedelta(hours=5) + timedelta(minutes=minutes)
+        )
+
+    percent = _period_cells(client.get("/overview").text, "08-19 今天")[-1]
+
+    assert percent.startswith("≤ ")
+    assert int(percent.removeprefix("≤ ").removesuffix("%")) <= 100
+
+
+def test_the_today_card_spells_out_the_new_denominator(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """「今天收益」那张卡上的小字要跟着改口径：可用 = 已过时长 × 线数。"""
+    _run(
+        repository,
+        started_at_utc=NOW - timedelta(hours=2),
+        ended_at_utc=NOW - timedelta(hours=1),
+        configured_lines=5,
+    )
+    _dispatch(
+        factory,
+        run_id,
+        dispatched_at_utc=NOW - timedelta(hours=2),
+        line_free_at_utc=NOW - timedelta(hours=1),
+    )
+
+    card = _utilisation_card(client.get("/overview").text)
+
+    assert "占用 1.0 / 可用 50.0 航线小时" in card
+    assert "今天已过时长 × 5 条" in card
+
+
+# -- 挂机运行时长 ---------------------------------------------------------------
+
+
+def test_a_period_without_any_heartbeat_says_no_data_instead_of_zero(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ **心跳之前的那些天必须写「—」，不许写 0。**
+
+    写 0 等于说「那天没开机」，而事实是「那天没人在记」——心跳是 2026-08-20 才加的，
+    历史补不回来（用户口径 2026-08-20）。
+    """
+    _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=2))
+
+    html = client.get("/overview").text
+
+    # 挂机那一格在利用率左边。
+    assert _period_cells(html, "08-19 今天")[-2] == "—"
+    assert "—" in _utilisation_card(html)
+
+
+def test_the_uptime_column_reports_the_hours_the_scheduler_was_up(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """今天 00:30 起、04:00 最后一拍 ⇒ 3.5 小时。
+
+    ⚠️ 这个数**不是**轮次时长之和：实测 2026-08-20 那 41 分钟调度器开着却一轮都
+    没起（扫描间隔挡住 RANKING、`waiting_for_a_line` 压住 BOT），拿轮次覆盖冒充
+    挂机时长会把它误报成关机。所以这一条**一轮 `mission_runs` 都不造**。
+    """
+    day = datetime(2026, 8, 19, tzinfo=UTC)
+    # 前一天也落过拍：这样「今天」整段都在观测范围里，那个数才是确数而不是下界
+    # （下界那一档另有用例，见 test_a_day_before_the_first_beat_still_says_no_data）。
+    _uptime(repository, start=day - timedelta(hours=6), last_beat=day - timedelta(hours=5))
+    _uptime(repository, start=day + timedelta(minutes=30), last_beat=day + timedelta(hours=4))
+    _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=2))
+
+    html = client.get("/overview").text
+
+    assert _period_cells(html, "08-19 今天")[-2] == "3.5h"
+    assert "3.5 小时" in _utilisation_card(html)
+
+
+def test_a_killed_process_does_not_keep_the_uptime_growing(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """⚠️ **进程被杀的情形。** 崩溃时不会有人写「已停止」。
+
+    01:00 起、02:00 最后一拍，之后进程被 kill；现在是 10:00。挂机时长必须是
+    1 小时，不是 9 小时。换成「起了就一直算到现在」的写法，这一条立刻转红。
+    """
+    day = datetime(2026, 8, 19, tzinfo=UTC)
+    _uptime(repository, start=day - timedelta(hours=6), last_beat=day - timedelta(hours=5))
+    _uptime(repository, start=day + timedelta(hours=1), last_beat=day + timedelta(hours=2))
+    _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=2))
+
+    assert _period_cells(client.get("/overview").text, "08-19 今天")[-2] == "1.0h"
+
+
+def test_a_day_before_the_first_beat_still_says_no_data(
+    client: TestClient,
+    factory: sessionmaker[Session],
+    repository: SqlAlchemyRepository,
+    run_id: UUID,
+    planets: None,
+) -> None:
+    """⚠️ 库里已经有心跳了，但**更早的那些天**照样是「—」。
+
+    这一条和「有观测、那天真的没开机 = 0」必须分得开，否则「没开机」和
+    「没记录」在页面上长得一样，而这个指标存在的全部意义就是分开它们。
+
+    顺带钉住**心跳上线那一天**：第一拍落在 01:00，00:00–01:00 那一小时没人在记，
+    所以那天的挂机时长是**下界**，页面写「≥」。
+    """
+    day = datetime(2026, 8, 19, tzinfo=UTC)
+    _uptime(repository, start=day + timedelta(hours=1), last_beat=day + timedelta(hours=2))
+    _dispatch(factory, run_id, dispatched_at_utc=datetime(2026, 8, 18, 12, tzinfo=UTC))
+
+    html = client.get("/overview").text
+
+    assert _period_cells(html, "08-18")[-2] == "—"
+    assert _period_cells(html, "08-19 今天")[-2] == "≥ 1.0h"

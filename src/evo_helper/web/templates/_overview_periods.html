@@ -5,6 +5,11 @@
   ⚠️ **「读回战报」与「回收率」必须和资源列并排**（需求文档 8.4）。资源列只统计
   已读回的战报，而战报是滞后读回来的——实测 08-18 这一天，隔 11 小时从 33 份 /
   67,594 变成 61 份 / 166,194。少了这两列，用户明天再看同一天的数会以为出了 bug。
+
+  ⚠️ **「挂机」与「利用率」同理必须并排。** 利用率的分母自 2026-08-20 起是
+  「周期总时长 × 航线数」，它不再替用户解释「关着机器的那段不算产能」——
+  那件事改由「挂机」这一列直说。少了它，一个低利用率分不出是「航线闲着」
+  还是「机器根本没开」。
 #}
 {% if periods_failed %}
   <p class="error">周期统计这一趟没读到数据（查询失败，已记进系统日志）。</p>
@@ -20,6 +25,9 @@
         {% for cell in (rows[0].rare if rows else []) %}
           <th scope="col">{{ cell.label }}</th>
         {% endfor %}
+        {# 挂机紧挨着利用率：分母换成「周期总时长 × 线数」之后，「为什么低」
+           这个问题的答案就在这一列里。 #}
+        <th scope="col">挂机</th>
         <th scope="col">利用率</th>
       </tr>
     </thead>
@@ -35,14 +43,32 @@
           {% for cell in row.rare %}
             <td>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
           {% endfor %}
-          {# 超过 100% 照实显示、不截断：那是「派出去的活比开机时间还多」，
-             也就是关机太早、舰队回来时没人接（docs/数据概览-方案.md 第二节 C）。 #}
-          <td class="{% if row.utilisation is none %}muted{% elif row.utilisation > 1 %}tone-warn{% elif row.utilisation >= 0.8 %}tone-ok{% endif %}">
-            {% if row.utilisation is none %}—{% else %}{{ '%.0f'|format(row.utilisation * 100) }}%{% endif %}
+          {# 挂机运行时长。⚠️ **无观测写「—」，不写 0**：心跳是 2026-08-20 才加的，
+             之前的天补不回来，而写 0 等于说「那天没开机」——那是假话。 #}
+          <td class="{% if row.uptime_hours is none %}muted{% endif %}"
+              {% if row.uptime_hours is none %}title="这一段还没有心跳观测（心跳是 2026-08-20 加的）。写「—」而不是 0：0 的意思是那段时间没开机，而我们并不知道"
+              {% elif row.uptime_partial %}title="这一段只有一部分有心跳观测，所以这个数是下界"{% endif %}>
+            {% if row.uptime_hours is none %}—{% else %}{{ '≥ ' if row.uptime_partial }}{{ '%.1f'|format(row.uptime_hours) }}h{% endif %}
+          </td>
+          {#
+            利用率。分母 = 周期总时长 × 航线数（用户口径 2026-08-20，反转了 08-17
+            那条「任务实际运行时间 × 航线数」）。
+
+            ⚠️ 超过 100% 照实显示、不截断：配置中途被改小，或者在飞数真的超过配置数
+            （航线跨任务共享，海盗与 bot 抢同一批）。截掉就把真信号抹了。
+
+            ⚠️ 带「≤」的那些行**线数没有真值**，用的是当天最大并发在飞数这个下界：
+            **线数偏小 ⇒ 分母偏小 ⇒ 利用率偏高**，真实值不高于显示的这个数。
+            两种天不许混在一起不作区分。
+          #}
+          <td class="{% if row.utilisation is none %}muted{% elif row.utilisation > 1 %}tone-warn{% elif row.utilisation >= 0.8 %}tone-ok{% endif %}"
+              {% if not row.lines_exact %}title="这一段没有记下当时的航线数，用的是观测到的最大并发在飞数（{{ row.lines }} 条）当下界：分母偏小，所以真实利用率不高于这个数"
+              {% else %}title="分母 = 周期总时长 × {{ row.lines }} 条航线（那几轮开始时记下的真值）"{% endif %}>
+            {% if row.utilisation is none %}—{% else %}{{ '≤ ' if not row.lines_exact }}{{ '%.0f'|format(row.utilisation * 100) }}%{% endif %}
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="8" class="muted">这一档没有数据</td></tr>
+        <tr><td colspan="9" class="muted">这一档没有数据</td></tr>
       {% endfor %}
     </tbody>
   </table>

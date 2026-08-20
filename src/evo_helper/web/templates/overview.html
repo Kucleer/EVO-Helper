@@ -27,7 +27,16 @@
 
 <section class="panel" aria-label="周期统计">
   <div class="overview-tabs-head">
-    <h2 class="overview-heading">周期统计 <span>UTC+0 切天 · 资源列只统计已读回的战报</span></h2>
+    {#
+      ⚠️ 利用率的口径写在标题里，不留给悬停：分母 2026-08-20 从「任务实际运行时长
+      × 航线数」换成了「周期总时长 × 航线数」，同一个百分比在两个口径下差好几倍，
+      不写明的话谁都不知道自己在看哪一个。
+
+      「≤」那句同样要写在明处：那些行的航线数是**推算的下界**，于是利用率是**上界**
+      （偏高）。这个仓的规矩是宁可说「这个数不准」，也不让它假装准。
+    #}
+    <h2 class="overview-heading">周期统计 <span>UTC+0 切天 · 资源列只统计已读回的战报 ·
+      利用率分母 = 周期总时长 × 航线数 · 标「≤」的行航线数取的是下界（利用率因此偏高）</span></h2>
     <nav class="overview-tabs" aria-label="统计粒度">
       {% for value, label in [('day', '按天'), ('week', '按周'), ('month', '按月'), ('total', '总计')] %}
         <a class="overview-tab {% if granularity.value == value %}on{% endif %}"

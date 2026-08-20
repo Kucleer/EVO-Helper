@@ -80,6 +80,11 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "scan_plans.created_at_utc",
         "scan_plans.updated_at_utc",
         "scout_reports.reported_at_utc",
+        # a3c81f5d2b64（挂机心跳）随表建的。⚠️ 这两列全都在比时刻——写成
+        # `WITHOUT TIME ZONE` 的话 Postgres 上 tzinfo 会被静默截掉，挂机时长会算错
+        # 8 小时（服务器在 UTC+8）而页面上一点异样都看不出来。
+        "scheduler_uptime_segments.started_at_utc",
+        "scheduler_uptime_segments.last_beat_at_utc",
         "state_events.occurred_at_utc",
         "system_log.logged_at_utc",
         "target_revisits.executed_at_utc",
@@ -123,6 +128,9 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "attack_dispatches.line_hold_until_utc",
         # d4b6e0f19c73（面板名读不出的时刻）加的，那条迁移里也写着 `timezone=True`。
         "bot_targets.unreadable_seen_at_utc",
+        # a3c81f5d2b64（挂机心跳）随新表建的，那条迁移里也写着 `timezone=True`。
+        "scheduler_uptime_segments.started_at_utc",
+        "scheduler_uptime_segments.last_beat_at_utc",
     }
 )
 

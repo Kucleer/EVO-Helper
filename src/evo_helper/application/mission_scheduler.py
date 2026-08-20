@@ -125,6 +125,7 @@ from evo_helper.domain.target_order import (
     most_valuable_first,
     score_is_fresh,
 )
+from evo_helper.domain.uptime import due_for_a_beat, opens_a_new_segment
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
     BLIND_SCROLL_SAMPLES,
@@ -681,6 +682,13 @@ class MissionScheduler:
         #: 就清掉——那一下的含义是「我知道了，别再提醒我」。
         self._orphan_pid: int | None = None
         self._run_id: UUID | None = None
+        #: 挂机心跳：现在正往哪一段里落拍、上一拍是什么时候。
+        #:
+        #: **只记在内存里，而且进程一起来就是空的**（判据见
+        #: `domain.uptime.opens_a_new_segment`）：从库里找上一段接回来，会把控制台
+        #: 重启那几十秒算成挂机。宁可少算一拍，也不让这个数说大话。
+        self._uptime_segment_id: int | None = None
+        self._uptime_last_beat: datetime | None = None
         #: 每个**任务**上一次异常退出的时刻，喂给 `domain.scheduler.cooling_down`。
         #: **只记在内存里**：它的用途是压住本次运行里的重启 churn，控制台重启就
         #: 该忘掉；真正跨进程的那份记忆是 `mission_tasks.consecutive_failures`。
@@ -1169,6 +1177,22 @@ class MissionScheduler:
             for key in sorted(merged, key=lambda item: (item.galaxy, item.system, item.position))
         )
 
+    def _configured_line_total(self) -> int | None:
+        """此刻账号一共配着几条航线（只数启用的出发星球）。**一条都没配就 None。**
+
+        起子进程时把它写进 `mission_runs.configured_lines`，页面据此算利用率的分母。
+
+        ⚠️ **返回 None 而不是 0**：没有任何配着的出发星球时，「配了 0 条」这句话
+        和「不知道」在库里长得一模一样，而下游拿 0 当分母的乘数会把那一天的利用率
+        整段抹成「—」。None 的意思是「这一行说不出线数」，页面会退回下界推算
+        （`domain.overview.period_lines`）。
+
+        走 `configured_line_origins()` 而不是自己读表：`planet_id` 与坐标快照谁
+        优先、同一颗星球被两个任务配着要不要相加，这些规则只该有一份。
+        """
+        total = sum(item.fleet_lines for item in self.configured_line_origins() if item.enabled)
+        return total or None
+
     def military_candidate_pool(self) -> tuple[ScoredTarget, ...]:
         """此刻**还打得动**的那些 bot 目标。**读侧的公开入口**，同上。
 
@@ -1374,6 +1398,11 @@ class MissionScheduler:
             self._advance_backfill()
             if not self._enabled:
                 return
+            # 挂机心跳落在这道闸**之后**：这个指标问的是「调度器开着多久」，
+            # 而不是「控制台的进程活着多久」。用户按了「停止」之后页面开着一整夜，
+            # 那不是挂机——那段时间一发都不会派出去，把它算进挂机时长，
+            # 「利用率为什么低」这个问题就又没人回答了。
+            self._beat_uptime()
             self._cut_off_a_stalled_round()
             # 放在 `_step` **之前**：刚被放回来的任务这一秒就该参与排队，不必
             # 白等一个 tick。放在循环外面是因为它按 tick 算一次就够——`_step`
@@ -1389,6 +1418,70 @@ class MissionScheduler:
             # 读取不能复用它开始前那份快照。
             with self._lock:
                 self._view_generation += 1
+
+    # -- 挂机心跳 --------------------------------------------------------------
+    #
+    # 「挂机运行时长」的唯一写入点。判据全在 `domain.uptime`（该不该落一拍、
+    # 要不要另开一段），这里只负责按判据落行。
+    #
+    # ⚠️ **为什么必须有这个**：现在库里查不出「那段时间到底开没开机」。
+    # `state_events` 全表只有 1 行、写它的路径早删了；而拿 `mission_runs` 的轮次
+    # 覆盖去冒充挂机时长会说假话——实测 2026-08-20 有 6 小时的空隙是「开着但没活
+    # 干」（扫描间隔挡住 RANKING、`waiting_for_a_line` 压住 BOT）。整段在
+    # `domain.uptime` 的模块头上。
+
+    def _beat_uptime(self) -> None:
+        """落一拍挂机心跳。**每 tick 调一次，但按间隔限流。**
+
+        ⚠️ **写失败一律吞掉**（只记本地日志、不往上抛）：这是个观测指标，绝不能
+        因为它写不进去就把调度停了。`system_log` 也是同一个库，库都写不进去的时候
+        往那里记日志同样写不进去；而漏掉的那几拍**本身就是证据**——挂机时长上会
+        留一个和故障时段对得上的缺口。
+        """
+        now = self._clock()
+        previous = self._uptime_last_beat
+        if not due_for_a_beat(last_beat=previous, now=now):
+            return
+        try:
+            if opens_a_new_segment(last_beat=previous, now=now):
+                self._open_uptime_segment(now, after=previous, reason="心跳断了一段")
+            elif self._uptime_segment_id is None or not self._repository.beat_uptime_segment(
+                self._uptime_segment_id, now_utc=now
+            ):
+                # 行没了（换库、被清过）。当成新的一段，别把拍子丢进空里。
+                self._open_uptime_segment(now, after=previous, reason="那一段的行不见了")
+            self._uptime_last_beat = now
+        except Exception:  # noqa: BLE001 - 监控不许把调度器弄死，理由见上
+            _LOGGER.exception("挂机心跳落库失败，本拍跳过")
+
+    def _open_uptime_segment(self, now: datetime, *, after: datetime | None, reason: str) -> None:
+        """另开一段，**只在「断过」那一刻**写一条 `system_log`。
+
+        心跳本身每分钟一拍，一律不记日志（CLAUDE.md：每 tick 可能触发的要限流、
+        只在状态变化时写）。
+
+        ⚠️ **本进程的第一段（`after is None`）也不写。** 那不是异常——用户按了
+        「开始」、控制台刚起来，都会走到这里，而这两件事在别处已经看得见
+        （`mission_runs`、页面上的运行态）。真正值得一行日志的是**断过**：
+        上一拍还在，中间那段空档却超过了阈值。那说明机器睡了、tick 卡了、
+        或者进程死过一次——而挂机时长上正好会缺那一截，日志得说出那一截是什么。
+        """
+        self._uptime_segment_id = self._repository.open_uptime_segment(now_utc=now)
+        if after is None:
+            return
+        record_system_log(
+            "WARNING",
+            __name__,
+            f"挂机心跳：{reason}，已另开一段运行段",
+            payload={
+                "reason": reason,
+                "segment_id": self._uptime_segment_id,
+                "now_utc": now.isoformat(),
+                "previous_beat_utc": after.isoformat(),
+                # 这一截就是挂机时长里缺掉的那段。
+                "gap_seconds": (now - after).total_seconds(),
+            },
+        )
 
     # -- 手动战报补录 ----------------------------------------------------------
     #
@@ -2479,6 +2572,11 @@ class MissionScheduler:
             started_at_utc=child.started_at_utc,
             log_path=str(child.log_path),
             run_id=run_id,
+            # 这一轮开始时账号一共配着几条航线。⚠️ **必须在这里记下来**：数据概览页
+            # 的利用率分母是「周期总时长 × 航线数」，而航线数会变（用户 2026-08-20
+            # 把 4 条加到 9 条）。读页面时现取「此刻配着几条」去乘历史那些天，
+            # 会把 08-15（当时 4 条）低估到 44%，而页面上一点异样都看不出来。
+            configured_lines=self._configured_line_total(),
         )
         if task.kind is MissionKind.RANKING:
             self._military_ranking_batch_task_id = None if batch_task is None else batch_task.id
