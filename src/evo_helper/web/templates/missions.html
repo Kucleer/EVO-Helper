@@ -363,8 +363,19 @@
     // 后端读到 `None` 就不带 `--bot-limit`——和加这个框之前一模一样。
     // 「留空 = 全扫」这句话另有一份摆在框下面的回显里（`ranking_scan_summary`）：
     // 一个 placeholder 在框里填了字之后就看不见了，而那正是最该确认的时候。
+    // 扫描间隔：两轮扫描之间至少隔这么久，**从上一轮开始的那一刻算起**
+    // （用户口径 2026-08-20：「当新的扫描发起时，检查上次开始扫描的时候是否
+    // 大于 2 小时」）。它和「军力分数有效期」是按周内相位配套调的一对——
+    // 周四 6 小时窗口配 2 小时间隔，周一 2 小时窗口配 1 小时间隔。
+    //
+    // ⚠️ **留空 = 不限**，和加这一格之前逐字相同：空框在下面那个处理器里根本
+    // 不往上送，`params_json` 里就没有这个键，判据读到 `None` 就不施加冷却。
+    // 「留空 = 不限」另有一份摆在框下面的回显里（`ranking_scan_summary`）：
+    // placeholder 在框里填了字之后就看不见了，而那正是最该确认的时候。
     RANKING: [
       { key: 'bot_limit', label: '扫描数量', width: 96, min: 1, placeholder: '留空 = 全扫' },
+      { key: 'scan_cooldown_hours', label: '扫描间隔', width: 116, min: 0.1, step: '0.5', placeholder: '小时，留空 = 不限',
+        title: '两轮扫描之间至少隔这么久，从上一轮「开始」的时刻算起（不是结束）。调大＝扫描少打断攻击、一夜派得出去的发数多，代价是读数变旧、军力被高估；调小＝读数新鲜、选靶准，代价是更常打断攻击。留空 = 不限。安全阀：窗口内候选低于「窗口门限」时，这个间隔会立刻让路——否则池子会被饿空，选靶只好回落到上一周期的陈旧读数。' },
     ],
   };
 
@@ -713,8 +724,13 @@
       const label = document.createElement('span');
       label.className = field.label === '–' ? 'dash' : 'inline-label';
       label.textContent = field.label;
+      // `step` 与 `title` 都会在 `makeInput` 里被 undefined 跳过，所以老字段
+      // 一个字都不用改。`step` 不给的话浏览器默认按 1 取整，而扫描间隔是小时数，
+      // 「1.5 小时」会被数字框判成非法值——那一下页面上只显示一个红框，
+      // 用户看不出是步长的事。
       const input = makeInput('mission-param', {
-        type: 'number', min: field.min, max: field.max, placeholder: field.placeholder,
+        type: 'number', min: field.min, max: field.max, step: field.step,
+        placeholder: field.placeholder, title: field.title,
         style: `width:${field.width}px`, 'aria-label': field.label,
       });
       input.dataset.param = field.key;

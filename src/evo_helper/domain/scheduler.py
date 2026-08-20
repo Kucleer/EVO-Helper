@@ -198,6 +198,17 @@ class TaskStatus(Enum):
     BEFORE_WINDOW = "未到开启时间"
     #: 配了关闭时刻，而现在已经过了。
     AFTER_WINDOW = "已过关闭时间"
+    #: 配了**扫描间隔**，而距上一轮扫描开始还不到那么久。
+    #:
+    #: ⚠️ **必须和「冷却中」分开说，尽管两句话听起来是一回事。** 那一档说的是
+    #: `RESTART_COOLDOWN`（崩过之后等几分钟，代码定的、用户改不了），这一档说的是
+    #: 用户自己填在这一行上的扫描间隔（小时量级）。混成一句的代价是用户看着
+    #: 「冷却中」等了五分钟、发现它还是不动，而真正该动的是那个自己填的数字。
+    #:
+    #: ⚠️ 它同样**必须和「待命」分开**。不分的话，一个被扫描间隔按住的军力榜任务
+    #: 会一路掉到 `status_of` 末尾那句兜底的「等航线」上——而军力榜压根不派遣，
+    #: 那是一句用户照着去调航线数、调完也不会有任何变化的假话。
+    SCAN_COOLDOWN = "扫描间隔未到"
     #: 仅军力优先：候选还在，却**一个本周期的军力读数都没有**。
     #:
     #: ⚠️ **两个成因共用这一档，因为补救是同一件事：等军力榜扫一轮。**
@@ -277,6 +288,36 @@ class TaskSnapshot:
     enabled_from_utc: datetime | None = None
     #: 定时关闭的时刻。None 表示不限。区间是**左闭右开**的，见 `within_schedule_window`。
     enabled_until_utc: datetime | None = None
+    #: **两轮扫描之间至少隔这么久**，从**上一轮开始的那一刻**算起。
+    #: `None` = 不施加这道闸门，行为与没有这项功能时**逐字相同**。
+    #:
+    #: 用户口径（2026-08-20）：「比如在周四，我会把 bot 攻击的军力范围选择为
+    #: 6 小时。但是我又不希望太多的扫描打断派出攻击。所以我会设定扫描间隔为
+    #: 2 小时。**当新的扫描发起时，检查上次开始扫描的时候是否大于 2 小时。**
+    #: 当周一时，我会将军力范围选择为 2 小时，扫描冷却为 1 小时，这样尽快的轮转。」
+    #:
+    #: ⚠️ **起算点是「上一轮开始」，不是「上一轮结束」，这是用户明确要的。**
+    #: 按开始算，扫描节奏就稳定在「每 C 小时一轮」，不会被单轮时长拖着往后漂；
+    #: 按结束算，一轮扫描 30 分钟就等于把间隔悄悄变成 C+0.5 小时，而页面上那个
+    #: 数字还写着 C。改成从结束算不会有任何一处报错——它只会让实际节奏和用户
+    #: 配的数字长期对不上，正是本仓最忌讳的那种静默走样。
+    #:
+    #: ⚠️ **它和 `RESTART_COOLDOWN` 是两回事，别合并。** 那一个是「刚崩过就别急着
+    #: 再起」，量级是分钟、由代码定；这一个是「扫描别太频繁地打断攻击」，量级是
+    #: 小时、由用户按周内相位调。
+    #:
+    #: ⚠️ **故意没有代码默认值**，理由同 `military_attack_config.blind_scrolls`
+    #: 那一列：给了默认值就分不开「没配」和「恰好配成当前默认」，而这两件事
+    #: 后来要改默认值时的处置完全相反。
+    #:
+    #: 分类：**运维旋钮**（取值取决于用户这一周想怎么打，没有唯一正确答案）。
+    #: 调大 = 扫描少打断攻击、一夜派得出去的发数多，代价是读数变旧、
+    #: 军力被系统性高估（榜是从强到弱扫的，旧读数配上已经被打空的 bot）；
+    #: 调小 = 读数新鲜、选靶准，代价是更常打断攻击、鼠标时间被采集吃掉。
+    #:
+    #: 今天只有 `RANKING` 会带上它（`SCAN` 压根不吃参数）。判据本身不认 kind，
+    #: 将来第二种填空隙的任务要用它，不必改这一层。
+    scan_cooldown: timedelta | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +417,34 @@ NO_FACTS = TaskFacts()
 
 
 @dataclass(frozen=True)
+class MilitaryWindowPool:
+    """军力优先那一池此刻**窗口内还剩多少货**，以及它自己那把门限尺子。
+
+    ⚠️ **它是账号级的**：军力榜只有一份，`bot_targets` 只有一张表。所以它挂在
+    `SchedulerFacts` 上而不是某个任务的 `TaskFacts` 上——挂到任务上就得回答
+    「军力榜任务凭什么拿得到 bot 任务的池子」，而那个问题没有好答案，只会引出
+    「按 kind 去 per_task 里翻」这种按种类认人的写法（本模块通篇按 `task_id`
+    认人，理由在 `TaskSnapshot` 上）。
+
+    两个数的口径必须与 `domain.target_order.choose_by_military` 里那一行
+    `considered = in_window if len(in_window) >= window_floor else with_readings`
+    **完全一致**——`below_floor` 为真的那一刻，正是选靶会放弃窗口的那一刻。
+    各写一份的话，安全阀会在「其实还够用」的时候乱放行，或者在「已经不够了」
+    的时候不放行，而两种走样在页面上都看不出来。
+    """
+
+    #: 读数落在有效期窗口内的候选数（第 3 步之后）。
+    in_window: int
+    #: 这一轮的窗口门限（任务参数里的键仍叫 `top_n`）。
+    floor: int
+
+    @property
+    def below_floor(self) -> bool:
+        """窗口内已经不够用了——**再不扫，选靶就得放弃窗口、回落到旧读数**。"""
+        return self.in_window < self.floor
+
+
+@dataclass(frozen=True)
 class SchedulerFacts:
     """一次调度所需的全部事实，全部来自数据库。
 
@@ -394,6 +463,17 @@ class SchedulerFacts:
     pirate_quota: int = 32
     #: 收到游戏的超限邮件时写下的封锁截止时刻。比计数更硬的信号。同样是账号级。
     pirate_blocked_until_utc: datetime | None = None
+    #: 军力优先那一池此刻窗口内还剩多少货。**扫描冷却的安全阀读的就是它**
+    #: （`scan_cooldown_verdict`）。
+    #:
+    #: `None` 的含义是「**没有任何一个军力优先的 bot 任务在参与调度**」——
+    #: 那时没人等这份读数，也就无所谓「把自己饿死」，冷却照常生效。
+    #: ⚠️ 别把 `None` 当成「窗口是空的」：那会让一个连军力攻击都没开的账号
+    #: 上，扫描间隔永远不生效，而用户填的那个数在页面上看起来好好的。
+    #:
+    #: 有多个军力优先的 bot 任务时取**最饿的那一个**（`in_window - floor` 最小），
+    #: 理由是安全阀防的是「整池归零」，而最先归零的就是它。
+    military_window: MilitaryWindowPool | None = None
     #: 按 `task_id` 挂的逐任务事实。查不到的任务看到的是 `NO_FACTS`。
     per_task: Mapping[int, TaskFacts] = field(default_factory=dict)
 
@@ -689,6 +769,126 @@ def within_schedule_window(task: TaskSnapshot, now: datetime) -> bool:
     return not before_schedule_window(task, now) and not after_schedule_window(task, now)
 
 
+class ScanCooldown(Enum):
+    """扫描间隔这一刻是个什么态。**四档必须分得开**，因为要说的话各不相同。
+
+    合成一个 `bool` 的代价是日志再也说不清「为什么这一轮放行了」：
+    「没配」「已经过完了」「安全阀让路」三种都是「不挡」，而事后最要查的恰恰是
+    第三种——它意味着上一轮扫描失败或被打断，池子正在饿。
+    """
+
+    #: 没配冷却，或者这个任务从来没跑过（没有「上一轮」可言）。
+    OFF = "OFF"
+    #: 配了，而距上一轮开始已经够久了。
+    ELAPSED = "ELAPSED"
+    #: 冷却生效，这一轮不开。**唯一会挡住 `has_work` 的一档。**
+    BLOCKING = "BLOCKING"
+    #: 冷却本该生效，但窗口内候选已经低于门限，**安全阀让路**。
+    OVERRIDDEN = "OVERRIDDEN"
+
+
+@dataclass(frozen=True)
+class ScanCooldownVerdict:
+    """`scan_cooldown_verdict` 这一次的全部结论，连日志要用的那几个数一起带出来。
+
+    做成一个结构而不是只返回 `bool`，是为了让**判据与日志同源**：调用方要写
+    「还差 Z 分钟」「窗口内只剩 N 个」，若让它自己再算一遍，两份实现迟早分家，
+    而分家之后日志会理直气壮地说一个和判据不一样的数——本仓的规矩是
+    「日志说假话比不说更糟」。
+    """
+
+    state: ScanCooldown
+    #: 这一次用的冷却时长。`None` = 没配。
+    cooldown: timedelta | None
+    #: 上一轮**开始**的时刻（不是结束）。`None` = 从没跑过。
+    last_started_at_utc: datetime | None
+    #: 距上一轮开始已经过去多久。没配 / 没跑过时为 0。
+    elapsed: timedelta
+    #: 还差多久才到点。不在冷却里时为 0。
+    remaining: timedelta
+    #: 安全阀读的那一池。`None` = 没有军力优先的任务在等这份读数。
+    pool: MilitaryWindowPool | None
+
+    @property
+    def blocks(self) -> bool:
+        """这一刻要不要按住这条链路。**只有 `BLOCKING` 算数。**"""
+        return self.state is ScanCooldown.BLOCKING
+
+
+def scan_cooldown_verdict(task: TaskSnapshot, facts: SchedulerFacts) -> ScanCooldownVerdict:
+    """扫描间隔这一刻挡不挡得住这个任务。**判据只有这一份**，日志与页面都问它。
+
+    ## 判据：从「上一轮开始的时刻」算起
+
+    用户口径（2026-08-20）：「当新的扫描发起时，检查上次开始扫描的时候是否大于
+    2 小时」。⚠️ **是开始不是结束**，理由整段写在 `TaskSnapshot.scan_cooldown` 上：
+    按开始算，节奏才稳定在每 C 小时一轮，不会被单轮时长拖着漂。
+
+    边界取「大于等于就放行」，与 `after_schedule_window` 同向（区间左闭右开）：
+    正好满 C 小时的那一 tick 就该允许开新的一轮，而不是再等一秒。
+
+    ## ⚠️ 安全阀：**冷却不许把自己饿死**
+
+    ```
+    冷却只在「窗口内还有货」时生效。
+    一旦窗口内候选数低于门限（`MilitaryWindowPool.below_floor`），冷却立刻让路。
+    ```
+
+    没有它的话，这个旋钮会在**最不能出错的那一天**炸掉。周一的配置是窗口 2 小时、
+    冷却 1 小时；若某一轮扫描失败或中途被打断，下一轮又被冷却挡住，窗口内候选就会
+    归零 → 选靶第 3 步触发「窗口内不足门限就放弃窗口」
+    （`domain.target_order.WINDOW_POOL_FLOOR`）→ **回落到全部读数**。而周一恰恰是
+    最不能用上周期读数的一天：bot 军力每周一 UTC+0 刷新，那一刻全库读数同时作废
+    （`domain.target_order` 模块头第 2 步）。也就是说，一个本意是「少打断攻击」的
+    旋钮，会把攻击喂上一批已经作废的数据，而页面上只会显示一句听起来很正常的
+    「军力读数已放宽窗口」。
+
+    ⚠️ **安全阀的口径必须与选靶那一步逐字相同**（`below_floor` 上有说明）。
+    松一格，冷却会在池子已经不够用时继续挡；紧一格，冷却等于白配。
+
+    ⚠️ **安全阀只放行「开新的一轮」，不催任何人。** 它不会去起进程、不会抢占、
+    也不会缩短 `RESTART_COOLDOWN`——它只是把这道闸门抬起来，剩下的照走原有判据。
+
+    ## 它不碰已经在跑的那一轮
+
+    这一层是纯判据，动不了子进程。已经开始的军力榜批次照常跑到底：
+    `application.mission_scheduler._military_batch_decision` 在有子进程时一律
+    `Decision(Action.IDLE)`，而那条批次交接路径问的是**bot 任务**的 `has_work`，
+    与军力榜任务身上这道闸门无关。
+    """
+    cooldown = task.scan_cooldown
+    last_started = facts.of(task).last_started_at_utc
+    pool = facts.military_window
+    if cooldown is None or last_started is None:
+        return ScanCooldownVerdict(
+            state=ScanCooldown.OFF,
+            cooldown=cooldown,
+            last_started_at_utc=last_started,
+            elapsed=timedelta(),
+            remaining=timedelta(),
+            pool=pool,
+        )
+    elapsed = facts.now_utc - last_started
+    if elapsed >= cooldown:
+        return ScanCooldownVerdict(
+            state=ScanCooldown.ELAPSED,
+            cooldown=cooldown,
+            last_started_at_utc=last_started,
+            elapsed=elapsed,
+            remaining=timedelta(),
+            pool=pool,
+        )
+    starved = pool is not None and pool.below_floor
+    return ScanCooldownVerdict(
+        state=ScanCooldown.OVERRIDDEN if starved else ScanCooldown.BLOCKING,
+        cooldown=cooldown,
+        last_started_at_utc=last_started,
+        elapsed=elapsed,
+        remaining=cooldown - elapsed,
+        pool=pool,
+    )
+
+
 def bot_round_complete(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     """本轮范围内是不是每个目标都走完了流程。同上，供状态文案复用。
 
@@ -765,6 +965,12 @@ def has_work(
     只在**别人有活干**时才打断填空隙的任务，窗口关掉不会让任何人多出活来。
     """
     if not within_schedule_window(task, facts.now_utc):
+        return False
+    # 扫描间隔和定时窗口**同层**：两者都是「这一刻允不允许开新的一轮」，都与
+    # 「有没有活可干」无关，也都必须自动覆盖到那三处（普通调度、军力批次那条
+    # 专用路径、状态文案）。放在下面「填空隙恒为真」的早退之后就等于没有——
+    # 军力榜正是填空隙的那一种。
+    if scan_cooldown_verdict(task, facts).blocks:
         return False
     if cooling_down(task, facts, restart_cooldown=restart_cooldown):
         return False
@@ -862,6 +1068,10 @@ def status_of(
         return TaskStatus.BEFORE_WINDOW
     if after_schedule_window(task, facts.now_utc):
         return TaskStatus.AFTER_WINDOW
+    # 扫描间隔紧跟定时窗口，理由同上：它们是同一层的两道闸门，而这一档若不自己
+    # 报家门，就会一路掉到末尾那句兜底的「等航线」上——军力榜不派遣，那是假话。
+    if scan_cooldown_verdict(task, facts).blocks:
+        return TaskStatus.SCAN_COOLDOWN
     if task.kind is MissionKind.PIRATE and pirate_quota_exhausted(facts):
         return TaskStatus.QUOTA_EXHAUSTED
     # ⚠️ **「没有军力读数」要排在「已完成」之前。** 军力优先模式下两者在
