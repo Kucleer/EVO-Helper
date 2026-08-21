@@ -695,6 +695,64 @@ class MailRow:
         )
 
 
+@dataclass(frozen=True)
+class ExpectedReportWindows:
+    """补录时用报告的预计抵达时刻筛列表行，**只决定开不开，不认领归属**。
+
+    `due_attack_dispatches` 给的是当前尚缺的派遣。正常读全秒数时，游戏邮件时钟
+    在预计时刻前后十秒内；时长恰为整分钟则是 OCR 很可能丢掉秒数，真实到达只能
+    比算出的时刻晚最多一分钟，所以右侧放到 70 秒。这个类把区间先合并，避免每行
+    随欠账数线性比较。
+
+    有任一派遣没有预计时刻时不能拿时间排除任何行：漏开一封的代价比多开一封高。
+    这类派遣仍走原来的顺序补录通道；已知时刻的命中数照样会计入诊断日志。
+    """
+
+    intervals: tuple[tuple[datetime, datetime], ...]
+    has_unknown: bool
+
+    @classmethod
+    def from_dispatches(cls, dispatches: Sequence[Any]) -> ExpectedReportWindows:
+        raw: list[tuple[datetime, datetime]] = []
+        has_unknown = False
+        for dispatch in dispatches:
+            expected = getattr(dispatch, "expected_report_at_utc", None)
+            dispatched = getattr(dispatch, "dispatched_at_utc", None)
+            if expected is None:
+                has_unknown = True
+                continue
+            # `expected - dispatched` 是写库时已采到的飞行时间；整除分钟意味着
+            # 原画面的秒很可能丢了，不能把真实报告在后 59 秒的那一族筛掉。
+            whole_minute = (
+                isinstance(dispatched, datetime)
+                and (expected - dispatched).total_seconds() % 60 == 0
+            )
+            raw.append(
+                (
+                    expected - timedelta(seconds=10),
+                    expected + timedelta(seconds=70 if whole_minute else 10),
+                )
+            )
+        merged: list[tuple[datetime, datetime]] = []
+        for lower, upper in sorted(raw):
+            if merged and lower <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], upper))
+            else:
+                merged.append((lower, upper))
+        return cls(intervals=tuple(merged), has_unknown=has_unknown)
+
+    @property
+    def earliest(self) -> datetime | None:
+        """没有未知时刻时，列表可安全早停的最早区间下界。"""
+        return None if self.has_unknown or not self.intervals else self.intervals[0][0]
+
+    def matches(self, reported_at_utc: datetime | None) -> bool:
+        """时间读不出或没有候选时一律保留原行为，宁可多开。"""
+        if reported_at_utc is None or not self.intervals or self.has_unknown:
+            return True
+        return any(lower <= reported_at_utc <= upper for lower, upper in self.intervals)
+
+
 def mail_row_from_text(index: int, text: str) -> MailRow:
     """把一行邮件的 OCR 文字读成 `MailRow`。
 
@@ -807,6 +865,8 @@ class MailScan:
     pages: int = 0
     #: 真的打开过几封。
     opened: int = 0
+    #: 在列表页实际看过几行（含主题不符与被时刻闸门筛掉的行）。
+    observed: int = 0
     #: 这一趟**没能好好走完**的理由；正常收工时是 None。
     #:
     #: ⚠️ 摘要必须把它说出来。实机 2026-08-13 20:35：一趟给了 30 屏预算的补录在
@@ -2112,6 +2172,7 @@ class PirateLoop:
         max_pages: int = MAIL_SCAN_PAGES,
         max_opens: int = MAIL_MAX_OPENS,
         observe: Callable[[MailRow], None] | None = None,
+        should_open: Callable[[MailRow], bool] | None = None,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
@@ -2240,6 +2301,7 @@ class PirateLoop:
             last_times = times
             seen.update(identity for row in fresh if (identity := row.identity) is not None)
             for row in fresh:
+                scan.observed += 1
                 if observe is not None:
                     observe(row)
                 if row.is_older_than(not_before):
@@ -2258,6 +2320,9 @@ class PirateLoop:
                     continue
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
+                    continue
+                if should_open is not None and not should_open(row):
+                    say(f"  第 {row.index} 行时刻不在待补战报的预计窗口内；不打开")
                     continue
                 opened += 1
                 scan.opened = opened
@@ -2872,10 +2937,34 @@ class PirateLoop:
         窗口尺寸。
         """
         moment = now or datetime.now(UTC)
-        tally = BackfillTally(due_before=len(self._due_dispatches(moment)))
+        due_before = self._due_dispatches(moment)
+        tally = BackfillTally(due_before=len(due_before))
+        windows = ExpectedReportWindows.from_dispatches(due_before)
+        time_hits = 0
+        opened_blind = 0
+        skipped_by_time = 0
+
+        def should_open(row: MailRow) -> bool:
+            """主题闸门之后的时间闸门；列表时间糊掉时仍照开。"""
+            nonlocal time_hits, opened_blind, skipped_by_time
+            if row.reported_at_utc is None:
+                opened_blind += 1
+                return True
+            if windows.matches(row.reported_at_utc):
+                if windows.intervals and not windows.has_unknown:
+                    time_hits += 1
+                return True
+            skipped_by_time += 1
+            return False
+
         # ⚠️ **`exhaustive` 那一档一个字都不改 `not_before`。** 见上面那段：
         # 补录要够到的正是这道下限之外的战报。
         floor = not_before if exhaustive else self._routine_scan_floor(not_before, now=moment)
+        # 有明确预计时刻时，最早区间以前不可能有本趟要补的邮件；把早停锚点收紧
+        # 到这里，别还拿笼统的扫描下限多翻多开。未知时刻保留原下限，不能拿猜测
+        # 把它永久筛掉。
+        if not exhaustive and windows.earliest is not None:
+            floor = windows.earliest if floor is None else max(floor, windows.earliest)
 
         def visit(row: MailRow, page: Any) -> bool:
             if self._ingest_non_report_mail(row, page):
@@ -2896,8 +2985,36 @@ class PirateLoop:
             not_before=floor,
             max_pages=max_pages,
             max_opens=max_opens,
+            should_open=should_open if due_before else None,
         )
-        tally.due_after = len(self._due_dispatches(datetime.now(UTC)))
+        due_after = self._due_dispatches(datetime.now(UTC))
+        tally.due_after = len(due_after)
+        still_missing = [
+            {
+                "target": str(dispatch.target),
+                "expected_report_at_utc": (
+                    None
+                    if getattr(dispatch, "expected_report_at_utc", None) is None
+                    else dispatch.expected_report_at_utc.isoformat()
+                ),
+            }
+            for dispatch in due_after
+        ]
+        record_system_log(
+            "INFO",
+            "tools.backfill_reports",
+            "补录按时刻检索完成",
+            payload={
+                "gaps": len(due_before),
+                "windows": len(windows.intervals),
+                "rows_scanned": tally.scan.observed,
+                "opened_by_time": time_hits,
+                "opened_blind": opened_blind,
+                "skipped_by_time": skipped_by_time,
+                "claimed": tally.claimed,
+                "still_missing": still_missing,
+            },
+        )
         return tally
 
     def _due_dispatches(self, now: datetime) -> list[Any]:
