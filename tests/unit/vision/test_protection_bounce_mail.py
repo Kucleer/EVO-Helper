@@ -97,6 +97,41 @@ def test_a_second_coordinate_cannot_be_crossed_over() -> None:
     assert find_protection_bounce_targets(text) == [Coordinate(5, 222, 3)]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 句号被 OCR 吞掉。判据**不许**要求它——标点是这段文字里最容易读丢的东西。
+        "[4:321:9]（bot_4_321_9's Planet）处于保护状态，我方舰队已返航",
+        # 逗号也吞了。
+        "[4:321:9]（bot_4_321_9's Planet）处于保护状态 我方舰队已返航",
+        # 括注整段没读出来。
+        "[4:321:9] 处于保护状态，我方舰队已返航。",
+        # 括注读成了半角。
+        "[4:321:9](bot_4_321_9's Planet)处于保护状态,我方舰队已返航.",
+    ],
+)
+def test_punctuation_that_ocr_eats_is_not_part_of_the_criterion(text: str) -> None:
+    """⚠️ 判据只钉那三样，**不钉标点、不钉括注**。
+
+    钉上去的症状是最坏的一种：真的那封信读不出来，而日志里只会说「正文里没有读到
+    完整的那一句」——看起来像是游戏改了版面，实际上是我们自己把判据收窄了。
+    """
+    assert find_protection_bounce_targets(text) == [Coordinate(4, 321, 9)]
+
+
+def test_a_preview_that_also_mentions_a_report_keyword_still_wins() -> None:
+    """⚠️ 这一条必须排在所有关键词之前。
+
+    列表行上的文字是**正文预览**，面板半透明、背后那一页的字会透上来落进同一块
+    ROI（整段在 `MailRow.identity`）。于是「战报」「攻击报告」这些子串很容易混进来，
+    而它们的判定是子串匹配、天然更宽。让它们抢在前面的话，这封信会被归成
+    `SYSTEM` / `ATTACK`，然后要么根本不开、要么被当成战报读不出来。
+    """
+    noisy = f"战报 攻击报告 {BODY}"
+
+    assert classify_report_subject(noisy) is ReportKind.PROTECTION_BOUNCE
+
+
 def test_ocr_may_space_the_characters_out() -> None:
     """`chi_sim` 会在字之间塞空格；放开的只有空白，每个字仍要按顺序出现。"""
     spaced = "[4:321:9] ( bot s Planet ) 处 于 保 护 状 态 , 我方舰队 已 返 航 。"

@@ -191,8 +191,11 @@ def test_a_dispatch_that_could_not_be_identified_is_said_so_out_loud(
 
     (record,) = collector.records
     assert record.level == "WARNING"
-    assert "认不出这封信结的是哪一发" in record.message
+    # ⚠️ 带告警记号的原句，**不许**被改写成一句读起来像成功的话（「已处理（…）」）。
+    # 「结掉了」与「那一发仍然永久挂在未读回上」在库里必须一眼分得开。
+    assert "⚠️ 认不出这封信结的是哪一发" in record.message
     assert "仍算未读回" in record.message
+    assert "已处理" not in record.message
     assert json.loads(record.payload_json)["dispatch_closed"] is False
     assert json.loads(record.payload_json)["dispatch_id"] is None
     # 飞行时长无从谈起时**不许报一个 0**——那会读成「一分钟都没浪费」。
@@ -221,6 +224,39 @@ def test_a_missing_bot_target_row_is_said_so_out_loud(collector: Any) -> None:
     assert record.level == "WARNING"
     assert "保护期没记上" in record.message
     assert json.loads(record.payload_json)["protection_noted"] is False
+
+
+def test_the_mailbox_scan_routes_this_kind_to_its_own_reader(collector: Any) -> None:
+    """⚠️ 接线本身要有人守：分流漏了它，这封信会被当成战报去读。
+
+    症状不报错——读不出来、放过、下一趟再来一遍，永远读不进去。三条翻信箱的路
+    （收侦察报告、开工对账、手动补录）共用 `_ingest_non_report_mail` 这一处分流，
+    所以守住它就等于三条一起守住。
+    """
+    from evo_helper.tools.pirate_loop import NON_REPORT_MAIL_KINDS
+
+    repository = _Repository(_closed(uuid4()))
+
+    # 归它管：就地处理掉，**不**往下走战报解析器。
+    assert _loop(repository)._ingest_non_report_mail(ROW, _Mail()) is True
+    assert repository.calls != []
+    # `wanted` 与分流读的是同一份名单，两处不许各写一份。
+    assert ReportKind.PROTECTION_BOUNCE in NON_REPORT_MAIL_KINDS
+
+
+def test_a_real_battle_report_row_is_left_to_the_report_reader(collector: Any) -> None:
+    """反过来也要守：攻击战报**不许**被这条分流截走。"""
+    repository = _Repository(_closed(uuid4()))
+    attack_row = MailRow(
+        index=0,
+        subject="主题: 攻击报告",
+        raw_time_text="20/08/2026 14:29:32",
+        reported_at_utc=MAIL_AT,
+        kind=ReportKind.ATTACK,
+    )
+
+    assert _loop(repository)._ingest_non_report_mail(attack_row, _Mail()) is False
+    assert repository.calls == []
 
 
 def test_an_unreadable_mail_leaves_a_trace_too(collector: Any) -> None:

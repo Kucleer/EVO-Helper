@@ -10,9 +10,22 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from evo_helper.domain.battle_outcome import OUTCOME_LABELS, OUTCOME_PROTECTED
 from evo_helper.domain.protection_bounce import wasted_line_minutes, wasted_line_seconds
 
 DISPATCHED = datetime(2026, 8, 20, 13, 27, 26, tzinfo=UTC)
+
+
+def test_protected_is_not_a_banner_word() -> None:
+    """⚠️ `OUTCOME_LABELS` 是 **OCR 吸附词表**，不是「所有战果取值」的清单。
+
+    `vision.pirate_reports.parse_outcome` 拿它对横幅读数做编辑距离吸附。把一个
+    屏幕上根本不存在的词放进去，只是给横幅的噪声多一个可以吸附过去的靶子——
+    而吸附成功的后果是一份真战报的胜负被写成 `PROTECTED`。
+    这一档由 `vision.protection_bounce` 那条链路直接写死，一次 OCR 都不经过。
+    """
+    assert OUTCOME_PROTECTED not in OUTCOME_LABELS
+    assert OUTCOME_LABELS == ("VICTORY", "FAIL", "DRAW")
 
 
 def test_the_booked_line_time_wins_when_the_ledger_has_it() -> None:

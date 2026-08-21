@@ -958,6 +958,17 @@ def record_planet_list_overlay_retry(
 #: 它在账上和「战报还没回来」长得一模一样。
 _PROTECTION_BOUNCE_LOG_SOURCE = "tools.protection_bounce"
 
+#: 信箱里**要打开、但不该喂给战报解析器**的那几种邮件。
+#:
+#: ⚠️ 它同时是两处判据的唯一来源：翻信箱时「这一行值不值得开」（`wanted`），
+#: 以及开了之后「这一封归谁读」（`PirateLoop._ingest_non_report_mail`）。
+#: 两处各写一份的后果是**单向失效**——`wanted` 里漏一个，那封信永远不会被打开；
+#: 分流里漏一个，它会被当成战报读、读不出来，然后每一趟重来一遍。两种都不报错。
+NON_REPORT_MAIL_KINDS: tuple[ReportKind, ...] = (
+    ReportKind.PLANET_SCOUTED,
+    ReportKind.PROTECTION_BOUNCE,
+)
+
 
 class PirateLoop:
     """驱动一轮「扫 1–4 位 → 侦察 → 判定 → 攻击」。"""
@@ -2339,11 +2350,7 @@ class PirateLoop:
         remaining = set(wanted)
 
         def visit(row: MailRow, header: Any) -> bool:
-            if row.kind is ReportKind.PLANET_SCOUTED:
-                self._ingest_planet_scout_alert(row, header)
-                return False
-            if row.kind is ReportKind.PROTECTION_BOUNCE:
-                self._ingest_protection_bounce(row, header)
+            if self._ingest_non_report_mail(row, header):
                 return False
             # 舰种清单在详情页下半屏，要拖到底才看得到；VS 那一段则在拖之前读。
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
@@ -2373,7 +2380,7 @@ class PirateLoop:
         # 只给 `--attack` 不给 `--scout` 时用的是信箱里**已有**的那几封，
         # 它们比开工时刻早，早停会把它们全部挡在外面。
         self._scan_mail_rows(
-            wanted=(ReportKind.SCOUT, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            wanted=(ReportKind.SCOUT, *NON_REPORT_MAIL_KINDS),
             label="侦察报告、安全告警或保护期返航",
             visit=visit,
             not_before=self._started_at if self._options.scout else None,
@@ -2400,6 +2407,21 @@ class PirateLoop:
             return False
         repository.append_scout_report(to_scout_report(reading, report_id=uuid4()))
         return True
+
+    def _ingest_non_report_mail(self, row: MailRow, page: Any) -> bool:
+        """这一封属不属于 `NON_REPORT_MAIL_KINDS`；属于就地处理掉并返回 True。
+
+        三条翻信箱的路（收侦察报告、开工对账、手动补录）都要做同一件分流，而各写
+        一份的话，新增一种邮件时漏掉其中一条**不会报错**：那条路会把它当成战报去读、
+        读不出来、下一趟再来一遍。收成一处之后，漏不漏由这一个方法回答。
+        """
+        if row.kind is ReportKind.PLANET_SCOUTED:
+            self._ingest_planet_scout_alert(row, page)
+            return True
+        if row.kind is ReportKind.PROTECTION_BOUNCE:
+            self._ingest_protection_bounce(row, page)
+            return True
+        return False
 
     def _ingest_planet_scout_alert(self, row: MailRow, page: Any) -> None:
         """Persist and notify a foreign-reconnaissance mail exactly once.
@@ -2856,11 +2878,7 @@ class PirateLoop:
         floor = not_before if exhaustive else self._routine_scan_floor(not_before, now=moment)
 
         def visit(row: MailRow, page: Any) -> bool:
-            if row.kind is ReportKind.PLANET_SCOUTED:
-                self._ingest_planet_scout_alert(row, page)
-                return False
-            if row.kind is ReportKind.PROTECTION_BOUNCE:
-                self._ingest_protection_bounce(row, page)
+            if self._ingest_non_report_mail(row, page):
                 return False
             outcome = self._ingest_report(row, page)
             if outcome is not ReportIngest.UNREADABLE:
@@ -2872,7 +2890,7 @@ class PirateLoop:
             return self._stop_after_known()
 
         tally.scan = self._scan_mail_rows(
-            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            wanted=(self.RECONCILE_KIND, *NON_REPORT_MAIL_KINDS),
             label=f"{self.REPORT_LABEL}、安全告警或保护期返航",
             visit=visit,
             not_before=floor,
@@ -3124,11 +3142,7 @@ class PirateLoop:
         tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
 
         def visit(row: MailRow, page: Any) -> bool:
-            if row.kind is ReportKind.PLANET_SCOUTED:
-                self._ingest_planet_scout_alert(row, page)
-                return False
-            if row.kind is ReportKind.PROTECTION_BOUNCE:
-                self._ingest_protection_bounce(row, page)
+            if self._ingest_non_report_mail(row, page):
                 return False
             # Keep the existing early-stop invariant for already persisted
             # battle reports: alert handling must not turn every task start
@@ -3136,7 +3150,7 @@ class PirateLoop:
             return self._ingest_report_row(row, page)
 
         self._scan_mail_rows(
-            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            wanted=(self.RECONCILE_KIND, *NON_REPORT_MAIL_KINDS),
             label=f"{self.REPORT_LABEL}、安全告警或保护期返航",
             visit=visit,
             not_before=self._report_floor(day_start, now=now),
