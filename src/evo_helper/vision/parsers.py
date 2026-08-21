@@ -138,11 +138,24 @@ class ReportKind(Enum):
     #: 这是本方收到的安全提示，不是我方派出的侦察报告；不能进入侦察/攻击
     #: 战报链路，更不能被拿来认领任何派遣。
     PLANET_SCOUTED = "planet_scouted"
+    #: 「到达之后才发现目标在保护期，舰队原路返航」那封通知。
+    #:
+    #: ⚠️ **它不是战报，但它结掉的正是一发攻击。** 与 `PLANET_SCOUTED` 同样进不了
+    #: 战报解析链路（没有 VS 块、没有战损、没有收获），却与它相反：那一封说的是
+    #: 别人对我们做了什么，这一封说的是**我们自己派出去的那一发的下场**。
+    #: 处理见 `vision.protection_bounce`。
+    PROTECTION_BOUNCE = "protection_bounce"
     SYSTEM = "system"
     UNKNOWN = "unknown"
 
     @property
     def is_dispatch_matchable(self) -> bool:
+        """能不能拿去认领一发派遣**并当成战报读**。
+
+        ⚠️ `PROTECTION_BOUNCE` 在这里是 False，尽管它最终确实会结掉一发派遣。
+        这个属性问的是「能不能喂给战报解析器」，而那封通知里没有任何战报字段；
+        认领走的是另一条路（`vision.protection_bounce` → `record_protection_bounce`）。
+        """
         return self is ReportKind.ATTACK
 
 
@@ -261,9 +274,63 @@ def parse_report_timestamp(text: str, display_zone: tzinfo) -> datetime | None:
     return local.astimezone(UTC)
 
 
+def _spaced(phrase: str) -> str:
+    """把一句中文编成「字与字之间允许有空白」的模式。
+
+    `chi_sim` 会在字之间塞进空格（`INTERCEPTED_PROBES_RE` 已经为同一件事写过
+    `\\s*`）。放开的只有空白：**每一个字仍然必须按顺序出现**，所以这不会把判据
+    变宽到别的句子上去。
+    """
+    return r"\s*".join(re.escape(character) for character in phrase)
+
+
+#: 「到达之后才发现目标在保护期，舰队原路返航」那封通知的判据。
+#:
+#: 实机原文（用户 2026-08-21 提供的两张截图，全角括号与句号照抄）：
+#:
+#:     [4:321:9]（bot_4_321_9's Planet）处于保护状态，我方舰队已返航。
+#:
+#: ⚠️ **三样缺一不可：方括号里的坐标、「处于保护状态」、「已返航」。**
+#: 裸匹配「保护」会把正常战报误判——同一条教训 CLAUDE.md 上已经记了一次
+#: （黑洞事件只匹配完整损失短语，因为每份报告页脚都提「黑洞」二字）。这里更凶：
+#: 误判的后果是给一份真战报凭空造一条 `PROTECTED` 记录，而那份真战报的收获、
+#: 战损、胜负会连同它认领的那一发一起消失。
+#:
+#: 两句之间只允许**不含方括号**的字符：括注里是 `（bot_4_321_9's Planet）`
+#: 这种随目标而变的文字，不该写死；而禁掉方括号就保证跨不过下一个坐标去，
+#: 一封信里两条记录不会串成一条。
+PROTECTION_BOUNCE_RE = re.compile(
+    r"\[(\d{1,3}):(\d{1,3}):(\d{1,3})\]"
+    r"[^\[\]]{0,64}?" + _spaced("处于保护状态") + r"[^\[\]]{0,32}?" + _spaced("已返航")
+)
+
+
+def find_protection_bounce_targets(text: str) -> list[Coordinate]:
+    """这段文字里每一句「X 处于保护状态…已返航」说的目标，按出现顺序。
+
+    一封信正常只有一句；返回列表而不是单值，是为了让调用方**看得见**「读出了
+    不止一个坐标」这件事，而不是默默取第一个——那正是
+    `parse_all_coordinates` 当初改成返回全部的理由。
+    """
+    targets: list[Coordinate] = []
+    for match in PROTECTION_BOUNCE_RE.finditer(text):
+        try:
+            targets.append(
+                Coordinate(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            )
+        except ValueError:
+            continue
+    return targets
+
+
 def classify_report_subject(subject: str) -> ReportKind:
     """Classify a mail subject. Order matters: pirate is checked before attack."""
     text = subject.strip()
+    if PROTECTION_BOUNCE_RE.search(text):
+        # ⚠️ **排在所有关键词之前。** 列表行上的文字是正文预览，那句话里既有坐标
+        # 又可能夹着别的字；先判这一条，才不会被后面的子串判定抢走。子串判定
+        # （`"攻击报告" in text`）本来就宽，而这一条要求整句话都在。
+        return ReportKind.PROTECTION_BOUNCE
     if "你的行星被侦察" in text:
         return ReportKind.PLANET_SCOUTED
     if "海盗" in text:

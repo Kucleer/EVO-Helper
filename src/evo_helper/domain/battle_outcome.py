@@ -50,7 +50,23 @@ OUTCOME_VICTORY = "VICTORY"
 OUTCOME_FAIL = "FAIL"
 OUTCOME_DRAW = "DRAW"
 
+#: 「到达时目标在保护期，舰队原路返航」——**打了但没打成**。
+#:
+#: ⚠️ **它不是从画面上读来的第四种横幅，所以刻意不在 `OUTCOME_LABELS` 里。**
+#: 那个元组是 OCR 吸附用的词表（`vision.pirate_reports.parse_outcome` 按它做
+#: 编辑距离吸附）；把一个屏幕上根本不存在的词放进去，只会让横幅的噪声多一个
+#: 可以吸附过去的靶子。这一档由 `vision.protection_bounce` 那条链路直接写死，
+#: 一次 OCR 都不经过。
+#:
+#: ⚠️ **它也不是「成功但收获为 0」。** 没有战斗、没有战损、没有收获格——
+#: 这一行的 `attacker_units` / `losses` / `resources` 一律留空，因为那些数
+#: **不存在**，不是没读到。收益统计从 `battle_report_resources` 那张表往外
+#: 联表（`storage.origin_efficiency._rare`），一行都没有就是压根不参与，
+#: 不会被当成一个 0 拉低平均。
+OUTCOME_PROTECTED = "PROTECTED"
+
 #: 词表顺序无关紧要，但要稳定：横幅的读数按它做吸附。
+#: **只放画面上真的会出现的那三个词**，理由见 `OUTCOME_PROTECTED`。
 OUTCOME_LABELS = (OUTCOME_VICTORY, OUTCOME_FAIL, OUTCOME_DRAW)
 
 
@@ -107,6 +123,7 @@ __all__ = [
     "OUTCOME_DRAW",
     "OUTCOME_FAIL",
     "OUTCOME_LABELS",
+    "OUTCOME_PROTECTED",
     "OUTCOME_VICTORY",
     "outcome_from_survivors",
     "outcome_from_totals",
