@@ -2557,7 +2557,7 @@ git commit -m "missions 页改成调度台
 
 **Files:**
 - Create: `.changes/28-mission-scheduler.md`
-- Modify: `TODO-交接.md`
+- Modify: `TODO-交接.md（已于 2026-08-21 删除，见 AGENTS.md 0.2；内容在 git 历史里）`
 
 - [ ] **Step 1: 照模板写变更记录**
 
@@ -2567,12 +2567,12 @@ Run: `cat .changes/template.md`
 
 - [ ] **Step 2: 更新交接文档**
 
-把 `TODO-交接.md` 里需求 4 的状态从「未开始」改成「已完成」，并删掉第五节里那条已经作废的建议（「`window_start`/`window_end` 两列先别删」——本次改动根本没碰那两列）。
+把 `TODO-交接.md（已于 2026-08-21 删除，见 AGENTS.md 0.2；内容在 git 历史里）` 里需求 4 的状态从「未开始」改成「已完成」，并删掉第五节里那条已经作废的建议（「`window_start`/`window_end` 两列先别删」——本次改动根本没碰那两列）。
 
 - [ ] **Step 3: 提交**
 
 ```bash
-git add .changes/28-mission-scheduler.md TODO-交接.md
+git add .changes/28-mission-scheduler.md TODO-交接.md（已于 2026-08-21 删除，见 AGENTS.md 0.2；内容在 git 历史里）
 git commit -m "变更记录与交接文档"
 ```
 
