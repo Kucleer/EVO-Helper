@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
+from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     BattleReport,
     FleetSnapshotEntry,
@@ -131,6 +133,38 @@ def to_scout_report(reading: PirateScoutReading, *, report_id: UUID) -> ScoutRep
         origin=reading.origin,
         target=reading.target,
         trigger_ships=tuple(entries),
+    )
+
+
+def to_protection_bounce_report(
+    *,
+    report_id: UUID,
+    target: Coordinate,
+    origin: Coordinate,
+    mail_at_utc: datetime,
+    raw_time_text: str | None,
+) -> BattleReport:
+    """「到达时撞保护期」那一发的结账行。
+
+    ⚠️ **除了两个坐标、时刻和 `outcome`，其余一律留空——那些数不存在，
+    不是没读到。** 没有战斗就没有参战舰队、没有单位数、没有战损、没有收获格。
+    填 0 会让这一发变成「打赢了但一无所获」，直接污染收益统计；那正是
+    `domain.battle_outcome.OUTCOME_PROTECTED` 上写着要防的事。
+
+    `match_confidence` 也留 0：认领由 `repository.append_report` 自己按
+    「出发点 + 目标 + 抵达窗口」现认，这里不许预先断言一个没核过的置信度
+    （同 `to_battle_report` 的规矩）。出发点是从**认出来的那一发派遣**上取的，
+    不是从画面上读的——这封信里根本没写出发点。
+    """
+    if mail_at_utc.tzinfo is None:
+        raise ValueError("mail_at_utc must be timezone-aware")
+    return BattleReport(
+        report_id=report_id,
+        reported_at_utc=mail_at_utc,
+        attacker_origin=origin,
+        defender_target=target,
+        raw_time_text=raw_time_text,
+        outcome=OUTCOME_PROTECTED,
     )
 
 

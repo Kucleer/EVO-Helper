@@ -378,8 +378,13 @@
               ⚠️ **战损只在有战果的行上出现。** 侦察发（上面已分流）和还没战报的
               行都读不到这两个数，摆一行「战损 我 — · 敌 —」等于给一个不会来的
               东西留位置。
+
+              ⚠️ `PROTECTED`（到达时撞保护期）一并排掉，虽然它**有**战果。
+              那一发压根没打起来，战损这个概念在它身上不存在——不是「没读到」，
+              所以两个破折号在这里会读成「读失败了」，而这行恰恰是已经查清的。
             #}
-            {% set show_losses = entry.mission_kind != 'SCOUT' and entry.outcome is not none %}
+            {% set show_losses = entry.mission_kind != 'SCOUT'
+              and entry.outcome is not none and entry.outcome != 'PROTECTED' %}
             {#
               ⚠️ **有东西可展开才做成触发元素。** 既没收获也没截图时，摘要就是
               一行普通文字，不是按钮、也不带 `<template>`——摆一个点开是空的
