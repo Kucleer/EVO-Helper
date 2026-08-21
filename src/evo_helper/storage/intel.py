@@ -50,6 +50,7 @@ from sqlalchemy.orm import Mapped, Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.functions import func
 
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
 from evo_helper.domain.intel_query import (
     ConditionGroup,
     FleetCondition,
@@ -113,10 +114,23 @@ RESULT_AWAITING = "AWAITING"
 #: 「待战报」。这里补的就是这处不一致，不是新增一条时限。
 RESULT_NO_REPORT = "NO_REPORT"
 RESULT_NONE = "NONE"
+#: 「到达时目标在保护期，舰队原路返航」——**打了但没打成**，见
+#: `domain.battle_outcome.OUTCOME_PROTECTED`。
+#:
+#: ⚠️ 与 `NO_REPORT` 分家。两者都「没有战果」，但含义相反、能做的事也相反：
+#: `NO_REPORT` 是**战报丢了**（可能是没翻到、可能是手动撤回），那一发到底打成
+#: 什么样谁也不知道；这一档是**知道得清清楚楚**——没打起来，舰队原路飞回来了。
+#: 混成一档就等于把一个已经查清的结论重新扔回「不明」那一堆。
+#:
+#: ⚠️ 它是 `battle_reports.outcome` 上真的存着的一个值，不像 `AWAITING` /
+#: `NO_REPORT` / `NONE` 那三档是页面现算的（`_battle_result`）。所以它走的是
+#: `if attempt.outcome is not None: return attempt.outcome` 那条原样透传的路。
+RESULT_PROTECTED = OUTCOME_PROTECTED
 BATTLE_RESULTS = (
     RESULT_VICTORY,
     RESULT_FAIL,
     RESULT_DRAW,
+    RESULT_PROTECTED,
     RESULT_AWAITING,
     RESULT_NO_REPORT,
     RESULT_NONE,

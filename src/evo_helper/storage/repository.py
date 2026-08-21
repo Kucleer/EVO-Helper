@@ -255,6 +255,47 @@ class UnreadablePanelNote:
 
 
 @dataclass(frozen=True)
+class ProtectionBounceOutcome:
+    """一封「到达时撞保护期」通知落库之后的下场。**主要为写日志而存在。**
+
+    把两件事分开报，是因为它们会各自失败、失败的含义也不同（详见
+    `SqlAlchemyRepository.record_protection_bounce`）：`protection_noted` 假是
+    「这坐标在 `bot_targets` 里没有行」，`closed` 假是「认不出这封信结的是哪一发」。
+    合成一个布尔的话，日志就只剩「没记上」三个字，而这两种要查的地方完全不同。
+
+    ⚠️ 派遣那几个时刻与秒数**原样带出来**，不在这里先算成「白占了多少分钟」：
+    算法是 `domain.protection_bounce` 的事，而排障时要看的是它的**输入**
+    ——只报一个算完的分钟数，等于把「哪一列没记上」这个信息扔掉。
+    """
+
+    target: Coordinate
+    #: 邮件自己写的时刻 = 舰队抵达那一刻。保护期就是按它记的。
+    mail_at_utc: datetime
+    #: `bot_targets.protection_seen_at_utc` 写上了吗。
+    protection_noted: bool = False
+    #: 这封信这一趟之前就已经结过账了（信箱每趟都会翻到同样那几行）。
+    already_recorded: bool = False
+    report_id: UUID | None = None
+    dispatch_id: UUID | None = None
+    origin: Coordinate | None = None
+    dispatched_at_utc: datetime | None = None
+    line_free_at_utc: datetime | None = None
+    flight_seconds: int | None = None
+    #: 时间上够得着的候选发次有几个（收窄到抵达窗口**之前**）。
+    unmatched_candidates: int = 0
+    #: 其中落在抵达窗口里的有几个。1 才认；0 与 ≥2 都不猜。
+    ambiguous_arrivals: int = 0
+    #: 库里记着的军力值；None = 军力榜没见过这个坐标（或者它根本不在 `bot_targets` 里）。
+    #: 带着它的理由同 `UnreadablePanelNote`：排障第一个问题是「这个白跑的目标值不值得救」。
+    military_score: float | None = None
+
+    @property
+    def closed(self) -> bool:
+        """那一发被结掉了吗——**这一趟结的，或者早先已经结过的**。"""
+        return self.already_recorded or self.report_id is not None
+
+
+@dataclass(frozen=True)
 class PirateProgress:
     """一个海盗目标在某段时间里走到哪一步了，供控制台一行一行显示。
 
@@ -2192,6 +2233,115 @@ class SqlAlchemyRepository:
             target.protection_seen_at_utc = seen_at_utc
             session.commit()
             return True
+
+    def record_protection_bounce(
+        self,
+        target: Coordinate,
+        *,
+        mail_at_utc: datetime,
+        raw_time_text: str | None = None,
+    ) -> ProtectionBounceOutcome:
+        """一封「到达时撞保护期」通知落库：记保护期 + 把那一发**结掉**。
+
+        ## 两件事，故意分开成败
+
+        1. **记保护期**（`note_protection_period`，复用那唯一一个写入口）。这件事
+           **无条件做**：邮件本身就是「这个坐标在那一刻处于保护期」的完整证据，
+           认不认得出是哪一发派遣都不影响它。没有 `bot_targets` 行时它返回 False，
+           调用方照实说，而不是静默。
+        2. **结掉那一发**：给它写一条 `outcome=PROTECTED` 的 `battle_reports`。
+           这件事**要认得出是哪一发才做**，理由在下面。
+
+        ## 为什么用 `battle_reports` 结账，而不是给 `attack_dispatches` 加一列
+
+        「未读回」这件事全仓只有**一个判据**：`battle_reports.dispatch_id` 指没指
+        着这一发（各处都是同一个 LEFT JOIN — `pending_reports_for_kind`、
+        `storage.overview.unread_reports`、`storage.origin_efficiency._counts`、
+        `bot_dispatch_facts`）。写下这一行，四处同时结清，一句查询都不用改。
+        加一列则要把这四处逐个改到，**漏一处的症状是「只在那一个页面上还挂着」**
+        ——而那正是最难发现的一类不一致。何况
+        `pending_reports_for_kind` 的 docstring 上明写着本仓不落「放弃标记」。
+
+        ⚠️ **这一行不是「成功但收获为 0」**：`outcome` 是独立的第四档
+        （`domain.battle_outcome.OUTCOME_PROTECTED`），战损与收获一律留空。
+        收获统计是从 `battle_report_resources` 往外联表的，没有行就是压根不参与，
+        不会被当成一个 0 拉低平均（`storage.origin_efficiency._rare`）。
+
+        ## 认不出是哪一发时**宁可不写**
+
+        `battle_reports.attacker_origin_*` 三列非空，而这封通知里根本没有出发点
+        ——它只写了目标。所以出发点只能从认出来的那一发派遣上取。认不出（零个
+        候选，或者多个分不开）就只记保护期、不写战报行：凭猜写下去，等于把这一发
+        的账挂到别人头上，而那一发从此再也不会被认领。
+
+        认领用的是**与战报认领同一把尺子**：候选集 `_unmatched_dispatch_candidates`，
+        再按 `_within_expected_window` 收窄。这不是另立判据——邮件时刻**就是**
+        舰队的抵达时刻（生产实测两发分别差 0 秒与 1 秒），所以「战报该在什么时候
+        到」那把尺子量的正是同一件事。
+
+        `raw_time_text` 存邮件页眉那串原文，用意同 `BattleReport.raw_time_text`：
+        事后能核对 UTC 换算。
+        """
+        from evo_helper.application.report_ingest import to_protection_bounce_report
+
+        mail_at_utc = _require_utc(mail_at_utc, "mail_at_utc")
+        protection_noted = self.note_protection_period(target, seen_at_utc=mail_at_utc)
+        with self._session_factory() as session:
+            row = _bot_target_for(session, target)
+            military_score = None if row is None else row.military_score
+        if self.has_report_at(target, mail_at_utc):
+            # 同一封信这一趟已经结过账了（信箱每趟都会翻到同样那几行）。
+            # 保护期那一列照旧覆盖一次——它是幂等的，写的还是同一个时刻。
+            return ProtectionBounceOutcome(
+                target=target,
+                mail_at_utc=mail_at_utc,
+                protection_noted=protection_noted,
+                already_recorded=True,
+                military_score=military_score,
+            )
+        with self._session_factory() as session:
+            candidates = _unmatched_dispatch_candidates(
+                session, target=target, reported_at=mail_at_utc
+            )
+        arriving = [
+            candidate
+            for candidate in candidates
+            if _within_expected_window(candidate.dispatch.expected_report_at_utc, mail_at_utc)
+        ]
+        if len(arriving) != 1:
+            return ProtectionBounceOutcome(
+                target=target,
+                mail_at_utc=mail_at_utc,
+                protection_noted=protection_noted,
+                unmatched_candidates=len(candidates),
+                ambiguous_arrivals=len(arriving),
+                military_score=military_score,
+            )
+        picked = arriving[0]
+        report_id = uuid4()
+        self.append_report(
+            to_protection_bounce_report(
+                report_id=report_id,
+                target=target,
+                origin=picked.origin,
+                mail_at_utc=mail_at_utc,
+                raw_time_text=raw_time_text,
+            )
+        )
+        return ProtectionBounceOutcome(
+            target=target,
+            mail_at_utc=mail_at_utc,
+            protection_noted=protection_noted,
+            report_id=report_id,
+            dispatch_id=picked.dispatch.id,
+            origin=picked.origin,
+            dispatched_at_utc=picked.dispatch.dispatched_at_utc,
+            line_free_at_utc=picked.dispatch.line_free_at_utc,
+            flight_seconds=picked.dispatch.flight_seconds,
+            unmatched_candidates=len(candidates),
+            ambiguous_arrivals=1,
+            military_score=military_score,
+        )
 
     def protected_bot_targets_since(self, since: datetime) -> set[Coordinate]:
         """`since` 之后撞上过保护期的坐标。选靶第 ① 步据此排除它们。

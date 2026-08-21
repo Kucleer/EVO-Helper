@@ -950,6 +950,15 @@ def record_planet_list_overlay_retry(
     record_system_log("WARNING", "tools.pirate_loop", message, payload=body)
 
 
+#: 「到达时撞保护期」那条链路的日志 `source`。
+#:
+#: 单独一个 source 而不是共用 `tools.pirate_loop`，是为了让「这件事到底发没发生」
+#: 在库里一句 SQL 就能答上来。这条判据上线之前，生产库近 3 天提到「保护状态」的
+#: 日志是 **0 条**——解析器从来没认过它，而那正是这个缺陷藏了这么久的原因：
+#: 它在账上和「战报还没回来」长得一模一样。
+_PROTECTION_BOUNCE_LOG_SOURCE = "tools.protection_bounce"
+
+
 class PirateLoop:
     """驱动一轮「扫 1–4 位 → 侦察 → 判定 → 攻击」。"""
 
@@ -2333,6 +2342,9 @@ class PirateLoop:
             if row.kind is ReportKind.PLANET_SCOUTED:
                 self._ingest_planet_scout_alert(row, header)
                 return False
+            if row.kind is ReportKind.PROTECTION_BOUNCE:
+                self._ingest_protection_bounce(row, header)
+                return False
             # 舰种清单在详情页下半屏，要拖到底才看得到；VS 那一段则在拖之前读。
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
             slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
@@ -2361,8 +2373,8 @@ class PirateLoop:
         # 只给 `--attack` 不给 `--scout` 时用的是信箱里**已有**的那几封，
         # 它们比开工时刻早，早停会把它们全部挡在外面。
         self._scan_mail_rows(
-            wanted=(ReportKind.SCOUT, ReportKind.PLANET_SCOUTED),
-            label="侦察报告或安全告警",
+            wanted=(ReportKind.SCOUT, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            label="侦察报告、安全告警或保护期返航",
             visit=visit,
             not_before=self._started_at if self._options.scout else None,
         )
@@ -2427,6 +2439,94 @@ class PirateLoop:
             say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录；SMTP 未配置）")
         else:
             say(f"  第 {row.index} 行安全告警 → {alert.target}（已记录；邮件发送失败）")
+
+    def _ingest_protection_bounce(self, row: MailRow, page: Any) -> None:
+        """一封「到达时撞保护期」：记保护期、把那一发结掉、**留一条说得清的日志**。
+
+        ⚠️ **这一条不限流。** 限流的规矩针对的是「每 tick 可能触发」的那些
+        （`record_unrecognised_screen` 的 120 秒是先例）；这一条一封信只走一次
+        （第二趟翻到时 `already_recorded` 为真，走的是另一句），而且每一次都值钱
+        ——它记的是白占掉的一整趟往返航线（实测 48.9 与 124.1 分钟）。
+
+        ⚠️ **认不出是哪一发时照样要留痕，而且要说清「认不出」**。这一档是
+        CLAUDE.md 上那条教训的正面用法：日志要说清判据把活儿挡掉的那一刻——
+        为什么挡、当时看到了什么。含糊一句「已处理」的话，「结掉了」与「没结掉」
+        在库里就分不开，而后者意味着那一发仍然永久挂在未读回上。
+        """
+        from evo_helper.domain.protection_bounce import wasted_line_minutes
+        from evo_helper.vision.protection_bounce import (
+            ProtectionBounceUnreadable,
+            read_protection_bounce,
+        )
+
+        try:
+            reading = read_protection_bounce(page)
+        except ProtectionBounceUnreadable as error:
+            say(f"  第 {row.index} 行像是「到达时撞保护期」，却读不齐：{error}")
+            record_system_log(
+                "WARNING",
+                _PROTECTION_BOUNCE_LOG_SOURCE,
+                f"「到达时撞保护期」这一封读不齐：{error}",
+                payload={"mail_index": row.index, "mail_subject": row.subject},
+            )
+            return
+        repository, _run_id = self._ensure_run()
+        outcome = repository.record_protection_bounce(
+            reading.target,
+            mail_at_utc=reading.reported_at_utc,
+            raw_time_text=reading.raw_time_text,
+        )
+        wasted = wasted_line_minutes(
+            dispatched_at_utc=outcome.dispatched_at_utc,
+            line_free_at_utc=outcome.line_free_at_utc,
+            flight_seconds=outcome.flight_seconds,
+        )
+        payload: dict[str, Any] = {
+            "coordinate": str(reading.target),
+            "mail_at_utc": reading.reported_at_utc.isoformat(),
+            "dispatch_id": str(outcome.dispatch_id) if outcome.dispatch_id else None,
+            "wasted_line_minutes": None if wasted is None else round(wasted, 1),
+            "military_score": outcome.military_score,
+            "one_way_seconds": outcome.flight_seconds,
+            "origin": str(outcome.origin) if outcome.origin else None,
+            "protection_noted": outcome.protection_noted,
+            "dispatch_closed": outcome.closed,
+            "already_recorded": outcome.already_recorded,
+            "candidates": outcome.unmatched_candidates,
+            "arrivals_in_window": outcome.ambiguous_arrivals,
+        }
+        wasted_note = "白占航线不明（那一发的飞行时长没记上）"
+        if wasted is not None:
+            one_way = (
+                f"（单程 {outcome.flight_seconds / 60:.0f} 分）" if outcome.flight_seconds else ""
+            )
+            wasted_note = f"本次白占航线 {wasted:.0f} 分钟{one_way}"
+        protection_note = (
+            f"已记保护期到 {reading.reported_at_utc.isoformat()}"
+            if outcome.protection_noted
+            else "⚠️ 保护期没记上：这个坐标在 bot_targets 里没有行，下一轮还会被挑中"
+        )
+        if outcome.closed:
+            closed_note = (
+                "那一发早先已经结过账" if outcome.already_recorded else "那一发已结掉，不再算未读回"
+            )
+        else:
+            closed_note = (
+                f"⚠️ 认不出这封信结的是哪一发（时间上够得着 {outcome.unmatched_candidates} 发，"
+                f"落在抵达窗口里的有 {outcome.ambiguous_arrivals} 发）；"
+                "不猜，那一发仍算未读回"
+            )
+        message = (
+            f"到达时撞保护期：{reading.target} 在我们到达时处于保护状态，舰队原路返航；"
+            f"{wasted_note}；{protection_note}；{closed_note}"
+        )
+        say(f"  第 {row.index} 行 → {message}")
+        record_system_log(
+            "INFO" if outcome.closed and outcome.protection_noted else "WARNING",
+            _PROTECTION_BOUNCE_LOG_SOURCE,
+            message,
+            payload=payload,
+        )
 
     def prepare_for_mailbox(self) -> None:
         """开工前的两步：校几何、查会话。与 `run()` 开头同序、同理由。
@@ -2759,6 +2859,9 @@ class PirateLoop:
             if row.kind is ReportKind.PLANET_SCOUTED:
                 self._ingest_planet_scout_alert(row, page)
                 return False
+            if row.kind is ReportKind.PROTECTION_BOUNCE:
+                self._ingest_protection_bounce(row, page)
+                return False
             outcome = self._ingest_report(row, page)
             if outcome is not ReportIngest.UNREADABLE:
                 tally.read += 1
@@ -2769,8 +2872,8 @@ class PirateLoop:
             return self._stop_after_known()
 
         tally.scan = self._scan_mail_rows(
-            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED),
-            label=f"{self.REPORT_LABEL}或安全告警",
+            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            label=f"{self.REPORT_LABEL}、安全告警或保护期返航",
             visit=visit,
             not_before=floor,
             max_pages=max_pages,
@@ -3024,14 +3127,17 @@ class PirateLoop:
             if row.kind is ReportKind.PLANET_SCOUTED:
                 self._ingest_planet_scout_alert(row, page)
                 return False
+            if row.kind is ReportKind.PROTECTION_BOUNCE:
+                self._ingest_protection_bounce(row, page)
+                return False
             # Keep the existing early-stop invariant for already persisted
             # battle reports: alert handling must not turn every task start
             # into a run of eight redundant detail reads.
             return self._ingest_report_row(row, page)
 
         self._scan_mail_rows(
-            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED),
-            label=f"{self.REPORT_LABEL}或安全告警",
+            wanted=(self.RECONCILE_KIND, ReportKind.PLANET_SCOUTED, ReportKind.PROTECTION_BOUNCE),
+            label=f"{self.REPORT_LABEL}、安全告警或保护期返航",
             visit=visit,
             not_before=self._report_floor(day_start, now=now),
             max_pages=RECONCILE_MAX_PAGES,
