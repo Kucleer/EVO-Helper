@@ -32,6 +32,7 @@ from evo_helper.tools.pirate_loop import (
     BACKFILL_MAX_OPENS,
     BACKFILL_SCAN_PAGES,
     BackfillTally,
+    ExpectedReportWindows,
     LoopOptions,
     MailRow,
     MailScan,
@@ -53,11 +54,20 @@ class _Driver:
 
 
 class _Repository:
-    def __init__(self, *, due: Sequence[Coordinate] = (), scan_hours: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        due: Sequence[Coordinate] = (),
+        dispatches: Sequence[Any] | None = None,
+        scan_hours: int | None = None,
+    ) -> None:
         self.due = list(due)
+        self.dispatches = list(dispatches) if dispatches is not None else None
         self.scan_hours = scan_hours
 
     def due_attack_dispatches(self, target_kind: str, **_fields: Any) -> list[Any]:
+        if self.dispatches is not None:
+            return self.dispatches
         return [SimpleNamespace(target=target) for target in self.due]
 
     def military_attack_config(self) -> Any:
@@ -125,6 +135,7 @@ def _quiet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pirate_loop, "slow_drag", lambda *args, **kwargs: None)
     monkeypatch.setattr(pirate_loop, "say", lambda _line: None)
     monkeypatch.setattr(backfill_reports, "say", lambda _line: None)
+    monkeypatch.setattr(pirate_loop, "record_system_log", lambda *args, **kwargs: None)
 
 
 # -- 命令行契约 --------------------------------------------------------------
@@ -295,6 +306,74 @@ def test_the_backfill_never_records_a_daily_reconciliation() -> None:
     loop, _opened, _budgets = _loop([[_row(0)]])
 
     loop.backfill_reports(not_before=DAY_START, now=NOON)  # 不抛异常即通过
+
+
+# -- 按预计时刻预筛 ----------------------------------------------------------
+
+
+def test_expected_report_windows_keep_the_late_side_for_whole_minutes() -> None:
+    """整分钟不是精确到秒的飞行时长：OCR 可能吃掉了 0–59 秒。
+
+    这条故意用窄窗口会漏掉的 +60 秒样本钉住分档；若将来上游修好丢秒，再连同
+    这段与实现一起删，而不是悄悄把它收成对称 ±10 秒。
+    """
+    windows = ExpectedReportWindows.from_dispatches(
+        [
+            SimpleNamespace(
+                dispatched_at_utc=DAY_START,
+                expected_report_at_utc=DAY_START + timedelta(minutes=62),
+            )
+        ]
+    )
+
+    assert windows.matches(DAY_START + timedelta(minutes=63))
+    assert not windows.matches(DAY_START + timedelta(minutes=63, seconds=11))
+
+
+def test_expected_report_windows_keep_the_normal_window_narrow() -> None:
+    """读全秒数的那一族不许为了极少数异常退回顺序盲开。"""
+    expected = DAY_START + timedelta(minutes=62, seconds=6)
+    windows = ExpectedReportWindows.from_dispatches(
+        [SimpleNamespace(dispatched_at_utc=DAY_START, expected_report_at_utc=expected)]
+    )
+
+    assert windows.matches(expected + timedelta(seconds=10))
+    assert not windows.matches(expected + timedelta(seconds=11))
+
+
+def test_backfill_opens_only_rows_in_the_expected_time_windows() -> None:
+    """时刻只作为开封预筛，命中行仍由详情里的坐标归属判定。"""
+    dispatch = SimpleNamespace(
+        target=Coordinate(2, 56, 20),
+        dispatched_at_utc=NOON - timedelta(minutes=62, seconds=6),
+        expected_report_at_utc=NOON,
+    )
+    loop, opened, _budgets = _loop(
+        [[_row(0, at=NOON + timedelta(seconds=30)), _row(1, at=NOON + timedelta(seconds=5))]],
+        repository=_Repository(dispatches=[dispatch]),
+    )
+
+    loop.backfill_reports(not_before=DAY_START, now=NOON)
+
+    assert opened == [1]
+
+
+def test_an_unreadable_list_timestamp_is_still_opened_with_time_windows() -> None:
+    """时间 OCR 读不出时不敢筛掉，避免把唯一一封战报永久留在信箱。"""
+    dispatch = SimpleNamespace(
+        target=Coordinate(2, 56, 20),
+        dispatched_at_utc=NOON - timedelta(minutes=62, seconds=6),
+        expected_report_at_utc=NOON,
+    )
+    blind = MailRow(0, "海盗攻击报告", None, None, ReportKind.PIRATE)
+    loop, opened, _budgets = _loop(
+        [[blind, _row(1, at=NOON + timedelta(seconds=30))]],
+        repository=_Repository(dispatches=[dispatch]),
+    )
+
+    loop.backfill_reports(not_before=DAY_START, now=NOON)
+
+    assert opened == [0]
 
 
 # -- 时间下限（攻击配置页可配） ----------------------------------------------
