@@ -176,7 +176,8 @@
     }
   ],
   "interaction_notes": [
-    "Panels do not respond to mouse-wheel scroll; the wheel moves the page/parallax instead. Panel content scrolls only via click-drag inside the panel.",
+    "SUPERSEDED 2026-08-22 -- this note said 'panels do not respond to mouse-wheel scroll; the wheel moves the page/parallax instead'. Both halves are wrong. Panels DO scroll on the wheel, but only when each event carries exactly one notch (dwData=+/-120) at a dense interval (16ms); pyautogui.scroll(n) passes n straight through without multiplying by 120, so the 2026-08-07 probe was sending 1/120 of a notch and read it as 'no response'. The wheel also does NOT zoom or move the canvas behind the panel: measured zero per-pixel change in two off-panel background bands over eight runs (2026-08-19 and 2026-08-22). See docs/军力榜翻页-滚轮实测.md.",
+    "Wheel scrolling lands the list at a non-row-aligned offset (~12px off the calibration grid, measured 2026-08-22), so it is only usable where the screen is not read afterwards. Use click-drag inside the panel whenever the rows have to be OCR'd.",
     "Resizing the browser window does not re-layout the game canvas; a reload is required, which drops the open panel and returns to the entry screen.",
     "After scrolling a panel the page itself can shift so the panel header (back button) leaves the viewport; scroll the page up before clicking back."
   ]

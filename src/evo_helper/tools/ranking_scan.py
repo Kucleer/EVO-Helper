@@ -434,9 +434,14 @@ def drag_blind_rows(
 ) -> int:
     """用**慢拖**走过 `rows` 行——盲滚改滚轮之前那条老路，留着当一键回滚。
 
-    ⚠️ **它存在的唯一理由是回滚。** `storage.models.MilitaryAttackConfigRow`
-    上写着：`blind_scroll_rows` 置空即退回慢拖，不需要改代码、不需要重新发版。
-    没有这条路，回滚就变成「改代码 + 发版」。
+    ⚠️ **它存在的唯一理由是回滚**，而回滚的开关在**命令行**上：只给
+    `--blind-scrolls` 不给 `--blind-rows`，`scan()` 里的 `blind_rows` 就是 `None`，
+    整段走到这里来。没有这条路，回滚就变成「改代码 + 发版」。
+
+    ⚠️ **不要把这条路记成「配置里那一列置空」**：
+    `storage.models.MilitaryAttackConfigRow.blind_scroll_rows` 置空的含义是
+    「跟着代码默认值 700 走」，走的**仍是滚轮**。两种说法一度并存过，
+    而它们在配置层不可能同时成立。
 
     行 → 屏按 `ROWS_PER_SCROLL` 换算。返回的同样是**折合走过的行数**而不是请求值，
     理由同 `spin_blind_rows`：换算取整之后就不是原来那个行数了。
