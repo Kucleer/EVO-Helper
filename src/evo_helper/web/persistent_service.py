@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
@@ -1315,6 +1315,19 @@ class MissionConsoleService:
                     raise ServiceError(str(exc)) from exc
             else:
                 self._validate(kind, raw_params, target_origin)
+        # ⚠️ **换了出发点就跟着换名字。** 名字是从出发点的银河系派生出来的
+        # （`5:261:8` → `5系攻击`），派生规则见 `_auto_mission_name`。改了出发点
+        # 却留着旧名字，页面上就会出现「7系攻击」从 5 系出发这种直接误导人的行。
+        #
+        # 只在**这一次真的动了出发点**时改（`origin is not None`，空串「退回全局
+        # 主星」也算动），所以拖一下顺序、勾一下复选框都不会碰名字。调用方显式
+        # 送了 `name` 时听调用方的——那条路是给 API 直连留的。
+        #
+        # 存量任务（改版之前手输的那些名字）就在这一下被换成派生名：页面上已经
+        # 没有任务名输入框了，第一次编辑出发点是它们唯一会被改名的时机。
+        # **绝不在页面加载时批量改库**——那会在用户没有任何动作时改掉一批名字。
+        if kind is MissionKind.BOT and origin is not None and name is None:
+            name = self._derive_bot_name(target_origin.galaxy, exclude_task_id=task_id)
         # ⚠️ 这里原先还有一条 `elif origin is not None: self._check_origin(...)`：
         # 只改出发星球时单量那一项，因为「不是主星」当时会被临时闸门拒掉。
         # 闸门随「切换星球」实装删了（runner 开工会真的切过去），于是出发星球本身
@@ -1335,6 +1348,18 @@ class MissionConsoleService:
         )
         self._invalidate_scheduler_view()
         return self._task_view_for(task_id)
+
+    def _derive_bot_name(self, galaxy: int, *, exclude_task_id: int | None = None) -> str:
+        """这个银河系下还没被占用的那个自动名。
+
+        「已占用」按**全部任务**算，不只是 bot：海盗与扫描的名字也在同一列里
+        显示、也进日志，撞上了照样分不开。改名的那一行要先把自己排除掉，
+        否则「换个出发点又换回来」会白白升一次序号。
+        """
+        return _auto_mission_name(
+            galaxy,
+            [row.name for row in self._repository.mission_tasks() if row.id != exclude_task_id],
+        )
 
     def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
         """额外 origin 为空时，调用方明确知道仍回落旧单 origin。"""
@@ -1499,7 +1524,7 @@ class MissionConsoleService:
         self,
         kind_text: str,
         *,
-        name: str,
+        name: str | None = None,
         origin: str | None = None,
         fleet_lines: int | None = None,
     ) -> MissionTaskView:
@@ -1508,6 +1533,11 @@ class MissionConsoleService:
         新任务一律建成「不参与调度、参数为空」：它此刻既没有范围也没排优先级，
         直接参与调度等于「点了新建就开始派舰队」。用户填好范围、勾上复选框那一下
         会走 `patch_mission`，那条路上有参数校验。
+
+        ⚠️ **名字留空不再是错，而是「按出发点自动派生」**（2026-08-22 改版）：
+        页面上那个任务名输入框撤掉了，名字由出发点的银河系算出来（`5:261:8` →
+        `5系攻击`），重名自动加序号。见 `_auto_mission_name`。留空表示跟随全局
+        主星时按主星的银河系算——那正是这个任务真正会出发的地方。
         """
         kind = self._kind(kind_text)
         if self._scheduler.config_locked:
@@ -1518,11 +1548,14 @@ class MissionConsoleService:
                 f"只有 bot 攻击可以有多个任务；「{existing}」保持一个"
                 "（海盗每天 32 次是账号级配额，扫描恒在最后一位且永远有活干）"
             )
-        if not name.strip():
-            raise ServiceError("给这个任务起个名字，否则页面上两行长得一模一样")
         if fleet_lines is not None and fleet_lines < 1:
             raise ServiceError("航线数至少是 1；填 0 等于这个任务永远派不出去")
         parsed_origin = None if origin in (None, "") else _parse_origin(origin or "")
+        # 名字在**写库之前**定下来：页面不再送名字，而下面那句 `create_mission_task`
+        # 要的是最终值。调用方仍然可以显式给名字（API 直连、旧脚本），那时不派生。
+        resolved_name = (name or "").strip() or self._derive_bot_name(
+            (parsed_origin or self._scheduler.origin).galaxy
+        )
         rows = self._repository.mission_tasks()
         # 排在所有非扫描任务之后：新任务的优先级由用户拖，而默认插在最前面等于
         # 让一个还没配好的任务抢在正在正常工作的那些前面。
@@ -1531,9 +1564,16 @@ class MissionConsoleService:
         )
         task_id = self._repository.create_mission_task(
             kind,
-            name=name.strip(),
+            name=resolved_name,
             priority=priority,
-            params_json="{}",
+            # ⚠️ **新任务默认走军力优先**（2026-08-22 改版）。这不只是页面上那个
+            # 复选框的默认勾选状态——它必须**真的写进库**：页面上显示勾着、库里
+            # 却是「按坐标顺序、按范围打」，那是一张卡说一套、调度器做另一套。
+            #
+            # 另一半理由是范围三个字段已经不在页面上渲染了（见模板里
+            # `PARAM_FIELDS.BOT` 上那段）：默认成非军力优先的话，新任务一勾就会
+            # 因为「缺少 galaxy」被 400 拦下，而页面上根本没有能填它的框。
+            params_json='{"by_military": true}',
             origin=parsed_origin,
             fleet_lines=fleet_lines,
             now_utc=self._scheduler.now_utc(),
@@ -2031,6 +2071,31 @@ class MissionConsoleService:
             return MissionKind(kind_text.upper())
         except ValueError as exc:
             raise NotFoundError(f"没有 {kind_text} 这条任务链路") from exc
+
+
+def _auto_mission_name(galaxy: int, taken: Iterable[str]) -> str:
+    """bot 攻击任务的自动名：`5系攻击`，重名时加序号 `5系攻击 2` / `5系攻击 3`。
+
+    ⚠️ **重名必须加序号，不能就这么让它重。** 任务名是日志、运行历史、配置固化
+    记录里认人的那个字段（`MissionTaskView.label` 一路传到这三处），同一个银河系
+    下配两个任务时两行都叫「5系攻击」，事后追查就分不开是哪一个。
+
+    ⚠️ **算出来的名字要真的写进库**（`create_mission` / `patch_mission` 各写一次），
+    不许只在页面上显示：只显示的话页面写着「5系攻击」、日志里还是旧名字，
+    两边对不上，而这个字段存在的全部意义就是让两边对得上。
+
+    序号取「第一个没被占用的」而不是「现有个数 + 1」：删掉中间那个之后，
+    后者会算出一个和幸存者重名的号。名字一旦落库就不再变，所以同一批任务
+    每次渲染看到的都是同一串字——**名字不稳定比重名更糟**。
+    """
+    base = f"{galaxy}系攻击"
+    used = {name.strip() for name in taken if name and name.strip()}
+    if base not in used:
+        return base
+    ordinal = 2
+    while f"{base} {ordinal}" in used:
+        ordinal += 1
+    return f"{base} {ordinal}"
 
 
 def _parse_origin(text: str) -> Coordinate:

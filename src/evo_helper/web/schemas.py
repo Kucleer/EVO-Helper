@@ -214,8 +214,12 @@ class MissionTaskCreate(BaseModel):
 
     #: 目前只收 `BOT`：只有 bot 攻击需要多任务（用户口径 2026-08-13）。
     kind: str
-    #: 必填。同类型的多个任务在页面上全靠它区分。
-    name: str
+    #: 留空 = 按出发点的银河系自动派生（`5:261:8` → `5系攻击`，重名加序号）。
+    #:
+    #: 页面上那个任务名输入框 2026-08-22 撤掉了，所以这里必须收得下「没有名字」；
+    #: 派生在服务层做（`MissionConsoleService.create_mission`），因为只有那里
+    #: 数得清哪些名字已经被占用。显式送名字的路留着，给 API 直连与旧脚本。
+    name: str | None = None
     #: 留空表示跟着全局值走。
     origin: str | None = None
     fleet_lines: int | None = None

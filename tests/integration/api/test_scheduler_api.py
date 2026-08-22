@@ -1094,9 +1094,50 @@ def test_a_new_task_starts_switched_off(console: Console) -> None:
     assert created["enabled"] is False
 
 
-def test_a_new_task_needs_a_name(console: Console) -> None:
-    """两行长得一模一样的话，用户分不出改的是哪一个。"""
-    assert _create(console, name="   ").status_code == 400
+def test_a_task_without_a_name_is_named_after_the_galaxy_it_departs_from(
+    console: Console,
+) -> None:
+    """任务名不再手输，按出发点的银河系派生：`5:261:8` → 「5系攻击」。
+
+    ⚠️ 这条用例原先钉的是反面（名字留空 → 400，理由是「两行长得一模一样，
+    用户分不出改的是哪一个」）。2026-08-22 改版把页面上那个任务名输入框撤了，
+    于是「留空」从一种输入错误变成了**唯一的常规走法**——继续拒掉它，页面上的
+    「新建」按钮就永远点不动。「两行长得一模一样」这件事由下一条用例接手守：
+    重名自动加序号。
+    """
+    created = _create(console, name="   ", origin="5:261:8").json()
+
+    assert created["label"] == "5系攻击"
+
+
+def test_a_second_task_in_the_same_galaxy_gets_a_number_instead_of_the_same_name(
+    console: Console,
+) -> None:
+    """同一个银河系下的第二个任务叫「5系攻击 2」。
+
+    任务名是日志、运行历史、配置固化记录里认人的那个字段，重名会让事后追查
+    分不开是哪一个。序号取「第一个没被占用的」，所以名字一旦落库就不再变。
+    """
+    first = _create(console, name=None, origin="5:261:8").json()
+    second = _create(console, name=None, origin="5:250:3").json()
+
+    assert first["label"] == "5系攻击"
+    assert second["label"] == "5系攻击 2"
+
+
+def test_changing_the_origin_renames_the_task_to_match(console: Console) -> None:
+    """换了出发点就跟着换名字，否则页面上会出现「7系攻击」从 5 系出发。
+
+    ⚠️ 改名只发生在**真的动了出发点**的那一次 PATCH 上；拖顺序、勾复选框都不碰
+    名字（另有用例钉着「只改 priority 不动出发点」）。页面加载时也绝不批量改库。
+    """
+    created = _create(console, name=None, origin="5:261:8").json()
+
+    updated = console.client.patch(
+        f"/api/missions/{created['task_id']}", json={"origin": "7:228:15"}
+    ).json()
+
+    assert updated["label"] == "7系攻击"
 
 
 def test_only_the_bot_chain_may_have_more_than_one_task(console: Console) -> None:
