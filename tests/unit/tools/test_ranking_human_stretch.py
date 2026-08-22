@@ -23,6 +23,7 @@ from evo_helper.game.ranking_ui import (
     ROWS_PER_SCROLL,
 )
 from evo_helper.tools.ranking_scan import (
+    BlindWalk,
     ScanProgress,
     ScanStage,
     completion_message,
@@ -56,10 +57,14 @@ class _Board:
         self.scrolls += 1
         self.at = min(len(self.screens) - 1, self.at + 1)
 
-    def spin(self, rows: int) -> int:
-        """盲滚一趟。假的那条路原样走完请求的行数，屏号不动（这块板子按屏索引）。"""
+    def spin(self, rows: int) -> BlindWalk:
+        """盲滚一趟。假的那条路原样走完请求的行数，屏号不动（这块板子按屏索引）。
+
+        `measured=True`：滚轮那条路是闭环的（拨完读一次、不够就补拨），
+        常态下「走了多少行」是量出来的。测不出的那一支单独有用例。
+        """
         self.spun.append(rows)
-        return rows
+        return BlindWalk(rows=rows, measured=True)
 
     def read(self) -> str:
         self.reads += 1
@@ -292,7 +297,10 @@ class TestTheBlindPhaseSpinsOnce:
         走过的距离，误差会一路带到自标定的输入上。
         """
         board = _Board([BOTS])
-        board.spin = lambda rows: 480  # type: ignore[assignment,method-assign]  # 请求 500，实走 480
+        # 请求 500，实测只走了 480
+        board.spin = lambda rows: BlindWalk(  # type: ignore[assignment,method-assign]
+            rows=480, measured=True
+        )
 
         stretch = _run(board, blind_rows=500, detection_budget=5)
 

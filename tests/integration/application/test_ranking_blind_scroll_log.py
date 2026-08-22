@@ -73,6 +73,7 @@ def _run_one_pass(
     blind_rows: int = 700,
     notches: int = NOTCHES,
     measured: int | None = 706,
+    rounds: int = 1,
     source: str = "default",
 ) -> None:
     """跑一趟假采集：盲滚一次连拨，检测段慢拖到见到 bot，然后把账落库。
@@ -95,10 +96,16 @@ def _run_one_pass(
         scroll=scroll,
         spin=lambda rows: spin_blind_rows(
             rows,
+            # 闭环那一层自己量「走了多少行」（拨完读一次、不够就补拨），
+            # 所以测量值是从 `SpinResult` 带出来的，不再由这一层另测一遍。
             spin=lambda requested: SpinResult(
-                rows_requested=requested, notches=notches, spin_seconds=1.5
+                rows_requested=requested,
+                notches=notches,
+                spin_seconds=1.5,
+                rows_measured=measured,
+                rounds=rounds,
+                rates=(),
             ),
-            measure_rows=lambda: measured,
             account=account,
         ),
         read_names=lambda: screens[at],
@@ -148,10 +155,11 @@ def test_the_payload_answers_whether_the_calibration_still_holds(
 ) -> None:
     """⚠️ **这一条是整份的要害。**
 
-    要答得出「这个标定还成不成立」，库里就得同时有请求的行数、真发出去的格数、
-    实测走到第几名，以及**当时代码里的标定值**。缺任何一个，事后就只能猜。
+    要答得出「这个初始猜测还值不值得留」「这一趟收敛了没有」，库里就得同时有请求的
+    行数、真发出去的格数、**实测走了多少行**、补拨了几轮，以及**当时代码里的标定
+    值**。缺任何一个，事后就只能猜。
     """
-    _run_one_pass(screens=[HUMANS, HUMANS, BOTS])
+    _run_one_pass(screens=[HUMANS, HUMANS, BOTS], rounds=2)
 
     payload = _blind_spin_payloads(logs)[0]
 
@@ -160,6 +168,7 @@ def test_the_payload_answers_whether_the_calibration_still_holds(
     assert payload["rows_measured"] == 706
     assert payload["rows_per_notch_observed"] == round(706 / NOTCHES, 3)
     assert payload["rows_per_notch_calibrated"] == ROWS_PER_NOTCH
+    assert payload["rounds"] == 2
 
 
 def test_the_payload_carries_the_timing_and_the_provenance(logs: SystemLogRepository) -> None:
@@ -188,7 +197,9 @@ def test_the_payload_carries_the_rows_it_took_to_reach_the_bot_area(
 
     payload = _blind_spin_payloads(logs)[0]
 
-    assert payload["rows_to_bot_area"] == 700 + round(3 * ROWS_PER_SCROLL)
+    # ⚠️ 起点是**实测**走过的 706 行，不是请求的 700 行：自标定吃的是这个数，
+    # 而闭环之后它终于是量出来的了（原先这里是「格数 × 标定」）。
+    assert payload["rows_to_bot_area"] == 706 + round(3 * ROWS_PER_SCROLL)
 
 
 # -- ② 反常的那几趟同样要留痕 --------------------------------------------------
@@ -211,10 +222,12 @@ def test_a_run_that_never_saw_a_bot_still_records_the_spin(logs: SystemLogReposi
 def test_a_spin_whose_rows_could_not_be_measured_still_records_the_notches(
     logs: SystemLogRepository,
 ) -> None:
-    """测不出每格几行也要留痕：格数与用时本身就说明「拨是拨出去了」。
+    """走的是**开环退路**（起点名次读不出来）那一趟也要留痕：格数与用时本身就
+    说明「拨是拨出去了」，而 `rows_measured is None` 说明「这一趟没有闭环保护」。
 
     滚轮把列表停在非整行位置，逐行裁剪读出来的名次会横跨两行（实测过一屏只读出
-    2 个名次），所以「测不出」是常态而不是故障。
+    2 个名次），所以「读不出」是常态而不是故障——但它在库里必须看得出来，
+    因为那一趟走的距离全靠一个已经被证伪的标定。
     """
     _run_one_pass(screens=[HUMANS, BOTS], measured=None)
 

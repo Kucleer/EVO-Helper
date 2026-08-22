@@ -38,24 +38,84 @@ date: 2026-08-22
 基线（两次独立运行一致，且与生产日志 294.6 秒 / 70 屏吻合）：慢拖 `settle=2.0s`
 = **7.3 行/拖、4.23 秒/拖、1.73 行/秒**；滚轮单格连拨 ≈ **19–23 行/秒**。
 
-## ⚠️ 上线闸门：`ROWS_PER_NOTCH = 1.08` 只有 2 个样本
+## ⚠️ 上线闸门跑了，**没过** —— 于是盲滚改成了闭环
 
-**2 个样本、1 台机器、1 次会话**（40 格→44 行 = 1.10；80 格→85 行 = 1.06）。
-它一漂，「盲滚 700 行」实际走的就不是 700 行，而这个偏差是**静默**的 —— 采回来的数
-只是少一截，页面上、日志里都看不出异常。
+闸门原文：「上生产之前必须在实机复测至少 5 组（格数覆盖 40/80/160/320/480），确认
+线性仍成立、且 1.08 落在样本区间内；**复测不过就不上**」。2026-08-22 实机两趟各 5 组：
 
-⇒ **上生产之前必须在实机复测至少 5 组**（格数覆盖 40/80/160/320/480），确认线性仍
-成立、且 1.08 落在样本区间内。**复测不过就不上，先改标定值。**（本轮**没有**做这次
-复测。）
+| 格数 | 40 | 80 | 160 | 320 | 480 |
+|---|---|---|---|---|---|
+| 第一趟 行/格 | 1.23 | 0.49 | 1.25 | 0.95 | 0.98 |
+| 第二趟 行/格 | 1.00 | 0.65 | 0.89 | 1.08 | 0.74 |
+
+10 个样本：中位 **0.96**，区间 **0.49–1.25**（两端差 2.5 倍），**不随格数单调变化**
+—— 也就是说它不是一条能标定掉的系统偏差，是每趟都会重新抽一次的噪声。按 1.08 开环
+换算的「盲滚 700 行」（648 格），真实推进落在 **320–810 行**之间，而偏差是**静默**的。
+
+⇒ 换标定值救不了它（区间跨 2.5 倍，取哪个数都错）。用户口径（2026-08-22）：
+**「改成闭环：拨完读一次，不够就补拨」**。
+
+### 闭环怎么收敛
+
+1. 先读一次起点（注入的 `read_position()`，直接答「现在在第几名」；读不出就 `None`）。
+2. `target = 起点 + 请求行数`，然后最多 `MAX_SPIN_ROUNDS`(6) 轮：
+   `remaining <= SPIN_TOLERANCE_ROWS`(8) 算**到位**、
+   `remaining < SPIN_FINAL_APPROACH_ROWS`(30) 算**收手**（见下一节），
+   两条都不成立才拨；本轮格数 = `ceil(remaining / rate_hi)`，
+   `rate_hi` = **本趟已观测到的最大**行/格（还没观测时才用 `ROWS_PER_NOTCH`）；
+   拨完等一次 `GLIDE_SETTLE_S` 再读。
+3. ⚠️ **用最大速率是有意的**：它让每一轮都**故意走不到**、从下方逼近目标，
+   剩下的下一轮补。冲过头是**不可逆**的（这一段不采数据，榜首被跳过去不报错、
+   不少日志）；少走一点则由检测段接手（实测约 4.6 秒/屏）。**别改成平均或最小。**
+
+### ⚠️ 闭环第一版上实机又暴露两件事（2026-08-22 当天）
+
+```
+请求 200 行 → 实测 218 行；3 轮；逐轮行/格 (0.85, 0.98, 2.82)   ← 冲过头 18 行
+请求 500 行 → 第 1 轮拨完「读不出名次」，闭环当场失效         ← 根本问题
+```
+
+**读不出名次是根本问题**：闭环那一读走的是 `read_rows()` / `rows_from_image`，
+而那是**按行网格逐行裁剪**的（`ROW_FIRST_Y + k×ROW_PITCH_PX`）。滚轮会把列表停在
+**非整行位置**（实测偏离网格约 12px），逐行裁剪就横跨两行、名字和名次全糊——
+这条限制在本文档「只有盲滚段用滚轮」那一节里本来就写着，闭环踩的是同一颗雷。
+
+⇒ 用户口径（2026-08-22）：**给盲滚单独做一个与行对齐无关的位置读数器**。
+`tools/ranking_scan.py` 新增 `position_from_image()`：把**名次那一整列**裁下来
+（左右各放宽 `RANK_STRIP_PAD_PX`(10)、顶上多留 `RANK_STRIP_TOP_PAD_PX`(30)，
+底边盖满一屏）、放大 3 倍、`--psm 6` **读一次**、正则抓 `\[(\d{1,4})\]`、取中位数；
+抓不到 `SPIN_MARK_MIN_ROWS`(4) 个就交 `None`。整列一次读完，不按行切，
+所以列表停在哪儿都读得出。只读名次列是因为盲滚只需要「在第几名」——
+名字列 OCR 错误率约 8%，读它只是徒增失败面。
+`row_rank` 那个注入回调随之删掉（`read_position` 取代它，`_position_mark` 一并删）。
+
+**冲过头只出在最后一轮**：剩余只剩几行时，一格的粒度加惯性滑行压不住，而那一轮的
+分母只有几格、`moved / notches` 噪声大到离谱（上面那个 **2.82** 多半是测量假象，
+它还会喂进下一轮的 `rate_hi`）。⇒ 新常量 `SPIN_FINAL_APPROACH_ROWS = 30`：
+**剩余不足 30 行就收手，不再补拨**。最后那几十行的精度换不来什么（检测段逐屏接手，
+约 4 屏、18 秒），却是**唯一会冲过头的地方**，而冲过头不可逆。
+`SPIN_TOLERANCE_ROWS`(8) 保留原意（「到位了」的判据），两条各管一件事。
+
+### 三条退路（都不许把整趟判成失败）
+
+- **起点读不出来** → 退回**开环一次性拨完**，日志明说这一趟**没有闭环保护**、
+  实走多少行**测不出**。⚠️ 这条退路必须留：读不出就整趟不干，会让采集链路在
+  OCR 偶发失灵时直接瘫掉，而 OCR 偶发失灵是常态（整列读一次也不保证抓得到几个
+  `[N]`——榜首三名是奖章图标、本来就没有名次数字，开榜那一屏尤其少）。
+- **某轮之后读不出当前位置** → 就此收手，如实说走到哪儿了。
+- **某轮一行都没走** → 停，不再重试（拨不动时多拨几轮也一样，每轮要花 2.5 秒）。
+
+`ROWS_PER_NOTCH = 1.08` **降级为「第一轮的初始猜测」**，不再是精度来源：它标得准不
+准只影响第一轮走多远，不再影响整趟走多远。
 
 ## 落地的东西
 
 | 层 | 改动 |
 |---|---|
-| `game/ranking_ui.py` | 新增 `WHEEL_DELTA=120`、`WHEEL_GAP_S=0.016`、`ROWS_PER_NOTCH=1.08`、`GLIDE_SETTLE_S=2.5`、`BLIND_SCROLL_ROWS=700`、`BLIND_SCROLL_MARGIN_ROWS`。**都是标定常量，不是运维旋钮** |
-| `game/ranking_nav.py` | 原语 `wheel_notch()`（单事件恒为 `±120`）+ `spin_blind(rows) -> int`（返回实拨格数）。格数与间隔的循环放在 `game` 层，同 `_slow_drag` 分步的理由：放 `tools` 会让 `game` 反过来 import `tools` |
+| `game/ranking_ui.py` | 新增 `WHEEL_DELTA=120`、`WHEEL_GAP_S=0.016`、`ROWS_PER_NOTCH=1.08`（**只是第一轮的猜测**）、`GLIDE_SETTLE_S=2.5`、`BLIND_SCROLL_ROWS=700`、`BLIND_SCROLL_MARGIN_ROWS`，以及闭环的 `MAX_SPIN_ROUNDS=6` / `SPIN_TOLERANCE_ROWS=8`（「到位了」）/ `SPIN_FINAL_APPROACH_ROWS=30`（「还差这么多就别补了」）/ `SPIN_MARK_MIN_ROWS=4`，以及整列读名次的裁框余量 `RANK_STRIP_PAD_PX=10` / `RANK_STRIP_TOP_PAD_PX=30`。**都是标定常量，不是运维旋钮** |
+| `game/ranking_nav.py` | 原语 `wheel_notch()`（单事件恒为 `±120`）+ **闭环** `spin_blind(rows) -> SpinResult`（`rows_requested` / `notches` / `spin_seconds` / `rows_measured` / `rounds` / `rates`）。新增注入回调 `read_position()`（直接答「现在在第几名」，**不是**交行——逐行裁剪那条路在滚轮下会糊，见上）。格数与间隔、以及「拨完读一次」那个循环都放在 `game` 层，同 `_slow_drag` 分步的理由：放 `tools` 会让 `game` 反过来 import `tools` |
 | `tools/scan_coordinates.py` | 驱动实现 `wheel_notch()`，显式 `pyautogui.PAUSE = 0` |
-| `tools/ranking_scan.py` | 盲拖循环换成一次 `spin_blind_rows()`；行数记账（`BlindSpinAccount`）；日志改口径 |
+| `tools/ranking_scan.py` | 盲拖循环换成一次 `spin_blind_rows()`；行数记账（`BlindSpinAccount`）；日志改口径。新增**与行对齐无关**的位置读数器 `position_from_image()` 并注入为 `read_position`；盲滚段返回 `BlindWalk(rows, measured)` —— **走了多少行，以及那个数是量出来的还是算出来的** |
 | `domain/ranking.py` | 自标定与余量判据从屏改行；新判据 `is_bot_entry` |
 | `storage/models.py` + `alembic/versions/b8e1c4a72f05` | 新列 `blind_scroll_rows` |
 | `web/` + `settings.html` | 新旋钮 + 「≈N 秒」换算显示；旧「盲拖屏数」那一节改标题为「回滚用，当前不生效」 |
@@ -75,9 +135,13 @@ date: 2026-08-22
 只换内部而保留每次末尾的 `wait(SCROLL_SETTLE_WAIT_S)`，70 × 2 秒原样还在，等于白改。
 
 ```
-原先：for _ in range(70): 慢拖一屏 + 等 2.0s              → 294.6s
-现在：连拨 N 格（16ms 一格、中间一次都不等）+ 等一次 2.5s  → 约 11s
+原先：for _ in range(70): 慢拖一屏 + 等 2.0s                        → 294.6s
+现在：每轮「连拨 N 格（16ms 一格、中间一次都不等）+ 等 2.5s + 读一屏」 → 常态 2–3 轮
 ```
+
+⚠️ 闭环把等待从「整趟一次」变成「每轮一次」，但量级没变：一轮约 2.5 秒等待 + 一次
+**整列** OCR（只读名次那一列，不是整屏三列），常态两三轮，仍然远小于原先 70 × 2 秒。收益来自**不再每屏都等**，
+不是来自「整趟只等一次」。
 
 ⇒ `SCROLL_SETTLE_WAIT_S`(2.0s) 现在**只剩检测段和采集段在用**，盲滚段一次都不碰它。
 
@@ -120,24 +184,30 @@ date: 2026-08-22
 `source = tools.ranking_scan`，每轮盲滚一条。正文：
 
 ```
-盲滚 N 行：发了 M 格、拨完用 X.X 秒，每格实测 R 行（标定 1.08）
+盲滚请求 N 行：实测走了 M 行；补拨 K 轮共发了 P 格、拨完用 X.X 秒，每格实测 R 行（第一轮的猜测是 1.08）
 ```
+
+测不出那一趟（开环退路）正文写「实走多少行没测出来（起点名次读不出，这一趟是开环、
+没有闭环保护）」。**「请求 N 行」和「实测走了 M 行」永远是两个数。**
 
 `payload_json`：`rows_requested` / `notches_sent` / `spin_seconds` /
 `glide_seconds` / `rows_measured` / `rows_per_notch_observed` /
-`rows_per_notch_calibrated` / `rows_to_bot_area` / `source`（手填还是默认）。
+`rows_per_notch_calibrated` / `rounds` / `rows_per_notch_by_round` /
+`rows_to_bot_area` / `source`（手填还是默认）。
 
-⚠️ **`rows_per_notch_observed` 是这条日志的要害**：标定只有 2 个样本，它一旦漂了，
-盲滚距离就静默地变了。把每轮的实测值记进库，才能在事后回答「这个标定还成不成立」，
-而不是等到某天发现 bot 少采了一截再回头查。`rows_requested` 与 `notches_sent`
-**都要留**：格数是真发生的事，行数是它乘标定算出来的，只留折合值就把两者的差别抹平了。
+⚠️ **原先那句「盲滚 700 行（实走约 700 行）」是假证据**：那个「实走约」是拿格数乘
+标定算出来的，读起来却像量出来的 —— 而真实速率在 0.49–1.25 之间抽，同一句话可能对应
+320 行，也可能对应 810 行。现在 `rows_measured` 是**闭环量出来的**，测不出就明说测不出，
+一个字都不许拿换算冒充。
+
+⚠️ **`rows_per_notch_observed`（总行数 ÷ 总格数）仍然是这条日志的要害**：闭环之后它
+不再决定这一趟走多远，但「1.08 这个初始猜测还值不值得留」只有靠它答得出。
+`rows_per_notch_by_round` 逐轮留着**散布**（同一趟里也抖），压成一个平均数正好把推翻
+开环的那份证据抹掉。`rounds` 顶到 `MAX_SPIN_ROUNDS` 就是**这一趟没收敛**，
+而没收敛是静默的。
 
 ⚠️ 这条日志落在**检测段跑完之后**而不是拨完那一刻 —— `rows_to_bot_area` 要等检测段
 才知道，而它和「每格实测几行」放在同一条里才对得上账。
-
-⚠️ `rows_measured` 是**尽力而为**：滚轮把列表停在非整行位置，逐行裁剪读出来的名次会
-横跨两行，读不出就 `None`。它**只喂日志、不参与任何判据**，所以「读不准」的代价只是
-这一趟答不出「每格走了几行」。
 
 - Configuration: 新旋钮 **`military_attack_config.blind_scroll_rows`**（攻击配置页
   「军力榜盲滚行数」）。**留空 = 按实测自动标定**（最近 `BLIND_SCROLL_SAMPLES` 次
@@ -162,7 +232,9 @@ date: 2026-08-22
   ⚠️ **本轮没有对任何生产库执行 `alembic upgrade`**，也没有连生产库；迁移由生产自己
   在重启时升（`web.runtime._upgrade_database`）。
 - Verification: 单元 —— `tests/unit/game/test_ranking_wheel_constants.py`（标定常量）、
-  `tests/unit/game/test_ranking_spin_blind.py`（行→格换算，边界 0 / 1 / 很大的值）、
+  `tests/unit/game/test_ranking_spin_blind.py`（**闭环**：一轮到位不再多拨、走不够
+  会补拨、格数永远按 `rate_hi` 而不是平均/最小算、没进展就停、轮数上限、起点读不出
+  走开环退路且 `rows_measured is None`、`rows=0` 一格不拨一次不读）、
   `tests/unit/tools/test_live_driver_wheel.py`（`dwData` 恒为 ±120、间隔不小于
   `WHEEL_GAP_S`、`PAUSE` 被置 0）、`tests/unit/tools/test_ranking_blind_spin_account.py`、
   `tests/unit/domain/test_ranking.py`（`is_bot_entry`，含 `None` 放行那一档）、
@@ -172,9 +244,11 @@ date: 2026-08-22
   （新旋钮进「所有旋钮一起存一起读」那张表）。迁移 ——
   `tests/integration/storage/test_blind_scroll_rows_migration.py`（升级/降级各跑一次，
   存量行为 NULL）。
-  ⚠️ **两处仍然没验**：(1) **实机一趟都没跑过** —— 全部改动只有代码级断言，而
-  `ROWS_PER_NOTCH` 的复测（上线闸门）需要实机；(2) 页面没有渲染验证（「≈N 秒」那行
-  换算、旧屏数那一节的新标题），本轮不许起 preview / dev server。
+  ⚠️ **两处仍然没验**：(1) **闭环本身实机一趟都没跑过** —— 上线闸门那次复测跑的是
+  开环，它证伪了 `ROWS_PER_NOTCH` 却没有验证「拨完读一次」这条回路；实机要重点看的
+  是**起点名次读不读得出**（读不出就整趟退回开环、没有闭环保护）和**几轮收敛**
+  （顶到 6 轮 = 没收敛）；(2) 页面没有渲染验证（「≈N 秒」那行换算、旧屏数那一节的
+  新标题），本轮不许起 preview / dev server。
 - Safety: **盲滚段一次点击都不发**，`allow_actions` 全程为假；不改攻击链路、不改采集
   口径、不动任何与派遣有关的东西。四条不变量：**只有盲滚段用滚轮**；**单个事件不许
   超过一格**（大 delta 会被游戏封顶，而封顶是静默的）；**`pyautogui.PAUSE` 必须显式

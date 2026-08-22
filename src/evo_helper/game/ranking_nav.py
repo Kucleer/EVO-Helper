@@ -44,6 +44,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ from evo_helper.game.ranking_ui import (
     DRAG_RELEASE_HOLD_S,
     DRAG_STEPS,
     GLIDE_SETTLE_S,
+    MAX_SPIN_ROUNDS,
     MILITARY_TAB,
     NAV_BAR_Y,
     NAV_DRAG_FROM_X,
@@ -76,11 +78,14 @@ from evo_helper.game.ranking_ui import (
     READ_ATTEMPTS,
     REREAD_WAIT_S,
     ROWS_PER_NOTCH,
+    ROWS_PER_NOTCH_MAX,
     ROWS_PER_SCREEN,
     SCROLL_FROM_Y,
     SCROLL_SETTLE_WAIT_S,
     SCROLL_TO_Y,
     SCROLL_X,
+    SPIN_FINAL_APPROACH_ROWS,
+    SPIN_TOLERANCE_ROWS,
     TAB_SWITCH_WAIT_S,
     WHEEL_GAP_S,
 )
@@ -104,6 +109,13 @@ class RankingDriver(Protocol):
     def release(self) -> None: ...
 
     def wait(self, seconds: float) -> None: ...
+
+    def hover(self, x: int, y: int) -> None:
+        """把指针挪到某处，**不按下**。盲滚之前用它落点。
+
+        ⚠️ 不能用 `move_to` 代替：那是慢拖途中的一步，没按下就调会被守卫拦掉。
+        """
+        ...
 
     def wheel_notch(self) -> None:
         """往下滚**一格**（`dwData = -WHEEL_DELTA`）。
@@ -156,18 +168,35 @@ class ScrollStep[RowT]:
 class SpinResult:
     """一趟滚轮盲滚的账。
 
-    ⚠️ **`rows_measured` 不在这里，得由调用方填**——这一层拨完就返回，
-    一行都不读（`ScrollStep` 那边会把行带回来，是因为它本来就要读一屏做判据）。
+    ⚠️ **`rows_measured` 是这一层量出来的，不再由调用方填。** 2026-08-22 之前
+    这里写着「拨完就返回、一行都不读」，那是开环时代的说法——闭环之后本层每一轮
+    都要读一次位置才知道要不要补拨，于是「走了多少行」在这里就是现成的**测量值**。
+    调用方（`tools.ranking_scan`）照抄它进 `system_log` 即可，别再自己另测一遍：
+    那是另一帧画面，两帧之间列表可能已经动过。
 
-    `spin_seconds` 是**实测**拨完用了多久，记它是为了让「每格 16ms」这条
-    可验证：`WHEEL_GAP_S` 走的是 `driver.wait`，而 Windows 上 `time.sleep`
-    的粒度是 15.6ms——真被撑成 31ms/格的话，动量就攒不起来，
-    而症状同样是「拨了但没走」。把用时记进 `system_log` 才看得出这件事。
+    `rows_measured is None` 只有一个含义：**这一趟没有闭环保护**（起点读不出来，
+    退回开环一次性拨完）。它不是「零行」，也不是「没测」——所以日志上必须
+    照实说「测不出」，不许拿格数换算出一个数来冒充测量值。
+
+    `spin_seconds` 是**实测**拨完用了多久（只算发滚轮事件那些时间，不含每轮读屏
+    和等滑行），记它是为了让「每格 16ms」这条可验证：`WHEEL_GAP_S` 走的是
+    `driver.wait`，而 Windows 上 `time.sleep` 的粒度是 15.6ms——真被撑成 31ms/格
+    的话，动量就攒不起来，而症状同样是「拨了但没走」。把用时记进 `system_log`
+    才看得出这件事。
+
+    `rates` 是每一轮观测到的行/格。留着整串而不是只留个平均：这一族数的**散布**
+    才是要害（实测 0.49–1.25），压成一个平均数正好把它抹掉。
     """
 
     rows_requested: int
     notches: int
     spin_seconds: float
+    #: 实测走了多少行；`None` = 这一趟是开环退路，没测。
+    rows_measured: int | None
+    #: 拨了几轮（开环退路记 1；`rows == 0` 记 0）。
+    rounds: int
+    #: 每轮观测到的行/格。开环退路是空的——那一趟一次都没量。
+    rates: tuple[float, ...]
 
 
 @dataclass
@@ -186,6 +215,18 @@ class RankingNavigator[RowT]:
       实机上就是 `lambda row: row.score is not None`。
       它只在 `_switch_to_military` 那道「面板铺开了没有」的闸上用一次，
       **不是**用来判「我在哪个页签上」——那个判据不存在，见 `_switch_to_military`。
+    - `read_position`：**现在滚到第几名了**，读不出就 `None`。只服务于
+      `spin_blind` 的闭环——那一段唯一要回答的就是这一个问题。
+
+      ⚠️ **它答的是「在第几名」，不是「交出几行」，这个形状是有意的。**
+      2026-08-22 实机：闭环原先拿 `read_rows()` 交出来的行取名次中位数，
+      而那条路是**按行网格逐行裁剪**的（`ROW_FIRST_Y + k×ROW_PITCH_PX`）——
+      滚轮会把列表停在**非整行位置**（实测偏离网格约 12px），逐行裁剪就横跨
+      两行、名次全糊，于是请求 500 行时第一轮拨完当场「读不出名次」、闭环失效。
+      所以盲滚要一个**与行对齐无关**的读数器（实机上是
+      `tools.ranking_scan.position_from_image`：整列一次读完），
+      而这一层只要求它能直接答出名次，怎么读不管。
+
     ⚠️ **没有「这一屏是不是军事榜」这个回调**，因为那个判据不存在——见
     `_switch_to_military`。想看哪个榜就点哪个页签。
     """
@@ -194,6 +235,7 @@ class RankingNavigator[RowT]:
     read_labels: Callable[[], Sequence[tuple[int, str]]]
     read_rows: Callable[[], Sequence[RowT]]
     row_has_score: Callable[[RowT], bool]
+    read_position: Callable[[], int | None]
     say: Callable[[str], None] = print
 
     # -- 进榜单 -------------------------------------------------------------
@@ -382,35 +424,232 @@ class RankingNavigator[RowT]:
         self.driver.wait(SCROLL_SETTLE_WAIT_S)
 
     def spin_blind(self, *, rows: int) -> SpinResult:
-        """连拨滚轮走过 `rows` 行，**中间不读也不判**，末尾统一等一次滑行。
+        """连拨滚轮走过 `rows` 行：**拨完读一次，不够就补拨**（闭环）。
 
-        ⚠️ **等待只有末尾那一次，不是每格一次。** `scroll_blind` 那条路每屏都
+        用户口径（2026-08-22）：「改成闭环：拨完读一次，不够就补拨」。
+
+        ## 为什么不能开环
+
+        原先这里是 `notches = round(rows / ROWS_PER_NOTCH)` 一次性拨完，
+        精度全押在那一个标定上。**同一天实机把它证伪了**：两趟 × 5 组量到的
+        行/格是 0.49–1.25（中位 0.96），且不随格数单调变化——按 1.08 换算的
+        「盲滚 700 行」，真实推进落在 320–810 行之间，而偏差是**静默的**
+        （见 `ranking_ui.ROWS_PER_NOTCH` 上那张表）。
+
+        闭环把「走多远」从**推算**换成**测量**：每一轮拨完读一次名次中位数，
+        差多少就补多少。标定值只剩下「第一轮拨多少」这一个用处。
+
+        ## 从下方逼近：每一轮都故意走不到
+
+        本轮格数 = `ceil(剩余 / rate_hi)`，`rate_hi` 是**本趟已观测到的最大**
+        行/格（还没观测时才用 `ROWS_PER_NOTCH`）。
+
+        ⚠️ **用最大速率是有意的，别改成平均或最小。** 除以一个偏大的速率会算出
+        偏少的格数，也就是**故意走不到**，剩下的下一轮再补。而冲过头是**不可逆**
+        的：这一段不读屏（读也只读名次中位数、不采数据），榜首被跳过去的那一批
+        bot 不会报错、不会少一条日志，只是采回来的数静悄悄少一截。
+        少走一点的代价则完全不同——由检测段接手，实测约 4.6 秒/屏。
+
+        ⚠️ **除数取「本趟观测」与 `ROWS_PER_NOTCH_MAX`(1.25) 的较大者。**
+        只取本趟观测是不够的：第一轮恰好抽到区间下端（0.49）时，第二轮会按 0.49
+        算格数，而那一轮真实速率若跳回 1.25 就走出 2.5 倍距离、直接冲过头——
+        **越是遇到慢的一轮，下一轮越危险**。
+        （用一个偏大的速率当除数**不是**把精度押回被证伪的标定上：它只决定
+        「这一轮少走多少」，走了多远仍旧由测量回答。两件事别混。）
+
+        ## 最后几十行不补拨
+
+        剩余不足 `SPIN_FINAL_APPROACH_ROWS`(30) 就收手，哪怕还没进
+        `SPIN_TOLERANCE_ROWS`(8)。⚠️ **这不是懒，是因为那一轮是唯一会冲过头的
+        地方**：2026-08-22 实机请求 200 行走了 218 行，18 行的超出全出在最后一轮
+        （剩余只剩几行时，一格的粒度加惯性滑行压不住，而那一轮的分母只有几格，
+        行/格的噪声大到离谱——逐轮读数 0.85 / 0.98 / **2.82**）。
+        少走的几十行由检测段接手，多走的没有任何东西接得住。
+
+        ## 三条不能动的东西
+
+        ⚠️ **等待不是每格一次。** `scroll_blind` 那条路每屏都
         `wait(SCROLL_SETTLE_WAIT_S)`，70 屏就是 140 秒纯等待（生产实测整段
-        294.6 秒）——盲滚改滚轮的收益**全部**来自把这些等待合并成一次。
-        每格都等一下就等于没改：实测那样 80 格只走 2 行。
+        294.6 秒）——盲滚改滚轮的收益**全部**来自把这些等待合并。每格都等一下
+        就等于没改：实测那样 80 格只走 2 行。闭环之后等待是**每轮一次**
+        （常态两三轮），不是每格一次。
 
         ⚠️ **不许把 N 格合成一个大事件。** 游戏对单个事件的幅度封顶（实测 800 格
         只走 14px），而封顶是静默的；动量靠的是**密集的独立事件**。所以驱动面上
         只有 `wheel_notch()` 这一种粒度，密度在这里控制。
 
-        ⚠️ **拨完必须等滑行停**（`GLIDE_SETTLE_S`），否则紧接着的检测段会在
-        移动中的画面上逐行裁剪，读出来的名字横跨两行。
+        ⚠️ **每一轮拨完都要等滑行停**（`GLIDE_SETTLE_S`）才准读：不等就是在移动中
+        的画面上逐行裁剪，读出来的名字横跨两行——而那既会让这一轮的测量作废，
+        也会让紧接着的检测段读到糊的一屏。
+
+        ## 三条退路（都不许把整趟判成失败）
+
+        - **起点读不出来** → 退回**开环一次性拨完**，并说清这一趟没有闭环保护。
+          ⚠️ 这条退路必须留：读不出就整趟不干，会让采集链路在 OCR 偶发失灵时
+          直接瘫掉，而 OCR 偶发失灵是常态（滚轮把列表停在非整行位置）。
+        - **某一轮之后读不出当前位置** → 就此收手，如实说走到哪儿了。
+        - **某一轮一行都没走** → 停，不再重试。拨不动时多拨一百次也一样，
+          而每轮要花 2.5 秒等滑行。
 
         `rows == 0` 是最保守的合法取值（「一格都别拨」），此时**一次事件都不发、
-        一次等待都不做**——那样这一趟就退回成纯慢拖，也就是这次改动的一键回滚。
-        负数不接受：往上滚会把已经翻过的榜单再翻一遍，而调用方拿不到任何提示。
+        一次等待都不做、一次屏都不读**——那样这一趟就退回成纯慢拖，也就是这次
+        改动的一键回滚。负数不接受：往上滚会把已经翻过的榜单再翻一遍，
+        而调用方拿不到任何提示。
         """
         if rows < 0:
             raise ValueError(f"盲滚行数不能是负数（拿到 {rows}）：往上滚不是这一段该做的事")
+        if not rows:
+            # 一键回滚这一支：连「我现在在第几名」都不读。读一次要一遍整屏 OCR，
+            # 而这一支的语义就是「这一趟什么都别做」。
+            return SpinResult(
+                rows_requested=0,
+                notches=0,
+                spin_seconds=0.0,
+                rows_measured=None,
+                rounds=0,
+                rates=(),
+            )
+
+        start = self.read_position()
+        if start is None:
+            return self._spin_open_loop(rows)
+
+        target = start + rows
+        current = start
+        notches_total = 0
+        spin_seconds = 0.0
+        rates: list[float] = []
+        rounds = 0
+        position_lost = False
+        for _round in range(MAX_SPIN_ROUNDS):
+            remaining = target - current
+            if remaining <= SPIN_TOLERANCE_ROWS:
+                break
+            if remaining < SPIN_FINAL_APPROACH_ROWS:
+                # ⚠️ **最后那几十行不补拨——那是唯一会冲过头的地方。**
+                # 2026-08-22 实机：请求 200 行走了 218 行，18 行的超出全出在最后
+                # 一轮（剩余只剩几行时，一格的粒度加惯性滑行压不住，而那一轮的
+                # 分母只有几格，`moved / notches` 噪声大到离谱——逐轮读数
+                # 0.85 / 0.98 / 2.82，最后那个多半是测量假象）。
+                # 少走这几十行由检测段逐屏接手（约 4 屏、18 秒）；冲过头则不可逆。
+                self.say(
+                    f"  盲滚只差 {remaining} 行（不足 {SPIN_FINAL_APPROACH_ROWS} 行）："
+                    f"最后这一截不补拨了（补一轮反而是唯一会冲过头的地方），"
+                    f"停在第 {current} 名、本趟走了 {current - start} 行，交给检测段"
+                )
+                break
+            # 没有本趟观测时才用标定值——它只负责第一轮拨多远。
+            # ⚠️ 除数取「本趟观测」与「已知最快」的**较大者**，两边缺一不可：
+            # 只用本趟观测时，第一轮抽到区间下端（0.49）会让第二轮按 0.49 算格数，
+            # 而真实速率跳回 1.25 就走出 2.5 倍距离、冲过头——越是遇到慢的一轮，
+            # 下一轮越危险。只用常量时，游戏哪天变快了又跟不上。
+            rate_hi = max([*rates, ROWS_PER_NOTCH_MAX])
+            notches = math.ceil(remaining / rate_hi)
+            rounds += 1
+            spin_seconds += self._send_notches(notches)
+            notches_total += notches
+            self.driver.wait(GLIDE_SETTLE_S)
+            mark = self.read_position()
+            if mark is None:
+                self.say(
+                    f"  盲滚第 {rounds} 轮拨完读不出名次："
+                    f"从第 {start} 名起走了至少 {current - start} 行（要 {rows} 行），"
+                    "闭环到此为止，**实走多少行就此不可知**，剩下的交给检测段"
+                )
+                # ⚠️ **位置丢了就必须报「不知道」，不能报最后一次读到的差值。**
+                # 这一轮已经发出去 `notches` 格了，列表几乎肯定走了几百行；
+                # 而 `current` 停在上一次读得出的地方，`current - start` 会说成
+                # 「走了 0 行」。那是**一个断言**，而真相是「不知道」——
+                # 这个数一路喂进「翻了 N 行到达 bot 区」，也就是自标定的输入，
+                # 拿 0 去喂会把标定往「一格都走不动」的方向拽。
+                # 2026-08-22 实机：请求 500 行、真的拨了 400 格，报回来的是 0。
+                position_lost = True
+                break
+            moved = mark - current
+            if moved <= 0:
+                # ⚠️ **这一支不把 `current` 挪到 `mark` 上。** 名次中位数带一两行的
+                # 抖动，`mark` 偶尔会比上一轮还小；采纳它会让 `rows_measured` 变成
+                # 负数，而那个数一路喂进「翻了 N 行到达 bot 区」——自标定的输入。
+                # 「没往前走」这件事已经如实说出来了，不必再用一个假的负数去表达。
+                self.say(
+                    f"  盲滚第 {rounds} 轮发了 {notches} 格，名次一行没往前走"
+                    f"（拨完读到第 {mark} 名，拨之前是第 {current} 名；本趟共走"
+                    f" {current - start} 行、要 {rows} 行）：拨不动时多拨几轮也一样，就此收手"
+                )
+                break
+            current = mark
+            rates.append(moved / notches)
+        else:
+            if target - current > SPIN_TOLERANCE_ROWS:
+                self.say(
+                    f"  盲滚拨满 {MAX_SPIN_ROUNDS} 轮仍差 {target - current} 行"
+                    f"（要 {rows} 行、实走 {current - start} 行，停在第 {current} 名）："
+                    "不再补拨，剩下的交给检测段"
+                )
+        return SpinResult(
+            rows_requested=rows,
+            notches=notches_total,
+            spin_seconds=spin_seconds,
+            rows_measured=None if position_lost else current - start,
+            rounds=rounds,
+            rates=tuple(rates),
+        )
+
+    def _spin_open_loop(self, rows: int) -> SpinResult:
+        """起点读不出来时的退路：按标定一次性拨完，**这一趟没有闭环保护**。
+
+        ⚠️ **必须留这条路，不许改成「读不出就不滚」。** 位置读数器整列读一次、
+        抓 `[N]` 取中位数，抓不够几个就如实交 `None`（榜首三名是奖章图标、
+        本来就没有 `[N]`，开榜那一屏尤其少）。让一次 OCR 失灵瘫掉整条采集链路，
+        比这一趟少了保护坏得多。
+
+        ⚠️ **`rows_measured` 留 `None`，不许拿格数换算一个数填进去。** 那正是这次
+        改动要消灭的东西：`格数 × 1.08` 读起来像证据，其实是推算，而真实速率在
+        0.49–1.25 之间抽。测不出就得在日志上明说测不出。
+        """
+        self.say(
+            f"  盲滚 {rows} 行：起点名次读不出来（整列读数器交了「不知道」），"
+            f"这一趟退回开环、按标定 {ROWS_PER_NOTCH} 行/格一次性拨完——"
+            "**没有闭环保护**，实走多少行测不出"
+        )
         notches = round(rows / ROWS_PER_NOTCH)
+        spin_seconds = self._send_notches(notches)
+        if notches:
+            self.driver.wait(GLIDE_SETTLE_S)
+        return SpinResult(
+            rows_requested=rows,
+            notches=notches,
+            spin_seconds=spin_seconds,
+            rows_measured=None,
+            rounds=1,
+            rates=(),
+        )
+
+    def _send_notches(self, notches: int) -> float:
+        """拨 `notches` 格，返回**实测**用了多久（不含等滑行、不含读屏）。
+
+        ⚠️ **先把指针挪进榜单里，滚轮才有地方去。**
+
+        2026-08-22 生产事故：原先这里什么都不做，注释里写着「落点由上一个动作
+        负责——`open_military_ranking` 之后指针停在面板内部」。那句话是真的，
+        但**面板内部 ≠ 可滚动列表内部**：那一路最后点的是 `MILITARY_TAB`
+        (1084, 212)，而列表从 `ROW_FIRST_Y`(257) 才开始——指针停在列表**上方
+        45 像素**的页签条上。浏览器把滚轮事件路由给指针底下的元素，于是几百个
+        事件全发给了页签条，**榜单一行都没动**，而日志照样说「盲滚 700 行」。
+
+        落点用 `(SCROLL_X, SCROLL_FROM_Y)`——慢拖按下去的就是这一点，
+        它落在列表里是被这条链路验证过无数次的既有事实，不是新猜的坐标。
+        每一轮都挪一次而不是整趟挪一次：读屏那一步不碰鼠标，但**别把「指针没人
+        动过」当成不变式**——那正是上面那次事故的成因。挪一次的代价是零。
+        """
+        if not notches:
+            return 0.0
+        self.driver.hover(SCROLL_X, SCROLL_FROM_Y)
         started = time.monotonic()
         for _notch in range(notches):
             self.driver.wheel_notch()
             self.driver.wait(WHEEL_GAP_S)
-        spin_seconds = time.monotonic() - started
-        if notches:
-            self.driver.wait(GLIDE_SETTLE_S)
-        return SpinResult(rows_requested=rows, notches=notches, spin_seconds=spin_seconds)
+        return time.monotonic() - started
 
     # -- 收尾 ---------------------------------------------------------------
 
