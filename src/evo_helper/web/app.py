@@ -55,9 +55,15 @@ from evo_helper.domain.target_order import (
 )
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_MARGIN_ROWS,
+    BLIND_SCROLL_ROWS,
     BLIND_SCROLL_SAMPLES,
     BLIND_SCROLLS,
     BLIND_SCROLLS_MAX,
+    GLIDE_SETTLE_S,
+    ROWS_PER_NOTCH,
+    ROWS_PER_SCROLL,
+    WHEEL_GAP_S,
 )
 from evo_helper.storage.repository import SqlAlchemyRepository
 
@@ -778,6 +784,19 @@ def create_app(
                 "blind_scrolls_max": BLIND_SCROLLS_MAX,
                 "blind_scroll_samples": BLIND_SCROLL_SAMPLES,
                 "blind_scroll_margin": BLIND_SCROLL_MARGIN,
+                # 盲滚那一节要的四个标定常量。页面拿它们做「行 → 秒」换算，
+                # **不做越界判断**：`FIRST_BOT_RANK`(587) 那个「bot 起点」是玩家改名
+                # 伪装出来的，不是安全边界（用户口径 2026-08-22）。
+                "blind_scroll_rows_default": BLIND_SCROLL_ROWS,
+                "blind_scroll_margin_rows": BLIND_SCROLL_MARGIN_ROWS,
+                "rows_per_notch": ROWS_PER_NOTCH,
+                "wheel_gap_s": WHEEL_GAP_S,
+                "wheel_gap_ms": round(WHEEL_GAP_S * 1000),
+                "glide_settle_s": GLIDE_SETTLE_S,
+                # 屏口径那个观测下界折成行，只当参考数摆在页面上。**算出来而不是
+                # 手抄一个数**：日后谁重新标定了每屏行数，页面上这句话会跟着走。
+                "rows_per_scroll": ROWS_PER_SCROLL,
+                "blind_scroll_rows_reference": round(BLIND_SCROLLS_MAX * ROWS_PER_SCROLL),
                 # 同理，翻信箱那个默认值也从 `domain.report_wait` 传进来：页面上
                 # 那句「留空 = N 小时」是用户判断「填多少」的唯一依据，手抄一遍
                 # 之后调常量页面不跟。
@@ -1324,6 +1343,7 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
     return MilitaryAttackConfigOut(
         tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
         blind_scrolls=view.blind_scrolls,
+        blind_scroll_rows=view.blind_scroll_rows,
         report_scan_hours=view.report_scan_hours,
         unknown_line_hold_minutes=view.unknown_line_hold_minutes,
         reconcile_cooldown_minutes=view.reconcile_cooldown_minutes,
@@ -1395,6 +1415,7 @@ def register_mission_routes(app: FastAPI) -> None:
             console.replace_military_attack_tiers(
                 tuple(item.model_dump() for item in payload.tiers),
                 blind_scrolls=payload.blind_scrolls,
+                blind_scroll_rows=payload.blind_scroll_rows,
                 report_scan_hours=payload.report_scan_hours,
                 unknown_line_hold_minutes=payload.unknown_line_hold_minutes,
                 reconcile_cooldown_minutes=payload.reconcile_cooldown_minutes,

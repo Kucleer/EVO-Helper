@@ -14,6 +14,7 @@ from evo_helper.domain.ranking import (
     descending_breaks,
     interpolate_scores,
     is_bot_coordinate,
+    is_bot_entry,
     mentions_bot,
     repair_ranks,
 )
@@ -257,3 +258,66 @@ def test_the_range_check_is_not_this_functions_job() -> None:
     """
     assert mentions_bot("bot_2_1121_7")  # 1121 越界，但形状对
     assert coordinate_of("bot_2_1121_7") is None  # 真正的把关在这儿
+
+
+# -- 谁是 bot（第二道判据：军力不等于 0）----------------------------------------
+
+
+def test_a_bot_shaped_name_with_a_real_score_is_a_bot() -> None:
+    """用户口径（2026-08-22）：「id 符合 + 军力不等于 0」，两条都满足。"""
+    assert is_bot_entry(coordinate_of("bot_4_30_12"), 29_590.0)
+
+
+def test_a_zero_score_is_not_a_bot_however_good_the_name_looks() -> None:
+    """⚠️ 名字是可以改的。`bot_` 前缀会被玩家拿去伪装（`AGENTS.md` 4.8），
+    而伪装的真人在军事榜上军力常年是 0——这就是加第二道判据的全部理由。
+    """
+    assert not is_bot_entry(coordinate_of("bot_4_30_12"), 0.0)
+    assert not is_bot_entry(coordinate_of("bot_4_30_12"), 0)
+
+
+def test_an_unreadable_score_is_still_a_bot() -> None:
+    """⚠️ **这条是故意的，别「修」掉它。**
+
+    判据写的是 `score != 0`，而 `None != 0` 为真——所以军力读不出的行照旧算 bot。
+    用户口径（2026-08-22）只排除**明确的 0**；军力值本来就允许读不出
+    （用户口径 2026-08-14：「甚至有排名 我接受读不出值」），拿「读不出」当排除
+    依据会把大批真 bot 一起丢掉，而丢掉之后那些坐标从此不再派兵，页面上看不出来。
+
+    下一个人一定会想把它改成 `score is not None and score != 0`，这条用例就是拦它的。
+    """
+    assert is_bot_entry(coordinate_of("bot_4_30_12"), None)
+
+
+def test_a_name_that_yields_no_coordinate_is_never_a_bot() -> None:
+    """军力再高也不算：这一层唯一的产物是「我知道这是哪颗星球」。"""
+    assert not is_bot_entry(coordinate_of("goodbot"), 76_660_000.0)
+    assert not is_bot_entry(None, 29_590.0)
+
+
+def test_a_pirate_position_is_not_a_bot_even_with_a_score() -> None:
+    """1--4 号位那道闸还在——新判据是**加**一条，不是换一条。"""
+    assert not is_bot_entry(coordinate_of("bot_2_137_1"), 29_590.0)
+
+
+def test_an_out_of_range_name_is_not_a_bot_even_with_a_score() -> None:
+    """区间校验那道硬闸照旧（`bot_2_1121_7` 的 1121 越界）。"""
+    assert not is_bot_entry(coordinate_of("bot_2_1121_7"), 29_590.0)
+
+
+def test_interpolated_scores_must_not_be_fed_to_this_judge() -> None:
+    """⚠️ **传插值后的值会把这条判据要抓的信号擦掉。**
+
+    `tools.ranking_scan` 那条流水线会把破坏降序的行的分数丢成 `None`，再用
+    `interpolate_scores` 补一个中点——而**中点必然非零**。所以一个真值是 0 的行
+    只要在中途丢过一次分数（读成空，或读成个大数撞上降序判据），出来就是个
+    非零数，这条判据也就放它过去了。判据要的是**原始读数**。
+    """
+    coordinate = coordinate_of("bot_4_30_12")
+    raw_zero = 0.0
+    assert not is_bot_entry(coordinate, raw_zero)
+
+    # 那一行的分数被丢掉之后走插值：上下邻居 100 与 50，补出 75——非零。
+    filled = interpolate_scores([100.0, None, 50.0])
+    assert filled[1] == 75.0
+    assert is_bot_entry(coordinate, filled[1])  # 信号被擦掉了，所以别传这个

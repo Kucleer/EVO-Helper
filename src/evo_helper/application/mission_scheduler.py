@@ -77,7 +77,9 @@ from evo_helper.domain.missions import (
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import (
     BOT_AREA_REACHED_PREFIX,
+    bot_area_rows,
     bot_area_scrolls,
+    calibrated_blind_rows,
     calibrated_blind_scrolls,
     is_bot_coordinate,
 )
@@ -128,6 +130,8 @@ from evo_helper.domain.target_order import (
 from evo_helper.domain.uptime import due_for_a_beat, opens_a_new_segment
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_MARGIN_ROWS,
+    BLIND_SCROLL_ROWS,
     BLIND_SCROLL_SAMPLES,
     BLIND_SCROLLS,
 )
@@ -515,8 +519,55 @@ class ConfiguredOrigin:
 
 
 @dataclass(frozen=True)
+class BlindRowChoice:
+    """盲滚**行数**这一次判成了什么，**以及凭什么**。
+
+    与 `BlindScrollChoice` 同形（下面每条理由都是从那边搬过来的，换成行之后一条
+    都没失效），区别只在单位：滚轮没有「屏」这个概念，拨的是格，而行是唯一同时
+    量得住慢拖和滚轮的单位。
+
+    做成一个结构而不是只返回一个 `int | None`，是因为答案本身分不清三种来源，
+    而三种的善后完全不同：手填的要去攻击配置页上改，标定出来的说明这条反馈回路
+    还活着，**「没给出答案」则可能是刚上线、也可能是反解规则已经失效**——后者
+    正是 `domain.ranking.bot_area_reached_rows_message` 上警告过的那种静默退化。
+    `samples` 就是分开这两者的那个数：刚上线时它会一天天涨，失效时它恒为 0。
+
+    ⚠️ 行版这里还多一档静默失效：库里存着一整年**屏版**正文，前缀和行版一模一样，
+    只差单位那个字。屏版样本会被 `domain.ranking.bot_area_rows` 整条丢掉（有意的），
+    于是切换口径之后 `samples` 会先掉回 0 再重新涨——那一段看起来和「反解失效」
+    长得一样，唯一分得开的办法就是这个数在往上走。
+    """
+
+    #: 判定结果。`None` = 不往命令行上加 `--blind-rows`，采集用写死的默认值。
+    rows: int | None
+    #: `manual`（攻击配置页手填）/ `calibrated`（按实测标定）/ `default`（没答案）。
+    source: str
+    #: 从 `system_log` 里反解出来的**行版**实测样本条数。手填那一支不查库，恒为 0。
+    samples: int
+
+
+def _blind_row_verdict(choice: BlindRowChoice) -> str:
+    """把一次判定念成人话。**三种来源各一句，绝不含糊成一句通用的。**"""
+    if choice.source == "manual":
+        return f"{choice.rows} 行（攻击配置页上手填的，标定不再参与）"
+    if choice.source == "calibrated":
+        return (
+            f"{choice.rows} 行（按最近 {BLIND_SCROLL_SAMPLES} 次实测标定，"
+            f"当前共有 {choice.samples} 条行版实测样本）"
+        )
+    return (
+        f"「不指定」，采集将用写死的默认值 {BLIND_SCROLL_ROWS} 行"
+        f"（行版实测样本只有 {choice.samples} 条，自动标定要 {BLIND_SCROLL_SAMPLES} 条）"
+    )
+
+
+@dataclass(frozen=True)
 class BlindScrollChoice:
     """盲拖屏数这一次判成了什么，**以及凭什么**。
+
+    ⚠️ **口径已改行（2026-08-22），这一套眼下没有调用点**，留着的理由见
+    `MissionScheduler._blind_scrolls`：`military_attack_config.blind_scrolls`
+    那一列和攻击配置页上那个框都还在，它们是这次改动的回滚杠杆。
 
     做成一个结构而不是只返回一个 `int | None`，是因为答案本身分不清三种来源，
     而三种的善后完全不同：手填的要去攻击配置页上改，标定出来的说明这条反馈回路
@@ -762,8 +813,11 @@ class MissionScheduler:
         #: `STALE_POOL_WARNING_AFTER` 一条——不是只报一次：一整夜的停摆该在日志里
         #: 留下持续的痕迹，只报一次的话，翻日志的人会以为它早就恢复了。
         self._stale_pool_warned_at: dict[int, datetime] = {}
-        #: 上一次判定出来的盲拖屏数取值与它的来源，用来把日志压成「只在变化时写」。
-        #: 见 `_blind_scrolls`。
+        #: 上一次判定出来的盲滚行数取值与它的来源，用来把日志压成「只在变化时写」。
+        #: 见 `_blind_rows`。
+        self._blind_row_choice: BlindRowChoice | None = None
+        #: 屏口径那一份同样的账。**眼下没有调用点**（口径已改行），随
+        #: `_blind_scrolls` 一起留着当回滚杠杆。
         self._blind_scroll_choice: BlindScrollChoice | None = None
         #: 每 tick 都可能触发的那几条日志的限流账：`(任务, 日志种类)` → `_RepeatedLine`。
         #: 见 `_log_a_repeated_line`。眼下住着四种：自动停用、自动恢复、军力候选池、
@@ -1056,11 +1110,27 @@ class MissionScheduler:
         """校验全局攻击档位；任务参数不再携带档位。"""
         return _bot_tiers({"tiers": tiers})
 
+    def validate_blind_scroll_rows(self, value: object) -> int | None:
+        """校验攻击配置页上那个「盲滚行数」。同 `validate_military_tiers`：
+        页面在**写库之前**用调度器自己这把尺子量一遍。
+
+        返回 `None` 表示留空——那不是 0，是「跟着 `BLIND_SCROLL_ROWS`（700 行）
+        的默认值走」。
+
+        形状与 `validate_blind_scrolls` 逐字一致，只是单位从屏换成行：页面那一侧
+        两个框并排放着，校验入口的形状不同只会让保存那条路上多一处特例。
+        """
+        return _blind_scroll_rows(value)
+
     def validate_blind_scrolls(self, value: object) -> int | None:
         """校验攻击配置页上那个「盲拖屏数」。同 `validate_military_tiers`：
         页面在**写库之前**用调度器自己这把尺子量一遍。
 
         返回 `None` 表示留空——那不是 0，是「跟着 `BLIND_SCROLLS` 的默认值走」。
+
+        ⚠️ **屏口径已被行口径取代（2026-08-22），但这个校验还是活的**：那一列和
+        页面上那个框都留着当回滚杠杆，页面照旧要在写库之前量一遍。眼下写进去的
+        值不再上命令行——真正驱动盲滚的是 `validate_blind_scroll_rows` 那一个。
         """
         return _blind_scrolls(value)
 
@@ -2523,7 +2593,7 @@ class MissionScheduler:
                         _ranking_bot_limit(row.params_json),
                         None if batch_task is None else _bot_window_floor(batch_task.params_json),
                     ),
-                    blind_scrolls=self._blind_scrolls(),
+                    blind_rows=self._blind_rows(),
                 )
             elif task.kind is MissionKind.BOT and _bot_by_military(row.params_json):
                 command = self._military_command(row, max_dispatches=facts.free_lines)
@@ -3659,7 +3729,7 @@ class MissionScheduler:
             _ranking_scan_cooldown(params_json)
             return ranking_command(
                 bot_limit=_ranking_bot_limit(params_json),
-                blind_scrolls=self._blind_scrolls(),
+                blind_rows=self._blind_rows(),
             )
         if kind is MissionKind.PIRATE:
             return pirate_command(
@@ -3677,8 +3747,128 @@ class MissionScheduler:
         # 而一夜只走到第 121 系——后面那些永远轮不到。
         return self._bot_command(params_json, origin)
 
+    def _blind_rows(self) -> int | None:
+        """军力榜盲滚**行数**。**填了数就锁死，留空则按实测自动标定。**
+
+        取值顺序与屏口径那一份（`_blind_scrolls`）逐条一致，下面每条理由都是从
+        那边搬过来的，换成行之后一条都没失效：
+
+        取自**全局攻击配置**（攻击配置页），不是任务参数——用户口径
+        （2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+
+        返回 `None` 的意思是「命令行上不带 `--blind-rows`」，runner 用
+        `game.ranking_ui.BLIND_SCROLL_ROWS`（700 行）那个写死的默认值。样本攒不够
+        时就走这条。**不在这里自己回落成一个数字**：默认值只该有一处，写第二遍
+        日后必然漏改，而漏改之后两个默认值各自生效，谁也不知道用的是哪个。
+
+        手填的值优先于自动标定：它是覆盖，不是初值。
+
+        配置行还没建出来时（老库、或者 `ensure_mission_rows()` 还没跑）当成留空：
+        一个还没初始化的配置表说明不了「用户想改盲滚行数」，为它把整条采集链路
+        停掉是不成比例的。⚠️ 这里更不能抛 `MissionParamError`——那个异常的后果是
+        **自动停用到用户手动恢复为止**，不只是「这一轮不跑」。
+
+        ⚠️ **一个上界都不设**（用户口径 2026-08-22）：盲滚行数由用户定，尤其不许
+        拿 `FIRST_BOT_RANK`(587) 当边界——那个「bot 起点」是玩家改名伪装出来的，
+        真 bot 区在更后面。理由整段写在 `game.ranking_ui.BLIND_SCROLL_ROWS` 上。
+        """
+        choice = self._blind_row_decision()
+        self._log_blind_row_change(choice)
+        return choice.rows
+
+    def _blind_row_decision(self) -> BlindRowChoice:
+        """这一刻盲滚行数判成了什么，**以及凭什么**。判定本身不写任何日志。"""
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return BlindRowChoice(None, source="default", samples=0)
+        manual = _blind_scroll_rows(row.blind_scroll_rows)
+        if manual is not None:
+            # 手填时不去查库要样本：那次查询只为凑一句日志，而这条路上的答案
+            # 与样本无关。
+            return BlindRowChoice(manual, source="manual", samples=0)
+        return self._calibrated_blind_rows()
+
+    def _log_blind_row_change(self, choice: BlindRowChoice) -> None:
+        """盲滚行数的取值或来源变了才写一条。
+
+        ⚠️ **补的是自动标定唯一的哑点。** `domain.ranking.bot_area_reached_rows_message`
+        上写着：那句实测日志的措辞一改，攒下的样本一次性作废，标定就**静悄悄退回
+        写死的默认值**——页面上、日志里都看不出任何异常。采集那头照样打「盲滚 700
+        行」，看上去和「本来就没攒够样本」一模一样。所以差别只能由**判定这一侧**
+        说出来：这个数是手填的、是标定出来的、还是因为样本不够而根本没给出答案
+        （连带说清此刻攒到了几条）。
+
+        ⚠️ **只在变化时写**，同 `infrastructure.system_log.record_knob_override`
+        那条先例。`_blind_rows` 每次组军力榜命令行时都会走，而 `command_for` 那条
+        公开路径**页面保存配置时也会走**——每次都写的话，一天几十条重复的「盲滚
+        行数还是 515 行」会把真正的那一次变化埋掉，而这条日志存在的全部意义就是
+        那一次变化。
+
+        ⚠️ **措辞只说判定，不说「这一趟滚了多少行」。** 走到这里未必真会起一轮
+        采集：`command_for` 是页面拿来校验参数的，组出来的命令行随手就丢了。说成
+        「本趟盲滚 N 行」就是替一件没发生的事作证。真正「这一趟滚了多少行」那句
+        话在 `tools.ranking_scan` 里，由**真的滚完了**的那一侧打出来。
+        """
+        if choice == self._blind_row_choice:
+            return
+        self._blind_row_choice = choice
+        record_system_log(
+            "INFO",
+            "application.mission_scheduler",
+            f"军力榜盲滚行数判定为 {_blind_row_verdict(choice)}",
+            payload={
+                "blind_scroll_rows": choice.rows,
+                "source": choice.source,
+                "measurements": choice.samples,
+                "samples_required": BLIND_SCROLL_SAMPLES,
+                "margin": BLIND_SCROLL_MARGIN_ROWS,
+                "hard_coded_default": BLIND_SCROLL_ROWS,
+            },
+            logged_at_utc=self._clock(),
+        )
+
+    def _calibrated_blind_rows(self) -> BlindRowChoice:
+        """从 `system_log` 里那些「翻了 N **行**到达 bot 区」反推盲滚行数。
+
+        ⚠️ **实测记录刻意没有自己的表或列。** 每趟采集本来就会把这句话写进
+        `system_log`，那里已经攒着全部历史；再加一张表等于让同一件事有两份账，
+        而两份账迟早对不上（其中一份还只有新版本才写）。
+
+        多读一些行再筛：那句话不是每条日志都是，而 `recent_messages` 只做前缀
+        匹配。⚠️ **切了口径之后这一点更要紧**：库里那一年**屏版**正文的前缀和
+        行版一模一样，只差单位那个字，它们会占满前缀匹配的额度，然后被
+        `bot_area_rows` 整条丢掉（有意的——78 屏 ≈ 647 行，当成 78 行算出来的
+        盲滚荒谬地小）。读 `BLIND_SCROLL_SAMPLES` 的若干倍足以让新攒的行版样本
+        在一天之内就浮上来，同时仍然只碰几十行。
+
+        **样本条数要一起交出去**，那是日志唯一能分开「这台机器刚上线（或刚切完
+        口径）」和「反解规则失效了」的凭据：前者样本会一天天涨上去，后者恒为 0。
+        """
+        raw = self._repository.recent_system_log_messages(
+            starts_with=BOT_AREA_REACHED_PREFIX, limit=BLIND_SCROLL_SAMPLES * 8
+        )
+        measurements = [value for value in map(bot_area_rows, raw) if value is not None]
+        rows = calibrated_blind_rows(
+            measurements, sample_size=BLIND_SCROLL_SAMPLES, margin=BLIND_SCROLL_MARGIN_ROWS
+        )
+        return BlindRowChoice(
+            rows,
+            source="calibrated" if rows is not None else "default",
+            samples=len(measurements),
+        )
+
     def _blind_scrolls(self) -> int | None:
         """军力榜盲拖屏数。**填了数就锁死，留空则按实测自动标定。**
+
+        ⚠️ **眼下没有调用点**：口径 2026-08-22 改成行，组命令行走的是 `_blind_rows`。
+        这一套（连 `BlindScrollChoice` / `_blind_scroll_verdict` /
+        `_calibrated_blind_scrolls` / `_log_blind_scroll_change`）留着是因为
+        `military_attack_config.blind_scrolls` 那一列和攻击配置页上那个框都还在，
+        它们合起来是这次改动的**回滚杠杆**：把上面两处 `_blind_rows()` 换回
+        `_blind_scrolls()`、`ranking_command` 的参数换回 `--blind-scrolls`
+        （`tools.ranking_scan` 那个开关也还留着），盲滚就退回慢拖，不用重写判据。
+        等实机复测确认不回滚了，再连同 `domain.ranking` 里屏版那三个函数一起删。
 
         取自**全局攻击配置**（攻击配置页），不是任务参数——用户口径
         （2026-08-17）：「盲拖数量需在攻击配置页可配置」。
@@ -4072,8 +4262,50 @@ def _ranking_scan_cooldown(raw: str) -> timedelta | None:
     return timedelta(hours=hours)
 
 
+def _blind_scroll_rows(value: object) -> int | None:
+    """军力榜开榜后先盲滚几**行**。**留空 = 用 `BLIND_SCROLL_ROWS` 的默认值 700。**
+
+    形状与 `_blind_scrolls` 逐字一致（页面上两个框并排放着，校验形状不同只会让
+    保存那条路上多一处特例），单位从屏换成行。
+
+    ⚠️ **「没配」和「配了 0」是两回事，两个都合法。** 留空是「跟着默认走」；
+    `0` 是用户真的敲进去的「一行都别盲滚，从第一屏就开始检测 bot」——那是
+    **最保守**的取值（多花几屏廉价检测，绝不可能滚过头），所以它必须放行，
+    而不是像 `bot_limit` 那个 0 一样当成「把链路关掉」而拒绝。
+
+    ⚠️ **不设上界，一个都不加**（用户口径 2026-08-22：盲滚行数由用户定，助手不做
+    越界判断）。尤其不许拿 `game.ranking_ui.FIRST_BOT_RANK`(587) 当上界：那个
+    「bot 起点」是**玩家改名伪装**出来的（判据只看名字前缀 `bot_`，改名的真人一样
+    命中），真 bot 区在更后面，所以 700 行并不越界。拿一个被伪装污染的边界报警，
+    比不报警更坏——而这里报警的代价还格外高：`MissionParamError` 的后果是**自动
+    停用到用户手动恢复为止**，一个「拦一下」就能把整夜的采集关掉。
+
+    滚过头的代价仍然是真的（**静悄悄少采一截**，页面和日志都看不出），所以那句
+    警告留在界面上；但它是**提示**，不是拦路。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # `bool` 是 `int` 的子类，得单独排掉（同 `_int_param` 那条）：`True` 会被
+    # 当成盲滚 1 行，而用户敲进去的根本不是一个行数。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError("盲滚行数必须是整数；要用默认值就把它留空")
+    try:
+        rows = int(value)
+    except ValueError as exc:
+        raise MissionParamError(f"盲滚行数不是整数：{value!r}") from exc
+    if isinstance(value, float) and rows != value:
+        raise MissionParamError(f"盲滚行数必须是整数：{value!r}")
+    if rows < 0:
+        raise MissionParamError("盲滚行数不能是负数；要用默认值就把它留空")
+    return rows
+
+
 def _blind_scrolls(value: object) -> int | None:
     """军力榜开榜后先盲拖几屏。**留空 = 用 `BLIND_SCROLLS` 的默认值 40。**
+
+    ⚠️ **口径 2026-08-22 改行之后，驱动盲滚的是 `_blind_scroll_rows`。** 这一个
+    仍然是活的：页面上那个框和 `military_attack_config.blind_scrolls` 那一列都
+    留着当回滚杠杆，保存前照旧要用同一把尺子量一遍。
 
     用户口径（2026-08-17）：「盲拖数量需在攻击配置页可配置」。
 

@@ -111,7 +111,18 @@ class HumanInput:
         self._pause()
 
     def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
-        """Drag inside a panel. Game panels ignore the wheel and scroll only by drag."""
+        """面板内滚动的通用手段：慢拖。
+
+        ⚠️ 这里曾写着 `Game panels ignore the wheel and scroll only by drag.`，
+        **那句话两头都错**，已按实测（2026-08-22，见 `docs/军力榜翻页-滚轮实测.md`）
+        改掉：面板既没有忽略滚轮（单格 `dwData=±120`、16ms 间隔连拨，实测
+        19–23 行/秒，而慢拖是 1.73 行/秒），也不是「只能靠拖」。
+
+        但**拖仍然是这里的默认手段**，理由不是「滚轮不管用」而是**落点精度**：
+        滚轮有速度惯性，会把列表停在**非整行位置**（实测偏离标定网格约 12px），
+        而 `vision` 那边是逐行裁剪的——偏了就横跨两行，名字全糊。所以滚轮只用在
+        **不读屏的盲滚段**（`ranking_nav.spin_blind`），要读那一屏就还得靠拖。
+        """
         if not self._allow_actions:
             _reject_acting_label(label)
         start_x, start_y = self._jitter(from_x, from_y)

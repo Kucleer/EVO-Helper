@@ -44,6 +44,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -55,6 +56,7 @@ from evo_helper.game.ranking_ui import (
     DRAG_PRESS_HOLD_S,
     DRAG_RELEASE_HOLD_S,
     DRAG_STEPS,
+    GLIDE_SETTLE_S,
     MILITARY_TAB,
     NAV_BAR_Y,
     NAV_DRAG_FROM_X,
@@ -73,12 +75,14 @@ from evo_helper.game.ranking_ui import (
     RANKING_LABEL,
     READ_ATTEMPTS,
     REREAD_WAIT_S,
+    ROWS_PER_NOTCH,
     ROWS_PER_SCREEN,
     SCROLL_FROM_Y,
     SCROLL_SETTLE_WAIT_S,
     SCROLL_TO_Y,
     SCROLL_X,
     TAB_SWITCH_WAIT_S,
+    WHEEL_GAP_S,
 )
 
 
@@ -88,7 +92,7 @@ class RankingDriver(Protocol):
     `press` / `move_to` / `release` 是**分步慢拖**要的三个原语：
     一步式的 `dragTo` 会被游戏面板当成点击（`tools.pirate_loop.slow_drag`
     的注释里记着这条实测），而分步这件事必须发生在 `game` 层，
-    否则就得反过来 import `tools`。
+    否则就得反过来 import `tools`。`wheel_notch` 同理——见它自己的注释。
     """
 
     def click(self, x: int, y: int, *, label: str = ...) -> None: ...
@@ -100,6 +104,17 @@ class RankingDriver(Protocol):
     def release(self) -> None: ...
 
     def wait(self, seconds: float) -> None: ...
+
+    def wheel_notch(self) -> None:
+        """往下滚**一格**（`dwData = -WHEEL_DELTA`）。
+
+        ⚠️ 协议上只有「一格」这一种粒度，是**有意的**：允许传格数的话，
+        实现里迟早会把 N 格合成一个大事件发出去，而那会被游戏封顶
+        （实测 800 格只走 14px），且封顶是静默的——事件发出去了、列表没走。
+        格数与间隔的密度由 `RankingNavigator.spin_blind` 控制，
+        理由同分步慢拖：循环必须留在 `game` 层，否则就得反过来 import `tools`。
+        """
+        ...
 
 
 class RankingNotReached(RuntimeError):
@@ -135,6 +150,24 @@ class ScrollStep[RowT]:
 
     outcome: ScrollOutcome
     rows: tuple[RowT, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SpinResult:
+    """一趟滚轮盲滚的账。
+
+    ⚠️ **`rows_measured` 不在这里，得由调用方填**——这一层拨完就返回，
+    一行都不读（`ScrollStep` 那边会把行带回来，是因为它本来就要读一屏做判据）。
+
+    `spin_seconds` 是**实测**拨完用了多久，记它是为了让「每格 16ms」这条
+    可验证：`WHEEL_GAP_S` 走的是 `driver.wait`，而 Windows 上 `time.sleep`
+    的粒度是 15.6ms——真被撑成 31ms/格的话，动量就攒不起来，
+    而症状同样是「拨了但没走」。把用时记进 `system_log` 才看得出这件事。
+    """
+
+    rows_requested: int
+    notches: int
+    spin_seconds: float
 
 
 @dataclass
@@ -348,6 +381,37 @@ class RankingNavigator[RowT]:
         self._slow_drag(SCROLL_X, SCROLL_FROM_Y, SCROLL_X, SCROLL_TO_Y, label="榜单下滚")
         self.driver.wait(SCROLL_SETTLE_WAIT_S)
 
+    def spin_blind(self, *, rows: int) -> SpinResult:
+        """连拨滚轮走过 `rows` 行，**中间不读也不判**，末尾统一等一次滑行。
+
+        ⚠️ **等待只有末尾那一次，不是每格一次。** `scroll_blind` 那条路每屏都
+        `wait(SCROLL_SETTLE_WAIT_S)`，70 屏就是 140 秒纯等待（生产实测整段
+        294.6 秒）——盲滚改滚轮的收益**全部**来自把这些等待合并成一次。
+        每格都等一下就等于没改：实测那样 80 格只走 2 行。
+
+        ⚠️ **不许把 N 格合成一个大事件。** 游戏对单个事件的幅度封顶（实测 800 格
+        只走 14px），而封顶是静默的；动量靠的是**密集的独立事件**。所以驱动面上
+        只有 `wheel_notch()` 这一种粒度，密度在这里控制。
+
+        ⚠️ **拨完必须等滑行停**（`GLIDE_SETTLE_S`），否则紧接着的检测段会在
+        移动中的画面上逐行裁剪，读出来的名字横跨两行。
+
+        `rows == 0` 是最保守的合法取值（「一格都别拨」），此时**一次事件都不发、
+        一次等待都不做**——那样这一趟就退回成纯慢拖，也就是这次改动的一键回滚。
+        负数不接受：往上滚会把已经翻过的榜单再翻一遍，而调用方拿不到任何提示。
+        """
+        if rows < 0:
+            raise ValueError(f"盲滚行数不能是负数（拿到 {rows}）：往上滚不是这一段该做的事")
+        notches = round(rows / ROWS_PER_NOTCH)
+        started = time.monotonic()
+        for _notch in range(notches):
+            self.driver.wheel_notch()
+            self.driver.wait(WHEEL_GAP_S)
+        spin_seconds = time.monotonic() - started
+        if notches:
+            self.driver.wait(GLIDE_SETTLE_S)
+        return SpinResult(rows_requested=rows, notches=notches, spin_seconds=spin_seconds)
+
     # -- 收尾 ---------------------------------------------------------------
 
     def close(self) -> bool:
@@ -535,6 +599,7 @@ __all__ = [
     "RankingNotReached",
     "ScrollOutcome",
     "ScrollStep",
+    "SpinResult",
     "merged_labels",
     "nav_label_words",
     "ranking_label_x",

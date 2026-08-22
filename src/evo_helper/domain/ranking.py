@@ -139,6 +139,37 @@ def is_bot_coordinate(coordinate: Coordinate | None) -> TypeGuard[Coordinate]:
     return coordinate is not None and coordinate.position not in PIRATE_POSITIONS
 
 
+def is_bot_entry(coordinate: Coordinate | None, score: float | None) -> bool:
+    """这一行到底算不算 bot：**名字反解出坐标 + 军力读数不是 0**，两条缺一不可。
+
+    用户口径（2026-08-22）：「判断是否 bot 需要增加军力作匹配：id 符合 + 军力不等于 0」。
+    光看名字不够——`bot_` 前缀是玩家可以改名伪装的（`AGENTS.md` 4.8），而伪装的真人
+    在军事榜上军力常年是 0。所以加一条「军力不等于 0」当第二道判据。
+
+    ⚠️ **`score is None`（军力读不出）照旧算 bot。** 用户口径（2026-08-22）只排除
+    **明确的 0**。军力值本来就允许读不出（用户口径 2026-08-14：「基于榜单排序，
+    我不需要精确值……甚至有排名 我接受读不出值」），拿「读不出」当排除依据会把
+    大批真 bot 一起丢掉，而丢掉的后果是那些坐标从此不再派兵、页面上看不出异常。
+    所以下面写的是 `score != 0`（`None != 0` 为真）而**不是**
+    `score is not None and score != 0`——这不是漏了判空，是判据本身。
+
+    ⚠️ **必须传 OCR 的原始读数，不能传插值后的值。** `tools.ranking_scan` 那条
+    流水线是「读分数 → `descending_breaks` 把破坏降序的那些行的分数丢成 None →
+    `interpolate_scores` 用上下邻居补一个中点」。**插值补出来的值必然非零**
+    （中点落在两个非零邻居之间），所以任何一个 0 分行只要在中途丢过一次分数，
+    出来就是个非零数——**那正好把这条判据要抓的信号擦掉**，而擦掉之后它看起来
+    只是「一个普通的低分 bot」。丢分数的路不止一条：0 被读成空（`None`）、
+    或者被读成个大数（实测有丢小数点读成 1773K 的）而撞上降序判据，两条都会
+    走到插值那一步。
+
+    这条判据**不往 `mentions_bot` 里加**：那个是检测段「到 bot 区了没有」的廉价
+    早期信号，只把名字列整条 OCR 一次，**那里根本拿不到军力值**。判早了只是多读
+    几屏，所以它宁可宽。`is_bot_coordinate` 也保持原样——它答的是「这个坐标能不能
+    当 bot 目标」（海盗位那道闸），是这条判据的一半，被这里复用。
+    """
+    return is_bot_coordinate(coordinate) and score != 0
+
+
 def mentions_bot(text: str) -> bool:
     """这段文字里有没有出现**一个 bot 名字的形状**（`bot_银河_恒星系_行星`）。
 
@@ -250,13 +281,31 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
     榜单前面约 638 名是真人，中间还夹着 `[638] GoudanLi --- 0` 这种 0 分的真人。
     判据不是名次也不是分数，而是**名字反解得出坐标**——名次会随玩家增减往后挪，
     而写死「639 之后是 bot」在下一次刷新之后就是错的。
+
+    ⚠️ 用户口径（2026-08-22）给「是不是 bot」加了第二条「军力不等于 0」，
+    它住在 `is_bot_entry`，**没有加到这里**：那条判据要的是 OCR 的**原始读数**，
+    而这个函数只拿到一批已经成型的 `RankingRow`——分数可能在路上被降序判据丢过、
+    再被插值补成非零（见 `is_bot_entry` 的注释）。要用新判据就在读到原始分数的
+    那一层用。
     """
     return [row for row in rows if is_bot_coordinate(row.coordinate)]
 
 
-# -- 盲拖屏数的自动标定 --------------------------------------------------------
+# -- 盲滚距离的自动标定 --------------------------------------------------------
 #
-# 每一趟采集都会量出「翻了 N 屏到达 bot 区」，而盲拖屏数长期是写死的 40——
+# ⚠️ **单位是「行」，不是「屏」**（2026-08-22 改口径，见
+# `docs/superpowers/specs/2026-08-22-ranking-blind-scroll-wheel-design.md` 第二节）。
+# 「屏」只是慢拖的副产品（1 屏 ≈ 8.3 行），而盲滚段改用滚轮之后连「屏」这个概念都
+# 没有了；名次天然就是行，所以标定、余量、日志正文一律用行，屏退化成显示单位。
+#
+# 屏那一套（`bot_area_reached_message` / `bot_area_scrolls` /
+# `calibrated_blind_scrolls`）**留着但已被取代**：库里存着一整年屏版样本，
+# 读得出来才谈得上过渡。新代码一律用下面的行版。
+#
+# 下面这段推理是屏版时期写的，**换成行之后每一条都仍然成立**（只是数乘了 8.3），
+# 所以原样搬过来：
+#
+# 每一趟采集都会量出「翻了 N 行到达 bot 区」，而盲滚距离长期是写死的 40 屏——
 # 也就是说系统每天量出八次答案，一次都没反馈回去。生产实测（2026-08-17 同一天
 # 六趟）：77 / 78 / 73 / 74 / 72 / 78，而盲拖 40，中间 32–38 屏全在逐屏 OCR
 # 检测**必定还是真人**的那一段。按每天 8 趟算，一天白花 250–300 次检测。
@@ -270,13 +319,24 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
 
 #: 那句话的固定前缀。查历史样本时在 SQL 里按它做前缀匹配，**必须和
 #: `bot_area_reached_message` 拼出来的开头一模一样**，所以由它拼、不各写一遍。
+#:
+#: ⚠️ **行版与屏版共用这一个前缀**，是有意的：查库时一次前缀匹配就把两套正文
+#: 都捞回来，再由各自的解析器挑走自己那一套（另一套会被解析成 `None` 丢掉）。
+#: 代价是查询的 `limit` 得留够——过渡期里捞回来的一批可能大半是屏版历史。
 BOT_AREA_REACHED_PREFIX = "翻了 "
 
 _BOT_AREA_REACHED_SUFFIX = " 屏到达 bot 区"
 
+_BOT_AREA_REACHED_ROWS_SUFFIX = " 行到达 bot 区"
+
 
 def bot_area_reached_message(scrolls: int) -> str:
-    """「翻了 N 屏到达 bot 区」这句话的**唯一出处**。
+    """「翻了 N **屏**到达 bot 区」这句话的**唯一出处**。
+
+    ⚠️ **已被 `bot_area_reached_rows_message` 取代（口径改行，2026-08-22），
+    等调用点切完再删。** 新代码要发的是行版正文——这个函数只为存量调用点和
+    库里那一年屏版样本留着。别拿它去发盲滚的实测：滚轮没有「屏」这个概念，
+    发出来的数会被行版解析器整条丢掉，而丢掉是静默的。
 
     ⚠️ 它同时是一句给人看的日志和一条给机器读回来的实测记录
     （`bot_area_scrolls` 从 `system_log` 里反解它）。所以措辞不许随手改：
@@ -286,15 +346,56 @@ def bot_area_reached_message(scrolls: int) -> str:
     return f"{BOT_AREA_REACHED_PREFIX}{scrolls}{_BOT_AREA_REACHED_SUFFIX}"
 
 
-#: 反解上面那句话。锚在两端，免得把「…之后翻了 3 屏到达 bot 区」这种复述也当成样本。
+def bot_area_reached_rows_message(rows: int) -> str:
+    """「翻了 N **行**到达 bot 区」这句话的**唯一出处**。
+
+    ⚠️ 它同时是一句给人看的日志和一条给机器读回来的实测记录
+    （`bot_area_rows` 从 `system_log` 里反解它）。所以措辞不许随手改：
+    改了就等于把已经攒下的样本一次性作废，而作废之后自动标定会静悄悄退回
+    写死的默认值——页面上、日志里都看不出任何异常。
+
+    ⚠️ **单位那个字（「行」）是唯一区分它和屏版正文的东西。** 两套正文前缀一样、
+    形状一样，只差这一个字，而解析是按整句锚定的——把它写成「屏」就等于把这条
+    实测发到屏版那一套里去，两边都得不到样本。
+    """
+    return f"{BOT_AREA_REACHED_PREFIX}{rows}{_BOT_AREA_REACHED_ROWS_SUFFIX}"
+
+
+#: 反解屏版那句话。锚在两端，免得把「…之后翻了 3 屏到达 bot 区」这种复述也当成样本。
 _BOT_AREA_REACHED = re.compile(
     f"^{re.escape(BOT_AREA_REACHED_PREFIX)}(\\d+){re.escape(_BOT_AREA_REACHED_SUFFIX)}$"
 )
 
+#: 反解行版那句话。
+#:
+#: ⚠️ **和屏版是两条独立的正则，不许合成一条「屏|行」。** 库里存着一整年
+#: 「翻了 N 屏到达 bot 区」，合起来匹配就会把「78 屏」当成 78 行喂给自标定——
+#: 那是把 8.3 倍的量纲错读成 1 倍，而算出来的盲滚只是「小得离谱」，不会报错。
+_BOT_AREA_REACHED_ROWS = re.compile(
+    f"^{re.escape(BOT_AREA_REACHED_PREFIX)}(\\d+){re.escape(_BOT_AREA_REACHED_ROWS_SUFFIX)}$"
+)
+
 
 def bot_area_scrolls(message: str) -> int | None:
-    """一条日志正文里的实测屏数；不是那句话就返回 None。"""
+    """一条日志正文里的实测**屏**数；不是那句话就返回 None。
+
+    ⚠️ **已被 `bot_area_rows` 取代（口径改行，2026-08-22），等调用点切完再删。**
+    留着是因为库里那一年屏版样本还得读得出来，不是给新代码用的。
+    """
     match = _BOT_AREA_REACHED.match(message.strip())
+    return int(match.group(1)) if match is not None else None
+
+
+def bot_area_rows(message: str) -> int | None:
+    """一条日志正文里的实测**行**数；不是那句话就返回 None。
+
+    ⚠️ **屏版正文在这里一律返回 None**，这是有意的、也是被一条用例钉死的：
+    库里存着一整年「翻了 N 屏到达 bot 区」，而 78 屏 ≈ 647 行——当成 78 行的话
+    自标定会给出一个荒谬的小值。小值本身安全（只是白花检测段那 4.6 秒/屏），
+    但它是撞上的而不是算出来的，换个方向的噪声就未必安全了。屏版样本要读，
+    走 `bot_area_scrolls`，且**不参与行版标定**。
+    """
+    match = _BOT_AREA_REACHED_ROWS.match(message.strip())
     return int(match.group(1)) if match is not None else None
 
 
@@ -302,6 +403,9 @@ def calibrated_blind_scrolls(
     measurements: Sequence[int], *, sample_size: int, margin: int
 ) -> int | None:
     """按最近 `sample_size` 次实测定盲拖屏数：`min(样本) - margin`。
+
+    ⚠️ **已被 `calibrated_blind_rows` 取代（口径改行，2026-08-22），
+    等调用点切完再删。** 判据本身一条没变，只是单位从屏换成行。
 
     `measurements` 按**新到旧**排列，多给的会被截掉——只看最近那一段是因为这个
     数随玩家增长往上漂，陈年样本只会把盲拖压得越来越保守（安全但白花检测）。
@@ -324,18 +428,58 @@ def calibrated_blind_scrolls(
     return max(0, min(recent) - margin)
 
 
+def calibrated_blind_rows(
+    measurements: Sequence[int], *, sample_size: int, margin: int
+) -> int | None:
+    """按最近 `sample_size` 次实测定盲滚**行数**：`min(样本) - margin`。
+
+    与 `calibrated_blind_scrolls` 同形——下面每条理由都是从那边搬过来的，
+    换成行之后一条都没失效（只是数乘了约 8.3）。
+
+    `measurements` 按**新到旧**排列，多给的会被截掉。**只看最近那一段**是因为
+    这个数随玩家增长往上漂，陈年样本只会把盲滚压得越来越保守：安全，但少走的
+    距离由检测段接手，而检测段约 4.6 秒/屏。
+
+    ⚠️ **反馈回去的必须是最近 K 次的最小值**，不是最近一次，更不是平均值。
+    实测同一天六趟的跨度就有 6 屏（约 50 行）：拿偏大的那次去设盲滚就会滚过
+    bot 起点，而滚过头的后果是**采回来的数静悄悄少一截，页面上看不出来**。
+
+    **样本不够就返回 `None`**，意思是「这次不给答案，用写死的默认值」。返回
+    `None` 而不是在这里自己回落成某个数字：默认值只有
+    `game.ranking_ui.BLIND_SCROLL_ROWS` 一处，在这里再写一遍，日后调默认值
+    就会漏掉这一处——而漏掉之后两个默认值会各自生效，谁也不知道用的是哪个。
+
+    `margin` 由调用方传进来（取值住在 `game.ranking_ui`），它不是保险丝上的
+    裕度而是**判据的一部分**：余量必须大于实测噪声的跨度，否则算出来的盲滚
+    会落进噪声区间里，也就是「某些趟必然滚过头」。
+
+    结果钳到 0：样本比余量还小（榜单极短）时，答案是「一行都别盲滚」，
+    而不是一个负数。
+    """
+    if sample_size < 1:
+        raise ValueError("sample_size 必须至少为 1")
+    recent = list(measurements)[:sample_size]
+    if len(recent) < sample_size:
+        return None
+    return max(0, min(recent) - margin)
+
+
 __all__ = [
     "BOT_AREA_REACHED_PREFIX",
     "POSITIONS_PER_SYSTEM",
     "RankingRow",
     "bot_area_reached_message",
+    "bot_area_reached_rows_message",
+    "bot_area_rows",
     "bot_area_scrolls",
     "bot_rows",
+    "calibrated_blind_rows",
     "calibrated_blind_scrolls",
     "coordinate_of",
     "descending_breaks",
     "interpolate_scores",
     "is_bot_coordinate",
+    "is_bot_entry",
     "mentions_bot",
     "repair_ranks",
 ]

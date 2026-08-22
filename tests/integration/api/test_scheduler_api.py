@@ -1602,6 +1602,91 @@ def test_impossible_pacing_knobs_are_refused_by_the_api(
     assert console.client.get("/api/attack-config").json()[field] is None
 
 
+def test_the_blind_scroll_rows_round_trip_through_the_attack_config(console: Console) -> None:
+    """盲滚行数存得住、读得回，且 `0` 和 `700` 都是合法取值。
+
+    ⚠️ `0` 那一条是这里的要害：它的意思是「一格都不拨」，和「留空 = 自动标定
+    （样本不够时 700 行）」是**两个不同的取值**。哪一层把 0 读成留空，用户就再也
+    配不出「不盲滚」。
+    """
+    zero = console.client.put("/api/attack-config", json={"tiers": [], "blind_scroll_rows": 0})
+    zero_read = console.client.get("/api/attack-config").json()
+    saved = console.client.put(
+        "/api/attack-config",
+        json={
+            "tiers": [{"min_score": 0, "preset": "AAA"}],
+            "blind_scrolls": 30,
+            "blind_scroll_rows": 700,
+        },
+    )
+    read_back = console.client.get("/api/attack-config").json()
+
+    assert zero.status_code == 200, zero.text
+    assert zero_read["blind_scroll_rows"] == 0, "0 被读成了留空"
+    assert saved.status_code == 200, saved.text
+    assert read_back["blind_scroll_rows"] == 700
+    # 屏口径那一列刻意保留（它是回滚杠杆的用户入口），所以这一次 PUT 同时送
+    # 两项，钉住「送了行数没把屏数冲掉」。
+    assert read_back["blind_scrolls"] == 30
+    assert read_back["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
+
+
+def test_a_blank_blind_scroll_rows_stays_blank(console: Console) -> None:
+    """留空要一路留空到库里：回落成 700 的话，日后调默认值它不跟，自动标定也再没机会说话。"""
+    console.client.put("/api/attack-config", json={"tiers": [], "blind_scroll_rows": 300})
+
+    cleared = console.client.put("/api/attack-config", json={"tiers": []})
+
+    assert cleared.status_code == 200, cleared.text
+    assert console.client.get("/api/attack-config").json()["blind_scroll_rows"] is None
+
+
+def test_a_negative_blind_scroll_rows_is_refused_by_the_schedulers_ruler(
+    console: Console,
+) -> None:
+    """负数由**调度器那把尺子**拒（400，带中文原因），不是 pydantic。
+
+    两道关各管一段，和 `report_scan_hours` 那一对完全同形：压根不是整数的在
+    schemas 那层就进不来（422），数字但不合理的必须让调度器判——页面自己再判一遍
+    的结果是「页面收下了、实机跑起来不是那个数」。
+    """
+    response = console.client.put("/api/attack-config", json={"tiers": [], "blind_scroll_rows": -1})
+
+    assert response.status_code == 400, response.text
+    assert "盲滚行数" in response.json()["detail"], "拒了还得说清拒的是哪一格"
+    assert console.client.get("/api/attack-config").json()["blind_scroll_rows"] is None
+
+
+def test_a_very_large_blind_scroll_rows_is_not_refused(console: Console) -> None:
+    """**一个上界都不设**（用户口径 2026-08-22：盲滚行数由用户定）。
+
+    ⚠️ 这条守的是「别拿 `FIRST_BOT_RANK`(587) 当边界拦」：那个「bot 起点」是玩家
+    改名伪装出来的，不是安全边界。而这里拦一下的代价格外高——`MissionParamError`
+    的后果是自动停用到用户手动恢复为止，一次「好心拦一下」能把整夜采集关掉。
+    """
+    saved = console.client.put("/api/attack-config", json={"tiers": [], "blind_scroll_rows": 5000})
+
+    assert saved.status_code == 200, saved.text
+    assert console.client.get("/api/attack-config").json()["blind_scroll_rows"] == 5000
+
+
+@pytest.mark.parametrize("value", [3.5, "很多", True])
+def test_a_blind_scroll_rows_that_is_not_an_integer_is_refused(
+    console: Console, value: object
+) -> None:
+    """压根不是整数的在 pydantic 那层就进不来（422）。
+
+    ⚠️ `True` 单独列一条：`bool` 是 `int` 的子类，放过去就会被存成 1 行——
+    「拨一格」和「用户想表达的意思」没有任何关系。
+    """
+    response = console.client.put(
+        "/api/attack-config", json={"tiers": [], "blind_scroll_rows": value}
+    )
+
+    assert response.status_code == 422, response.text
+    assert console.client.get("/api/attack-config").json()["blind_scroll_rows"] is None
+
+
 #: 攻击配置页上**全部**可空旋钮，以及一组各自合法、且两两不同的取值。
 #:
 #: ⚠️ **新增旋钮时必须往这里加一行。** 这张表是下面那条用例的全部输入，
@@ -1613,6 +1698,9 @@ def test_impossible_pacing_knobs_are_refused_by_the_api(
 #: 已经不存在的字段红掉，而红的原因看起来像是管线漏了一边。
 _ALL_KNOBS = {
     "blind_scrolls": 30,
+    # 盲滚行数（滚轮口径）。和上面那个屏数（慢拖口径）**同时存在**：置空它就退回
+    # 慢拖，是这次改动的一键回滚，所以两列必须各自存得住。
+    "blind_scroll_rows": 700,
     "report_scan_hours": 2,
     "unknown_line_hold_minutes": 45,
     "reconcile_cooldown_minutes": 0,
@@ -1664,6 +1752,7 @@ def test_the_settings_page_renders_every_knob(console: Console) -> None:
     body = response.text
     for knob_id in (
         "blind-scrolls",
+        "blind-scroll-rows",
         "report-scan-hours",
         "line-hold",
         "reconcile-cooldown",
@@ -1679,6 +1768,22 @@ def test_the_settings_page_renders_every_knob(console: Console) -> None:
     # 往回读几小时」那一格的默认值撞号，撞上了这条就什么都没验。
     assert "面板名读不出排除时长（小时，默认 6）" in body, "默认值没从常量传进模板"
     assert "上限 24 小时——超过一天" in body, "上界没从常量传进模板"
+    # 盲滚那一节的行↔秒换算：三个标定常量都得真的渲染进去，那一行是用户判断
+    # 「填这么多要滚多久」的唯一依据。换算本身在 JS 里，所以这里只钉住
+    # 「常量到了页面上」和「那个显示位存在」。
+    assert "默认的 700 行" in body, "盲滚默认行数没从常量传进模板"
+    assert "减 83 行余量" in body, "盲滚自动标定的余量没从常量传进模板"
+    assert "1.08 行/格" in body, "每格行数没从常量传进模板"
+    assert "惯性滑行约 2.5 秒" in body, "滑行等待没从常量传进模板"
+    assert 'id="blind-rows-seconds"' in body, "行↔秒换算那一行没有显示位"
+    # 两个框并排放着，页面必须说清哪一个当真：屏数那一格现在完全不生效，
+    # 不写明白的话用户会以为自己填的屏数还管事，而实机走的是行数那一路。
+    assert "完全不上命令行" in body, "没说清屏数那个框已经不生效"
+    # ⚠️ 读回必须是 `??` 而不是 `||`：0 是合法取值（「一格都不拨」），`||` 会把它
+    # 显示成空框，也就是显示成「用默认值」——用户下一次保存就把 0 改掉了，而他
+    # 从头到尾没看见自己填的那个 0。这一条是白盒断言，因为这一页没有 JS 测试台，
+    # 而这个错误在页面上长得和「本来就没配」一模一样。
+    assert "config.blind_scroll_rows ?? ''" in body, "0 会被 `||` 显示成留空"
 
 
 def test_every_knob_is_blank_on_a_fresh_database(console: Console) -> None:

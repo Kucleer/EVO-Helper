@@ -131,6 +131,60 @@ def test_military_ranking_command_can_stop_at_the_attack_batch_size() -> None:
     ]
 
 
+def test_the_blind_stretch_is_measured_in_rows_not_screens() -> None:
+    """⚠️ **整条对比，因为要钉的是那个开关的名字。**
+
+    盲滚段 2026-08-22 从慢拖换成滚轮，单位跟着从「屏」换成「行」——滚轮没有屏
+    这个概念，拨的是格。开关名写错（还留着 `--blind-scrolls`）的后果不是报错：
+    `tools.ranking_scan` 收不到行数，就按自己的默认值滚，于是攻击配置页上填的
+    那个数**静悄悄不生效**，而页面和日志里都看不出。
+    """
+    assert ranking_command(bot_limit=100, blind_rows=700)[1:] == [
+        "-u",
+        "-m",
+        "evo_helper.tools.ranking_scan",
+        "--bot-limit",
+        "100",
+        "--blind-rows",
+        "700",
+    ]
+
+
+def test_a_blank_blind_row_count_leaves_the_flag_off_the_command_line() -> None:
+    """留空 = 命令行上一个 `--blind-rows` 都没有。
+
+    断言「没有这个开关」而不是「等于 700」：默认值只该有
+    `game.ranking_ui.BLIND_SCROLL_ROWS` 一处，在这里补一个「看起来一样」的
+    数字送过去，日后调默认值就调不动了。
+    """
+    assert "--blind-rows" not in ranking_command(bot_limit=100, blind_rows=None)
+
+
+def test_zero_blind_rows_is_a_real_value_and_not_a_blank() -> None:
+    """`0` 是「一行都别盲滚，从第一屏就开始检测」——**最保守**的取值，必须放行。"""
+    assert ranking_command(blind_rows=0)[-2:] == ["--blind-rows", "0"]
+
+
+@pytest.mark.parametrize("rows", [-1, -700])
+def test_a_negative_blind_row_count_is_refused(rows: int) -> None:
+    """负数没有意义。**只拒这一侧。**"""
+    with pytest.raises(MissionParamError):
+        ranking_command(blind_rows=rows)
+
+
+@pytest.mark.parametrize("rows", [587, 588, 700, 5000])
+def test_a_large_blind_row_count_is_still_accepted(rows: int) -> None:
+    """⚠️ **不设上界，`FIRST_BOT_RANK`(587) 更不是边界。**
+
+    用户口径（2026-08-22）：那个「bot 起点」是玩家改名伪装出来的（判据只看名字
+    前缀 `bot_`，改名的真人一样命中），真 bot 区在更后面——所以 700 行不越界。
+
+    这里拦一下的代价还格外高：`MissionParamError` 的后果是**自动停用到用户手动
+    恢复为止**（见那个异常的注释），一次多疑的越界判断就能把整夜的采集关掉。
+    """
+    assert ranking_command(blind_rows=rows)[-2:] == ["--blind-rows", str(rows)]
+
+
 def test_pirate_command_is_the_full_argv_including_the_action_flags() -> None:
     """`--scout --attack` 是真的动鼠标派舰队的开关，必须整条对比，不能只挑几个子串。
 

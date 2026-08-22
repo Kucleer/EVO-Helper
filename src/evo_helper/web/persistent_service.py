@@ -1437,6 +1437,7 @@ class MissionConsoleService:
         tiers: tuple[dict[str, Any], ...],
         *,
         blind_scrolls: object = None,
+        blind_scroll_rows: object = None,
         report_scan_hours: object = None,
         unknown_line_hold_minutes: object = None,
         reconcile_cooldown_minutes: object = None,
@@ -1459,6 +1460,7 @@ class MissionConsoleService:
         try:
             self._scheduler.validate_military_tiers(normalized)
             scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
+            rows = self._scheduler.validate_blind_scroll_rows(blind_scroll_rows)
             hours = self._scheduler.validate_report_scan_hours(report_scan_hours)
             hold = self._scheduler.validate_unknown_line_hold_minutes(unknown_line_hold_minutes)
             cooldown = self._scheduler.validate_reconcile_cooldown_minutes(
@@ -1480,6 +1482,7 @@ class MissionConsoleService:
         row = self._repository.replace_military_attack_tiers(
             json.dumps(normalized, ensure_ascii=False),
             blind_scrolls=scrolls,
+            blind_scroll_rows=rows,
             report_scan_hours=hours,
             unknown_line_hold_minutes=hold,
             reconcile_cooldown_minutes=cooldown,
@@ -2404,6 +2407,7 @@ def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
     """
     return {
         "blind_scrolls": row.blind_scrolls,
+        "blind_scroll_rows": row.blind_scroll_rows,
         "report_scan_hours": row.report_scan_hours,
         "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
         "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,

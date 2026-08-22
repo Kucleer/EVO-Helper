@@ -2862,6 +2862,7 @@ class SqlAlchemyRepository:
         tiers_json: str,
         *,
         blind_scrolls: int | None = None,
+        blind_scroll_rows: int | None = None,
         report_scan_hours: int | None = None,
         unknown_line_hold_minutes: int | None = None,
         reconcile_cooldown_minutes: int | None = None,
@@ -2884,6 +2885,7 @@ class SqlAlchemyRepository:
                 session.add(row)
             row.tiers_json = tiers_json
             row.blind_scrolls = blind_scrolls
+            row.blind_scroll_rows = blind_scroll_rows
             row.report_scan_hours = report_scan_hours
             row.unknown_line_hold_minutes = unknown_line_hold_minutes
             row.reconcile_cooldown_minutes = reconcile_cooldown_minutes
