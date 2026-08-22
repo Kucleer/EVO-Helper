@@ -216,3 +216,52 @@ def test_the_candidate_pool_carries_the_military_reading(  # type: ignore[no-unt
     pool = scheduler.military_candidate_pool()
 
     assert [(item.coordinate, item.military_score) for item in pool] == [(TARGET_A, 1_234.0)]
+
+
+# -- 「那一轮开始时配着几条航线」 ------------------------------------------------
+
+
+def test_a_launch_records_how_many_lines_were_configured(  # type: ignore[no-untyped-def]
+    repository, scheduler, launcher
+) -> None:
+    """⚠️ **航线数必须在起子进程那一刻记进 `mission_runs`。**
+
+    数据概览页的利用率分母是「周期总时长 × 航线数」，而航线数会变（用户
+    2026-08-20 把 4 条加到 9 条）。读页面时现取「此刻配着几条」去乘历史那些天，
+    会把 08-15（当时 4 条）低估到 44%——**而页面上一点异样都看不出来**。
+
+    两颗星球各 5 条 / 4 条，相加是 9：它们抢的是同一批航线里的份额，
+    这个数是账号级的。
+    """
+    _configure_origins(repository)
+    pirate = next(
+        row.id for row in repository.mission_tasks() if row.kind == MissionKind.PIRATE.value
+    )
+    repository.update_mission_task(pirate, enabled=True)
+    scheduler.start()
+
+    scheduler.tick()
+
+    assert launcher.spawned, "这一趟没起子进程，下面那条断言就什么都没守住"
+    assert repository.mission_runs(limit=1)[0].configured_lines == HOME_LINES + SECOND_LINES
+
+
+def test_a_launch_with_no_configured_origin_records_none_not_zero(  # type: ignore[no-untyped-def]
+    repository, scheduler, launcher
+) -> None:
+    """⚠️ **一颗出发星球都没配时记 None，不许记 0。**
+
+    「配了 0 条」和「不知道」在库里长得一样，而 0 会让那一天的分母变成 0、
+    利用率整段显示成「—」，把那天真打出去的活抹掉。None 的意思是「这一行说不出
+    线数」，页面会退回下界推算。
+    """
+    pirate = next(
+        row.id for row in repository.mission_tasks() if row.kind == MissionKind.PIRATE.value
+    )
+    repository.update_mission_task(pirate, enabled=True)
+    scheduler.start()
+
+    scheduler.tick()
+
+    assert launcher.spawned
+    assert repository.mission_runs(limit=1)[0].configured_lines is None

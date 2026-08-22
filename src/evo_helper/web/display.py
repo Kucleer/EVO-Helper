@@ -314,19 +314,28 @@ DISPATCH_STATE_GLYPHS: dict[str, str] = {
 #:
 #: 与 `AWAITING` 分开而不是并档：`AWAITING` 是**还在等**，那才是「等着人回来收」
 #: 的意思，黄色在它身上是对的。
+#: ⚠️ **顺序即下拉框里的顺序**（`web.app._ordered_outcomes` 按这张表的键序排）。
+#: `PROTECTED` 排在胜/负/平之后、`AWAITING` 之前：它和前三档一样是**已经有结论**
+#: 的一发，只是结论是「没打成」；而 `AWAITING` 往后那几档说的都是「还没有结论」。
 BATTLE_RESULT_LABELS: dict[str, str] = {
     "VICTORY": "胜",
     "FAIL": "负",
     "DRAW": "平",
+    "PROTECTED": "撞保护期",
     "AWAITING": "待战报",
     "NO_REPORT": "无战报",
     "NONE": "不适用",
 }
 
+#: `PROTECTED` 取 `warn` 而不是空：这一发白占了一整趟往返的航线时间
+#: （实测 48.9 与 124.1 分钟），**是件该有人看见的事**——目标该从候选池里排掉，
+#: 排不掉就会一趟趟重复。与 `NO_REPORT` 那个「已经没有下一步了、别一直亮着」
+#: 的理由正相反。
 BATTLE_RESULT_TONES: dict[str, str] = {
     "VICTORY": "ok",
     "FAIL": "danger",
     "DRAW": "",
+    "PROTECTED": "warn",
     "AWAITING": "warn",
     "NO_REPORT": "",
     "NONE": "",
@@ -336,6 +345,7 @@ BATTLE_RESULT_GLYPHS: dict[str, str] = {
     "VICTORY": "★",
     "FAIL": "✕",
     "DRAW": "＝",
+    "PROTECTED": "🛡",
     "AWAITING": "🕗",
     "NO_REPORT": "∅",
     "NONE": "—",

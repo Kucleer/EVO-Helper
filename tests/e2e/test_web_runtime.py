@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
@@ -9,7 +10,13 @@ from sqlalchemy import create_engine, inspect, text
 
 from alembic import command
 from evo_helper.config import Settings
-from evo_helper.web.runtime import _upgrade_database, create_runtime_app
+from evo_helper.infrastructure.code_version import CodeVersion
+from evo_helper.web.runtime import (
+    _alembic_revision,
+    _upgrade_database,
+    create_runtime_app,
+    record_startup_version,
+)
 from support.database import scratch_database_url
 
 
@@ -146,3 +153,146 @@ def test_applying_migrations_does_not_silence_application_logging(tmp_path: Path
 
     assert logger.isEnabledFor(logging.INFO)
     assert not logger.disabled
+
+
+# -- 启动时把「代码版本 + 迁移前后的 revision」记进 system_log --------------------
+#
+# ⚠️ 这一节补的缺口：实机跑在另一台机器上，而库里原本查不出「代码停在哪个
+# commit」。`alembic_version` 只说库升到了哪，`system_log` 的 host / pid 只说进程
+# 什么时候换的——两样推不出「那台机器 pull 了没有」。没 pull 的机器重启 bat，
+# 只会把库升到**旧 commit 所知的 head**，而我们会误以为已经升到 `main` 的 head。
+
+
+class _Recorded:
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def __call__(self, level, source, message, *, payload=None, **_):  # type: ignore[no-untyped-def]
+        self.calls.append((level, message, dict(payload or {})))
+
+
+def test_the_startup_line_records_the_revision_before_and_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ **两个 revision 都要记，只记一个就答不出「这次重启到底升没升」。**
+
+    这里造的正是实机上那个形状：库已经升到 head 了，重启 bat 什么都没动。
+    """
+    recorded = _Recorded()
+    monkeypatch.setattr("evo_helper.web.runtime.record_system_log", recorded, raising=True)
+    database_url = scratch_database_url(tmp_path, "startup-log.db")
+    _upgrade_database(database_url)
+    head = _current_revision(database_url)
+
+    record_startup_version(revision_before=head, revision_after=head)
+
+    level, message, payload = recorded.calls[0]
+    assert (payload["revision_before"], payload["revision_after"]) == (head, head)
+    assert payload["upgraded"] is False
+    assert "库没动" in message
+    assert level == "INFO"
+
+
+def test_a_real_upgrade_says_it_moved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """升了就要看得出来：两个 revision 不一样，正文也说「升到」。
+
+    ⚠️ 把两列合成一列（只记 `revision_after`）的话，这一条和上一条会变成同一句话，
+    而「升没升」这个问题——现在最查不出来的那个——就又没人回答了。
+    """
+    recorded = _Recorded()
+    monkeypatch.setattr("evo_helper.web.runtime.record_system_log", recorded, raising=True)
+
+    record_startup_version(revision_before=None, revision_after="a3c81f5d2b64")
+
+    _, message, payload = recorded.calls[0]
+    assert payload["upgraded"] is True
+    assert payload["revision_before"] is None
+    assert "升到 a3c81f5d2b64" in message
+
+
+def test_the_startup_line_carries_the_code_version_including_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **commit / 分支 / dirty 三样都要进 payload，`dirty` 尤其不许省。**
+
+    有未提交改动正是「跑的代码和 `main` 不一样」的最强信号。
+    """
+    recorded = _Recorded()
+    monkeypatch.setattr("evo_helper.web.runtime.record_system_log", recorded, raising=True)
+    monkeypatch.setattr(
+        "evo_helper.web.runtime.read_code_version",
+        lambda: CodeVersion(commit="5447ca5", branch="main", dirty=True),
+    )
+
+    record_startup_version(revision_before="x", revision_after="x")
+
+    _, message, payload = recorded.calls[0]
+    assert (payload["commit"], payload["branch"], payload["dirty"]) == ("5447ca5", "main", True)
+    assert "有未提交改动" in message
+
+
+def test_nothing_local_beyond_the_three_fields_leaks_into_the_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ 仓库是公开的，日志会被贴出来看。
+
+    本地路径、用户名、远端地址一概不许进 payload——三样加两个 revision 就够了。
+    """
+    recorded = _Recorded()
+    monkeypatch.setattr("evo_helper.web.runtime.record_system_log", recorded, raising=True)
+
+    record_startup_version(revision_before="x", revision_after="y")
+
+    _, _, payload = recorded.calls[0]
+    assert set(payload) == {
+        "commit",
+        "branch",
+        "dirty",
+        "revision_before",
+        "revision_after",
+        "upgraded",
+    }
+
+
+def test_a_startup_line_never_takes_the_service_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ **最严重的回归：一个纯观测的功能让控制台起不来。**
+
+    git 不在 PATH / 不是 git 仓库时 `read_code_version` 自己降级（那边有用例），
+    这一条守的是**上层**：拿到一份「三样全不知道」的版本，照样记得出一行，
+    不抛。
+    """
+    recorded = _Recorded()
+    monkeypatch.setattr("evo_helper.web.runtime.record_system_log", recorded, raising=True)
+    monkeypatch.setattr(
+        "evo_helper.web.runtime.read_code_version",
+        lambda: CodeVersion(commit=None, branch=None, dirty=None),
+    )
+
+    record_startup_version(revision_before=None, revision_after=None)
+
+    _, message, payload = recorded.calls[0]
+    assert "取不到" in message
+    assert payload["dirty"] is None, "取不到不许写成 False"
+
+
+def test_a_fresh_database_has_no_revision_yet(tmp_path: Path) -> None:
+    """全新库上 `alembic_version` 还不存在——那正是「升级前没有版本」这个事实。
+
+    读不到不许抛：第一次启动走的就是这条路。
+    """
+    database_url = scratch_database_url(tmp_path, "fresh.db")
+
+    assert _alembic_revision(database_url) is None
+
+    _upgrade_database(database_url)
+
+    assert _alembic_revision(database_url) == _current_revision(database_url)
+
+
+def _current_revision(database_url: str) -> str:
+    with create_engine(database_url).connect() as connection:
+        value = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    assert value is not None
+    return str(value)

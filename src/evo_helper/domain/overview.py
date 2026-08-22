@@ -26,6 +26,19 @@
 ⚠️ 切日刻意在 Python 里做，不用 `func.date()`：那个函数在 PostgreSQL 上按**会话
 时区**换算，服务器在 UTC+8 时整条日界会挪 8 小时（同 `storage.repository._utc_day`，
 来历是 PR #159 那个海盗配额的日界缺陷）。
+
+## ⚠️ 利用率的分母：2026-08-20 换成「周期总时长 × 航线数」
+
+用户口径（2026-08-20）**反转了他自己 08-17 定的那一条**：「把分母换成一天的总
+时长，这样更能体现利用率。然后再增加一个挂机运行时长。」
+
+旧口径（任务实际运行时长 × 航线数）指出的问题是真的——关一晚上机器、第二天利用率
+腰斩，而那不是「资源闲着」，是「本来就没开工」。新口径**把这个问题交给
+「挂机运行时长」去回答**（`domain.uptime`）。**两个是一对，只做前一半会让页面
+比改之前更难读。**
+
+线数在新分母里是**唯一**的乘数（旧分母里它只是其中一个），所以「那一天到底配着
+几条」从此直接决定利用率错多少倍。取法与「真值 / 下界」的区分见 `period_lines`。
 """
 
 from __future__ import annotations
@@ -216,10 +229,14 @@ def recovery_rate(reports: int, dispatches: int) -> float | None:
 def utilisation(occupied_seconds: float, available_seconds: float) -> float | None:
     """航线利用率 = 航线被占用的时长 ÷ 可用航线时长。分母为 0 时返回 None。
 
-    ⚠️ **超过 100% 不许截断。** 舰队在天上飞的时候 runner 不一定在跑——实测
-    2026-08-15 只开了 3 小时、派了 42 发，那些舰队要飞到几小时后才回来，算出来
-    243%。那是个真信号（「派出去的活比开机时间还多」＝关机太早、舰队回来时没人
-    接），截成 100% 就把它抹掉了。整段在 `docs/数据概览-方案.md` 第二节 C。
+    ⚠️ **超过 100% 不许截断。** 旧分母（运行时长 × 线数）下它的来历是「舰队在天上
+    飞的时候 runner 不一定在跑」（实测 2026-08-15 算出 243%）；换成「周期总时长 ×
+    线数」之后这一条仍然可能发生，只是来历变了：**配置中途被改小**，或者**在飞数
+    真的超过配置数**（航线跨任务共享，海盗与 bot 抢同一批，实测 `4:277:15` 在飞
+    5 条而配置是 4 条，见 `overflow_lines`）。两种都是真信号，截成 100% 就把它抹掉了。
+
+    ⚠️ 反过来，**线数取下界那些天在构造上不会超过 100%**
+    （见 `max_concurrent_lines`）——那种天算出 >100% 是实现有 bug。
     """
     if available_seconds <= 0:
         return None
@@ -291,26 +308,111 @@ def occupied_seconds(
     )
 
 
+class LineSource(StrEnum):
+    """这个周期的航线数是**怎么来的**。页面必须把两者区分开。"""
+
+    #: 真值：`mission_runs.configured_lines` 里记着那一轮开始时账号配着几条。
+    RECORDED = "recorded"
+    #: 下界：那一天观测到的**最大并发在飞数**。⚠️ 见 `max_concurrent_lines`。
+    LOWER_BOUND = "lower_bound"
+
+
 @dataclass(frozen=True, slots=True)
-class RunWindow:
-    """调度器真的在跑的一段，以及那段时间这台账号配着几条航线。"""
+class LineCount:
+    """这个周期按几条航线算分母，以及那个数有多硬。"""
 
-    start: datetime
-    end: datetime
     lines: int
+    source: LineSource
+
+    @property
+    def exact(self) -> bool:
+        """这是真值还是推算出来的下界。页面按它决定要不要标「≤」。"""
+        return self.source is LineSource.RECORDED
 
 
-def available_seconds(
-    runs: tuple[RunWindow, ...], window_start: datetime, window_end: datetime
-) -> float:
-    """可用航线时长 = Σ（任务实际运行时长 × 该时段的航线数）。
+def available_seconds(*, window_start: datetime, window_end: datetime, lines: int) -> float:
+    """可用航线时长 = **周期总时长 × 航线数**。
 
-    ⚠️ **分母不能用「24 小时 × 当前航线数」。** 调度器停着的那段不该算进产能——
-    关一晚上机器、第二天利用率腰斩，而那不是「资源闲着」，是「本来就没开工」。
-    用户口径（2026-08-17）：「C 的分母是任务实际运行时间 × 航线数」。
+    ⚠️ **用户口径（2026-08-20）反转了他自己 08-17 定的那一条。** 旧口径是
+    「任务实际运行时间 × 航线数」；新口径是「把分母换成一天的总时长，这样更能
+    体现利用率」。
+
+    旧注释里那个理由**不是废话，它指出的问题是真的**：关一晚上机器、第二天利用率
+    腰斩，而那不是「资源闲着」，是「本来就没开工」。新口径把这个问题**交给
+    「挂机运行时长」那个指标去回答**（`domain.uptime`）——所以那两个数必须一起
+    看，只做前一半会让页面比改之前更难读。
+
+    「周期总时长」就是调用方给的这个窗口有多长。⚠️ **当前那个周期的右边界一律钳到
+    「现在」**（`web.overview_routes`）：占用段也只算到现在（`storage.overview.
+    occupancies`），两边不同源的话，早上八点打开页面会看到一个「除以 24 小时」
+    的假低值。
+
+    航线数怎么定见 `period_lines`——**不许拿此刻的配置去乘历史周期**：旧口径里
+    线数只是分母的一个乘数，新口径里它是**唯一**的乘数，错多少利用率就错多少倍。
     """
-    return sum(
-        overlap_seconds(run.start, run.end, window_start, window_end) * run.lines for run in runs
+    span = (window_end - window_start).total_seconds()
+    if span <= 0 or lines <= 0:
+        return 0.0
+    return span * lines
+
+
+def max_concurrent_lines(
+    occupancies: tuple[Occupancy, ...], window_start: datetime, window_end: datetime
+) -> int:
+    """这个窗口里**同一时刻**最多有几条航线在忙。
+
+    历史那些天没有记下当时的航线数（`mission_runs.configured_lines` 是 2026-08-20
+    才加的列），拿这个数替它们。
+
+    ⚠️ **这是下界，方向必须记牢：**
+    任一时刻最多 M 条在忙，只能说明**至少**配着 M 条——配了更多而没派满的看不出来。
+    于是 **线数取下界 ⇒ 分母偏小 ⇒ 利用率取上界**：历史天会显示得比真实**偏高**。
+    页面上必须把这件事标出来（`LineSource.LOWER_BOUND`），不许和真值混在一起。
+
+    ⚠️ **不许合并重叠区间。** 合并等于把并行的航线算成一条，M 会恒等于 1
+    （同 `occupied_seconds` 那段的理由）——利用率随之被高估成几倍。
+
+    **一个可以自检的性质**：用这个数当线数时，利用率在构造上 **≤ 100%**
+    （任一时刻最多 M 条在忙 ⇒ 占用 ≤ M × 窗口长度）。算出 >100% 就是实现有 bug，
+    这一条有用例钉着。
+    """
+    events: list[tuple[datetime, int]] = []
+    for item in occupancies:
+        if overlap_seconds(item.start, item.end, window_start, window_end) <= 0:
+            continue
+        events.append((max(item.start, window_start), 1))
+        events.append((min(item.end, window_end), -1))
+    peak = 0
+    holding = 0
+    # 同一刻先减后加（`-1 < 1`）：首尾相接的两段（一条航线刚放开、另一发立刻派出）
+    # 是先后两条，不是同时两条。
+    for _, delta in sorted(events, key=lambda event: (event[0], event[1])):
+        holding += delta
+        peak = max(peak, holding)
+    return peak
+
+
+def period_lines(
+    *,
+    recorded: int | None,
+    occupancies: tuple[Occupancy, ...],
+    window_start: datetime,
+    window_end: datetime,
+) -> LineCount:
+    """这个周期按几条航线算分母，以及那个数是真值还是下界。
+
+    ⚠️ **`recorded is None` 的意思是「不知道」**——既不是 0，也**不许拿此刻的配置
+    去顶**。用户 2026-08-20 把航线从 4 条加到 9 条，按 9 条去算 08-15（当时 4 条）
+    会把那天低估到 44%；填 0 则分母为 0、利用率整段变成「—」，把那天真打出去的
+    活抹掉。两种都是拿假话当数据用。
+
+    没有真值时退到「当天最大并发在飞数」这个**下界**（用户选定的方案 C）。
+    """
+    if recorded is not None:
+        return LineCount(lines=max(recorded, 0), source=LineSource.RECORDED)
+    return LineCount(
+        lines=max_concurrent_lines(occupancies, window_start, window_end),
+        source=LineSource.LOWER_BOUND,
     )
 
 
@@ -421,11 +523,13 @@ __all__ = [
     "SLOT_FLYING",
     "SLOT_UNKNOWN",
     "Granularity",
+    "LineCount",
+    "LineSource",
     "Occupancy",
-    "RunWindow",
     "available_seconds",
     "day_start",
     "line_slots",
+    "max_concurrent_lines",
     "month_start",
     "occupancy_end",
     "occupied_seconds",
@@ -434,6 +538,7 @@ __all__ = [
     "parse_granularity",
     "period_end",
     "period_label",
+    "period_lines",
     "period_start",
     "period_starts",
     "recovery_rate",

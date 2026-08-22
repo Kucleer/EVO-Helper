@@ -174,14 +174,29 @@ def disable_for_lack_of_lines(  # type: ignore[no-untyped-def]
     return row
 
 
+#: 挂机心跳那条链路写的行的前缀。**这个夹具刻意把它们扔掉**，见 `RecordingLog`。
+UPTIME_PREFIX = "挂机心跳"
+
+
 class RecordingLog:
-    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。
+
+    ⚠️ **挂机心跳写的行一律不收。** 用这个夹具的那几份用例钉的都是「**某一条链路**
+    写了几条」（停用写一条、到点开关各写一条、池子饿了写一条），而它们全都会把
+    时钟往前跳十分钟——正好跳过挂机心跳的断线阈值，于是心跳会诚实地补一行
+    「断过一段」。不筛的话，那些用例会因为一条与自己无关的链路而红。
+
+    心跳自己那份留痕由 `test_scheduler_uptime_heartbeat.py` 钉着，它另建一个不筛的
+    记录器——**筛掉不等于不测**。
+    """
 
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.payloads: list[dict[str, object]] = []
 
     def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
+        if message.startswith(UPTIME_PREFIX):
+            return
         self.messages.append(message)
         self.payloads.append(dict(payload or {}))
 

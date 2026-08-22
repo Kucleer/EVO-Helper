@@ -14,11 +14,13 @@ from typing import Any
 import uvicorn
 from alembic.config import Config
 from fastapi import FastAPI
+from sqlalchemy import inspect, text
 
 from alembic import command
 from evo_helper.application.ai_targeting import DEFAULT_AI_RETENTION_DAYS
 from evo_helper.config import Settings
-from evo_helper.infrastructure.system_log import attach_system_log_handler
+from evo_helper.infrastructure.code_version import read_code_version
+from evo_helper.infrastructure.system_log import attach_system_log_handler, record_system_log
 from evo_helper.infrastructure.system_log_db import install_database_system_log, purge_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import purge_report_screenshots
@@ -143,13 +145,78 @@ def main() -> int:
     （2026-08-17）：「生产环境重新执行 bat 后会执行数据库表结构最新修改」。
     别把它挪回 `create_runtime_app`：那样任何构造一次 app 的代码都会静默
     升级生产库，理由见那个函数的说明。
+
+    ⚠️ **迁移前后各读一次 `alembic_version`，连同代码版本一起记进 `system_log`。**
+    实机跑在另一台机器上，而库里原本查不出「代码停在哪个 commit」——于是有一个
+    看不见的失效场景：那台机器没 pull、还停在旧 commit，重启 bat 只会把库升到
+    **旧 commit 所知的 head**，而我们会误以为已经升到 `main` 的 head。两个
+    revision 都记下来，「这次重启到底升没升」才答得出来（只记一个答不出）。
     """
     settings = Settings()
     for line in announce(settings):
         print(line)
+    revision_before = _alembic_revision(settings.database_url)
     _upgrade_database(settings.database_url)
-    uvicorn.run(create_runtime_app(settings), host=settings.host, port=settings.port)
+    revision_after = _alembic_revision(settings.database_url)
+    # ⚠️ **建 app 之后才记。** `system_log` 的出口是在 `create_runtime_app` 里装的
+    # （`install_database_system_log`），在那之前 `record_system_log` 是空操作——
+    # 这条日志会静默地掉进地板缝里。
+    app = create_runtime_app(settings)
+    record_startup_version(revision_before=revision_before, revision_after=revision_after)
+    uvicorn.run(app, host=settings.host, port=settings.port)
     return 0
+
+
+def record_startup_version(*, revision_before: str | None, revision_after: str | None) -> None:
+    """把「跑的是哪份代码」和「这次重启升没升库」记成一条 `system_log`。
+
+    **只在启动写一次**，不挂在任何每 tick 的路径上。
+
+    ⚠️ 三样本地信息（commit / 分支 / dirty）之外什么都不进 payload：仓库是公开的，
+    日志会被贴出来看。`host` / `pid` 由 `system_log` 自己带。
+    """
+    version = read_code_version()
+    upgraded = revision_before != revision_after
+    moved = (
+        f"库从 {revision_before or '（空库）'} 升到 {revision_after or '未知'}"
+        if upgraded
+        else f"库没动，仍是 {revision_after or '未知'}"
+    )
+    record_system_log(
+        "INFO",
+        __name__,
+        f"控制台启动：{version.describe()}；{moved}",
+        payload={
+            "commit": version.commit,
+            "branch": version.branch,
+            # ⚠️ None 是「问不出来」，不是「干净」。有未提交改动正是「跑的代码和
+            # `main` 不一样」的最强信号，不许省掉、也不许美化。
+            "dirty": version.dirty,
+            # 两个都记。只记一个的话，「这次重启到底升没升」就答不出来了。
+            "revision_before": revision_before,
+            "revision_after": revision_after,
+            "upgraded": upgraded,
+        },
+    )
+
+
+def _alembic_revision(database_url: str) -> str | None:
+    """库现在停在哪个 revision。**表还不存在（全新库）时返回 None。**
+
+    读不到不是错：第一次启动时 `alembic_version` 根本还没建出来，而那正好是
+    「升级前没有版本」这个事实。任何异常都吞掉——这是观测，不是判据。
+    """
+    engine = create_database_engine(database_url)
+    try:
+        if "alembic_version" not in inspect(engine).get_table_names():
+            return None
+        with engine.connect() as connection:
+            value = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        return None if value is None else str(value)
+    except Exception:  # noqa: BLE001 - 读不到版本号不该让控制台起不来
+        return None
+    finally:
+        engine.dispose()
 
 
 def _upgrade_database(database_url: str) -> None:

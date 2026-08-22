@@ -27,7 +27,16 @@
 
 <section class="panel" aria-label="周期统计">
   <div class="overview-tabs-head">
-    <h2 class="overview-heading">周期统计 <span>UTC+0 切天 · 资源列只统计已读回的战报</span></h2>
+    {#
+      ⚠️ 利用率的口径写在标题里，不留给悬停：分母 2026-08-20 从「任务实际运行时长
+      × 航线数」换成了「周期总时长 × 航线数」，同一个百分比在两个口径下差好几倍，
+      不写明的话谁都不知道自己在看哪一个。
+
+      「≤」那句同样要写在明处：那些行的航线数是**推算的下界**，于是利用率是**上界**
+      （偏高）。这个仓的规矩是宁可说「这个数不准」，也不让它假装准。
+    #}
+    <h2 class="overview-heading">周期统计 <span>UTC+0 切天 · 资源列只统计已读回的战报 ·
+      利用率分母 = 周期总时长 × 航线数 · 标「≤」的行航线数取的是下界（利用率因此偏高）</span></h2>
     <nav class="overview-tabs" aria-label="统计粒度">
       {% for value, label in [('day', '按天'), ('week', '按周'), ('month', '按月'), ('total', '总计')] %}
         <a class="overview-tab {% if granularity.value == value %}on{% endif %}"
@@ -39,6 +48,19 @@
   <div id="overview-periods">
     {% include "_overview_periods.html" %}
   </div>
+</section>
+
+{#
+  「按星球效率」。⚠️ 这一段**自己一条路由**（`/overview/origin-efficiency`），
+  不走上面那套 `?fragment=`——它和「利用率 / 挂机时长」那一块同时开发，挤进同一个
+  函数的话，合并冲突会落在判据上（分子分母各自该取什么），而那是这一页最不该被
+  合并搞乱的地方。整段理由在 `web/origin_efficiency.py` 头上。
+
+  所以这里只放一个空容器，底下的脚本载入后立刻取一次。首屏那一瞬是「读取中」，
+  换来的是这一段与那一块在代码上完全不相干。
+#}
+<section class="panel" aria-label="按星球效率">
+  <div id="overview-origins"><p class="muted">按星球效率读取中…</p></div>
 </section>
 
 <script>
@@ -101,6 +123,59 @@
       if (document.visibilityState === 'visible') { refreshNow(); refreshPeriods(); }
       start();
     });
+    start();
+  })();
+</script>
+
+<script>
+  // 「按星球效率」那一段自己刷自己。
+  //
+  // ⚠️ **刻意是独立的一个 IIFE，不去改上面那个 `swapper`。** 这一段和
+  // 「利用率 / 挂机时长」那一块同时开发，上面那段脚本属于那一块；共用一个函数
+  // 换来的是一处必然的合并冲突，而分开写只多十几行。
+  //
+  // 轮询的纪律与上面逐条相同（页面不可见就真的停表、上一次没回来就不发下一次、
+  // 只换标了 id 的那一块、失败不弹窗不停表），理由写在 base.html 的 autoRefresh。
+  // 周期是一分钟：这是几趟聚合查询，一分钟之内不会有肉眼可见的变化。
+  (function () {
+    const EVERY_MS = 60000;
+    // 日期选择走地址栏（`?origin_day=YYYY-MM-DD`），这里原样转给片段路由。
+    // 服务端认不出来时静默回落到今天，不 422（同 `granularity` 那一条）。
+    const search = new URLSearchParams(window.location.search);
+    const day = search.get('origin_day');
+    let inFlight = false;
+    let timer = null;
+
+    async function refresh() {
+      const target = document.getElementById('overview-origins');
+      if (!target || inFlight || document.visibilityState !== 'visible') return;
+      inFlight = true;
+      try {
+        let url = '/overview/origin-efficiency';
+        if (day) url += `?origin_day=${encodeURIComponent(day)}`;
+        const response = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+        if (!response.ok) return;
+        target.innerHTML = await response.text();
+      } catch (_) {
+        // 下一轮会重试。
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    function start() {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+      if (document.visibilityState !== 'visible') return;
+      timer = window.setInterval(refresh, EVERY_MS);
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') refresh();
+      start();
+    });
+    // 首屏那个容器是空的（见上面的注释），所以载入后立刻取一次。
+    refresh();
     start();
   })();
 </script>

@@ -169,12 +169,40 @@
 </div>
 
 <div class="overview-grid overview-grid-four">
+  {#
+    航线利用率。⚠️ 分母自 2026-08-20 起是「**周期总时长 × 航线数**」，不再是
+    「任务实际运行时长 × 航线数」（用户口径反转了他自己 08-17 定的那条）。
+
+    ⚠️ 于是分母不再替用户解释「为什么低」——**那件事改由下面「挂机」那一行直说**。
+    两个数必须挨着摆：只剩利用率的话，一个低值分不出是「航线闲着」还是
+    「机器根本没开」。
+
+    ⚠️ 「≤」不是装饰：那一天的航线数没有真值（`mission_runs.configured_lines`
+    是 08-20 才加的列），只能用「当天最大并发在飞数」当**下界**。
+    **线数取下界 ⇒ 分母偏小 ⇒ 利用率取上界**，也就是显示得比真实**偏高**。
+  #}
   <div class="tile overview-card">
     <div class="label">航线利用率</div>
-    <div class="value {% if now.today.utilisation is none %}muted{% elif now.today.utilisation >= 0.8 %}tone-ok{% else %}tone-warn{% endif %}">
-      {% if now.today.utilisation is none %}—{% else %}{{ '%.1f'|format(now.today.utilisation * 100) }}<span class="overview-unit">%</span>{% endif %}
+    <div class="value {% if now.today.utilisation is none %}muted{% elif now.today.utilisation >= 0.8 %}tone-ok{% else %}tone-warn{% endif %}"
+         {% if not now.today.lines_exact %}title="航线数没有真值，用的是今天观测到的最大并发在飞数（{{ now.today.lines }} 条）当下界：分母偏小，所以真实利用率不高于这个数"{% endif %}>
+      {% if now.today.utilisation is none %}—{% else %}{{ '≤ ' if not now.today.lines_exact }}{{ '%.1f'|format(now.today.utilisation * 100) }}<span class="overview-unit">%</span>{% endif %}
     </div>
-    <div class="overview-note">占用 {{ '%.1f'|format(now.today.occupied_hours) }} / 可用 {{ '%.1f'|format(now.today.available_hours) }} 航线小时</div>
+    <div class="overview-note">占用 {{ '%.1f'|format(now.today.occupied_hours) }} / 可用 {{ '%.1f'|format(now.today.available_hours) }} 航线小时
+      <span class="muted">（今天已过时长 × {{ now.today.lines }} 条{{ '，线数取下界' if not now.today.lines_exact }}）</span></div>
+    {#
+      挂机运行时长。⚠️ **没有心跳观测的那些天写「—」，绝不写 0**：显示 0 等于说
+      「那天没开机」，而心跳是 2026-08-20 才加的，之前的天补不回来。判据同这一页
+      「常规资源」那张卡上「0 和 — 的分界」（PR #217 定的）。
+    #}
+    <div class="overview-note">挂机
+      {% if now.today.uptime_hours is none %}
+        <b class="muted" title="心跳是 2026-08-20 才加的，之前没有观测。这里写「—」而不是 0——写 0 等于说那段时间没开机，而那是假话">—</b>
+      {% else %}
+        <b class="{% if now.today.uptime_hours >= 1 %}tone-accent{% else %}muted{% endif %}"
+           {% if now.today.uptime_partial %}title="今天只有一部分时间有心跳观测（心跳刚上线），所以这个数是下界"{% endif %}>{{ '≥ ' if now.today.uptime_partial }}{{ '%.1f'|format(now.today.uptime_hours) }} 小时</b>
+        <span class="muted">调度器开着的累计时长</span>
+      {% endif %}
+    </div>
   </div>
   <div class="tile overview-card">
     <div class="label">派遣 / 战报</div>
