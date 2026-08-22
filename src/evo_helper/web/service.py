@@ -360,6 +360,16 @@ class DashboardView:
 
 
 @dataclass(frozen=True)
+class MissionOriginView:
+    planet_id: int | None
+    galaxy: int = 0
+    system: int = 0
+    position: int = 0
+    fleet_lines: int = 0
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class MissionTaskView:
     """调度台上的一行。
 
@@ -397,16 +407,15 @@ class MissionTaskView:
     #: 也都是拿到 UTC 自己按 Asia/Shanghai 渲染的，两套口径迟早会差 8 小时。
     enabled_from_utc: datetime | None = None
     enabled_until_utc: datetime | None = None
-
-
-@dataclass(frozen=True)
-class MissionOriginView:
-    planet_id: int | None
-    galaxy: int = 0
-    system: int = 0
-    position: int = 0
-    fleet_lines: int = 0
-    enabled: bool = True
+    #: 这个任务**生效中的军力方案**（`mission_task_origins`，含停用项）。
+    #: 空元组 = 没有生效的方案（非军力优先，或那张表本来就是空的），那一档舰队
+    #: 从上面那个 `origin` 出发。页面主行照这个显示「实际从哪儿派」——`origin`
+    #: 对军力攻击已经不作数了，两个都摆在卡上就是互相打脸。
+    origins: tuple[MissionOriginView, ...] = ()
+    #: 「配置的出发点」落在哪几个银河系，升序去重；`[0]` 就是任务名用的那个。
+    #: 页面据此给卡片分色、并把银河系号写在卡上。**空 = 这条链路不派遣**
+    #: （扫描 / 军力榜），那时不该有颜色。
+    galaxies: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

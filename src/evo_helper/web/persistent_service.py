@@ -148,6 +148,33 @@ def _origins_text(origins: Sequence[MissionOriginView]) -> str:
     )
 
 
+def _origin_galaxies(plan: Sequence[MissionOriginView], fallback: Coordinate) -> tuple[int, ...]:
+    """「这个任务配置的出发点」落在哪几个银河系，**升序去重**。
+
+    ⚠️ **军力攻击的「从哪儿出发」在军力方案里**（`mission_task_origins`），不在
+    遗留的那一列 `mission_tasks.origin_*`。生产实测（2026-08-22）：#2 号任务名叫
+    「5系攻击」，`origin_*` 写着 `4:277:15`，而军力方案里配的是 `5:261:8` ——
+    真正派遣用的是后者（`MissionScheduler._military_assignments` → `_military_origins`
+    → `_configured_origins`，新表非空就不看旧列）。用户口径（2026-08-22）：名字取
+    「配置的出发点」的银河系，对军力攻击而言那就是军力方案。
+
+    次序**必须稳定**：`replace_mission_origins` 是整表重写，行序跟着用户在页面上
+    加减那几行走，取「第一行」会让任务在用户只是调了一下行序时改名——而名字是
+    日志里认人的字段。所以这里按银河系号升序，命名取 `[0]`（最小的那个）。
+
+    停用的出发点在**没有任何启用项**时才参与：它们仍然是「配置的出发点」，而回落到
+    遗留单 origin 会给出一个这个任务根本不会去的地方。方案整个为空才回落
+    （那一档调度器也真的回落，见 `_configured_origins`）。
+    """
+    enabled = sorted({item.galaxy for item in plan if item.enabled})
+    if enabled:
+        return tuple(enabled)
+    paused = sorted({item.galaxy for item in plan})
+    if paused:
+        return tuple(paused)
+    return (fallback.galaxy,)
+
+
 class PersistentApplicationService:
     """Persist all Web management state through SQLAlchemy sessions."""
 
@@ -1302,12 +1329,13 @@ class MissionConsoleService:
         # 校验的时机有两个：动了参数，或者这一下是在**启用**它。后者不能省——
         # 先存一个空范围、再单独勾复选框，就绕过去了。只改 priority / 名字、
         # 或者要**关掉**它时不校验：参数填错了还关不掉，那就真的没退路了。
+        # 「改完之后」的军力优先开关。**必须在校验之外也算一次**：它决定「从哪儿
+        # 出发」现在听谁的（开=军力方案，关=遗留单 origin），也就决定名字按哪个
+        # 银河系派生。原先这个值只在校验分支里算，于是把开关拨过去之后名字不动。
+        raw_params = params_json or row.params_json
+        military = _view_params(raw_params).get("by_military") is True
+        was_military = _view_params(row.params_json).get("by_military") is True
         if params is not None or enabled is True:
-            raw_params = params_json or row.params_json
-            try:
-                military = bool(json.loads(raw_params).get("by_military", False))
-            except (json.JSONDecodeError, AttributeError):
-                military = False
             if kind is MissionKind.BOT and military:
                 try:
                     self._scheduler.validate_military_params(raw_params)
@@ -1319,15 +1347,27 @@ class MissionConsoleService:
         # （`5:261:8` → `5系攻击`），派生规则见 `_auto_mission_name`。改了出发点
         # 却留着旧名字，页面上就会出现「7系攻击」从 5 系出发这种直接误导人的行。
         #
-        # 只在**这一次真的动了出发点**时改（`origin is not None`，空串「退回全局
-        # 主星」也算动），所以拖一下顺序、勾一下复选框都不会碰名字。调用方显式
-        # 送了 `name` 时听调用方的——那条路是给 API 直连留的。
+        # ⚠️ **「出发点」有两个来源，名字听真正派遣那个的。** 军力优先开着时听军力
+        # 方案（`mission_task_origins`），关着时才听遗留的单 `origin_*`——见
+        # `_bot_name_galaxy`。所以这一条这次动的名字，多半只是把遗留列改回一个
+        # 已经不作数的值，而名字仍旧是军力方案说的那个（那正是要的效果）。
         #
-        # 存量任务（改版之前手输的那些名字）就在这一下被换成派生名：页面上已经
-        # 没有任务名输入框了，第一次编辑出发点是它们唯一会被改名的时机。
-        # **绝不在页面加载时批量改库**——那会在用户没有任何动作时改掉一批名字。
-        if kind is MissionKind.BOT and origin is not None and name is None:
-            name = self._derive_bot_name(target_origin.galaxy, exclude_task_id=task_id)
+        # 改名的时机有两个（第三个在 `replace_mission_origins` 里，那才是现在真正
+        # 改变「从哪儿出发」的那一下）：
+        # ① 这一次真的动了出发点（`origin is not None`，空串「退回全局主星」也算动）；
+        # ② 军力优先开关**真的翻了面**——那一下「听谁的」整个换了源，名字必须跟着走。
+        # 拖一下顺序、勾一下复选框、只改三个军力参数都不会碰名字。调用方显式送了
+        # `name` 时听调用方的——那条路是给 API 直连留的。
+        #
+        # 存量任务（改版之前手输的、或按旧口径按遗留列派生的那些名字）就在这几下
+        # 被换成新派生名。**绝不在页面加载时批量改库**——那会在用户没有任何动作时
+        # 改掉一批名字。
+        origin_source_moved = origin is not None or military != was_military
+        if kind is MissionKind.BOT and name is None and origin_source_moved:
+            name = self._derive_bot_name(
+                self._bot_name_galaxy(task_id, fallback=target_origin, by_military=military),
+                exclude_task_id=task_id,
+            )
         # ⚠️ 这里原先还有一条 `elif origin is not None: self._check_origin(...)`：
         # 只改出发星球时单量那一项，因为「不是主星」当时会被临时闸门拒掉。
         # 闸门随「切换星球」实装删了（runner 开工会真的切过去），于是出发星球本身
@@ -1360,6 +1400,26 @@ class MissionConsoleService:
             galaxy,
             [row.name for row in self._repository.mission_tasks() if row.id != exclude_task_id],
         )
+
+    def _bot_name_galaxy(
+        self, task_id: int | None, *, fallback: Coordinate, by_military: bool
+    ) -> int:
+        """这个 bot 任务该按哪个银河系取名。
+
+        ⚠️ **军力优先开着时听军力方案，不听 `mission_tasks.origin_*`。** 那一列
+        对军力攻击已经不决定任何舰队去哪儿（`_configured_origins`：新表非空就不看
+        旧列），拿它取名的后果是生产库里那五行——#2 叫「5系攻击」而旧列写着
+        `4:277:15`，#9 叫「1系攻击」而旧列同样写着 `4:277:15`，两个任务的旧列一模
+        一样却从两个不同银河系出发。
+
+        关着时才回落到遗留那一列（`fallback` 已经是解析完默认值的那颗，三列为
+        NULL 时就是全局主星）：那条路上它**真的**决定从哪儿出发。
+
+        `task_id is None` 是「这一行还没进库」（`create_mission`），那时方案必然是
+        空的，直接按 `fallback` 算，省一次查。
+        """
+        plan = () if task_id is None or not by_military else self.mission_origins(task_id)
+        return _origin_galaxies(plan, fallback)[0]
 
     def mission_origins(self, task_id: int) -> tuple[MissionOriginView, ...]:
         """额外 origin 为空时，调用方明确知道仍回落旧单 origin。"""
@@ -1400,6 +1460,21 @@ class MissionConsoleService:
                 raise AssertionError("validated planet_id disappeared")
             resolved.append((item.planet_id, item.fleet_lines, item.enabled))
         self._repository.replace_mission_task_origins(task_id, tuple(resolved))
+        # ⚠️ **改完军力方案就重派名字。** 这一下才是现在真正改变「这个任务从哪儿
+        # 出发」的那个动作：军力优先开着时调度器只看这张表（`_configured_origins`）。
+        # 不在这里重派的话，用户把方案从 5 系改到 1 系、卡上仍写着「5系攻击」——
+        # 而那个名字会一路进日志、运行历史、配置固化记录。
+        #
+        # 只在军力优先**开着**时改：关着时这张表一行都不参与派遣，跟着它改名等于
+        # 按一份没生效的配置命名。
+        if _view_params(row.params_json).get("by_military") is True:
+            self._repository.update_mission_task(
+                task_id,
+                name=self._derive_bot_name(
+                    self._bot_name_galaxy(task_id, fallback=self._origin_of(row), by_military=True),
+                    exclude_task_id=task_id,
+                ),
+            )
         self._invalidate_scheduler_view()
         return self.mission_origins(task_id)
 
@@ -1553,8 +1628,13 @@ class MissionConsoleService:
         parsed_origin = None if origin in (None, "") else _parse_origin(origin or "")
         # 名字在**写库之前**定下来：页面不再送名字，而下面那句 `create_mission_task`
         # 要的是最终值。调用方仍然可以显式给名字（API 直连、旧脚本），那时不派生。
+        # 新任务的军力方案必然是空的（那张表跟着 task_id 建，这一刻还没有行），
+        # 所以这里算出来的就是遗留列那颗的银河系。走同一个入口是为了让「名字按
+        # 哪儿取」只有一处规则——日后新建能带方案时，这里不用再改一遍。
         resolved_name = (name or "").strip() or self._derive_bot_name(
-            (parsed_origin or self._scheduler.origin).galaxy
+            self._bot_name_galaxy(
+                None, fallback=parsed_origin or self._scheduler.origin, by_military=True
+            )
         )
         rows = self._repository.mission_tasks()
         # 排在所有非扫描任务之后：新任务的优先级由用户拖，而默认插在最前面等于
@@ -1893,6 +1973,11 @@ class MissionConsoleService:
             restart_cooldown=timedelta(seconds=snapshot.config.restart_cooldown_seconds),
         )
         params = _view_params(row.params_json)
+        # 军力方案（`mission_task_origins`）整张表算一次，就在 `budget` 里，
+        # **不许在这里再查一遍**：这个视图每 2 秒被轮询一次，每行一查等于把同一批
+        # 查询乘上任务条数。空元组的含义是「没有生效的军力方案」，那一档页面回落
+        # 到遗留的单 origin 显示。
+        plan = budget.origins.get(task.task_id, ())
         return MissionTaskView(
             task_id=task.task_id,
             kind=task.kind.value,
@@ -1910,6 +1995,10 @@ class MissionConsoleService:
             fleet_lines_is_default=row.fleet_lines is None,
             enabled_from_utc=task.enabled_from_utc,
             enabled_until_utc=task.enabled_until_utc,
+            origins=plan,
+            # 填空隙的那两条不派遣，「出发点的银河系」对它们没有意义——给了值，
+            # 页面就会给它们上一套按银河系分的颜色，而那句颜色说的是假话。
+            galaxies=(() if fills_gaps(task.kind) else _origin_galaxies(plan, task.origin)),
         )
 
     def _task_view_for(self, task_id: int) -> MissionTaskView:

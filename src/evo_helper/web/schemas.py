@@ -150,6 +150,19 @@ class StateEventOut(BaseModel):
     to_state: str | None = None
 
 
+class MissionOriginOut(CoordinateModel):
+    """军力方案里的一个出发点。
+
+    ⚠️ **定义摆在 `MissionTaskOut` 前面是必须的，不是排版偏好。** 后者的
+    `origins` 字段引用它，而这个模块没有 `from __future__ import annotations`，
+    注解在类体执行时就要能解析——挪到后面去会在 import 阶段直接 NameError。
+    """
+
+    planet_id: int | None = None
+    fleet_lines: int = Field(ge=1)
+    enabled: bool = True
+
+
 class MissionTaskOut(BaseModel):
     #: 任务 id。**页面上一切写操作都按它寻址**——同一 `kind` 可以有多行
     #: （多个 bot 攻击任务），按 kind 寻址会打到不确定的那一行上。
@@ -180,6 +193,14 @@ class MissionTaskOut(BaseModel):
     #: 没配就是 None，含义是「这一端不限」。
     enabled_from_utc: datetime | None = None
     enabled_until_utc: datetime | None = None
+    #: **生效中的军力方案**（含停用项）。空列表 = 没有生效的方案，那一档舰队从
+    #: 上面那个 `origin` 出发。页面主行照这个显示「实际从哪儿派」：`origin` 对
+    #: 军力攻击已经不作数（调度器只看这张表），两个都摆在卡上就是互相打脸。
+    origins: list[MissionOriginOut] = Field(default_factory=list)
+    #: 「配置的出发点」落在哪几个银河系，升序去重；`[0]` 就是任务名用的那个。
+    #: 页面据此给卡片分色、并把银河系号写在卡上（颜色只做分组，状态另有文字）。
+    #: 空 = 这条链路不派遣（扫描 / 军力榜），那时不该有颜色。
+    galaxies: list[int] = Field(default_factory=list)
 
 
 class MissionTaskPatch(BaseModel):
@@ -231,12 +252,6 @@ class MissionOriginIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     planet_id: int = Field(ge=1)
-    fleet_lines: int = Field(ge=1)
-    enabled: bool = True
-
-
-class MissionOriginOut(CoordinateModel):
-    planet_id: int | None = None
     fleet_lines: int = Field(ge=1)
     enabled: bool = True
 

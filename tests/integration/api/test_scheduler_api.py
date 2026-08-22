@@ -1390,6 +1390,172 @@ def _military_bot(console: Console, *coordinates: tuple[Coordinate, int]) -> int
     return task_id
 
 
+def test_the_name_follows_the_military_plan_not_the_legacy_origin_column(
+    console: Console,
+) -> None:
+    """⚠️ **名字按军力方案取，不按 `mission_tasks.origin_*`。**
+
+    生产实测（2026-08-22）：#2 号任务的旧列写着 `4:277:15`、军力方案里配的是
+    `5:261:8`，而真正派遣读的是后者（`_military_assignments` → `_configured_origins`：
+    新表非空就不看旧列）。按旧列取名的后果就是卡上写着「4系攻击」的任务从 5 系
+    出发——而任务名是日志、运行历史、配置固化记录里认人的那个字段。
+
+    用户口径（2026-08-22）：名字取「配置的出发点」的银河系；对军力攻击而言，
+    配置的出发点就是军力方案。
+    """
+    task_id = console.task_id("BOT")
+    # 先把旧列写成另一个银河系：这一列仍然存在（海盗、按星球效率、非军力优先那条
+    # 分支都还读它），但它不该决定军力攻击叫什么名字。
+    console.client.patch(f"/api/missions/{task_id}", json={"origin": "4:277:15"})
+
+    _military_bot(console, (Coordinate(5, 261, 8), 6))
+
+    assert console.task("BOT")["label"] == "5系攻击"
+
+
+def test_saving_the_military_plan_renames_the_task(console: Console) -> None:
+    """改完军力方案就重派名字——那才是现在真正改变「从哪儿出发」的那个动作。
+
+    不在这一下重派的话，用户把方案从 5 系改到 1 系、卡上仍写着「5系攻击」，
+    而那个名字会一路进日志与固化记录。
+
+    ⚠️ 顺带钉住「重派不许升序号」：`_derive_bot_name` 把自己排除在「已占用」之外，
+    否则每存一次方案名字就变成「1系攻击 2」「1系攻击 3」……而名字不稳定比重名更糟。
+    """
+    task_id = _military_bot(console, (Coordinate(5, 261, 8), 6))
+    assert console.task("BOT")["label"] == "5系攻击"
+
+    planet = console.client.post(
+        "/api/attack-planets", json={"galaxy": 1, "system": 55, "position": 6}
+    )
+    moved = console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[{"planet_id": planet.json()["planet_id"], "fleet_lines": 3, "enabled": True}],
+    )
+
+    assert moved.status_code == 200, moved.text
+    assert console.task("BOT")["label"] == "1系攻击"
+    for _ in range(2):
+        console.client.put(
+            f"/api/missions/{task_id}/origins",
+            json=[{"planet_id": planet.json()["planet_id"], "fleet_lines": 3, "enabled": True}],
+        )
+    assert console.task("BOT")["label"] == "1系攻击", "重存同一份方案不许把序号往上顶"
+
+
+def test_a_plan_spanning_two_galaxies_is_named_after_the_lowest_and_stays_stable(
+    console: Console,
+) -> None:
+    """方案跨两个银河系时按**最小**的那个取名，而且不随行序抖动。
+
+    `replace_mission_origins` 是整表重写，行序跟着用户在页面上加减那几行走。
+    取「第一行」的话，用户只是把两行的次序换一下就会给任务改名——而名字是日志里
+    认人的字段。所以判据是「银河系号升序取第一个」（`_origin_galaxies`）。
+
+    「这个任务其实也从 9 系出发」这件事不靠名字说：卡片主行念的是「2 个出发点」，
+    摘要那一行把两颗逐个列出来，银河系标记写着「4/9系」。
+    """
+    task_id = _military_bot(console, (Coordinate(9, 250, 8), 2), (Coordinate(4, 277, 15), 6))
+    assert console.task("BOT")["label"] == "4系攻击"
+
+    planets = {
+        f"{item['galaxy']}:{item['system']}:{item['position']}": item["planet_id"]
+        for item in console.client.get("/api/attack-planets").json()
+    }
+    reordered = console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[
+            {"planet_id": planets["4:277:15"], "fleet_lines": 6, "enabled": True},
+            {"planet_id": planets["9:250:8"], "fleet_lines": 2, "enabled": True},
+        ],
+    )
+
+    assert reordered.status_code == 200, reordered.text
+    assert console.task("BOT")["label"] == "4系攻击", "换一下行序就改名的话，日志里认不出人"
+
+
+def test_a_paused_origin_stops_counting_towards_the_name(console: Console) -> None:
+    """停用一颗出发点之后，名字跟着**还在派的**那一颗走。
+
+    停掉 4 系那颗、只剩 9 系在派，任务却还叫「4系攻击」的话，页面就在说一句
+    「从 4 系出发」的假话——而停用与删除的善后完全不同，所以那一颗仍然列在卡上、
+    仍然标着「（停用）」。
+    """
+    task_id = _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+    planets = {
+        f"{item['galaxy']}:{item['system']}:{item['position']}": item["planet_id"]
+        for item in console.client.get("/api/attack-planets").json()
+    }
+
+    console.client.put(
+        f"/api/missions/{task_id}/origins",
+        json=[
+            {"planet_id": planets["4:277:15"], "fleet_lines": 6, "enabled": False},
+            {"planet_id": planets["9:250:8"], "fleet_lines": 2, "enabled": True},
+        ],
+    )
+
+    task = console.task("BOT")
+    assert task["label"] == "9系攻击"
+    assert task["galaxies"] == [9]
+    assert "4:277:15 · 6 条（停用）" in str(task["summary"]), "停用的那颗照样要列出来"
+
+
+def test_turning_military_priority_off_hands_the_name_back_to_the_legacy_origin(
+    console: Console,
+) -> None:
+    """`by_military` 为假时，名字回到任务级那一颗——那条路上它真的决定从哪儿出发。
+
+    关掉之后选靶换成「按坐标顺序、按范围打」（`nearest_first(bot_targets_in_range)`），
+    军力方案那张表一行都不参与派遣。继续按它取名，就是照一份没生效的配置命名。
+
+    ⚠️ **页面上已经没有这个开关了**（用户口径 2026-08-22：「原来的攻击模式已经
+    被废弃了，前端页面不需要兼容」），但接口这一路还在、库里还可能存着 `false`，
+    而命名规则必须对那一档说得出话——所以这条用例钉的是**后端**行为。后端那一轮
+    清理是单独登记的待办；等它做了，这条用例才跟着走。
+    """
+    # 非军力优先那条分支是**按范围**打的，范围内一个已记录的 bot 都没有时后端会
+    # 400（那是另一条判据）。这里要验的是改名，所以先让范围立得住。
+    _seed_bot(console.repository, Coordinate(2, 150, 5))
+    task_id = _military_bot(console, (Coordinate(5, 261, 8), 6))
+    console.client.patch(f"/api/missions/{task_id}", json={"origin": "4:277:15"})
+    assert console.task("BOT")["label"] == "5系攻击"
+
+    off = console.client.patch(
+        f"/api/missions/{task_id}",
+        json={
+            "params": {"by_military": False, "galaxy": 2, "first_system": 150, "last_system": 151}
+        },
+    )
+
+    assert off.status_code == 200, off.text
+    assert console.task("BOT")["label"] == "4系攻击"
+
+
+def test_the_page_gets_the_plan_and_the_galaxies_it_needs_to_colour_the_card(
+    console: Console,
+) -> None:
+    """`/api/scheduler` 下发生效中的军力方案与银河系号，页面不自己判「哪个作数」。
+
+    页面据此做三件事：主行念「实际会从哪儿派」、卡片按银河系分色、卡上写出银河系号
+    （颜色每 9 个银河系循环一次，所以号码必须在卡上）。判据只有一份，在
+    `_origin_galaxies` 里——任务名用的也是它，所以名字、颜色、出发点必然说同一件事。
+
+    ⚠️ **不派遣的两条链路不给银河系号**：给了，页面就会按颜色把它们也归到某个
+    银河系，而那句颜色说的是假话（`scan_command()` 连出发点都不接）。
+    """
+    _military_bot(console, (Coordinate(4, 277, 15), 6), (Coordinate(9, 250, 8), 2))
+
+    bot = console.task("BOT")
+    assert bot["galaxies"] == [4, 9]
+    assert [(item["galaxy"], item["fleet_lines"]) for item in bot["origins"]] == [(4, 6), (9, 2)]
+    assert console.task("SCAN")["galaxies"] == []
+    assert console.task("RANKING")["galaxies"] == []
+    # 海盗只有任务级那一颗，方案是空的——那一档也要有银河系号，它照样派舰队。
+    assert console.task("PIRATE")["origins"] == []
+    assert console.task("PIRATE")["galaxies"] == [2]
+
+
 def test_a_military_row_shows_its_real_origins_not_the_stale_task_level_count(
     console: Console,
 ) -> None:

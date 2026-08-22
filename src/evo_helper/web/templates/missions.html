@@ -398,39 +398,30 @@
   // 每条链路的参数框。**次序即卡上从左到右的次序**，与
   // `web.display.PARAM_LABELS` 是同一批键。
   //
-  // ⚠️ **BOT 这一档是空的，而且是有意留空的**（2026-08-22 改版）。
-  // 从前它是「星系 / 系号 / –」三个范围框。撤掉的依据在
-  // `application/mission_scheduler.py` 的 `_bot_targets_for`：
+  // ⚠️ **BOT 这一档是空的，而且是有意留空的。** bot 攻击在页面上已经没有任何
+  // 参数框：范围那三个（星系 / 起始系号 / 结束系号）只服务于**已废弃**的那条
+  // 选靶分支：
   //
   //     if _bot_by_military(params_json):
-  //         return most_valuable_first(...)          ← 军力优先走这条，不看范围
+  //         return most_valuable_first(...)          ← 现在只走这条
   //     in_range = bot_targets_in_range(..., **_bot_range(params_json))
-  //     return nearest_first(in_range, origin)       ← 按范围筛的是这条
+  //     return nearest_first(in_range, origin)       ← 按范围筛的那条，已废弃
   //
-  // 也就是说：军力优先模式下那三个字段**一次都没被用到**。一个填了不生效的
-  // 输入框比没有更糟——用户会以为自己把这一轮的范围配好了。
+  // ⚠️ **这三个字段在页面上来回过三次，理由必须留在这里**，否则下一个人会以为
+  // 是随手改的：
+  // ① 2026-08-22 第一版把它们从页面整个撤掉（军力优先模式下确实一次都用不到）；
+  // ② 随后发现那样留下一个陷阱——「军力优先」开关能关，关掉走上面第二条分支，
+  //    后端缺 `galaxy` 直接 400，而页面上没有任何地方能填它，等于把一种运行模式
+  //    删掉了、只是删得不明说；
+  // ③ 于是它们回到「更多」里，跟着那个开关反向显隐；
+  // ④ 用户口径（2026-08-22）：「目前原来的攻击模式已经被废弃了，前端页面不需要
+  //    兼容。」——那条分支不再是「还走得通的另一条路」，于是开关和这三个框一起
+  //    从页面上撤掉。②那个陷阱随之消失：没有开关，就没有「关掉之后没处填」。
   //
-  // ⚠️ **后端那三个字段全部保留**（`_bot_range`、`domain.missions.
+  // ⚠️ **后端那三个字段一个都没删**（`_bot_range`、`domain.missions.
   // bot_targets_in_range`、`display.PARAM_LABELS` 里的「星系 / 起始系号 /
-  // 结束系号」）：非军力优先那条分支还在跑（「军力优先」开关只是挪进了每张卡的
-  // 「更多」里，没有删），存量任务的 `params_json` 里也还存着这三个值，
-  // 配置固化记录要认得出它们才念得出「改了什么」。这里空着的只是**页面渲染**。
-  // bot 攻击的**范围**三字段。
-  //
-  // ⚠️ **刻意不放在 `PARAM_FIELDS.BOT` 里**：那个表驱动的是**主行**的渲染，
-  // 而 2026-08-22 改版之后主行不再有范围框（军力优先模式下
-  // `most_valuable_first` 压根不看它们）。它们只在「更多」里、且只在军力优先
-  // 关掉时显形——那时它们是**必填**的（后端缺 `galaxy` 会 400）。
-  //
-  // ⚠️ **键名走 `dataset.param`**，和 `PARAM_FIELDS` 那批一致：保存处理器
-  // （`.mission-param` 那个）认的是这个属性，写成别的名字就变成一个填了
-  // 永远存不进去的框——而「配了没效果」是这套系统里最贵的那类故障。
-  const BOT_RANGE_FIELDS = [
-    { key: 'galaxy', label: '星系', width: 60, min: 1 },
-    { key: 'first_system', label: '系号', width: 78, min: 1 },
-    { key: 'last_system', label: '–', width: 78, min: 1 },
-  ];
-
+  // 结束系号」）：存量任务的 `params_json` 里还存着它们，配置固化记录要认得出来
+  // 才念得出「改了什么」。后端那一轮清理另有待办，这里撤的只是**页面渲染**。
   const PARAM_FIELDS = {
     PIRATE: [{ key: 'radius', label: '半径', width: 78, min: 1, max: 999 }],
     BOT: [],
@@ -481,10 +472,53 @@
   // 这一页没有前端构建，引一个 tooltip 组件就是给部署添一份麻烦。
   const MILITARY_SELECTION_TIP = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
   const MILITARY_ORIGIN_TIP = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
-  // 「军力优先」为什么被挪进折叠区、以及关掉它意味着什么。关掉不是「不打」，
-  // 是换一条完全不同的选靶路：按坐标顺序、按范围筛（那三个范围框已经不在页面上
-  // 渲染了，见 `PARAM_FIELDS.BOT`）。所以它默认开着，也留着能关。
-  const MILITARY_MODE_TIP = '默认开。开＝按「军力 ÷ 往返小时」选靶（本页上面那三个参数就是给它用的）；关＝回到按坐标顺序、按范围打的老路，而范围三个字段已经不在页面上渲染，只能靠库里存着的旧值。日常不要动它，这里留着只是因为「非军力优先」这条运行模式还在。';
+  // ⚠️ 这里从前有个 `MILITARY_MODE_TIP`，讲的是「军力优先」开关关掉之后会怎样。
+  // 开关本身已经删了（用户口径 2026-08-22：「目前原来的攻击模式已经被废弃了，
+  // 前端页面不需要兼容」），说明也跟着删——留一句解释一个不存在的控件的话，
+  // 只会让下一个人去找那个控件。军力攻击现在**恒按军力方案派遣**，
+  // 新任务落库就是 `by_military: true`（`create_mission`）。
+  // 「任务级出发点」这个遗留字段为什么还在、又为什么不在主行。
+  //
+  // ⚠️ **这一段是这次改版的核心。** 生产实测（2026-08-22）：#2 号任务的
+  // `mission_tasks.origin_*` 写着 `4:277:15`，而军力方案里配的是 `5:261:8`；
+  // #9 号的旧列也是 `4:277:15`，方案却是 `1:55:6`。主行从前把这个下拉框摆在
+  // 显眼处，用户读到的「出发 4:277:15」和舰队真正出发的地方是两回事——同一张卡
+  // 上两个「出发点」互相打脸，而作数的是被折起来的那一个。
+  //
+  // 字段本身**一个都没删**：海盗从它出发、军力榜按星球统计效率读它、军力方案
+  // 一行都没配时的 bot 也从它出发。所以它进「更多」，并把「什么时候才作数」
+  // 写在脸上。
+  const LEGACY_ORIGIN_TIP = '这是任务级的那一颗出发星球（mission_tasks.origin_*）。军力攻击配了军力方案时它不决定舰队去哪儿——调度器只看下面那份方案（mission_task_origins 非空就不看这一列）；方案一行都没配时它才是真正的出发点。它同时还是「按星球效率」那一页的统计口径，所以不会被删。';
+  const PIRATE_ORIGIN_TIP = '海盗只有这一个出发点（军力方案只给 bot 攻击用）。留空＝跟随全局主星。';
+
+  // 这个任务「实际会从哪儿派」，以及卡上那个银河系标记。
+  //
+  // ⚠️ **判据只有一份，而且在服务端**：`task.origins` 是生效中的军力方案
+  // （`web.persistent_service._task_view`，非军力优先或方案为空时下发空列表），
+  // `task.galaxies` 是命名与配色共用的那串银河系号
+  // （`_origin_galaxies`，升序去重，`[0]` 就是任务名用的那个）。页面在这里自己
+  // 算一份「哪个才作数」的话，卡上的名字、颜色、出发点三者迟早各说一套——而这
+  // 正是这次改版要修的那个 bug。
+  function dispatchFacts(task) {
+    const plan = task.origins || [];
+    const coordinate = (item) => `${item.galaxy}:${item.system}:${item.position}`;
+    const live = plan.filter((item) => item.enabled);
+    // 方案为空 = 舰队真的从任务级那一颗出发（调度器同一档回落，见
+    // `MissionScheduler._configured_origins`）。
+    if (!plan.length) {
+      return { text: task.origin || '—', title: `任务级出发点 ${task.origin}（没有配军力方案）` };
+    }
+    const full = plan
+      .map((item) => `${coordinate(item)} · ${item.fleet_lines} 条${item.enabled ? '' : '（停用）'}`)
+      .join(' / ');
+    // 一颗都没启用是一种**要说出来的**配置：方案配着、却一发都派不出去。
+    // 显示成「1 个出发点」会让用户以为它在派。
+    if (!live.length) return { text: `${plan.length} 个出发点全部停用`, title: full };
+    if (live.length === 1) return { text: coordinate(live[0]), title: full };
+    // 多于一个时主行只报个数（列全会把整张卡顶宽），完整清单在摘要那一行和这里的
+    // `title` 里各有一份，「更多」里还有一份可编辑的。
+    return { text: `${live.length} 个出发点`, title: full };
+  }
 
   const errorBox = document.getElementById('mission-error');
   const hint = document.getElementById('mission-hint');
@@ -575,6 +609,21 @@
     field.className = 'fld';
     field.append(...nodes);
     return field;
+  }
+
+  // 输入框后面那个单位（「小时」「个」）。
+  //
+  // ⚠️ **必须是元素，不能是裸文本节点。** 从前这里塞的是
+  // `document.createTextNode(' 小时')`：裸文本在 flex 容器里只成为一个匿名项，
+  // 前后那点间距全靠 `gap`，而 `gap` 一小，页面上就读成
+  // 「读数有效期 [6] 小时窗口门限 [200] 个军力上限」——单位和下一个字段的标签黏
+  // 成了一个词（用户口径 2026-08-22：「框体与文字之间增加左右间隙」）。
+  // 做成 `.unit` 之后，间距由 CSS 一处说了算，也才有个能悬停、能查的节点。
+  function makeUnit(text) {
+    const span = document.createElement('span');
+    span.className = 'unit';
+    span.textContent = text;
+    return span;
   }
 
   // ---- 定时窗口的时区换算 ---------------------------------------------------
@@ -668,42 +717,26 @@
     list.append(line);
   }
 
-  // 「军力优先」开关拨动之后，这张卡上该露出什么。
+  // 运行中把军力那几个控件锁上。
   //
-  // ⚠️ **出发星球与航线数那两个控件不再跟着开关藏起来**（2026-08-22 改版）。
-  // 从前军力模式会把它们换成「多出发点方案」，可它们在军力模式下并没有失效：
-  // 没配多出发点方案时调度器就回落到任务级的这一颗（`_configured_origins`），
-  // 而且**任务名正是按它的银河系取的**。藏起来就等于把一个还在生效、还在决定
-  // 任务叫什么名字的配置藏了。多出发点方案改为放进「更多」里，与它并存。
+  // ⚠️ **这个函数从前叫 `setMilitaryVisible`，管的是显隐**：卡上有一个「军力
+  // 优先」开关，关着的时候军力那三个参数和多出发点方案整块藏起来、范围三字段
+  // 反向露出来。开关和范围框都随「原来的攻击模式被废弃」一起删了（用户口径
+  // 2026-08-22），于是**没有任何东西再需要按状态显隐**——军力方案恒显示，因为
+  // 它是这条链路唯一的派遣依据。剩下的只有「运行中配置已固化，一个都不许改」。
   //
-  // ⚠️ **「保存军力方案」那个按钮不跟着开关藏。** 它存的是整份军力方案，
-  // **包括开关本身**（`saveMilitary` 里 `by_military: enabled`，关着的时候只送
-  // 这一个键）。跟着一起藏起来的话，用户把开关拨到「关」之后就再没有任何按钮
-  // 能把这个状态存下来——那等于这个开关只能开不能关，而「留着它」的全部意义
-  // 就是那条路还走得通。所以它挪到了开关那一行，恒在。
-  function setMilitaryVisible(row, locked) {
-    const toggle = row.querySelector('.military-enabled');
+  // 锁而不是藏：运行中最想看的恰恰是「这一轮按什么配置在跑」，看得见改不了。
+  // 后端也会 409，但用户不该点下去才发现。
+  function setMilitaryLock(row, locked) {
     const settings = row.querySelector('.military-settings');
     const militaryDispatch = row.querySelector('.military-dispatch');
     const save = row.querySelector('.military-save');
-    if (!toggle || !settings || !militaryDispatch || !save) return;
-    const enabled = toggle.checked;
-    settings.hidden = !enabled;
-    militaryDispatch.hidden = !enabled;
-    // 范围三字段**反向**显隐：军力优先关掉时它们才生效，而那时它们是必填的
-    // （后端缺 `galaxy` 会 400）。见 `rangeRow` 上那段。
-    const range = row.querySelector('.mission-range');
-    if (range) {
-      range.hidden = enabled;
-      for (const input of range.querySelectorAll('input')) input.disabled = locked;
-    }
+    if (!settings || !militaryDispatch || !save) return;
     for (const input of settings.querySelectorAll('input, select')) input.disabled = locked;
     for (const input of militaryDispatch.querySelectorAll('input, select')) input.disabled = locked;
+    // 按钮不在上面那圈 `input, select` 里，得单独锁一次（「增加出发点」「移除」）。
     for (const button of militaryDispatch.querySelectorAll('button')) button.disabled = locked;
-    // 按钮不在上面那圈 `input, select` 里，得单独锁一次——运行中配置已固化，
-    // 后端也会 409，但用户不该点下去才发现。
     save.disabled = locked;
-    toggle.disabled = locked;
   }
 
   function loadMilitaryOrigins(task, row) {
@@ -724,7 +757,7 @@
         } else {
           addMilitaryOrigin(list, { fleet_lines: task.fleet_lines, enabled: true });
         }
-        setMilitaryVisible(row, latest && latest.config_locked === true);
+        setMilitaryLock(row, latest && latest.config_locked === true);
       })
       .catch(fail);
   }
@@ -775,8 +808,20 @@
     name.textContent = task.label || MISSION_LABELS[task.kind] || task.kind;
     line.append(name);
 
-    // 出发星球与航线数。**航线上限按星球各一份**，所以这两个必须挨在一起——
-    // 只看到航线数会以为那是账号总额。
+    // 出发点。**主行只说事实，不放控件**（2026-08-22 第二轮改版）。
+    //
+    // ⚠️ **一张卡上不许有两个「出发点」。** 从前主行摆的是绑在
+    // `mission_tasks.origin_*` 上的下拉框，而军力攻击真正据以派遣的是军力方案
+    // （`mission_task_origins`，见 `_military_assignments` → `_configured_origins`）。
+    // 生产实测（2026-08-22）：#2 号任务下拉框里显示 `4:277:15`、方案里配的是
+    // `5:261:8`；主行那个数越显眼，误判「舰队从哪儿起飞」的概率就越大。
+    //
+    // 所以主行改成一段**只读文字**，念的是「实际会从哪儿派」（`dispatchFacts`
+    // 按服务端下发的 `origins` 算，方案为空时才回落到任务级那一颗）。那个遗留
+    // 下拉框和任务级航线数一起挪进「更多」，并在那里写明它什么时候才作数。
+    // 航线数同理：军力优先那一档 `mission_tasks.fleet_lines` 是个永远不会更新的
+    // 残值（见 `_summary` 上那段），主行摆着它就是在报一个假数——每颗星球各自的
+    // 航线数在摘要那一行里逐颗列着。
     //
     // ⚠️ **不派遣的那两条链路都不给这两个控件**（2026-08-22 改版）：
     //
@@ -804,19 +849,21 @@
           + ' · 始终填空隙 · 不参与排序';
       line.append(note);
     } else {
+      // 银河系标记。**颜色只是加速，号码本身必须写在卡上**：这一页的既有规矩是
+      // 「状态绝不只用颜色承载」，同一条规矩这里照用——色相按银河系号取，而 9 个
+      // 之后循环（`galaxyHue`），光靠颜色分不出 1 系和 10 系。
+      const galaxy = document.createElement('span');
+      galaxy.className = 'galaxy-tag';
+      galaxy.textContent = '—系';
+      line.append(galaxy);
       // 「跟着全局走」和「就是这个值」显示成同一个数字的话，用户改了全局值之后
-      // 会以为任务也跟着变了。所以这一句紧跟在那两个控件后面。
+      // 会以为任务也跟着变了。所以这一句紧跟在出发点后面。
       const defaults = document.createElement('span');
       defaults.className = 'muted mission-defaults';
-      const origin = document.createElement('select');
-      origin.className = 'mission-origin';
-      origin.style.width = '175px';
-      origin.setAttribute('aria-label', '出发星球');
-      populateTaskPlanetSelect(origin);
-      const lines = makeInput('mission-lines', {
-        type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
-      });
-      line.append(makeField('出发 ', origin), makeField('航线 ', lines), defaults);
+      const dispatch = document.createElement('span');
+      dispatch.className = 'mission-dispatch coord';
+      dispatch.textContent = '—';
+      line.append(makeField('出发 ', dispatch), defaults);
     }
 
     // 参数框。BOT 那一档是空的（见 `PARAM_FIELDS` 上那段），空的就一个节点
@@ -881,8 +928,8 @@
       // 现在挪进这个 ⓘ（`MILITARY_SELECTION_TIP`，一字未改）：它就贴在这三个框
       // 旁边，够得着，而不再按任务条数把同一段话乘一遍。
       settings.append(
-        makeField('读数有效期 ', maxAge, document.createTextNode(' 小时')),
-        makeField('窗口门限 ', topN, document.createTextNode(' 个')),
+        makeField('读数有效期 ', maxAge, makeUnit('小时')),
+        makeField('窗口门限 ', topN, makeUnit('个')),
         makeField('军力上限 ', maximum),
         makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP),
       );
@@ -951,9 +998,12 @@
 
     // ---- 「更多」折叠区 -----------------------------------------------------
     //
-    // 主行只放每天都要看的那几样。剩下三样搬进这里：「军力优先」开关、定时开关、
-    // 多出发星球方案。它们的共同点是**配一次就不再动**，而它们恒展开时买到的
-    // 是一整片空框。
+    // 主行只放每天都要看的那几样。剩下三样搬进这里：定时开关、军力方案
+    // （出发点 / 航线）、任务级出发点。它们的共同点是**配一次就不再动**，
+    // 而它们恒展开时买到的是一整片空框。
+    //
+    // ⚠️ 这里从前还有「军力优先」那个开关，2026-08-22 随「原来的攻击模式被废弃」
+    // 一起删了（用户口径）。
     //
     // ⚠️ **配了定时的任务不许藏。** 把一份已经生效的配置折起来，比多占几行危险
     // 得多：用户看不见它，就会以为定时没生效，然后去改别的东西。这里守两道——
@@ -972,14 +1022,15 @@
     const moreHead = document.createElement('summary');
     // 标题把里面真有的东西列出来。海盗与扫描没有军力那两样，写上去就是一句
     // 「点开却找不到」——用户会以为这一块坏了。
-    moreHead.append('更多：'
-      + (task.kind === 'BOT' ? '军力优先 · ' : '')
-      + '定时开关（UTC+8）'
-      + (task.kind === 'BOT' ? ' · 多出发星球方案' : ''));
+    moreHead.append('更多：定时开关（UTC+8）'
+      + (task.kind === 'BOT' ? ' · 军力方案（出发点 / 航线）' : '')
+      + (fillsGaps ? '' : ' · 任务级出发点'));
     // 折叠态的那一行小字：没配就说没配，配了就把两端的时刻念出来。
     const windowState = document.createElement('span');
     windowState.className = 'muted mission-window-state';
-    windowState.style.marginLeft = '6px';
+    // 6px → 12px：这一行现在列着三样东西（定时 / 军力方案 / 任务级出发点），
+    // 最后一样和这句小字之间 6px 会读成「任务级出发点未设定时」。
+    windowState.style.marginLeft = '12px';
     windowState.textContent = '未设定时';
     moreHead.append(windowState);
     more.append(moreHead);
@@ -987,59 +1038,16 @@
     // 折起来的又掰开。`toggle` 事件不冒泡，所以只能挂在这个节点上。
     more.addEventListener('toggle', () => { row.dataset.moreTouched = '1'; });
 
-    if (task.kind === 'BOT') {
-      // 「军力优先」。
-      //
-      // ⚠️ **它是一种运行模式，不是一个装饰**：关掉之后选靶换成「按坐标顺序、
-      // 按范围打」那条分支（`nearest_first(bot_targets_in_range(...))`）。
-      // 2026-08-22 改版只把它从主行挪进这里（用户口径：「主行上不需要这个按钮」），
-      // **没有删**——删了就等于从界面上删掉一种运行模式。默认开。
-      const modeLabel = document.createElement('label');
-      modeLabel.className = 'inline-label military-toggle';
-      modeLabel.style.cursor = 'pointer';
-      const militaryToggle = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
-      modeLabel.append(militaryToggle, document.createTextNode(' 军力优先'));
-      // 「保存军力方案」摆在开关这一行，**任何模式下都够得着**（理由见
-      // `setMilitaryVisible` 上那段）。它存的是整份军力方案：开关、下面三个参数、
-      // 以及多出发点那一组。
-      const save = document.createElement('button');
-      save.type = 'button';
-      save.className = 'btn primary small military-save';
-      save.textContent = '保存军力方案';
-      save.title = '保存这张卡的军力配置：军力优先开关、主行那三个参数、以及下面的多出发星球方案';
-      const modeRow = document.createElement('div');
-      modeRow.className = 'more-line';
-      modeRow.append(modeLabel, makeTips('军力优先说明', MILITARY_MODE_TIP), save);
-      more.append(modeRow);
-
-      // ⚠️ **范围三字段：只在军力优先「关掉」时显形，而且必须在。**
-      //
-      // 改版第一版把它们从页面上整个撤掉了，理由是军力优先模式下
-      // `most_valuable_first` 压根不看它们（那是对的）。但那样就留下一个陷阱：
-      // 开关**能关**、关掉之后走 `nearest_first(bot_targets_in_range(...))`
-      // 那条分支，而后端会因为缺 `galaxy` 直接 400 ——**而页面上已经没有
-      // 任何地方能填它**。也就是「开关只能开不能关」，等于那条运行模式
-      // 事实上被删掉了，只是删得不明说。
-      //
-      // 所以它们回到这里，跟着开关反向显隐：开着 = 军力选靶，这三个数没用、
-      // 藏起来；关着 = 按坐标顺序按范围打，这三个数是**必填**。
-      const rangeRow = document.createElement('div');
-      rangeRow.className = 'more-line mission-range';
-      const rangeHint = document.createElement('span');
-      rangeHint.className = 'inline-label';
-      rangeHint.textContent = '范围（仅非军力优先时生效）';
-      rangeRow.append(rangeHint);
-      for (const field of BOT_RANGE_FIELDS) {
-        const input = makeInput('mission-param', {
-          type: 'number', min: String(field.min ?? 1),
-          style: `width:${field.width}px`, 'aria-label': field.label,
-        });
-        // `dataset.param`，不是 `dataset.key`——保存与回显两处都认这个属性。
-        input.dataset.param = field.key;
-        rangeRow.append(makeField(`${field.label} `, input));
-      }
-      more.append(rangeRow);
-    }
+    // ⚠️ **这里从前有两块，2026-08-22 一起删了**：「军力优先」那个复选框，
+    // 和跟着它反向显隐的范围三字段（星系 / 起始系号 / 结束系号）。
+    // 用户口径：「目前原来的攻击模式已经被废弃了，前端页面不需要兼容。」
+    // 也就是 `nearest_first(bot_targets_in_range(...))` 那条选靶分支不再是「另一
+    // 条还走得通的路」——留着开关就是留着一个通往废弃行为的入口，而那三个框
+    // 只服务于那条路。军力攻击现在恒按军力方案派遣，新任务落库就是
+    // `by_military: true`。**后端字段一个都没删**（另有清理待办），页面只是不再
+    // 暴露它们；这几轮来回的完整理由记在 `PARAM_FIELDS` 上面那段里。
+    //
+    // 「保存军力方案」那个按钮没跟着删，它挪到了下面那一组出发点的标题行上。
 
     // 定时开关。**留空 = 这一端不限**，两端都留空就是完全按现在的样子跑。
     //
@@ -1082,25 +1090,75 @@
     more.append(windowRow);
 
     if (task.kind === 'BOT') {
-      // 多出发星球方案。军力模式下才生效，所以跟着「军力优先」显隐
-      // （`setMilitaryVisible`）。
+      // 军力方案：这条链路**唯一**的派遣依据（`_military_assignments` →
+      // `_military_origins` → `_configured_origins`）。
+      //
+      // ⚠️ **恒显示，不再跟任何开关显隐。** 从前它跟着「军力优先」藏起来，而那个
+      // 开关随「原来的攻击模式被废弃」删掉了（用户口径 2026-08-22）。把这条链路
+      // 唯一的派遣依据藏在一个条件后面，本来就只有「还有另一条路」时才说得通。
       const militaryDispatch = document.createElement('div');
       militaryDispatch.className = 'military-dispatch more-line';
-      militaryDispatch.hidden = true;
       const originHead = document.createElement('div');
       originHead.append('出发点 / 航线　');
       const addOrigin = document.createElement('button');
       addOrigin.type = 'button';
       addOrigin.className = 'btn small military-add-origin';
       addOrigin.textContent = '增加出发点';
+      // 「保存军力方案」。⚠️ **它必须和这一组待编辑的行摆在一起**：从前它长在
+      // 「军力优先」那一行上，理由是那一行不会被藏（`saveMilitary` 要能存下
+      // 「关」这个状态）。开关删了之后那个理由随之消失，而「改完这几行、就在
+      // 这几行旁边按保存」才是它该在的地方——存的正是这一组加上上面那三个参数。
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'btn primary small military-save';
+      save.textContent = '保存军力方案';
+      save.title = '保存这张卡的军力配置：主行那三个参数，以及下面这一组出发点与航线';
       // 这句说明每一张卡长得一模一样（它讲的是这个功能怎么用，不是这一张卡的
       // 事实），所以进 ⓘ 而不是再铺一行 `<div>`。
       originHead.append(addOrigin, document.createTextNode(' '),
-                        makeTips('多出发点说明', MILITARY_ORIGIN_TIP));
+                        makeTips('多出发点说明', MILITARY_ORIGIN_TIP),
+                        document.createTextNode(' '), save);
       const origins = document.createElement('div');
       origins.className = 'military-origin-list';
       militaryDispatch.append(originHead, origins);
       more.append(militaryDispatch);
+    }
+
+    // 任务级出发点与航线数（遗留的 `mission_tasks.origin_*` / `fleet_lines`）。
+    //
+    // ⚠️ **判据仍然是 `fillsGaps`，不是 `isScan`。** 扫描与军力榜两条都不派遣，
+    // 两个函数签名（`scan_command()` / `ranking_command()`）都不接出发点和航线，
+    // 填进去的值从来没有到达过 runner——一个改了也不生效的输入框比没有更糟。
+    // 挪进「更多」不改这一条：不该有的地方照旧一个控件都不建。
+    //
+    // ⚠️ **控件本身一个都不许删。** 海盗从这一颗出发；军力方案一行都没配时的
+    // bot 也从这一颗出发（`_configured_origins` 那一档回落）；「按星球效率」
+    // 那一页还按它统计。它只是不该继续摆在主行上冒充「军力攻击从哪儿起飞」
+    // ——那一句由主行那段只读文字负责。
+    if (!fillsGaps) {
+      const legacy = document.createElement('div');
+      legacy.className = 'more-line mission-legacy-origin';
+      const head = document.createElement('span');
+      head.className = 'inline-label';
+      // 文案按链路分：海盗没有军力方案，这一颗就是它唯一的出发点，写成
+      // 「只在军力方案为空时生效」是句假话。
+      head.textContent = task.kind === 'BOT'
+        ? '任务级出发点（只在军力方案一行都没配时才生效）'
+        : '出发点';
+      const origin = document.createElement('select');
+      origin.className = 'mission-origin';
+      origin.setAttribute('aria-label', '任务级出发星球');
+      populateTaskPlanetSelect(origin);
+      const lines = makeInput('mission-lines', {
+        type: 'number', min: 1, style: 'width:72px', 'aria-label': '任务级航线数',
+      });
+      legacy.append(
+        head,
+        makeField('出发 ', origin),
+        makeField('航线 ', lines, makeUnit('条')),
+        makeTips('任务级出发点说明', task.kind === 'BOT' ? LEGACY_ORIGIN_TIP : PIRATE_ORIGIN_TIP),
+      );
+      more.append(legacy);
     }
 
     row.append(more);
@@ -1189,7 +1247,49 @@
       // 展开只是去看，里面那两个输入框上一行已经置灰了，看得见改不了。
       row.querySelector('.mission-window-toggle').disabled = false;
       // 卡整体压暗：没参与调度的那些，一眼能和在跑的分开。
+      // ⚠️ **压暗只是加速，不是唯一信号**：`.off` 那一套（压暗 + 左边框转灰转虚线
+      // + 去饱和）与状态 chip 里那个「未启用」三个字并存，谁都不许单独承担。
       row.classList.toggle('off', !task.enabled);
+
+      // 银河系配色与标记。**色相由服务端下发的 `galaxies` 算，页面不自己判**
+      // 「哪个出发点才作数」——判据只有一份，在 `_origin_galaxies` 里，任务名用的
+      // 也是同一份，所以卡的颜色、卡上的号码、卡上的名字必然说同一件事。
+      //
+      // ⚠️ 色相**每 9 个银河系循环一次**（40° 一档），所以 1 系和 10 系同色。
+      // 这正是「号码必须写在卡上」的理由：颜色只做分组加速，分不清就看字。
+      const galaxyTag = row.querySelector('.galaxy-tag');
+      if (galaxyTag) {
+        const galaxies = task.galaxies || [];
+        galaxyTag.textContent = galaxies.length ? `${galaxies.join('/')}系` : '—系';
+        galaxyTag.title = galaxies.length > 1
+          ? `这个任务配置的出发点分布在 ${galaxies.join('、')} 系；任务名按最小的那个取（${galaxies[0]}系）`
+          : '出发点所在的银河系（卡片配色按它分组，颜色每 9 个银河系循环一次）';
+        // 号码没变就不动样式：这一段每 2 秒跑一次。
+        // `data-galaxy` 是 CSS 的挂钩（`.mission-card[data-galaxy]`），
+        // `--galaxy-hue` 是那一档的色相。两个一起写、一起删，别让 CSS 命中一张
+        // 没有色相的卡（那会算出 `hsl(0deg ...)`，也就是把没配出发点的卡染成红色）。
+        const current = galaxies.length ? String(galaxies[0]) : '';
+        if ((row.dataset.galaxy || '') !== current) {
+          if (current === '') {
+            delete row.dataset.galaxy;
+            row.style.removeProperty('--galaxy-hue');
+          } else {
+            row.dataset.galaxy = current;
+            row.style.setProperty('--galaxy-hue', `${((galaxies[0] - 1) % 9) * 40}deg`);
+          }
+        }
+      }
+
+      // 主行那句「实际会从哪儿派」。跟库走，每轮都写——它不是输入框，写回去不会
+      // 顶掉任何人正在敲的字，而它说的正是这次改版要修的那件事。
+      const dispatch = row.querySelector('.mission-dispatch');
+      if (dispatch) {
+        const facts = dispatchFacts(task);
+        dispatch.textContent = facts.text;
+        // ⚠️ 截断与 `title` 是一对：多出发点那一档主行只写「N 个出发点」，
+        // 完整清单必须够得着，否则「哪一颗停用了」就只剩摘要那一行在说。
+        dispatch.title = facts.title;
+      }
       // 拖拽结束时要把这一块里原有的那几个 priority 值重新分配一遍（见
       // `onCardDragEnd`），所以每张卡得记着自己现在是几。
       row.dataset.priority = task.priority;
@@ -1236,9 +1336,13 @@
 
       // 「跟着全局走」和「就是这个值」显示成同一个数字的话，用户改了全局值
       // 之后会以为任务也跟着变了。所以这一句必须写出来。
+      // ⚠️ **军力方案生效时这一句必须闭嘴。** 「出发星球跟随全局」讲的是任务级
+      // 那一列没填过，而那一列此刻不决定任何舰队去哪儿——照旧念出来，就又造出一个
+      // 「到底从哪儿出发」的说法。同理航线数：方案生效时航线按每颗星球各自配的算。
+      const planActive = (task.origins || []).length > 0;
       const following = [];
-      if (task.origin_is_default) following.push('出发星球');
-      if (task.fleet_lines_is_default) following.push('航线数');
+      if (task.origin_is_default && !planActive) following.push('出发星球');
+      if (task.fleet_lines_is_default && !planActive) following.push('航线数');
       const defaultsLine = row.querySelector('.mission-defaults');
       if (defaultsLine) {
         // ⚠️ **正文压到四个字，完整那句进 `title`。** 一行式的卡上这一句原本占
@@ -1296,8 +1400,9 @@
 
       if (task.kind === 'BOT' && (!row.dataset.militaryPrimed || locked)) {
         row.dataset.militaryPrimed = '1';
-        const mode = row.querySelector('.military-enabled');
-        mode.checked = task.params.by_military === true;
+        // ⚠️ 这里从前还回显一个 `.military-enabled` 复选框（`by_military`）。
+        // 开关删了，回显跟着删——`by_military` 仍然在库里、仍然由后端读，
+        // 页面只是不再提供切换入口（用户口径 2026-08-22：那条模式已废弃）。
         // 没配过时显示后端的默认值（`domain.target_order.WINDOW_POOL_FLOOR`）。
         row.querySelector('.military-top-n').value = task.params.top_n ?? 100;
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
@@ -1306,7 +1411,7 @@
         row.querySelector('.military-score-max-age').value = task.params.score_max_age_hours ?? task.params.rescan_after_hours ?? 2;
         loadMilitaryOrigins(task, row);
       }
-      if (task.kind === 'BOT') setMilitaryVisible(row, locked);
+      if (task.kind === 'BOT') setMilitaryLock(row, locked);
     }
     tickClock();
   }
@@ -1512,9 +1617,12 @@
   function saveMilitary(taskId, row) {
     const task = latest.tasks.find((item) => String(item.task_id) === String(taskId));
     if (!task) return;
-    const enabled = row.querySelector('.military-enabled').checked;
-    const payload = { ...task.params, by_military: enabled };
-    if (!enabled) return patch(taskId, payload);
+    // ⚠️ **`by_military` 恒送 true。** 从前这里读的是那个开关，还有一支
+    // 「关着就只送这一个键」的早退。开关随「原来的攻击模式被废弃」删了（用户口径
+    // 2026-08-22），于是这里也只剩一种走法。仍然**显式送**这个键而不是不送：
+    // 存量任务里可能存着 `false`，不送就等于让一份已经废弃的模式一直留在库里，
+    // 而页面上再也没有地方能把它掰回来。
+    const payload = { ...task.params, by_military: true };
     const topN = Number(row.querySelector('.military-top-n').value);
     const maxAge = Number(row.querySelector('.military-score-max-age').value);
     const maximumText = row.querySelector('.military-max-score').value.trim();
@@ -1713,9 +1821,8 @@
       }
       patch(taskId, { params });
     }
-    if (event.target.matches('.military-enabled')) {
-      setMilitaryVisible(row, latest && latest.config_locked === true);
-    }
+    // ⚠️ 这里从前还有一支 `.military-enabled`（拨一下开关就重算显隐）。
+    // 开关删了，这一支跟着删——留着就是一段永远不会被触发的死代码。
   }
 
   // ---- 拖拽排序 -----------------------------------------------------------
