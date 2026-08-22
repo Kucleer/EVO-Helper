@@ -54,6 +54,18 @@ site-packages 找包，撞上 `py.typed` 缺失而整个跳过。**一律 `mypy 
 ⚠️ 本机 mypy 版本若不在 `pyproject` 声明的 `>=1.11,<2` 内，**它报的结果不作数**——
 以 CI 为准。真要修依赖先 `uv sync`，**别带 `--all-extras`**（装上 `ultralytics` 会引入假错）。
 
+⚠️ **本机有两个解释器，mypy 结论相反**（2026-08-22 实测，害人不浅）：
+
+| 跑法 | mypy | 结果 |
+|---|---|---|
+| `python -m mypy src`（裸 `python` = 3.14 32-bit） | **1.14.1，在声明范围内** | 3 errors ← **这个才作数** |
+| `.venv\Scripts\python.exe -m mypy src` | 2.3.0，**超出 `<2`** | `Success: no issues` |
+
+⇒ **一律用裸 `python -m mypy src`**。拿 venv 那个跑会把下面这 3 条既有错误判成通过：
+`domain/intel_query.py:88`（no-untyped-call）、`application/mission_scheduler.py:2973`
+（两条 union-attr，`min(..., default=None)`）。**这 3 条在 `main` 上就有**（PR #234 时已逐字比对过），
+所以验收判据是「**不新增**」，不是「全绿」。
+
 ### 0.4 ⚠️ 实测出来的事实**住在代码注释里**，不在文档里
 
 这个仓的注释密度很高，而且**注释才是活的**：OCR 配方、界面 ROI、飞行时间标定、

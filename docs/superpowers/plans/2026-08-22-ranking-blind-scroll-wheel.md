@@ -698,11 +698,16 @@ git commit -m "feat(军力榜盲滚): 每轮盲滚落库，含实测每格行数
 
 ## Task 10: 全量验证与文档
 
-- [ ] **Step 1: 四条基线全绿**
+- [ ] **Step 1: 四条基线**
 
 ```bash
 python -m pytest tests -q && python -m ruff check src tests && python -m ruff format --check src tests && python -m mypy src
 ```
+
+⚠️ **mypy 的判据是「不新增」，不是「全绿」**：`main` 上本来就有 3 条
+（`domain/intel_query.py:88`、`application/mission_scheduler.py:2973` ×2）。
+⚠️ **必须用裸 `python -m mypy src`**（mypy 1.14.1，在 `pyproject` 声明的 `>=1.11,<2` 内）。
+`.venv` 里那个是 2.3.0、超出声明范围，会把上面 3 条判成通过——结果不作数。
 
 - [ ] **Step 2: 改写 `docs/军力榜翻页-滚轮实测.md`**——主结论「不能」被推翻，换成「事件形状决定成败」，并把钩子实测证据、`pyautogui.scroll` 不乘 120、单事件封顶三条写进去。**保留原文的量法与三个坑**，那部分仍然成立。
 
