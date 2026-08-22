@@ -49,21 +49,24 @@ def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
     }
 
 
-def test_this_revision_is_the_head() -> None:
-    """**这一条是最新的迁移，所以由它来说「head 就是我」。**
+def test_this_revision_is_on_a_single_headed_chain() -> None:
+    """链上只有一个 head，而这一条在链上。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前一个字
-    都看不出来。合并时若发现别的分支也挂在 `d4b6e0f19c73` 上，**后进的那条改自己
-    的 `down_revision`**。
+    都看不出来。合并时若发现别的分支也挂在同一个父节点上，**后进的那条改自己的
+    `down_revision`**。
 
-    ⚠️ 再往后接新迁移时，把这两句挪到那一条自己的用例里，并把这里降级成
-    「链上只有一个 head，而我在链上」——先例见
-    `test_dispatch_flight_source_migration.py`。
+    ⚠️ 这条**不再断言「head 就是我」**：后面又接了新的迁移（`b8e1c4a72f05`，
+    盲滚行数），「谁是 head」这句话只该由**最新那一条**的用例来说，否则每加一条
+    迁移都要回来改一次这里，而改多了就没人再当真（同
+    `test_dispatch_flight_source_migration.py` 与
+    `test_bot_target_unreadable_migration.py` 里那一段的理由）。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {revision.revision for revision in script.walk_revisions()}
 
 
 def test_the_line_count_is_nullable_with_no_default(database_url: str) -> None:

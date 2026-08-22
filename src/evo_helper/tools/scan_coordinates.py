@@ -34,6 +34,7 @@ from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments,
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, exit_code_for_environment_fault
 from evo_helper.game.game_window import ForegroundUnavailable
 from evo_helper.game.overlay import dismiss_overlays, look_at_close_button
+from evo_helper.game.ranking_ui import WHEEL_DELTA
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -709,11 +710,11 @@ class LiveDriver:
 class SlowDragDriver:
     """把 `LiveDriver` 包成 `game.ranking_nav.RankingDriver` 要的那个操作面。
 
-    多出来的只有分步慢拖的三个原语 `press` / `move_to` / `release`。
-    `LiveDriver.drag` 是一步式的 `dragTo`，游戏面板会把它当成点击
+    多出来的是分步慢拖的三个原语 `press` / `move_to` / `release`，外加盲滚要的
+    `wheel_notch`。`LiveDriver.drag` 是一步式的 `dragTo`，游戏面板会把它当成点击
     （`pirate_loop.slow_drag` 的注释里记着这条实测），而**分步这件事必须发生在
     `game` 层**——否则 `game.ranking_nav` 就得反过来 import `tools`。
-    所以分步的循环在那边，这里只提供三个原语。同 `pirate_loop._PlanetListDriver`。
+    所以分步的循环在那边，这里只提供原语。同 `pirate_loop._PlanetListDriver`。
 
     ⚠️ **这一层是有状态的**，而 `LiveDriver` 的其余部分不是。「手指正按着」这个
     状态就是它单独存在、而不是把三个方法加到 `LiveDriver` 上的理由：按着不放的
@@ -791,6 +792,35 @@ class SlowDragDriver:
             return
         self._driver._gui.mouseUp()  # noqa: SLF001 - 同上
         self._origin = None
+
+    def wheel_notch(self) -> None:
+        """往下滚**一格**。盲滚段唯一的动作原语。
+
+        ⚠️ **`pyautogui.scroll(n)` 在 Windows 上把 `n` 原样当 `dwData` 传给
+        `mouse_event`，不乘 120。** 所以这里发的是 `-WHEEL_DELTA`(-120) 而不是
+        `-1`——发 `-1` 只是 1/120 格，实测 80 次只走 0–3 行，**而它看起来完全
+        正常**：事件发出去了，底层鼠标钩子也收到了，只是 `delta=-1`。
+        （用户手动拨硬件滚轮，钩子看到的是 `delta=-120`。）
+
+        ⚠️ **`PAUSE` 必须显式置 0。** 它默认 0.1 秒，`scroll()` 返回前会睡这么久，
+        于是 `ranking_ui.WHEEL_GAP_S`(16ms) 被撑成 117ms/格；游戏做的是速度惯性
+        滚动，那个密度攒不起动量，实测 80 格只走 2 行。症状和「发不足一格」
+        一模一样，都是「拨了但没走」。
+
+        ⚠️ **FAILSAFE 不许动。** 急停（鼠标甩到屏幕左上角）照常有效——
+        盲滚一趟要发几百个事件，这是最需要留一条人工急停的地方。
+        `load_pyautogui()` 把它置 True，这里只碰 `PAUSE`。
+
+        ⚠️ **这里既不抢前台也不移鼠标**，两件事都不能放进一个 16ms 的循环里：
+        `focus()` 抢不到会退避重试最多 4.5 秒，`origin()` 会在窗口不见时把游戏
+        重新拉起来。落点由**上一个动作**负责——`spin_blind` 之前刚走完
+        `open_military_ranking`，那一路的 `click` 走 `LiveDriver.click`
+        （抢过前台），指针停在面板内部（`MILITARY_TAB` 或榜单行上）。
+        """
+        import pyautogui
+
+        pyautogui.PAUSE = 0
+        pyautogui.scroll(-WHEEL_DELTA)
 
 
 # -- 扫描循环 ------------------------------------------------------------------

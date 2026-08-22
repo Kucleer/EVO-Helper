@@ -842,6 +842,17 @@ class MilitaryAttackConfigRow(Base):
     #: 放在这张全局表而不是 `mission_tasks.params_json`：用户口径（2026-08-17）
     #: 是「盲拖数量需在攻击配置页可配置」，而这一页存的就是全局的那几项。
     blind_scrolls: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    #: 军力榜开榜后先用滚轮盲滚多少**行**（`game.ranking_ui.BLIND_SCROLL_ROWS` = 700
+    #: 是留空时的默认值）。口径是「行」而不是「屏」：滚轮那一段量得到的是行。
+    #:
+    #: **可空、不给 server_default**：NULL = 「跟着代码里的默认值走」。先例是上面那一列
+    #: `blind_scrolls`——给了默认值就分不开「没配」和「恰好配成当前默认」，日后调默认值
+    #: 时所有老行都会被钉死在旧数上，而它们表达的其实是「跟着默认走」。
+    #:
+    #: ⚠️ **上面那一列 `blind_scrolls`（屏）刻意保留不删。** 它是这次改动的一键回滚：
+    #: 本列置空即退回慢拖那条路，不需要改代码、不需要再来一条迁移。顺手把它删掉，
+    #: 回滚就变成「改代码 + 重新发版」。
+    blind_scroll_rows: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     #: 对账那一趟翻信箱最多往回读几个**小时**
     #: （`tools.pirate_loop.PirateLoop.backfill_reports` 的 routine 那一档）。
     #:
