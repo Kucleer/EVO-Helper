@@ -261,6 +261,19 @@ class MilitaryAttackConfigOut(BaseModel):
     #: `MissionScheduler.validate_blind_scrolls` 判，和调度器启动时用的是同一把
     #: 尺子——两边分家的结果是页面收下了、实机跑起来不是那个数。
     blind_scrolls: int | None = None
+    #: 军力榜采集开榜后先用滚轮连拨几**行**。**`None` = 留空 = 按代码默认值走。**
+    #:
+    #: 同上一项的形状：这里只认「是不是整数」，范围由
+    #: `MissionScheduler.validate_blind_scroll_rows` 判——页面和调度器必须用同一把
+    #: 尺子，分家的结果是页面收下了、实机跑起来不是那个数。
+    #:
+    #: ⚠️ **`0` 是合法取值**（「一格都不拨」，最保守的那一头），不是「留空」。
+    #:
+    #: ⚠️ **这一项显式 `strict=True`，上面那些旋钮没有。** 非严格模式下 `bool` 会被
+    #: 当成 `int` 收下（`true` 存成 1 行），而「拨一格」和用户想说的话没有任何关系。
+    #: `_blind_scrolls` 那边本来就把 `bool` 单独排掉了，只是 pydantic 在它之前就把
+    #: `true` 换成了 1、调度器再也看不见那是个布尔——这里补的是那一段。
+    blind_scroll_rows: int | None = Field(default=None, strict=True)
     #: 对账那一趟翻信箱最多往回读几个小时。**`None` = 留空 = 默认 6 小时。**
     #:
     #: 同上一项：这里只认「是不是整数」，范围由

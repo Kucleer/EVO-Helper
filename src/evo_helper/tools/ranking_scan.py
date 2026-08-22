@@ -21,22 +21,29 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
 from evo_helper.domain.ranking import (
     RankingRow,
-    bot_area_reached_message,
+    bot_area_reached_rows_message,
     coordinate_of,
     descending_breaks,
     interpolate_scores,
-    is_bot_coordinate,
+    is_bot_entry,
     mentions_bot,
     repair_ranks,
 )
 from evo_helper.domain.records import RankingTarget
 from evo_helper.domain.scheduler import EXIT_RANKING_INCOMPLETE
-from evo_helper.game.ranking_nav import RankingNavigator, ScrollOutcome, nav_label_words
+from evo_helper.game.ranking_nav import (
+    RankingNavigator,
+    ScrollOutcome,
+    SpinResult,
+    nav_label_words,
+)
 from evo_helper.game.ranking_ui import (
-    BLIND_SCROLL_MARGIN,
+    BLIND_SCROLL_MARGIN_ROWS,
+    BLIND_SCROLL_ROWS,
     BLIND_SCROLLS,
     BOT_DETECTION_BUDGET_SCROLLS,
     DRY_SCREENS,
+    GLIDE_SETTLE_S,
     NAME_COLUMN,
     NAME_SAMPLE_CHARS,
     NAME_SAMPLE_EVERY_SCROLLS,
@@ -48,6 +55,8 @@ from evo_helper.game.ranking_ui import (
     ROW_CROP_HALF_HEIGHT,
     ROW_FIRST_Y,
     ROW_PITCH_PX,
+    ROWS_PER_NOTCH,
+    ROWS_PER_SCROLL,
     SCORE_COLUMN,
     SCROLL_STALL_CONFIRMATIONS,
 )
@@ -265,19 +274,34 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
         dropped = [index for index, score in enumerate(trusted) if score is None and read[index]]
         say(f"军力值破坏降序，丢掉这几行的分数（坐标保留）: {dropped}")
     filled = interpolate_scores(trusted)
-    return [
-        RankingTarget(
-            coordinate=row.coordinate,
-            military_score=filled[index],
-            military_score_at_utc=observed_at,
-            # **读到了但被降序判据丢掉**的那些，补回来的值同样是估算——
-            # 判据看的是 `trusted` 不是 `read`，否则被丢掉的行会伪装成实读。
-            military_score_estimated=trusted[index] is None and filled[index] is not None,
-            military_rank=repaired[index],
+    targets: list[RankingTarget] = []
+    for index, row in enumerate(rows):
+        coordinate = row.coordinate
+        # ⚠️ **判据吃的是 `row.score`（OCR 的原始读数），不是 `filled[index]`。**
+        # 用户口径（2026-08-22）：判 bot 要「id 符合 + 军力不等于 0」，因为
+        # `bot_` 前缀是玩家可以改名伪装的，而伪装的真人军力常年是 0。
+        # 而上面那条流水线正好会把这个信号擦掉：0 分行一旦被读成空、或者被读成
+        # 个大数而撞上降序判据，分数就先丢成 None、再被 `interpolate_scores`
+        # 补成两个非零邻居的中点——**插出来的值必然非零**，于是那一行看起来
+        # 只是「一个普通的低分 bot」。整段账写在 `domain.ranking.is_bot_entry` 上。
+        #
+        # `coordinate is None` 那半句是给类型检查器看的：`is_bot_entry` 里面
+        # 已经挡掉了它（它复用 `is_bot_coordinate`），但它返回的是 `bool` 而不是
+        # `TypeGuard`，narrow 不下来。判据本身不靠这半句。
+        if coordinate is None or not is_bot_entry(coordinate, row.score):
+            continue
+        targets.append(
+            RankingTarget(
+                coordinate=coordinate,
+                military_score=filled[index],
+                military_score_at_utc=observed_at,
+                # **读到了但被降序判据丢掉**的那些，补回来的值同样是估算——
+                # 判据看的是 `trusted` 不是 `read`，否则被丢掉的行会伪装成实读。
+                military_score_estimated=trusted[index] is None and filled[index] is not None,
+                military_rank=repaired[index],
+            )
         )
-        for index, row in enumerate(rows)
-        if is_bot_coordinate(row.coordinate)
-    ]
+    return targets
 
 
 def take_batch_targets(
@@ -295,31 +319,186 @@ def take_batch_targets(
     return picked
 
 
-def report_bot_area_reached(scrolled: int, *, blind_scrolls: int) -> None:
-    """记下这一趟的实测屏数，并在余量被吃掉时喊一声。
+def report_bot_area_reached(rows: int, *, blind_rows: int) -> None:
+    """记下这一趟实测走了多少**行**才到 bot 区，并在余量被吃掉时喊一声。
 
     ⚠️ **两件事刻意绑在同一个出口上。** 那句话是自动标定唯一的**样本**
-    （`domain.ranking.bot_area_scrolls` 从 `system_log` 里反解它），而告警是这份
-    样本唯一能暴露「盲拖是不是已经拖过头」的时刻。摆成两个各自独立的调用点，
+    （`domain.ranking.bot_area_rows` 从 `system_log` 里反解它），而告警是这份
+    样本唯一能暴露「盲滚是不是已经滚过头」的时刻。摆成两个各自独立的调用点，
     删掉其中任何一个都不会有东西报错。
 
-    ⚠️ **告警补的是自动标定唯一的盲点。** 标定看不出自己拖过头了：拖过头的表现是
-    「第一屏检测就看到 bot」，而那和「刚好卡在 bot 起点上」在数据上一模一样——
-    两种都记成 `scrolled == blind_scrolls`。真拖过头时，被跳过去的那一批 bot
+    ⚠️ **告警补的是自动标定唯一的盲点。** 标定看不出自己滚过头了：滚过头的表现是
+    「第一屏检测就看到 bot」，而那和「刚好停在 bot 起点上」在数据上一模一样——
+    两种都记成 `rows == blind_rows`。真滚过头时，被跳过去的那一批 bot
     不会报错、不会少一条日志，只是**采回来的数静悄悄少一截**。
 
-    所以余量一旦被吃掉就主动喊一声，而不是等用户哪天自己发现数据不对。
-    余量还剩 `scrolled - blind_scrolls` 屏；低于 `BLIND_SCROLL_MARGIN` 就报。
+    ⚠️ **单位是行，不再是屏**（2026-08-22 改口径）。滚轮那一段根本没有「屏」这个
+    概念，而按行比余量就少一次 `ROWS_PER_SCROLL` 换算——少一次换算就少一处能
+    悄悄错量纲的地方。余量还剩 `rows - blind_rows` 行，低于
+    `BLIND_SCROLL_MARGIN_ROWS` 就报。
+
+    ⚠️ **不拿 `FIRST_BOT_RANK`(587) 当边界。** 用户口径（2026-08-22）：那段
+    「bot 起点」是**玩家改名伪装**出来的，不是真 bot（判据只看名字前缀，改名的
+    真人一样命中），真 bot 区在更后面。拿一个被伪装污染的边界报警比不报更坏——
+    它会天天喊，而天天喊的告警等于没有告警。这里比的只有两个实测量：本趟走了
+    多少行到达 bot 区，和这趟盲滚了多少行。
     """
-    say(bot_area_reached_message(scrolled))
-    slack = scrolled - blind_scrolls
-    if slack >= BLIND_SCROLL_MARGIN:
+    say(bot_area_reached_rows_message(rows))
+    slack = rows - blind_rows
+    if slack >= BLIND_SCROLL_MARGIN_ROWS:
         return
     warn(
-        f"⚠️ 盲拖余量告急：本趟实测 {scrolled} 屏到达 bot 区，而盲拖了 {blind_scrolls} 屏，"
-        f"余量只剩 {slack} 屏（应有 {BLIND_SCROLL_MARGIN} 屏）。"
-        "再漂一点盲拖就会拖过 bot 起点，把榜首那批军力最高的 bot 整段跳过去，"
-        "而采回来的数只会静悄悄少一截。请检查攻击配置页上的盲拖屏数是不是手填得太大。"
+        f"⚠️ 盲滚余量告急：本趟实测 {rows} 行到达 bot 区，而盲滚了 {blind_rows} 行，"
+        f"余量只剩 {slack} 行（应有 {BLIND_SCROLL_MARGIN_ROWS} 行）。"
+        "再漂一点盲滚就会滚过 bot 起点，把榜首那批军力最高的 bot 整段跳过去，"
+        "而采回来的数只会静悄悄少一截。请检查攻击配置页上的盲滚行数是不是填得太大。"
+    )
+
+
+# -- 盲滚段：一次连拨，并把这一趟的账记进库 ------------------------------------
+
+
+@dataclass
+class BlindSpinAccount:
+    """一趟盲滚的账。**可变**，因为它要跨两个时刻才凑得齐。
+
+    ⚠️ `rows_to_bot_area` 不在这里面：那个数要等检测段翻完才知道，而这份账在
+    滚轮刚拨完就有了。两个时刻凑一条日志，所以账先攒着，落库那一步交给
+    `report_blind_spin` 在检测段结束之后做。
+    """
+
+    #: 要求走多少行（`spin` 收到的那个数）。
+    rows_requested: int = 0
+    #: 实际发出去多少格。**格数才是真发生的事**，行数是它乘标定算出来的。
+    notches_sent: int = 0
+    #: 拨完这些格实际用了多久。记它是为了让「每格 16ms」这条可验证：
+    #: Windows 上 `time.sleep` 的粒度是 15.6ms，真被撑成 31ms/格的话动量就攒不
+    #: 起来，而症状同样是「拨了但没走」。
+    spin_seconds: float = 0.0
+    #: 拨完之后为等滑行停下来等了多久。
+    glide_seconds: float = 0.0
+    #: 拨完之后实测走到了第几名；读不出就是 None。
+    rows_measured: int | None = None
+
+    @property
+    def rows_per_notch_observed(self) -> float | None:
+        """这一趟实测每格走了多少行；测不出就是 None。
+
+        ⚠️ **这是整条盲滚日志的要害。** `ROWS_PER_NOTCH`(1.08) 只有 2 个样本、
+        1 台机器、1 次会话。它一漂，「盲滚 700 行」实际走的就不是 700 行，而这个
+        偏差是**静默的**：不报错、不少一条日志，只是采回来的数少一截。每一趟都把
+        实测值记进库，事后才答得出「这个标定还成不成立」——而不是等某天发现
+        bot 少采了一截再回头查。
+        """
+        if not self.notches_sent or self.rows_measured is None:
+            return None
+        return round(self.rows_measured / self.notches_sent, 3)
+
+
+def spin_blind_rows(
+    rows: int,
+    *,
+    spin: Callable[[int], SpinResult],
+    measure_rows: Callable[[], int | None] = lambda: None,
+    account: BlindSpinAccount | None = None,
+) -> int:
+    """连拨滚轮走过 `rows` 行，记账，返回**折合走过的行数**。
+
+    这就是喂给 `scroll_through_humans` 的那个 `spin`。单拎出来是为了让「记了哪些
+    账」测得到：真的那条路要驱动鼠标，单元测试进不去，而这条日志正是这次改动
+    唯一能事后自证的东西。
+
+    返回的是 `实发格数 × ROWS_PER_NOTCH`，**不是**传进来的 `rows`：行 → 格那一步
+    要取整，取整之后就已经不是原来那个行数了。把请求值当成走过的距离记账，误差会
+    一路带到「实测多少行到达 bot 区」上，而那正是自标定的输入。
+
+    ⚠️ `measure_rows` 是**尽力而为**的，读不出就返回 None，不许据此把这一趟判成
+    失败：滚轮会把列表停在非整行位置，而 `rows_from_image` 是逐行裁剪的——偏了
+    就横跨两行（实测过一次：画面清晰，一屏只读出 2 个名次）。它只服务于日志，
+    不参与任何判据。
+    """
+    result = spin(rows)
+    measured = measure_rows() if result.notches else None
+    if account is not None:
+        account.rows_requested = result.rows_requested
+        account.notches_sent = result.notches
+        account.spin_seconds = round(result.spin_seconds, 3)
+        # `spin_blind` 拨完之后统一等一次 `GLIDE_SETTLE_S`；一格都没拨就一次都不等。
+        account.glide_seconds = GLIDE_SETTLE_S if result.notches else 0.0
+        account.rows_measured = measured
+    return round(result.notches * ROWS_PER_NOTCH)
+
+
+def drag_blind_rows(
+    rows: int, *, scroll_blind: Callable[[], None], say_line: Callable[[str], None] = say
+) -> int:
+    """用**慢拖**走过 `rows` 行——盲滚改滚轮之前那条老路，留着当一键回滚。
+
+    ⚠️ **它存在的唯一理由是回滚。** `storage.models.MilitaryAttackConfigRow`
+    上写着：`blind_scroll_rows` 置空即退回慢拖，不需要改代码、不需要重新发版。
+    没有这条路，回滚就变成「改代码 + 发版」。
+
+    行 → 屏按 `ROWS_PER_SCROLL` 换算。返回的同样是**折合走过的行数**而不是请求值，
+    理由同 `spin_blind_rows`：换算取整之后就不是原来那个行数了。
+    """
+    screens = round(rows / ROWS_PER_SCROLL)
+    say_line(f"盲滚走的是慢拖那条老路：{rows} 行折合 {screens} 屏（滚轮盲滚已关掉）")
+    for _screen in range(screens):
+        scroll_blind()
+    return round(screens * ROWS_PER_SCROLL)
+
+
+def blind_spin_payload(
+    account: BlindSpinAccount, *, rows_to_bot_area: int | None, source: str
+) -> dict[str, Any]:
+    """那一条盲滚日志的 `payload_json`。
+
+    ⚠️ **`rows_requested` 与 `notches_sent` 都要留**，别只留一个：格数是真发生
+    的事，行数是它乘标定算出来的，而这条日志存在的意义就是让「标定还成不成立」
+    在事后答得出来——只留折合值就把两者的差别抹平了。
+
+    `rows_per_notch_calibrated` 把**当时代码里的标定值**一起存下来：日后有人把
+    1.08 改了，库里这一批老记录才说得清它们是按哪个数算的。
+    """
+    return {
+        "rows_requested": account.rows_requested,
+        "notches_sent": account.notches_sent,
+        "spin_seconds": account.spin_seconds,
+        "glide_seconds": account.glide_seconds,
+        "rows_measured": account.rows_measured,
+        "rows_per_notch_observed": account.rows_per_notch_observed,
+        "rows_per_notch_calibrated": ROWS_PER_NOTCH,
+        "rows_to_bot_area": rows_to_bot_area,
+        "source": source,
+    }
+
+
+def report_blind_spin(
+    account: BlindSpinAccount,
+    *,
+    rows_to_bot_area: int | None,
+    source: str,
+    record: Callable[[str, dict[str, Any]], None],
+) -> None:
+    """把这一趟盲滚落 `system_log`（**落库不落文件**）。
+
+    ⚠️ **落库而不是打文件。** 实机在另一台机器上，本地 `var/logs` 是陈旧的；
+    「这个标定还成不成立」这个问题要在控制台的日志页上答得出来。
+
+    正文里那句「每格实测 N 行」是给人看的，机器读的是 `payload_json`——
+    别把它当成解析入口（那种双身份的正文只有「翻了 N 行到达 bot 区」一处，
+    而那一处的措辞代价写在 `domain.ranking.bot_area_reached_rows_message` 上）。
+    """
+    observed = account.rows_per_notch_observed
+    tail = (
+        f"，每格实测 {observed} 行（标定 {ROWS_PER_NOTCH}）"
+        if observed is not None
+        else "；这一趟没测出每格走了多少行"
+    )
+    record(
+        f"盲滚 {account.rows_requested} 行：发了 {account.notches_sent} 格、"
+        f"拨完用 {account.spin_seconds:.1f} 秒{tail}",
+        blind_spin_payload(account, rows_to_bot_area=rows_to_bot_area, source=source),
     )
 
 
@@ -329,7 +508,7 @@ def report_bot_area_reached(scrolled: int, *, blind_scrolls: int) -> None:
 class ScanStage(Enum):
     """本趟走到了哪一段。**收尾那句话靠它区分「被掐」与「跑满」**（见 `completion_message`）。"""
 
-    BLIND = "盲拖中"
+    BLIND = "盲滚中"
     DETECTING = "检测中"
     COLLECTING = "采集中"
     CLOSED = "已收尾"
@@ -340,10 +519,13 @@ class ScanProgress:
     """一趟采集的进度。可变，因为它要在 `finally` 里被读到——包括 Ctrl+C 那一次。"""
 
     stage: ScanStage = ScanStage.BLIND
-    #: 这一趟盲拖了几屏（进入检测段之前）。
-    blind_scrolls: int = 0
-    #: 真人段总共翻了几屏，**含盲拖那一段**。
-    human_scrolled: int = 0
+    #: 这一趟盲滚了多少**行**（进入检测段之前）。
+    blind_rows: int = 0
+    #: 真人段总共走了多少**行**，**含盲滚那一段**。
+    human_rows: int = 0
+    #: 检测段翻了几屏。⚠️ **这一项的单位仍旧是屏**，因为检测段照旧慢拖
+    #: （滚轮会把列表停在非整行位置，逐行裁剪就横跨两行、名字全糊）。
+    detection_scrolls: int = 0
     #: 采集段滚了几屏。
     collect_scrolls: int = 0
 
@@ -358,6 +540,8 @@ class NameSample:
     （空 = 没在榜单页上 / 读不出），`overlap` 说明列表动没动。
     """
 
+    #: 抽样发生在**检测段**第几屏。盲滚那一段不计在内：它一次连拨，中间没有
+    #: 「屏」这个刻度，也没有可抽样的时刻。
     scrolled: int
     excerpt: str
     #: 与**上一次抽样**的重合率；第一次抽样没有上一次，是 None。
@@ -430,8 +614,11 @@ class HumanStretch:
 
     #: 见到 bot 名字了吗。False = 这一趟到此为止。
     reached_bots: bool
-    #: 一共翻了几屏（含盲拖）。
-    scrolled: int
+    #: 一共走了多少**行**（盲滚那一段 + 检测段的屏折合过来的行）。
+    #: 这就是喂给自标定的那个实测量，见 `report_bot_area_reached`。
+    rows: int
+    #: 检测段翻了几屏。**盲滚那一段不计在内**——它没有「屏」这个单位。
+    detection_scrolls: int
     #: 为什么停下来的，给人看的一句话。
     reason: str
     samples: tuple[NameSample, ...] = ()
@@ -440,37 +627,62 @@ class HumanStretch:
 def scroll_through_humans(
     *,
     scroll: Callable[[], None],
+    spin: Callable[[int], int],
     read_names: Callable[[], str],
     wait: Callable[[float], None],
-    blind_scrolls: int,
+    blind_rows: int,
     detection_budget: int,
     say_line: Callable[[str], None],
     record: Callable[[str, dict[str, Any]], None] = lambda _m, _p: None,
     progress: ScanProgress | None = None,
 ) -> HumanStretch:
-    """盲拖 + 检测，一直翻到名字列里出现 bot 名字为止。
+    """盲滚 + 检测，一直翻到名字列里出现 bot 名字为止。
 
-    预算是 `blind_scrolls + detection_budget`——**加法，不是隐式相减**。
-    整段道理写在 `game.ranking_ui.BOT_DETECTION_BUDGET_SCROLLS` 上。
+    ⚠️ **两段用两种动作，别把它们合成一种。**
+
+    - 盲滚段只调**一次** `spin(blind_rows)`：滚轮连拨、末尾统一等一次滑行。
+      原先这里是 `for _ in range(blind_scrolls): scroll()`，70 屏 × 每屏等 2 秒
+      = 生产实测 294.6 秒，而这次改动的收益**全部**来自把那些等待合并成一次。
+      改在这一层而不是 `scroll_blind()` 内部，就是为了不把 70 次等待原样留下。
+    - 检测段仍旧一屏一次 `scroll()`（慢拖），**一个字都不许换成滚轮**：滚轮会把
+      列表停在非整行位置，而 `rows_from_image` 是按 `ROW_FIRST_Y + k×ROW_PITCH`
+      逐行裁剪的——偏了就横跨两行，名字全糊。实测过一次：画面清晰，
+      `rows_from_image` 只读出 2 个名次。
+
+    `spin` 吃行数、返回**实际折合走过的行数**（行 → 格要取整，取整之后就不是原来
+    那个行数了）。怎么走由调用方决定：`spin_blind_rows` 是滚轮那条路，
+    `drag_blind_rows` 是留作回滚的慢拖那条路——这一层两条都不认识。
+
+    `detection_budget` 是**检测段自己的屏数预算**，与盲滚走多远无关。整段道理写在
+    `game.ranking_ui.BOT_DETECTION_BUDGET_SCROLLS` 上：原先那个耦合是隐式且反向的
+    （盲拖调大，检测预算等量缩小），换成行口径之后连相减的机会都没有了。
 
     每 `NAME_SAMPLE_EVERY_SCROLLS` 屏留一次现场（`NameSample`），到顶时把整串
     交出去，好让日志说得出这一趟里名字列**一直在变 / 一直没变 / 最后读到的是什么**。
     """
     progress = progress if progress is not None else ScanProgress()
     progress.stage = ScanStage.BLIND
-    progress.blind_scrolls = blind_scrolls
-    for _ in range(blind_scrolls):
-        scroll()
-        progress.human_scrolled += 1
-    scrolled = blind_scrolls
-    progress.human_scrolled = scrolled
+    progress.blind_rows = blind_rows
+    # 0 行是最保守的合法取值（「一格都别拨」）：那时连 `spin` 都不调，
+    # 整个真人段退化成纯检测——也就是最保守的那一头。
+    rows_spun = spin(blind_rows) if blind_rows else 0
+    progress.human_rows = rows_spun
     progress.stage = ScanStage.DETECTING
-    if blind_scrolls:
-        say_line(f"盲拖 {blind_scrolls} 屏（那一段必定还是真人），开始检测 bot")
+    if blind_rows:
+        say_line(f"盲滚 {blind_rows} 行（实走约 {rows_spun} 行，那一段必定还是真人），开始检测 bot")
 
-    budget = blind_scrolls + detection_budget
+    scrolled = 0
     samples: list[NameSample] = []
     marker, attempts = read_name_column_confirming(read_names, wait)
+
+    def rows_now() -> int:
+        """到此刻为止走了多少行 = 盲滚的行 + 检测段的屏 × 每屏行数。
+
+        两段的单位不一样，所以账只能在这里合。⚠️ 换算只有这一处：多写一处
+        `ROWS_PER_SCROLL` 就多一处能悄悄错量纲的地方，而错了量纲的表现是
+        自标定给出一个离谱的数，不是一条报错。
+        """
+        return rows_spun + round(scrolled * ROWS_PER_SCROLL)
 
     def take_sample() -> None:
         excerpt = name_excerpt(marker)
@@ -489,6 +701,7 @@ def scroll_through_humans(
             f"翻真人段 {scrolled} 屏：名字列摘要与上一次抽样的重合率",
             {
                 "scrolled": scrolled,
+                "rows": rows_now(),
                 "name_excerpt": sample.excerpt,
                 "overlap": sample.overlap,
                 "list_looks_stuck": sample.stuck,
@@ -498,40 +711,51 @@ def scroll_through_humans(
     while not mentions_bot(marker):
         if not marker:
             # 三次都读不出来才认：整条名字列一个字都没有 = 已经不在榜单页上。
-            say_line(f"翻真人段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空；已离页")
+            say_line(f"检测段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空；已离页")
             record(
-                f"翻真人段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空，判为已离页",
+                f"检测段第 {scrolled} 屏之后名字列连读 {READ_ATTEMPTS} 次全空，判为已离页",
                 {
                     "scrolled": scrolled,
+                    "rows": rows_now(),
                     "reads": list(attempts),
                     "samples": _samples_payload(samples),
                 },
             )
             return HumanStretch(
                 reached_bots=False,
-                scrolled=scrolled,
+                rows=rows_now(),
+                detection_scrolls=scrolled,
                 reason=f"名字列连读 {READ_ATTEMPTS} 次全空，已离页",
                 samples=tuple(samples),
             )
-        if scrolled >= budget:
-            reason = (
-                f"翻满 {budget} 屏（盲拖 {blind_scrolls} + 检测预算 {detection_budget}）"
-                "仍没见到 bot"
-            )
+        if scrolled >= detection_budget:
+            reason = f"盲滚 {blind_rows} 行之后又翻满 {detection_budget} 屏检测预算仍没见到 bot"
             say_line(f"{reason}；本轮到此为止")
-            record(reason + "；本轮到此为止", _budget_payload(samples, scrolled=scrolled))
+            record(
+                reason + "；本轮到此为止",
+                _budget_payload(samples, scrolled=scrolled, rows=rows_now()),
+            )
             _say_sample_verdict(samples, say_line)
             return HumanStretch(
-                reached_bots=False, scrolled=scrolled, reason=reason, samples=tuple(samples)
+                reached_bots=False,
+                rows=rows_now(),
+                detection_scrolls=scrolled,
+                reason=reason,
+                samples=tuple(samples),
             )
         scroll()
         scrolled += 1
-        progress.human_scrolled = scrolled
+        progress.detection_scrolls = scrolled
+        progress.human_rows = rows_now()
         marker, attempts = read_name_column_confirming(read_names, wait)
         if scrolled % NAME_SAMPLE_EVERY_SCROLLS == 0:
             take_sample()
     return HumanStretch(
-        reached_bots=True, scrolled=scrolled, reason="名字列里出现了 bot", samples=tuple(samples)
+        reached_bots=True,
+        rows=rows_now(),
+        detection_scrolls=scrolled,
+        reason="名字列里出现了 bot",
+        samples=tuple(samples),
     )
 
 
@@ -541,10 +765,11 @@ def _samples_payload(samples: Sequence[NameSample]) -> list[dict[str, Any]]:
     ]
 
 
-def _budget_payload(samples: Sequence[NameSample], *, scrolled: int) -> dict[str, Any]:
+def _budget_payload(samples: Sequence[NameSample], *, scrolled: int, rows: int) -> dict[str, Any]:
     overlaps = [s.overlap for s in samples if s.overlap is not None]
     return {
         "scrolled": scrolled,
+        "rows": rows,
         "samples": _samples_payload(samples),
         "last_name_excerpt": samples[-1].excerpt if samples else "",
         "stuck_samples": sum(1 for s in samples if s.stuck),
@@ -586,21 +811,24 @@ def exit_code_for_stretch(stretch: HumanStretch) -> int:
 
 
 def completion_message(progress: ScanProgress, *, written: int, suspect: int, outcome: int) -> str:
-    """收尾那一句。**必须说清本趟走到了哪一段、翻了多少屏。**
+    """收尾那一句。**必须说清本趟走到了哪一段、走了多少行。**
 
     ⚠️ 原先它只说「逐屏写入 0 条」，对「跑 2.2 分钟被用户掐」和「跑满预算一无所获」
     说的是同一句话——2026-08-18 排障时**我据此对用户下过错误结论**。两者的善后
     完全相反：前者什么都不用管（本来就没跑到采集段），后者说明判据或版面坏了。
 
+    ⚠️ **两段的单位不一样，句子里就要写不一样。** 盲滚段是行（滚轮没有「屏」这个
+    概念），检测段与采集段是屏（照旧慢拖）。把它们凑成一个数会让「盲滚 700」
+    看起来像 700 屏，而那是 8.3 倍的量纲差。
+
     ⚠️ **它在 `finally` 里被调用**，所以 Ctrl+C / 调度器抢占那一路也留得下这一句。
     """
     stage = progress.stage
-    detected = progress.human_scrolled - progress.blind_scrolls
     verdict = "完成" if outcome == 0 and stage is ScanStage.CLOSED else f"停在「{stage.value}」"
     return (
         f"军事榜采集{verdict}："
-        f"真人段翻了 {progress.human_scrolled} 屏"
-        f"（盲拖 {progress.blind_scrolls} + 检测 {detected}），"
+        f"真人段走了 {progress.human_rows} 行"
+        f"（盲滚 {progress.blind_rows} 行 + 检测 {progress.detection_scrolls} 屏），"
         f"采集段滚了 {progress.collect_scrolls} 屏；"
         f"逐屏写入 {written} 条，其中末屏可疑 {suspect} 条"
     )
@@ -610,6 +838,8 @@ def scan(
     columns: RankingColumns | None = None,
     *,
     blind_scrolls: int = BLIND_SCROLLS,
+    blind_rows: int | None = BLIND_SCROLL_ROWS,
+    blind_rows_source: str = "default",
     detection_budget: int = BOT_DETECTION_BUDGET_SCROLLS,
     bot_scrolls: int = 400,
     bot_limit: int | None = None,
@@ -619,6 +849,18 @@ def scan(
     返回 0 = 正常到底，`EXIT_RANKING_INCOMPLETE` = 没走完整趟（中途离页，或者翻满
     检测预算仍没见到 bot 区）。**那个码不是 2**——2 是 `argparse` 的，整段理由写在
     `domain.scheduler.EXIT_RANKING_INCOMPLETE` 上。
+
+    盲滚段走哪条路由 `blind_rows` 决定，**两个旋钮的优先级是显式的**：
+
+    - `blind_rows` 是行数（默认 `BLIND_SCROLL_ROWS`），走滚轮连拨那条路，
+      此时 `blind_scrolls` 一概不看。
+    - `blind_rows=None` 是**一键回滚**：退回慢拖 `blind_scrolls` 屏那条老路。
+      `storage.models.MilitaryAttackConfigRow.blind_scroll_rows` 上写着这条路要
+      留着，好让回滚不必改代码、不必重新发版。
+
+    `blind_rows_source` 只进日志（`"cli"` = 命令行给的，`"default"` = 用了代码
+    默认值）。**它答不出「手填还是自标定」**——那个区别只有调度器知道，写在它自己
+    那条「盲滚行数判定为…」的记录里，两条按时间对起来看。
 
     ⚠️ **离页也要入库。** 原先这里 `return 2` 排在 `save_ranking_targets` 前面，
     于是断线就把这一趟全扔了——而交接文档写着**断线是预期结果**（2026-08-14
@@ -631,9 +873,11 @@ def scan(
 
     if bot_limit is not None and bot_limit < 1:
         raise ValueError("bot_limit must be at least 1")
-    # 0 合法（「一屏都别盲拖」是最保守的取值），负数不是。
+    # 0 合法（盲滚「一格都别拨」、盲拖「一屏都别拖」都是最保守的取值），负数不是。
     if blind_scrolls < 0:
         raise ValueError("blind_scrolls must not be negative")
+    if blind_rows is not None and blind_rows < 0:
+        raise ValueError("blind_rows must not be negative")
     columns = columns or RankingColumns()
     pytesseract.pytesseract.tesseract_cmd = Settings().tesseract_path
     driver = LiveDriver()  # 默认 False：此工具没有派舰队能力。
@@ -689,6 +933,38 @@ def scan(
         reached = bot_limit is not None and len(collected) >= bot_limit
         return picked, reached
 
+    def record_log(message: str, payload: dict[str, Any]) -> None:
+        record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
+
+    def measure_rows() -> int | None:
+        """盲滚拨完之后实测走到了第几名（读得出就带进日志）。
+
+        ⚠️ **尽力而为，读不出就 None。** 滚轮把列表停在非整行位置，逐行裁剪读出来
+        的名次会横跨两行——实测过一屏只读出 2 个名次。`progress_mark` 取中位数，
+        对两侧离群免疫，两三个读数就够用；而它只喂日志，不参与任何判据，所以
+        「读不准」的代价只是这一趟答不出「每格走了几行」。
+        """
+        return progress_mark(read_rows()) or None
+
+    account = BlindSpinAccount()
+    if blind_rows is None:
+        # -- 回滚路径：盲滚段退回慢拖 ---------------------------------------
+        # 行 ↔ 屏各换算一次，来回是恒等的（40 屏 × 8.3 = 332 行 → 40 屏）。
+        blind_phase_rows = round(blind_scrolls * ROWS_PER_SCROLL)
+
+        def spin(rows: int) -> int:
+            return drag_blind_rows(rows, scroll_blind=nav.scroll_blind, say_line=say)
+    else:
+        blind_phase_rows = blind_rows
+
+        def spin(rows: int) -> int:
+            return spin_blind_rows(
+                rows,
+                spin=lambda requested: nav.spin_blind(rows=requested),
+                measure_rows=measure_rows,
+                account=account,
+            )
+
     # ⚠️ **开榜放在 try 外面。** 它在读标签行那一步就可能失败，那时面板压根没开，
     # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
     # 那是这条链路的硬红线。放在外面就没有「记得判断开没开」这回事：
@@ -708,24 +984,38 @@ def scan(
         # 恰恰是唯一读不准的一列（榜首的 1–2 位数尤其串），实机 2026-08-15 连着
         # 假阳性四次。而 bot 名字是纯 ASCII、读得稳——把判据换到读得准的信号上，
         # 整段就不需要那条判据了。这一段只靠 `detection_budget` 兜底。
-        # 头 `blind_scrolls` 屏连检测都省了——那一段**必定**还在真人区。
+        # 头 `blind_phase_rows` 行连检测都省了——那一段**必定**还在真人区。
+        #
+        # ⚠️ **`scroll` 与 `spin` 是两个不同的动作，别合成一个。** 检测段照旧慢拖
+        # （`nav.scroll_blind`）；换成滚轮会把列表停在非整行位置，逐行裁剪就横跨
+        # 两行、名字全糊（实测：画面清晰，一屏只读出 2 个名次）。
         stretch = scroll_through_humans(
             scroll=nav.scroll_blind,
+            spin=spin,
             read_names=lambda: name_column_text(driver.capture(), ocr, columns),
             wait=driver.wait,
-            blind_scrolls=blind_scrolls,
+            blind_rows=blind_phase_rows,
             detection_budget=detection_budget,
             say_line=say,
-            record=lambda message, payload: record_system_log(
-                "INFO", "tools.ranking_scan", message, payload=payload
-            ),
+            record=record_log,
             progress=progress,
         )
         outcome = exit_code_for_stretch(stretch)
         if stretch.reached_bots:
             # ⚠️ 这一句不只是给人看的：它是**自动标定唯一的实测样本来源**，
             # 而同一个出口还负责在余量被吃掉时报警。别把它拆回一句 `say`。
-            report_bot_area_reached(stretch.scrolled, blind_scrolls=blind_scrolls)
+            report_bot_area_reached(stretch.rows, blind_rows=blind_phase_rows)
+        if account.rows_requested:
+            # ⚠️ **落在这里而不是拨完那一刻**，因为 `rows_to_bot_area` 要等检测段
+            # 跑完才知道，而那个数与「每格实测几行」放在同一条里才对得上账。
+            # 慢拖那条回滚路不会走到这里（`account` 一个字段都没填）——它本来就
+            # 没有格数可记。
+            report_blind_spin(
+                account,
+                rows_to_bot_area=stretch.rows if stretch.reached_bots else None,
+                source=blind_rows_source,
+                record=record_log,
+            )
 
         # -- 第二段：细读三列 ------------------------------------------------
         if outcome == 0:
@@ -868,13 +1158,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="最多采集 N 个不同 bot，供一轮军力攻击使用",
     )
     parser.add_argument(
+        "--blind-rows",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"开榜后先用滚轮连拨 N 行再开始检测 bot；不传就用默认的 {BLIND_SCROLL_ROWS} 行。"
+            "0 = 一格都不拨（最保守）"
+        ),
+    )
+    parser.add_argument(
         "--blind-scrolls",
         type=int,
         default=None,
         metavar="N",
         help=(
-            f"开榜后先无脑拖 N 屏再开始检测 bot；不传就用默认的 {BLIND_SCROLLS} 屏。"
-            "宁小勿大：拖多了会越过 bot 起点，把该采的那一段整个跳过去"
+            f"【回滚用】盲滚段退回慢拖 N 屏那条老路；不传 N 就用默认的 {BLIND_SCROLLS} 屏。"
+            "只在没给 --blind-rows 时才生效"
         ),
     )
     for name in ("rank", "name", "score"):
@@ -900,6 +1200,24 @@ def main(argv: list[str] | None = None) -> int:
     def pair(raw: list[int] | None, fallback: tuple[int, int]) -> tuple[int, int]:
         return (raw[0], raw[1]) if raw else fallback
 
+    # ⚠️ **优先级要显式写出来，不能靠「谁不是 None」撞出来。** 两个旋钮同时存在是
+    # 有意的：`--blind-rows` 是滚轮那条新路，`--blind-scrolls` 留着当**一键回滚**
+    # （只传它就退回慢拖，不必改代码、不必重新发版；道理写在
+    # `storage.models.MilitaryAttackConfigRow.blind_scroll_rows` 上）。
+    # 两个都给时行数赢：那才是这次改动的主路，而回滚是要显式选的。
+    if args.blind_rows is not None:
+        blind_rows: int | None = args.blind_rows
+        blind_rows_source = "cli"
+    elif args.blind_scrolls is not None:
+        # 只给了屏数 = 明确要走老路。行数置 None 就是这个意思。
+        blind_rows = None
+        blind_rows_source = "cli"
+    else:
+        # 不传就是 `BLIND_SCROLL_ROWS` 那个常量本身，不是另写一个「看起来一样」的
+        # 数字：默认值只该有一处。
+        blind_rows = BLIND_SCROLL_ROWS
+        blind_rows_source = "default"
+
     return run_with_foreground_guard(
         lambda: scan(
             RankingColumns(
@@ -908,8 +1226,8 @@ def main(argv: list[str] | None = None) -> int:
                 score=pair(args.score_column, default.score),
             ),
             bot_limit=args.bot_limit,
-            # 不传就是 `BLIND_SCROLLS` 那个常量本身，不是另写一个「看起来一样」的
-            # 数字：默认值只该有一处。
+            blind_rows=blind_rows,
+            blind_rows_source=blind_rows_source,
             blind_scrolls=BLIND_SCROLLS if args.blind_scrolls is None else args.blind_scrolls,
         )
     )
@@ -930,12 +1248,15 @@ def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
 
 
 __all__ = [
+    "BlindSpinAccount",
     "HumanStretch",
     "NameSample",
     "RankingColumns",
     "ScanProgress",
     "ScanStage",
+    "blind_spin_payload",
     "completion_message",
+    "drag_blind_rows",
     "exit_code_for_stretch",
     "progress_mark",
     "is_self_row",
@@ -947,9 +1268,12 @@ __all__ = [
     "release_stuck_mouse",
     "main",
     "parse_score",
+    "report_blind_spin",
+    "report_bot_area_reached",
     "rows_from_image",
     "sample_overlap",
     "scroll_through_humans",
+    "spin_blind_rows",
     "targets_from_rows",
     "take_batch_targets",
     "track_progress",

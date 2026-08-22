@@ -12,17 +12,49 @@
   </div>
 </section>
 
-<section class="panel" aria-labelledby="blind-head">
-  <h2 id="blind-head">军力榜盲拖屏数</h2>
+<section class="panel" aria-labelledby="blind-rows-head">
+  <h2 id="blind-rows-head">军力榜盲滚行数</h2>
   <p class="muted">
-    开榜之后先无脑往下拖几屏再开始逐屏检测 bot——那一段必定还是真人，检测纯属白花。
-    <strong>留空 = 按实测自动标定</strong>：取最近 {{ blind_scroll_samples }} 次「翻了 N 屏到达 bot 区」的<strong>最小值</strong>再减 {{ blind_scroll_margin }} 屏余量；
+    开榜之后先盲滚过这么多行再开始逐屏检测 bot——那一段必定还是真人，检测纯属白花。
+    <strong>留空 = 按实测自动标定</strong>：取最近 {{ blind_scroll_samples }} 次「翻了 N 行到达 bot 区」的<strong>最小值</strong>再减 {{ blind_scroll_margin_rows }} 行余量；
+    历史不足 {{ blind_scroll_samples }} 次时用默认的 {{ blind_scroll_rows_default }} 行。<strong>填了数就锁死</strong>，不再自动调。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>这一段已经不是慢拖了，是滚轮连拨。</strong>
+    实测约 {{ rows_per_notch }} 行/格、每格 {{ wheel_gap_ms }} 毫秒接着拨下一格（中间不等），
+    拨完之后还会<strong>惯性滑行约 {{ glide_settle_s }} 秒</strong>才停——所以填出来的行数换算成时间就是下面那一行。
+  </p>
+  <p class="muted">
+    <strong>填大填小由你定</strong>，这里不拦、也不标红。盲滚少走的行由检测段接手，而检测段每屏都要做一次整列 OCR，
+    比多拨几格贵得多——所以宁可多滚。反过来，滚过头会<strong>跳过榜单靠前的一段</strong>，那里面的 bot 就整段没采到，
+    而漏采是<strong>静默的</strong>：不报错、不少日志，只是采回来的数少一截。
+    参考：屏口径下已记录的观测下界是 {{ blind_scrolls_max }} 屏，按 {{ rows_per_scroll }} 行/屏折合约 {{ blind_scroll_rows_reference }} 行——
+    那只是<strong>观测值</strong>，不是上限。
+  </p>
+  <div class="filter-bar" style="margin-top:10px">
+    <input id="blind-scroll-rows" type="number" min="0" step="1"
+           placeholder="留空 = 自动标定，样本不够时 {{ blind_scroll_rows_default }} 行" aria-label="军力榜盲滚行数">
+    <button class="btn primary small" type="button" id="btn-save-blind-rows">保存盲滚行数</button>
+  </div>
+  <p id="blind-rows-seconds" class="overview-note"></p>
+</section>
+
+<section class="panel" aria-labelledby="blind-head">
+  <h2 id="blind-head">军力榜盲拖屏数（回滚用，当前不生效）</h2>
+  <p class="muted">
+    ⚠️ <strong>这个框现在完全不上命令行，填什么都不影响实机。</strong>
+    2026-08-22 盲滚段从慢拖改成了滚轮，口径也从「屏」换成了「行」——真正决定盲滚多远的只有上面那个<strong>盲滚行数</strong>
+    （包括它留空时的自动标定）。这一格连同库里那一列一起留着，是为了滚轮出问题时能退回慢拖；
+    <strong>但那个回滚要改代码</strong>（把调度器那两处换回屏口径），不是把上面那个框清空就行。
+  </p>
+  <p class="muted">
+    填法与原先一样：<strong>留空 = 按实测自动标定</strong>，取最近 {{ blind_scroll_samples }} 次「翻了 N 屏到达 bot 区」的<strong>最小值</strong>再减 {{ blind_scroll_margin }} 屏余量；
     历史不足 {{ blind_scroll_samples }} 次时用默认的 {{ blind_scrolls_default }} 屏。<strong>填了数就锁死</strong>，不再自动调。
   </p>
   <p class="muted">
-    ⚠️ <strong>宁小勿大。</strong>填小了只是多花几屏检测（一屏约 0.3 秒），代价极小；
-    填大了会<strong>拖过 bot 起点</strong>，把榜首那批军力最高的 bot 整段跳过去——而采回来的数只会静悄悄少一截，页面上完全看不出来。
-    参考：已记录的最小实测屏数减余量是 {{ blind_scrolls_max }} 屏——这只是**观测下界**，不是上限。
+    ⚠️ 回滚之后这个数填大了会<strong>跳过榜单靠前的一段</strong>，那里面的 bot 就整段没采到，而漏采是<strong>静默的</strong>——
+    不报错、不少日志，只是采回来的数少一截，页面上完全看不出来。填小了只是多花几屏检测（一屏约 0.3 秒），代价小得多。
+    参考：已记录的最小实测屏数减余量是 {{ blind_scrolls_max }} 屏——那只是<strong>观测值</strong>，不是上限；
     榜会随玩家增加变长，实测值也在涨，所以这里<strong>不拦</strong>更大的值，由你判断。
   </p>
   <div class="filter-bar" style="margin-top:10px">
@@ -225,7 +257,16 @@
   const tiers = document.getElementById('tier-list');
   const planets = document.getElementById('planet-list');
   const blindScrolls = document.getElementById('blind-scrolls');
+  const blindScrollRows = document.getElementById('blind-scroll-rows');
+  const blindRowsSeconds = document.getElementById('blind-rows-seconds');
   const reportScanHours = document.getElementById('report-scan-hours');
+  // 行↔秒换算用的三个数**全部由服务端下发**（`game.ranking_ui` 里那三个标定常量），
+  // 页面不抄第二遍：抄一遍之后谁重新标定，页面上那个秒数就是假的，而它正是用户
+  // 判断「填多少」的唯一依据。
+  const ROWS_PER_NOTCH = {{ rows_per_notch }};
+  const WHEEL_GAP_S = {{ wheel_gap_s }};
+  const GLIDE_SETTLE_S = {{ glide_settle_s }};
+  const BLIND_SCROLL_ROWS_DEFAULT = {{ blind_scroll_rows_default }};
   // 三个调度节奏旋钮。`payload` 里的键名就是 `PUT /api/attack-config` 的字段名。
   //
   // 「对账翻信箱时长」**故意不并进这个数组**：它有自己那条前端下界（至少 1，
@@ -248,6 +289,24 @@
     return { galaxy: parts[0], system: parts[1], position: parts[2] };
   };
   const showError = (error = '') => { errorBox.textContent = error; errorBox.hidden = !error; };
+
+  // 盲滚行数唯一的辅助显示：**行 ↔ 秒换算**。
+  //
+  // ⚠️ **不做越界判断、不标红。** 那个「bot 起点 587」是玩家改名伪装出来的，
+  // 不是安全边界（用户口径 2026-08-22）——拿一个被污染的边界报警，比不报警更坏。
+  // 这里只回答「填这么多要滚多久」，填大填小由用户定。
+  function showBlindRowsSeconds() {
+    const text = blindScrollRows.value.trim();
+    const rows = text === '' ? BLIND_SCROLL_ROWS_DEFAULT : Number(text);
+    if (!Number.isFinite(rows) || rows < 0) { blindRowsSeconds.textContent = ''; return; }
+    const notches = Math.ceil(rows / ROWS_PER_NOTCH);
+    const seconds = rows / ROWS_PER_NOTCH * WHEEL_GAP_S + GLIDE_SETTLE_S;
+    // 留空时算不出确定的秒数：那一路走自动标定，行数要等实测样本才知道。
+    // 所以这里只按「样本不够时的默认值」给个量级，并说清那是哪一种情况——
+    // 直接写成「留空 = N 秒」会把自动标定那条路说成一个固定值。
+    const head = text === '' ? `留空 = 自动标定；样本不够时按 ${BLIND_SCROLL_ROWS_DEFAULT} 行算，` : `${rows} 行 `;
+    blindRowsSeconds.textContent = `${head}约 ${seconds.toFixed(1)} 秒（连拨 ${notches} 格 + 惯性滑行 ${GLIDE_SETTLE_S} 秒）`;
+  }
   const fail = (error) => showError(error.detail || error.message || String(error));
 
   function addTier(tier = {}) {
@@ -293,6 +352,10 @@
         // `?? ''` 而不是 `|| ''`：0 是合法取值（「一屏都别盲拖」），
         // `||` 会把它显示成空框，也就是显示成「自动标定」。
         blindScrolls.value = config.blind_scrolls ?? '';
+        // 同理，盲滚行数也是 `??`：0 是合法取值（「一格都不拨」），
+        // `||` 会把它显示成空框，也就是显示成「用默认值」。
+        blindScrollRows.value = config.blind_scroll_rows ?? '';
+        showBlindRowsSeconds();
         reportScanHours.value = config.report_scan_hours ?? '';
         // 同上，一律 `??`：0 是合法取值（翻信箱冷却填 0 = 每轮都翻），
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
@@ -319,6 +382,13 @@
       scrolls = Number(raw);
       if (!Number.isInteger(scrolls) || scrolls < 0) throw new Error('盲拖屏数要填非负整数；要自动标定就把它留空');
     }
+    const rawRows = blindScrollRows.value.trim();
+    let rows = null;
+    if (rawRows !== '') {
+      rows = Number(rawRows);
+      // 下界是 0 不是 1：0 = 「一格都不拨」，是最保守的那一头。上界**不设**。
+      if (!Number.isInteger(rows) || rows < 0) throw new Error('盲滚行数要填非负整数；要用默认值就把它留空');
+    }
     const rawHours = reportScanHours.value.trim();
     let hours = null;
     if (rawHours !== '') {
@@ -326,7 +396,12 @@
       // 这里的 0 和盲拖那个 0 不一样：下界就是「此刻」，等于一封都翻不到。
       if (!Number.isInteger(hours) || hours < 1) throw new Error('翻信箱时长要填至少 1 的整数小时；要用默认值就把它留空');
     }
-    const payload = { tiers: tierPayload, blind_scrolls: scrolls, report_scan_hours: hours };
+    const payload = {
+      tiers: tierPayload,
+      blind_scrolls: scrolls,
+      blind_scroll_rows: rows,
+      report_scan_hours: hours,
+    };
     for (const knob of knobs) {
       const text = knob.element.value.trim();
       if (text === '') { payload[knob.key] = null; continue; }
@@ -348,6 +423,8 @@
   document.getElementById('btn-add-tier').onclick = () => addTier();
   document.getElementById('btn-save-tiers').onclick = saveConfig;
   document.getElementById('btn-save-blind').onclick = saveConfig;
+  document.getElementById('btn-save-blind-rows').onclick = saveConfig;
+  blindScrollRows.oninput = showBlindRowsSeconds;
   document.getElementById('btn-save-scan').onclick = saveConfig;
   document.getElementById('btn-save-knobs').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {

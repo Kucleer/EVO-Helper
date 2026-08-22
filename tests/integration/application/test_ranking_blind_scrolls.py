@@ -1,25 +1,20 @@
-"""军力榜的「盲拖屏数」：攻击配置页上可配，**留空 = 按实测自动标定**。
+"""军力榜的「盲拖屏数」——**屏口径，现在是一键回滚那条路。**
 
-用户口径（2026-08-17）：「盲拖数量需在攻击配置页可配置」。
+口径 2026-08-22 换成行（滚轮连拨取代慢拖，而滚轮没有「屏」这个概念）。真正驱动
+盲滚的那一份用例搬到了 `test_ranking_blind_rows.py`；这一份留下来钉的是**回滚
+杠杆还在**这件事，那是两个不同的断言：
+
+1. `military_attack_config.blind_scrolls` 那一列、攻击配置页上那个框、
+   `validate_blind_scrolls` 那把尺子**都还是活的**——页面照旧要在写库之前量一遍。
+2. 但那个值**不再上命令行**：调度器组的是 `--blind-rows`。
+3. 屏口径的判定机器（`_blind_scrolls` 和它那三个帮手）原样留着，接回去就能用。
+   ⚠️ **一条不测的回滚路不是回滚路**：等真要回滚那天才发现它烂了，就等于没有。
 
 盲拖是「开榜之后先无脑往下拖几屏再开始逐屏检测 bot」——那一段必定还是真人，
 检测纯属白花。这个数长期写死成 40，而生产实测（2026-08-17 同一天六趟）
 到达 bot 区要 77 / 78 / 73 / 74 / 72 / 78 屏：中间 32–38 屏全在白检测，
-按每天 8 趟算一天白花 250–300 次。
-
-这份用例钉的是**三件互相制衡**的事：
-
-1. **没有历史时用写死的默认值 40。** 这是加这个功能之前的行为。
-2. **有历史时用 `min(最近 5 次) - 10`，取最小值而不是最近一次或平均值。**
-   ⚠️ 这一条是整份里最要紧的：六次实测跨度 6 屏（72–78），拿 78 或者平均值去设
-   盲拖就会**拖过 bot 起点**，把榜首那批军力最高的 bot 整段跳过去——而采回来的
-   数只会静悄悄少一截，页面上、日志里都看不出任何异常。
-3. **手填的值锁死**，不再自动调；不可能的取值当场拒掉。
-
-值住在**全局攻击配置**（`military_attack_config.blind_scrolls`），不是
-`mission_tasks.params_json`：用户指定的位置是攻击配置页，那一页存的就是全局项。
-实测样本**没有自己的表**，直接从 `system_log` 里那些「翻了 N 屏到达 bot 区」
-反解回来——那些行本来就在库里攒着。
+按每天 8 趟算一天白花 250–300 次。那六个数在行口径下换算成行，仍然是
+`test_ranking_blind_rows.py` 里标定用的样本。
 """
 
 from __future__ import annotations
@@ -49,10 +44,6 @@ from evo_helper.storage.system_log import SystemLogRepository
 from evo_helper.tools.ranking_scan import scan
 
 from .conftest import Clock, make_supervisor
-from .test_line_shortage_recovery import (
-    RecordingLog,
-    recorded,  # noqa: F401 - fixture，被下面的用例按名字取用
-)
 
 ORIGIN = Coordinate(2, 137, 18)
 
@@ -120,12 +111,6 @@ def _seed_measurements(
     )
 
 
-def _blind_scrolls_in(command: list[str]) -> int | None:
-    if "--blind-scrolls" not in command:
-        return None
-    return int(command[command.index("--blind-scrolls") + 1])
-
-
 # -- 常量本身 ------------------------------------------------------------------
 
 
@@ -133,10 +118,12 @@ def test_the_hard_coded_fallback_is_still_forty_screens() -> None:
     """⚠️ **断言具体数字，不是「等于那个常量」。**
 
     写成 `assert BLIND_SCROLLS == BLIND_SCROLLS` 那样的自反断言，改了常量用例
-    照样绿——而这个数改大就意味着没有历史数据的那几趟会拖过 bot 起点。
+    照样绿——而这个数改大就意味着**回滚之后**那几趟会拖过 bot 起点。
 
     40 的来历见 `game.ranking_ui`：按推进速率的上界 12 名/屏算，40 屏最多推进
-    480 名，够不到 bot 起点 587。
+    480 名。⚠️ 那套推理里的「够不到 bot 起点 587」前提已经不成立（用户口径
+    2026-08-22：587 那一段是玩家改名伪装的），但 40 这个数本身仍是回滚那条路
+    唯一的默认值，采集那侧的形参默认值必须跟它对得上。
     """
     assert BLIND_SCROLLS == 40
     assert inspect.signature(scan).parameters["blind_scrolls"].default == 40
@@ -148,6 +135,9 @@ def test_the_calibration_window_and_margin_are_wide_enough_for_the_measured_nois
     六次实测 72–78，跨度 6：余量小于 6 就意味着某些趟必然拖过头。
     窗口取 5 是因为 `77 / 78 / 78` 这样连着三趟偏大的窗口在实测里真的出现过，
     K=3 的最小值就是 77——那正好落回噪声区间里。
+
+    ⚠️ 这两个数在行口径下仍然当家：`BLIND_SCROLL_SAMPLES` 两边共用，
+    `BLIND_SCROLL_MARGIN_ROWS` 是拿 `BLIND_SCROLL_MARGIN` 换算出来的。
     """
     assert BLIND_SCROLL_MARGIN == 10
     assert BLIND_SCROLL_SAMPLES == 5
@@ -158,131 +148,59 @@ def test_the_manual_ceiling_matches_what_the_calibration_would_pick() -> None:
     """手填的上界 = 把自动标定那道公式套在已记录的实测上。
 
     这样用户想把当下自动算出来的值钉死时填得进去，而手填的数又不会越过
-    **有实测支撑**的那条线。
+    **有实测支撑**的那条线。（这个常量眼下只剩界面上那句提示在用，见下面
+    「不设上界」那条。）
     """
     assert BLIND_SCROLLS_MAX == 62
     assert BLIND_SCROLLS_MAX == min(MEASURED) - BLIND_SCROLL_MARGIN
 
 
-# -- 留空 + 没有历史 = 写死的默认值 --------------------------------------------
+# -- 屏数不再上命令行 ----------------------------------------------------------
 
 
-def test_an_empty_box_without_history_keeps_the_hard_coded_default(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher
-) -> None:
-    """样本攒不够时命令行上**一个 `--blind-scrolls` 都不能有**。
-
-    断言「没有这个开关」而不是「等于 40」：默认值只该有 `BLIND_SCROLLS` 一处，
-    调度器这边再送一个「看起来一样」的数字过去，日后调默认值就调不动了。
-    """
-    _only_ranking(repository)
-
-    command = _launched(scheduler, launcher)
-
-    assert "--blind-scrolls" not in command
-
-
-def test_history_shorter_than_the_window_still_uses_the_default(  # type: ignore[no-untyped-def]
+def test_the_screen_knob_no_longer_reaches_the_command_line(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory
 ) -> None:
-    """差一次都不算够。
+    """⚠️ **手填了屏数也不许出现 `--blind-scrolls`。**
 
-    半截样本比没有样本更危险：三趟里最小的那个纯属运气，拿它去设盲拖正是
-    「按最近一次定」那条已经被否掉的做法。
+    两个开关在 `tools.ranking_scan` 上并存是有意的（`--blind-scrolls` 就是回滚
+    那条路），但**优先级要显式**：只传 `--blind-scrolls` 的意思是「退回慢拖」。
+    调度器要是在正常路径上顺手把它带上，等于每一趟都在回滚——而回滚是要人
+    显式选的，不该由一个存量配置值悄悄决定。
     """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[: BLIND_SCROLL_SAMPLES - 1])
-
-    assert "--blind-scrolls" not in _launched(scheduler, launcher)
-
-
-# -- 留空 + 有历史 = min(最近 K 次) − 余量 -------------------------------------
-
-
-def test_the_calibration_takes_the_smallest_recent_measurement(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, session_factory
-) -> None:
-    """⚠️ **这一条守的是「不许拖过头」，是整份里最要紧的。**
-
-    喂的是带噪声的真实样本（78 / 73 / 74 / 72 / 78）：
-
-    * 取最小值 → 72 − 10 = **62**（正确）
-    * 取最大值 → 78 − 10 = 68 —— 比最小的那一趟还多 6 屏，**必定拖过 bot 起点**
-    * 取平均值 → 75 − 10 = 65 —— 同样越过 72 那一趟
-    * 取最近一次 → 78 − 10 = 68 —— 同上
-
-    三个错答案都在这里被显式排除掉，免得改成其中之一还能绿。
-    """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[1:])
-
-    chosen = _blind_scrolls_in(_launched(scheduler, launcher))
-
-    recent = MEASURED[1:]
-    mean = round(sum(recent) / len(recent))
-
-    assert chosen == 62
-    assert chosen != max(recent) - BLIND_SCROLL_MARGIN, "取了最大值/最近一次"
-    assert chosen != mean - BLIND_SCROLL_MARGIN, "取了平均值"
-
-
-def test_only_the_most_recent_measurements_count(  # type: ignore[no-untyped-def]
-    scheduler, repository, session_factory
-) -> None:
-    """窗口之外的陈年样本不参与。
-
-    这个数随玩家增长往上漂，把很久以前那一趟（榜单短得多）算进来只会把盲拖
-    永远压在一个过时的低位上——安全，但等于白花几十屏检测，也就是这个功能
-    本来要省掉的那部分。
-    """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, (30, *MEASURED[1:]))
-
-    command = scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    assert _blind_scrolls_in(command) == 62
-
-
-def test_the_calibration_never_goes_negative(  # type: ignore[no-untyped-def]
-    scheduler, repository, session_factory
-) -> None:
-    """样本比余量还小时，答案是「一屏都别盲拖」，不是一个负数。"""
-    _only_ranking(repository)
-    _seed_measurements(session_factory, (3,) * BLIND_SCROLL_SAMPLES)
-
-    assert _blind_scrolls_in(scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)) == 0
-
-
-# -- 填了数就锁死 --------------------------------------------------------------
-
-
-def test_a_configured_value_wins_over_the_calibration(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, session_factory
-) -> None:
-    """手填的是**覆盖**，不是初值：有历史也照样用手填的那个数。"""
     _only_ranking(repository)
     _seed_measurements(session_factory, MEASURED[1:])
     repository.replace_military_attack_tiers("[]", blind_scrolls=25)
 
-    assert _blind_scrolls_in(_launched(scheduler, launcher)) == 25
+    command = _launched(scheduler, launcher)
+
+    assert "--blind-scrolls" not in command
+    assert "25" not in command
 
 
-def test_zero_means_no_blind_drag_at_all_and_is_not_treated_as_blank(  # type: ignore[no-untyped-def]
+def test_the_screen_era_decision_still_works_if_it_is_wired_back(  # type: ignore[no-untyped-def]
     scheduler, repository, session_factory
 ) -> None:
-    """`0` 是一个真的取值：一屏都别盲拖，从第一屏就开始检测。
+    """⚠️ **一条不测的回滚路不是回滚路。**
 
-    它是**最保守**的取值（多花几十次廉价检测，绝不可能拖过头），所以必须放行。
-    把它当成「留空」就等于在用户明确要求最保守时反而去拖 62 屏。
+    `_blind_scrolls` 眼下没有调用点（组命令行走的是 `_blind_rows`），所以这里
+    刻意伸手去按那个私有方法：不按的话它会静静地烂掉，而发现的时机正是要回滚
+    的那一天——那时没人有空调试判据。
+
+    钉的是取值顺序在屏口径下**一条没变**：手填优先，留空按 `min(最近 5 次) - 10`
+    自标定。
     """
     _only_ranking(repository)
     _seed_measurements(session_factory, MEASURED[1:])
-    repository.replace_military_attack_tiers("[]", blind_scrolls=0)
 
-    assert _blind_scrolls_in(scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)) == 0
+    assert scheduler._blind_scrolls() == min(MEASURED[1:]) - BLIND_SCROLL_MARGIN
+
+    repository.replace_military_attack_tiers("[]", blind_scrolls=25)
+
+    assert scheduler._blind_scrolls() == 25
 
 
-# -- 拒掉不可能的取值 ----------------------------------------------------------
+# -- 那把尺子还是活的 ----------------------------------------------------------
 
 
 @pytest.mark.parametrize("raw", [-1, -40])
@@ -306,6 +224,14 @@ def test_a_blank_value_is_not_an_error_it_is_the_auto_mode(
     assert scheduler.validate_blind_scrolls(raw) is None
 
 
+def test_zero_is_a_real_value_and_not_a_blank(scheduler: MissionScheduler) -> None:
+    """`0` 是用户真的敲进去的「一屏都别盲拖」——**最保守**的取值，必须放行。
+
+    把它当成「留空」就等于在用户明确要求最保守时反而去拖 62 屏。
+    """
+    assert scheduler.validate_blind_scrolls(0) == 0
+
+
 @pytest.mark.parametrize("raw", [BLIND_SCROLLS_MAX, BLIND_SCROLLS_MAX + 1, 70, 999])
 def test_a_value_above_the_recorded_minimum_is_still_accepted(
     scheduler: MissionScheduler, raw: int
@@ -323,171 +249,29 @@ def test_a_value_above_the_recorded_minimum_is_still_accepted(
     assert scheduler.validate_blind_scrolls(raw) == raw
 
 
-# -- 判定本身要在日志里说得出来 ------------------------------------------------
-#
-# ⚠️ **补的是自动标定唯一的哑点。** `bot_area_reached_message` 上写着：那句实测
-# 日志的措辞一改，库里全部历史样本一次性作废，标定就**静悄悄退回写死的默认值**
-# ——页面上、日志里都看不出任何异常。采集那头照样打「盲拖 40 屏」，看上去和
-# 「本来就没攒够样本」一模一样。所以差别只能由判定这一侧说出来。
-
-
-def _verdicts(log: RecordingLog) -> list[str]:
-    """只挑盲拖那一类的日志。同一个 tick 里还会写别的（定时窗口之类）。"""
-    return [message for message in log.messages if "盲拖屏数" in message]
-
-
-def _verdict_payloads(log: RecordingLog) -> list[dict[str, object]]:
-    return [
-        payload
-        for message, payload in zip(log.messages, log.payloads, strict=True)
-        if "盲拖屏数" in message
-    ]
-
-
-def test_a_missing_calibration_says_so_and_counts_the_samples(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """⚠️ **样本条数是「刚上线」和「反解规则失效了」唯一的分界。**
-
-    两种情形下命令行完全一样（不带 `--blind-scrolls`）、采集日志也完全一样
-    （「盲拖 40 屏」）。区别只有一个：前者的样本会一天天涨上去，后者恒为 0。
-    不把这个数写进 `payload_json`，事后就只能靠猜。
-    """
-    _only_ranking(repository)
-
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    assert len(_verdicts(recorded)) == 1
-    assert str(BLIND_SCROLLS) in _verdicts(recorded)[0], "没说清回落到的是哪个默认值"
-    payload = _verdict_payloads(recorded)[0]
-    assert payload["source"] == "default"
-    assert payload["blind_scrolls"] is None
-    assert payload["measurements"] == 0
-    assert payload["samples_required"] == BLIND_SCROLL_SAMPLES
-
-
-def test_a_successful_calibration_is_written_with_its_sample_count(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    session_factory,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """标定成功也要写：那是「这条反馈回路还活着」唯一的证据。"""
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[1:])
-
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    payload = _verdict_payloads(recorded)[0]
-    assert payload["source"] == "calibrated"
-    assert payload["blind_scrolls"] == 62
-    assert payload["measurements"] == len(MEASURED[1:])
-    assert "62" in _verdicts(recorded)[0]
-
-
-def test_a_hand_typed_value_is_reported_as_hand_typed(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    session_factory,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """手填和标定必须分得开。
-
-    盲拖拖过头的后果是**采回来的数静悄悄少一截**，而两种来源的善后完全不同：
-    一个要去攻击配置页上改，一个要去看实测样本。日志说成同一句，用户只能挨个试。
-    """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[1:])
-    repository.replace_military_attack_tiers("[]", blind_scrolls=25)
-
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    payload = _verdict_payloads(recorded)[0]
-    assert payload["source"] == "manual"
-    assert payload["blind_scrolls"] == 25
-    assert "手填" in _verdicts(recorded)[0]
-
-
-def test_the_verdict_is_only_written_when_it_changes(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    session_factory,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """⚠️ **限流：判定没变就一个字都不写。**
-
-    `_blind_scrolls` 在每次组军力榜命令行时都会走，而 `command_for` 那条公开路径
-    **页面保存配置时也会走**。每次都写的话，一天几十条重复的「还是 62 屏」会把
-    真正的那一次变化埋掉——而这条日志存在的全部意义就是那一次变化。
-    """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[1:])
-
-    for _ in range(5):
-        scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    assert len(_verdicts(recorded)) == 1
-
-
-def test_a_changed_verdict_is_written_again(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    session_factory,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """限流不许压掉**真的**变化。
-
-    「样本攒够了、标定第一次给出答案」正是用户最该看到的那一条：在此之前每趟
-    都白拖三十几屏，从这条起不再白拖。压掉它，这个功能到底有没有生效就无从查起。
-    """
-    _only_ranking(repository)
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-    assert _verdict_payloads(recorded)[0]["source"] == "default"
-
-    _seed_measurements(session_factory, MEASURED[1:])
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    assert len(_verdicts(recorded)) == 2
-    assert _verdict_payloads(recorded)[1]["source"] == "calibrated"
-    assert _verdict_payloads(recorded)[1]["blind_scrolls"] == 62
-
-
-def test_the_verdict_never_claims_a_scan_actually_ran(  # type: ignore[no-untyped-def]
-    scheduler,
-    repository,
-    session_factory,
-    recorded: RecordingLog,  # noqa: F811
-) -> None:
-    """⚠️ **措辞只说判定，不说「这一趟拖了几屏」。**
-
-    走到这里未必真会起一轮采集：`command_for` 是页面拿来校验参数的，组出来的
-    命令行随手就丢了。说成「本趟盲拖 N 屏」就是替一件没发生的事作证——而这个
-    仓库今天已经为「日志说假话」付过两天的代价（`bot_loop._say_still_waiting`）。
-
-    真正「这一趟拖了几屏」那句话在 `tools.ranking_scan` 里，由**真的拖完了**的
-    那一侧打出来。
-    """
-    _only_ranking(repository)
-    _seed_measurements(session_factory, MEASURED[1:])
-
-    scheduler.command_for(MissionKind.RANKING, "{}", origin=ORIGIN)
-
-    verdict = _verdicts(recorded)[0]
-    assert "判定" in verdict
-    assert "本趟" not in verdict
-    assert "已盲拖" not in verdict
-
-
 # -- 页面上说得出这件事 --------------------------------------------------------
 
 
 def test_the_attack_settings_page_carries_the_box_and_the_warning() -> None:
     """框要在**攻击配置页**上（用户指定的位置），而且旁边写清风险。
 
-    一个光秃秃的数字框自己说不出「宁小勿大」。而这个值填大了的后果恰恰是
+    一个光秃秃的数字框自己说不出后果。而这个值填错了的后果恰恰是
     不报错、不少日志、只是数少一截——页面上不写明白，用户没有别的途径知道。
+
+    ⚠️ 这个框在行口径下**留着不删**（设计口径 2026-08-22：不删列、不删页面项），
+    它是回滚杠杆的用户入口。但它**当前不生效**，页面必须说出这件事——
+    否则用户会一直调一个根本不上命令行的数。
+
+    ⚠️ **这里刻意不再断言「宁小勿大」和「拖过 bot 起点」那两句原文。**
+    - 「拖过 bot 起点」建立在 `FIRST_BOT_RANK`(587) 是真 bot 边界之上，而用户口径
+      （2026-08-22）说那一段是**玩家改名伪装**的 bot，判据只看名字前缀，改名的真人
+      一样命中。前提不成立，页面上继续那么写就是拿假边界吓用户。
+    - 「宁小勿大」在**行口径下正好反过来**：盲滚少走的行由检测段接手，而检测段每屏
+      要做一次整列 OCR（约 4.6 秒/屏），比多拨几格贵得多——所以行那个框写的是
+      「宁可多滚」。两个框的取向不同，断言不能共用一句话。
+
+    钉的是**实质**而不是措辞：框还在、留空的含义写着、静默漏采的后果写着、
+    以及「这个框当前不生效」。
     """
     page = (Path(evo_helper.web.__file__).parent / "templates" / "settings.html").read_text(
         encoding="utf-8"
@@ -495,6 +279,6 @@ def test_the_attack_settings_page_carries_the_box_and_the_warning() -> None:
 
     assert 'id="blind-scrolls"' in page, "攻击配置页上没有这个输入框，等于功能不存在"
     assert "留空 = 按实测自动标定" in page
-    assert "宁小勿大" in page
-    assert "拖过 bot 起点" in page
-    assert "少一截" in page
+    assert "当前不生效" in page, "这个框已经不上命令行了，页面必须说出来"
+    assert "少一截" in page, "静默漏采这个后果必须写在页面上"
+    assert "拖过 bot 起点" not in page, "587 不是真 bot 边界，这句假前提不许留在页面上"

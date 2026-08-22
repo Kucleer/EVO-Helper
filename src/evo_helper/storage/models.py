@@ -849,9 +849,16 @@ class MilitaryAttackConfigRow(Base):
     #: `blind_scrolls`——给了默认值就分不开「没配」和「恰好配成当前默认」，日后调默认值
     #: 时所有老行都会被钉死在旧数上，而它们表达的其实是「跟着默认走」。
     #:
-    #: ⚠️ **上面那一列 `blind_scrolls`（屏）刻意保留不删。** 它是这次改动的一键回滚：
-    #: 本列置空即退回慢拖那条路，不需要改代码、不需要再来一条迁移。顺手把它删掉，
-    #: 回滚就变成「改代码 + 重新发版」。
+    #: ⚠️ **本列置空 ≠ 退回慢拖。** 置空只是「跟着代码默认值 700 走」，走的仍是滚轮。
+    #: 两种说法一度并存在设计文档里（「留空 = 700 行」与「置空即退回慢拖」），
+    #: 而它们在配置层不可能同时成立——留空只能有一个含义。**取前者**：
+    #: 与本表其余可空旋钮的惯例一致，NULL 一律是「跟着代码默认走」。
+    #:
+    #: ⚠️ **上面那一列 `blind_scrolls`（屏）仍刻意保留不删**，但它是**代码级**回滚的
+    #: 落脚点，不是配置级的：把 `domain.missions.ranking_command` 的参数换回
+    #: `--blind-scrolls`、两处调用点换回 `_blind_scrolls()`，就退回慢拖那条路，
+    #: 而那一列和页面上那个框还在，不必再来一条迁移。顺手把它删掉，
+    #: 回滚就变成「改代码 + 加迁移 + 重新发版」。
     blind_scroll_rows: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     #: 对账那一趟翻信箱最多往回读几个**小时**
     #: （`tools.pirate_loop.PirateLoop.backfill_reports` 的 routine 那一档）。
