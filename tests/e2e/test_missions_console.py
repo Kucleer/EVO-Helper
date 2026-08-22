@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -134,59 +135,70 @@ def test_the_scheduler_and_the_backfill_share_one_compact_top_bar(
         assert node in body, node
 
 
-def test_the_military_first_switch_moved_into_the_fold_without_being_deleted(
-    client: TestClient,
-) -> None:
-    """「军力优先」从主行挪进「更多」折叠区，**没有被删掉**。
+def test_the_military_first_switch_is_gone_from_the_page(client: TestClient) -> None:
+    """「军力优先」那个开关**整个从页面上删掉了**。
 
-    ⚠️ 旧断言钉的是 `taskCell.append(modeLabel)`（它长在任务名那一格里）。
-    用户口径 2026-08-22 只说了「主行上不需要这个按钮」——删掉它等于从界面上
-    删掉一种运行模式：关掉之后选靶换成「按坐标顺序、按范围打」那条分支。
-    所以这里钉的是「进了折叠区」而不是「不见了」。
+    ⚠️ **这一条推翻了它自己的两个前身，来回的理由必须留着**，否则下一个人会以为
+    是随手改的：
+    ① 最早它长在主行任务名那一格里（`taskCell.append(modeLabel)`）；
+    ② 2026-08-22 用户说「主行上不需要这个按钮」，于是挪进「更多」——那时**不能**
+       删，因为关掉它意味着换一条真的还在跑的选靶分支
+       （`nearest_first(bot_targets_in_range(...))`），删了等于从界面上删掉一种
+       运行模式；
+    ③ 同日用户又说「目前原来的攻击模式已经被废弃了，前端页面不需要兼容」——
+       那条分支不再是「另一条走得通的路」，于是开关连同范围三字段一起撤掉。
 
-    默认开，而且这个默认**落在库里**（新任务的 `params_json` 就带
-    `by_military`），不是页面上一个勾好看的复选框——页面显示勾着、库里却是
-    另一套，就是一张卡说一套、调度器做另一套。
+    ⚠️ **后端一个字段都没删**：`by_military` 仍然在库里、仍然由调度器读，新任务
+    落库仍然是 `true`（另有用例钉着）。页面只是不再提供切换入口。
+
+    军力方案（出发点 / 航线）留在「更多」里，而且**不再跟任何开关显隐**——它是
+    这条链路唯一的派遣依据，藏在一个条件后面只有「还有另一条路」时才说得通。
     """
     body = _page_body(client.get("/missions").text)
 
-    assert "makeInput('military-enabled', { type: 'checkbox'" in body
-    # 它现在挂在「更多」那一层里（`modeRow` 被 append 进 `more`），不在主行上。
-    assert "modeRow.append(modeLabel" in body
-    assert "more.append(modeRow)" in body
-    assert "taskCell.append(modeLabel)" not in body
-    # 多出发点方案同样搬进折叠区，但仍然是这张卡自己的东西。
+    # ⚠️ 断言打在**代码构造**上，不是裸字符串 `military-enabled`：那个类名如今只
+    # 出现在几句「这里从前有个开关」的注释里，而那几句注释是有意留下的（来回改过
+    # 三次的东西，理由不留在原地下一个人就会再改回来）。整页搜会被自己的注释喂饱。
+    assert "makeInput('military-enabled'" not in body, "开关又长回来了"
+    assert "querySelector('.military-enabled')" not in body, "还有代码在读那个开关"
+    assert "matches('.military-enabled')" not in body
+    assert "modeRow" not in body
+    assert "军力优先说明" not in body
+    # 军力方案还在折叠区里，而且恒显示（没有 `hidden = true` 那一句了）。
     assert "militaryDispatch.className = 'military-dispatch more-line'" in body
     assert "more.append(militaryDispatch)" in body
+    assert "militaryDispatch.hidden = true" not in body
 
 
-def test_the_save_button_stays_reachable_when_military_first_is_switched_off(
-    client: TestClient,
-) -> None:
-    """⚠️ 「保存军力方案」不许跟着开关一起藏。
+def test_the_save_button_sits_with_the_rows_it_saves(client: TestClient) -> None:
+    """「保存军力方案」摆在它要保存的那几行旁边，并且运行中会被锁上。
 
-    它存的是整份军力方案，**包括开关本身**（`saveMilitary` 里 `by_military:
-    enabled`，关着的时候只送这一个键）。跟着 `.military-dispatch` 一起藏起来的话，
-    用户把开关拨到「关」之后就再没有任何按钮能把这个状态存下来——那等于这个开关
-    只能开不能关，而「把它留下来」的全部意义就是那条路还走得通。
+    ⚠️ 旧断言钉的是「按钮长在开关那一行、不许跟着 `.military-dispatch` 一起藏」
+    ——理由是 `saveMilitary` 当时要能把「军力优先＝关」这个状态存下来，跟着藏起来
+    就等于那个开关只能开不能关。开关随「原来的攻击模式被废弃」删了（用户口径
+    2026-08-22），那个理由随之消失：军力方案不再藏，按钮也就没有「被藏掉」这回事。
+
+    于是它挪到出发点那一组的标题行上——「改完这几行、就在这几行旁边按保存」。
+    `by_military` 仍然显式送 `true`（存量任务里可能存着 `false`，而页面上再也没有
+    别的地方能把它掰回来）。
     """
     body = _page_body(client.get("/missions").text)
 
-    # 按钮长在开关那一行（`modeRow`），不在会被 `setMilitaryVisible` 藏掉的
-    # `.military-dispatch` 里。
-    assert "modeRow.append(modeLabel, makeTips('军力优先说明', MILITARY_MODE_TIP), save)" in body
-    assert "militaryDispatch.append(originHead, origins)" in body
-    # 只藏多出发点那一组，按钮那一行不动。
-    assert "militaryDispatch.hidden = !enabled" in body
+    assert "save.className = 'btn primary small military-save'" in body
+    assert "makeTips('多出发点说明', MILITARY_ORIGIN_TIP)," in body
+    assert "document.createTextNode(' '), save)" in body
+    assert "by_military: true" in body, "恒送 true：存量任务里那个 false 得有地方被纠正"
+    # 运行中配置已固化，按钮不该点下去才发现（后端也会 409）。
     assert "save.disabled = locked" in body
 
 
 def test_a_new_task_is_created_military_first(client: TestClient) -> None:
     """默认开这件事由库说了算：新建出来的任务 `params.by_military` 就是 true。
 
-    页面上那个复选框只是回显（`task.params.by_military === true`）。默认写在
-    页面上的话，用户看到勾着、调度器却按坐标顺序打——而范围那三个字段已经不在
-    页面上渲染了，他连改回去的地方都找不到。
+    ⚠️ 页面上已经**没有**任何地方能改它了（那个复选框随「原来的攻击模式被废弃」
+    删掉了，用户口径 2026-08-22）。正因为如此，这个默认更加**必须真的落库**：
+    页面显示成军力优先、库里却是「按坐标顺序、按范围打」的话，用户连改回去的
+    地方都找不到——而范围那三个字段也不在页面上了。
     """
     created = client.post("/api/missions", json={"kind": "BOT", "origin": "5:261:8"})
 
@@ -432,33 +444,36 @@ def test_the_bot_row_carries_a_new_round_button(client: TestClient) -> None:
 
 
 def test_the_bot_card_no_longer_renders_the_three_range_boxes(client: TestClient) -> None:
-    """军力攻击卡上不再有「星系 / 系号 / –」那三个范围框。
+    """军力攻击卡上**整页都没有**「星系 / 起始系号 / 结束系号」那三个范围框。
 
-    依据在 `application/mission_scheduler.py` 的选靶分支：
+    它们只服务于 `application/mission_scheduler.py` 里那条选靶分支：
 
         if _bot_by_military(params_json):
-            return most_valuable_first(...)        ← 军力优先走这条，不看范围
+            return most_valuable_first(...)        ← 现在只走这条
         in_range = bot_targets_in_range(..., **_bot_range(params_json))
+        return nearest_first(in_range, origin)     ← 按范围筛的那条，已废弃
 
-    也就是说军力优先模式下那三个字段**一次都没被用到**。一个填了不生效的输入框
-    比没有更糟——用户会以为自己把这一轮的范围配好了。
+    ⚠️ **这三个框在页面上来回过三次，理由必须留在这里**，否则下一个人会以为是
+    随手改的：
+    ① 2026-08-22 第一版整个撤掉（军力优先模式下确实一次都用不到）；
+    ② 随后发现陷阱——「军力优先」开关能关，关掉走上面第二条分支，后端缺 `galaxy`
+       直接 400，而页面上没有任何地方能填它，等于把一种运行模式删掉了、只是删得
+       不明说。于是它们回到「更多」里，跟着开关反向显隐；
+    ③ 同日用户口径：「目前原来的攻击模式已经被废弃了，前端页面不需要兼容。」
+       那条分支不再是「另一条走得通的路」，②那个陷阱随开关一起消失——没有开关，
+       就没有「关掉之后没处填」。于是三个框再次撤掉，这一次连「更多」里也不留。
+
+    ⚠️ **后端一个字段都没删**，另有用例（`test_the_backend_still_keeps_...`）钉着。
     """
     body = _page_body(client.get("/missions").text)
 
     # 主行的渲染源是 `PARAM_FIELDS`；BOT 那一档清空，主行就长不出范围框。
     assert "BOT: []," in body
-
-    # ⚠️ **但三个字段本身必须还在页面上**，在「更多」里、只在军力优先关掉时显形。
-    # 第一版把它们整个撤掉了，于是留下一个陷阱：开关能关，关掉之后后端因为缺
-    # `galaxy` 直接 400，而页面上没有任何地方能填它——那等于把一种运行模式
-    # 删掉了，只是删得不明说。见
-    # `test_turning_military_priority_off_leaves_somewhere_to_put_the_range`。
+    # 整页都不该再有这三个键，也不该再有那张单独的字段表和那一行容器。
     for key in ("'galaxy'", "'first_system'", "'last_system'"):
-        assert key in body, f"{key} 从页面上消失了：关掉军力优先之后就没处填了"
-    # 判据是「不在主行」，而不是「不在页面上」：范围行必须建在主行之后。
-    main_line = body.index("line.append(makeField('出发 '")
-    range_row = body.index("rangeRow.className = 'more-line mission-range'")
-    assert main_line < range_row, "范围行跑到主行里去了"
+        assert key not in body, f"{key} 又回到页面上了：那条选靶分支已经废弃"
+    assert "BOT_RANGE_FIELDS" not in body
+    assert "mission-range" not in body
 
 
 def test_the_backend_still_keeps_the_range_fields_the_page_stopped_rendering(
@@ -466,10 +481,13 @@ def test_the_backend_still_keeps_the_range_fields_the_page_stopped_rendering(
 ) -> None:
     """**只是不渲染，后端一个字段都没删。**
 
-    非军力优先那条分支还在跑（「军力优先」开关只是挪进了折叠区），存量任务的
-    `params_json` 里也还存着这三个值，配置固化记录要认得出它们才念得出「改了
-    什么」。这一条就是钉住「页面撤控件」没有顺手变成「后端删字段」——那会让
-    一批已经存在的任务在下一次启用时静默改变打法。
+    ⚠️ 用户口径（2026-08-22）：「目前原来的攻击模式已经被废弃了，前端页面不需要
+    兼容。此部分代码也记录待办，需要清理。」——**前端不兼容，不等于后端可以删。**
+    存量任务的 `params_json` 里还存着这三个值，配置固化记录要认得出它们才念得出
+    「改了什么」；后端那一轮清理是单独登记的待办，不是这次改页面的副产品。
+
+    这一条就是钉住「页面撤控件」没有顺手变成「后端删字段」——那会让一批已经存在
+    的任务在下一次启用时静默改变打法，而「静默改变打法」是这条链路最贵的故障。
     """
     from evo_helper.application.mission_scheduler import _bot_range
     from evo_helper.domain.missions import bot_targets_in_range
@@ -809,33 +827,171 @@ def _page_body(html: str) -> str:
     return html[start:]
 
 
-def test_turning_military_priority_off_leaves_somewhere_to_put_the_range(
+def _console_css() -> str:
+    """样式表，**注释先剥掉**。
+
+    ⚠️ 这个仓库里注释比代码长，而注释里成段引用着规则本身。不剥的话，「这条规则
+    还在不在」的断言会被一句谈论它的注释喂饱——真把规则删了也照样绿。
+    （同 `test_attack_log_military_estimated.py` 里那个同名助手。）
+    """
+    css = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "evo_helper"
+        / "web"
+        / "static"
+        / "console.css"
+    ).read_text(encoding="utf-8")
+    return re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+
+
+def test_the_card_has_exactly_one_place_that_says_where_the_fleet_departs(
     client: TestClient,
 ) -> None:
-    """⚠️ 关掉「军力优先」之后，范围三字段**必须够得着**。
+    """⚠️ **一张卡上不许有两个「出发点」互相打脸。**
 
-    改版第一版把范围框整个撤掉了，理由是军力优先模式下 `most_valuable_first`
-    压根不看它们——那是对的。但那样就留下一个陷阱：
+    从前主行摆的是绑在 `mission_tasks.origin_*` 上的下拉框，而军力攻击真正据以
+    派遣的是军力方案（`mission_task_origins`）。生产实测（2026-08-22）：#2 号任务
+    下拉框显示 `4:277:15`、方案里配的是 `5:261:8`，两个数都在卡上，作数的却是被
+    折起来的那一个。
 
-        开关能关 → 关掉走 `nearest_first(bot_targets_in_range(...))`
-                 → 后端缺 `galaxy` 直接 400
-                 → **而页面上没有任何地方能填它**
+    改法：主行只留一段**只读文字**，念服务端算好的「实际会从哪儿派」；那个下拉框
+    连同任务级航线数一起进「更多」，并在那里写明它什么时候才作数。
 
-    也就是「开关只能开不能关」，等于那条运行模式被删掉了，只是删得不明说。
-    留着一个按下去必然报错、又无法补救的开关，比干脆删掉更坏。
-
-    所以三个字段回到「更多」里，跟着开关**反向**显隐。这一条钉的就是这件事。
+    ⚠️ **后端字段一个都没删**，控件也没删——海盗从那一颗出发，军力方案一行都没配
+    时的 bot 也从那一颗出发（`_configured_origins` 那一档回落），「按星球效率」
+    那一页还按它统计。
     """
     body = _page_body(client.get("/missions").text)
 
-    # 范围行建在「更多」里，而且是 BOT 那一档的三个字段。
-    assert "mission-range" in body
-    assert "range.hidden = enabled" in body, "范围行必须与开关反向显隐"
-    assert "BOT_RANGE_FIELDS" in body, "范围字段要有单独的定义表"
-    # ⚠️ 键名必须是 `dataset.param`：保存与回显两处认的都是这个属性。写成
-    # `dataset.key` 的话，框看着能填、值永远存不进去——第一版就踩了这个。
-    assert "input.dataset.param = field.key" in body
-    # 主行上不许再出现它们：用户要的是「主行只有出发/航线/三个军力参数」。
-    line = body.index("line.append(makeField('出发 '")
-    fold = body.index("rangeRow.className = 'more-line mission-range'")
-    assert line < fold, "范围行跑到主行前面去了"
+    # 主行：只读文字，判据来自服务端下发的 origins。
+    assert "dispatch.className = 'mission-dispatch coord'" in body
+    assert "function dispatchFacts(task)" in body
+    assert "个出发点" in body, "多于一个时主行要报个数"
+    # 那个遗留下拉框搬进了「更多」，而且带着「什么时候才作数」这句话。
+    legacy = body.index("legacy.className = 'more-line mission-legacy-origin'")
+    dispatch = body.index("dispatch.className = 'mission-dispatch coord'")
+    assert dispatch < legacy, "遗留下拉框跑回主行前面去了"
+    assert "任务级出发点（只在军力方案一行都没配时才生效）" in body
+    assert "LEGACY_ORIGIN_TIP" in body
+    # 控件本身一个都没少。
+    assert "origin.className = 'mission-origin'" in body
+    assert "makeInput('mission-lines'" in body
+
+
+def test_each_galaxy_gets_its_own_card_colour_and_the_number_is_still_written_on_it(
+    client: TestClient,
+) -> None:
+    """每个银河系一套框体配色（用户口径 2026-08-22），**但颜色只做分组**。
+
+    这一页的既有规矩是「状态绝不只用颜色承载」。同一条规矩在这里的落点：
+    ① 银河系号本身写在卡上（`.galaxy-tag`）——色相每 9 个银河系循环一次，
+       光看颜色分不出 1 系和 10 系；
+    ② 启用/停用仍由状态 chip 里那几个字说，`.off` 那一套只是加速。
+
+    色相由页面按号码算进 `--galaxy-hue`，CSS 只认 `[data-galaxy]` 这个挂钩：
+    枚举九个类名的话，银河系号没有上界（`Coordinate` 只要求 ≥ 1），漏掉的那些会
+    静默落回默认色。
+    """
+    body = _page_body(client.get("/missions").text)
+    css = _console_css()
+
+    assert "galaxy.className = 'galaxy-tag'" in body
+    assert "galaxyTag.textContent = galaxies.length ? `${galaxies.join('/')}系`" in body
+    assert "row.style.setProperty('--galaxy-hue'" in body
+    assert ".mission-card[data-galaxy] {" in css
+    assert "border-left-color: hsl(var(--galaxy-hue)" in css
+    # 停用的卡：压暗 + 左边框变虚线 + 撤掉那层浅底色，三样一起，
+    # chip 那几个字一个没动。
+    #
+    # ⚠️ **边框转灰那一条已被推翻**（2026-08-22）：第一版写的是
+    # `border-left-color: var(--text-faint)`，而实测常态是五张 bot 卡全都
+    # 「未启用」——边框一律灰掉之后一屏里银河系分组一点颜色都不剩，
+    # 而分组配色正是同一次改版要做的另一半。现在色相保留、只压暗一档，
+    # 判据搬到 `test_a_disabled_card_keeps_its_galaxy_hue`。
+    off = _rule_block(css, ".mission-card.off {")
+    assert "opacity" in off
+    assert "border-left-style: dashed" in off
+    assert "background-image: none" in off
+    assert "var(--text-faint)" not in off, "未启用的边框又被灰掉了，银河系分组会整屏消失"
+    # ⚠️ **不许洗白银河系标记。** 实测常态是一屏卡全都「未启用」，把标记也去饱和
+    # 之后那一屏里银河系分组一点颜色都不剩——而分组配色正是这次要做的另一半。
+    assert "grayscale" not in off
+    assert "mission-status-word" in body, "状态那个词是启用/停用的主信号，不许被颜色顶掉"
+
+
+def test_the_units_do_not_stick_to_the_next_label(client: TestClient) -> None:
+    """「读数有效期 [6] 小时窗口门限 [200] 个军力上限」——单位和下一个标签黏成了
+    一个词（用户口径 2026-08-22：「框体与文字之间增加左右间隙」）。
+
+    ⚠️ **单位必须是元素，不能是裸文本节点。** 裸文本在 flex 容器里只成为一个匿名
+    项，前后那点间距全靠容器的 `gap`，没有任何地方能单独给它留白。
+    """
+    body = _page_body(client.get("/missions").text)
+    css = _console_css()
+
+    assert "function makeUnit(text)" in body
+    assert "makeField('读数有效期 ', maxAge, makeUnit('小时'))" in body
+    assert "makeField('窗口门限 ', topN, makeUnit('个'))" in body
+    # ⚠️ 反面也要钉，但只在**那一段**上找：`makeUnit` 上方那段注释里逐字引用着
+    # 从前那句裸文本节点，整页搜会被自己的注释喂饱。
+    appended = body[body.index("settings.append(") :]
+    appended = appended[: appended.index("line.append(settings)")]
+    assert "createTextNode" not in appended, "退回裸文本节点就又黏上了"
+    # 字段与字段之间的间隙必须明显大于标签与它自己的框之间的距离。
+    fields = _rule_block(css, ".regional-params, .military-settings {")
+    assert "gap: 6px 18px" in fields
+    assert "gap: 6px" in _rule_block(css, ".mission-line .fld {")
+    assert "gap: 4px 12px" in _rule_block(css, ".mission-line {")
+
+
+def test_the_dropdowns_are_big_enough_to_click(client: TestClient) -> None:
+    """下拉框加宽加高（用户口径 2026-08-22：「下拉框放大以便点击」）。
+
+    ⚠️ **字号不许跟着缩。** 出发点那个下拉框里装的是坐标，看错一位就是舰队去错
+    地方；「放大点击区」不能以「看错一位」为代价换。
+    """
+    css = _console_css()
+
+    select = _rule_block(css, ".mission-card select {")
+    assert "min-height: 30px" in select
+    assert "font-size: 13px" in select
+    assert "cursor: pointer" in select
+    assert "min-width: 210px" in _rule_block(css, ".mission-origin {")
+    assert "min-width: 240px" in _rule_block(css, ".military-origin-planet {")
+
+
+def _rule_block(css: str, selector: str) -> str:
+    start = css.index(selector)
+    end = css.index("}", start)
+    return css[start:end]
+
+
+def test_a_disabled_card_keeps_its_galaxy_hue() -> None:
+    """⚠️ 未启用的卡**仍旧保留银河系色相**，只压暗一档。
+
+    判据是**两个变量占两个通道**：色相回答「哪个银河系」，虚实 + 透明度 + 底色
+    回答「参不参与调度」。挤在色相这一个通道上，两件事必然互相抹掉一件。
+
+    这条是踩出来的（2026-08-22）：第一版把未启用的边框换成中性灰
+    （`var(--text-faint)`），而实测常态就是**五张 bot 卡全都未启用**——一屏里
+    银河系分组于是一点颜色都不剩，而「每个银河系一套配色」正是同一次改版要做的
+    另一半。同一条 CSS 规则的注释里当时已经论证过这个后果（论的是
+    `filter: grayscale()`），却在下一行把边框自己灰掉了。
+
+    启用/停用**不只靠这些视觉信号**：状态 chip 的文字始终写着（本仓规矩是
+    「状态绝不只用颜色承载」）。
+    """
+    css = _console_css()
+
+    assert ".mission-card.off[data-galaxy]" in css, "未启用态没有单独保留色相的规则"
+    # 有银河系的那一支必须留色相；没有银河系的（扫描 / 军力榜）才用中性灰。
+    hued = css.index(".mission-card.off[data-galaxy]")
+    assert "hsl(var(--galaxy-hue)" in css[hued : hued + 160], "未启用的边框把银河系色相灰掉了"
+    plain = css.index(".mission-card.off:not([data-galaxy])")
+    assert "var(--text-faint)" in css[plain : plain + 120]
+    # 「参不参与调度」得由别的通道承载，否则和色相抢同一个。
+    off = css.index(".mission-card.off {")
+    block = css[off : off + 200]
+    assert "border-left-style: dashed" in block
+    assert "opacity" in block

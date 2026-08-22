@@ -1274,6 +1274,8 @@ def _mission_task_out(task: MissionTaskView) -> MissionTaskOut:
         fleet_lines_is_default=task.fleet_lines_is_default,
         enabled_from_utc=task.enabled_from_utc,
         enabled_until_utc=task.enabled_until_utc,
+        origins=[MissionOriginOut(**item.__dict__) for item in task.origins],
+        galaxies=list(task.galaxies),
     )
 
 
