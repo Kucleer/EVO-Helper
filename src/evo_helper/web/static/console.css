@@ -228,16 +228,19 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
 
 .panel.compact { padding: 10px 12px; }
 
-/* 任务页顶部的两个操作区只在需要时露出说明；把常驻说明折进提示图标，
-   让任务表尽量留在首屏。 */
-.missions-control-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 10px;
+/* 任务页顶部：调度器与战报补录**压成一条**（2026-08-22 改版）。
+   从前是并排的两张面板，加起来吃掉整整两屏顶部，而它们常驻显示的只有一行。
+   两件事仍然分得开（各自一个 `<h2>`，中间一条 `.sep` 竖线）。
+   ⚠️ 压扁的只是常驻那一行：补录的摘要区、日志尾巴、日志路径仍然摆在这张面板
+   里，跑起来才显形——除了它们，补录那十几分钟页面上没有别的进度来源。 */
+.missions-topbar h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
-.missions-control-grid.single { grid-template-columns: minmax(0, 1fr); }
-.missions-control-grid .panel { margin: 0; }
 .missions-control-head { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
 .missions-control-head h2 { margin: 0; }
 .tips {
@@ -371,21 +374,92 @@ tbody tr.kind-bot td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 tbody tr.kind-pirate td:first-child { box-shadow: inset 3px 0 0 var(--pirate); }
 tbody tr.kind-pirate td.coord { color: var(--pirate); }
 
-/* ---- 调度台的任务行 --------------------------------------------------- */
+/* ---- 调度台的任务卡 --------------------------------------------------- */
 
-/* 表格默认整行 hover 变手型（别处的行是可点开的），任务行不是链接，
-   给它按住能拖的手型，扫描那一行则明确地什么都不是。 */
-#mission-rows td { white-space: normal; vertical-align: top; }
-#mission-rows tr { cursor: default; }
-#mission-rows tr[draggable="true"] { cursor: grab; }
-#mission-rows tr[draggable="true"]:active { cursor: grabbing; }
-.mission-dispatch { min-width: 245px; }
-.military-toggle { display: block; margin-top: 5px; }
-.military-dispatch { margin-top: 2px; }
-
-@media (max-width: 1100px) {
-  .missions-control-grid { grid-template-columns: minmax(0, 1fr); }
+/* 2026-08-22 改版：任务从表格行换成卡片，**一张卡一行**。
+   表格那一版每个任务要横跨六列、每列各自换行，一个任务吃掉四五行高度；
+   而这一页最常做的事只有「看状态、改一个数、勾一下」。 */
+.mission-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel-raised);
+  margin-bottom: 8px;
+  cursor: default;
 }
+.mission-card[draggable="true"] { cursor: grab; }
+.mission-card[draggable="true"]:active { cursor: grabbing; }
+/* 没参与调度的压暗。**只压暗，不折叠也不禁用**：它随时会被勾回来，
+   而看不见的东西没人会想起来去勾。 */
+.mission-card.off { opacity: 0.62; }
+
+/* 主行。`flex-wrap` 是为了窄屏——放不下时优雅地掉到第二行，
+   而不是把整张卡撑出横向滚动条。 */
+.mission-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 10px;
+}
+.mission-line .spacer { flex: 1 1 12px; }
+.mission-line .muted { font-size: 11px; }
+/* 「标签 + 控件」**不许断行**：断了的话「航线」和它的输入框会被挤到两行去，
+   一张卡就变成两三行，而压高度正是这次改版要做的事。 */
+.mission-line .fld {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.mission-line input, .mission-line select { padding: 3px 7px; font-size: 13px; }
+.mission-name { font-weight: 600; color: var(--accent-strong); }
+.regional-params, .military-settings { display: inline-flex; align-items: center; gap: 8px; }
+
+/* 「更多」折叠区：军力优先 · 定时开关 · 多出发星球方案。
+   共同点是**配一次就不再动**，恒展开时买到的是一整片空框。 */
+.mission-more { border-top: 1px dashed var(--border); padding: 0 10px; }
+.mission-more > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 5px 0;
+  user-select: none;
+}
+.mission-more > summary:focus-visible { outline: 2px solid var(--accent); }
+.mission-more .more-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 0 7px; }
+.mission-more .mission-window { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.mission-more .fld { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.military-toggle { display: inline-flex; align-items: center; gap: 4px; margin: 0; }
+.military-dispatch { display: block; }
+.military-dispatch[hidden] { display: none; }
+
+/* 底部「其他链路」：海盗与全星系扫描。样式压暗一档，**功能一点没少**
+   （复选框照旧能勾、参数照旧能改）——把还在跑的链路做成看不见，用户就会
+   以为它没在跑，然后去别处找原因。 */
+.missions-secondary { background: var(--bg); }
+.missions-secondary .mission-card { background: var(--bg-panel); }
+.missions-secondary .mission-name { color: var(--text); }
+
+/* 默认折起来的整节（运行历史 / 配置固化记录）：事后对账才看的东西。 */
+details.foldable > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+}
+details.foldable > summary > h2 {
+  display: inline;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+details.foldable[open] > summary { margin-bottom: 12px; }
 
 .drag-handle { color: var(--text-faint); font-size: 15px; user-select: none; }
 

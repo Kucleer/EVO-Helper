@@ -27,16 +27,31 @@
   </div>
 </section>
 
-<div class="missions-control-grid{% if not backfill_enabled %} single{% endif %}">
-<section class="panel compact missions-control" aria-labelledby="sched-head">
-  <div class="missions-control-head">
+{#
+  ---- 顶部一条：调度器 + 战报补录 -------------------------------------------
+
+  2026-08-22 改版：这两块从前是并排的两张面板（`missions-control-grid`），
+  加起来吃掉整整两屏的顶部——而它们**常驻显示的东西只有一行**：一个状态、
+  一个当前、四个按钮。任务卡才是这一页的主体，它被挤到折叠线以下。
+
+  ⚠️ **压扁的只是常驻那一行。** 补录的三块「跑起来才显形」的东西
+  （摘要区 `#backfill-summary`、日志尾巴 `#backfill-log`、完整日志路径
+  `#backfill-log-path-line`）一个都没动，仍然摆在这张面板里、仍然默认 `hidden`：
+  补录最坏要跑十几分钟（60 封 × 约 15 秒），除了它们页面上没有别的进度来源，
+  而「点了没反应」正是那三块要防的。
+
+  两件事仍然分得开（各自一个 `<h2>`，中间一条竖线）：调度器是常驻运行的那个，
+  补录是手动触发、**不进调度**的修复工具。它反过来**优先于**任务：补录改的正是
+  任务读来做决策的那批数据（战报在不在库里决定 bot 目标要不要再打一遍、海盗还
+  剩几次配额），所以补录一排上，正在跑的扫描会被抢占，海盗/bot 则等它自己跑完
+  （硬杀会留下一发飞出去了却没记账的舰队），期间一个任务都不起。
+#}
+<section class="panel compact missions-topbar" aria-labelledby="sched-head">
+  <div class="filter-bar">
     <h2 id="sched-head">调度器</h2>
     <span class="tips" tabindex="0" role="img"
           aria-label="调度器说明"
           title="点开始后调度器常驻运行并按任务优先级派遣；任一时刻最多一个子进程操作游戏窗口。控制台重启后会停在已停止。勾选启动战报补录时，仅本次开始前补录一趟；关闭则攻击续跑不会进入信箱。">ⓘ</span>
-  </div>
-  <div class="filter-bar">
-    <span class="inline-label">状态</span>
     <span class="chip" id="sched-state"><span class="glyph" aria-hidden="true">■</span>已停止</span>
     <span class="muted" id="sched-uptime"></span>
     <span class="sep" role="separator"></span>
@@ -44,11 +59,7 @@
     <span id="current-line" class="muted">没有任务在跑</span>
     <span class="spacer"></span>
     {#
-      「先对账再跑任务」默认勾着。取消勾选＝跳过启动对账，那是给「刚停了两分钟
-      又点开始、明知没有欠账」准备的口子，不是常规走法——所以它是一个要动手取消
-      的复选框，而不是一个要动手勾上的。
-    #}
-    {#
+      「先对账再跑任务」。
       ⚠️ **默认不勾**（2026-08-13 实机之后改的）。这一趟失败时闸门要等人点确认
       才放行任务，而无人值守时没人点——凌晨崩一次，之后一整夜一个任务都不起。
       整段理由在 web/schemas.py 的 SchedulerStartIn.reconcile 上。
@@ -63,50 +74,35 @@
     <button class="btn primary small" type="button" id="btn-start">开始</button>
     <button class="btn small" type="button" id="btn-stop"
             data-endpoint="/api/scheduler/stop">结束</button>
-  </div>
-</section>
-
-{#
-  战报补录 / 对账。手动触发，**不进调度**：它是修复工具，会独占游戏窗口十几分钟，
-  做成定时任务就会跟正经的攻击轮抢窗口。
-
-  它反过来**优先于**任务：补录改的正是任务读来做决策的那批数据（战报在不在库里
-  决定 bot 目标要不要再打一遍、海盗还剩几次配额）。所以补录一排上，正在跑的扫描
-  会被抢占，海盗/bot 则等它自己跑完（硬杀会留下一发飞出去了却没记账的舰队），
-  期间一个任务都不起。
-#}
-{% if backfill_enabled %}
-<section class="panel compact missions-control" aria-labelledby="backfill-head">
-  <div class="missions-control-head">
+    {% if backfill_enabled %}
+    <span class="sep" role="separator"></span>
     <h2 id="backfill-head">战报补录</h2>
     <span class="tips" tabindex="0" role="img"
           aria-label="战报补录说明"
           title="补录只读邮件：不删邮件、不领奖励、不派遣舰队。它会独占游戏窗口并暂停任务；完成后请查看结果，再点继续任务。">ⓘ</span>
-  </div>
-  <div class="filter-bar">
-    <span class="inline-label">状态</span>
     <span class="chip" id="backfill-phase">
       <span class="glyph" aria-hidden="true">○</span><span id="backfill-word">未在补录</span>
     </span>
     <span class="muted" id="backfill-detail"></span>
-    <span class="spacer"></span>
-    <span class="inline-label">链路</span>
     <select id="backfill-kind" aria-label="补哪条链路的战报">
       {% for kind, label in backfill_kind_labels.items() %}
         <option value="{{ kind }}">{{ label }}</option>
       {% endfor %}
     </select>
-    <span class="inline-label">起始日期（UTC）</span>
     {#
       默认退一天，由服务端算（浏览器算的是 UTC+8，早上 8 点之前会差一天）。
       **默认「今天」是反的**：昨夜漏掉的那批会被整批藏起来，而漏掉的恰恰是昨夜的。
+      这个日期按 **UTC** 日算，所以标题里写清楚——页面别处的时间一律 UTC+8。
     #}
     <input type="date" id="backfill-since" value="{{ backfill_default_since }}"
-           aria-label="补录起始日期，按 UTC 日算">
+           aria-label="补录起始日期，按 UTC 日算" title="起始日期按 UTC 日算">
     <button class="btn small" type="button" id="btn-backfill">开始补录</button>
     <button class="btn small" type="button" id="btn-backfill-cancel" hidden>取消补录</button>
     <button class="btn primary small" type="button" id="btn-backfill-resume" hidden>继续任务</button>
+    {% endif %}
   </div>
+
+  {% if backfill_enabled %}
   {# 400 / 409 显示在这里。静默失败等于把后端那句中文说明扔了。 #}
   <p class="chip danger" id="backfill-error" role="status" style="margin:10px 0 0" hidden></p>
 
@@ -147,45 +143,43 @@
   <p class="muted" style="margin:6px 0 0;font-size:11px" id="backfill-log-path-line" hidden>
     完整日志：<span class="coord" id="backfill-log-path"></span>
   </p>
+  {% endif %}
 </section>
-{% endif %}
-</div>
 
+{#
+  ---- 军力攻击 ---------------------------------------------------------------
+
+  2026-08-22 改版：任务从一张表变成一张张卡，**一张卡一行**。表格那一版每行要
+  横跨六列、每列各自换行，一个任务能吃掉四五行高度；而这一页最常做的事只有
+  「看状态、改一个数、勾一下」。
+
+  这一节只放 bot 攻击。军力榜扫描单独一节（它是这里的读数来源，但它不派舰队），
+  海盗与全星系扫描沉到页面底部的「其他链路」。
+#}
 <section class="panel" aria-labelledby="tasks-head">
-  <h2 id="tasks-head">任务</h2>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th scope="col" style="width:26px"><span class="visually-hidden">排序</span></th>
-          <th scope="col" style="width:34px"><span class="visually-hidden">是否参与</span></th>
-          <th scope="col">任务</th>
-          <th scope="col">出发星球 / 航线</th>
-          <th scope="col">参数</th>
-          {#
-            标题上把时区写死。页面别处的时间列也都按 Asia/Shanghai 渲染，
-            但这两个是**输入**框——用户填进去的那串数字到底按哪个时区解释，
-            不写出来就只能靠猜，猜错正好差 8 小时。
-            （「战报补录」那个日期控件标的是 UTC，是特例，别拿它类比。）
-          #}
-          <th scope="col">定时开关（UTC+8）</th>
-          <th scope="col">状态</th>
-        </tr>
-      </thead>
-      {#
-        整个 tbody 由 JS 按 /api/scheduler 下发的任务列表建出来。**不能再在这里
-        按 mission_labels 渲染固定几行**：同一类型现在可以有多个任务（多个 bot
-        攻击），行数是用户加出来的，服务端这一页只渲染一次，加完一个任务不刷新
-        整页就看不见它。状态、随行事实、参数回显仍然全部由接口下发——判据在页面
-        上抄一份就会和调度器走散。
-      #}
-      <tbody id="mission-rows"></tbody>
-    </table>
+  <div class="missions-control-head">
+    <h2 id="tasks-head">军力攻击</h2>
+    <span class="muted" style="font-size:11px">
+      按「军力 ÷ 往返小时」选靶 · 拖 ⠿ 调优先级 · 名字按出发点的银河系自动取
+    </span>
   </div>
+  {#
+    卡片全部由 JS 按 /api/scheduler 下发的任务列表建出来。**不能再在这里按
+    mission_labels 渲染固定几张**：同一类型现在可以有多个任务（多个 bot 攻击），
+    张数是用户加出来的，服务端这一页只渲染一次，加完一个任务不刷新整页就看不见
+    它。状态、随行事实、参数回显仍然全部由接口下发——判据在页面上抄一份就会和
+    调度器走散。
+  #}
+  <div id="mission-cards"></div>
+
   <div class="filter-bar" style="margin-top:10px">
     <span class="inline-label">新建 bot 攻击任务</span>
-    <input type="text" id="new-task-name" placeholder="任务名，例如「2 号星 · 近系」"
-           style="width:200px" aria-label="新任务的名字">
+    {#
+      ⚠️ **这里不再有任务名输入框**（2026-08-22）。名字由服务端按出发点的银河系
+      派生（`5:261:8` → `5系攻击`），重名自动加序号，见
+      `web.persistent_service._auto_mission_name`。留空 = 跟随全局主星，那时按
+      主星的银河系取名——那正是这个任务真正会出发的地方。
+    #}
     <select id="new-task-origin" aria-label="新任务的出发星球">
       <option value="">选择星球（留空=全局主星）</option>
     </select>
@@ -193,6 +187,7 @@
            style="width:70px" aria-label="新任务的航线数">
     <button class="btn small" type="button" id="btn-new-task">新建</button>
     <span class="muted" style="font-size:11px">
+      名字自动取「出发点的银河系 + 系攻击」，同一银河系的第二个自动加序号。
       只有 bot 攻击可以有多个：海盗每天 32 次是账号级配额，扫描恒在最后一位。
     </span>
   </div>
@@ -235,12 +230,52 @@
 </section>
 
 {#
+  ---- 军力榜扫描 -------------------------------------------------------------
+
+  单独一张卡，紧挨着军力攻击：它是上面那一节**读数的唯一来源**（「军力 ÷ 往返
+  小时」里的军力就是它采回来的），但它自己**不派舰队**——`ranking_command()`
+  里没有 `--attack`，`LiveDriver()` 用默认的 `allow_actions=False`，结构上就没有
+  派舰队的能力。摆在这儿而不是跟海盗、全星系扫描混在一起，是因为调它的参数
+  （扫多少、隔多久扫一次）改的其实是攻击的选靶质量。
+#}
+<section class="panel" aria-labelledby="ranking-head">
+  <div class="missions-control-head">
+    <h2 id="ranking-head">军力榜扫描</h2>
+    <span class="muted" style="font-size:11px">攻击的读数来源 · 它不派舰队</span>
+  </div>
+  <div id="ranking-cards"></div>
+</section>
+
+{#
+  ---- 其他链路 ---------------------------------------------------------------
+
+  海盗与全星系扫描沉到底部、样式压暗：现在这台助手的主线是军力攻击，这两条
+  一个是每天 32 次的账号级配额，一个是填空隙用的扫描。
+
+  ⚠️ **压暗不是停用。** 复选框照旧能勾、参数照旧能改（海盗的「半径」就在卡上），
+  样式上的次要和功能上的次要是两回事——把还在跑的链路做成看不见，用户就会以为
+  它没在跑，然后去别处找原因。
+#}
+<section class="panel missions-secondary" aria-labelledby="other-head">
+  <div class="missions-control-head">
+    <h2 id="other-head">其他链路</h2>
+    <span class="muted" style="font-size:11px">不参与军力攻击 · 可开关、参数照常改</span>
+  </div>
+  <div id="other-cards"></div>
+</section>
+
+{#
   配置固化记录。调度器一「开始」就把三条链路当时的配置抄一份，运行中不许改，
   所以这份记录就是「那一轮到底按什么跑的」的唯一答案——`mission_runs` 里只有
   一行命令行，看不出页面上填的是哪一套。
+
+  **默认折起来**（2026-08-22）：它是事后对账用的，平时不看。折的是一整节，
+  而不是节里的某几行——用户要看的时候一次全展开。
 #}
-<section class="panel" aria-labelledby="freeze-head">
-  <h2 id="freeze-head">配置固化记录</h2>
+<details class="panel foldable" aria-labelledby="freeze-head">
+  <summary><h2 id="freeze-head">配置固化记录</h2>
+    <span class="muted" style="font-size:11px">每轮「开始」时冻结的那份参数，跑完对账用</span>
+  </summary>
   <div id="freeze-current" class="filter-bar">
     <span class="muted">读取中…</span>
   </div>
@@ -293,10 +328,13 @@
       控制台没开也查得到。
     </p>
   {% endif %}
-</section>
+</details>
 
-<section class="panel" aria-labelledby="runs-head">
-  <h2 id="runs-head">运行历史</h2>
+{# 运行历史同样默认折起来：它是事后翻的，不是盯着看的。 #}
+<details class="panel foldable" aria-labelledby="runs-head">
+  <summary><h2 id="runs-head">运行历史</h2>
+    <span class="muted" style="font-size:11px">调度器起过的每一个子进程</span>
+  </summary>
   <div class="table-wrap">
     <table>
       <thead>
@@ -331,7 +369,7 @@
       </tbody>
     </table>
   </div>
-</section>
+</details>
 
 <script>
 (() => {
@@ -345,18 +383,57 @@
   const BACKFILL_GLYPHS = {{ backfill_phase_glyphs | tojson }};
   const BACKFILL_ENABLED = {{ backfill_enabled | tojson }};
   // 链路的中文名。任务没起名时用它兜底——服务端下发的 label 已经做过这一步，
-  // 这里只在建行的说明文字上用。
+  // 这里只在建卡的说明文字上用。
   const MISSION_LABELS = {{ mission_labels | tojson }};
 
-  // 每条链路的参数框。**次序即页面上从左到右的次序**，与
-  // `web.display.PARAM_LABELS` 是同一批键。扫描没有参数（它自己维护计划与游标）。
+  // 「填空隙」的那几条链路：不派遣舰队、没有完成态、**恒在最后一位**。
+  // 与 `domain.scheduler.GAP_FILLERS` 是同一批，页面这一侧只用它来决定
+  // 「这张卡能不能拖」——带 priority 的 PATCH 打到它们身上一律 400，
+  // 用户不该拖完了才发现。
+  //
+  // ⚠️ 军力榜（RANKING）也在这里面。从前这个判断写成「是不是 SCAN」，于是
+  // 军力榜那张卡是可拖的，拖一下就吃一个 400。
+  const FILLS_GAPS = ['SCAN', 'RANKING'];
+
+  // 每条链路的参数框。**次序即卡上从左到右的次序**，与
+  // `web.display.PARAM_LABELS` 是同一批键。
+  //
+  // ⚠️ **BOT 这一档是空的，而且是有意留空的**（2026-08-22 改版）。
+  // 从前它是「星系 / 系号 / –」三个范围框。撤掉的依据在
+  // `application/mission_scheduler.py` 的 `_bot_targets_for`：
+  //
+  //     if _bot_by_military(params_json):
+  //         return most_valuable_first(...)          ← 军力优先走这条，不看范围
+  //     in_range = bot_targets_in_range(..., **_bot_range(params_json))
+  //     return nearest_first(in_range, origin)       ← 按范围筛的是这条
+  //
+  // 也就是说：军力优先模式下那三个字段**一次都没被用到**。一个填了不生效的
+  // 输入框比没有更糟——用户会以为自己把这一轮的范围配好了。
+  //
+  // ⚠️ **后端那三个字段全部保留**（`_bot_range`、`domain.missions.
+  // bot_targets_in_range`、`display.PARAM_LABELS` 里的「星系 / 起始系号 /
+  // 结束系号」）：非军力优先那条分支还在跑（「军力优先」开关只是挪进了每张卡的
+  // 「更多」里，没有删），存量任务的 `params_json` 里也还存着这三个值，
+  // 配置固化记录要认得出它们才念得出「改了什么」。这里空着的只是**页面渲染**。
+  // bot 攻击的**范围**三字段。
+  //
+  // ⚠️ **刻意不放在 `PARAM_FIELDS.BOT` 里**：那个表驱动的是**主行**的渲染，
+  // 而 2026-08-22 改版之后主行不再有范围框（军力优先模式下
+  // `most_valuable_first` 压根不看它们）。它们只在「更多」里、且只在军力优先
+  // 关掉时显形——那时它们是**必填**的（后端缺 `galaxy` 会 400）。
+  //
+  // ⚠️ **键名走 `dataset.param`**，和 `PARAM_FIELDS` 那批一致：保存处理器
+  // （`.mission-param` 那个）认的是这个属性，写成别的名字就变成一个填了
+  // 永远存不进去的框——而「配了没效果」是这套系统里最贵的那类故障。
+  const BOT_RANGE_FIELDS = [
+    { key: 'galaxy', label: '星系', width: 60, min: 1 },
+    { key: 'first_system', label: '系号', width: 78, min: 1 },
+    { key: 'last_system', label: '–', width: 78, min: 1 },
+  ];
+
   const PARAM_FIELDS = {
     PIRATE: [{ key: 'radius', label: '半径', width: 78, min: 1, max: 999 }],
-    BOT: [
-      { key: 'galaxy', label: '星系', width: 60, min: 1 },
-      { key: 'first_system', label: '系号', width: 78, min: 1 },
-      { key: 'last_system', label: '–', width: 78, min: 1 },
-    ],
+    BOT: [],
     SCAN: [],
     // 军力榜这一趟最多采几个 bot。**留空 = 全扫**（用户口径 2026-08-17）：
     // 空框在下面那个处理器里根本不往上送，于是 `params_json` 里没有这个键，
@@ -385,14 +462,15 @@
   const LOCKED_HINT = '调度器运行中，任务配置已固化，不可修改；点「结束」后可改。'
     + '被自动停用的链路仍可点「恢复」。';
   const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。'
+    + '任务名按出发点的银河系自动取，换出发点时跟着改。'
     + '定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、'
     + '也不打断正在跑的那一轮。';
 
   // ---- 通用说明（进 ⓘ，不占行高）-------------------------------------------
   //
-  // 判据：**在每一行任务里长得一模一样的说明 → 进 ⓘ；只描述这一行自己的事实
+  // 判据：**在每一张卡里长得一模一样的说明 → 进 ⓘ；只描述这一张卡自己的事实
   // （摘要那一句、随行事实那一句）→ 留在页面上。** 这两段从前是每行各铺一遍的
-  // `<div>`，十几行任务就把同一段话铺十几遍，而它们逐字相同——那是纯粹的行高，
+  // `<div>`，十几个任务就把同一段话铺十几遍，而它们逐字相同——那是纯粹的行高，
   // 不是信息。
   //
   // ⚠️ **文案一个字都没改，只换了呈现方式。** 这里的每一句都在别处有对应的判据
@@ -403,8 +481,11 @@
   // 这一页没有前端构建，引一个 tooltip 组件就是给部署添一份麻烦。
   const MILITARY_SELECTION_TIP = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
   const MILITARY_ORIGIN_TIP = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
+  // 「军力优先」为什么被挪进折叠区、以及关掉它意味着什么。关掉不是「不打」，
+  // 是换一条完全不同的选靶路：按坐标顺序、按范围筛（那三个范围框已经不在页面上
+  // 渲染了，见 `PARAM_FIELDS.BOT`）。所以它默认开着，也留着能关。
+  const MILITARY_MODE_TIP = '默认开。开＝按「军力 ÷ 往返小时」选靶（本页上面那三个参数就是给它用的）；关＝回到按坐标顺序、按范围打的老路，而范围三个字段已经不在页面上渲染，只能靠库里存着的旧值。日常不要动它，这里留着只是因为「非军力优先」这条运行模式还在。';
 
-  const rows = document.getElementById('mission-rows');
   const errorBox = document.getElementById('mission-error');
   const hint = document.getElementById('mission-hint');
   const freezeCurrent = document.getElementById('freeze-current');
@@ -419,11 +500,25 @@
   const uptimeText = document.getElementById('sched-uptime');
   const currentLine = document.getElementById('current-line');
 
-  // 输入框只在这一行第一次拿到数据时填一次（标记在 `row.dataset.primed` 上）。
+  // 卡片归哪一节。**分节只是摆放，不是判据**：起谁、按什么次序起，全部由
+  // /api/scheduler 下发的次序说了算，这张表只决定它出现在页面的哪一块。
+  const CARD_BOXES = {
+    BOT: document.getElementById('mission-cards'),
+    RANKING: document.getElementById('ranking-cards'),
+    PIRATE: document.getElementById('other-cards'),
+    SCAN: document.getElementById('other-cards'),
+  };
+  const BOXES = [...new Set(Object.values(CARD_BOXES))];
+
+  function allRows() {
+    return [...document.querySelectorAll('.mission-row')];
+  }
+
+  // 输入框只在这一张卡第一次拿到数据时填一次（标记在 `row.dataset.primed` 上）。
   // 每轮轮询都写回去的话，用户正在输入的半径会被上一次保存的值顶掉——这正是
-  // 「状态区单独轮询、不刷整页」要躲的坑。标记挂在行上而不是一个全局开关：
-  // 新建出来的那一行必须也能填一次，而那时别的行早就填过了。
-  // 拖拽进行中不重排，否则行会在手底下跳走。
+  // 「状态区单独轮询、不刷整页」要躲的坑。标记挂在卡上而不是一个全局开关：
+  // 新建出来的那一张必须也能填一次，而那时别的卡早就填过了。
+  // 拖拽进行中不重排，否则卡会在手底下跳走。
   let dragging = null;
 
   function showError(message) {
@@ -438,12 +533,12 @@
   }
 
   function rowFor(taskId) {
-    return rows.querySelector(`[data-task-id="${taskId}"]`);
+    return document.querySelector(`.mission-row[data-task-id="${taskId}"]`);
   }
 
-  // ---- 建行 ---------------------------------------------------------------
+  // ---- 建卡 ---------------------------------------------------------------
   //
-  // 行数由服务端下发的任务列表决定（同一类型可以有多个），所以每一行都在这里
+  // 张数由服务端下发的任务列表决定（同一类型可以有多个），所以每一张都在这里
   // 建。**建过就不再重建**：重建会让正在编辑的输入框失焦，而状态每 2 秒轮询
   // 一次，那样参数永远填不完。
 
@@ -456,7 +551,7 @@
     return input;
   }
 
-  // 通用说明的 ⓘ。和页面顶上那两个（`missions-control-head` 里的）是同一种东西：
+  // 通用说明的 ⓘ。和页面顶上那两个（`missions-topbar` 里的）是同一种东西：
   // `.tips` 的样式在 console.css 里，提示走浏览器原生 `title`。
   //
   // ⚠️ `aria-label` 给的是「这是什么的说明」，**完整正文在 `title` 里**——两处
@@ -470,6 +565,16 @@
     tips.title = text;
     tips.textContent = 'ⓘ';
     return tips;
+  }
+
+  // 一小格「标签 + 控件」。卡是一行 flex，标签和它的控件之间**不许断行**，
+  // 否则「航线」和它的输入框会被挤到两行去，一张卡就变成两三行——而压高度
+  // 正是这次改版要做的事。
+  function makeField(...nodes) {
+    const field = document.createElement('span');
+    field.className = 'fld';
+    field.append(...nodes);
+    return field;
   }
 
   // ---- 定时窗口的时区换算 ---------------------------------------------------
@@ -507,13 +612,6 @@
     // 显式带上 `+08:00`。不带偏移量的话服务端会 400——这是有意的，
     // 一个没有时区的时刻在这条链路上必然差 8 小时，且不会报任何错。
     return `${text.slice(0, 16)}:00+08:00`;
-  }
-
-  function makeCell(row, ...nodes) {
-    const cell = document.createElement('td');
-    cell.append(...nodes);
-    row.append(cell);
-    return cell;
   }
 
   function populateTaskPlanetSelect(select, selected = '') {
@@ -570,21 +668,41 @@
     list.append(line);
   }
 
+  // 「军力优先」开关拨动之后，这张卡上该露出什么。
+  //
+  // ⚠️ **出发星球与航线数那两个控件不再跟着开关藏起来**（2026-08-22 改版）。
+  // 从前军力模式会把它们换成「多出发点方案」，可它们在军力模式下并没有失效：
+  // 没配多出发点方案时调度器就回落到任务级的这一颗（`_configured_origins`），
+  // 而且**任务名正是按它的银河系取的**。藏起来就等于把一个还在生效、还在决定
+  // 任务叫什么名字的配置藏了。多出发点方案改为放进「更多」里，与它并存。
+  //
+  // ⚠️ **「保存军力方案」那个按钮不跟着开关藏。** 它存的是整份军力方案，
+  // **包括开关本身**（`saveMilitary` 里 `by_military: enabled`，关着的时候只送
+  // 这一个键）。跟着一起藏起来的话，用户把开关拨到「关」之后就再没有任何按钮
+  // 能把这个状态存下来——那等于这个开关只能开不能关，而「留着它」的全部意义
+  // 就是那条路还走得通。所以它挪到了开关那一行，恒在。
   function setMilitaryVisible(row, locked) {
     const toggle = row.querySelector('.military-enabled');
     const settings = row.querySelector('.military-settings');
-    const regional = row.querySelector('.regional-params');
-    const standardDispatch = row.querySelector('.mission-standard-dispatch');
     const militaryDispatch = row.querySelector('.military-dispatch');
-    if (!toggle || !settings || !regional || !standardDispatch || !militaryDispatch) return;
+    const save = row.querySelector('.military-save');
+    if (!toggle || !settings || !militaryDispatch || !save) return;
     const enabled = toggle.checked;
     settings.hidden = !enabled;
-    regional.hidden = enabled;
-    standardDispatch.hidden = enabled;
     militaryDispatch.hidden = !enabled;
+    // 范围三字段**反向**显隐：军力优先关掉时它们才生效，而那时它们是必填的
+    // （后端缺 `galaxy` 会 400）。见 `rangeRow` 上那段。
+    const range = row.querySelector('.mission-range');
+    if (range) {
+      range.hidden = enabled;
+      for (const input of range.querySelectorAll('input')) input.disabled = locked;
+    }
     for (const input of settings.querySelectorAll('input, select')) input.disabled = locked;
     for (const input of militaryDispatch.querySelectorAll('input, select')) input.disabled = locked;
     for (const button of militaryDispatch.querySelectorAll('button')) button.disabled = locked;
+    // 按钮不在上面那圈 `input, select` 里，得单独锁一次——运行中配置已固化，
+    // 后端也会 409，但用户不该点下去才发现。
+    save.disabled = locked;
     toggle.disabled = locked;
   }
 
@@ -613,17 +731,24 @@
 
   function buildRow(task) {
     const isScan = task.kind === 'SCAN';
-    const row = document.createElement('tr');
-    row.className = 'mission-row';
+    // 填空隙的那几条恒在最后一位，拖不动（带 priority 的 PATCH 一律 400）。
+    const fillsGaps = FILLS_GAPS.includes(task.kind);
+    const row = document.createElement('div');
+    row.className = 'mission-row mission-card';
     row.dataset.taskId = task.task_id;
     row.dataset.kind = task.kind;
-    row.setAttribute('draggable', isScan ? 'false' : 'true');
+    row.setAttribute('draggable', fillsGaps ? 'false' : 'true');
 
-    // 排序把手。扫描恒在最后一位，拖不动。
+    // 主行：一张卡一行。次序即用户从左往右读的次序。
+    const line = document.createElement('div');
+    line.className = 'mission-line';
+    row.append(line);
+
+    // 排序把手。扫描与军力榜恒在最后一位，拖不动。
     const handle = document.createElement('span');
-    if (isScan) {
+    if (fillsGaps) {
       handle.className = 'muted';
-      handle.title = '扫描恒在最后一位，不参与排序';
+      handle.title = '填空隙的链路恒在最后一位，不参与排序';
       handle.textContent = '·';
     } else {
       handle.className = 'drag-handle';
@@ -631,54 +756,58 @@
       handle.textContent = '⠿';
     }
     handle.setAttribute('aria-hidden', 'true');
-    makeCell(row, handle);
+    line.append(handle);
 
     const checkbox = makeInput('mission-enabled', { type: 'checkbox' });
     checkbox.setAttribute('aria-label', `让「${task.label}」参与调度`);
-    makeCell(row, checkbox);
+    line.append(checkbox);
 
-    // 名字。同类型的多个任务全靠它区分，所以它必须能改。
-    const name = makeInput('mission-name', {
-      type: 'text', style: 'width:150px', 'aria-label': '任务名',
-    });
-    const kindLine = document.createElement('div');
-    kindLine.className = 'muted';
-    kindLine.style.fontSize = '11px';
-    kindLine.textContent = MISSION_LABELS[task.kind] || task.kind;
-    if (isScan) {
-      // 这句话必须在页面上，不能只靠「拖不动」让用户自己猜。扫描永远有活干，
-      // 排在它后面的链路就永远轮不到——把它拖到海盗前面等于当天 32 次配额
-      // 悄无声息地全流失。只想跑扫描的话，取消另外两个复选框。
-      kindLine.textContent += ' · 始终填空隙 · 不参与排序（它永远有活干，排它后面的永远轮不到）';
-    }
-    const taskCell = makeCell(row, name, kindLine);
-    if (task.kind === 'BOT') {
-      const modeLabel = document.createElement('label');
-      modeLabel.className = 'inline-label military-toggle';
-      modeLabel.style.cursor = 'pointer';
-      const militaryToggle = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
-      modeLabel.append(militaryToggle, document.createTextNode(' 军力优先'));
-      taskCell.append(modeLabel);
-    }
-
-    // 出发星球与航线数。**航线上限按星球各一份**，所以这两个必须成对出现在
-    // 同一格里——只看到航线数会以为那是账号总额。
+    // 名字。
     //
-    // **扫描这一行不给这两个框**：它压根不派遣，填了不会有任何效果，而一个改了
-    // 也不生效的输入框比没有更糟——用户会以为自己配好了。
-    const defaults = document.createElement('div');
-    defaults.className = 'muted mission-defaults';
-    defaults.style.fontSize = '11px';
-    if (isScan) {
-      const dash = document.createElement('span');
-      dash.className = 'muted';
-      dash.textContent = '— 不派遣';
-      makeCell(row, dash);
+    // ⚠️ **不再是输入框**（2026-08-22 改版）：bot 攻击的名字由服务端按出发点的
+    // 银河系派生（`5:261:8` → `5系攻击`，重名加序号），换出发点时跟着改。
+    // 留一个能手输的框，就会出现「名字写着 7 系、实际从 5 系出发」这种直接
+    // 误导人的行——而任务名正是日志与运行历史里认人的那个字段。
+    const name = document.createElement('span');
+    name.className = 'mission-name';
+    // 服务端下发的 `label` 已经做过「没起名就用链路中文名」这一步；这里再兜一次，
+    // 是因为一张没有名字的卡在页面上会缩成一个看不见的空格。
+    name.textContent = task.label || MISSION_LABELS[task.kind] || task.kind;
+    line.append(name);
+
+    // 出发星球与航线数。**航线上限按星球各一份**，所以这两个必须挨在一起——
+    // 只看到航线数会以为那是账号总额。
+    //
+    // ⚠️ **不派遣的那两条链路都不给这两个控件**（2026-08-22 改版）：
+    //
+    //     domain.missions.scan_command()     -> def scan_command() -> list[str]
+    //     domain.missions.ranking_command()  -> 只吃 bot_limit / blind_rows
+    //
+    // 两个签名**都不接出发点和航线**，填进去的值从来没有到达过 runner。
+    // 一个改了也不生效的输入框比没有更糟——用户会以为自己配好了，
+    // 而「配了没效果」这种故障在这套系统里最贵（今天上午「盲滚 700 行实际
+    // 一行没走」就是同一形状）。
+    //
+    // ⚠️ 判据用 `fillsGaps` 而不是 `isScan`：改版第一版写的是后者，于是军力榜
+    // 那张卡照旧渲染了这两个死控件。两条链路的共同点正是「填空隙、不派遣」。
+    if (fillsGaps) {
+      // 这句话必须在页面上，不能只靠「拖不动」让用户自己猜：这两条永远有活干，
+      // 排在它们后面的链路就永远轮不到。只想跑它们的话，取消另外那些复选框。
+      const note = document.createElement('span');
+      note.className = 'muted mission-scan-note';
+      note.textContent = isScan
+        ? '不派遣、没有任何参数：它自己维护扫描计划与游标'
+          + '（scan_command() 一个参数都不接，出发点与航线都不参与）'
+          + ' · 始终填空隙 · 不参与排序（它永远有活干，排它后面的永远轮不到）'
+        : '不派遣：攻击的军力读数就是它采回来的'
+          + '（ranking_command() 只吃「扫描数量」和「盲滚行数」，出发点与航线都不参与）'
+          + ' · 始终填空隙 · 不参与排序';
+      line.append(note);
     } else {
-      const dispatch = document.createElement('div');
-      dispatch.className = 'mission-dispatch';
-      const standardDispatch = document.createElement('div');
-      standardDispatch.className = 'mission-standard-dispatch';
+      // 「跟着全局走」和「就是这个值」显示成同一个数字的话，用户改了全局值之后
+      // 会以为任务也跟着变了。所以这一句紧跟在那两个控件后面。
+      const defaults = document.createElement('span');
+      defaults.className = 'muted mission-defaults';
       const origin = document.createElement('select');
       origin.className = 'mission-origin';
       origin.style.width = '175px';
@@ -687,64 +816,36 @@
       const lines = makeInput('mission-lines', {
         type: 'number', min: 1, style: 'width:64px', 'aria-label': '航线数',
       });
-      standardDispatch.append(origin, document.createTextNode(' '), lines, defaults);
-      dispatch.append(standardDispatch);
-      if (task.kind === 'BOT') {
-        const militaryDispatch = document.createElement('div');
-        militaryDispatch.className = 'military-dispatch';
-        militaryDispatch.hidden = true;
-        const originHead = document.createElement('div');
-        originHead.append('出发点 / 航线　');
-        const addOrigin = document.createElement('button');
-        addOrigin.type = 'button';
-        addOrigin.className = 'btn small military-add-origin';
-        addOrigin.textContent = '增加出发点';
-        // 这句说明每一行长得一模一样（它讲的是这个功能怎么用，不是这一行的事实），
-        // 所以进 ⓘ 而不是再铺一行 `<div>`。
-        originHead.append(addOrigin, document.createTextNode(' '),
-                          makeTips('多出发点说明', MILITARY_ORIGIN_TIP));
-        const origins = document.createElement('div');
-        origins.className = 'military-origin-list';
-        const save = document.createElement('button');
-        save.type = 'button';
-        save.className = 'btn primary small military-save';
-        save.style.marginTop = '7px';
-        save.textContent = '保存军力方案';
-        militaryDispatch.append(originHead, origins, save);
-        dispatch.append(militaryDispatch);
-      }
-      makeCell(row, dispatch);
+      line.append(makeField('出发 ', origin), makeField('航线 ', lines), defaults);
     }
 
-    // 参数框。
-    const params = document.createElement('span');
-    const regional = document.createElement('span');
-    regional.className = 'regional-params';
-    for (const field of PARAM_FIELDS[task.kind] || []) {
-      const label = document.createElement('span');
-      label.className = field.label === '–' ? 'dash' : 'inline-label';
-      label.textContent = field.label;
-      // `step` 与 `title` 都会在 `makeInput` 里被 undefined 跳过，所以老字段
-      // 一个字都不用改。`step` 不给的话浏览器默认按 1 取整，而扫描间隔是小时数，
-      // 「1.5 小时」会被数字框判成非法值——那一下页面上只显示一个红框，
-      // 用户看不出是步长的事。
-      const input = makeInput('mission-param', {
-        type: 'number', min: field.min, max: field.max, step: field.step,
-        placeholder: field.placeholder, title: field.title,
-        style: `width:${field.width}px`, 'aria-label': field.label,
-      });
-      input.dataset.param = field.key;
-      regional.append(label, input);
+    // 参数框。BOT 那一档是空的（见 `PARAM_FIELDS` 上那段），空的就一个节点
+    // 都不建——一个孤零零的「—」在一行式的卡上只是噪声。
+    const fields = PARAM_FIELDS[task.kind] || [];
+    if (fields.length) {
+      const regional = document.createElement('span');
+      regional.className = 'regional-params';
+      for (const field of fields) {
+        const label = document.createElement('span');
+        label.className = field.label === '–' ? 'dash' : 'inline-label';
+        label.textContent = field.label;
+        // `step` 与 `title` 都会在 `makeInput` 里被 undefined 跳过，所以老字段
+        // 一个字都不用改。`step` 不给的话浏览器默认按 1 取整，而扫描间隔是小时数，
+        // 「1.5 小时」会被数字框判成非法值——那一下页面上只显示一个红框，
+        // 用户看不出是步长的事。
+        const input = makeInput('mission-param', {
+          type: 'number', min: field.min, max: field.max, step: field.step,
+          placeholder: field.placeholder, title: field.title,
+          style: `width:${field.width}px`, 'aria-label': field.label,
+        });
+        input.dataset.param = field.key;
+        regional.append(makeField(label, input));
+      }
+      line.append(regional);
     }
-    if (!regional.childNodes.length) {
-      const dash = document.createElement('span');
-      dash.className = 'muted';
-      dash.textContent = '—';
-      regional.append(dash);
-    }
-    params.append(regional);
+
     if (task.kind === 'BOT') {
-      const settings = document.createElement('div');
+      const settings = document.createElement('span');
       settings.className = 'military-settings';
       // ⚠️ **这一格 2026-08-18 换了身份，文案必须跟着走。** 从前它是「军力截断
       // （取前几名）」，那道硬截断已经取消——现在只有一条判据：`军力 ÷ 往返小时`。
@@ -779,96 +880,18 @@
       // 从前这三件事铺在框下面的一整段 `<div>` 里，每一行任务都逐字重复一遍。
       // 现在挪进这个 ⓘ（`MILITARY_SELECTION_TIP`，一字未改）：它就贴在这三个框
       // 旁边，够得着，而不再按任务条数把同一段话乘一遍。
-      settings.append('窗口门限 ', topN, document.createTextNode(' 个　上限 '), maximum, document.createTextNode('　分数有效期 '), maxAge, document.createTextNode(' 小时 '), makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP));
-      params.append(settings);
+      settings.append(
+        makeField('读数有效期 ', maxAge, document.createTextNode(' 小时')),
+        makeField('窗口门限 ', topN, document.createTextNode(' 个')),
+        makeField('军力上限 ', maximum),
+        makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP),
+      );
+      line.append(settings);
     }
-    const summary = document.createElement('div');
-    summary.className = 'muted mission-summary';
-    summary.style.fontSize = '11px';
-    // 摘要讲的是**这一行自己的事实**（出发点/航线、全账号已配几条、有没有超配、
-    // 这一轮按什么口径出击），所以它必须留在页面上——那是用户唯一能一眼看出
-    // 「航线超配了」的地方。
-    //
-    // 但它长短不定（多出发点那一档会列出每颗星球），折起行来一行任务能吃掉三四行。
-    // 所以钉成**一行不折行**，超出部分省略号收掉，完整内容进 `title`。
-    // ⚠️ 省略和 `title` 是一对，**不许只留前者**：截断了又读不到全文，等于把
-    // 「已超出」那三个字藏了起来。渲染那一处两句写在一起，就是为了不让谁只改一边。
-    summary.style.whiteSpace = 'nowrap';
-    summary.style.overflow = 'hidden';
-    summary.style.textOverflow = 'ellipsis';
-    // 表格是 auto 布局：不给上界的话，`nowrap` 会把整列撑到摘要的全长，
-    // 别的列反而被挤窄。这个数**取到参数列本来就有的宽度附近**——给窄了等于
-    // 白白多截几个字，而「全账号已配 N 条」正排在摘要中段，截过头就看不见了。
-    summary.style.maxWidth = '640px';
-    summary.textContent = '…';
-    makeCell(row, params, summary);
 
-    // 定时开关。**留空 = 这一端不限**，两端都留空就是完全按现在的样子跑。
-    //
-    // 它和「参与调度」那个复选框是**与**的关系，不是同一件事的两种写法：复选框
-    // 是用户的意志（勾掉就是不想跑），定时窗口只是在它之上再加一道时间闸门。
-    // 到点绝不去改那个复选框——改了的话，用户手动开的会被悄悄关掉，而且事后
-    // 分不清是谁关的。
-    //
-    // ---- 折叠 ----
-    //
-    // 这一列恒展开着两组日期时间输入，比别的列都高，而**绝大多数任务根本没配
-    // 定时**——那三行高度买到的是两个空框。所以默认折起来，只留一行。
-    //
-    // ⚠️ **配了定时的任务不许藏。** 把一份已经生效的配置折起来，比多占几行危险
-    // 得多：用户看不见它，就会以为定时没生效，然后去改别的东西。这里守两道——
-    // ① 配了定时的行**默认展开**（`render` 里做，因为那时才知道库里有没有值）；
-    // ② 折叠那一行本身把配着的时刻念出来（`.mission-window-state`），
-    //    所以哪怕用户自己把它折回去，「这个任务配了定时」照样一眼看得见。
-    //
-    // 折叠状态**只存在内存里**（`row.dataset`），不落 localStorage、更不落后端。
-    // 理由是它不是配置而是「我这一刻在看什么」：一旦持久化，上一次的折叠记忆就会
-    // 盖过上面那条「配了定时默认展开」——而那正是这里最不能出的错。刷新页面回到
-    // 「按有没有配定时来决定」这个由数据说了算的状态，是更安全的默认。
-    const window_ = document.createElement('div');
-    window_.className = 'mission-window';
-    window_.hidden = true;
-    for (const [className, label] of [['mission-enabled-from', '开启'], ['mission-enabled-until', '关闭']]) {
-      const line = document.createElement('div');
-      // 「开启」和它的输入框**必须待在同一行**。默认会折：这一列窄，标签加上
-      // 180px 的输入框差几个像素放不下，于是每一端各占两行——展开一次白吃 58px，
-      // 而那正好是这次要省的东西。表格是 auto 布局，`nowrap` 会让这一列自己
-      // 从别处的余量里要够宽度（实测 217px → 257px，整张表照样没超屏）。
-      line.style.whiteSpace = 'nowrap';
-      const text = document.createElement('span');
-      text.className = 'inline-label';
-      text.textContent = label;
-      const input = makeInput(className, {
-        type: 'datetime-local', style: 'width:180px', 'aria-label': `${label}时间（UTC+8）`,
-      });
-      line.append(text, input);
-      window_.append(line);
-    }
-    const windowNote = document.createElement('div');
-    windowNote.className = 'muted';
-    windowNote.style.fontSize = '11px';
-    // 「不抢停」必须写在页面上：用户看到关闭时刻已过而任务还在跑，不写清楚
-    // 就只能理解成「定时没生效」，然后去点强制结束。
-    // 它跟着输入框一起收进折叠区：要看它的人，正是此刻在填这两个框的人。
-    // （同一句话另有一份在表格底下那条常驻说明里，折着也读得到。）
-    windowNote.textContent = '留空=不限；到点只挡新的一轮，正在跑的不打断';
-    window_.append(windowNote);
-    const windowToggleLabel = document.createElement('label');
-    windowToggleLabel.className = 'inline-label';
-    windowToggleLabel.style.cursor = 'pointer';
-    const windowToggle = makeInput('mission-window-toggle', {
-      type: 'checkbox', 'aria-label': '展开定时开关的配置',
-    });
-    windowToggleLabel.append(windowToggle, document.createTextNode(' 定时'));
-    // 折叠态的那一行小字：没配就说没配，配了就把两端的时刻念出来。
-    const windowState = document.createElement('span');
-    windowState.className = 'muted mission-window-state';
-    windowState.style.fontSize = '11px';
-    windowState.style.marginLeft = '6px';
-    windowState.textContent = '未设定时';
-    const windowHead = document.createElement('div');
-    windowHead.append(windowToggleLabel, windowState);
-    makeCell(row, windowHead, window_);
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    line.append(spacer);
 
     // 状态。
     const chip = document.createElement('span');
@@ -881,36 +904,206 @@
     word.className = 'mission-status-word';
     word.textContent = '读取中';
     chip.append(glyph, word);
-    const detail = document.createElement('div');
+    const detail = document.createElement('span');
     detail.className = 'muted mission-detail';
-    detail.style.fontSize = '11px';
+    const summary = document.createElement('span');
+    summary.className = 'muted mission-summary';
+    // 摘要讲的是**这一行自己的事实**（出发点/航线、全账号已配几条、有没有超配、
+    // 这一轮按什么口径出击），所以它必须留在页面上——那是用户唯一能一眼看出
+    // 「航线超配了」的地方。
+    //
+    // 但它长短不定（多出发点那一档会列出每颗星球），铺开来一张卡就被它顶成两行。
+    // 所以钉成**一行不折行**，超出部分省略号收掉，完整内容进 `title`。
+    // ⚠️ 省略和 `title` 是一对，**不许只留前者**：截断了又读不到全文，等于把
+    // 「已超出」那三个字藏了起来。渲染那一处两句写在一起，就是为了不让谁只改一边。
+    summary.style.whiteSpace = 'nowrap';
+    summary.style.overflow = 'hidden';
+    summary.style.textOverflow = 'ellipsis';
+    // 不给上界的话，`nowrap` 的摘要会把整张卡撑宽，别的控件反而被挤走。
+    // 这个数**取到摘要本来就有的宽度附近**——给窄了等于白白多截几个字，
+    // 而「全账号已配 N 条」正排在摘要中段，截过头就看不见了。
+    summary.style.maxWidth = '640px';
+    summary.textContent = '…';
     // 自动停用是对**当时那一阵**的判定，不是墓碑：连崩三次多半是「窗口抢不到
     // 前台」这种环境原因，人回到座位上它就好了。而停用时复选框仍然是勾着的，
     // 页面上没有这个按钮的话，用户只能靠「取消勾选再勾回来」猜出恢复的办法。
     const revive = document.createElement('button');
     revive.className = 'btn small mission-revive';
     revive.type = 'button';
-    revive.style.marginTop = '6px';
     revive.hidden = true;
     revive.textContent = '恢复';
-    const cell = makeCell(row, chip, detail, revive);
+    line.append(chip, detail, summary, revive);
     if (task.kind === 'BOT') {
       // bot 打完一轮就退出调度，**不自动开下一轮**——自动开就等于没人看着的
       // 时候一直派舰队。开新一轮只能是用户按下的这一下。
       const newRound = document.createElement('button');
       newRound.className = 'btn small mission-new-round';
       newRound.type = 'button';
-      newRound.style.marginTop = '6px';
       newRound.hidden = true;
       newRound.textContent = '重开一轮';
       // 删除只给 bot：另外两条链路各只有一个任务，后端也会拒。
       const remove = document.createElement('button');
       remove.className = 'btn small mission-delete';
       remove.type = 'button';
-      remove.style.marginTop = '6px';
       remove.textContent = '删除';
-      cell.append(newRound, remove);
+      line.append(newRound, remove);
     }
+
+    // ---- 「更多」折叠区 -----------------------------------------------------
+    //
+    // 主行只放每天都要看的那几样。剩下三样搬进这里：「军力优先」开关、定时开关、
+    // 多出发星球方案。它们的共同点是**配一次就不再动**，而它们恒展开时买到的
+    // 是一整片空框。
+    //
+    // ⚠️ **配了定时的任务不许藏。** 把一份已经生效的配置折起来，比多占几行危险
+    // 得多：用户看不见它，就会以为定时没生效，然后去改别的东西。这里守两道——
+    // ① 配了定时的卡**默认把这一区展开**（`render` 里做，因为那时才知道库里有没有
+    //    值），并连带展开里面那组输入框；
+    // ② 折叠区的标题行本身把配着的时刻念出来（`.mission-window-state` 就摆在
+    //    `<summary>` 上），所以哪怕用户自己把它折回去，「这个任务配了定时」照样
+    //    一眼看得见。
+    //
+    // 折叠状态**只存在内存里**（`row.dataset`），不落 localStorage、更不落后端。
+    // 理由是它不是配置而是「我这一刻在看什么」：一旦持久化，上一次的折叠记忆就会
+    // 盖过上面那条「配了定时默认展开」——而那正是这里最不能出的错。刷新页面回到
+    // 「按有没有配定时来决定」这个由数据说了算的状态，是更安全的默认。
+    const more = document.createElement('details');
+    more.className = 'mission-more';
+    const moreHead = document.createElement('summary');
+    // 标题把里面真有的东西列出来。海盗与扫描没有军力那两样，写上去就是一句
+    // 「点开却找不到」——用户会以为这一块坏了。
+    moreHead.append('更多：'
+      + (task.kind === 'BOT' ? '军力优先 · ' : '')
+      + '定时开关（UTC+8）'
+      + (task.kind === 'BOT' ? ' · 多出发星球方案' : ''));
+    // 折叠态的那一行小字：没配就说没配，配了就把两端的时刻念出来。
+    const windowState = document.createElement('span');
+    windowState.className = 'muted mission-window-state';
+    windowState.style.marginLeft = '6px';
+    windowState.textContent = '未设定时';
+    moreHead.append(windowState);
+    more.append(moreHead);
+    // 用户自己动过这个折叠区之后就一律听用户的，别让每 2 秒一轮的轮询把他刚
+    // 折起来的又掰开。`toggle` 事件不冒泡，所以只能挂在这个节点上。
+    more.addEventListener('toggle', () => { row.dataset.moreTouched = '1'; });
+
+    if (task.kind === 'BOT') {
+      // 「军力优先」。
+      //
+      // ⚠️ **它是一种运行模式，不是一个装饰**：关掉之后选靶换成「按坐标顺序、
+      // 按范围打」那条分支（`nearest_first(bot_targets_in_range(...))`）。
+      // 2026-08-22 改版只把它从主行挪进这里（用户口径：「主行上不需要这个按钮」），
+      // **没有删**——删了就等于从界面上删掉一种运行模式。默认开。
+      const modeLabel = document.createElement('label');
+      modeLabel.className = 'inline-label military-toggle';
+      modeLabel.style.cursor = 'pointer';
+      const militaryToggle = makeInput('military-enabled', { type: 'checkbox', 'aria-label': '按军力优先攻击' });
+      modeLabel.append(militaryToggle, document.createTextNode(' 军力优先'));
+      // 「保存军力方案」摆在开关这一行，**任何模式下都够得着**（理由见
+      // `setMilitaryVisible` 上那段）。它存的是整份军力方案：开关、下面三个参数、
+      // 以及多出发点那一组。
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'btn primary small military-save';
+      save.textContent = '保存军力方案';
+      save.title = '保存这张卡的军力配置：军力优先开关、主行那三个参数、以及下面的多出发星球方案';
+      const modeRow = document.createElement('div');
+      modeRow.className = 'more-line';
+      modeRow.append(modeLabel, makeTips('军力优先说明', MILITARY_MODE_TIP), save);
+      more.append(modeRow);
+
+      // ⚠️ **范围三字段：只在军力优先「关掉」时显形，而且必须在。**
+      //
+      // 改版第一版把它们从页面上整个撤掉了，理由是军力优先模式下
+      // `most_valuable_first` 压根不看它们（那是对的）。但那样就留下一个陷阱：
+      // 开关**能关**、关掉之后走 `nearest_first(bot_targets_in_range(...))`
+      // 那条分支，而后端会因为缺 `galaxy` 直接 400 ——**而页面上已经没有
+      // 任何地方能填它**。也就是「开关只能开不能关」，等于那条运行模式
+      // 事实上被删掉了，只是删得不明说。
+      //
+      // 所以它们回到这里，跟着开关反向显隐：开着 = 军力选靶，这三个数没用、
+      // 藏起来；关着 = 按坐标顺序按范围打，这三个数是**必填**。
+      const rangeRow = document.createElement('div');
+      rangeRow.className = 'more-line mission-range';
+      const rangeHint = document.createElement('span');
+      rangeHint.className = 'inline-label';
+      rangeHint.textContent = '范围（仅非军力优先时生效）';
+      rangeRow.append(rangeHint);
+      for (const field of BOT_RANGE_FIELDS) {
+        const input = makeInput('mission-param', {
+          type: 'number', min: String(field.min ?? 1),
+          style: `width:${field.width}px`, 'aria-label': field.label,
+        });
+        // `dataset.param`，不是 `dataset.key`——保存与回显两处都认这个属性。
+        input.dataset.param = field.key;
+        rangeRow.append(makeField(`${field.label} `, input));
+      }
+      more.append(rangeRow);
+    }
+
+    // 定时开关。**留空 = 这一端不限**，两端都留空就是完全按现在的样子跑。
+    //
+    // 它和「参与调度」那个复选框是**与**的关系，不是同一件事的两种写法：复选框
+    // 是用户的意志（勾掉就是不想跑），定时窗口只是在它之上再加一道时间闸门。
+    // 到点绝不去改那个复选框——改了的话，用户手动开的会被悄悄关掉，而且事后
+    // 分不清是谁关的。
+    const window_ = document.createElement('div');
+    window_.className = 'mission-window';
+    window_.hidden = true;
+    for (const [className, label] of [['mission-enabled-from', '开启'], ['mission-enabled-until', '关闭']]) {
+      const input = makeInput(className, {
+        type: 'datetime-local', style: 'width:180px', 'aria-label': `${label}时间（UTC+8）`,
+      });
+      const text = document.createElement('span');
+      text.className = 'inline-label';
+      text.textContent = label;
+      // 「开启」和它的输入框**必须待在同一行**：默认会折，每一端各占两行等于
+      // 展开一次白吃 58px，而那正好是这次要省的东西。
+      window_.append(makeField(text, input));
+    }
+    const windowNote = document.createElement('span');
+    windowNote.className = 'muted';
+    // 「不抢停」必须写在页面上：用户看到关闭时刻已过而任务还在跑，不写清楚
+    // 就只能理解成「定时没生效」，然后去点强制结束。
+    // 它跟着输入框一起收进折叠区：要看它的人，正是此刻在填这两个框的人。
+    // （同一句话另有一份在任务卡底下那条常驻说明里，折着也读得到。）
+    windowNote.textContent = '留空=不限；到点只挡新的一轮，正在跑的不打断';
+    window_.append(windowNote);
+    const windowToggleLabel = document.createElement('label');
+    windowToggleLabel.className = 'inline-label';
+    windowToggleLabel.style.cursor = 'pointer';
+    const windowToggle = makeInput('mission-window-toggle', {
+      type: 'checkbox', 'aria-label': '展开定时开关的配置',
+    });
+    windowToggleLabel.append(windowToggle, document.createTextNode(' 定时（UTC+8）'));
+    const windowRow = document.createElement('div');
+    windowRow.className = 'more-line';
+    windowRow.append(windowToggleLabel, window_);
+    more.append(windowRow);
+
+    if (task.kind === 'BOT') {
+      // 多出发星球方案。军力模式下才生效，所以跟着「军力优先」显隐
+      // （`setMilitaryVisible`）。
+      const militaryDispatch = document.createElement('div');
+      militaryDispatch.className = 'military-dispatch more-line';
+      militaryDispatch.hidden = true;
+      const originHead = document.createElement('div');
+      originHead.append('出发点 / 航线　');
+      const addOrigin = document.createElement('button');
+      addOrigin.type = 'button';
+      addOrigin.className = 'btn small military-add-origin';
+      addOrigin.textContent = '增加出发点';
+      // 这句说明每一张卡长得一模一样（它讲的是这个功能怎么用，不是这一张卡的
+      // 事实），所以进 ⓘ 而不是再铺一行 `<div>`。
+      originHead.append(addOrigin, document.createTextNode(' '),
+                        makeTips('多出发点说明', MILITARY_ORIGIN_TIP));
+      const origins = document.createElement('div');
+      origins.className = 'military-origin-list';
+      militaryDispatch.append(originHead, origins);
+      more.append(militaryDispatch);
+    }
+
+    row.append(more);
     return row;
   }
 
@@ -949,24 +1142,29 @@
     orphanBanner.hidden = state.orphan_pid === null || state.orphan_pid === undefined;
     if (!orphanBanner.hidden) orphanPid.textContent = state.orphan_pid;
 
-    // 建出还不存在的行、删掉已经不在列表里的行。**已经在的一个都不重建**：
+    // 建出还不存在的卡、删掉已经不在列表里的卡。**已经在的一张都不重建**：
     // 重建会让正在编辑的输入框失焦，而这里每 2 秒跑一次。
     const wantedIds = new Set(state.tasks.map((task) => String(task.task_id)));
-    for (const row of [...rows.querySelectorAll('.mission-row')]) {
+    for (const row of allRows()) {
       if (!wantedIds.has(row.dataset.taskId)) row.remove();
     }
     for (const task of state.tasks) {
-      if (!rowFor(task.task_id)) rows.append(buildRow(task));
+      if (!rowFor(task.task_id)) (CARD_BOXES[task.kind] || CARD_BOXES.BOT).append(buildRow(task));
     }
 
-    // tasks 已经按调度次序排好（扫描恒最后），页面照抄，不自己排。
-    // **次序没变就一个节点都不动**，理由同上。
-    const wanted = state.tasks.map((task) => task.task_id).join(',');
-    const shown = [...rows.querySelectorAll('.mission-row')].map((row) => row.dataset.taskId).join(',');
-    if (!dragging && wanted !== shown) {
-      for (const task of state.tasks) {
-        const row = rowFor(task.task_id);
-        if (row) rows.append(row);
+    // tasks 已经按调度次序排好（填空隙的恒最后），页面照抄，不自己排。
+    // **次序没变就一个节点都不动**，理由同上。分节之后每一块各自比一次：
+    // 判据仍然是同一份下发次序，只是被拆到了三块容器里。
+    for (const box of BOXES) {
+      const wanted = state.tasks
+        .filter((task) => (CARD_BOXES[task.kind] || CARD_BOXES.BOT) === box)
+        .map((task) => task.task_id);
+      const shown = [...box.querySelectorAll('.mission-row')].map((row) => row.dataset.taskId);
+      if (!dragging && wanted.join(',') !== shown.join(',')) {
+        for (const taskId of wanted) {
+          const row = rowFor(taskId);
+          if (row) box.append(row);
+        }
       }
     }
 
@@ -990,6 +1188,11 @@
       // 折叠开关**不跟着锁**：运行中最想知道的恰恰是「这一轮的定时配的是什么」，
       // 展开只是去看，里面那两个输入框上一行已经置灰了，看得见改不了。
       row.querySelector('.mission-window-toggle').disabled = false;
+      // 卡整体压暗：没参与调度的那些，一眼能和在跑的分开。
+      row.classList.toggle('off', !task.enabled);
+      // 拖拽结束时要把这一块里原有的那几个 priority 值重新分配一遍（见
+      // `onCardDragEnd`），所以每张卡得记着自己现在是几。
+      row.dataset.priority = task.priority;
       // 删除只在这条链路还有别的任务时才给。每条链路至少留一行——删光了页面上
       // 就再也建不回来（海盗与扫描连「新建」的入口都没有）。后端也会拒，
       // 但用户不该点下去才发现。
@@ -999,9 +1202,9 @@
         removeButton.hidden = siblings <= 1;
         removeButton.disabled = locked;
       }
-      // 扫描那一行本来就不能拖，锁上之后另外两行也不能。`dragstart` 认的就是
+      // 填空隙的那几张本来就不能拖，锁上之后别的也不能。`dragstart` 认的就是
       // 这个属性，所以改它就等于真的拖不动，不是只把把手画灰。
-      row.setAttribute('draggable', locked || task.kind === 'SCAN' ? 'false' : 'true');
+      row.setAttribute('draggable', locked || FILLS_GAPS.includes(task.kind) ? 'false' : 'true');
       const handle = row.querySelector('.drag-handle');
       if (handle) handle.style.opacity = locked ? '0.35' : '';
 
@@ -1012,12 +1215,16 @@
       chip.querySelector('.mission-status-word').textContent = task.status;
 
       row.querySelector('.mission-detail').textContent = task.detail || '';
-      // 摘要压成一行、超出用省略号收（建行那一处设的样式），所以**完整内容必须
+      // 摘要压成一行、超出用省略号收（建卡那一处设的样式），所以**完整内容必须
       // 同时进 `title`**——这两句写在一起，就是为了不让谁只改一边：只截断不留
       // `title`，「全账号已配 N 条 · 已超出」这类只在这里露面的事实就被藏了。
       const summaryLine = row.querySelector('.mission-summary');
       summaryLine.textContent = task.summary || '';
       summaryLine.title = task.summary || '';
+
+      // 名字由服务端派生，页面只显示。它会随出发点变，所以每轮都跟库走——
+      // 它不是输入框，写回去不会顶掉任何人正在敲的字。
+      row.querySelector('.mission-name').textContent = task.label;
 
       const newRound = row.querySelector('.mission-new-round');
       // 「已完成」这个判断由服务端给出，页面只认那个词。
@@ -1034,16 +1241,24 @@
       if (task.fleet_lines_is_default) following.push('航线数');
       const defaultsLine = row.querySelector('.mission-defaults');
       if (defaultsLine) {
-        defaultsLine.textContent =
-          following.length ? `${following.join(' / ')}跟随全局默认` : '';
+        // ⚠️ **正文压到四个字，完整那句进 `title`。** 一行式的卡上这一句原本占
+        // 154px，把状态 chip 挤到第二行去了（1440px 视口下实测）。
+        // ⚠️ 但**不能整句挪进 tooltip**：「哪个值在跟随全局」必须一眼看得见，
+        // 否则用户改了全局值之后会以为这个任务跟着变了——那正是这句话存在的理由。
+        // 所以留可见的信号、把细节收进悬停。
+        defaultsLine.textContent = following.length ? '跟随全局' : '';
+        defaultsLine.title = following.length
+          ? `${following.join(' / ')}跟随全局默认：改了全局值，这个任务会跟着变`
+          : '';
       }
 
-      // 定时那一列的折叠。**判据是库里到底有没有配定时**，不是页面上那两个框
-      // 里此刻是什么——框里的值只在 prime 那一下写进去，用它来判会在新建的行上
+      // 定时那一块的折叠。**判据是库里到底有没有配定时**，不是页面上那两个框
+      // 里此刻是什么——框里的值只在 prime 那一下写进去，用它来判会在新建的卡上
       // 得出「没配」。
       const scheduled = Boolean(task.enabled_from_utc || task.enabled_until_utc);
       // 折叠态那一行小字：把配着的时刻直接念出来。⚠️ **这不是装饰**——用户可以
       // 自己把一个配了定时的任务折回去，那之后「它配了定时」就只剩这一句在说。
+      // 它摆在 `<summary>` 上，所以「更多」整块折着也读得到。
       row.querySelector('.mission-window-state').textContent = scheduled
         ? `已配定时 · 开启 ${windowMoment(task.enabled_from_utc)} · 关闭 ${windowMoment(task.enabled_until_utc)}`
         : '未设定时';
@@ -1053,22 +1268,24 @@
       // 动过之后一律听用户的——否则每 2 秒一轮的轮询会把他刚折起来的又掰开。
       if (!row.dataset.windowTouched) windowToggle.checked = scheduled;
       row.querySelector('.mission-window').hidden = !windowToggle.checked;
-      // 展开时这句小字就多余了——那两个输入框里摆着的正是同样的两个时刻，
-      // 而它自己也要占一行。折起来的时候它是唯一的信源，那时才需要它。
+      // 展开时这句小字就多余了——那两个输入框里摆着的正是同样的两个时刻。
+      // 折起来的时候它是唯一的信源，那时才需要它。
       row.querySelector('.mission-window-state').hidden = windowToggle.checked;
+      // 「更多」这一层同理：配了定时就连带展开，否则那份配置藏在两层折叠底下。
+      const more = row.querySelector('.mission-more');
+      if (!row.dataset.moreTouched) more.open = scheduled;
 
       // 输入框平时只填一次（每轮都写回去会把用户正在输入的值顶掉），但锁着的
       // 时候没人能输入，那就每轮都跟库走——否则「结束」之后框里留着的可能是
       // 上一次输入到一半的值，而它看起来和已保存的值一模一样。
-      // **刚建出来的行也要填一次**，否则新加的任务是一排空框。
+      // **刚建出来的卡也要填一次**，否则新加的任务是一排空框。
       if (!row.dataset.primed || locked) {
         row.dataset.primed = '1';
         for (const input of row.querySelectorAll('.mission-param')) {
           const value = task.params[input.dataset.param];
           input.value = value === undefined ? '' : value;
         }
-        row.querySelector('.mission-name').value = task.label;
-        // 扫描那一行没有这两个框（它不派遣），所以这里得先看有没有。
+        // 扫描那一张没有这两个控件（它不派遣），所以这里得先看有没有。
         const originInput = row.querySelector('.mission-origin');
         if (originInput) populateTaskPlanetSelect(originInput, task.origin || '');
         const linesInput = row.querySelector('.mission-lines');
@@ -1156,7 +1373,7 @@
         `${latest.current.label} · 已运行 ${elapsed(latest.current.started_at_utc, now)} · ${latest.current.log_path}`;
       currentLine.className = '';
     } else if (latestBackfill && latestBackfill.blocking) {
-      // 补录扣着窗口时，任务那几行会一直显示「待命」而什么都不起。不把原因写在
+      // 补录扣着窗口时，任务那几张卡会一直显示「待命」而什么都不起。不把原因写在
       // 这里的话，那看起来就是调度器坏了——而它其实正在按顺序办事。
       currentLine.textContent = `任务已暂停：${latestBackfill.phase}（补录优先于任务）`;
       currentLine.className = '';
@@ -1292,14 +1509,6 @@
       .catch((error) => { fail(error); return refresh(); });
   }
 
-  function coordinatePayload(text) {
-    const parts = text.trim().split(':').map(Number);
-    if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) {
-      throw new Error(`出发点「${text}」应为 星系:恒星系:位置，例如 2:137:18`);
-    }
-    return { galaxy: parts[0], system: parts[1], position: parts[2] };
-  }
-
   function saveMilitary(taskId, row) {
     const task = latest.tasks.find((item) => String(item.task_id) === String(taskId));
     if (!task) return;
@@ -1372,19 +1581,21 @@
       () => backfillCommand('/api/backfill/resume');
   }
 
+  // 新建。**不送名字**：服务端按出发点的银河系派生（`5:261:8` → `5系攻击`），
+  // 重名自动加序号。页面自己算一份的话，两处规则迟早分家，而名字是日志里认人
+  // 的字段——分家之后页面显示的和日志里写的就不是同一个名字了。
   document.getElementById('btn-new-task').onclick = () => {
     showError('');
     const lines = document.getElementById('new-task-lines').value.trim();
     const payload = {
       kind: 'BOT',
-      name: document.getElementById('new-task-name').value,
       origin: document.getElementById('new-task-origin').value.trim() || null,
       // 空框不往上送：`Number('')` 是 0，而 0 条航线的任务永远派不出去。
       fleet_lines: lines === '' ? null : Number(lines),
     };
     return EVOHelper.request('POST', '/api/missions', payload)
       .then(() => {
-        for (const id of ['new-task-name', 'new-task-origin', 'new-task-lines']) {
+        for (const id of ['new-task-origin', 'new-task-lines']) {
           document.getElementById(id).value = '';
         }
         return refresh();
@@ -1412,7 +1623,12 @@
       .catch((error) => { fail(error); return refresh(); });
   };
 
-  rows.addEventListener('click', (event) => {
+  // ---- 事件 ---------------------------------------------------------------
+  //
+  // 卡片分在三块容器里（军力攻击 / 军力榜 / 其他链路），所以同一套处理器要挂
+  // 三份。**处理器本身一份**：分节只是摆放，行为在哪一节里都一模一样。
+
+  function onCardClick(event) {
     const row = event.target.closest('.mission-row');
     if (!row) return;
     const taskId = row.dataset.taskId;
@@ -1434,19 +1650,19 @@
     }
     if (event.target.closest('.mission-delete')) {
       // 删掉的是用户自己配出来的东西，而且不可撤销（历史台账留着，配置不留）。
-      if (!window.confirm(`删除任务「${row.querySelector('.mission-name').value}」？`)) return;
+      if (!window.confirm(`删除任务「${row.querySelector('.mission-name').textContent}」？`)) return;
       showError('');
       EVOHelper.request('DELETE', `/api/missions/${taskId}`)
         .then(refresh)
         .catch((error) => { fail(error); return refresh(); });
     }
-  });
+  }
 
-  rows.addEventListener('change', (event) => {
+  function onCardChange(event) {
     const row = event.target.closest('.mission-row');
     if (!row) return;
     const taskId = row.dataset.taskId;
-    // 定时那一列的折叠开关。**它什么都不 PATCH**：折不折只是这一刻的视图，
+    // 定时那一块的折叠开关。**它什么都不 PATCH**：折不折只是这一刻的视图，
     // 存进库里就成了一份要跟着任务走的假配置。`windowTouched` 一旦立起来，
     // 上面 `render` 里那条「配了定时默认展开」就不再替用户做主——否则每 2 秒
     // 一轮的轮询会把他刚折起来的又掰开。
@@ -1464,12 +1680,10 @@
       patch(taskId, { enabled: event.target.checked });
       return;
     }
-    if (event.target.matches('.mission-name')) {
-      patch(taskId, { name: event.target.value });
-      return;
-    }
     if (event.target.matches('.mission-origin')) {
       // 空串在接口上是一个**动作**：把出发星球退回「用全局主星」。
+      // 服务端会顺手把任务名改成新银河系的那个（`5:261:8` → `5系攻击`），
+      // 所以这一下之后卡上的名字会跟着变——那是有意的，不是刷新丢了什么。
       patch(taskId, { origin: event.target.value.trim() });
       return;
     }
@@ -1502,48 +1716,69 @@
     if (event.target.matches('.military-enabled')) {
       setMilitaryVisible(row, latest && latest.config_locked === true);
     }
-  });
+  }
 
   // ---- 拖拽排序 -----------------------------------------------------------
   //
-  // 扫描那一行 draggable="false"，而且这里还挡住「把别人拖到它后面」：
-  // PATCH /api/missions/SCAN 带 priority 一律 400，用户不该拖完了才发现。
+  // 填空隙的那几张 draggable="false"，而且这里还挡住「把别人拖到它后面」：
+  // PATCH 带 priority 打到它们身上一律 400，用户不该拖完了才发现。
+  //
+  // ⚠️ **只在同一块容器里重排。** 海盗现在摆在页面底部的「其他链路」，
+  // 和 bot 攻击不在同一块里——把两块拼起来算次序的话，随便拖一下 bot 就会
+  // 把海盗的优先级压到所有 bot 之后，而用户根本没碰海盗那张卡。
 
-  rows.addEventListener('dragstart', (event) => {
+  function onCardDragStart(event) {
     const row = event.target.closest('.mission-row');
     if (!row || row.getAttribute('draggable') !== 'true') return;
     dragging = row;
     event.dataTransfer.effectAllowed = 'move';
     // Firefox 不带数据的拖拽根本起不来。
     event.dataTransfer.setData('text/plain', row.dataset.taskId);
-  });
+  }
 
-  rows.addEventListener('dragover', (event) => {
+  function onCardDragOver(event) {
     const row = event.target.closest('.mission-row');
     if (!dragging || !row || row === dragging) return;
-    if (row.getAttribute('draggable') !== 'true') return;  // 扫描恒在最后
+    if (row.parentNode !== dragging.parentNode) return;  // 不跨节拖
+    if (row.getAttribute('draggable') !== 'true') return;  // 填空隙的恒在最后
     event.preventDefault();
     const box = row.getBoundingClientRect();
     const before = event.clientY < box.top + box.height / 2;
     row.parentNode.insertBefore(dragging, before ? row : row.nextSibling);
-  });
+  }
 
-  // 行已经在 dragover 里就位了，这里只是把浏览器的默认落点行为挡掉——
-  // 不挡的话，某些浏览器会拿 text/plain 的内容当地址栏输入。
-  rows.addEventListener('drop', (event) => event.preventDefault());
-
-  rows.addEventListener('dragend', () => {
+  function onCardDragEnd() {
     if (!dragging) return;
+    const box = dragging.parentNode;
     dragging = null;
-    // 只给能排序的那些行下发新次序；扫描不带 priority。
-    const movable = [...rows.querySelectorAll('.mission-row[draggable="true"]')];
-    movable
+    // 只给这一块里能排序的那些卡下发新次序，而且**只把它们原有的那几个
+    // priority 值重新分配一遍**（升序发给新的排列）。直接发 0..n-1 的话，
+    // 别的容器里那些任务（海盗）的相对位置会被悄悄改掉——它们的 priority
+    // 本来可能夹在两个 bot 之间。
+    const movable = [...box.querySelectorAll('.mission-row[draggable="true"]')];
+    const slots = movable
+      .map((row) => Number(row.dataset.priority))
+      .filter((value) => Number.isInteger(value))
+      .sort((a, b) => a - b);
+    if (slots.length !== movable.length) return refresh();
+    return movable
       .reduce(
-        (chain, row, index) => chain.then(() => patch(row.dataset.taskId, { priority: index })),
+        (chain, row, index) => chain.then(() => patch(row.dataset.taskId, { priority: slots[index] })),
         Promise.resolve(),
       )
       .then(refresh);
-  });
+  }
+
+  for (const box of BOXES) {
+    box.addEventListener('click', onCardClick);
+    box.addEventListener('change', onCardChange);
+    box.addEventListener('dragstart', onCardDragStart);
+    box.addEventListener('dragover', onCardDragOver);
+    // 卡已经在 dragover 里就位了，这里只是把浏览器的默认落点行为挡掉——
+    // 不挡的话，某些浏览器会拿 text/plain 的内容当地址栏输入。
+    box.addEventListener('drop', (event) => event.preventDefault());
+    box.addEventListener('dragend', onCardDragEnd);
+  }
 
   // 只有上一轮读完才排下一轮。固定间隔会在慢查询尚未返回时再叠一轮 GET；浏览器
   // 取消旧请求也不会中断 FastAPI 的同步查库，最终把线程池与
