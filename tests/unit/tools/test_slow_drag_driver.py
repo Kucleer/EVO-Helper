@@ -254,6 +254,8 @@ def test_a_real_navigator_scroll_comes_out_as_one_proper_drag() -> None:
         read_rows=lambda: screens.pop(0) if screens else [("b",)],
         # 这条只走 `scroll_once`，碰不到那道「面板铺开了没有」的闸。
         row_has_score=lambda _row: True,
+        # 也碰不到 `spin_blind` 的闭环——这条路一次滚轮都不发。
+        read_position=lambda: None,
         say=lambda _message: None,
     )
 

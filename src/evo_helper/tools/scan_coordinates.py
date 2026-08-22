@@ -793,6 +793,30 @@ class SlowDragDriver:
         self._driver._gui.mouseUp()  # noqa: SLF001 - 同上
         self._origin = None
 
+    def hover(self, x: int, y: int) -> None:
+        """把指针挪到某处，**不按下**。滚轮盲滚之前用它落点。
+
+        ⚠️ **不能借 `move_to` 干这件事**：那是分步慢拖的途中一步，没按下就调会被
+        它的守卫拦掉（「没有按下就移动：这一拖没有参照系」）。那道守卫是对的——
+        它保证一次拖动的所有中间点共用按下时的那套原点。
+
+        ⚠️ **为什么盲滚必须先落点**：浏览器把滚轮事件路由给**指针底下**的元素。
+        `open_military_ranking` 之后指针停在 `MILITARY_TAB`(1084, 212)，而榜单从
+        `ROW_FIRST_Y`(257) 才开始——差 45 像素，事件全喂给页签条，榜单一行不动，
+        而日志照样报「盲滚 700 行」（那个数是按格数换算的，不是量出来的）。
+        2026-08-22 生产事故就是这么来的。
+
+        这里**抢前台**：它在一次拨格循环之前只做一次，付得起 `focus()` 的代价，
+        而拨格循环里反而不能抢（退避重试最多 4.5 秒，塞不进 16ms）。
+        """
+        import random
+
+        self._driver.focus()
+        origin_x, origin_y = self._driver.origin()
+        self._driver._gui.moveTo(  # noqa: SLF001 - 同上
+            origin_x + x, origin_y + y, random.uniform(0.2, 0.4)
+        )
+
     def wheel_notch(self) -> None:
         """往下滚**一格**。盲滚段唯一的动作原语。
 
@@ -819,8 +843,24 @@ class SlowDragDriver:
         """
         import pyautogui
 
-        pyautogui.PAUSE = 0
-        pyautogui.scroll(-WHEEL_DELTA)
+        # ⚠️ **`PAUSE` 只在这一次调用里归零，出去必须还回去。**
+        #
+        # 2026-08-22 生产事故：原先这里是裸的 `pyautogui.PAUSE = 0`，全局赋值、
+        # 永不恢复。盲滚一跑完，同进程后面**所有** pyautogui 调用都没有停顿了——
+        # 包括检测段的分步慢拖。而本仓早就记着「一步到位的拖动会被游戏面板当成
+        # 点击」：`_slow_drag` 一屏要发 1 次 press + 12 次 move_to + 1 次 release，
+        # 14 个调用 × 0.1 秒 = 1.4 秒的节奏被抹平之后，游戏把整段拖动当成点击，
+        # **列表一行都不动**。
+        #
+        # 生产日志的算术：出事那一轮检测段 2.95 秒/屏，而改动前的盲拖是 4.21 秒/屏，
+        # 差 1.26 秒——正是那 14 个调用的 PAUSE 被吃掉的量。症状是「翻了 30 屏、
+        # 名字列重合率 0.97」，也就是翻了个寂寞。
+        previous = pyautogui.PAUSE
+        try:
+            pyautogui.PAUSE = 0
+            pyautogui.scroll(-WHEEL_DELTA)
+        finally:
+            pyautogui.PAUSE = previous
 
 
 # -- 扫描循环 ------------------------------------------------------------------

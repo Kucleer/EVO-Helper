@@ -200,6 +200,10 @@ def _navigator(
         read_labels=read_labels or game.labels,
         read_rows=read_rows or game.rows,
         row_has_score=_has_score,
+        # 这一份用例全走「开榜 / 滚一屏 / 收尾」，碰不到 `spin_blind` 的闭环
+        # （那一段的用例在 `test_ranking_spin_blind.py`）。交 None 就是「读不出」，
+        # 也是最保守的取值：真被走到了，闭环会退回开环而不是拿一个假名次接着算。
+        read_position=lambda: None,
         say=lambda _message: None,
     )
     return navigator, driver
@@ -656,6 +660,9 @@ class TestComposingWithTheParsingLayer:
             # ⚠️ 实机注入的就是这一句（见 `tools.ranking_scan.scan`）。
             # 上面那些用例喂的是字符串，接不到这条真实的取分数路径。
             row_has_score=lambda row: row.score is not None,
+            # 实机注入的是 `tools.ranking_scan.position_from_image`（整列一次读），
+            # 而这条用例只走开榜那一段，碰不到闭环。
+            read_position=lambda: None,
             say=lambda _message: None,
         )
 

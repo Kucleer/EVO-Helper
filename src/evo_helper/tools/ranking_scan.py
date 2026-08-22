@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import re
+import statistics
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,6 +50,8 @@ from evo_helper.game.ranking_ui import (
     NAME_SAMPLE_EVERY_SCROLLS,
     NAME_SAMPLE_STUCK_OVERLAP,
     RANK_COLUMN,
+    RANK_STRIP_PAD_PX,
+    RANK_STRIP_TOP_PAD_PX,
     RANKING_LIST_MAX_Y,
     READ_ATTEMPTS,
     REREAD_WAIT_S,
@@ -56,9 +59,11 @@ from evo_helper.game.ranking_ui import (
     ROW_FIRST_Y,
     ROW_PITCH_PX,
     ROWS_PER_NOTCH,
+    ROWS_PER_SCREEN,
     ROWS_PER_SCROLL,
     SCORE_COLUMN,
     SCROLL_STALL_CONFIRMATIONS,
+    SPIN_MARK_MIN_ROWS,
 )
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -194,6 +199,66 @@ def name_column_text(image: Any, ocr: Any, columns: RankingColumns | None = None
     columns = columns or RankingColumns()
     box = (columns.name[0], ROW_FIRST_Y - 25, columns.name[1], RANKING_LIST_MAX_Y)
     return _read_cell(image.crop(box), ocr, single_line=False)
+
+
+def position_from_image(image: Any, ocr: Any, columns: RankingColumns | None = None) -> int | None:
+    """现在滚到第几名了：把**名次那一整列**一次读完，取读到的 `[N]` 的中位数。
+
+    这是 `game.ranking_nav.RankingNavigator.spin_blind` 闭环注入的 `read_position`。
+
+    ## ⚠️ 为什么不复用 `rows_from_image`
+
+    2026-08-22 实机：闭环拿 `read_rows()` 的行取名次中位数，请求 500 行时
+    **第一轮拨完就「读不出名次」，闭环当场失效**。根子是 `rows_from_image`
+    按行网格逐行裁剪（`ROW_FIRST_Y + k×ROW_PITCH_PX`），而**滚轮会把列表停在
+    非整行位置**（实测偏离网格约 12px）——每一格裁出来的都横跨两行，名次和名字
+    全糊。这条限制在设计里本来就写着（`game.ranking_ui` 的滚轮那一段：
+    「检测段不许换滚轮」就是这个理由），闭环踩的是同一颗雷。
+
+    整列一次读**与行对齐无关**：不按行切，列表停在哪儿都一样读得出来。
+    用户口径（2026-08-22）：「给盲滚单独做一个与行对齐无关的位置读数器」。
+
+    ## ⚠️ 为什么只读名次列
+
+    盲滚只需要回答「在第几名」，不需要名字和分数。名字那列的 OCR 错误率约 8%
+    （实机），读它只是徒增一份失败的机会——而这里读失败的代价是闭环退回开环，
+    也就是这次改动要治的病本身。
+
+    ## 判据
+
+    - 正则要 `[N]` **成对的方括号**，不是裸数字：整列一次读会把别的东西也吃进来
+      （背景文字、被放宽的边界扫到的一点分数列），而那些都不带方括号。
+      `\\d{1,4}` 是因为榜单最长是四位名次（`[4781]` 那种五位以上的读数是串出来的）。
+    - 取**中位数**不取最大/最小（同 `progress_mark` 的整段实测）：名次列会串出
+      高位噪声，当场读到过 `[4781]`，而那一屏真实名次只到 20 左右。
+      混进来的还有**自己那一行**（吸附的，名次和当前位置无关）。中位数对两侧
+      离群都免疫，前提是样本够多——所以少于 `SPIN_MARK_MIN_ROWS` 个就交 `None`。
+    - `median_low` 而不是 `median`：偶数个样本时后者给的是两数的平均，
+      也就是一个**榜上不存在的半个名次**。半行的精度在这里毫无意义
+      （容差是 `SPIN_TOLERANCE_ROWS` = 8 行），而 `int` 的返回类型是有意义的。
+
+    ⚠️ **读不出就是读不出，这里不重读**（不像 `_rows_confirming` 那样重试）：
+    读不出的正常含义是「这一屏本来就没几个 `[N]`」，重读同一帧也一样，
+    白等 `READ_ATTEMPTS × REREAD_WAIT_S` = 1.8 秒。真离页了也不该由这里发现——
+    盲滚段本来就不读内容，紧接着的检测段第一屏就会认出来。
+    """
+    columns = columns or RankingColumns()
+    strip = image.crop(
+        (
+            columns.rank[0] - RANK_STRIP_PAD_PX,
+            ROW_FIRST_Y - RANK_STRIP_TOP_PAD_PX,
+            columns.rank[1] + RANK_STRIP_PAD_PX,
+            round(ROW_FIRST_Y + ROWS_PER_SCREEN * ROW_PITCH_PX),
+        )
+    )
+    # 配方复用 `_read_cell(single_line=False)`：灰度、3× LANCZOS、`--psm 6`、`eng`
+    # ——和 `name_column_text` 读整条名字列的是同一套。另写一套迟早分家，
+    # 而分家那天两边都「读出了数」，只是其中一边读得更差。
+    raw = _read_cell(strip, ocr, single_line=False)
+    found = [int(number) for number in re.findall(r"\[(\d{1,4})\]", raw)]
+    if len(found) < SPIN_MARK_MIN_ROWS:
+        return None
+    return statistics.median_low(found)
 
 
 def is_self_row(name: str, player_name: str) -> bool:
@@ -375,63 +440,92 @@ class BlindSpinAccount:
     #: Windows 上 `time.sleep` 的粒度是 15.6ms，真被撑成 31ms/格的话动量就攒不
     #: 起来，而症状同样是「拨了但没走」。
     spin_seconds: float = 0.0
-    #: 拨完之后为等滑行停下来等了多久。
+    #: 拨完之后为等滑行停下来等了多久。**每轮一次**，所以是轮数 × `GLIDE_SETTLE_S`。
     glide_seconds: float = 0.0
-    #: 拨完之后实测走到了第几名；读不出就是 None。
+    #: 闭环**实测**这一趟走了多少行；开环退路（起点读不出来）时是 None。
+    #: ⚠️ None 的含义是「这一趟没测」，不是「没走」——日志上必须分得开。
     rows_measured: int | None = None
+    #: 拨了几轮。1 = 一轮就到位（或开环退路）；顶到 `MAX_SPIN_ROUNDS` 说明这一趟
+    #: 没收敛，而没收敛是**静默**的（只是少走一截），所以得记下来。
+    rounds: int = 0
+    #: 每轮观测到的行/格。留整串而不是只留平均：这一族数的**散布**才是要害
+    #: （2026-08-22 实测 0.49–1.25），压成一个平均数正好把它抹掉。
+    rates: tuple[float, ...] = ()
 
     @property
     def rows_per_notch_observed(self) -> float | None:
-        """这一趟实测每格走了多少行；测不出就是 None。
+        """这一趟实测每格走了多少行（**总行数 ÷ 总格数**）；测不出就是 None。
 
-        ⚠️ **这是整条盲滚日志的要害。** `ROWS_PER_NOTCH`(1.08) 只有 2 个样本、
-        1 台机器、1 次会话。它一漂，「盲滚 700 行」实际走的就不是 700 行，而这个
-        偏差是**静默的**：不报错、不少一条日志，只是采回来的数少一截。每一趟都把
-        实测值记进库，事后才答得出「这个标定还成不成立」——而不是等某天发现
-        bot 少采了一截再回头查。
+        ⚠️ **这是整条盲滚日志的要害。** `ROWS_PER_NOTCH`(1.08) 2026-08-22 被实机
+        证伪了：10 个样本落在 0.49–1.25，中位 0.96。闭环之后它不再决定这一趟走多远
+        （走多远是量出来的），但「这个数还值不值得当第一轮的猜测」仍旧只有靠每趟
+        记实测才答得出。
+
+        ⚠️ **分子是闭环量出来的行数，不是「拨完停在第几名」。** 改闭环之前这里填的
+        是绝对名次（`progress_mark`），只因为盲滚总是从榜首起步才碰巧接近行数；
+        补拨之后起点不再是 0，那种巧合不成立了。
         """
         if not self.notches_sent or self.rows_measured is None:
             return None
         return round(self.rows_measured / self.notches_sent, 3)
 
 
+@dataclass(frozen=True, slots=True)
+class BlindWalk:
+    """盲滚那一段走完之后的账：走了多少行，**以及这个数是量出来的还是算出来的**。
+
+    ⚠️ **两者必须分得开，这就是这个类存在的全部理由。** 原先这一段返回一个裸的
+    `int`，而日志照着它打「盲滚 700 行（实走约 700 行）」——那个「实走约」是拿
+    格数乘标定算出来的，读起来却像证据。2026-08-22 实机量到真实速率在 0.49–1.25
+    之间抽，也就是说那句「实走约 700 行」可能对应 320 行，也可能对应 810 行。
+    """
+
+    #: 记账用的行数：闭环时是实测值，开环退路时是按标定折合出来的。
+    rows: int
+    #: 上面那个数是**量出来的**吗。
+    measured: bool
+
+
 def spin_blind_rows(
     rows: int,
     *,
     spin: Callable[[int], SpinResult],
-    measure_rows: Callable[[], int | None] = lambda: None,
     account: BlindSpinAccount | None = None,
-) -> int:
-    """连拨滚轮走过 `rows` 行，记账，返回**折合走过的行数**。
+) -> BlindWalk:
+    """连拨滚轮走过 `rows` 行（闭环），记账，返回**走过的行数 + 它是不是量出来的**。
 
     这就是喂给 `scroll_through_humans` 的那个 `spin`。单拎出来是为了让「记了哪些
     账」测得到：真的那条路要驱动鼠标，单元测试进不去，而这条日志正是这次改动
     唯一能事后自证的东西。
 
-    返回的是 `实发格数 × ROWS_PER_NOTCH`，**不是**传进来的 `rows`：行 → 格那一步
-    要取整，取整之后就已经不是原来那个行数了。把请求值当成走过的距离记账，误差会
-    一路带到「实测多少行到达 bot 区」上，而那正是自标定的输入。
+    ⚠️ **量出来的那个数优先，绝不拿格数换算去冒充它。** `game.ranking_nav.spin_blind`
+    每一轮都要读一次名次才知道要不要补拨，所以「走了多少行」在那一层就是测量值；
+    这里照抄，不再自己另测一遍——那是另一帧画面，两帧之间列表可能已经动过。
+    只有**开环退路**（起点名次读不出来）那一支没有测量值，那时才退回
+    `实发格数 × ROWS_PER_NOTCH`，并把 `measured=False` 一路带出去让日志说实话。
 
-    ⚠️ `measure_rows` 是**尽力而为**的，读不出就返回 None，不许据此把这一趟判成
-    失败：滚轮会把列表停在非整行位置，而 `rows_from_image` 是逐行裁剪的——偏了
-    就横跨两行（实测过一次：画面清晰，一屏只读出 2 个名次）。它只服务于日志，
-    不参与任何判据。
+    ⚠️ 换算值也**不是**传进来的 `rows`：行 → 格那一步要取整，取整之后就已经不是
+    原来那个行数了。把请求值当成走过的距离记账，误差会一路带到「实测多少行到达
+    bot 区」上，而那正是自标定的输入。
     """
     result = spin(rows)
-    measured = measure_rows() if result.notches else None
     if account is not None:
         account.rows_requested = result.rows_requested
         account.notches_sent = result.notches
         account.spin_seconds = round(result.spin_seconds, 3)
-        # `spin_blind` 拨完之后统一等一次 `GLIDE_SETTLE_S`；一格都没拨就一次都不等。
-        account.glide_seconds = GLIDE_SETTLE_S if result.notches else 0.0
-        account.rows_measured = measured
-    return round(result.notches * ROWS_PER_NOTCH)
+        # `spin_blind` **每一轮**拨完等一次 `GLIDE_SETTLE_S`；一格都没拨就一次都不等。
+        account.glide_seconds = round(GLIDE_SETTLE_S * result.rounds, 3) if result.notches else 0.0
+        account.rows_measured = result.rows_measured
+        account.rounds = result.rounds
+        account.rates = tuple(round(rate, 3) for rate in result.rates)
+    if result.rows_measured is not None:
+        return BlindWalk(rows=result.rows_measured, measured=True)
+    return BlindWalk(rows=round(result.notches * ROWS_PER_NOTCH), measured=False)
 
 
 def drag_blind_rows(
     rows: int, *, scroll_blind: Callable[[], None], say_line: Callable[[str], None] = say
-) -> int:
+) -> BlindWalk:
     """用**慢拖**走过 `rows` 行——盲滚改滚轮之前那条老路，留着当一键回滚。
 
     ⚠️ **它存在的唯一理由是回滚**，而回滚的开关在**命令行**上：只给
@@ -445,12 +539,16 @@ def drag_blind_rows(
 
     行 → 屏按 `ROWS_PER_SCROLL` 换算。返回的同样是**折合走过的行数**而不是请求值，
     理由同 `spin_blind_rows`：换算取整之后就不是原来那个行数了。
+
+    ⚠️ `measured=False`：这条路一屏都不读，走了多少行全是乘出来的
+    （`ROWS_PER_SCROLL` 8.3 自己也是个标定值，生产日志反推是 7.2–7.8）。
+    闭环那套「拨完读一次」只在滚轮那条路上；老路就是老路，别让日志把它说成实测。
     """
     screens = round(rows / ROWS_PER_SCROLL)
     say_line(f"盲滚走的是慢拖那条老路：{rows} 行折合 {screens} 屏（滚轮盲滚已关掉）")
     for _screen in range(screens):
         scroll_blind()
-    return round(screens * ROWS_PER_SCROLL)
+    return BlindWalk(rows=round(screens * ROWS_PER_SCROLL), measured=False)
 
 
 def blind_spin_payload(
@@ -464,6 +562,12 @@ def blind_spin_payload(
 
     `rows_per_notch_calibrated` 把**当时代码里的标定值**一起存下来：日后有人把
     1.08 改了，库里这一批老记录才说得清它们是按哪个数算的。
+
+    `rounds` / `rows_per_notch_by_round` 是闭环带来的两把尺子：前者答「这一趟补拨
+    了几轮、有没有顶到 `MAX_SPIN_ROUNDS` 上限」（顶到了就是没收敛，而没收敛是静默
+    的），后者答「同一趟里速率抖得有多厉害」——那正是 2026-08-22 推翻开环的那份
+    证据（0.49–1.25）该继续被盯住的地方。`rounds == 1` 且 `rows_measured is None`
+    的那种记录就是**开环退路**：起点名次读不出来，这一趟没有闭环保护。
     """
     return {
         "rows_requested": account.rows_requested,
@@ -473,6 +577,8 @@ def blind_spin_payload(
         "rows_measured": account.rows_measured,
         "rows_per_notch_observed": account.rows_per_notch_observed,
         "rows_per_notch_calibrated": ROWS_PER_NOTCH,
+        "rounds": account.rounds,
+        "rows_per_notch_by_round": list(account.rates),
         "rows_to_bot_area": rows_to_bot_area,
         "source": source,
     }
@@ -495,13 +601,19 @@ def report_blind_spin(
     而那一处的措辞代价写在 `domain.ranking.bot_area_reached_rows_message` 上）。
     """
     observed = account.rows_per_notch_observed
+    walked = (
+        f"实测走了 {account.rows_measured} 行"
+        if account.rows_measured is not None
+        else "实走多少行没测出来（起点名次读不出，这一趟是开环、没有闭环保护）"
+    )
     tail = (
-        f"，每格实测 {observed} 行（标定 {ROWS_PER_NOTCH}）"
+        f"，每格实测 {observed} 行（第一轮的猜测是 {ROWS_PER_NOTCH}）"
         if observed is not None
-        else "；这一趟没测出每格走了多少行"
+        else ""
     )
     record(
-        f"盲滚 {account.rows_requested} 行：发了 {account.notches_sent} 格、"
+        f"盲滚请求 {account.rows_requested} 行：{walked}；"
+        f"补拨 {account.rounds} 轮共发了 {account.notches_sent} 格、"
         f"拨完用 {account.spin_seconds:.1f} 秒{tail}",
         blind_spin_payload(account, rows_to_bot_area=rows_to_bot_area, source=source),
     )
@@ -632,7 +744,7 @@ class HumanStretch:
 def scroll_through_humans(
     *,
     scroll: Callable[[], None],
-    spin: Callable[[int], int],
+    spin: Callable[[int], BlindWalk],
     read_names: Callable[[], str],
     wait: Callable[[float], None],
     blind_rows: int,
@@ -654,9 +766,10 @@ def scroll_through_humans(
       逐行裁剪的——偏了就横跨两行，名字全糊。实测过一次：画面清晰，
       `rows_from_image` 只读出 2 个名次。
 
-    `spin` 吃行数、返回**实际折合走过的行数**（行 → 格要取整，取整之后就不是原来
-    那个行数了）。怎么走由调用方决定：`spin_blind_rows` 是滚轮那条路，
-    `drag_blind_rows` 是留作回滚的慢拖那条路——这一层两条都不认识。
+    `spin` 吃行数、返回一个 `BlindWalk`：走过多少行，**以及那个数是量出来的还是
+    算出来的**。怎么走由调用方决定：`spin_blind_rows` 是滚轮那条路（闭环，常态下
+    量得出），`drag_blind_rows` 是留作回滚的慢拖那条路（一屏都不读，只能乘出来）
+    ——这一层两条都不认识，它只负责**不把算出来的数说成量出来的**。
 
     `detection_budget` 是**检测段自己的屏数预算**，与盲滚走多远无关。整段道理写在
     `game.ranking_ui.BOT_DETECTION_BUDGET_SCROLLS` 上：原先那个耦合是隐式且反向的
@@ -670,11 +783,21 @@ def scroll_through_humans(
     progress.blind_rows = blind_rows
     # 0 行是最保守的合法取值（「一格都别拨」）：那时连 `spin` 都不调，
     # 整个真人段退化成纯检测——也就是最保守的那一头。
-    rows_spun = spin(blind_rows) if blind_rows else 0
+    walk = spin(blind_rows) if blind_rows else BlindWalk(rows=0, measured=False)
+    rows_spun = walk.rows
     progress.human_rows = rows_spun
     progress.stage = ScanStage.DETECTING
     if blind_rows:
-        say_line(f"盲滚 {blind_rows} 行（实走约 {rows_spun} 行，那一段必定还是真人），开始检测 bot")
+        # ⚠️ **「请求多少行」和「实走多少行」必须是两个数，而且要说清后者是不是量的。**
+        # 原先这里写的是「盲滚 700 行（实走约 700 行…）」，那个「实走约」是拿格数
+        # 乘标定算出来的，读起来却像证据——而 2026-08-22 实机量到真实速率在
+        # 0.49–1.25 之间抽，同一句话可能对应 320 行，也可能对应 810 行。
+        walked = (
+            f"实测走了 {rows_spun} 行"
+            if walk.measured
+            else f"实走多少行没测出来，按 {rows_spun} 行记账"
+        )
+        say_line(f"盲滚请求 {blind_rows} 行：{walked}（那一段必定还是真人），开始检测 bot")
 
     scrolled = 0
     samples: list[NameSample] = []
@@ -904,6 +1027,14 @@ def scan(
         # 「这一行的分数解析出来了没有」——`ranking_nav` 拿它判**面板铺开了没有**
         # （不是判页签，那个判据不存在）。行的形状只有这一层认识，所以由这里注入。
         row_has_score=lambda row: row.score is not None,
+        # 「我现在滚到第几名了」——`spin_blind` 的闭环拿它答这一个问题，
+        # 拨完读一次、不够就补拨。
+        #
+        # ⚠️ **刻意不是 `read_rows` 那条路。** `rows_from_image` 逐行裁剪，而滚轮
+        # 把列表停在非整行位置，裁出来横跨两行、名次全糊（2026-08-22 实机：请求
+        # 500 行，第一轮拨完读不出名次，闭环当场失效）。`position_from_image`
+        # 整列一次读完，与行对齐无关——整段账写在它自己的文档串上。
+        read_position=lambda: position_from_image(driver.capture(), ocr, columns),
         # 把导航条那 8 条输出也接到同一个出口上；不注入的话它们只走 `print`，
         # 既没有时刻也进不了 `system_log`。
         say=say,
@@ -941,32 +1072,25 @@ def scan(
     def record_log(message: str, payload: dict[str, Any]) -> None:
         record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
 
-    def measure_rows() -> int | None:
-        """盲滚拨完之后实测走到了第几名（读得出就带进日志）。
-
-        ⚠️ **尽力而为，读不出就 None。** 滚轮把列表停在非整行位置，逐行裁剪读出来
-        的名次会横跨两行——实测过一屏只读出 2 个名次。`progress_mark` 取中位数，
-        对两侧离群免疫，两三个读数就够用；而它只喂日志，不参与任何判据，所以
-        「读不准」的代价只是这一趟答不出「每格走了几行」。
-        """
-        return progress_mark(read_rows()) or None
-
     account = BlindSpinAccount()
     if blind_rows is None:
         # -- 回滚路径：盲滚段退回慢拖 ---------------------------------------
         # 行 ↔ 屏各换算一次，来回是恒等的（40 屏 × 8.3 = 332 行 → 40 屏）。
         blind_phase_rows = round(blind_scrolls * ROWS_PER_SCROLL)
 
-        def spin(rows: int) -> int:
+        def spin(rows: int) -> BlindWalk:
             return drag_blind_rows(rows, scroll_blind=nav.scroll_blind, say_line=say)
     else:
         blind_phase_rows = blind_rows
 
-        def spin(rows: int) -> int:
+        def spin(rows: int) -> BlindWalk:
+            # ⚠️ **「走了多少行」不在这一层测。** `spin_blind` 每一轮都要读一次名次
+            # 才知道要不要补拨，所以那一层手里就有测量值；这里再测一次是另一帧画面，
+            # 而两帧之间列表可能已经动过（原先这里挂着一个 `measure_rows`，
+            # 记进日志的其实是「拨完停在第几名」，不是「走了多少行」）。
             return spin_blind_rows(
                 rows,
                 spin=lambda requested: nav.spin_blind(rows=requested),
-                measure_rows=measure_rows,
                 account=account,
             )
 
@@ -1254,6 +1378,7 @@ def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
 
 __all__ = [
     "BlindSpinAccount",
+    "BlindWalk",
     "HumanStretch",
     "NameSample",
     "RankingColumns",
@@ -1273,6 +1398,7 @@ __all__ = [
     "release_stuck_mouse",
     "main",
     "parse_score",
+    "position_from_image",
     "report_blind_spin",
     "report_bot_area_reached",
     "rows_from_image",
