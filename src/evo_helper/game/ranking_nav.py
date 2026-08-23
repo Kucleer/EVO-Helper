@@ -81,6 +81,7 @@ from evo_helper.game.ranking_ui import (
     ROWS_PER_NOTCH_MAX,
     ROWS_PER_SCREEN,
     SCROLL_FROM_Y,
+    SCROLL_SETTLE_MIN_ROWS,
     SCROLL_SETTLE_WAIT_S,
     SCROLL_TO_Y,
     SCROLL_X,
@@ -396,7 +397,9 @@ class RankingNavigator[RowT]:
             return ScrollStep(ScrollOutcome.OFF_PAGE, ())
         self._slow_drag(SCROLL_X, SCROLL_FROM_Y, SCROLL_X, SCROLL_TO_Y, label="榜单下滚")
         self.driver.wait(SCROLL_SETTLE_WAIT_S)
-        after = self._rows_confirming()
+        # ⚠️ 拖**后**那次要求读满，拖前那次不要求——拖前只回答「还在榜单页上吗」，
+        # 对它设行数下限会让「最后一屏不满」变成「不许拖」。
+        after = self._rows_confirming(min_rows=SCROLL_SETTLE_MIN_ROWS)
         if not after:
             # ⚠️ **不能判成「到底了」。** 拖之前明明读得出，拖之后读不出，
             # 那不是榜单读完了，是画面变了（实机一小时断了三次，其中一次正好
@@ -695,19 +698,32 @@ class RankingNavigator[RowT]:
 
     # -- 读一屏（空结果重读） -----------------------------------------------
 
-    def _rows_confirming(self) -> tuple[RowT, ...]:
-        """读这一屏的榜单行，**空结果要重读几次再认**。
+    def _rows_confirming(self, *, min_rows: int = 1) -> tuple[RowT, ...]:
+        """读这一屏的榜单行，**读到的行太少就重读几次再认**。
 
         拖动中有加载动画（用户实机口径），那一帧读到的是半屏或全空。
         单帧的空结果是抛硬币，不是证据——同
         `preset_picker.read_names_confirming` / `vision.scan_reading.read_panel_confirming`。
+
+        ⚠️ **`min_rows` 让「太少」也算重读的理由，不只是「空」。**
+        2026-08-23 实机延迟曲线：十屏里有一屏，拖完 0.5 秒时只读出 **1 行**
+        （不是 0 行！），要到 1 秒左右才读满。原先只在**空**结果上重试，
+        那一屏就会带着 1 行走下去——`SCROLL_SETTLE_WAIT_S` 从 2.0 砍到 0.35
+        全靠这道补读兜着，见那两个常量上的账。
+
+        ⚠️ **重试用尽之后交回「读到最多的那一次」，不是空。**
+        榜单最后一屏本来就可能不满 `min_rows`；交空会被 `scroll_once` 判成
+        `OFF_PAGE`，那一屏就整个作废——而它明明读出来了。
         """
+        best: tuple[RowT, ...] = ()
         for _attempt in range(READ_ATTEMPTS):
             rows = tuple(self.read_rows())
-            if rows:
-                return rows
+            if len(rows) > len(best):
+                best = rows
+            if len(best) >= min_rows:
+                return best
             self.driver.wait(REREAD_WAIT_S)
-        return ()
+        return best
 
     def _labels_confirming(self) -> tuple[tuple[int, str], ...]:
         """读底部导航的标签，**空结果要重读几次再认**。

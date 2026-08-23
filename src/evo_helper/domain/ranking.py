@@ -222,6 +222,37 @@ def repair_ranks(ranks: Sequence[int | None]) -> list[int | None]:
     return [offset + index for index in range(len(known))]
 
 
+def rows_skipped(previous_last_rank: int | None, current_first_rank: int | None) -> int | None:
+    """上一屏末行名次 vs 本屏首行名次：中间**漏掉了几名**。读不出名次返回 `None`。
+
+    采集段一直没有这道判据——它靠的是「一次拖动推进得比一屏少」这个**隐含前提**，
+    而那个前提从来没被校验过。2026-08-23 实机两趟各十屏实测：
+
+        推进 7–10 行，可见 11–14 行，余量 3–6 行；两趟合计漏掉 **0** 名。
+
+    ⚠️ **别拿「推进多少」当方差依据。** 那个数来自 `progress_mark`（名次中位数），
+    它自己带噪声：第一趟里出现过 `+4` 紧跟 `+12`，而两者之和正好是 2×8——
+    是中间那一屏的名次被读串了，不是列表真的先慢后快。
+
+    ⚠️ **漏掉的名次不会在任何别的地方露头。** 采集段只按坐标去重，跳过去的那几名
+    压根没被读过，所以「采到的 bot 数」看起来完全正常——和刚修掉的那个整屏漏采
+    是同一类静默失败。所以这个数必须**记进日志**（`is_bot_entry` 那种事后判据
+    救不了没读过的行）。
+
+    ⚠️ **`None` 不是 0。** 名次读不出（榜首三名是奖章图标、或者 OCR 没认出来）
+    时答案是「不知道」，不是「没漏」。判据要能区分这两件事，否则读不出名次的那几屏
+    会伪装成「重叠完好」。
+
+    ⚠️ 名次**只是校验和**（`repair_ranks` 能从邻居补），所以这个数是**观测**，
+    不是闸门：单次 OCR 认错一个数字就中断整趟采集，代价比漏几名大得多。
+    要不要据此停下来，等推进量真的提上去（`docs/军力榜采集提速-方案.md` 步 2）
+    再定——那时候重叠余量只剩 2 行，判据才该从「记下来」变成「当场停」。
+    """
+    if previous_last_rank is None or current_first_rank is None:
+        return None
+    return max(0, current_first_rank - previous_last_rank - 1)
+
+
 def descending_breaks(scores: Sequence[float | None]) -> list[int]:
     """军力值里破坏降序的那几行的下标。**只报，不改。**
 
@@ -477,6 +508,7 @@ __all__ = [
     "calibrated_blind_scrolls",
     "coordinate_of",
     "descending_breaks",
+    "rows_skipped",
     "interpolate_scores",
     "is_bot_coordinate",
     "is_bot_entry",

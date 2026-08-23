@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import pathlib
 import re
 import statistics
+import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +32,7 @@ from evo_helper.domain.ranking import (
     is_bot_entry,
     mentions_bot,
     repair_ranks,
+    rows_skipped,
 )
 from evo_helper.domain.records import RankingTarget
 from evo_helper.domain.scheduler import EXIT_RANKING_INCOMPLETE
@@ -57,7 +61,9 @@ from evo_helper.game.ranking_ui import (
     REREAD_WAIT_S,
     ROW_CROP_HALF_HEIGHT,
     ROW_FIRST_Y,
+    ROW_GRID_TOLERANCE_PX,
     ROW_PITCH_PX,
+    ROW_WORD_SPREAD_PX,
     ROWS_PER_NOTCH,
     ROWS_PER_SCREEN,
     ROWS_PER_SCROLL,
@@ -124,6 +130,39 @@ def parse_score(text: str) -> float | None:
     """
     quantity = parse_quantity(text)
     return None if quantity is None else float(quantity.value)
+
+
+def renderable_score(score: float | None) -> bool:
+    """这个军力值，游戏**渲染得出来**吗？渲染不出来的一律是 OCR 多插了一位。
+
+    军事榜把军力显示成 `10.29K` / `9.86K` / `1.15M`——**两位小数**。
+    所以 1000 以上的值最小刻度是 `0.01K = 10`，**必然是 10 的整数倍**。
+    而 `parse_quantity` 也认裸数（那是给别处用的，见它的模块头），于是
+    `10.259K` 这种读数被当成合法的 10259 一路放进库里。
+
+    2026-08-23 语料实测，落库的军力值有 8.3% 长这样：
+
+        图上 10.29K → 读成 10.259K → 10259      图上 9.93K → 读成 9.935K → 9935
+        图上  9.83K → 读成  3.835K →  3835      图上 9.94K → 读成 5.954K → 5954
+
+    ⚠️ **这一道和 `descending_breaks` 是互补的，不是重复的。** 降序判据认得出
+    「比上一行大」；上面这四个**全都比上一行小**，它一个都抓不到。反过来
+    「丢小数点」那类（`17.73K` 读成 `1773K`）值飞高，降序判据抓得住而这一道抓不住
+    （177300 也是 10 的整数倍）。两道网挡的是两个方向。
+
+    ⚠️ **1000 以下不查。** 那一档游戏直接显示整数（`850` 就是 850），没有小数位，
+    任何整数都渲染得出来。榜尾的 bot 就在这一档，拿「10 的整数倍」去查会把
+    合法值误丢成估算值。
+
+    ⚠️ **`None` 是合法的**（读不出）——判据是「读出来的数不可能」，
+    不是「必须读出来」。军力值本来就允许读不出（用户口径 2026-08-14）。
+
+    ⚠️ **插值出来的 `.5` 不走这里。** `targets_from_rows` 是在插值**之前**查的，
+    那时候还没有 `.5`。别把这道判据挪到插值后面去。
+    """
+    if score is None or abs(score) < 1000:
+        return True
+    return abs(score) % 10 < 1e-6
 
 
 def release_stuck_mouse(driver: LiveDriver) -> None:
@@ -277,7 +316,7 @@ def is_self_row(name: str, player_name: str) -> bool:
 def rows_from_image(
     image: Any, ocr: Any, columns: RankingColumns | None = None, *, player_name: str = ""
 ) -> list[RankingRow]:
-    """按实机标定的列边界逐格 OCR；**名字读不出来**的一行才丢掉。
+    """先**量出**每一行在哪，再逐格 OCR；**名字读不出来**的一行才丢掉。
 
     ⚠️ **判据是名字，不是名次。** 原先这里是「名次或名字缺一就丢」，
     而 2026-08-14 实机第一屏就打脸：**榜首前三名没有名次数字，是奖章图标**，
@@ -287,32 +326,235 @@ def rows_from_image(
     ⚠️ **自己那一行要按名字剔掉**（见 `is_self_row`）——它是吸附的，
     `RANKING_LIST_MAX_Y` 只挡得住它贴底那一档。
 
+    ## ⚠️⚠️ 行位置是**量出来的**，不是按网格算的（2026-08-23 改）
+
+    原先这里按 `ROW_FIRST_Y + k × ROW_PITCH_PX` 算第 k 行的中心。
+    15 屏实机语料证明**网格原点自己在漂**（见 `_row_bands`）：每屏 -7.5px、
+    以行距 44.8px 为模回绕、周期 6 屏。偏移一旦超过约 13px，±`ROW_CROP_HALF_HEIGHT`
+    的裁剪窗口就把字切掉一截，`--psm 7` **整屏读不出**——那一屏的 bot 全部
+    静默丢弃。实测：**每 6 屏里约 3 屏被整屏丢掉**，语料 15 屏里 7 屏归零。
+
+    改法是先读一次**整条名字列**拿到每个词的坐标，聚类出行位置（`locate_rows`），
+    再拿**实测中心**去裁剪。取值仍旧是三列逐格 `--psm 7`——整列读只当尺子，
+    一个字都不采信（理由写在 `locate_rows` 上，那条界守着「舰队飞去哪」）。
+
+    代价是每屏多一次 OCR（40 次 vs 39 次），换回来两件事：
+
+    1. **不再整屏漏采**——语料 15/15 屏都读满，落库 bot 行 71 → 157（**2.21×**）；
+    2. **逐格读本身更准**——偏移 8.5px 那一屏原先把邻行的数字碎片裁进来，
+       读出 `10.259K` / `5.954K` / `93.87K` / `3.835K` 这种多一位的值。
+
+    ⚠️ **每屏的绝对耗时基本没变**，快的是「每个 bot 多少秒」：同样约 4 秒一屏，
+    原先平均采到 4.7 个 bot，现在 10–12 个。屏数要再降得靠滚轮推进那一步
+    （`docs/军力榜采集提速-方案.md` 步 2），跟这里无关。
+
     ⚠️ **裁剪半高比行距的一半窄。** 星球地表的 `TOTAL CREWS` / `COMMAND OFFICERS`
     透过半透明面板落在 x 769–949（正压在名字列上），y 恰好在两行之间：
     真实行 525，背景在 500 和 548。按 `ROW_PITCH_PX / 2` = 22.4 裁会把上下背景
     各吃进去一点，所以用 `ROW_CROP_HALF_HEIGHT`。
     """
     columns = columns or RankingColumns()
+    boxes = [
+        (round(center - ROW_CROP_HALF_HEIGHT), round(center + ROW_CROP_HALF_HEIGHT))
+        for center in locate_rows(image, ocr, columns)
+    ]
+
+    def column_cells(column: tuple[int, int], chosen: list[int]) -> list[Any]:
+        return [image.crop((column[0], boxes[i][0], column[1], boxes[i][1])) for i in chosen]
+
+    everything = list(range(len(boxes)))
+    names = _read_cells(column_cells(columns.name, everything), ocr)
+    # ⚠️ **名次和军力只读「名字读得出」的那些行**，和原先逐格那版一个口径：
+    # 名字读不出的一行整行都要丢，那两格读了也是白读。
+    kept = [i for i, name in enumerate(names) if name and not is_self_row(name, player_name)]
+    ranks = _read_cells(column_cells(columns.rank, kept), ocr)
+    scores = _read_cells(column_cells(columns.score, kept), ocr)
+
     rows: list[RankingRow] = []
-    index = 0
-    while True:
-        center = ROW_FIRST_Y + index * ROW_PITCH_PX
-        if center > RANKING_LIST_MAX_Y:
-            break
-        top = round(center - ROW_CROP_HALF_HEIGHT)
-        bottom = round(center + ROW_CROP_HALF_HEIGHT)
-        name = _read_cell(image.crop((columns.name[0], top, columns.name[1], bottom)), ocr)
-        if not name or is_self_row(name, player_name):
-            index += 1
-            continue
-        rank_box = (columns.rank[0], top, columns.rank[1], bottom)
-        rank = _rank_of(_read_cell(image.crop(rank_box), ocr))
-        score = parse_score(
-            _read_cell(image.crop((columns.score[0], top, columns.score[1], bottom)), ocr)
+    for slot, index in enumerate(kept):
+        name = names[index]
+        rows.append(
+            RankingRow(
+                rank=_rank_of(ranks[slot]),
+                name=name,
+                score=parse_score(scores[slot]),
+                coordinate=coordinate_of(name),
+            )
         )
-        rows.append(RankingRow(rank=rank, name=name, score=score, coordinate=coordinate_of(name)))
-        index += 1
     return rows
+
+
+def locate_rows(image: Any, ocr: Any, columns: RankingColumns | None = None) -> list[float]:
+    """读一次整条名字列，返回**实测的行中心**（升序）。
+
+    ## ⚠️⚠️ 整列读在这里是**尺子**，不是读数的
+
+    它只回答「行在哪」——那是个**几何**问题，一个词里的字认错了不影响它的 y。
+    三列的取值一律照旧逐格 `--psm 7` 读，裁在这里量出来的中心上。
+
+    这条界必须守死。2026-08-23 语料实测，整列 `--psm 6` 在**名字**列上会认错数字：
+
+        图上 bot_2_55_9    整列读成 bot_2_55_93    ← 位置 93 越界，被坐标校验挡下（丢行）
+        图上 bot_7_306_9   整列读成 bot_7_306_3    ← ⚠️ 3 是合法位置，校验挡不住
+
+    第二条是最坏的一种：`7:306:3` 反解得出、区间校验放过，于是**舰队飞到一个
+    错的星球**。名字这一列没有任何事后校验兜得住它——军力列有 `descending_breaks`、
+    名次列有 `repair_ranks`，名字列什么都没有，它就是这一层的产物本身。
+
+    反过来逐格读也会错（同屏 `bot_2_9_5` 被逐格读成 `bot_2_39_5`），所以这不是
+    「哪个读法更好」，而是**错的代价不对称**：逐格读错一格只坏那一行的值，
+    整列读错一个字会坏那一行的**归属**，而当它错的是数字时，错出来的还是个
+    合法坐标——没有任何下游判据看得出来。
+
+    ⚠️ **行位置由名字列定**，不由名次列或军力列定：名次列榜首三名是奖章图标、
+    军力列可能整格读不出，拿它们定行会少几条带。
+
+    搜索窗口比列表区上下各放宽一个行距：行会漂到网格上方约 22px（见 `_row_bands`），
+    按列表区硬裁会把漂上去的第一行切掉。放宽之后会捞进标题那一行，由 `_row_bands`
+    剔掉（相位不巧时它会漏一条进来，代价是白裁一格——那一格的名字反解不出坐标，
+    在 `is_bot_entry` 那道判据上落地，不会变成目标）。
+    """
+    columns = columns or RankingColumns()
+    top = round(ROW_FIRST_Y - ROW_PITCH_PX)
+    bottom = round(RANKING_LIST_MAX_Y + ROW_PITCH_PX)
+    return _row_bands(
+        _words_with_boxes(
+            image.crop((columns.name[0], top, columns.name[1], bottom)), ocr, top_offset=top
+        )
+    )
+
+
+#: 整列读时，`image_to_data` 里 `conf` 低于这个数的词直接丢。
+#:
+#: tesseract 对非文字区域会吐出 `conf = -1` 的行；而半透明面板透上来的背景字
+#: （`TOTAL CREWS` 之类）置信度也偏低。取 30 是个宽松的下界——**主要的过滤靠
+#: 几何**（见 `_row_bands`），这一道只负责把明显的垃圾扫掉。
+COLUMN_WORD_MIN_CONF = 30
+
+
+def _words_with_boxes(
+    strip: Any, ocr: Any, *, top_offset: int, upscale: int = 3
+) -> list[tuple[float, int, str]]:
+    """整条列读一次，返回 `(原图 y 中心, 原图 x 左沿, 文本)`。
+
+    ⚠️ **要坐标而不只要文本**，这是整列读能成立的全部原因：逐格裁剪同时干了
+    「切出这一行」和「把行间透字挡在外面」两件事，而整列读一次会把透字一起读进来。
+    拿到每个词的坐标之后，那两件事都能在 OCR **之后**用几何补回来，判据与裁剪等价。
+    实测 `image_to_data` 和 `image_to_string` **一样快**（真实截图 0.52 秒 / 3 列），
+    所以坐标是白拿的。
+
+    走 TSV 而不是 `Output.DICT`：TSV 是纯文本，假的 `ocr` 在测试里只要返回一段
+    字符串就能驱动整条路径，不必装 pandas、也不必模仿 pytesseract 的对象。
+    """
+    from PIL import Image
+
+    grey = strip.convert("L").resize(
+        (strip.width * upscale, strip.height * upscale), Image.Resampling.LANCZOS
+    )
+    tsv = str(ocr.image_to_data(grey, lang="eng", config="--psm 6"))
+    words: list[tuple[float, int, str]] = []
+    for line in tsv.splitlines()[1:]:  # 第一行是表头
+        parts = line.split("	")
+        if len(parts) < 12:
+            continue
+        try:
+            left, top, _width, height = (int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9]))
+            conf = float(parts[10])
+        except ValueError:
+            continue
+        text = parts[11].strip()
+        if not text or conf < COLUMN_WORD_MIN_CONF:
+            continue
+        # 放大过的坐标要缩回去，再加上裁剪时的偏移，才是原图坐标。
+        words.append(((top + height / 2) / upscale + top_offset, round(left / upscale), text))
+    return words
+
+
+def _row_bands(words: list[tuple[float, int, str]]) -> list[float]:
+    """把词的 y 中心**聚类**成一行一行，返回每行的实测中心（升序）。
+
+    ⚠️⚠️ **这是整件事的要害：行不落在固定网格上。**
+
+    原先 `rows_from_image` 假设第 k 行的中心是 `ROW_FIRST_Y + k × ROW_PITCH_PX`。
+    2026-08-23 的 15 屏实机语料证明**网格原点自己在漂**——每屏 bot 名字相对
+    网格的中位偏移：
+
+        -6.1 → -13.7 → -21.1 → +16.1 → +8.6 → +1.1 → -6.4 → -13.8 → -21.4 → ...
+        每屏 -7.5px，以行距 44.8px 为模回绕，周期 6 屏
+
+    成因：一次慢拖推进的不是整数行（实测约 8.17 行），那 0.17 行 ≈ 7.5px 的零头
+    逐屏累积。偏移一旦超过约 13px，±`ROW_CROP_HALF_HEIGHT`(15) 的裁剪窗口就把字
+    切掉一截，`--psm 7` **整屏读不出**——那一屏的 bot 全部静默丢弃。
+
+    实测后果：**每 6 屏里约 3 屏被整屏丢掉**，语料 15 屏里 7 屏归零。生产日志里
+    「12, 8, 6 → 0, 0, 0」那个周期 6 的形状就是它，**不是**「榜单真人与 bot 交错」
+    ——那个结论是拿同一个坏读法得出来的，等于用 bug 证明 bug。
+
+    两步：先按行距的一半聚类，再用**网格一致性**剔掉不属于列表的带。
+    第二步是必要的：搜索窗口为了容纳漂上去的行而放宽了一个行距，会捞进标题
+    那一行（实测 y≈236，与列表行差 1.5 个行距而不是整数个）。
+    """
+    if not words:
+        return []
+    ys = sorted(y for y, _x, _t in words)
+    clusters: list[list[float]] = [[ys[0]]]
+    for y in ys[1:]:
+        # ⚠️ **判据是「这一组的跨度」，不是「和上一个词的间距」。**
+        #
+        # 单链聚类（只看相邻间距）在这里会串联：标题那一行是**固定的 UI 元素**
+        # （实测 y≈235.7），而列表行的相位在漂，两者的距离恒等于相位差的回绕值
+        # ——按定义不超过半个行距，也就是不超过单链的阈值本身。于是「标题单独
+        # 成一条带」和「标题被网格判据剔掉」这两件事互斥，某些相位下标题会和
+        # 第一条列表行并成一条带，把那条带的中心拽偏约 10px。
+        #
+        # 按跨度成组就没这个问题：**同一行的词共享基线**，实测跨度最大 1.3px，
+        # 而表头离最近那条列表行最少 17.2px。上界走 `ROW_WORD_SPREAD_PX`(6)
+        # ——它是按这两个实测值定的，两头都留了几倍余量，账写在那个常量上。
+        if y - clusters[-1][0] <= ROW_WORD_SPREAD_PX:
+            clusters[-1].append(y)
+        else:
+            clusters.append([y])
+    centers = [sum(c) / len(c) for c in clusters]
+
+    # 网格一致性：列表内的行**彼此**间隔整数个行距，所以 `(y - 基准) mod 行距`
+    # 对它们是同一个数（实测同屏内散布 < 1px）。取中位数当基准，偏离超过容差的
+    # 剔掉。这剔的是标题行那种「不在行网格上」的东西，不是「偏移大的屏」
+    # ——整屏一起漂不影响这个判据，它只看行与行的**相对**位置。
+    offsets = [_wrap_offset(c) for c in centers]
+    base = statistics.median_low(offsets)
+    return [
+        c
+        for c, off in zip(centers, offsets, strict=True)
+        if abs(_wrap_delta(off - base)) <= ROW_GRID_TOLERANCE_PX
+        # 上界沿用列表区那条线，放宽半个裁剪窗口以容纳整屏下漂。
+        # 再往下就是吸附的自己那一行，而 `is_self_row` 才是它的正主。
+        and c <= RANKING_LIST_MAX_Y + ROW_CROP_HALF_HEIGHT
+    ]
+
+
+def _wrap_offset(center: float) -> float:
+    """这一行相对行网格的偏移，折进 `[-行距/2, +行距/2)`。"""
+    return _wrap_delta(center - ROW_FIRST_Y)
+
+
+def _wrap_delta(delta: float) -> float:
+    half = ROW_PITCH_PX / 2
+    return (delta + half) % ROW_PITCH_PX - half
+
+
+def first_rank_of(rows: Sequence[RankingRow]) -> int | None:
+    """这一屏最上面那个**读出来了**的名次。一个都没读出来就是 `None`。
+
+    不是 `rows[0].rank`：榜首三名没有名次数字（是奖章图标），而 OCR 也会漏认，
+    所以要往下找第一个非空的。`None` 的意思是「这一屏的名次一个都没认出来」，
+    那时重叠判据只能答「不知道」。
+    """
+    return next((row.rank for row in rows if row.rank is not None), None)
+
+
+def last_rank_of(rows: Sequence[RankingRow]) -> int | None:
+    """这一屏最下面那个**读出来了**的名次。理由同 `first_rank_of`。"""
+    return next((row.rank for row in reversed(rows) if row.rank is not None), None)
 
 
 def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[RankingTarget]:
@@ -329,10 +571,18 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
     丢的是**分数不是行**：坐标仍然是好的（那 30 个里有 2 个还是坐标扫描验证过的）。
     丢完之后走插值，用上下两个好邻居补一个中点，并标成估算——
     这正是 `interpolate_scores` 存在的意义。
+
+    ⚠️ **降序那道网只挡一个方向**，所以前面还有一道 `renderable_score`：
+    降序判据认得出「比上一行大」，认不出「这个数游戏根本渲染不出来」。
+    2026-08-23 语料实测，15 屏落库的军力值里有 8.3% 是 `10259` / `9935` / `3835`
+    这种多插了一位的读数，而它们**比上一行小**，降序判据一个都没抓到。
     """
     repaired = repair_ranks([row.rank for row in rows])
     read = [row.score for row in rows]
     trusted = list(read)
+    for index, score in enumerate(read):
+        if not renderable_score(score):
+            trusted[index] = None
     for index in descending_breaks(read):
         trusted[index] = None
     if len(read) != len(trusted) or any(a != b for a, b in zip(read, trusted, strict=True)):
@@ -1072,6 +1322,15 @@ def scan(
     def record_log(message: str, payload: dict[str, Any]) -> None:
         record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
 
+    # 重叠账：`previous_last_rank` 是上一屏末行的名次，`missed` 是整趟累计漏掉的名次数。
+    # 见 `domain.ranking.rows_skipped`。
+    #
+    # ⚠️ **提到 `try` 之前**，理由和下面那句收尾一样：被 Ctrl+C / 调度器抢占打断时
+    # 也要报得出「这一趟漏了多少」。定义在循环里的话，`finally` 会撞 `NameError`
+    # ——而那会把一次干净的中断变成一条堆栈。
+    previous_last_rank: int | None = None
+    missed = 0
+
     account = BlindSpinAccount()
     if blind_rows is None:
         # -- 回滚路径：盲滚段退回慢拖 ---------------------------------------
@@ -1155,6 +1414,7 @@ def scan(
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
             dry = 0
+            previous_last_rank = last_rank_of(rows)
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 progress.collect_scrolls = extra
                 step = nav.scroll_once()
@@ -1175,7 +1435,42 @@ def scan(
                 # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
-                say(f"  采集第{extra:>3}滚 本屏 bot {len(fresh)} 连续空屏 {dry}")
+                # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.rows_skipped`：
+                # 跳过去的名次压根没被读过，所以「采到的 bot 数」看起来完全正常
+                # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
+                # 这里只观测不拦（名次只是校验和，认错一个数字就中断整趟不值），
+                # 拦不拦等推进量提上去再定。
+                skipped = rows_skipped(previous_last_rank, first_rank_of(rows))
+                if skipped:
+                    missed += skipped
+                    say(f"  ⚠️ 与上一屏之间漏掉 {skipped} 名（重叠断了）")
+                # ⚠️ **不许写 `or previous_last_rank`。** 这一屏名次全读不出时，
+                # 保留上一屏的值会让下一屏拿「隔两屏」的名次去比，凭空报出一个
+                # 8–16 名的**假漏采**——而假警报比不报更坏：它会把这条判据教成
+                # 「经常喊狼来了」，真断的那次就没人看了。读不出就该是 `None`，
+                # 让下一次比较答「不知道」（见 `rows_skipped` 那条口径）。
+                previous_last_rank = last_rank_of(rows)
+                # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
+                #
+                # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
+                # 在日志里长得一模一样。2026-08-23 那个漏采一半的缺陷就是这么埋住的：
+                # 生产日志里「12, 8, 6 → 0, 0, 0」被当成「榜单真人与 bot 交错」，
+                # 而真相是那三屏各有 10–12 个 bot、一个都没读出来。要分开这两件事
+                # 当时得临时写只读探针——那正是「出事时能只靠库里日志定位」不成立的样子。
+                say(
+                    f"  采集第{extra:>3}滚 读出 {len(rows):>2} 行 "
+                    f"本屏 bot {len(fresh)} 连续空屏 {dry}"
+                )
+                record_log(
+                    "采集一屏",
+                    {
+                        "scroll": extra,
+                        "rows_read": len(rows),
+                        "bots_fresh": len(fresh),
+                        "dry_screens": dry,
+                        "rows_skipped": skipped,
+                    },
+                )
                 if reached_limit:
                     say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
                     break
@@ -1202,6 +1497,12 @@ def scan(
                 progress, written=written, suspect=written - len(kept), outcome=outcome
             )
         )
+        # ⚠️ **漏掉的名次单独报一行，不塞进 `completion_message`。**
+        # 那句话是「这一趟干了多少」，这句是「这一趟漏了多少」——后者是异常信号，
+        # 混进前者会被当成正常统计扫过去。为 0 时不打，省得每趟都有一行噪声。
+        if missed:
+            say(f"⚠️ 本趟重叠断了，累计漏掉 {missed} 名（没被读过，事后判据救不了）")
+            record_log("采集重叠断裂", {"rows_missed": missed})
     return outcome
 
 
@@ -1367,13 +1668,105 @@ def _rank_of(text: str) -> int | None:
     return int(match.group()) if match is not None else None
 
 
-def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
-    """灰度、**不二值化**、3× LANCZOS。单格用 `--psm 7`，整条列用 `--psm 6`。"""
+def _prepared(cell: Any) -> Any:
+    """灰度、**不二值化**、3× LANCZOS。逐格与成批两条路共用同一份预处理。
+
+    ⚠️ 拆出来是为了让两条路喂给 tesseract 的像素**逐字节相同**——那是成批读
+    唯一站得住的前提（见 `_read_cells`）。
+    """
     from PIL import Image
 
-    grey = cell.convert("L").resize((cell.width * 3, cell.height * 3), Image.Resampling.LANCZOS)
+    return cell.convert("L").resize((cell.width * 3, cell.height * 3), Image.Resampling.LANCZOS)
+
+
+def _read_cell(cell: Any, ocr: Any, *, single_line: bool = True) -> str:
+    """读一格。单格用 `--psm 7`，整条列用 `--psm 6`。"""
     config = "--psm 7" if single_line else "--psm 6"
-    return str(ocr.image_to_string(grey, lang="eng", config=config)).strip()
+    return str(ocr.image_to_string(_prepared(cell), lang="eng", config=config)).strip()
+
+
+#: 成批读一列时，tesseract 最多跑多久。超时就退回逐格读。
+#:
+#: 一列 13 格实测 0.16 秒，给到 60 秒是纯粹的兜底——挂机整夜时一个卡住的子进程
+#: 会把整条链路停摆，而退回逐格读只是慢 7 倍。
+CELL_BATCH_TIMEOUT_S = 60.0
+
+
+def _read_cells(cells: list[Any], ocr: Any) -> list[str]:
+    """读一整列的格子：**一次进程，逐格独立**。读不成就原样退回逐格调用。
+
+    ## ⚠️ 为什么不是「把格子拼成一张图读一次」
+
+    贵的不是「分开读」，是**启动进程**。2026-08-23 本机实测：
+
+        整屏读（三列逐格，40 次调用）    3.96 秒
+        40 次单格调用                    4.10 秒  → 每次 102 毫秒
+         1 次整列调用（像素量还更大）    0.25 秒
+        ⇒ 固定开销占整屏读的 **97%**
+
+    所以第一反应是把 13 个格拼进一张画布读一次。**试了，不行**：横向拼 + `--psm 7`
+    与逐格读有 **22.6%** 的格不一致，竖向拼 + `--psm 6` 有 **49.5%**。根子是
+    tesseract 的二值化与字号统计是**对整幅图**算的——13 个格进同一张图，全局统计
+    就变了，于是「像素逐字节相同」并不等于「结果相同」。
+
+    而且差异里有**致命的一类**：`bot_2_470_11` 被拼图读成 `bot_2_470_1`。
+    `_1` 是个合法位置，反解得出坐标、区间校验放过——舰队会飞到一个错的星球。
+    和整列读栽在同一个坑（见 `locate_rows`）。
+
+    ## 成立的做法：tesseract 的图片清单
+
+    CLI 支持传一个清单文件（每行一个图片路径），**清单里每张图各自独立走完整条
+    流水线**，输出用换页符分页。于是逐格独立与一次 spawn 同时拿到。
+
+    2026-08-23 语料实测（15 屏 × 3 列 = 558 格）：**0 个不一致，快 7.3×**
+    （每列 1.19 秒 → 0.16 秒）。
+
+    ⚠️ **退回逐格读的两个口子都必须留着**：拿不到 tesseract 可执行文件时
+    （单元测试注入的假 `ocr` 就是这种），以及子进程出错/超时时。退回只是慢，
+    而读不出来是要丢数据的。
+    """
+    if not cells:
+        return []
+    exe = getattr(getattr(ocr, "pytesseract", None), "tesseract_cmd", None)
+    if not exe:
+        return [_read_cell(cell, ocr) for cell in cells]
+    try:
+        return _tesseract_batch(str(exe), [_prepared(cell) for cell in cells])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return [_read_cell(cell, ocr) for cell in cells]
+
+
+def _tesseract_batch(exe: str, images: list[Any]) -> list[str]:
+    """把已经预处理好的格子交给 tesseract 的清单模式，返回**与入参等长**的文本。
+
+    ⚠️ **返回长度必须和入参对齐**，不足补空串：调用方按下标把结果配回行，
+    少一页就会整列错位——那种错不会报错，只会把军力配到别人名下。
+    """
+    with tempfile.TemporaryDirectory(prefix="evo-ocr-") as folder:
+        root = pathlib.Path(folder)
+        paths = []
+        for index, image in enumerate(images):
+            target = root / f"{index:03d}.png"
+            image.save(target)
+            paths.append(str(target))
+        listing = root / "cells.txt"
+        listing.write_text("\n".join(paths), encoding="utf-8")
+        completed = subprocess.run(
+            [exe, str(listing), "stdout", "-l", "eng", "--psm", "7"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            # ⚠️ OCR 出来的字什么都可能有，编码错误不许弄死进程（同 `say` 那条账）。
+            errors="replace",
+            timeout=CELL_BATCH_TIMEOUT_S,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError(f"tesseract 清单模式返回 {completed.returncode}")
+        # 清单模式用**换页符**分页，一张图一页，顺序与清单一致。
+        pages = [page.strip() for page in completed.stdout.split("\f")]
+        pages = pages[: len(images)]
+        return pages + [""] * (len(images) - len(pages))
 
 
 __all__ = [
@@ -1395,12 +1788,16 @@ __all__ = [
     "name_column_text",
     "name_excerpt",
     "read_name_column_confirming",
+    "first_rank_of",
+    "last_rank_of",
     "release_stuck_mouse",
+    "renderable_score",
     "main",
     "parse_score",
     "position_from_image",
     "report_blind_spin",
     "report_bot_area_reached",
+    "locate_rows",
     "rows_from_image",
     "sample_overlap",
     "scroll_through_humans",
