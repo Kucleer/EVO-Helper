@@ -448,8 +448,14 @@ class MilitaryAttackConfigView:
     #: 面板名读不出之后排除多久；`None` = 留空 = 默认 6 小时
     #: （见 `domain.target_order.DEFAULT_UNREADABLE_EXCLUSION`）。
     unreadable_exclusion_hours: int | None = None
+    #: 军力分数有效期（小时）；`None` = 留空 = 默认 2 小时
+    #: （见 `domain.target_order.DEFAULT_SCORE_MAX_AGE`）。**是浮点**：1.5 小时合法。
+    score_max_age_hours: float | None = None
+    #: 选靶第 3 步的窗口门限（个）；`None` = 留空 = 默认 100
+    #: （见 `domain.target_order.WINDOW_POOL_FLOOR`）。
+    window_floor: int | None = None
     # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 删掉了（理由在
-    # `domain.target_order` 模块头第 3 步）。「用多新的数据」改由任务参数
+    # `domain.target_order` 模块头第 3 步）。「用多新的数据」改由上面那个
     # `score_max_age_hours` 划线回答。
     #: 全账号同时在飞的舰队上限；`None` = 留空 = 默认 9。
     account_line_limit: int | None = None

@@ -62,9 +62,14 @@ site-packages 找包，撞上 `py.typed` 缺失而整个跳过。**一律 `mypy 
 | `.venv\Scripts\python.exe -m mypy src` | 2.3.0，**超出 `<2`** | `Success: no issues` |
 
 ⇒ **一律用裸 `python -m mypy src`**。拿 venv 那个跑会把下面这 3 条既有错误判成通过：
-`domain/intel_query.py:88`（no-untyped-call）、`application/mission_scheduler.py:2973`
-（两条 union-attr，`min(..., default=None)`）。**这 3 条在 `main` 上就有**（PR #234 时已逐字比对过），
+`domain/intel_query.py:88`（no-untyped-call）、`application/mission_scheduler.py` 里
+`_military_batch_task` 末尾那一行（两条 union-attr，`min(..., default=None)`）。
+**这 3 条在 `main` 上就有**（PR #234 时已逐字比对过），
 所以验收判据是「**不新增**」，不是「全绿」。
+
+⚠️ **第 2、3 条只记函数名，不记行号。** 原先这里写着 `mission_scheduler.py:2973`，
+而那个文件几乎每个 PR 都动，行号一改就成了假话——照着假行号去比对的人会以为自己
+新引入了两条错误。（2026-08-23 那次它漂到了 3134。）
 
 ### 0.4 ⚠️ 实测出来的事实**住在代码注释里**，不在文档里
 

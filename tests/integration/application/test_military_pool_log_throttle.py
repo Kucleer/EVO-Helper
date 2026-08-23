@@ -42,12 +42,12 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, enable, only_gap_filler, task
+from .test_mission_scheduler import add_bot_target, enable, only_gap_filler, set_score_window, task
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 
 #: 窗口 2 小时、军力截断要 2 个。窗口内够不够由用例自己摆。
-BY_MILITARY = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
+BY_MILITARY = '{"by_military": true}'
 
 
 @pytest.fixture
@@ -60,6 +60,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 2 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=2, window_floor=2)
 
 
 class RecordingLog:
@@ -408,8 +420,13 @@ def test_the_window_is_the_same_configurable_knob(  # type: ignore[no-untyped-de
     这一条同时守住「0 不是假值」：写成 `seconds or DEFAULT` 的实现会让它转红。
     """
     row = a_healthy_pool(repository, session_factory)
+    # ⚠️ 窗口那两格要一起送：这是**整份替换**，不带就把 `military_window` 夹具摆好的
+    # 窗口冲成默认的 2 小时 / 100 个，而门限 100 会让「健康的池子」当场变成不健康的。
     repository.replace_military_attack_tiers(
-        '[{"min_score": 0, "preset": "AAA"}]', auto_toggle_log_seconds=0
+        '[{"min_score": 0, "preset": "AAA"}]',
+        auto_toggle_log_seconds=0,
+        score_max_age_hours=2,
+        window_floor=2,
     )
 
     for index in range(4):

@@ -81,10 +81,11 @@ from evo_helper.tools.pirate_loop import TargetCheck
 from evo_helper.vision.scan_reading import PlanetPanel
 
 from .conftest import Clock, make_supervisor
+from .test_mission_scheduler import set_score_window
 
 NOW = datetime(2026, 8, 20, 12, 33, tzinfo=UTC)
 #: `top_n` 只剩「窗口门限」一个身份，填 2 是把门限压到候选数之下，好让窗口不被放弃。
-BOT_TOP_TWO = '{"by_military": true, "top_n": 2}'
+BOT_TOP_TWO = '{"by_military": true}'
 
 #: ⚠️ **编出来的坐标**，不是实机上那三个——仓库是公开的。
 UNREADABLE = Coordinate(6, 100, 7)
@@ -101,6 +102,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 2 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=2, window_floor=2)
 
 
 def _task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
@@ -154,9 +167,18 @@ def _row(session_factory, coordinate: Coordinate) -> orm.BotTargetRow:  # type: 
         ).one()
 
 
-def _configure(repository: SqlAlchemyRepository, **knobs: int | None) -> None:
-    """写一份全局攻击配置。没提到的旋钮一律留空（= 用默认值）。"""
-    repository.replace_military_attack_tiers("[]", **knobs)
+def _configure(repository: SqlAlchemyRepository, **knobs: float | None) -> None:
+    """写一份全局攻击配置。没提到的旋钮一律留空（= 用默认值）。
+
+    ⚠️ **选靶窗口那两格必须显式带上。** `replace_military_attack_tiers` 是整份替换，
+    而 2026-08-23 起有效期与窗口门限住在这张表里（从前是任务参数 `score_max_age_hours`
+    / `top_n`）。不带的话这一句会把 `military_window` 夹具摆好的窗口冲掉，于是门限退回
+    代码默认的 **100**——这个模块的候选池只有几个目标，那时每一轮都走「放弃窗口」，
+    本条用例要量的排除判据就落在了一条不同的路径上，而它照样是绿的。
+    """
+    knobs.setdefault("score_max_age_hours", 2)
+    knobs.setdefault("window_floor", 2)
+    repository.replace_military_attack_tiers("[]", **knobs)  # type: ignore[arg-type]
 
 
 def _launched(launcher) -> list[str]:  # type: ignore[no-untyped-def]

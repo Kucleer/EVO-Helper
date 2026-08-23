@@ -67,6 +67,23 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     return scheduler
 
 
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线：**有效期 2 小时、窗口门限 2 个**，摆在全局配置里。
+
+    2026-08-23 起这两格是全局的（`military_attack_config`），不再是任务参数——
+    从前它们写在 `BOT_BY_MILITARY_2H` 那串 JSON 里，一眼看得见。搬走之后若不摆，
+    每条用例吃的都是代码默认值（2 小时 / **100 个**），而这个模块里的候选池只有
+    两三个目标：门限 100 会让**每一条**用例都走「放弃窗口」那一支，于是窗口相关的
+    正例（用例 a）根本量不到自己要量的东西，而它照样是绿的——那是最坏的一种绿。
+
+    ⚠️ **做成 autouse 而不是让每条用例自己调。** 这个模块有二十几条军力用例，
+    漏掉一条的症状就是上面那种「测了另一件事的绿」。要另一个窗口的用例自己再调一次
+    `set_score_window` 覆盖掉它（写在用例里，就近可见）。
+    """
+    set_score_window(repository, max_age_hours=2, window_floor=2)
+
+
 def task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
     """这条链路那一行的 id。
 
@@ -78,6 +95,49 @@ def task_id(repository: SqlAlchemyRepository, kind: MissionKind) -> int:
 
 def enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object) -> None:
     repository.update_mission_task(task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
+
+
+def set_score_window(
+    repository: SqlAlchemyRepository,
+    *,
+    max_age_hours: float | None = None,
+    window_floor: int | None = None,
+) -> None:
+    """把「选靶窗口」那两格写进**全局**攻击配置。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——用户口径：「军力攻击的有效期 门限 改为全局设置，不再根据单个星系进行
+    调整」。所以要摆一个窗口，摆的地方是这里，不是 `params_json`。
+
+    ⚠️ **必须把现有的其它旋钮原样带回去。** `replace_military_attack_tiers` 是
+    **整份替换**（那是它有意的语义：页面上就是整份 PUT），只送这两格等于把档位和
+    其余十来个旋钮一起冲成空的——而症状会落在一条与本用例无关的判据上，
+    排查起来是最贵的那一类。
+    """
+    try:
+        row = repository.military_attack_config()
+    except ValueError:
+        # 配置行还没建（`prepare()` 才建它）。这条路上没有「其它旋钮」要保留，
+        # 而 `replace_military_attack_tiers` 会顺手把 id=1 那一行建出来。
+        repository.replace_military_attack_tiers(
+            "[]", score_max_age_hours=max_age_hours, window_floor=window_floor
+        )
+        return
+    repository.replace_military_attack_tiers(
+        row.tiers_json,
+        blind_scrolls=row.blind_scrolls,
+        blind_scroll_rows=row.blind_scroll_rows,
+        report_scan_hours=row.report_scan_hours,
+        unknown_line_hold_minutes=row.unknown_line_hold_minutes,
+        reconcile_cooldown_minutes=row.reconcile_cooldown_minutes,
+        bot_revisit_hours=row.bot_revisit_hours,
+        protection_exclusion_hours=row.protection_exclusion_hours,
+        unreadable_exclusion_hours=row.unreadable_exclusion_hours,
+        score_max_age_hours=max_age_hours,
+        window_floor=window_floor,
+        account_line_limit=row.account_line_limit,
+        auto_toggle_log_seconds=row.auto_toggle_log_seconds,
+    )
 
 
 def only_gap_filler(repository: SqlAlchemyRepository, kept: MissionKind | None = None) -> None:
@@ -1575,7 +1635,14 @@ def test_a_run_records_which_task_started_it(  # type: ignore[no-untyped-def]
 
 # -- 军力优先那一支 ------------------------------------------------------------
 
-BOT_BY_MILITARY = '{"by_military": true, "top_n": 2}'
+#: 军力优先那一支的任务参数。
+#:
+#: ⚠️ **这里从前带着 `"top_n": 2`，2026-08-23 去掉了。** 有效期与窗口门限那两格
+#: 搬进了全局攻击配置（用户口径：「军力攻击的有效期 门限 改为全局设置，不再根据
+#: 单个星系进行调整」），留在 `params_json` 里的那个键**后端已经不读**——留着它
+#: 就是让这几十条用例的入参说一件不发生的事。窗口由下面那个 `military_window`
+#: 夹具统一摆。
+BOT_BY_MILITARY = '{"by_military": true}'
 
 
 def test_military_ranking_batch_finishes_before_its_bot_attack_is_started(  # type: ignore[no-untyped-def]
@@ -1819,7 +1886,9 @@ def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool(  # type: ignore[no-u
     enable(
         repository,
         MissionKind.BOT,
-        params_json='{"by_military": true, "top_n": 50, "max_score": 100000}',
+        # `top_n` 那个键 2026-08-23 起后端不读了（窗口门限改成全局），所以这里不写。
+        # 这条用例量的是 `max_score`，窗口由 `military_window` 夹具摆成 2 小时 / 2 个。
+        params_json='{"by_military": true, "max_score": 100000}',
     )
     only_gap_filler(repository)
     scheduler.start()
@@ -1857,7 +1926,12 @@ def test_the_cap_keeps_the_unbeatable_ones_out_of_the_pool(  # type: ignore[no-u
 # 但是没有具体数据来拟合相关曲线」），不是实测的材料产出。整段在
 # `domain.target_order` 模块头第 4 步。
 
-BOT_BY_MILITARY_2H = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
+#: ⚠️ **名字里那个 `2H` 现在指的是全局配置里的 2 小时**，不是这串 JSON 里的键：
+#: 有效期与窗口门限 2026-08-23 搬进了 `military_attack_config`，`params_json` 里那
+#: 两个键后端已经不读。窗口由下面那个 `military_window` 夹具摆成「2 小时 / 2 个」
+#: ——**和这个名字说的是同一件事**，所以名字不改；改名反而会让引用它的那二十几条
+#: 用例都得回来读一遍才知道自己摆的是什么窗口。
+BOT_BY_MILITARY_2H = '{"by_military": true}'
 
 
 def _targets_of(command: list[str]) -> list[str]:
@@ -1904,7 +1978,10 @@ def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[n
         dispatched_at=NOW - timedelta(hours=23),
         flight=timedelta(minutes=1),
     )
-    enable(repository, MissionKind.BOT, params_json='{"by_military": true, "top_n": 1}')
+    enable(repository, MissionKind.BOT, params_json='{"by_military": true}')
+    # 窗口门限压到 1：剔除之后窗口内只剩一个，门限 2 会让这一轮走「放弃窗口」那一支
+    # ——那时量的就不是「剔除有没有在最前」了。2026-08-23 起这个数摆在全局配置里。
+    set_score_window(repository, max_age_hours=2, window_floor=1)
     only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
@@ -2011,7 +2088,10 @@ def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ig
         military_score=7_000.0,
         scanned_at=NOW - timedelta(minutes=1),
     )
-    enable(repository, MissionKind.BOT, params_json='{"by_military": true, "top_n": 1}')
+    enable(repository, MissionKind.BOT, params_json='{"by_military": true}')
+    # 窗口门限 1 个：窗口内还剩 2 个，够用，所以窗口不必放弃——这条用例量的正是
+    # 「窗口够用时窗口外的进不来」。2026-08-23 起这个数摆在全局配置里，不在任务参数。
+    set_score_window(repository, max_age_hours=2, window_floor=1)
     only_gap_filler(repository)
     scheduler.start()
     scheduler.tick()
@@ -2247,19 +2327,25 @@ def test_an_empty_pool_is_not_dressed_up_as_missing_data(  # type: ignore[no-unt
     assert not facts.scores_are_missing
 
 
-def test_the_old_parameter_name_still_sets_the_hint(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher, session_factory
+def test_the_old_task_level_window_keys_are_ignored_and_shouted_about(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, recorded: RecordingLog
 ) -> None:
-    """旧任务的 `params_json` 里存的还是 `rescan_after_hours`，得照样认。
+    """旧任务的 `params_json` 里还存着按星系配的有效期/门限，**一律忽略，并且告警**。
 
-    生产库里已经存着一批带旧键的任务，而用户是自己重启 bat 升级的。读不出来的话
-    这一格会静默回落到默认的 2 小时——用户配的 1 小时被悄悄改宽了一倍，
-    而页面上看不出任何异常。
+    ⚠️ **这条用例整个换了判据（2026-08-23）。** 它从前叫
+    `test_the_old_parameter_name_still_sets_the_hint`，钉的是「旧键 `rescan_after_hours`
+    照样读得出来」——那时这一格是任务参数。用户口径（2026-08-23）：「军力攻击的
+    有效期 门限 改为全局设置，不再根据单个星系进行调整」，于是「照样读得出来」
+    正是现在**不许**发生的事：读得出来就等于这个设置没有变成全局的。
 
-    ⚠️ **断言换过一次。** 这条从前验的是「旧键设的 1 小时真的把 90 分钟前的读数
-    挡住了」（`launcher.spawned == []`）。有效期现在不挡任何目标，所以那个断言在
-    新规格下只会验出「它确实不挡了」——什么都守不住。改成直接验**读出来的时长**：
-    这个数现在只喂给日志里那句「超期多久」，而日志说假话比不说更糟。
+    守的是一个具体的静默走样：生产库里存着一批带旧键的任务（`top_n` 配着 2、
+    有效期配着 1 小时），而用户是自己重启 bat 升级的。升完之后那个 1 小时**不再生效**
+    ——某个银河突然打得少了、或者突然开始报「放宽窗口」，而页面上、日志里一个字的
+    解释都没有。所以这一条要同时钉两件事：
+
+    1. **真的忽略了**：读出来的窗口是全局那一份（夹具摆的 2 小时 / 2 个），不是 1 小时；
+    2. **说出来了**，而且说清了「旧值是多少」和「这一轮实际用的是多少」——只报
+       「有旧值」回答不了用户唯一想问的那句：那我现在到底按几小时在打。
     """
     row_params = '{"by_military": true, "top_n": 2, "rescan_after_hours": 1}'
     add_bot_target(
@@ -2268,15 +2354,31 @@ def test_the_old_parameter_name_still_sets_the_hint(  # type: ignore[no-untyped-
         military_score=9_000.0,
         scanned_at=NOW - timedelta(minutes=90),
     )
+    add_bot_target(
+        session_factory,
+        Coordinate(2, 141, 6),
+        military_score=8_000.0,
+        scanned_at=NOW - timedelta(minutes=30),
+    )
     enable(repository, MissionKind.BOT, params_json=row_params)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
     row = task(repository, MissionKind.BOT)
-
     reading = scheduler._military_pool_reading(row)  # noqa: SLF001 - 钉的就是这一层读出来的数
+    assert reading.max_age == timedelta(hours=2), "旧的任务级有效期还在生效，那它就不是全局设置"
+    assert reading.window_floor == 2, "旧的任务级门限还在生效"
 
-    assert reading.max_age == timedelta(hours=1), "旧键读不出来会静默改宽一倍"
-    # 90 分钟 > 1 小时：这一条**照样出兵**，只是在日志里被点名为「已超期」。
-    assert reading.stale == 1
-    assert [item.coordinate for item in reading.eligible] == [Coordinate(2, 140, 5)]
+    ignored = [item for item in recorded.warnings() if "已改为全局设置" in item[1]]
+    assert len(ignored) == 1, "旧值被悄悄忽略了却没告警，就是「行为变了却没人告诉你」"
+    _, message, payload = ignored[0]
+    assert payload["ignored_params"] == {"top_n": "2", "rescan_after_hours": "1"}
+    # 这一轮实际用的两个数都要报出来，否则看见告警的人还得回库里查。
+    assert payload["score_max_age_hours"] == 2.0
+    assert payload["window_floor"] == 2
+    assert "rescan_after_hours=1" in message
+    assert "有效期 2.0 小时" in message
 
 
 def test_without_the_parameter_the_hint_uses_the_documented_default(  # type: ignore[no-untyped-def]

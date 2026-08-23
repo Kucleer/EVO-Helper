@@ -60,6 +60,7 @@ from .test_mission_scheduler import (
     enable,
     only_gap_filler,
     set_config,
+    set_score_window,
     task,
     task_id,
 )
@@ -77,10 +78,10 @@ TARGET = Coordinate(2, 150, 8)
 #: 而 `max_score` 要到第 4 步才生效，于是 `has_work()` 看得见「还有目标」、
 #: `_military_command()` 却挑不出一个来。这正是**对齐之后仍然可达**的那一档
 #: `MissionIdle`，也就是限流真正要挡的东西。
-ALL_TOO_STRONG = '{"by_military": true, "top_n": 2, "score_max_age_hours": 24, "max_score": 100}'
+ALL_TOO_STRONG = '{"by_military": true, "max_score": 100}'
 
 #: 同上，但不设上限：池子挑得出人，只看航线够不够。
-BY_MILITARY = '{"by_military": true, "top_n": 2, "score_max_age_hours": 24}'
+BY_MILITARY = '{"by_military": true}'
 
 
 @pytest.fixture
@@ -93,6 +94,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 24 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=24, window_floor=2)
 
 
 class RecordingLog:

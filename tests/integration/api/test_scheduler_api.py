@@ -1914,6 +1914,12 @@ _ALL_KNOBS = {
     "bot_revisit_hours": 6,
     "protection_exclusion_hours": 4,
     "unreadable_exclusion_hours": 3,
+    # 选靶窗口那两格（2026-08-23 从任务参数搬进这一页）。有效期**刻意给一个小数**：
+    # 这一条同时守住「这一路没有任何一处把它取整」——库里那一列、pydantic 那个字段、
+    # 读侧那个 `_float_knob`，任何一处退回 `int` 都会让 1.5 变成 1，而症状是窗口
+    # 窄了三分之一、日志里却写着 1.0。
+    "score_max_age_hours": 1.5,
+    "window_floor": 40,
     "account_line_limit": 6,
     "auto_toggle_log_seconds": 90,
 }
@@ -1966,11 +1972,22 @@ def test_the_settings_page_renders_every_knob(console: Console) -> None:
         "bot-revisit",
         "protection-exclusion",
         "unreadable-exclusion",
+        # 选靶窗口那两格（2026-08-23 从任务页搬过来）。
+        "score-max-age",
+        "window-floor",
         "account-line-limit",
         "auto-toggle-log",
     ):
         assert f'id="{knob_id}"' in body, f"{knob_id} 那个框没渲染出来"
         assert f"getElementById('{knob_id}')" in body, f"{knob_id} 没接进保存那张表"
+    # 选靶窗口那一节：默认值与上界同样从常量传进模板，而且必须说清「这两格现在是
+    # 全局的」——用户是在任务页上找不到那两个框之后才来这一页的，页面不说他就以为
+    # 功能丢了。有效期那个默认值**不许取整**：写成 `2 小时` 是对的（当前默认就是 2），
+    # 但断言带上标签，免得和别处那些 2 撞号。
+    assert "军力分数有效期（小时，默认 2.0）" in body, "有效期默认值没从常量传进模板"
+    assert "窗口门限（个，默认 100）" in body, "窗口门限默认值没从常量传进模板"
+    assert "上限 168 小时（一周）" in body, "有效期上界没从常量传进模板"
+    assert "现在是全局的" in body, "没说清这两格已经不按星系配了"
     # ⚠️ 断言的是**带标签的那一句**，不是光秃秃的 `留空 = 6`——后者和「翻信箱
     # 往回读几小时」那一格的默认值撞号，撞上了这条就什么都没验。
     assert "面板名读不出排除时长（小时，默认 6）" in body, "默认值没从常量传进模板"

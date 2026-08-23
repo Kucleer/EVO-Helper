@@ -39,7 +39,7 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web.persistent_service import ranking_scan_summary
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, disable, enable, task, task_id
+from .test_mission_scheduler import add_bot_target, disable, enable, set_score_window, task, task_id
 
 #: 周二中午。**刻意不取周一**：选靶第 2 步有一条按「本周期起点（周一 00:00 UTC）」
 #: 划的线，周一凌晨摆出来的读数会先被那条线整批丢掉，于是「窗口内有几个」这件事
@@ -51,7 +51,7 @@ ORIGIN = Coordinate(2, 137, 18)
 TWO_HOURS = '{"scan_cooldown_hours": 2}'
 
 #: 军力优先、窗口门限 2 个、有效期 6 小时。窗口内够不够由每条用例自己摆。
-BY_MILITARY = '{"by_military": true, "top_n": 2, "score_max_age_hours": 6}'
+BY_MILITARY = '{"by_military": true}'
 
 
 @pytest.fixture
@@ -64,6 +64,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 6 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=6, window_floor=2)
 
 
 class RecordingLog:

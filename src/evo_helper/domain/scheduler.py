@@ -435,7 +435,8 @@ class MilitaryWindowPool:
 
     #: 读数落在有效期窗口内的候选数（第 3 步之后）。
     in_window: int
-    #: 这一轮的窗口门限（任务参数里的键仍叫 `top_n`）。
+    #: 这一轮的窗口门限（2026-08-23 起是全局的一格
+    #: `military_attack_config.window_floor`；从前是任务参数 `top_n`）。
     floor: int
 
     @property

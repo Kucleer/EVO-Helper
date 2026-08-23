@@ -322,9 +322,23 @@ class MilitaryAttackConfigOut(BaseModel):
     #: 「面板名读不出」是根因还没查清的现象，两者该排多久没有理由相同。
     #: 范围由 `MissionScheduler.validate_unreadable_exclusion_hours` 判。
     unreadable_exclusion_hours: int | None = None
+    #: 军力分数有效期（小时）。**`None` = 留空 = 默认 2。**
+    #:
+    #: ⚠️ **是 `float`，不是 `int`。** 1.5 小时一直是合法取值（页面上步长 0.5），
+    #: 声明成 `int` 会让 pydantic 当场 422，而错误话术说的是「不是整数」——
+    #: 用户看不出这句话是从哪来的。范围由
+    #: `MissionScheduler.validate_score_max_age_hours` 判。
+    #:
+    #: ⚠️ **2026-08-23 从任务参数搬到这里**（用户口径：「军力攻击的有效期 门限
+    #: 改为全局设置，不再根据单个星系进行调整」）。任务页上那两个框已经撤掉。
+    score_max_age_hours: float | None = None
+    #: 选靶第 3 步的窗口门限（个）。**`None` = 留空 = 默认 100。**
+    #: 它**不决定打谁**，只决定「这一轮肯不肯只信新数据」——理由在
+    #: `domain.target_order.WINDOW_POOL_FLOOR`。
+    window_floor: int | None = None
     # ⚠️ 这里曾经有一个 `military_time_pool`，2026-08-18 随那个错误设计一起删掉了
     # （理由在 `storage.models.MilitaryAttackConfigRow` 与 `domain.target_order`
-    # 模块头第 3 步）。**别加回来**：「用多新的数据」现在由任务参数
+    # 模块头第 3 步）。**别加回来**：「用多新的数据」现在由上面那个
     # `score_max_age_hours` 划线回答，不再有「取前几个」这件事。
     #: **全账号**同时在飞的舰队上限。**`None` = 留空 = 默认 9。**
     #:

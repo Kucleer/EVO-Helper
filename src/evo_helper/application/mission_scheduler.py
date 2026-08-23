@@ -119,6 +119,7 @@ from evo_helper.domain.target_order import (
     DEFAULT_SCORE_MAX_AGE,
     DEFAULT_UNREADABLE_EXCLUSION,
     PROTECTION_EXCLUSION_MAX_HOURS,
+    SCORE_MAX_AGE_MAX_HOURS,
     UNREADABLE_EXCLUSION_MAX_HOURS,
     WINDOW_POOL_FLOOR,
     MilitaryChoice,
@@ -343,7 +344,8 @@ class MilitaryPoolReading:
     #: 这一层不再自己算第二份。
     choice: MilitaryChoice
     #: 这一次用的**窗口门限**，写进日志好让用户对得上自己配的那个数
-    #: （任务参数里的键仍叫 `top_n`）。
+    #: （2026-08-23 起它是全局的一格：`military_attack_config.window_floor`，
+    #: 从前是任务参数 `top_n`）。
     #:
     #: ⚠️ **它不再是「打前几名」。** 2026-08-18 起第 4 步按 `军力 ÷ 往返小时`
     #: 排序、军力硬截断取消，这个数只剩一个身份：第 3 步「窗口内够不够用」的尺子。
@@ -794,7 +796,8 @@ class MissionScheduler:
         # 时会随调度器对象一同重置。
         self._view_generation = 0
         #: 军力榜正在为哪个 bot 攻击任务采一批目标。榜单一旦开始采这一批，
-        #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够**窗口门限**（``top_n``）后反过来
+        #: 不能在写入前几行后就被新出现的 bot 候选抢占；采够**窗口门限**
+        #: （`military_attack_config.window_floor`，全局一格）后反过来
         #: 也必须先启动该任务，再交还普通优先级排序。
         self._military_ranking_batch_task_id: int | None = None
         # 点「开始」后军力任务只使用这一份档位；运行中修改全局配置不会让
@@ -1095,16 +1098,19 @@ class MissionScheduler:
         多出发点由任务表配置，页面保存军力参数时它们可能正好还没一并落库；此时
         调 ``command_for`` 会错误地走旧的区域攻击参数校验。这里与真正派遣共用
         同一套解析器，专门给保存前校验使用。
+
+        ⚠️ **这里不再校验有效期与窗口门限。** 2026-08-23 起那两格是全局的
+        （`military_attack_config`），由 `validate_score_max_age_hours` /
+        `validate_window_floor` 在攻击配置页那条路上把关。**留在这里反而有害**：
+        存量任务的 `params_json` 里还存着那两个旧键，照旧校验等于让一个**已经不
+        生效**的值把保存整个拦下来，而报出来的错说的是一个用户在任务页上再也看不到
+        的框。旧键的善后在 `_legacy_window_keys`：忽略，并在派遣时告警。
         """
-        params = _params(params_json)
         if not _bot_by_military(params_json):
             return
-        if _bot_window_floor(params_json) < 1:
-            raise MissionParamError("top_n 必须至少为 1")
         maximum = _bot_max_score(params_json)
         if maximum is not None and maximum < 0:
             raise MissionParamError("max_score 不能小于 0")
-        _bot_score_max_age(params)
 
     def validate_military_tiers(self, tiers: list[dict[str, Any]]) -> tuple[MilitaryTier, ...]:
         """校验全局攻击档位；任务参数不再携带档位。"""
@@ -1175,6 +1181,18 @@ class MissionScheduler:
     def validate_unreadable_exclusion_hours(self, value: object) -> int | None:
         """校验攻击配置页上那个「面板名读不出之后排除多久」。留空返回 `None`。"""
         return _unreadable_exclusion_hours(value)
+
+    def validate_score_max_age_hours(self, value: object) -> float | None:
+        """校验攻击配置页上那个「军力分数有效期」。留空返回 `None`。
+
+        **允许小数**（1.5 小时是合法取值），其余同 `validate_blind_scrolls`：
+        页面在写库之前用调度器自己这把尺子量一遍，两边不许各判一次。
+        """
+        return _score_max_age_hours(value)
+
+    def validate_window_floor(self, value: object) -> int | None:
+        """校验攻击配置页上那个「窗口门限」。留空返回 `None`。"""
+        return _window_floor_value(value)
 
     def validate_account_line_limit(self, value: object) -> int | None:
         """校验攻击配置页上那个「全账号航线上限」。留空返回 `None`。"""
@@ -1368,6 +1386,60 @@ class MissionScheduler:
         )
         return window
 
+    def _score_max_age(self) -> timedelta:
+        """军力读数「算不算新」的门槛，也就是选靶第 3 步那扇**窗口**的宽度。
+
+        ⚠️ **它是全局的**（`military_attack_config.score_max_age_hours`），
+        2026-08-23 起不再按任务、也就是不再按出发点银河系各配一份。用户口径
+        （2026-08-23）：「军力攻击的有效期 门限 改为全局设置，不再根据单个星系进行
+        调整」。整段理由在 `domain.target_order.DEFAULT_SCORE_MAX_AGE`——最要紧的
+        一句是：这个数约束的是**军力榜扫描的节奏**，而榜是一趟扫完全宇宙的，
+        与舰队从哪个银河系出发无关。
+
+        ⚠️ **读侧只能有这一处。** 从前它是从 `params_json` 里各读一份，于是「页面
+        显示的窗口」和「派遣真正用的窗口」有两处算式；这条链路每一次事故都是从
+        「同一个数有两份算法」开始的。
+
+        留空 = `DEFAULT_SCORE_MAX_AGE`（2 小时）；填了就往 `system_log` 落一条
+        「配置生效」，好让排障的人不必照着代码里那个 2 小时去推现场。
+        """
+        hours = self._float_knob("score_max_age_hours")
+        if hours is None:
+            return DEFAULT_SCORE_MAX_AGE
+        window = timedelta(hours=hours)
+        record_knob_override(
+            "score_max_age",
+            source=__name__,
+            effective=window,
+            default=DEFAULT_SCORE_MAX_AGE,
+            detail="军力读数落在这段时间之内才算新（选靶第 3 步的窗口宽度）",
+        )
+        return window
+
+    def _window_floor(self) -> int:
+        """选靶第 3 步的**窗口门限**：窗口内至少几个，这一轮才肯只用窗口内的。
+
+        ⚠️ **它不决定打谁**（军力硬截断 2026-08-18 就取消了），只决定「这一轮肯不肯
+        只信新数据」。整段理由在 `domain.target_order.WINDOW_POOL_FLOOR`。
+
+        ⚠️ **它和上面那个有效期是同一道判据的两半，所以一起搬成了全局。**
+        一半全局一半按星系，等于让同一道判据的两半各说一套——「窗口多宽」按全局、
+        「窗口内够不够用」按星系，那种组合谁也解释不清。
+
+        留空 = `WINDOW_POOL_FLOOR`（100）。
+        """
+        floor = self._knob("window_floor")
+        if floor is None:
+            return WINDOW_POOL_FLOOR
+        record_knob_override(
+            "window_floor",
+            source=__name__,
+            effective=floor,
+            default=WINDOW_POOL_FLOOR,
+            detail="窗口内至少这么多个目标，这一轮才肯只用窗口内的（选靶第 3 步）",
+        )
+        return floor
+
     def _account_line_limit(self) -> int | None:
         """全账号同时能在飞的舰队上限。**留空 = 不施加这道闸，而不是某个默认值。**
 
@@ -1444,6 +1516,20 @@ class MissionScheduler:
             return None
         value = getattr(row, column, None)
         return None if value is None else int(value)
+
+    def _float_knob(self, column: str) -> float | None:
+        """同 `_knob`，但**不取整**。
+
+        ⚠️ **有效期那一格必须走这一条。** 它一直允许填 1.5 小时（页面上步长 0.5），
+        而 `_knob` 里那个 `int()` 会把 1.5 悄悄变成 1——用户配的窗口窄了三分之一，
+        日志里写的却是 1.0，看起来完全正常。
+        """
+        try:
+            row = self._repository.military_attack_config()
+        except ValueError:
+            return None
+        value = getattr(row, column, None)
+        return None if value is None else float(value)
 
     def tick(self) -> None:
         """每秒一次。收退出码、看判据、该起就起。
@@ -2588,10 +2674,15 @@ class MissionScheduler:
                 #
                 # ⚠️ 窗口门限 2026-08-18 起不再是「打前几名」（军力硬截断取消了），
                 # 但它在这里的用法没变：扫够那么多个，这一轮才不必放弃窗口。
+                #
+                # ⚠️ 2026-08-23 起它是**全局**的一个数（`_window_floor`），所以这里
+                # 不再看 `batch_task` 的参数——但 `batch_task is None` 这个分支必须
+                # 留着：它表达的是「这一趟没有任何军力任务在等这批目标」，那时不该
+                # 拿一个攻击侧的门限去卡用户给扫描链路划的上限。
                 command = ranking_command(
                     bot_limit=_smallest_limit(
                         _ranking_bot_limit(row.params_json),
-                        None if batch_task is None else _bot_window_floor(batch_task.params_json),
+                        None if batch_task is None else self._window_floor(),
                     ),
                     blind_rows=self._blind_rows(),
                 )
@@ -3097,8 +3188,10 @@ class MissionScheduler:
                 # 那会让页面算出来的一批和调度器算出来的一批差上几秒钟的窗口边界，
                 # 而边界上的目标恰恰是最容易两边不一致的那些。
                 now=self._clock(),
-                max_age=_bot_score_max_age(_params(params_json)),
-                window_floor=_bot_window_floor(params_json),
+                # ⚠️ 有效期与窗口门限**从全局配置读**（2026-08-23 起），不再从
+                # `params_json` 里各读一份。整段理由在 `_score_max_age` 上。
+                max_age=self._score_max_age(),
+                window_floor=self._window_floor(),
                 max_score=_bot_max_score(params_json),
             )
         in_range = bot_targets_in_range(self._bot_targets(), **_bot_range(params_json))
@@ -3250,8 +3343,9 @@ class MissionScheduler:
         ## 喂进去的是 `candidates`（全池），不是 `eligible`
 
         ⚠️ **这一点是整个一期成不成立的地方。** `eligible` 是四步流水线筛完的
-        结果：第 3 步按 `score_max_age_hours` 的窗口和 `top_n` 门限裁过，第 4 步
-        过了 `max_score` 军力上限。而这三个旋钮的**数值一个都没进 prompt**——
+        结果：第 3 步按有效期的窗口和窗口门限裁过（两格 2026-08-23 起住在
+        `military_attack_config`），第 4 步过了 `max_score` 军力上限（仍是任务参数）。
+        而这三个旋钮的**数值一个都没进 prompt**——
         方案第一节的整段理由就是「AI 不该参考旋钮，AI 就是去调这些旋钮的」。
         喂 `eligible` 等于旋钮的值不给、筛选效果照给，**把答案先塞给它**的另一种
         形态。所以这里取 `reading.candidates`。
@@ -3384,9 +3478,11 @@ class MissionScheduler:
         的模块头第 3 步上——挡整轮的那一版让实机停摆 2.5 小时，换成「取最新 N 个」
         的那一版把全库最弱的一批选了出来。
         """
-        params = _params(row.params_json)
-        max_age = _bot_score_max_age(params)
-        window_floor = _bot_window_floor(row.params_json)
+        # ⚠️ **两个数都从全局配置读**（2026-08-23 起），不再看 `row.params_json`。
+        # 用户口径（2026-08-23）：「军力攻击的有效期 门限 改为全局设置，不再根据
+        # 单个星系进行调整」。存量任务里那两个旧键的善后在 `_legacy_window_keys`。
+        max_age = self._score_max_age()
+        window_floor = self._window_floor()
         candidates = self._military_candidates(row)
         now = self._clock()
         return MilitaryPoolReading(
@@ -3474,6 +3570,61 @@ class MissionScheduler:
             repeat_noun="账目",
         )
         self._warn_about_a_widened_window(row, reading)
+        self._warn_about_legacy_window_params(row, reading)
+
+    def _warn_about_legacy_window_params(
+        self, row: orm.MissionTaskRow, reading: MilitaryPoolReading
+    ) -> None:
+        """这个任务的 `params_json` 里还存着**已经不生效**的有效期/窗口门限。
+
+        2026-08-23 那两格搬进了全局攻击配置（用户口径：「军力攻击的有效期 门限
+        改为全局设置，不再根据单个星系进行调整」），存量任务里那几个键**一律忽略**。
+
+        ⚠️ **忽略必须说出来，这一条不是可选的附注。** 这次改动会让实机的行为在
+        某些任务上**当场变掉**：一个从前配着 6 小时有效期的任务，这一轮起用的是
+        全局的 2 小时（或用户在攻击配置页填的那个数）。不说的话，症状是「某个银河
+        突然打得少了 / 突然开始报放宽窗口了」，而页面上、日志里都找不到任何解释
+        ——那正是这个仓栽过好几次的那种静默走样。
+
+        ⚠️ **级别是 WARNING**，理由同 `_warn_about_a_widened_window`：淹在每轮都写的
+        INFO 里的一句话等于没说。而且这一条是**有尽头的**——用户在任务页保存一次
+        就会把那几个旧键清掉，告警随之消失。所以它不会永远吵。
+
+        ⚠️ **说清「旧值是多少」和「这一轮实际用的是多少」两个数。** 只报「有旧值」
+        的告警回答不了用户唯一想问的那个问题：那我现在到底按几小时在打。
+
+        ⚠️ **限流走同一道闸**（`_log_a_repeated_line`）：这句话每一轮派遣都会算到，
+        不限流就是又一条一小时六千行。
+        """
+        legacy = _legacy_window_keys(row.params_json)
+        if not legacy:
+            return
+        hours = reading.max_age.total_seconds() / 3600
+        stale = "、".join(f"{key}={value!r}" for key, value in sorted(legacy.items()))
+        message = (
+            f"军力选靶窗口已改为全局设置：任务「{row.name}」的参数里还存着 {stale}，"
+            "**已忽略**——有效期与窗口门限 2026-08-23 起不再按星系分别配。"
+            f"这一轮实际用的是全局值：有效期 {hours:.1f} 小时、窗口门限 "
+            f"{reading.window_floor} 个。要改就去攻击配置页改那一份；"
+            "在任务页保存一次会把这几个旧键清掉，这条告警随之消失。"
+        )
+        payload: dict[str, Any] = {
+            "task_id": row.id,
+            "mission_kind": MissionKind.BOT.value,
+            "ignored_params": {key: str(value) for key, value in legacy.items()},
+            "score_max_age_hours": hours,
+            "window_floor": reading.window_floor,
+        }
+        self._log_a_repeated_line(
+            key=(row.id, "military_legacy_window_params"),
+            mission_kind=MissionKind.BOT.value,
+            signature=_line_signature(message, payload),
+            level="WARNING",
+            message=message,
+            payload=payload,
+            now=reading.now,
+            repeat_noun="告警",
+        )
 
     def _warn_about_a_widened_window(
         self, row: orm.MissionTaskRow, reading: MilitaryPoolReading
@@ -4224,13 +4375,19 @@ def _ranking_scan_cooldown(raw: str) -> timedelta | None:
 
     ## 为什么住在 `mission_tasks.params_json`，而不是 `military_attack_config`
 
-    ⚠️ **它是任务级的，和 `score_max_age_hours` 同一层。** 两条理由都来自用户
-    2026-08-20 那段话：
+    ⚠️ **它仍然是任务级的**，理由来自用户 2026-08-20 那段话的第二半：**扫描任务
+    将来可能不止一个**，一个全局值配不了「这个扫得勤、那个扫得稀」。
 
-    1. 用户按**周内相位**来回调（周一 1 小时、周四 2 小时），而它和同样按相位调的
-       「军力分数有效期」是配套的一对——两个数分居两张表，改一次要跑两个页面，
-       而漏改一个的后果恰恰是本函数的安全阀在救的那件事。
-    2. 扫描任务将来可能不止一个，全局值配不了「这个扫得勤、那个扫得稀」。
+    ⚠️ **那段话的第一半 2026-08-23 已经不成立了，别再照它推理。** 它说的是「它和
+    同样按周内相位调的『军力分数有效期』是配套的一对，两个数分居两张表，改一次要
+    跑两个页面」——而有效期那一格当日搬成了全局设置（用户口径：「军力攻击的有效期
+    门限 改为全局设置，不再根据单个星系进行调整」），于是这两个数**本来就分居两处
+    了**：扫描间隔在任务上，有效期在攻击配置页。那个「配套的一对」的论据因此只剩
+    「记得一起调」这一句，不再能用来推「它们该住在同一张表」。
+
+    ⚠️ 「一起调」这件事本身没有消失，而且更要紧了：扫完一轮的时间必须短于有效期，
+    否则池子永远追不上。守它的不是「同页」，是本函数的安全阀（窗口内候选低于门限时
+    这个间隔立刻让路）加上放宽窗口那条 WARNING。
 
     ## 为什么没有代码默认值
 
@@ -4526,6 +4683,83 @@ def _unreadable_exclusion_hours(value: object) -> int | None:
     return hours
 
 
+def _optional_number(value: object, *, label: str) -> float | None:
+    """同 `_optional_int`，但**不要求是整数**；留空返回 `None`。
+
+    专为「军力分数有效期」准备：它一直允许 1.5 小时（页面上步长 0.5），
+    拿 `_optional_int` 去量会把一个合法取值当场判成非法，而错误话术里说的是
+    「必须是整数」——用户看不出这句话是从哪来的。
+
+    `bool` 一样单独排掉（理由同 `_optional_int`）。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise MissionParamError(f"{label}必须是数字；要用默认值就把它留空")
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise MissionParamError(f"{label}不是数字：{value!r}") from exc
+
+
+def _score_max_age_hours(value: object) -> float | None:
+    """军力分数有效期（小时）。**留空 = 默认 `DEFAULT_SCORE_MAX_AGE`（2 小时）。**
+
+    ## 两条边界
+
+    - **必须是正数。** 0（和负数）等于「一条读数都不算新」，那时窗口内恒为 0 个、
+      永远不足门限，于是**每一轮都放弃窗口**——这个旋钮被填成了它的反面：
+      看起来是「只用最新数据」，实际是「一律拿全部旧读数打」，而页面上只会显示
+      那句正常的「军力读数已放宽窗口」。填 0 的人多半以为自己在收紧。
+    - **最多 `SCORE_MAX_AGE_MAX_HOURS`（168 小时 = 一周）。** 理由在那个常量上：
+      第 2 步的周期边界已经把上周期的读数整批挡在外面，超过一周之后这个数**再也
+      挡不掉任何东西**——一个填了却什么都不做的旋钮比没有它更坏。
+    """
+    hours = _optional_number(value, label="军力分数有效期（小时）")
+    if hours is None:
+        return None
+    if hours <= 0:
+        raise MissionParamError(
+            "军力分数有效期必须是正数：填 0 等于「没有一条读数算新」，"
+            "于是每一轮都会放弃窗口、改用全部旧读数——和你想要的正好相反。"
+            "要用默认值就把它留空。"
+        )
+    if hours > SCORE_MAX_AGE_MAX_HOURS:
+        raise MissionParamError(
+            f"军力分数有效期最多 {SCORE_MAX_AGE_MAX_HOURS} 小时（一周）："
+            "bot 军力每周一 UTC+0 刷新，上周期的读数本来就整批不参与选靶，"
+            "再往上填这个数挡不掉任何目标。"
+        )
+    return hours
+
+
+def _window_floor_value(value: object) -> int | None:
+    """选靶第 3 步的窗口门限。**留空 = 默认 `WINDOW_POOL_FLOOR`（100）。**
+
+    ## 一条边界
+
+    - **至少 1。** 0 等于「窗口内一个都不用有也算够」，于是窗口**永远不会被放弃**
+      ——听起来像是「更严格」，实际后果相反：窗口内真的一个都没有的夜里（周一凌晨
+      正是如此），这一轮就在一个空池子上选靶、一发不派，而那句本该响的
+      「军力读数已放宽窗口」一个字都不会写。**这道闸存在的意义就是别悄悄停摆。**
+
+    上界**刻意不设**：门限该多大取决于候选池此刻有多少个（实测 3000+ 个 bot，
+    而窗口内能有多少又取决于扫描节奏），写死一个数就是拿一个凭空的上界去卡用户
+    真实的处境。填得比池子还大只会让窗口每轮都被放弃，而那件事**会告警**，
+    从日志里一眼看得出来。
+    """
+    floor = _optional_int(value, label="窗口门限（个）")
+    if floor is None:
+        return None
+    if floor < 1:
+        raise MissionParamError(
+            "窗口门限至少为 1：填 0 等于窗口永远不会被放弃，"
+            "于是窗口内真的一个目标都没有时这一轮会在空池子上选靶、一发不派，"
+            "而那句「军力读数已放宽窗口」的告警一个字都不会写。"
+        )
+    return floor
+
+
 def _account_line_limit(value: object) -> int | None:
     """全账号同时能在飞的舰队上限。**留空 = 不施加这道闸**（不是「用某个默认值」）。
 
@@ -4641,27 +4875,6 @@ def _bot_by_military(raw: str) -> bool:
     return bool(_params(raw).get("by_military", False))
 
 
-def _bot_window_floor(raw: str) -> int:
-    """**窗口门限**：窗口内至少要有这么多个目标，这一轮才肯只用窗口内的。
-    默认 `WINDOW_POOL_FLOOR`（用户口径：100）。
-
-    ⚠️ **它不再决定打谁。** 2026-08-18 之前它是「窗口内按军力取前 N 个」那道硬
-    截断，现在第 4 步换成按 `军力 ÷ 往返小时` 排序，截断随之取消
-    （整段理由在 `domain.target_order` 模块头第 4 步）。**别照着旧名字理解它**。
-
-    参数里的键仍叫 `top_n`：生产库里存着的就是这个键，而它只是 `params_json` 里的
-    一个键、没有 DB 列。改名要么写一次迁移、要么让用户配好的数悄悄回落成默认值，
-    两样都比留着一个旧键贵。**页面上的文案改到位就够了**——用户看见的是文案，
-    看不见键名。
-    """
-    value = _params(raw).get("top_n")
-    return (
-        int(value)
-        if isinstance(value, int | float | str) and str(value).strip()
-        else WINDOW_POOL_FLOOR
-    )
-
-
 def _bot_max_score(raw: str) -> float | None:
     """军力上限，超过就不打。没配就是不设限。
 
@@ -4674,41 +4887,47 @@ def _bot_max_score(raw: str) -> float | None:
     return float(value)
 
 
-#: 这个参数从前的名字。**只读不写**，为的是不动生产库里已经存着的那批
-#: `params_json`——页面保存一次就会换成新名字，没保存过的照旧读得出来。
-_LEGACY_SCORE_MAX_AGE_KEY = "rescan_after_hours"
+#: 存量任务的 `params_json` 里可能还存着的那三个键——**有效期与窗口门限从前是
+#: 按任务配的**。2026-08-23 改成全局之后它们**一律被忽略**（用户口径：「军力攻击的
+#: 有效期 门限 改为全局设置，不再根据单个星系进行调整」）。
+#:
+#: `rescan_after_hours` 是有效期最早的名字；`score_max_age_hours` 是它改名之后、
+#: 搬家之前的名字；`top_n` 是窗口门限在 `params_json` 里的键。
+_LEGACY_WINDOW_KEYS = ("score_max_age_hours", "rescan_after_hours", "top_n")
 
 
-def _bot_score_max_age(data: dict[str, Any]) -> timedelta:
-    """军力分数「算不算新」的门槛，也就是选靶第 3 步那扇**窗口**的宽度。
+def _legacy_window_keys(raw: str) -> dict[str, object]:
+    """存量任务参数里还留着的**已失效**的有效期/窗口门限值，键 → 值。
 
-    ⚠️ **语义换过三次，别按任何一个旧名字、旧版本理解它。**
+    ## 为什么是「忽略并告警」，而不是迁移，也不是照旧读
 
-    - 最早叫 `rescan_after_hours`，页面上写「榜单超过 N 小时提示重扫」，真的只是
-      提示：日志记一句，照样拿旧读数派遣。实机 2026-08-17 栽在这上面——用户设的
-      是 1 小时，而 `4:293:6` 顶着 3.6 小时前的读数被打了出去。
-    - 2026-08-17 把它改成硬判据（分数过期的整批跳过）。**那一版更糟**：一个新鲜
-      分数都没有时，候选池退化成「军力完全不参与」，实机当晚连续 2.5 小时如此。
-    - PR #176 又把它降级成提示，选靶交给「时间池」（按读数时间取前 N）。
-      **那一版最糟**：军力榜从强到弱扫，「读数最新」系统性地等价于「军力最弱」，
-      于是「军力优先」选出了全库最弱的一批（实测表在 `domain.target_order`
-      模块头第 3 步）。而用户设的 3 小时仍然什么都不挡——实机 2026-08-18 10:30
-      打了一个读数是 24 小时前的目标。
-    - **现在**：它重新是一道真的筛选，但筛不出足够的目标时会**放弃窗口并打
-      WARNING**，而不是让这一轮空手（`domain.target_order.choose_by_military`）。
+    改成全局之后这两格有唯一的一份取值（`military_attack_config`）。存量的
+    `params_json` 里每个军力任务各存着一份自己的，三条路各有代价：
 
-    ⚠️ **页面文案必须跟着它走。** 同一个数字在页面上和判据里说两件事，正是上面
-    每一次事故共同的形状。
+    - **照旧读**：那就不是全局设置，用户改了攻击配置页也不生效——需求本身没做到。
+    - **自动迁移**（把某个任务的值搬进全局）：库里有多个军力任务，搬哪一份都是替
+      用户拍一个数。拍错的症状是**所有星系一起换了个有效期**，而页面上看不出这个
+      数是从哪来的。这个数该是多少只有用户知道，所以不替他决定。
+    - **忽略并告警**（现在这条）：全局那两列留空 = 跟着代码默认走（2 小时 / 100 个），
+      同时每一轮派遣往 `system_log` 落一条 WARNING，说清「这个任务里存着一个
+      X 小时的旧值，已忽略，这一轮实际用的是全局的 Y 小时」。
 
-    旧名字仍然读得出来（`_LEGACY_SCORE_MAX_AGE_KEY`）：生产库里已经存着一批带旧
-    键的 `params_json`，读不出来就会静默回落到默认值，把用户配好的数悄悄改掉。
+    ⚠️ **判据必须是「这个键在不在」，不能是「它等不等于默认值」。** 后者会把
+    「用户当年就配的 2 小时」判成没配过，于是那条任务永远不告警——而它同样存着
+    一个再也不生效的值，用户同样需要知道这件事。
+
+    ⚠️ **不在这里抛异常，一条路都不许。** 旧值不合法（负数、字符串）只是被忽略；
+    `params_json` 整个读不出来也只是返回空，不往外抛 `MissionParamError`——抛出去
+    会一路走到 `disable_mission_task` 把任务停用、挂上 `disabled_reason`，用户不去
+    页面点一次「恢复」就永远不跑。**这是一条日志用的辅助判据，它没有资格成为派遣
+    链路的一个失败点。** 坏 JSON 在别处（`_bot_by_military` 那条路）已经有自己的
+    善后，那才是该报它的地方。
     """
-    value = data.get("score_max_age_hours", data.get(_LEGACY_SCORE_MAX_AGE_KEY))
-    if value is None:
-        return DEFAULT_SCORE_MAX_AGE
-    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
-        raise MissionParamError("军力分数有效期（小时）必须是正数")
-    return timedelta(hours=float(value))
+    try:
+        params = _params(raw)
+    except MissionParamError:
+        return {}
+    return {key: params[key] for key in _LEGACY_WINDOW_KEYS if key in params}
 
 
 def _bot_tiers(data: dict[str, Any]) -> tuple[MilitaryTier, ...]:
