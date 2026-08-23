@@ -160,7 +160,7 @@
   <div class="missions-control-head">
     <h2 id="tasks-head">军力攻击</h2>
     <span class="muted" style="font-size:11px">
-      按「军力 ÷ 往返小时」选靶 · 拖 ⠿ 调优先级 · 名字按出发点的银河系自动取
+      按「军力 ÷ 往返小时」选靶 · ▲▼ 调优先级 · 名字按出发点的银河系自动取
     </span>
   </div>
   {#
@@ -222,7 +222,7 @@
     ——只置灰不解释，用户只会得出「这页坏了」。
   #}
   <p class="muted" id="mission-hint" style="margin:8px 0 0;font-size:12px">
-    改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。
+    改参数按回车或点别处即保存；复选框控制是否参与调度；▲▼ 调整优先级。
     航线数是**这颗出发星球上**这个任务能占几条——上限按星球各一份，不是账号共享。
     定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、
     也不打断正在跑的那一轮。
@@ -452,7 +452,7 @@
   // 挡不住直接打接口的，只拒不置灰则要用户改完才发现。
   const LOCKED_HINT = '调度器运行中，任务配置已固化，不可修改；点「结束」后可改。'
     + '被自动停用的链路仍可点「恢复」。';
-  const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；拖动 ⠿ 调整优先级。'
+  const EDITABLE_HINT = '改参数按回车或点别处即保存；复选框控制是否参与调度；▲▼ 调整优先级。'
     + '任务名按出发点的银河系自动取，换出发点时跟着改。'
     + '定时开关按 UTC+8 填，留空即不限；它只挡「开新的一轮」，不会去动复选框、'
     + '也不打断正在跑的那一轮。';
@@ -553,9 +553,6 @@
   // 「状态区单独轮询、不刷整页」要躲的坑。标记挂在卡上而不是一个全局开关：
   // 新建出来的那一张必须也能填一次，而那时别的卡早就填过了。
   // 拖拽进行中不重排，否则卡会在手底下跳走。
-  let dragging = null;
-  //: 这一次按下落在哪张卡的 ⠿ 上。不是从把手起的拖动会被 `onCardDragStart` 挡掉。
-  let grabbedHandleRow = null;
 
   function showError(message) {
     errorBox.textContent = message;
@@ -782,26 +779,51 @@
     row.className = 'mission-row mission-card';
     row.dataset.taskId = task.task_id;
     row.dataset.kind = task.kind;
-    row.setAttribute('draggable', fillsGaps ? 'false' : 'true');
+    // ⚠️ **`data-sortable` 而不是 `draggable`。** 拖拽整套换成了上下箭头
+    // （用户口径 2026-08-23：「你还是用上下箭头来调整排序把，不要拖拽方案了」），
+    // 但「这张卡能不能排序」这个判据还得有个挂钩——填空隙的那几条恒在最后一位，
+    // 带 priority 的 PATCH 打到它们身上一律 400。
+    row.dataset.sortable = fillsGaps ? 'false' : 'true';
 
     // 主行：一张卡一行。次序即用户从左往右读的次序。
     const line = document.createElement('div');
     line.className = 'mission-line';
     row.append(line);
 
-    // 排序把手。扫描与军力榜恒在最后一位，拖不动。
-    const handle = document.createElement('span');
+    // 排序控件：**上下箭头**，一次点击和上/下那张卡换个位置。
+    //
+    // ⚠️ **原先是拖拽（⠿），换掉了。** 用户口径（2026-08-23）：
+    // 「你还是用上下箭头来调整排序把，不要拖拽方案了」。
+    //
+    // 拖拽在这一页上试了三轮都没成：整张卡可拖会把「想选输入框里的文字」变成一次
+    // 重排；收窄到只有把手能起拖之后，那个字形只有 11×23px，实际结果是拖不动；
+    // 撑大靶子加缓存指纹之后用户报的仍是拖不动，而我在真浏览器里复现不出来。
+    // 箭头没有这一整类问题：靶子是个真按钮、点了就是点了、不依赖 HTML5 拖拽的
+    // 那套事件时序，也不会被缓存里的旧 CSS 骗（光标提示不再是唯一的可见线索）。
+    //
+    // **顺带解决了另一件事**：拖拽那一版每次都要给这一块里**每张卡**各发一个
+    // PATCH（重排会动到一整段的 priority）；换成两两交换之后一次点击只发 **2 个**。
+    const order = document.createElement('span');
+    order.className = 'mission-order';
     if (fillsGaps) {
-      handle.className = 'muted';
-      handle.title = '填空隙的链路恒在最后一位，不参与排序';
-      handle.textContent = '·';
+      order.classList.add('muted');
+      order.title = '填空隙的链路恒在最后一位，不参与排序';
+      order.textContent = '·';
+      order.setAttribute('aria-hidden', 'true');
     } else {
-      handle.className = 'drag-handle';
-      handle.title = '拖拽调整优先级';
-      handle.textContent = '⠿';
+      for (const [cls, glyph, word] of [['mission-up', '▲', '上移'], ['mission-down', '▼', '下移']]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = cls;
+        button.textContent = glyph;
+        // ⚠️ 有可读的名字，不是 `aria-hidden` 的装饰字符：它现在是个真按钮，
+        // 键盘能 Tab 到、读屏要念得出。
+        button.setAttribute('aria-label', `${word}「${task.label}」`);
+        button.title = `${word}（调整优先级）`;
+        order.append(button);
+      }
     }
-    handle.setAttribute('aria-hidden', 'true');
-    line.append(handle);
+    line.append(order);
 
     const checkbox = makeInput('mission-enabled', { type: 'checkbox' });
     checkbox.setAttribute('aria-label', `让「${task.label}」参与调度`);
@@ -1254,7 +1276,7 @@
         .filter((task) => (CARD_BOXES[task.kind] || CARD_BOXES.BOT) === box)
         .map((task) => task.task_id);
       const shown = [...box.querySelectorAll('.mission-row')].map((row) => row.dataset.taskId);
-      if (!dragging && wanted.join(',') !== shown.join(',')) {
+      if (wanted.join(',') !== shown.join(',')) {
         for (const taskId of wanted) {
           const row = rowFor(taskId);
           if (row) box.append(row);
@@ -1266,6 +1288,22 @@
     hint.textContent = locked ? LOCKED_HINT : EDITABLE_HINT;
     renderFreeze(state.frozen_config, locked);
     document.getElementById('btn-new-task').disabled = locked;
+
+    // ⚠️ **首尾两端的箭头要真的禁用。** 点一个无处可去的箭头会发出一个把
+    // priority 设成它自己的 PATCH——不报错、不改变任何东西，但用户看到的是
+    // 「点了没反应」，和「坏了」分不开。
+    //
+    // 每一块各自算首尾：海盗摆在另一块里，把两块拼起来算的话，bot 段最后一张的
+    // ▼ 会看着可点，而点下去要么越块、要么打到填空隙那几张身上（一律 400）。
+    for (const box of BOXES) {
+      const sortable = [...box.querySelectorAll('.mission-row[data-sortable="true"]')];
+      sortable.forEach((row, index) => {
+        const up = row.querySelector('.mission-up');
+        const down = row.querySelector('.mission-down');
+        if (up) up.disabled = index === 0;
+        if (down) down.disabled = index === sortable.length - 1;
+      });
+    }
 
     for (const task of state.tasks) {
       const row = rowFor(task.task_id);
@@ -1348,11 +1386,9 @@
         removeButton.hidden = siblings <= 1;
         removeButton.disabled = locked;
       }
-      // 填空隙的那几张本来就不能拖，锁上之后别的也不能。`dragstart` 认的就是
-      // 这个属性，所以改它就等于真的拖不动，不是只把把手画灰。
-      row.setAttribute('draggable', locked || FILLS_GAPS.includes(task.kind) ? 'false' : 'true');
-      const handle = row.querySelector('.drag-handle');
-      if (handle) handle.style.opacity = locked ? '0.35' : '';
+      // 填空隙的那几张本来就不能排序，锁上之后别的也不能。`moveCard` 认的就是
+      // 这个属性，所以改它就等于真的动不了，不是只把箭头画灰。
+      row.dataset.sortable = locked || FILLS_GAPS.includes(task.kind) ? 'false' : 'true';
 
       const chip = row.querySelector('.mission-status');
       const tone = STATUS_TONES[task.status] || '';
@@ -1787,6 +1823,14 @@
     const row = event.target.closest('.mission-row');
     if (!row) return;
     const taskId = row.dataset.taskId;
+    if (event.target.closest('.mission-up')) {
+      moveCard(row, -1);
+      return;
+    }
+    if (event.target.closest('.mission-down')) {
+      moveCard(row, 1);
+      return;
+    }
     if (event.target.closest('.mission-new-round')) command(`/api/missions/${taskId}/new-round`);
     // 走的是和复选框同一个 PATCH：`enabled: true` 顺带清掉停用原因与失败计数，
     // 而参数不合格的任务照样会被 400 拦下（错误显示在下面那条红字里）。
@@ -1874,90 +1918,44 @@
 
   // ---- 拖拽排序 -----------------------------------------------------------
   //
-  // 填空隙的那几张 draggable="false"，而且这里还挡住「把别人拖到它后面」：
-  // PATCH 带 priority 打到它们身上一律 400，用户不该拖完了才发现。
-  //
-  // ⚠️ **只在同一块容器里重排。** 海盗现在摆在页面底部的「其他链路」，
-  // 和 bot 攻击不在同一块里——把两块拼起来算次序的话，随便拖一下 bot 就会
-  // 把海盗的优先级压到所有 bot 之后，而用户根本没碰海盗那张卡。
+  // ⚠️ **上下箭头，不是拖拽。** 用户口径（2026-08-23）：
+  // 「你还是用上下箭头来调整排序把，不要拖拽方案了」。整套 HTML5 拖拽
+  // （`dragstart` / `dragover` / `dragend` / `drop`，以及为「只有把手能起拖」加的
+  // `pointerdown` 那道闸）连同 `.drag-handle` 一起删了，别再照着旧版本加回来。
 
-  function onCardPointerDown(event) {
-    // ⚠️ **`closest` 而不是 `matches`**：把手里就一个字符，但 `aria-hidden` 与
-    // 将来可能加的图标都会让 `event.target` 落在它的子节点上。
-    grabbedHandleRow = event.target.closest('.drag-handle')
-      ? event.target.closest('.mission-row')
-      : null;
-  }
+  function moveCard(row, delta) {
+    const box = row.parentNode;
+    // ⚠️ **只在同一块容器里换。** 海盗摆在页面底部的「其他链路」，和 bot 攻击不在
+    // 同一块里——把两块拼起来算次序的话，动一下 bot 就会把海盗的优先级压到所有
+    // bot 之后，而用户根本没碰海盗那张卡。
+    const sortable = [...box.querySelectorAll('.mission-row[data-sortable="true"]')];
+    const at = sortable.indexOf(row);
+    const other = sortable[at + delta];
+    if (at < 0 || !other) return undefined;
 
-  function onCardDragStart(event) {
-    const row = event.target.closest('.mission-row');
-    if (!row || row.getAttribute('draggable') !== 'true') return;
-    // ⚠️ **只有按在 ⠿ 上才算起拖。**
-    //
-    // 用户口径（2026-08-23）：「整张卡都能拖，应只有 ⠿ 能拖」。
-    // `draggable` 只能设在**被拖的那个元素**上（要拖的是整张卡，不是把手），
-    // 所以限制不了起拖点——得在这里把「不是从把手起的」那些拖动挡掉。
-    //
-    // 挡的是真实的误操作：卡上有下拉框、数字输入框和一串文字，想选中输入框里的
-    // 文字、或者想划选那行说明时，按下去一移动就变成了一次重排——而重排会给
-    // 这一块里每张卡各发一个 PATCH，用户根本没想改优先级。
-    if (grabbedHandleRow !== row) {
-      event.preventDefault();
-      return;
-    }
-    dragging = row;
-    event.dataTransfer.effectAllowed = 'move';
-    // Firefox 不带数据的拖拽根本起不来。
-    event.dataTransfer.setData('text/plain', row.dataset.taskId);
-  }
+    // ⚠️ **交换两张卡原有的那两个 priority 值，不重排整段。**
+    // 拖拽那一版是「把这一块里原有的那些值升序发给新的排列」，于是一次操作要给
+    // 每张卡各发一个 PATCH。两两交换只动两张卡，也同样不会碰到别的容器里那些
+    // 任务的相对位置（它们的 priority 本来可能夹在两个 bot 之间）。
+    const mine = Number(row.dataset.priority);
+    const theirs = Number(other.dataset.priority);
+    // 值不是整数说明页面上这两张卡的 priority 还没跟库对齐（刚建出来、或者上一次
+    // PATCH 失败了）。这时候交换会写出两个凭空来的数，所以宁可什么都不做、
+    // 拉一次最新状态。
+    if (!Number.isInteger(mine) || !Number.isInteger(theirs)) return refresh();
+    if (mine === theirs) return refresh();
 
-  function onCardDragOver(event) {
-    const row = event.target.closest('.mission-row');
-    if (!dragging || !row || row === dragging) return;
-    if (row.parentNode !== dragging.parentNode) return;  // 不跨节拖
-    if (row.getAttribute('draggable') !== 'true') return;  // 填空隙的恒在最后
-    event.preventDefault();
-    const box = row.getBoundingClientRect();
-    const before = event.clientY < box.top + box.height / 2;
-    row.parentNode.insertBefore(dragging, before ? row : row.nextSibling);
-  }
-
-  function onCardDragEnd() {
-    grabbedHandleRow = null;
-    if (!dragging) return;
-    const box = dragging.parentNode;
-    dragging = null;
-    // 只给这一块里能排序的那些卡下发新次序，而且**只把它们原有的那几个
-    // priority 值重新分配一遍**（升序发给新的排列）。直接发 0..n-1 的话，
-    // 别的容器里那些任务（海盗）的相对位置会被悄悄改掉——它们的 priority
-    // 本来可能夹在两个 bot 之间。
-    const movable = [...box.querySelectorAll('.mission-row[draggable="true"]')];
-    const slots = movable
-      .map((row) => Number(row.dataset.priority))
-      .filter((value) => Number.isInteger(value))
-      .sort((a, b) => a - b);
-    if (slots.length !== movable.length) return refresh();
-    return movable
-      .reduce(
-        (chain, row, index) => chain.then(() => patch(row.dataset.taskId, { priority: slots[index] })),
-        Promise.resolve(),
-      )
-      .then(refresh);
+    // ⚠️ **两个 PATCH 之间有一瞬两张卡同分。** 串行发是有意的：并发发两个的话，
+    // 后端按到达顺序写，谁先落地不定，而这两个值互为对方的目标——交叉之后
+    // 两张卡会一起变成同一个数，次序彻底丢掉。串行则最坏只是中间那一瞬同分，
+    // 而调度那一侧本来就要在同分时按 id 决定先后。
+    return patch(row.dataset.taskId, { priority: theirs })
+      .then(() => patch(other.dataset.taskId, { priority: mine }));
   }
 
   for (const box of BOXES) {
     box.addEventListener('click', onCardClick);
     box.addEventListener('change', onCardChange);
-    // ⚠️ **`pointerdown` 必须排在 `dragstart` 之前记下起拖点**：浏览器是先派
-    // `pointerdown`、再在拖动真正开始时派 `dragstart`，所以到 `dragstart` 时
-    // 这个值已经就位。用 `pointerdown` 而不是 `mousedown`，触屏上也算。
-    box.addEventListener('pointerdown', onCardPointerDown);
-    box.addEventListener('dragstart', onCardDragStart);
-    box.addEventListener('dragover', onCardDragOver);
-    // 卡已经在 dragover 里就位了，这里只是把浏览器的默认落点行为挡掉——
-    // 不挡的话，某些浏览器会拿 text/plain 的内容当地址栏输入。
-    box.addEventListener('drop', (event) => event.preventDefault());
-    box.addEventListener('dragend', onCardDragEnd);
   }
 
   // 只有上一轮读完才排下一轮。固定间隔会在慢查询尚未返回时再叠一轮 GET；浏览器
