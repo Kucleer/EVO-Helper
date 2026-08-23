@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from evo_helper.domain.models import Coordinate, FleetPresetRef
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
@@ -44,17 +46,54 @@ from evo_helper.domain.scheduler import quota_day_start_utc
 from evo_helper.storage import models as orm
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.tools import pirate_loop as pirate_loop_module
 from evo_helper.tools.pirate_loop import LoopOptions, Outcome, PirateLoop, TargetCheck
 from support.database import scratch_database_url
 
 ORIGIN = Coordinate(2, 137, 18)
 SYSTEM = (2, 137)
 
-#: 日界走的就是活链路那一份，不另写 `replace(hour=0)`——那正是这条链路
-#: 不许自己写的东西（理由整段在 `domain.scheduler.quota_day_start_utc`）。
-DAY_START = quota_day_start_utc(datetime.now(UTC))
+#: ⚠️ **时刻全部从这个固定瞬间推，绝不读墙上时钟。**
+#:
+#: 2026-08-23 00:06 UTC 的 CI 上红过一次：`test_a_target_scouted_today_is_not_
+#: scouted_again` 期望「今天已侦察 → 不再派」，实际多出一发 `scout 1`。
+#: 根因是两侧的「今天」来自**不同的瞬间**——
+#:
+#:     这里的 DAY_START     ：模块**导入**时读一次 `datetime.now(UTC)`
+#:     被测循环的 day_start ：`_daily_progress` 在**执行**时读 `datetime.now(UTC)`
+#:
+#: 那一趟 CI 收集模块在 08-22 23:5x、跑到这条用例已是 08-23 00:06，于是夹具种下的
+#: 「今天」成了循环眼里的「昨天」，去重当然不生效。**只在跨 UTC 零点的那一小段
+#: 时间里红**，平时怎么跑都是绿的——这种测试比没有测试更费人。
+#:
+#: 日界仍旧走活链路那一份 `quota_day_start_utc`，不另写 `replace(hour=0)`
+#: （理由整段在 `domain.scheduler.quota_day_start_utc`；那个函数自己在
+#: `tests/unit/domain/test_scheduler.py` 里有用例）。这里钉住的只是**读时钟的那一刻**。
+NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+DAY_START = quota_day_start_utc(NOW)
 TODAY = DAY_START + timedelta(minutes=1)
 YESTERDAY = DAY_START - timedelta(minutes=1)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把被测链路的时钟钉在 `NOW` 上。
+
+    `tools.pirate_loop` 对 `datetime` 的用法**只有 `datetime.now`**（14 处，
+    没有构造器、没有 `min`/`max`），所以换掉整个名字是安全的，而且比逐处
+    monkeypatch 更难漏。
+
+    ⚠️ 钉的是时钟，**不是** `quota_day_start_utc`。把那个函数换掉就等于让这一组
+    用例不再验证真实的日界口径，而「本地日历天 vs UTC 日」正是它存在的全部理由。
+    """
+
+    class _FrozenDatetime:
+        @staticmethod
+        def now(tz: Any = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)
+
+    monkeypatch.setattr(pirate_loop_module, "datetime", _FrozenDatetime)
+
 
 #: 四格都读到、都有实打实的舰队 → 判定「打」。
 HAS_FLEET = {"深空吞噬者": 8, "噬能截击者": 4, "钛能守卫者": 1, "收割者": 0}
