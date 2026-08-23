@@ -47,6 +47,7 @@ bot 坐标的成本从「逐坐标导航读面板」降到「一屏读 13 行」
 from __future__ import annotations
 
 import re
+import statistics
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -273,6 +274,105 @@ def descending_breaks(scores: Sequence[float | None]) -> list[int]:
         else:
             last = score
     return breaks
+
+
+#: 相邻两行的军力值最多允许跌掉几倍。超过就是读错了，不是榜单真的这么陡。
+#:
+#: 榜单按军力降序，而**相邻名次的差极小**：语料 15 屏实测跨 12 行只从 10,610
+#: 跌到 10,470（1.3%），整段 570 名也只从 10.6K 跌到 9.5K（约 10%）。
+#:
+#: 而**丢首位**那类读错正好是 10 倍：2026-08-23 生产实测有整三屏把 `11.75K` /
+#: `11.41K` / `11.11K` 读成 `1.75K` / `1.41K` / `1.11K`——屏内 1,750 → 1,600
+#: 自成完好的降序，`descending_breaks` 一个都没抓到，而上一屏末尾是 13,200、
+#: 下一屏开头是 10,980。
+#:
+#: 取 5 是留在两者之间：真实跌幅到不了 5 倍，丢首位必然是 10 倍。
+#:
+#: ⚠️ **不要往 2 附近调。** 真人段与 bot 段交界处可能有真实的断崖，
+#: 而误判的代价是把一批好读数丢成估算值。
+SCORE_CLIFF_FACTOR = 5.0
+
+
+def trusted_scores(
+    scores: Sequence[float | None],
+    *,
+    anchor: float | None = None,
+    cliff_factor: float = SCORE_CLIFF_FACTOR,
+) -> list[float | None]:
+    """把不可信的军力读数换成 `None`：**比上一个可信值大**（破坏降序），
+    或者**比它跌掉 `cliff_factor` 倍以上**（丢了首位）。
+
+    ## ⚠️⚠️ `anchor` 是上一屏最后一个可信值，它是这道判据的要害
+
+    原先只有 `descending_breaks`，而它是**按屏**跑的——于是**每屏的第一行没有
+    任何约束**，跨屏的断层也完全看不见。2026-08-23 生产实测两种漏网，都是 10 倍，
+    而且方向相反：
+
+        93,670  落在它那一屏的**第一行**，屏内没有前一个可比，直接落库
+                （真值约 9,670；小数点被读成了一个数字，语料里见过 `9.87K` → `93.87K`）
+        1,750 / 1,412 / 1,112  是**整三屏**偏小 10 倍，屏内自成完好的降序
+
+    两者都是 10 的整数倍，所以 `tools.ranking_scan.renderable_score` 也放过了。
+    把上一屏的锚点带进来，两个方向一并挡住。
+
+    ⚠️ **锚点只跟着可信值走。** 一个被判为不可信的读数不许当下一个的基准，
+    否则一次读错会把它后面整段拖着一起判错。
+
+    ⚠️ **只判「不可信」，不猜真值。** 丢了首位的那些看起来像 `1.75K`，
+    真值是 `11.75K` 还是 `1.75K` 这一层答不了——乘 10 补回去就是在猜，
+    而这个仓有硬规矩：猜出来的数不许长得像量出来的。所以交 `None`，
+    由 `interpolate_scores` 用上下邻居补中点、并由调用方标成估算。
+    """
+    # ⚠️ **没有锚点时用这一屏的中位数起头，不能用第一个读数。**
+    #
+    # 整趟的第一屏没有上一屏可依，而拿第一个读数当基准会让一个偏大的首行
+    # 把它后面整屏拖着一起判错：`[93670, 9650, 9640]` 里 93,670 当上基准之后，
+    # 9,650 和 9,640 都成了「跌掉 10 倍」——比不加这道判据还差。
+    #
+    # 中位数抗单点异常（一个坏值动不了它），而它只用来起头：第一个可信值一出现，
+    # 基准就交给它。
+    #
+    # ⚠️ 这条成立的前提是**同一屏内军力值差得很近**（实测跨 12 行只差 1.3%），
+    # 而这个前提只在采集段成立——榜首那几屏能从 5.97M 跌到十万级。
+    # `targets_from_rows` 只在采集段被调用（那时早已滚进 bot 段），所以够用。
+    # ⚠️⚠️ **0 永远不许当基准。**
+    #
+    # 榜上真有 0 分行（`[638] GoudanLi --- 0`），而 0 当上基准会造成一个**吸收态**：
+    # `basis = 0` 之后任何正读数都撞上 `too_big`（`score > 0 * 5`）被丢，
+    # 而 0 自己因为 `basis > 0` 那半句不成立反而被采信；于是锚点交出 0，
+    # 下一屏所有正值都「大于锚点」被全丢，整屏不可信又让锚点**沿用** 0 ——
+    # 此后每一屏全空，而且不报错。症状正是这道判据本该治的那类静默失败。
+    #
+    # 所以基准只跟着**正的**可信值走。0 仍然可以被采信（没有正基准时），
+    # 它只是不参与定基准。
+    #
+    # ⚠️ 这不影响「军力不等于 0」那条 bot 判据：`targets_from_rows` 喂给
+    # `is_bot_entry` 的是**原始读数** `row.score`，不是这里的结果。
+    positive = [score for score in scores if score is not None and score > 0]
+    # **降序基准**只能是真正的前一行：没有锚点时第一行的顺序无从约束（本来也是），
+    # 拿中位数充当前一行会误伤——一屏里最大的那个天然高于中位数。
+    last = anchor if anchor else None
+    # **断崖基准**两个方向都按倍数判，所以没有锚点时可以拿中位数起头：
+    # 它抗单点异常（一个坏值动不了它），够挡住整趟第一屏那个偏大的首行。
+    # 取正值的中位数——理由见上面那段。
+    basis = anchor if anchor else (statistics.median(positive) if positive else None)
+
+    trusted: list[float | None] = []
+    for score in scores:
+        if score is None:
+            trusted.append(None)
+            continue
+        out_of_order = last is not None and score > last
+        too_big = basis is not None and score > basis * cliff_factor
+        too_small = basis is not None and score * cliff_factor < basis
+        if out_of_order or too_big or too_small:
+            trusted.append(None)
+            continue
+        trusted.append(score)
+        if score > 0:
+            last = score
+            basis = score
+    return trusted
 
 
 def interpolate_scores(scores: Sequence[float | None]) -> list[float | None]:
@@ -507,8 +607,10 @@ __all__ = [
     "calibrated_blind_rows",
     "calibrated_blind_scrolls",
     "coordinate_of",
+    "SCORE_CLIFF_FACTOR",
     "descending_breaks",
     "rows_skipped",
+    "trusted_scores",
     "interpolate_scores",
     "is_bot_coordinate",
     "is_bot_entry",

@@ -554,6 +554,8 @@
   // 新建出来的那一张必须也能填一次，而那时别的卡早就填过了。
   // 拖拽进行中不重排，否则卡会在手底下跳走。
   let dragging = null;
+  //: 这一次按下落在哪张卡的 ⠿ 上。不是从把手起的拖动会被 `onCardDragStart` 挡掉。
+  let grabbedHandleRow = null;
 
   function showError(message) {
     errorBox.textContent = message;
@@ -1879,9 +1881,30 @@
   // 和 bot 攻击不在同一块里——把两块拼起来算次序的话，随便拖一下 bot 就会
   // 把海盗的优先级压到所有 bot 之后，而用户根本没碰海盗那张卡。
 
+  function onCardPointerDown(event) {
+    // ⚠️ **`closest` 而不是 `matches`**：把手里就一个字符，但 `aria-hidden` 与
+    // 将来可能加的图标都会让 `event.target` 落在它的子节点上。
+    grabbedHandleRow = event.target.closest('.drag-handle')
+      ? event.target.closest('.mission-row')
+      : null;
+  }
+
   function onCardDragStart(event) {
     const row = event.target.closest('.mission-row');
     if (!row || row.getAttribute('draggable') !== 'true') return;
+    // ⚠️ **只有按在 ⠿ 上才算起拖。**
+    //
+    // 用户口径（2026-08-23）：「整张卡都能拖，应只有 ⠿ 能拖」。
+    // `draggable` 只能设在**被拖的那个元素**上（要拖的是整张卡，不是把手），
+    // 所以限制不了起拖点——得在这里把「不是从把手起的」那些拖动挡掉。
+    //
+    // 挡的是真实的误操作：卡上有下拉框、数字输入框和一串文字，想选中输入框里的
+    // 文字、或者想划选那行说明时，按下去一移动就变成了一次重排——而重排会给
+    // 这一块里每张卡各发一个 PATCH，用户根本没想改优先级。
+    if (grabbedHandleRow !== row) {
+      event.preventDefault();
+      return;
+    }
     dragging = row;
     event.dataTransfer.effectAllowed = 'move';
     // Firefox 不带数据的拖拽根本起不来。
@@ -1900,6 +1923,7 @@
   }
 
   function onCardDragEnd() {
+    grabbedHandleRow = null;
     if (!dragging) return;
     const box = dragging.parentNode;
     dragging = null;
@@ -1924,6 +1948,10 @@
   for (const box of BOXES) {
     box.addEventListener('click', onCardClick);
     box.addEventListener('change', onCardChange);
+    // ⚠️ **`pointerdown` 必须排在 `dragstart` 之前记下起拖点**：浏览器是先派
+    // `pointerdown`、再在拖动真正开始时派 `dragstart`，所以到 `dragstart` 时
+    // 这个值已经就位。用 `pointerdown` 而不是 `mousedown`，触屏上也算。
+    box.addEventListener('pointerdown', onCardPointerDown);
     box.addEventListener('dragstart', onCardDragStart);
     box.addEventListener('dragover', onCardDragOver);
     // 卡已经在 dragover 里就位了，这里只是把浏览器的默认落点行为挡掉——
