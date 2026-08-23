@@ -17,6 +17,7 @@ from evo_helper.domain.ranking import (
     is_bot_entry,
     mentions_bot,
     repair_ranks,
+    rows_skipped,
 )
 
 #: 实机军事榜那一屏（`ScreenShot_2026-08-14_113055`），名次 639–650。
@@ -321,3 +322,57 @@ def test_interpolated_scores_must_not_be_fed_to_this_judge() -> None:
     filled = interpolate_scores([100.0, None, 50.0])
     assert filled[1] == 75.0
     assert is_bot_entry(coordinate, filled[1])  # 信号被擦掉了，所以别传这个
+
+
+# -- 这一屏接得上上一屏吗（重叠自查）-------------------------------------------
+
+
+def test_an_overlapping_screen_reports_no_gap() -> None:
+    """一次拖动推进得比一屏少时，本屏首行**回头**落在上屏里——这是常态。
+
+    实测推进 4–12 行而可见 13–14 行，所以大多数屏的首行名次都小于上屏末行名次。
+    这种情形答案必须是 0（「一名都没漏」），不是一个负数：负数会被
+    `if skipped:` 当成真值，于是每一屏都报一次「漏掉 -5 名」。
+    """
+    assert rows_skipped(857, 850) == 0
+    assert rows_skipped(857, 857) == 0
+
+
+def test_the_very_next_rank_is_continuous_not_a_gap() -> None:
+    """⚠️ **边界：末行 850、首行 851 中间什么都没有。**
+
+    榜单名次严格连续（`repair_ranks` 的全部依据），所以 851 紧接着 850。
+    这里差一就意味着**每一屏都凭空报漏 1 名**——而一条天天喊的告警等于
+    没有告警，真断的那次也就没人看了。
+    """
+    assert rows_skipped(850, 851) == 0
+    assert rows_skipped(850, 852) == 1
+
+
+def test_a_real_gap_is_counted_by_name_not_by_screen() -> None:
+    """推进 12 行那一屏（2026-08-23 实机十屏里最狠的一次）重叠只剩 1–2 行。
+
+    再多漂一点重叠就断了，而断掉的那几名**压根没被读过**：采集段只按坐标去重，
+    「采到的 bot 数」看起来完全正常。这个数是那次静默失败唯一的痕迹，
+    所以它数的是**名次**（漏了几个 bot），不是「漏了几屏」。
+    """
+    assert rows_skipped(853, 860) == 6
+    assert rows_skipped(639, 651) == 11
+
+
+def test_an_unreadable_rank_answers_i_do_not_know_instead_of_no_gap() -> None:
+    """⚠️⚠️ **`None` 不是 0，这条是整道判据的要害。**
+
+    名次读不出有两个常态来源：榜首三名是奖章图标（`rows_from_image` 那条用例），
+    以及 OCR 漏认。那时正确答案是「不知道」——答 0 就等于宣布「重叠完好」，
+    于是**恰恰是最可疑的那几屏（连名次都读不出的）会伪装成最干净的**。
+
+    下一个人一定会想把它写成 `max(0, ...)` 配上 `or 0` 把 `None` 抹平，
+    这条用例就是拦它的。
+    """
+    assert rows_skipped(None, 851) is None
+    assert rows_skipped(850, None) is None
+    assert rows_skipped(None, None) is None
+    # 写成 `is None` 而不是 `== 0`：`None == 0` 为假，但 `not None` 与 `not 0`
+    # 都是真——只在真值上断言的话，把 None 换成 0 的实现照样绿。
+    assert rows_skipped(850, 851) == 0

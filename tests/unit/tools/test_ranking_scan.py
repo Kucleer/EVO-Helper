@@ -8,20 +8,27 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import RankingRow
 from evo_helper.domain.records import RankingTarget
 from evo_helper.game.ranking_ui import (
     NAME_COLUMN,
     RANK_COLUMN,
+    RANKING_LIST_MAX_Y,
+    ROW_CROP_HALF_HEIGHT,
     ROW_FIRST_Y,
     ROW_PITCH_PX,
+    ROWS_PER_SCREEN,
     SCORE_COLUMN,
     SELF_ROW_BOTTOM_Y,
 )
 from evo_helper.tools.ranking_scan import (
+    first_rank_of,
     is_self_row,
     keep_screens,
+    last_rank_of,
     name_column_text,
     parse_score,
     progress_mark,
@@ -33,12 +40,69 @@ from evo_helper.tools.ranking_scan import (
 
 NOW = datetime(2026, 8, 14, tzinfo=UTC)
 
+#: 假 `image_to_data` 的表头。列序照 tesseract 的 TSV 原样排：`_words_with_boxes`
+#: 只取 6–9（left/top/width/height）、10（conf）、11（text），但它对**列数少于 12**
+#: 的行整行跳过，所以前面那六列必须占位齐全，不能只给用得上的那几列。
+_TSV_HEADER = (
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+)
+
+#: 假词框的尺寸（原图像素）与置信度。高度要小于 `ROW_CROP_HALF_HEIGHT × 2`，
+#: 否则「裁剪窗口装得下一整行字」这个前提本身就不成立。置信度取高值：
+#: `COLUMN_WORD_MIN_CONF` 那道闸不是这些用例要考的东西。
+_WORD_HEIGHT_PX = 20
+_WORD_WIDTH_PX = 40
+_WORD_CONF = "96.00"
+
+#: 裁剪中心偏离**实际**行中心超过这个数，`--psm 7` 就整格读不出来。
+#:
+#: ⚠️ 这是替身里最要紧的一笔，别为了让用例好过而放宽它。2026-08-23 语料实测的
+#: 门槛约 13px：±`ROW_CROP_HALF_HEIGHT`(15) 的窗口一旦偏出这么多就把字切掉一截，
+#: 那一格整格读不出。替身要是「不管裁在哪都照样把文字交出来」，那么
+#: 「整屏漂了 21px」那几条用例在**旧的按网格裁剪**的实现上也会绿——护栏就成了摆设。
+_CELL_READ_TOLERANCE_PX = 13.0
+
+
+def _tsv(words: list[tuple[float, int, str]], *, top_offset: int, upscale: int = 3) -> str:
+    """把 `(原图 y 中心, 列内 x 左沿, 文本)` 编回 tesseract 的 TSV。
+
+    坐标要**反着**走 `_words_with_boxes` 的换算：TSV 里的数是放大过的裁剪块里的
+    坐标，所以先减掉裁剪偏移再乘放大倍数。取整带来的误差不到 1/6 像素。
+    """
+    lines = [_TSV_HEADER]
+    height = _WORD_HEIGHT_PX * upscale
+    for y, x, text in words:
+        top = round((y - top_offset) * upscale - height / 2)
+        lines.append(
+            "\t".join(
+                [
+                    "5",  # level：词一级
+                    "1",  # page_num
+                    "1",  # block_num
+                    "1",  # par_num
+                    "1",  # line_num
+                    "1",  # word_num
+                    str(x * upscale),
+                    str(top),
+                    str(_WORD_WIDTH_PX * upscale),
+                    str(height),
+                    _WORD_CONF,
+                    text,
+                ]
+            )
+        )
+    return "\n".join(lines)
+
 
 class _Cell:
-    """假裁剪块。记下自己被 `convert` 成了什么模式——配方的一部分。"""
+    """假裁剪块。记下自己被 `convert` 成了什么模式——配方的一部分。
 
-    def __init__(self, text: str, log: list[str]) -> None:
+    `text` 是 `image_to_string` 拿到的东西，`tsv` 是 `image_to_data` 拿到的东西。
+    """
+
+    def __init__(self, text: str, log: list[str], *, tsv: str = "") -> None:
         self.text = text
+        self.tsv = tsv
         self.width = 20
         self.height = 20
         self._log = log
@@ -52,38 +116,114 @@ class _Cell:
 
 
 class _Image:
-    """按 y 摆行的假面板。`rows` 是 {行号: (名次文字, 名字, 分数文字)}。"""
+    """按 y 摆行的假面板。`rows` 是 {行号: (名次文字, 名字, 分数文字)}。
 
-    def __init__(self, rows: dict[int, tuple[str, str, str]]) -> None:
+    `offset` 是**整屏行位置相对行网格的偏移**（像素）：第 k 行的真实中心是
+    `ROW_FIRST_Y + k × ROW_PITCH_PX + offset`。它不是替身多给的一个自由度，
+    是这一层要治的病本身——2026-08-23 语料里这个偏移每屏 -7.5px、以行距为模回绕。
+
+    `off_grid` 是名字列上**不在行网格上**的字：`((y, 文本), ...)`。屏上真有两种
+    ——固定的标题行（y≈235.7）和透过半透明面板的星球地表文字（y 落在两行之间）。
+    它们跟着整列那一次 OCR 一起被读进来，所以替身必须交得出它们，否则「这两样
+    到底被谁挡住的」根本没法验。它们**不随 `offset` 漂**：一个是固定 UI，
+    一个是底下那一层画面。
+    """
+
+    def __init__(
+        self,
+        rows: dict[int, tuple[str, str, str]],
+        *,
+        offset: float = 0.0,
+        off_grid: tuple[tuple[float, str], ...] = (),
+    ) -> None:
         self.rows = rows
+        self.offset = offset
+        self.off_grid = off_grid
         self.modes: list[str] = []
+        #: 逐格裁的窗口（名字、名次、军力）。
         self.crops: list[tuple[int, int, int, int]] = []
+        #: 整条名字列裁的窗口。跟 `crops` 分开记：它比一行高得多，混在一起会把
+        #: 「每一格都裁得比行距窄」那条断言变成永远为假。
+        self.strips: list[tuple[int, int, int, int]] = []
+
+    def centre_of(self, index: int) -> float:
+        """第 `index` 行的**真实**中心 y（含整屏偏移）。"""
+        return ROW_FIRST_Y + index * ROW_PITCH_PX + self.offset
+
+    def _words(self, top: int, bottom: int) -> list[tuple[float, int, str]]:
+        """落在 `[top, bottom]` 之间的名字列词框。
+
+        坐标口径同 `_words_with_boxes` 交出来的那份：y 是原图的，x 是**列内**的
+        左沿（那一步没有加回裁剪偏移，因为它只用来排左右顺序）。
+
+        ⚠️ **名字读不出来的行照样交得出词框。** 行在那儿、整列 `--psm 6` 认得出
+        有个词，而逐格 `--psm 7` 读出来是空的——这是实机常态，也正是
+        `rows_from_image` 里 `if not name` 那一支要挡的东西。替身要是「名字为空
+        就连位置都不给」，那一支就永远没人走过。
+        """
+        placed = [
+            (self.centre_of(index), name or "~") for index, (_r, name, _s) in self.rows.items()
+        ]
+        words: list[tuple[float, int, str]] = []
+        for centre, text in sorted(placed + [(y, t) for y, t in self.off_grid]):
+            if not top <= centre <= bottom:
+                continue
+            words.extend(
+                (centre, order * _WORD_WIDTH_PX, token) for order, token in enumerate(text.split())
+            )
+        return words
 
     def crop(self, box: tuple[int, int, int, int]) -> _Cell:
-        self.crops.append(box)
         left, top, _right, bottom = box
+        if left == NAME_COLUMN[0] and bottom - top > ROW_PITCH_PX:
+            # 整条名字列：`locate_rows` 从这里走 `image_to_data` 量行位置，
+            # `name_column_text` 从这里走 `image_to_string` 只要文本。
+            self.strips.append(box)
+            words = self._words(top, bottom)
+            text = "\n".join(token for _y, _x, token in words)
+            return _Cell(text, self.modes, tsv=_tsv(words, top_offset=top))
+        self.crops.append(box)
         centre = (top + bottom) / 2
-        index = round((centre - ROW_FIRST_Y) / ROW_PITCH_PX)
-        cells = self.rows.get(index)
-        if cells is None:
-            return _Cell("", self.modes)
         column = {RANK_COLUMN[0]: 0, NAME_COLUMN[0]: 1, SCORE_COLUMN[0]: 2}.get(left)
-        return _Cell("" if column is None else cells[column], self.modes)
+        index = round((centre - ROW_FIRST_Y - self.offset) / ROW_PITCH_PX)
+        cells = self.rows.get(index)
+        if cells is not None and abs(centre - self.centre_of(index)) <= _CELL_READ_TOLERANCE_PX:
+            return _Cell("" if column is None else cells[column], self.modes)
+        # 网格上没有行，但可能裁在了标题或透字上——只有名字列看得见它们，
+        # 名次列和军力列那两个横向区间上没有这些字。
+        for y, text in self.off_grid:
+            if column == 1 and abs(centre - y) <= _CELL_READ_TOLERANCE_PX:
+                return _Cell(text, self.modes)
+        return _Cell("", self.modes)
 
 
 class _Ocr:
-    """假 OCR。**记下 config**——「整条列用 psm 6 而不是 psm 7」是配方的一部分。"""
+    """假 OCR。**记下 config**——「整条列用 psm 6 而不是 psm 7」是配方的一部分。
+
+    `image_to_data` 的 config 单独记在 `data_configs` 里，好让「单格一律 psm 7」
+    那条断言仍旧只盯逐格那一路。
+    """
 
     def __init__(self) -> None:
         self.configs: list[str] = []
+        self.data_configs: list[str] = []
 
     def image_to_string(self, cell: _Cell, **kwargs: object) -> str:
         self.configs.append(str(kwargs.get("config", "")))
         return cell.text
 
+    def image_to_data(self, cell: _Cell, **kwargs: object) -> str:
+        self.data_configs.append(str(kwargs.get("config", "")))
+        return cell.tsv
 
-def _read(rows: dict[int, tuple[str, str, str]]) -> tuple[list[RankingRow], _Image]:
-    image = _Image(rows)
+
+def _read(
+    rows: dict[int, tuple[str, str, str]],
+    *,
+    offset: float = 0.0,
+    off_grid: tuple[tuple[float, str], ...] = (),
+) -> tuple[list[RankingRow], _Image]:
+    image = _Image(rows, offset=offset, off_grid=off_grid)
     return rows_from_image(image, _Ocr()), image
 
 
@@ -155,6 +295,160 @@ def test_the_self_row_is_matched_through_the_ocr_noise_glued_to_it() -> None:
     assert is_self_row("| kucleer", "Kucleer")
     assert not is_self_row("bot_4_155_13", "Kucleer")
     assert not is_self_row("Kucleer", "")  # 没配名字就不剔，宁可多读不要错剔
+
+
+# -- 行位置是量出来的，不是按网格算的 ------------------------------------------
+
+
+def _full_screen() -> dict[int, tuple[str, str, str]]:
+    """满满一屏 bot，军力严格降序（免得撞上 `descending_breaks` 那道安全网）。"""
+    return {
+        index: (f"[{600 + index}]", f"bot_4_{30 + index}_12", f"{29.5 - index / 10:.2f}K")
+        for index in range(ROWS_PER_SCREEN)
+    }
+
+
+@pytest.mark.parametrize("offset", [0.0, 8.0, 21.0])
+def test_a_screen_that_drifted_off_the_row_grid_is_still_read_in_full(offset: float) -> None:
+    """⚠️⚠️ **21px 那一档是这次改动的护栏：旧实现在它上面整屏归零。**
+
+    2026-08-23 的 15 屏语料：bot 名字相对行网格的中位偏移逐屏走
+    `-6.1 → -13.7 → -21.1 → +16.1 → +8.6 → +1.1 → -6.4 → …`——每屏 -7.5px、
+    以行距 44.8px 为模回绕、周期 6 屏。成因是一次慢拖推进的不是整数行
+    （实测约 8.17 行），那 0.17 行 ≈ 7.5px 的零头逐屏累积。
+
+    偏移一旦超过约 13px，按 `ROW_FIRST_Y + k × ROW_PITCH_PX` 算出来的裁剪窗口
+    就把字切掉一截，`--psm 7` **整屏读不出**——那一屏的 bot 全部静默丢弃。
+    实测每 6 屏里约 3 屏被整屏丢掉，语料 15 屏里 7 屏归零；生产日志上
+    「12, 8, 6 → 0, 0, 0」那个周期 6 的形状就是它。
+
+    三档一起钉：0px 是不漂时的底线，8px 是「还勉强读得出但已经开始把邻行数字
+    碎片裁进来」的那一档，21px 是**整屏失效**的那一档。三档都必须读满 13 行。
+    """
+    rows, image = _read(_full_screen(), offset=offset)
+
+    assert len(rows) == ROWS_PER_SCREEN, "有行被整屏丢掉了"
+    assert [row.name for row in rows] == [
+        f"bot_4_{30 + index}_12" for index in range(ROWS_PER_SCREEN)
+    ]
+    assert [row.rank for row in rows] == [600 + index for index in range(ROWS_PER_SCREEN)]
+    assert all(row.score is not None for row in rows)
+
+    # 裁剪窗口必须**跟着漂**，也就是中心来自实测而不是网格。差 1px 以内是
+    # 裁剪边界取整的零头。
+    wanted = [image.centre_of(index) for index in range(ROWS_PER_SCREEN)]
+    read_at = [(top + bottom) / 2 for _l, top, _r, bottom in image.crops]
+    assert all(min(abs(c - w) for w in wanted) <= 1.0 for c in read_at), "裁剪窗口没跟着漂"
+
+    # 搜索窗口上下各放宽一个行距，量行位置只量这一次。21px 那一档全靠这个放宽
+    # 才够得着最后一行（815.6 已经越过 `RANKING_LIST_MAX_Y`）。
+    ((_left, strip_top, _right, strip_bottom),) = image.strips
+    assert strip_top <= ROW_FIRST_Y - ROW_PITCH_PX
+    assert strip_bottom >= RANKING_LIST_MAX_Y + ROW_PITCH_PX
+
+
+#: 标题那一行的实测 y（2026-08-23 语料）。它是**固定的 UI 元素**，不随列表相位漂，
+#: 在相位 0 上离第一条列表行（`ROW_FIRST_Y` 257）只有 21.3px。
+_TITLE_Y = 235.7
+_TITLE = ((_TITLE_Y, "PLAYER"),)
+
+
+@pytest.mark.parametrize("offset", [0.0, -6.1, 8.6])
+def test_the_title_row_is_dropped_without_taking_the_first_list_row_with_it(
+    offset: float,
+) -> None:
+    """⚠️⚠️ **这条钉的是「按跨度成组」那次改动，相位 0 上旧的单链聚类会红。**
+
+    `locate_rows` 上下各放宽一个行距（为了容纳漂到网格上方约 22px 的行），
+    代价是窗口顶上多出标题那一行（实测 y≈235.7，固定不漂）。它不在行网格上，
+    该由 `_row_bands` 的网格一致性判据剔掉。
+
+    问题出在**聚类**这一步：标题离第一条列表行只有 21.3px（相位 0），而原先的
+    单链聚类阈值是半个行距 22.4px——于是两者并成一条带，中心被拽偏约 10px，
+    这条带的相位跟着变得不一致，网格判据把它整条剔掉，**第一条列表行连带没了**。
+    更根子的说法：标题到最近那条列表行的距离恒等于相位差的回绕值，按定义
+    不超过半个行距，所以「标题单独成带」和「标题被网格判据剔掉」在单链下互斥。
+
+    按跨度成组（`y − 这一组的第一个 <= ROW_CROP_HALF_HEIGHT`，15px）就解开了：
+    同一行的词共享基线、y 散布只有 1–2px，而标题与列表行差 21.3px。
+
+    三档相位都是语料实测的（相位每屏 -7.5px、以行距为模回绕）：
+
+        相位  0.0   标题离第一行 21.3px < 22.4  单链下并带、整条被网格判据剔掉
+                                                → **第一条列表行整个丢掉**，这条
+                                                   用例是它的护栏（实测会红）
+        相位 -6.1   标题离第一行 15.2px          单链下也并带，但并出来的相位偏差
+                                                   只有 7.6px、没超容差，所以带留着、
+                                                   中心被拽偏 7.6px。替身宽容到 13px
+                                                   看不出来（实机上那一格会把标题的字
+                                                   一起裁进来），这一档只是陪跑
+        相位  8.6   标题离第一行 29.9px          两种聚类都好，留着防「修过头把好
+                                                   相位改坏」
+    """
+    rows, _image = _read(_full_screen(), offset=offset, off_grid=_TITLE)
+
+    assert [row.name for row in rows] == [
+        f"bot_4_{30 + index}_12" for index in range(ROWS_PER_SCREEN)
+    ], "第一条列表行不许跟着标题一起没"
+    assert "PLAYER" not in [row.name for row in rows]
+    assert all(row.coordinate is not None for row in rows), "标题并进来会把名字拼坏"
+
+
+def test_a_title_row_that_slips_through_never_becomes_a_target() -> None:
+    """⚠️ **网格判据并不是每个相位都剔得掉标题——漏进来的那一格必须无害。**
+
+    +16.1px 那个相位上（语料实测的第四屏），标题相对列表行的偏差回绕成 7.4px，
+    落在 `ROW_GRID_TOLERANCE_PX`(8) 之内，于是它作为**第 14 条带**留了下来。
+    `locate_rows` 的注释认了这笔代价：白裁一格。
+
+    这条钉的是「代价到此为止」：那一格读出来的是标题的字，`coordinate_of`
+    反解不出坐标，于是 `targets_from_rows` 一条都不会为它落库。真出问题的是
+    **反过来**——要是哪天标题的字碰巧反解得出坐标，舰队就会飞过去。
+    """
+    rows, _image = _read(_full_screen(), offset=16.1, off_grid=_TITLE)
+
+    assert "PLAYER" in [row.name for row in rows], "这个相位上标题确实漏进来了"
+    assert [row.coordinate for row in rows].count(None) == 1
+
+    targets = targets_from_rows(rows, observed_at=NOW)
+
+    assert all(target.coordinate is not None for target in targets)
+    assert len(targets) == len(rows) - 1
+
+
+def test_text_bleeding_through_between_two_rows_never_becomes_a_row() -> None:
+    """⚠️ **行间透字要挡掉——整列读那一次会把它一起读进来。**
+
+    实机词框：星球地表的 `COMMAND OFFICERS` / `-17003` 透过半透明面板落在
+    x 769–949（正压在名字列上），y 在 500 和 548，而真实行在 525。
+
+    挡它的是**两道**判据叠在一起，都不是名字归行那种事后拼接：
+
+    1. `_row_bands` 的网格一致性——透字不在行网格上（500 偏 19.8px、
+       548 偏 21.8px，都超 `ROW_GRID_TOLERANCE_PX`），成不了一条带，
+       于是根本没有哪一格会裁在它身上；
+    2. 逐格裁剪只有 ±`ROW_CROP_HALF_HEIGHT`(15) 而不是半个行距(22.4)——
+       真实行那一格裁 510–540，把 490–510 的透字关在外面。
+
+    挡不住的后果是名字被拼成 `COMMAND OFFICERS bot_4_100_13` 之类，
+    `coordinate_of` 反解不出坐标，这一行的舰队就没处可去。
+    """
+    # 480.2 / 525.0 / 569.8 就是语料里那三行（相位 -0.8，行号 5/6/7）。
+    screen = {
+        5: ("[605]", "bot_4_30_12", "29.50K"),
+        6: ("[606]", "bot_4_100_13", "29.40K"),
+        7: ("[607]", "bot_4_183_20", "29.30K"),
+    }
+    bleed = ((500.0, "COMMAND OFFICERS"), (548.0, "-17003"))
+
+    rows, image = _read(screen, offset=-0.8, off_grid=bleed)
+
+    assert [row.name for row in rows] == ["bot_4_30_12", "bot_4_100_13", "bot_4_183_20"]
+    # 一格都没裁在透字上——第一道判据就把它挡在成带之前了。
+    assert all(
+        all(abs((top + bottom) / 2 - y) > ROW_CROP_HALF_HEIGHT for y, _text in bleed)
+        for _l, top, _r, bottom in image.crops
+    ), "有一格裁在了透字上"
 
 
 # -- 配方（实机换来的那一条） --------------------------------------------------
@@ -426,6 +720,20 @@ def test_single_cells_are_still_read_as_one_line() -> None:
     assert set(ocr.configs) == {"--psm 7"}
 
 
+def test_the_measuring_pass_reads_the_name_column_as_multiple_lines_too() -> None:
+    """量行位置那一次也走 `--psm 6`（多行），而且只走一次。
+
+    用 `--psm 7` 的话，`image_to_data` 只吐得出一行的词框——聚出来就一条带，
+    一屏十三行里十二行连带位置都没有，全部静默丢弃。这跟
+    `test_the_whole_name_column_is_read_as_multiple_lines` 是同一颗雷的另一个入口。
+    """
+    ocr = _Ocr()
+
+    rows_from_image(_Image(_full_screen()), ocr)
+
+    assert ocr.data_configs == ["--psm 6"]
+
+
 # -- 降序异常必须丢，不能只打印 ------------------------------------------------
 
 
@@ -502,3 +810,66 @@ def test_the_rank_is_carried_into_storage() -> None:
     targets = targets_from_rows(rows, observed_at=NOW)
 
     assert [t.military_rank for t in targets] == [639, 640, 641]
+
+
+# -- 这一屏的头尾名次：给重叠自查当尺子 ----------------------------------------
+
+
+def test_the_first_rank_skips_the_medal_rows_instead_of_reading_none() -> None:
+    """⚠️ **不是 `rows[0].rank`。** 榜首前三名显示的是**奖章图标**，名次列一个字
+    都读不出（`test_the_top_three_have_medals_instead_of_rank_numbers` 那一屏）。
+
+    照 `rows[0].rank` 写的话，开榜第一屏交出来的就是 `None`——于是重叠自查在
+    **最该看的那一屏**（榜首、军力最高的那批 bot 所在的一段）永远答「不知道」。
+    """
+    rows = [
+        RankingRow(None, "unkn0wn", 404_170_000.0, None),
+        RankingRow(None, "XXxxNAZIMxxXX", 160_120_000.0, None),
+        RankingRow(None, "halo", 115_900_000.0, None),
+        RankingRow(4, "Cocyte", 93_290_000.0, None),
+    ]
+
+    assert first_rank_of(rows) == 4
+
+
+def test_the_last_rank_skips_unreadable_rows_from_the_bottom() -> None:
+    """末行同理：OCR 漏认一行是常态（名次列本来就是最不准的一列）。
+
+    照 `rows[-1].rank` 写的话，末行恰好没读出来就把整屏的下界丢掉，而下一屏
+    拿到的 `previous_last_rank` 是 `None`——一次可修的漏认被放大成
+    「这两屏之间接不接得上，不知道」。
+    """
+    rows = [
+        RankingRow(850, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(851, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
+        RankingRow(None, "bot_4_183_20", 28_510.0, Coordinate(4, 183, 20)),
+    ]
+
+    assert last_rank_of(rows) == 851
+    assert first_rank_of(rows) == 850
+
+
+def test_a_screen_with_no_readable_rank_at_all_answers_none() -> None:
+    """⚠️ **一屏名次全读不出时答 `None`，不是 0。**
+
+    0 是个合法名次的位置（`rows_skipped` 会拿它当数算），而这一屏的真实含义是
+    「这一屏的名次一个都没认出来」。答 0 就会让下一屏算出一个凭空的巨大漏采。
+    """
+    rows = [
+        RankingRow(None, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(None, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
+    ]
+
+    assert first_rank_of(rows) is None
+    assert last_rank_of(rows) is None
+
+
+def test_an_empty_screen_answers_none_instead_of_blowing_up() -> None:
+    """整屏读不出来（离页、面板没铺开）时 `read_rows()` 交的就是空列表。
+
+    这一路是**常态**而不是异常：`rows_from_image` 只要名字读不出就丢行，
+    一屏全丢就是空的。`rows[0]` 那种写法在这里是 `IndexError`——
+    而它会从采集循环里抛出去，把一次「这一屏没读到」变成整趟崩掉。
+    """
+    assert first_rank_of([]) is None
+    assert last_rank_of([]) is None
