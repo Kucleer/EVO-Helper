@@ -151,8 +151,9 @@ def test_the_military_first_switch_is_gone_from_the_page(client: TestClient) -> 
     ⚠️ **后端一个字段都没删**：`by_military` 仍然在库里、仍然由调度器读，新任务
     落库仍然是 `true`（另有用例钉着）。页面只是不再提供切换入口。
 
-    军力方案（出发点 / 航线）留在「更多」里，而且**不再跟任何开关显隐**——它是
-    这条链路唯一的派遣依据，藏在一个条件后面只有「还有另一条路」时才说得通。
+    军力方案（出发点 / 航线）**不再跟任何开关显隐**——它是这条链路唯一的派遣依据，
+    藏在一个条件后面只有「还有另一条路」时才说得通。它此刻在主行右侧
+    （2026-08-22 第三轮改版，另有用例钉着落点）。
     """
     body = _page_body(client.get("/missions").text)
 
@@ -164,9 +165,16 @@ def test_the_military_first_switch_is_gone_from_the_page(client: TestClient) -> 
     assert "matches('.military-enabled')" not in body
     assert "modeRow" not in body
     assert "军力优先说明" not in body
-    # 军力方案还在折叠区里，而且恒显示（没有 `hidden = true` 那一句了）。
-    assert "militaryDispatch.className = 'military-dispatch more-line'" in body
-    assert "more.append(militaryDispatch)" in body
+    # 军力方案恒显示（没有 `hidden = true` 那一句了）。
+    #
+    # ⚠️ 旧断言钉的是 `militaryDispatch.className = 'military-dispatch more-line'`
+    # 和 `more.append(militaryDispatch)`——也就是「它在折叠区里」。2026-08-22 第三轮
+    # 改版把它提到了主行右侧（用户口径：「下拉框放在右侧，减少一行」），`more-line`
+    # 这个类名跟着去掉了（那条布局规则属于折叠区，主行里借不到）。「恒显示」这一条
+    # 本身没变，所以只换落点、不换判据；落点由
+    # `test_the_military_plan_sits_in_the_main_line_not_behind_a_fold` 单独钉。
+    assert "militaryDispatch.className = 'military-dispatch'" in body
+    assert "line.append(dispatchSpacer, militaryDispatch)" in body
     assert "militaryDispatch.hidden = true" not in body
 
 
@@ -178,18 +186,135 @@ def test_the_save_button_sits_with_the_rows_it_saves(client: TestClient) -> None
     就等于那个开关只能开不能关。开关随「原来的攻击模式被废弃」删了（用户口径
     2026-08-22），那个理由随之消失：军力方案不再藏，按钮也就没有「被藏掉」这回事。
 
-    于是它挪到出发点那一组的标题行上——「改完这几行、就在这几行旁边按保存」。
+    于是它挪到出发点那一组旁边——「改完这几行、就在这几行旁边按保存」。
     `by_military` 仍然显式送 `true`（存量任务里可能存着 `false`，而页面上再也没有
     别的地方能把它掰回来）。
+
+    ⚠️ 旧断言钉的是 `document.createTextNode(' '), save)`——那时按钮长在一个叫
+    `originHead` 的 `<div>` 里，靠裸空白文本节点分隔。2026-08-22 第三轮改版把整块
+    提到主行右侧并改成一个 `flex` 容器（标签 / 列表 / 按钮各是一个 flex 项），而
+    **纯空白文本节点在 flex 容器里根本不渲染**，间距一直是 `gap` 在给。所以那两个
+    「间隔」删了，断言换成钉「保存按钮和这一组出发点是同一次 append 的邻居」。
     """
     body = _page_body(client.get("/missions").text)
 
     assert "save.className = 'btn primary small military-save'" in body
-    assert "makeTips('多出发点说明', MILITARY_ORIGIN_TIP)," in body
-    assert "document.createTextNode(' '), save)" in body
+    assert "makeTips('多出发点说明', MILITARY_ORIGIN_TIP), save);" in body
+    assert "militaryDispatch.append(originHead, origins, addOrigin," in body
     assert "by_military: true" in body, "恒送 true：存量任务里那个 false 得有地方被纠正"
     # 运行中配置已固化，按钮不该点下去才发现（后端也会 409）。
     assert "save.disabled = locked" in body
+
+
+def test_the_military_plan_sits_in_the_main_line_not_behind_a_fold(
+    client: TestClient,
+) -> None:
+    """军力方案在**主行右侧**，不在折叠里（用户口径 2026-08-22）。
+
+    ⚠️ **这一条推翻了它的前身，来回的理由必须留着。** 上一版把它放进「更多」，
+    理由写的是「配一次就不再动」。那句话对定时开关成立，对它不成立：它是这条链路
+    唯一的派遣依据（`_military_assignments` → `_military_origins` →
+    `_configured_origins`），加一颗星球、改一个航线数都得先点开一层折叠才够得着，
+    而主行那段只读文字只念结果、改不了。
+
+    落点是主行最右侧：摘要钉了 640px 的上界，它右边本来就是一整片留白。用户口径
+    「下拉框放在右侧，减少一行」减掉的那一行，正是从前常驻的「更多」折叠条。
+
+    ⚠️ **`flex-wrap`，不是绝对定位。** 多出发点时这一块是一份多行列表、高度不定；
+    定位硬塞的话行数一多就会盖住底下的东西，宽度算错还会撑出横向滚动条。
+    """
+    body = _page_body(client.get("/missions").text)
+    css = _console_css()
+
+    # 落在主行上，前面带一个 `.spacer` 把它推到右边。
+    assert "dispatchSpacer.className = 'spacer'" in body
+    assert "line.append(dispatchSpacer, militaryDispatch)" in body
+    assert "more.append(militaryDispatch)" not in body, "又被塞回折叠区了"
+    # ⚠️ 排在「更多」**之前**：`.mission-more[open]` 会撑成整行，排在它后面的话
+    # 一展开就把军力方案挤到更下面一行去。
+    assert body.index("line.append(dispatchSpacer, militaryDispatch)") < body.index(
+        "line.append(more);"
+    ), "军力方案排到「更多」后面去了，展开一次就被挤下去"
+
+    dispatch = _rule_block(css, ".military-dispatch {")
+    assert "display: flex" in dispatch, "改回 display: block 就又是两行"
+    assert "flex-wrap: wrap" in dispatch, "多出发点时会撑出横向滚动条"
+    # 绝对定位是明确否掉的方案。
+    assert "position: absolute" not in dispatch
+    # 每颗出发点一行、纵向排：两颗并排就已经比主行右侧那块空白宽。
+    assert "flex-direction: column" in _rule_block(css, ".military-origin-list {")
+
+
+def test_the_fleet_lines_box_is_not_grouped_with_the_origin_dropdown(
+    client: TestClient,
+) -> None:
+    """航线数是**独立控件**（用户口径 2026-08-22：「航线设置数量不要在下拉内」）。
+
+    `.fld` 只圈住「数字框 + 条」这一格——「条」是航线数自己的单位，不是下拉框的
+    一部分。下拉框裸着排在前面，两者之间的距离由 `.military-origin-line` 的 `gap`
+    给。把两个控件包进同一个 `.fld`（`white-space: nowrap` 的一小格）就等于在页面
+    上宣称它们是一件事，而它们是两件：一个是「从哪儿起飞」，一个是「派几条」。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "line.append(planet, makeField(fleetLines, makeUnit('条')), enable" in body
+    assert "makeField(planet" not in body, "下拉框被包进了同一个视觉分组"
+    # 控件本身还是那两个，类名不许改（`saveMilitary` 按类名收集这一组）。
+    assert "planet.className = 'military-origin-planet'" in body
+    assert "makeInput('military-origin-lines'" in body
+
+
+def test_the_more_fold_no_longer_owns_a_whole_row(client: TestClient) -> None:
+    """「更多」的 `<summary>` 是主行里的一小格，不再是常驻的第三行。
+
+    ⚠️ **这一条推翻了它的前身。** 上一版 `<details>` 是 `.mission-card` 的直接
+    子节点，带一条横贯整卡的虚线：于是单出发点、没配定时的卡恒定三行高，而那第三
+    行里一个值都没有——纯粹是一条写着「更多：……」的横幅。用户口径（2026-08-22）：
+    「减少一行。」
+
+    现在它是 `.mission-line` 的 flex 项：折着时宽度由 `<summary>` 的内容定，
+    `[open]` 时 `flex: 1 1 100%` 撑成整行、内容往下长。那条虚线也只在展开时才画
+    ——折着的时候它横穿主行，会被读成「卡到这里就结束了」。
+    """
+    body = _page_body(client.get("/missions").text)
+    css = _console_css()
+
+    assert "line.append(more);" in body
+    assert "row.append(more);" not in body, "又挂回卡片上了，那就是独占一行"
+    # 折叠标题不许再列一样已经不在里面的东西。断言打在**完整的那句表达式**上，
+    # 不是裸的「军力方案（出发点 / 航线）」——那几个字如今还在几句说明「它为什么
+    # 搬走了」的注释里，整页搜会被自己的注释喂饱。
+    assert "(task.kind === 'BOT' ? ' · 军力方案（出发点 / 航线）' : '')" not in body
+    assert "'更多：定时开关（UTC+8）'" in body
+
+    # 折着的时候不画分隔线（它会横穿主行）。
+    assert "border-top" not in _rule_block(css, ".mission-more {")
+    # 展开时才独占一行。
+    opened = _rule_block(css, ".mission-more[open] {")
+    assert "flex: 1 1 100%" in opened
+    assert "border-top: 1px dashed var(--border)" in opened
+
+
+def test_the_expanded_fold_keeps_every_control_it_used_to_hold(
+    client: TestClient,
+) -> None:
+    """展开区里的东西**一个都没丢**。
+
+    这次改版只搬走了军力方案那一块。剩下四个控件（定时的两端、任务级出发点、
+    任务级航线数）连同它们的说明文字全都还在——「压掉一行」如果是靠悄悄删控件
+    换来的，那就是把用户配好的东西弄没了，而这类故障事后最难看出来。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    # ① 定时那两端，连同「留空=不限」那句话，都在同一条 `.more-line` 上进折叠区。
+    assert "['mission-enabled-from', '开启'], ['mission-enabled-until', '关闭']" in body
+    assert "windowNote.textContent = '留空=不限；到点只挡新的一轮，正在跑的不打断'" in body
+    assert "more.append(windowRow)" in body
+    # ② 任务级出发点与航线数，连同「什么时候才作数」那句话。
+    assert "origin.className = 'mission-origin'" in body
+    assert "makeInput('mission-lines'" in body
+    assert "任务级出发点（只在军力方案一行都没配时才生效）" in body
+    assert "more.append(legacy)" in body
 
 
 def test_a_new_task_is_created_military_first(client: TestClient) -> None:
@@ -910,9 +1035,16 @@ def test_each_galaxy_gets_its_own_card_colour_and_the_number_is_still_written_on
     # 而分组配色正是同一次改版要做的另一半。现在色相保留、只压暗一档，
     # 判据搬到 `test_a_disabled_card_keeps_its_galaxy_hue`。
     off = _rule_block(css, ".mission-card.off {")
-    assert "opacity" in off
-    assert "border-left-style: dashed" in off
-    assert "background-image: none" in off
+    # ⚠️ 压暗**不在**这个块里，它打在兄弟节点上——见下面那条断言。
+    # 打在整张卡上的话，那个「参与调度」的勾选框会跟着淡到 60%，
+    # 而它是唯一能把一张停用的卡救回来的控件（子元素 opacity 与父级相乘，捞不回来）。
+    assert "opacity" not in off, "压暗又打回整张卡了，勾选框会跟着淡掉"
+    assert ".mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }" in css
+    # ⚠️ 虚线挪到**外框**上，那条银河系色带保持实线（用户口径 2026-08-22
+    # 「可以更更明显点」）。虚线打在色带上会把它切成一串短点，而它承载的正是
+    # 「这张卡属于哪个银河系」这个一眼就该看见的信息。
+    assert "border-style: dashed" in off
+    assert "border-left-style: solid" in off
     assert "var(--text-faint)" not in off, "未启用的边框又被灰掉了，银河系分组会整屏消失"
     # ⚠️ **不许洗白银河系标记。** 实测常态是一屏卡全都「未启用」，把标记也去饱和
     # 之后那一屏里银河系分组一点颜色都不剩——而分组配色正是这次要做的另一半。
@@ -990,8 +1122,117 @@ def test_a_disabled_card_keeps_its_galaxy_hue() -> None:
     assert "hsl(var(--galaxy-hue)" in css[hued : hued + 160], "未启用的边框把银河系色相灰掉了"
     plain = css.index(".mission-card.off:not([data-galaxy])")
     assert "var(--text-faint)" in css[plain : plain + 120]
-    # 「参不参与调度」得由别的通道承载，否则和色相抢同一个。
+    # 「参不参与调度」得由别的通道承载，否则和色相抢同一个：
+    # 外框虚线 + 透明度 + 状态 chip 的文字，而色带本身保持实线、保持色相。
+    assert ".mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }" in css, (
+        "压暗必须排除勾选框：它是唯一能把停用的卡救回来的控件"
+    )
     off = css.index(".mission-card.off {")
-    block = css[off : off + 200]
-    assert "border-left-style: dashed" in block
-    assert "opacity" in block
+    block = css[off : off + 260]
+    assert "border-style: dashed" in block, "外框没有虚线，停用就只剩透明度了"
+    assert "border-left-style: solid" in block, "虚线打在色带上会把银河系那条线切碎"
+
+
+def test_disabling_a_card_never_touches_the_galaxy_channel() -> None:
+    """⚠️ **停用只许动透明度 / 外框虚实 / 底色浓淡，色相一律不碰。**
+
+    这一条是同一个错误在同一天里犯到第三次之后立的规矩：
+
+    ① `filter: grayscale()` —— 论证过后自己否掉了；
+    ② 未启用的左色带换成 `var(--text-faint)` —— 灰掉了；
+    ③ 未启用的银河系徽章 `background: none` —— 刚做成实心又洗回透明。
+
+    三次都是同一个形状：**拿「停用」去改「银河系」那个通道**。而实测常态是一屏
+    卡全都未启用（生产 2026-08-22：五张 bot 卡无一启用），于是每一次都恰好在
+    最需要看清分组的那一屏里，把分组整个抹掉。
+
+    判据不是「别写 grayscale」这种个例，而是**两个变量各占一个通道**：
+    色相答「哪个银河系」，其余通道答「参不参与调度」。
+    """
+    css = _console_css()
+
+    off = _rule_block(css, ".mission-card.off {")
+    # 停用能用的三个通道。
+    # ⚠️ 压暗不在这个块里：它打在兄弟节点上，好把「参与调度」那个勾选框排除掉。
+    assert "opacity" not in off, "压暗打回整张卡了，勾选框会跟着淡到 60%"
+    assert ".mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }" in css
+    assert "border-style: dashed" in off
+    # 色带与徽章都必须另有一条「保留色相」的规则，且不许出现中性灰。
+    for selector in (
+        ".mission-card.off[data-galaxy]",
+        ".mission-card.off[data-galaxy] .galaxy-tag",
+    ):
+        assert selector in css, selector
+        block = _rule_block(css, selector + " {")
+        assert "hsl(var(--galaxy-hue)" in block, f"{selector} 把银河系色相丢了"
+        assert "--text-faint" not in block, f"{selector} 又灰掉了"
+        assert "grayscale" not in block
+    # 没有银河系的那两张（扫描 / 军力榜）本来就没有色相可留，才用中性灰。
+    plain = _rule_block(css, ".mission-card.off:not([data-galaxy]) .galaxy-tag {")
+    assert "background: none" in plain
+
+
+def test_the_enable_checkbox_is_big_and_sits_in_the_left_gutter(client: TestClient) -> None:
+    """⚠️ 「参与调度」那个勾选框放大、并挪到卡片左侧那条留白里、垂直居中。
+
+    用户口径（2026-08-22）：「选中框放大，并放在红框这个位置」。
+    原先它挤在第一行 `⠿` 旁边、只有默认的 13px —— 而一张卡三行高，
+    **决定「这条链路到底跑不跑」的那个开关是全卡最小最难点的控件**。
+
+    绝对定位而不是改 DOM：它长在 `.mission-line` 里，而那一行是 `flex-wrap` 的，
+    留在流里会跟着换行跑到别处去。垂直居中对的是**整张卡**，所以它落在中间那一行
+    的高度上、与整卡对齐。
+
+    ⚠️ 停用的卡整体压暗，但这个开关**不跟着淡** —— 它是唯一能把那张卡救回来的
+    控件，跟着一起淡掉就等于最该点的东西最看不见。
+    """
+    css = _console_css()
+
+    rule = _rule_block(css, ".mission-card .mission-enabled {")
+    assert "position: absolute" in rule
+    assert "top: 50%" in rule
+    assert "translateY(-50%)" in rule
+    assert "width: 22px" in rule and "height: 22px" in rule
+    # 卡片得腾出位置、并且是定位上下文，否则它会飞到 body 左上角。
+    card = _rule_block(css, ".mission-card {")
+    assert "position: relative" in card
+    assert "padding-left" in card
+    # 停用时不跟着压暗。
+    # ⚠️ 旧断言钉的是 `.mission-card.off .mission-enabled { opacity: 1.6 }`——
+    # 那一句既超出 opacity 的取值范围（钳成 1），也不可能反抗父级的 0.6
+    # （子元素的 opacity 与父级相乘）。真正的解法是压暗兄弟节点，
+    # 而那要求勾选框是卡的**直接子元素**，所以这里连它的 DOM 位置一起钉。
+    assert ".mission-card.off > *:not(.mission-enabled)" in css
+    body = _page_body(client.get("/missions").text)
+    assert "row.prepend(checkbox);" in body, "勾选框不是卡的直接子元素，压暗排除不掉它"
+
+
+def test_ten_galaxies_never_share_a_hue(client: TestClient) -> None:
+    """⚠️ **十个银河系必须十种颜色，而且要留冗余。**
+
+    用户口径（2026-08-22）：「注意最大是 10 个星球，你需要有冗余」。
+
+    第一版写的是 `((galaxy - 1) % 9) * 40` —— 一圈 360° 按 40° 一档，只有 **9**
+    种色相。第 10 个银河系恰好绕回第 1 个，而且撞在最坏的位置上：不是「颜色接近」，
+    是**一模一样**。差一个，且刚好差在用户说的那个上界上。
+
+    改成黄金角步进 `(galaxy * 137) % 360`：137 与 360 互质，要到第 360 个银河系
+    才重复。附带的好处是相邻号码隔 137°，比均分方案（相邻只差一档）更好分。
+
+    ⚠️ **别为了「整齐」改回均分。** 均分的档数 = `360 / gcd(step, 360)`，
+    任何一个能整除 360 的步长都会在个位数或十几个之后开始撞车。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    # ⚠️ 断言打在**那条语句**上，不是裸子串。注释里引用了旧公式作对照，
+    # 而注释也是页面正文——整页搜 `% 9) * 40` 会被自己的说明喂饱。
+    # （子代理在 `.military-enabled` 上踩过同一个坑，见那条用例。）
+    assert "setProperty('--galaxy-hue', `${(galaxies[0] * 137) % 360}deg`)" in body, (
+        "色相步进被改回去了，第 10 个银河系会撞色"
+    )
+
+    # 把公式在这里算一遍：前 12 个银河系两两不同，最接近的也要拉开肉眼可分的距离。
+    hues = [(galaxy * 137) % 360 for galaxy in range(1, 13)]
+    assert len(set(hues)) == 12, "12 个银河系里出现了重复色相"
+    closest = min(abs(a - b) for index, a in enumerate(hues) for b in hues[index + 1 :])
+    assert closest >= 15, f"最接近的两个色相只差 {closest}°，分不开"

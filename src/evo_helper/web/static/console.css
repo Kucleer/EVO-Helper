@@ -386,9 +386,44 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
   margin-bottom: 8px;
   cursor: default;
   /* 左边框是「这张卡属于哪个银河系」的那条色带。没有银河系的链路（扫描 /
-     军力榜，它们不派遣）落在这个默认值上——给它们上色等于让颜色说假话。 */
-  border-left: 4px solid var(--border-strong);
+     军力榜，它们不派遣）落在这个默认值上——给它们上色等于让颜色说假话。
+     ⚠️ **8px 而不是 4px**（用户口径 2026-08-22：「可以更更明显点」）：4px 的细条
+     在这一页的密度下几乎看不见，而它承载的是「这张卡属于哪个银河系」这个
+     一眼就该分出来的信息。 */
+  border-left: 8px solid var(--border-strong);
+  /* 勾选框绝对定位到左侧那条留白里（见下），所以这里要给它腾出位置，
+     而且卡片自己得是定位上下文。 */
+  position: relative;
+  padding-left: 34px;
 }
+
+/* 「参与调度」那个勾选框。
+   ⚠️ **放大到 22px，并挪到卡片左侧、垂直居中**（用户口径 2026-08-22：
+   「选中框放大，并放在红框这个位置」）。原先它挤在第一行的 ⠿ 旁边，
+   只有默认的 13px：一张卡三行高，而决定「这条链路到底跑不跑」的那个开关
+   是全卡最小、最难点的一个控件。
+   ⚠️ 绝对定位而不是改 DOM 结构：它此刻长在 `.mission-line` 里，
+   而那一行是 `flex-wrap` 的——留在流里就会跟着换行跑到别处去。
+   垂直居中对的是**整张卡**，所以它落在第二行那个高度上，与整卡对齐，
+   而不是只跟第一行对齐。 */
+.mission-card .mission-enabled {
+  position: absolute;
+  left: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  z-index: 1;
+}
+/* ⚠️ 停用态的压暗**打在兄弟节点上，不打在整张卡上**，好让这个开关保持全亮。
+   它是唯一能把一张停用的卡救回来的控件，跟着一起淡掉就等于最该点的东西最看不见。
+   这里不能用 `.mission-card.off .mission-enabled { opacity: 1 }` 去捞：
+   子元素的 `opacity` 与父级**相乘**，父卡 0.6 × 子 1 还是 0.6，捞不回来。
+   （所以它必须是卡的**直接子元素**——见 missions.html 里 `row.prepend(checkbox)`。）*/
+.mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }
 .mission-card[draggable="true"] { cursor: grab; }
 .mission-card[draggable="true"]:active { cursor: grabbing; }
 
@@ -404,12 +439,12 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    那一套共同说明。饱和度压得低、只做左边框加一层极浅的底色，是为了不盖住文字
    ——底色一深，`--text-muted` 的小字就先输了。 */
 .mission-card[data-galaxy] {
-  border-left-color: hsl(var(--galaxy-hue) 55% 55%);
+  border-left-color: hsl(var(--galaxy-hue) 68% 58%);
   background-image: linear-gradient(
     90deg,
-    hsl(var(--galaxy-hue) 45% 50% / 0.13),
-    hsl(var(--galaxy-hue) 45% 50% / 0.02) 240px,
-    transparent 420px
+    hsl(var(--galaxy-hue) 55% 50% / 0.22),
+    hsl(var(--galaxy-hue) 55% 50% / 0.06) 420px,
+    transparent 760px
   );
 }
 /* 银河系号。**这是颜色的说明书**：色相每 9 个银河系循环一次，光看颜色分不出
@@ -425,10 +460,16 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
   background: var(--bg-input);
   white-space: nowrap;
 }
+/* ⚠️ **实心徽章，不是彩色文字**（用户口径 2026-08-22：「可以更更明显点」）。
+   原先是「浅底 + 彩色字」，在这一页的密度下和普通 muted 小字几乎分不开。
+   实心底 + 深色字的对比度足够高，一眼就能把同一个银河系的几张卡归到一起，
+   而且它同时是**颜色的说明书**——色相每 9 个银河系循环一次，号码必须看得见。 */
 .mission-card[data-galaxy] .galaxy-tag {
-  color: hsl(var(--galaxy-hue) 70% 78%);
-  border-color: hsl(var(--galaxy-hue) 45% 42%);
-  background: hsl(var(--galaxy-hue) 45% 50% / 0.16);
+  color: hsl(var(--galaxy-hue) 60% 12%);
+  border-color: hsl(var(--galaxy-hue) 60% 68%);
+  background: hsl(var(--galaxy-hue) 62% 62%);
+  font-weight: 700;
+  padding: 1px 8px;
 }
 /* 主行那句「实际会从哪儿派」。只读文字，不是控件——控件在「更多」里，
    理由见 missions.html 里那一大段。 */
@@ -448,11 +489,12 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    做的另一半。所以标记保留自己的色相（透明度已经把它压下去一档），撤掉的是
    底色和边框那两处更重的信号。 */
 .mission-card.off {
-  opacity: 0.55;
-  background-image: none;
-  border-left-style: dashed;
+  /* ⚠️ 底色**留着**（只压薄），否则同一个银河系的几张卡在「全都未启用」那一屏里
+     又只剩边缘那一条线可认——而实测常态正是全都未启用。 */
+  border-style: dashed;
+  border-left-style: solid;
 }
-/* ⚠️ **未启用时边框仍旧保留银河系色相**，只压暗一档。
+/* ⚠️ **未启用时那条色带一点都不许灰掉**，只压暗一档；虚线挪到**外框**上。
    上一版这里写的是 `border-left-color: var(--text-faint)`，于是同一条规则里
    刚论证过的那个后果又被自己撞上了：实测（8771，2026-08-22）常态是五张 bot 卡
    全都「未启用」，边框一律灰掉之后**一屏里银河系分组一点颜色都不剩**——而
@@ -460,10 +502,32 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    判据：**两个变量占两个通道**。色相回答「哪个银河系」，虚实 + 透明度 + 底色
    回答「参不参与调度」。挤在色相这一个通道上，两件事必然互相抹掉一件。
    （启用/停用也**不只靠这些**：状态 chip 的文字始终写着，见 `missions.html`。）*/
-.mission-card.off[data-galaxy] { border-left-color: hsl(var(--galaxy-hue) 32% 40%); }
+.mission-card.off[data-galaxy] {
+  border-left-color: hsl(var(--galaxy-hue) 58% 48%);
+  background-image: linear-gradient(
+    90deg,
+    hsl(var(--galaxy-hue) 50% 48% / 0.13),
+    transparent 420px
+  );
+}
 /* 没有银河系的那两张（扫描 / 军力榜）没有色相可留，照旧用中性灰。 */
 .mission-card.off:not([data-galaxy]) { border-left-color: var(--text-faint); }
-.mission-card.off .galaxy-tag { background: none; border-color: var(--border); }
+/* ⚠️ **停用时徽章也不许洗白**，只压暗一档。
+   这是同一个错误在这一小块 CSS 里的**第三次**（2026-08-22 同一天）：
+   ① `filter: grayscale()` —— 论证过后否掉了；
+   ② 未启用的左色带换成 `var(--text-faint)` —— 改了；
+   ③ 这里 `background: none` —— 又把刚做成实心的徽章洗回透明。
+   三次都是同一个形状：**拿「停用」去改「银河系」那个通道**。而实测常态是一屏卡
+   全都未启用，于是每次都恰好在最需要分组的那一屏里把分组抹掉。
+   判据只有一句：停用只许动透明度、外框虚实、底色浓淡，**色相一律不碰**。 */
+.mission-card.off[data-galaxy] .galaxy-tag {
+  background: hsl(var(--galaxy-hue) 45% 52%);
+  border-color: hsl(var(--galaxy-hue) 45% 58%);
+}
+.mission-card.off:not([data-galaxy]) .galaxy-tag {
+  background: none;
+  border-color: var(--border);
+}
 
 /* 主行。`flex-wrap` 是为了窄屏——放不下时优雅地掉到第二行，
    而不是把整张卡撑出横向滚动条。 */
@@ -520,15 +584,31 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    否则读起来就是一串。 */
 .regional-params, .military-settings { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 18px; }
 
-/* 「更多」折叠区：军力优先 · 定时开关 · 多出发星球方案。
-   共同点是**配一次就不再动**，恒展开时买到的是一整片空框。 */
-.mission-more { border-top: 1px dashed var(--border); padding: 0 10px; }
+/* 「更多」折叠区：定时开关 · 任务级出发点。
+   共同点是**配一次就不再动**，恒展开时买到的是一整片空框。
+
+   ⚠️ **2026-08-22 第三轮改版：它不再独占一行。** 从前这里写的是
+   `border-top: 1px dashed var(--border); padding: 0 10px;`——那一版它是 `.mission-card`
+   的直接子节点，于是每张卡恒定第三行：一条横贯整卡的虚线加一行「更多：……」，
+   而单出发点、没配定时时那一行里一个值都没有。
+   现在这个 `<details>` 是 `.mission-line` 里的一个 flex 项：折着时宽度由
+   `<summary>` 的内容定（只占一小格），`[open]` 时 `flex-basis: 100%` 把它推成
+   独占一行，展开的内容照旧往下长。那条虚线也跟着只在展开时才画——折着的时候
+   它横穿主行，会被读成「卡到这里结束了」。 */
+.mission-more { padding: 0; }
 .mission-more > summary {
   cursor: pointer;
   font-size: 11px;
   color: var(--text-muted);
-  padding: 5px 0;
+  padding: 3px 0;
   user-select: none;
+  white-space: nowrap;
+}
+.mission-more[open] {
+  flex: 1 1 100%;
+  border-top: 1px dashed var(--border);
+  margin-top: 4px;
+  padding-top: 3px;
 }
 .mission-more > summary:focus-visible { outline: 2px solid var(--accent); }
 .mission-more .more-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; padding: 0 0 7px; }
@@ -543,10 +623,36 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
   color: var(--text-muted);
 }
 .military-origin-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+/* 每颗出发点一行，**纵向**排。
+   ⚠️ 不许改成横排：一行 = 一个下拉（`min-width: 240px`）+ 航线 + 启用 + 移除，
+   两颗并排就已经比主行右侧那块空白宽，第三颗必然把整张卡撑出横向滚动条。
+   行距由这里的 `gap` 一处说了算（`addMilitaryOrigin` 里那个 `marginTop` 已经删了，
+   两份叠起来三颗出发点白吃 15px）。 */
+.military-origin-list { display: flex; flex-direction: column; gap: 5px; }
 /* ⚠️ 这里从前有一条 `.military-toggle`（「军力优先」那个复选框的行内布局）。
    开关随「原来的攻击模式被废弃」从页面上删掉了（用户口径 2026-08-22），规则
    跟着删——留着一条没有任何节点会命中的规则，下一个人会以为那个控件还在。 */
-.military-dispatch { display: block; }
+
+/* 军力方案（出发点 / 航线）。
+   ⚠️ **2026-08-22 第三轮改版：它不在「更多」里了**，而是主行最右侧那一格
+   （用户口径：「航线设置数量不要在下拉内。下拉框放在右侧，减少一行。」）。
+   从前它是 `.military-dispatch more-line`，布局全靠 `.mission-more .more-line`
+   那条规则借来——那个选择器现在一个节点都命不中了，所以这里自己写一份。
+
+   判据只有一条：**能换行**。单出发点时它是「标签 + 一个下拉 + 一个航线框 +
+   三个按钮」一行；多出发点时中间那个列表纵向长高，放不下的按钮自己掉到下一行。
+   写死一行（`nowrap`）就会把整张卡撑出横向滚动条，而卡是要横着读状态的。 */
+.military-dispatch {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 12px;
+  /* 「出发点 / 航线」那个标签跟卡上别处的字段标签一样是灰小字（`.inline-label`
+     在这一页只是个语义标记，没有自己的颜色）。按钮、下拉、输入框都自带前景色，
+     不受这一条影响。 */
+  color: var(--text-muted);
+}
 .military-dispatch[hidden] { display: none; }
 
 /* 底部「其他链路」：海盗与全星系扫描。样式压暗一档，**功能一点没少**

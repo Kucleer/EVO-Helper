@@ -689,7 +689,9 @@
   function addMilitaryOrigin(list, origin = {}) {
     const line = document.createElement('div');
     line.className = 'military-origin-line';
-    line.style.marginTop = '5px';
+    // ⚠️ 行距交给 `.military-origin-list` 的 `gap`（它现在是**纵向** flex），这里
+    // 不再写 `marginTop`：两份间距叠起来，三颗出发点就白吃 15px 高度，而这一轮
+    // 改版做的正是压高度。
     const planet = document.createElement('select');
     planet.className = 'military-origin-planet';
     planet.setAttribute('aria-label', '军力攻击出发星球');
@@ -713,7 +715,15 @@
     remove.type = 'button';
     remove.className = 'btn small military-remove-origin';
     remove.textContent = '移除';
-    line.append(planet, document.createTextNode(' '), fleetLines, document.createTextNode(' '), enabled, remove);
+    // ⚠️ **航线数是独立控件，不许和出发点下拉包进同一个视觉分组**（用户口径
+    // 2026-08-22：「航线设置数量不要在下拉内」）。所以 `.fld` 只圈住「数字框 +
+    // 条」这一格——那是它自己的单位，不是下拉框的一部分。下拉框裸着排在前面，
+    // 两者之间的距离由 `.military-origin-line` 的 `gap` 说了算。
+    //
+    // 从前这里塞的是 `createTextNode(' ')` 做间隔。纯空白的文本节点在 flex 容器里
+    // 根本不渲染（和 `makeUnit` 上那段踩过的坑同源），也就是说那两个「间隔」一直
+    // 是假的，真正在起作用的只有 `gap`。留着只会让下一个人以为间距靠它。
+    line.append(planet, makeField(fleetLines, makeUnit('条')), enabled, remove);
     list.append(line);
   }
 
@@ -793,7 +803,18 @@
 
     const checkbox = makeInput('mission-enabled', { type: 'checkbox' });
     checkbox.setAttribute('aria-label', `让「${task.label}」参与调度`);
-    line.append(checkbox);
+    // ⚠️ **挂在卡上、而且放在 DOM 最前，不是挂在主行里。**
+    //
+    // 它是绝对定位的（见 console.css），所以 DOM 位置不影响它画在哪儿。挂到卡上
+    // 是为了让 CSS 能把它**排除在「停用则压暗」之外**：
+    // `opacity` 在子元素上是**相乘**的，父卡 0.6 × 子 1 仍然是 0.6——
+    // 一度写过 `.mission-card.off .mission-enabled { opacity: 1.6 }` 想把它捞回来，
+    // 那既超出 opacity 的取值范围（钳成 1）、也不可能反抗父级的 0.6。
+    // 唯一的解法是压暗**兄弟节点**而不是整张卡，而那要求它是卡的直接子元素。
+    //
+    // 放最前还有一个实际好处：它视觉上在最左，Tab 顺序也就跟着最先——
+    // 而这是全卡唯一能决定「这条链路到底跑不跑」的控件。
+    row.prepend(checkbox);
 
     // 名字。
     //
@@ -851,7 +872,7 @@
     } else {
       // 银河系标记。**颜色只是加速，号码本身必须写在卡上**：这一页的既有规矩是
       // 「状态绝不只用颜色承载」，同一条规矩这里照用——色相按银河系号取，而 9 个
-      // 之后循环（`galaxyHue`），光靠颜色分不出 1 系和 10 系。
+      // 循环（`galaxyHue` 用黄金角步进，360 个银河系才重复），但色相本身不带号码。
       const galaxy = document.createElement('span');
       galaxy.className = 'galaxy-tag';
       galaxy.textContent = '—系';
@@ -996,11 +1017,65 @@
       line.append(newRound, remove);
     }
 
+    // ---- 军力方案：主行右侧那块空白 -----------------------------------------
+    //
+    // ⚠️ **2026-08-22 第三轮改版：它从「更多」里提出来了。** 从前它是折叠区里的
+    // 一条 `.more-line`，理由写着「配一次就不再动」。那句话对定时开关成立，对它
+    // 不成立：它是这条链路**唯一**的派遣依据（`_military_assignments` →
+    // `_military_origins` → `_configured_origins`），换出发点、加一颗星球、改航线
+    // 都得先点开一层折叠才够得着，而主行那段只读文字只念结果、不能改。
+    //
+    // 用户口径（2026-08-22）：「航线设置数量不要在下拉内。下拉框放在右侧，减少
+    // 一行。」落点就是主行的**最右侧**：摘要钉了 640px 的上界（见上面那段），它
+    // 右边本来就是一整片留白，把这一块填进去等于白拿一行——而省下来的那一行正是
+    // 从前常驻的「更多」折叠条。
+    //
+    // ⚠️ **不用绝对定位硬塞。** 多出发点时这一块本来就是一份多行列表，高度不定；
+    // 定位塞进去的话，行数一多就会盖住底下的东西，而且宽度算错就撑出横向滚动条。
+    // 这里靠 `flex-wrap`：前面那个 `.spacer` 把它推到右边，放不下时它自己换行。
+    if (task.kind === 'BOT') {
+      const dispatchSpacer = document.createElement('span');
+      dispatchSpacer.className = 'spacer';
+      const militaryDispatch = document.createElement('div');
+      militaryDispatch.className = 'military-dispatch';
+      // 标题只剩一个标签。从前它是一个 `<div>`，把「增加出发点 / ⓘ / 保存」三个
+      // 按钮都装在里面，于是这一块恒定两行高（标题一行 + 列表一行）。现在标签、
+      // 列表、按钮是同一个 flex 容器的三个项，单出发点时它们排成**一行**。
+      const originHead = document.createElement('span');
+      originHead.className = 'inline-label';
+      originHead.textContent = '出发点 / 航线';
+      const origins = document.createElement('div');
+      origins.className = 'military-origin-list';
+      const addOrigin = document.createElement('button');
+      addOrigin.type = 'button';
+      addOrigin.className = 'btn small military-add-origin';
+      addOrigin.textContent = '增加出发点';
+      // 「保存军力方案」。⚠️ **它必须和这一组待编辑的行摆在一起**：从前它长在
+      // 「军力优先」那一行上，理由是那一行不会被藏（`saveMilitary` 要能存下
+      // 「关」这个状态）。开关删了之后那个理由随之消失，而「改完这几行、就在
+      // 这几行旁边按保存」才是它该在的地方——存的正是这一组加上主行那三个参数。
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'btn primary small military-save';
+      save.textContent = '保存军力方案';
+      save.title = '保存这张卡的军力配置：主行那三个参数，以及这一组出发点与航线';
+      // 这句说明每一张卡长得一模一样（它讲的是这个功能怎么用，不是这一张卡的
+      // 事实），所以进 ⓘ 而不是再铺一行 `<div>`。
+      militaryDispatch.append(originHead, origins, addOrigin,
+                              makeTips('多出发点说明', MILITARY_ORIGIN_TIP), save);
+      line.append(dispatchSpacer, militaryDispatch);
+    }
+
     // ---- 「更多」折叠区 -----------------------------------------------------
     //
-    // 主行只放每天都要看的那几样。剩下三样搬进这里：定时开关、军力方案
-    // （出发点 / 航线）、任务级出发点。它们的共同点是**配一次就不再动**，
-    // 而它们恒展开时买到的是一整片空框。
+    // ⚠️ **它不再独占一行**（2026-08-22 第三轮改版）。从前 `<summary>` 是卡片里
+    // 常驻的第三行，写着「更多：定时开关 · 军力方案 · 任务级出发点」——单出发点、
+    // 没配定时时，那一整行里一个值都没有，纯粹是一条横幅。现在 `<summary>` 就是
+    // 主行里的一个 flex 项（折着时只占一小格），展开时靠 CSS 的
+    // `.mission-more[open] { flex: 1 1 100%; }` 独占一行、内容往下长。
+    //
+    // 剩下两样搬进这里：定时开关、任务级出发点。它们的共同点是**配一次就不再动**，
+    // 而它们恒展开时买到的是一整片空框。军力方案不再在里面——理由见上面那段。
     //
     // ⚠️ 这里从前还有「军力优先」那个开关，2026-08-22 随「原来的攻击模式被废弃」
     // 一起删了（用户口径）。
@@ -1020,16 +1095,17 @@
     const more = document.createElement('details');
     more.className = 'mission-more';
     const moreHead = document.createElement('summary');
-    // 标题把里面真有的东西列出来。海盗与扫描没有军力那两样，写上去就是一句
-    // 「点开却找不到」——用户会以为这一块坏了。
+    // 标题把里面真有的东西列出来。填空隙那两条没有任务级出发点（它们不派遣），
+    // 写上去就是一句「点开却找不到」——用户会以为这一块坏了。
+    // ⚠️ 「军力方案（出发点 / 航线）」这一段跟着控件一起从这里删了：折叠标题上
+    // 列一样已经不在里面的东西，比不列更糟。
     moreHead.append('更多：定时开关（UTC+8）'
-      + (task.kind === 'BOT' ? ' · 军力方案（出发点 / 航线）' : '')
       + (fillsGaps ? '' : ' · 任务级出发点'));
     // 折叠态的那一行小字：没配就说没配，配了就把两端的时刻念出来。
     const windowState = document.createElement('span');
     windowState.className = 'muted mission-window-state';
-    // 6px → 12px：这一行现在列着三样东西（定时 / 军力方案 / 任务级出发点），
-    // 最后一样和这句小字之间 6px 会读成「任务级出发点未设定时」。
+    // 6px → 12px：标题里最后那样东西（「任务级出发点」）和这句小字之间给 6px，
+    // 会读成「任务级出发点未设定时」。
     windowState.style.marginLeft = '12px';
     windowState.textContent = '未设定时';
     moreHead.append(windowState);
@@ -1089,40 +1165,9 @@
     windowRow.append(windowToggleLabel, window_);
     more.append(windowRow);
 
-    if (task.kind === 'BOT') {
-      // 军力方案：这条链路**唯一**的派遣依据（`_military_assignments` →
-      // `_military_origins` → `_configured_origins`）。
-      //
-      // ⚠️ **恒显示，不再跟任何开关显隐。** 从前它跟着「军力优先」藏起来，而那个
-      // 开关随「原来的攻击模式被废弃」删掉了（用户口径 2026-08-22）。把这条链路
-      // 唯一的派遣依据藏在一个条件后面，本来就只有「还有另一条路」时才说得通。
-      const militaryDispatch = document.createElement('div');
-      militaryDispatch.className = 'military-dispatch more-line';
-      const originHead = document.createElement('div');
-      originHead.append('出发点 / 航线　');
-      const addOrigin = document.createElement('button');
-      addOrigin.type = 'button';
-      addOrigin.className = 'btn small military-add-origin';
-      addOrigin.textContent = '增加出发点';
-      // 「保存军力方案」。⚠️ **它必须和这一组待编辑的行摆在一起**：从前它长在
-      // 「军力优先」那一行上，理由是那一行不会被藏（`saveMilitary` 要能存下
-      // 「关」这个状态）。开关删了之后那个理由随之消失，而「改完这几行、就在
-      // 这几行旁边按保存」才是它该在的地方——存的正是这一组加上上面那三个参数。
-      const save = document.createElement('button');
-      save.type = 'button';
-      save.className = 'btn primary small military-save';
-      save.textContent = '保存军力方案';
-      save.title = '保存这张卡的军力配置：主行那三个参数，以及下面这一组出发点与航线';
-      // 这句说明每一张卡长得一模一样（它讲的是这个功能怎么用，不是这一张卡的
-      // 事实），所以进 ⓘ 而不是再铺一行 `<div>`。
-      originHead.append(addOrigin, document.createTextNode(' '),
-                        makeTips('多出发点说明', MILITARY_ORIGIN_TIP),
-                        document.createTextNode(' '), save);
-      const origins = document.createElement('div');
-      origins.className = 'military-origin-list';
-      militaryDispatch.append(originHead, origins);
-      more.append(militaryDispatch);
-    }
+    // ⚠️ **这里从前是军力方案那一块**（`.military-dispatch more-line`）。
+    // 2026-08-22 提到主行右侧去了，理由写在上面那一大段：它是这条链路唯一的派遣
+    // 依据，折起来就等于「唯一能改派遣的地方要先点一下才够得着」。
 
     // 任务级出发点与航线数（遗留的 `mission_tasks.origin_*` / `fleet_lines`）。
     //
@@ -1161,7 +1206,11 @@
       more.append(legacy);
     }
 
-    row.append(more);
+    // ⚠️ **挂在主行上，不是挂在卡上**（2026-08-22 第三轮改版）：`<summary>` 要和
+    // 摘要、军力方案排在同一个 `flex-wrap` 里，折着时才只占一小格而不是一整行。
+    // 排在**最后**是有意的：展开时 CSS 给它 `flex: 1 1 100%`，它会自己落到下一行
+    // 去；排在军力方案前面的话，一展开就把军力方案挤到更下面一行。
+    line.append(more);
     return row;
   }
 
@@ -1275,7 +1324,17 @@
             row.style.removeProperty('--galaxy-hue');
           } else {
             row.dataset.galaxy = current;
-            row.style.setProperty('--galaxy-hue', `${((galaxies[0] - 1) % 9) * 40}deg`);
+            // ⚠️ **黄金角步进（137°），不是「均分一圈」。**
+            //
+            // 原先写的是 `((galaxy - 1) % 9) * 40`：一圈 360° 按 40° 一档，
+            // 只有 **9** 种色相。而用户口径（2026-08-22）「最大是 10 个星球，
+            // 你需要有冗余」——第 10 个银河系恰好绕回第 1 个，撞在最坏的位置上：
+            // 不是「颜色接近」，是**一模一样**。
+            //
+            // 137 与 360 互质，所以 `(galaxy * 137) % 360` 要到第 360 个银河系
+            // 才重复，冗余远超 10。而且相邻号码在色轮上隔着 137°，
+            // 1 系和 2 系的差别比均分方案还大——均分时相邻只差一档。
+            row.style.setProperty('--galaxy-hue', `${(galaxies[0] * 137) % 360}deg`);
           }
         }
       }
