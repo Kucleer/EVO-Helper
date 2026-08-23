@@ -149,10 +149,15 @@ def test_the_old_task_parameters_are_left_exactly_as_they_were(database_url: str
                 "INSERT INTO mission_tasks "
                 "(kind, enabled, priority, params_json, consecutive_failures, "
                 "created_at_utc, updated_at_utc) "
-                "VALUES ('BOT', 1, 1, :params, 0, "
+                "VALUES ('BOT', :enabled, 1, :params, 0, "
                 "'2026-08-23 00:00:00', '2026-08-23 00:00:00')"
             ),
-            {"params": params},
+            # ⚠️ **`enabled` 要绑成 Python 的 `True`，不能在 SQL 里写字面量 `1`。**
+            # 本地默认跑 SQLite（1 就是真），而 CI 跑 PostgreSQL——那边这一列是
+            # `boolean`，塞整数直接 `DatatypeMismatch`：
+            #   column "enabled" is of type boolean but expression is of type integer
+            # 绑成参数之后由方言各自适配，两边都过。这条本地绿、CI 红过一次。
+            {"params": params, "enabled": True},
         )
 
     command.upgrade(config, "head")
