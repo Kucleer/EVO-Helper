@@ -1276,3 +1276,54 @@ def test_ten_galaxies_never_share_a_hue(client: TestClient) -> None:
     assert len(set(hues)) == 12, "12 个银河系里出现了重复色相"
     closest = min(abs(a - b) for index, a in enumerate(hues) for b in hues[index + 1 :])
     assert closest >= 15, f"最接近的两个色相只差 {closest}°，分不开"
+
+
+def test_only_the_handle_starts_a_drag_not_the_whole_card(client: TestClient) -> None:
+    """⚠️ **拖拽只许从 ⠿ 起，不许从卡身任何位置起。**
+
+    用户口径（2026-08-23）：「整张卡都能拖，应只有 ⠿ 能拖」。
+
+    守的是真实的误操作：卡上有出发点下拉框、航线数输入框、军力上限输入框和一串
+    说明文字。`draggable` 设在整张卡上时，想选中输入框里的文字、或者想划选那行
+    说明，按下去一移动就变成了一次重排——而重排会给这一块里**每张卡各发一个
+    PATCH**，用户根本没想改优先级。
+
+    ⚠️ **`draggable` 属性本身仍然设在卡上，不能挪到把手上。** HTML5 拖拽只拖
+    「带 draggable 的那个元素」，要拖的是整张卡；而且这一页有三处拿
+    `draggable === 'true'` 当「这张卡能不能排序」的判据
+    （`onCardDragStart` / `onCardDragOver` / `onCardDragEnd` 里那个
+    `querySelectorAll`）。所以限制起拖点只能在 `dragstart` 里挡，
+    而不是去动那个属性。
+    """
+    body = client.get("/missions", headers={"X-Console-Token": TOKEN}).text
+
+    # 按下时记住落点，`dragstart` 时据此决定放不放行。
+    assert "box.addEventListener('pointerdown', onCardPointerDown)" in body
+    assert "event.target.closest('.drag-handle')" in body
+    # 不是从把手起的那些拖动要被真的挡掉，不能只是 return（return 之后浏览器
+    # 照样把卡拖起来，只是这一页不再跟着重排——落点错了却看着像能拖）。
+    assert "if (grabbedHandleRow !== row) {" in body
+    assert "event.preventDefault();" in body
+    # 一次拖完要清掉，否则下一次从卡身按下也会被当成「还按着把手」。
+    assert "grabbedHandleRow = null;" in body
+
+
+def test_the_grab_cursor_only_sits_on_the_handle() -> None:
+    """抓手光标只画在 ⠿ 上——它是「哪里能拖」唯一的可见提示。
+
+    画在整张卡上就等于把规则教错：用户会去拖卡身，然后发现没反应。这一条和
+    `test_only_the_handle_starts_a_drag_not_the_whole_card` 是一件事的两半，
+    少哪一半都会让另一半看起来像坏了。
+    """
+    css = _console_css()
+
+    assert '.mission-card[draggable="true"] .drag-handle { cursor: grab; }' in css
+    # ⚠️ 旧规则打在整张卡上，别留着——两条并存时卡身照旧显示抓手。
+    assert '.mission-card[draggable="true"] { cursor: grab; }' not in css
+    # 把手不许被选中：`user-select` 没关掉的话，按住它拖会变成划选那个字符。
+    #
+    # ⚠️ 用行首锚定找**基础**规则，不能拿 `_rule_block(css, ".drag-handle {")`
+    # ——它是子串匹配，会先撞上上面那条 `.mission-card[...] .drag-handle {`。
+    base = re.search(r"^\.drag-handle\s*\{[^}]*\}", css, re.MULTILINE)
+    assert base is not None, "`.drag-handle` 的基础规则不见了"
+    assert "user-select: none" in base.group(0)

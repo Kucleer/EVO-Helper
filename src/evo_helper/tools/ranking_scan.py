@@ -27,12 +27,12 @@ from evo_helper.domain.ranking import (
     RankingRow,
     bot_area_reached_rows_message,
     coordinate_of,
-    descending_breaks,
     interpolate_scores,
     is_bot_entry,
     mentions_bot,
     repair_ranks,
     rows_skipped,
+    trusted_scores,
 )
 from evo_helper.domain.records import RankingTarget
 from evo_helper.domain.scheduler import EXIT_RANKING_INCOMPLETE
@@ -67,6 +67,7 @@ from evo_helper.game.ranking_ui import (
     ROWS_PER_NOTCH,
     ROWS_PER_SCREEN,
     ROWS_PER_SCROLL,
+    SCORE_ANCHOR_RESET_SCREENS,
     SCORE_COLUMN,
     SCROLL_STALL_CONFIRMATIONS,
     SPIN_MARK_MIN_ROWS,
@@ -557,7 +558,36 @@ def last_rank_of(rows: Sequence[RankingRow]) -> int | None:
     return next((row.rank for row in reversed(rows) if row.rank is not None), None)
 
 
-def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[RankingTarget]:
+def screen_scores(rows: Sequence[RankingRow], *, anchor: float | None) -> list[float | None]:
+    """这一屏哪些军力读数可信——渲染得出来、不破坏降序、也没跌掉一个数量级。
+
+    两道判据叠在一起，顺序要紧：先按「游戏渲染得出来吗」把多插一位的挑掉
+    （`renderable_score`），**再**拿它们去和锚点比。反过来的话，一个渲染不出来的
+    大数会先当上锚点，把它后面一整段好读数都判成「破坏降序」。
+    """
+    return trusted_scores(
+        [row.score if renderable_score(row.score) else None for row in rows], anchor=anchor
+    )
+
+
+def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> float | None:
+    """交给**下一屏**的锚点：这一屏最后一个可信值；一个都没有就沿用旧锚点。
+
+    ⚠️ **沿用而不是清空。** 整屏读废（或整屏都被判为不可信）是常态之一，
+    清成 `None` 就等于把下一屏也放行——而那正是这道判据要挡的情形。
+
+    ⚠️ **只找正值。** 0 不许当锚点：它当上锚点之后此后每一屏都会被全丢，
+    而且不报错。整段账在 `domain.ranking.trusted_scores` 上。
+    """
+    return next(
+        (value for value in reversed(screen_scores(rows, anchor=anchor)) if value),
+        anchor,
+    )
+
+
+def targets_from_rows(
+    rows: list[RankingRow], *, observed_at: datetime, anchor: float | None = None
+) -> list[RankingTarget]:
     """修名次、**丢掉破坏降序的军力值**、插补空缺，并留下「这个数是估算的」的证据。
 
     ⚠️ **降序异常必须丢，不能只打印。** 2026-08-15 那一夜的教训：库里 30 个 bot
@@ -579,15 +609,23 @@ def targets_from_rows(rows: list[RankingRow], *, observed_at: datetime) -> list[
     """
     repaired = repair_ranks([row.rank for row in rows])
     read = [row.score for row in rows]
-    trusted = list(read)
-    for index, score in enumerate(read):
-        if not renderable_score(score):
-            trusted[index] = None
-    for index in descending_breaks(read):
-        trusted[index] = None
-    if len(read) != len(trusted) or any(a != b for a, b in zip(read, trusted, strict=True)):
-        dropped = [index for index, score in enumerate(trusted) if score is None and read[index]]
-        say(f"军力值破坏降序，丢掉这几行的分数（坐标保留）: {dropped}")
+    trusted = screen_scores(rows, anchor=anchor)
+    dropped = [
+        (index, read[index])
+        for index, score in enumerate(trusted)
+        if score is None and read[index] is not None
+    ]
+    if dropped:
+        # ⚠️ **把锚点和被丢的值一起打出来。**
+        #
+        # 原先这一句只说「破坏降序」加一串下标，而现在有三条拒收理由
+        # （比前一行大 / 比基准大一个数量级 / 比基准小一个数量级），事后分不清是
+        # 「读数真错了」还是「锚点本身错了、把好读数误伤了」——那两件事的处置完全
+        # 相反。带上锚点和原值就能一眼判：值和锚点差 10 倍是前者，差不到 2 倍是后者。
+        say(
+            f"军力值不可信，丢掉这几行的分数（坐标保留）"
+            f"[锚点 {anchor}]: {[(i, v) for i, v in dropped]}"
+        )
     filled = interpolate_scores(trusted)
     targets: list[RankingTarget] = []
     for index, row in enumerate(rows):
@@ -1330,6 +1368,13 @@ def scan(
     # ——而那会把一次干净的中断变成一条堆栈。
     previous_last_rank: int | None = None
     missed = 0
+    # ⚠️ **军力锚点要跨屏活着。** 上一屏最后一个可信的军力值，用来判下一屏的
+    # 第一行——`descending_breaks` 是按屏跑的，屏首那一行原先没有任何约束，
+    # 而 2026-08-23 生产实测正是从那里漏进去一个 10 倍偏大的值
+    # （账在 `domain.ranking.trusted_scores`）。
+    score_anchor: float | None = None
+    #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
+    blind_score_screens = 0
 
     account = BlindSpinAccount()
     if blind_rows is None:
@@ -1409,7 +1454,10 @@ def scan(
         if outcome == 0:
             progress.stage = ScanStage.COLLECTING
             rows = read_rows()
-            first, reached_limit = collect(targets_from_rows(rows, observed_at=datetime.now(UTC)))
+            first, reached_limit = collect(
+                targets_from_rows(rows, observed_at=datetime.now(UTC), anchor=score_anchor)
+            )
+            score_anchor = next_score_anchor(rows, anchor=score_anchor)
             screens.append(first)
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
@@ -1424,8 +1472,35 @@ def scan(
                     break
                 rows = list(step.rows)
                 fresh, reached_limit = collect(
-                    targets_from_rows(rows, observed_at=datetime.now(UTC))
+                    targets_from_rows(rows, observed_at=datetime.now(UTC), anchor=score_anchor)
                 )
+                score_anchor = next_score_anchor(rows, anchor=score_anchor)
+                # ⚠️ **自愈阀：连着几屏整屏被判掉，就把锚点撤掉重新起头。**
+                #
+                # 锚点错了的后果是不对称的：它会把**后面每一屏**的好读数都判成
+                # 「破坏降序」，而整屏被判掉又让锚点「沿用」下去——一个错值就能
+                # 让整趟余下的军力值全空，且每屏只打一句「丢掉这几行」，没有累计信号。
+                # （2026-08-23 实测过一种入口：第一屏中位数为 0，见
+                # `domain.ranking.trusted_scores`；那条已经堵了，但堵的是入口，
+                # 不是这个形状本身。）
+                #
+                # 撤掉锚点的代价只是「下一屏按自己的中位数起头」，而收益是把一次
+                # 永久性静默失败压成两屏的颠簸。
+                if any(target.military_score is not None for target in fresh):
+                    blind_score_screens = 0
+                else:
+                    blind_score_screens += 1
+                    if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
+                        say(
+                            f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
+                            f"（锚点 {score_anchor}）：撤掉锚点重新起头"
+                        )
+                        record_log(
+                            "军力锚点重置",
+                            {"screens": blind_score_screens, "anchor": score_anchor},
+                        )
+                        score_anchor = None
+                        blind_score_screens = 0
                 # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
                 # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
                 # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
@@ -1791,7 +1866,9 @@ __all__ = [
     "first_rank_of",
     "last_rank_of",
     "release_stuck_mouse",
+    "next_score_anchor",
     "renderable_score",
+    "screen_scores",
     "main",
     "parse_score",
     "position_from_image",

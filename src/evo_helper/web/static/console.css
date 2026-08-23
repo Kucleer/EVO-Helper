@@ -424,8 +424,11 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    子元素的 `opacity` 与父级**相乘**，父卡 0.6 × 子 1 还是 0.6，捞不回来。
    （所以它必须是卡的**直接子元素**——见 missions.html 里 `row.prepend(checkbox)`。）*/
 .mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }
-.mission-card[draggable="true"] { cursor: grab; }
-.mission-card[draggable="true"]:active { cursor: grabbing; }
+/* ⚠️ **抓手只画在 ⠿ 上，不画在整张卡上。** 用户口径（2026-08-23）：只有把手能
+   起拖（挡在 `missions.html` 的 `onCardDragStart` 里）。光标是这条规则唯一的
+   可见提示——画在整张卡上就等于把「哪里能拖」教错，用户会去拖卡身然后发现没反应。 */
+.mission-card[draggable="true"] .drag-handle { cursor: grab; }
+.mission-card[draggable="true"] .drag-handle:active { cursor: grabbing; }
 
 /* 每个银河系一套配色（用户口径 2026-08-22：「每个银河系一套框体配色」）。
 

@@ -298,6 +298,17 @@ ROW_GRID_TOLERANCE_PX = 8.0
 #: 两头都宽。**别调回 15**，那是另一把尺子（一格裁多高），和这里同名不同义。
 ROW_WORD_SPREAD_PX = 6.0
 
+#: 连着几屏一个军力值都没被采信，就把跨屏锚点撤掉重新起头。
+#:
+#: 锚点错了的后果是**不对称**的：它会把后面每一屏的好读数都判成「破坏降序」，
+#: 而整屏被判掉又让锚点沿用下去——一个错值就能让整趟余下的军力值全空。
+#: 判据整段在 `domain.ranking.trusted_scores`。
+#:
+#: 取 2 的账：单屏全废是常态（读不出、整屏偏移、真人段），**两屏连着全废**才可疑。
+#: 撤掉锚点的代价只是「下一屏按自己的中位数起头」，比一次永久性静默失败便宜得多。
+#: ⚠️ 这不是安全边界：调大只是让自愈来得晚一点，调小会让正常的两屏颠簸误触发重置。
+SCORE_ANCHOR_RESET_SCREENS = 2
+
 #: 一次滚动大约推进多少名（实测 ≈ 8.3）。
 #: **只用来估时间，不用来算行**：滚动带惯性，按它外推行号必错。
 ROWS_PER_SCROLL = 8.3
@@ -798,6 +809,7 @@ __all__ = [
     "ROW_GRID_TOLERANCE_PX",
     "ROW_PITCH_PX",
     "ROW_WORD_SPREAD_PX",
+    "SCORE_ANCHOR_RESET_SCREENS",
     "SCROLL_FROM_Y",
     "SCROLL_SETTLE_MIN_ROWS",
     "SCROLL_SETTLE_WAIT_S",
