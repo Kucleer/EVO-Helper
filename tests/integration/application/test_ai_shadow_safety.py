@@ -45,11 +45,11 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, enable, task
+from .test_mission_scheduler import add_bot_target, enable, set_score_window, task
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
-BY_MILITARY = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
+BY_MILITARY = '{"by_military": true}'
 
 ORIGIN_A = Coordinate(4, 277, 15)
 
@@ -156,6 +156,18 @@ def _make_scheduler(repository: SqlAlchemyRepository, clock: Clock, launcher, ob
     )
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 2 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=2, window_floor=2)
 
 
 def _a_working_pool(repository: SqlAlchemyRepository, session_factory) -> None:  # type: ignore[no-untyped-def]

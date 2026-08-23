@@ -22,11 +22,11 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, enable, task
+from .test_mission_scheduler import add_bot_target, enable, set_score_window, task
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
-BY_MILITARY = '{"by_military": true, "top_n": 2, "score_max_age_hours": 2}'
+BY_MILITARY = '{"by_military": true}'
 
 ORIGIN_A = Coordinate(4, 277, 15)
 
@@ -162,6 +162,10 @@ def _run_and_wait(  # type: ignore[no-untyped-def]
             ai_shadow=observer,
         )
         scheduler.prepare()
+        # 选靶窗口那两格 2026-08-23 起是全局的（`military_attack_config`），
+        # 不再是任务参数。这个模块的候选池只有两三个目标，门限若吃代码默认值
+        # （100）就每一轮都走「放宽窗口」那一支，本该量到的东西量不到。
+        set_score_window(repository, max_age_hours=2, window_floor=2)
         _working_pool(repository, session_factory)
         _enable_switch(session_factory)
         row = task(repository, MissionKind.BOT)

@@ -40,7 +40,14 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, enable, only_gap_filler, task, task_id
+from .test_mission_scheduler import (
+    add_bot_target,
+    enable,
+    only_gap_filler,
+    set_score_window,
+    task,
+    task_id,
+)
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 
@@ -51,7 +58,7 @@ NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 #: 才生效。于是 `has_work()` 看得见「还有 3 个能打」、`_military_command()` 却挑不出
 #: 一个来——这正是 `MissionIdle` 在生产里真实可达的形状：会自己好起来（军力榜扫到
 #: 弱一点的目标就成立了），不该停用任何东西。
-ALL_TOO_STRONG = '{"by_military": true, "top_n": 2, "score_max_age_hours": 24, "max_score": 100}'
+ALL_TOO_STRONG = '{"by_military": true, "max_score": 100}'
 
 #: 海盗半径填 0：要到组命令行才校验得出来，所以停用发生在决策**之后**。
 BAD_RADIUS = '{"radius": 0}'
@@ -67,6 +74,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 24 小时、窗口门限 2 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=24, window_floor=2)
 
 
 class FactsCounter:

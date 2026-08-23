@@ -12,6 +12,66 @@
   </div>
 </section>
 
+<section class="panel" aria-labelledby="window-head">
+  <h2 id="window-head">军力选靶窗口（有效期与门限）</h2>
+  <p class="muted">
+    ⚠️ <strong>这两格 2026-08-23 从任务行搬到了这里，现在是全局的</strong>——所有军力任务共用同一份，任务行上那两个框已经撤掉。
+    从前每个任务各配一份，而任务是按出发点银河系分的，于是同一个数存了好几份；
+    但它们约束的<strong>不是星系，是军力榜扫描的节奏</strong>：榜是一趟扫完全宇宙的，一轮扫多久、读数能有多新，与舰队从哪个银河系出发无关。
+  </p>
+  <p class="muted">
+    选靶顺序：① 剔除近期打过的与撞上过保护期的 → ② 只留有<strong>本周期</strong>军力读数的（从未上榜的不打，上周一之前读到的也不算）
+    → ③ 只留读数落在<strong>有效期</strong>之内的，<strong>窗口内不足门限那么多个时放弃窗口</strong>并告警
+    → ④ 过「军力上限」这道安全线，按 <code>军力 ÷ 往返小时</code> 从高到低出击。
+    <strong>这两格都不决定打谁</strong>——打谁只由第 ④ 步那一条判据定。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="score-max-age">军力分数有效期（小时，默认 {{ score_max_age_default }}）</label>
+    <input id="score-max-age" type="number" min="0.1" max="{{ score_max_age_max }}" step="0.5"
+           placeholder="留空 = {{ score_max_age_default }}" aria-label="军力分数有效期（小时）">
+  </div>
+  <p class="muted">
+    只有读数落在这段时间之内的目标，才算「军力值还可信」。<strong>可以填小数</strong>（1.5 小时是合法取值）。<br>
+    默认 {{ score_max_age_default }} 小时的来历是<strong>一轮军力榜扫描时长的约 2 倍</strong>（实测一轮约 60 分钟）。<br>
+    ⚠️ <strong>卡在「刚好一轮时长」附近是有害的</strong>：军力榜按军力降序扫，所以一轮扫完之后，
+    <strong>军力最高的那批读数最旧、最低的最新</strong>。窗口若只有一轮那么宽，能通过筛选的恰好是这一批里军力最低的那些——
+    而「军力优先」正是为了打高军力的，那会系统性地把攻击推向弱目标，把这个模式的意义抵消掉。
+  </p>
+  <p class="muted">
+    <strong>调小</strong>：只用最新读数，选靶最准；代价是窗口内的目标数会掉到门限之下，于是<strong>窗口反而被放弃</strong>，改用全部有读数的目标（会告警）。<br>
+    <strong>调大</strong>：几乎不会放弃窗口；代价是拿更旧的读数排序，而实测<strong>读数每陈旧 1 小时，稀有材料产出掉约 10%</strong>（n=45，2026-08-19）——
+    快照到开打这段时间里，目标可能已被别人打过。<br>
+    上限 {{ score_max_age_max }} 小时（一周）——bot 军力每周一 UTC+0 刷新，上周期的读数本来就整批不参与选靶，再往上填这个数<strong>挡不掉任何目标</strong>。
+    要「不设窗口」<strong>请不要填 0</strong>（后端会拒）：0 等于「没有一条读数算新」，于是每轮都放弃窗口、一律拿旧读数打——和你想要的正好相反。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <label for="window-floor">窗口门限（个，默认 {{ window_floor_default }}）</label>
+    <input id="window-floor" type="number" min="1" step="1"
+           placeholder="留空 = {{ window_floor_default }}" aria-label="窗口门限（窗口内至少几个）">
+  </div>
+  <p class="muted">
+    窗口内至少要有这么多个目标，这一轮才肯<strong>只用</strong>窗口内的那批。不足这么多个时会<strong>放弃窗口</strong>、改用全部有读数的目标，
+    并在任务行上标出「军力读数已放宽窗口」、往日志里写一条 WARNING。
+  </p>
+  <p class="muted">
+    ⚠️ <strong>它不是「打前几名」。</strong>那道军力硬截断 2026-08-18 就取消了（近而弱的和远而强的现在在同一把尺子上比）。
+    这个数只决定<strong>这一轮肯不肯只信新数据</strong>。<br>
+    ⚠️ <strong>不足时是「放弃窗口」，不是「按时间往下补几个」。</strong>往下补捞到的正是刚出窗口那一批，而那批恰恰是军力最弱的——补下去等于把上面那个选择偏差换个地方原样复发。
+  </p>
+  <p class="muted">
+    <strong>调大</strong>：对「新鲜」要求更苛刻，窗口更常被放弃（照样打，但会告警，你能看见）；<strong>调小</strong>：更愿意只用窗口内那批，代价是可选目标少、得分最高的那些可能都在窗口外。<br>
+    <strong>上限刻意不设</strong>：门限该多大取决于候选池此刻有多少个（库里 3000+ 个 bot，而窗口内能有多少又取决于扫描节奏），写死一个数就是拿一个凭空的上界去卡你真实的处境。
+    填得比池子还大只会让窗口每轮都被放弃，<strong>而那件事会告警</strong>。
+    要「窗口永不放弃」<strong>请不要填 0</strong>（后端会拒）：那样窗口内真的一个都没有时（周一凌晨正是如此）这一轮会在空池子上选靶、一发不派，而该响的告警一个字都不写。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
+    <button class="btn primary small" type="button" id="btn-save-window">保存选靶窗口</button>
+  </div>
+</section>
+
 <section class="panel" aria-labelledby="blind-rows-head">
   <h2 id="blind-rows-head">军力榜盲滚行数</h2>
   <p class="muted">
@@ -260,6 +320,11 @@
   const blindScrollRows = document.getElementById('blind-scroll-rows');
   const blindRowsSeconds = document.getElementById('blind-rows-seconds');
   const reportScanHours = document.getElementById('report-scan-hours');
+  // 选靶窗口那两格。**故意不并进下面那个 `knobs` 数组**：有效期允许小数
+  // （1.5 小时是合法取值），而那个数组统一判 `Number.isInteger` ——并进去会把一个
+  // 合法取值当场判成非法，而报出来的话说「要填整数」，用户看不出这句是从哪来的。
+  const scoreMaxAge = document.getElementById('score-max-age');
+  const windowFloor = document.getElementById('window-floor');
   // 行↔秒换算用的三个数**全部由服务端下发**（`game.ranking_ui` 里那三个标定常量），
   // 页面不抄第二遍：抄一遍之后谁重新标定，页面上那个秒数就是假的，而它正是用户
   // 判断「填多少」的唯一依据。
@@ -357,6 +422,10 @@
         blindScrollRows.value = config.blind_scroll_rows ?? '';
         showBlindRowsSeconds();
         reportScanHours.value = config.report_scan_hours ?? '';
+        // 一律 `??`：两格的「留空」都是一个真正的取值（跟着后端默认走），
+        // `||` 会把后端送来的数在某些取值上显示成空框，也就是显示成「没配」。
+        scoreMaxAge.value = config.score_max_age_hours ?? '';
+        windowFloor.value = config.window_floor ?? '';
         // 同上，一律 `??`：0 是合法取值（翻信箱冷却填 0 = 每轮都翻），
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
         for (const knob of knobs) knob.element.value = config[knob.key] ?? '';
@@ -396,11 +465,28 @@
       // 这里的 0 和盲拖那个 0 不一样：下界就是「此刻」，等于一封都翻不到。
       if (!Number.isInteger(hours) || hours < 1) throw new Error('翻信箱时长要填至少 1 的整数小时；要用默认值就把它留空');
     }
+    // 有效期：**只判「是不是数字」，不判整数**——1.5 小时是合法取值。
+    // 上下界留给后端（它和调度器启动时用的是同一把尺子）。
+    const rawMaxAge = scoreMaxAge.value.trim();
+    let maxAge = null;
+    if (rawMaxAge !== '') {
+      maxAge = Number(rawMaxAge);
+      if (!Number.isFinite(maxAge)) throw new Error('军力分数有效期要填数字（可带小数）；要用默认值就把它留空');
+    }
+    const rawFloor = windowFloor.value.trim();
+    let floor = null;
+    if (rawFloor !== '') {
+      floor = Number(rawFloor);
+      // 这里的下界是 1，不是 0：0 等于窗口永远不会被放弃，也就是把这道闸关掉。
+      if (!Number.isInteger(floor) || floor < 1) throw new Error('窗口门限要填至少 1 的整数；要用默认值就把它留空');
+    }
     const payload = {
       tiers: tierPayload,
       blind_scrolls: scrolls,
       blind_scroll_rows: rows,
       report_scan_hours: hours,
+      score_max_age_hours: maxAge,
+      window_floor: floor,
     };
     for (const knob of knobs) {
       const text = knob.element.value.trim();
@@ -425,6 +511,7 @@
   document.getElementById('btn-save-blind').onclick = saveConfig;
   document.getElementById('btn-save-blind-rows').onclick = saveConfig;
   blindScrollRows.oninput = showBlindRowsSeconds;
+  document.getElementById('btn-save-window').onclick = saveConfig;
   document.getElementById('btn-save-scan').onclick = saveConfig;
   document.getElementById('btn-save-knobs').onclick = saveConfig;
   document.getElementById('btn-add-planet').onclick = () => {

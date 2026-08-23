@@ -2869,6 +2869,8 @@ class SqlAlchemyRepository:
         bot_revisit_hours: int | None = None,
         protection_exclusion_hours: int | None = None,
         unreadable_exclusion_hours: int | None = None,
+        score_max_age_hours: float | None = None,
+        window_floor: int | None = None,
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
@@ -2892,6 +2894,8 @@ class SqlAlchemyRepository:
             row.bot_revisit_hours = bot_revisit_hours
             row.protection_exclusion_hours = protection_exclusion_hours
             row.unreadable_exclusion_hours = unreadable_exclusion_hours
+            row.score_max_age_hours = score_max_age_hours
+            row.window_floor = window_floor
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
             session.commit()

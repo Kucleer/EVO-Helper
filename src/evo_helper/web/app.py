@@ -48,10 +48,13 @@ from evo_helper.domain.report_wait import (
 from evo_helper.domain.scan_bounds import TOTAL_GALAXIES
 from evo_helper.domain.target_order import (
     DEFAULT_PROTECTION_EXCLUSION,
+    DEFAULT_SCORE_MAX_AGE,
     DEFAULT_UNREADABLE_EXCLUSION,
     GAME_PROTECTION_HOURS,
     PROTECTION_EXCLUSION_MAX_HOURS,
+    SCORE_MAX_AGE_MAX_HOURS,
     UNREADABLE_EXCLUSION_MAX_HOURS,
+    WINDOW_POOL_FLOOR,
 )
 from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN,
@@ -817,6 +820,15 @@ def create_app(
                 ),
                 "unreadable_exclusion_max": UNREADABLE_EXCLUSION_MAX_HOURS,
                 "game_protection_hours": GAME_PROTECTION_HOURS,
+                # 选靶窗口那两格。默认值同样从常量传进来而不是在 HTML 里手抄：
+                # 页面上那句「留空 = N」是用户判断「填多少」的唯一依据。
+                #
+                # ⚠️ 有效期**不取整**（`DEFAULT_SCORE_MAX_AGE` 现在是 2 小时，
+                # 但它一直允许小数）：`int()` 一下会让页面上写着「留空 = 2」而
+                # 实际默认是 2.5，那种偏差正是这一页最不该有的。
+                "score_max_age_default": DEFAULT_SCORE_MAX_AGE.total_seconds() / 3600,
+                "score_max_age_max": SCORE_MAX_AGE_MAX_HOURS,
+                "window_floor_default": WINDOW_POOL_FLOOR,
                 "account_line_limit_max": ACCOUNT_LINE_LIMIT_MAX,
                 "auto_toggle_log_default": int(REPEATED_LOG_WINDOW.total_seconds()),
                 "auto_toggle_log_max": REPEATED_LOG_MAX_SECONDS,
@@ -1352,6 +1364,8 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
         bot_revisit_hours=view.bot_revisit_hours,
         protection_exclusion_hours=view.protection_exclusion_hours,
         unreadable_exclusion_hours=view.unreadable_exclusion_hours,
+        score_max_age_hours=view.score_max_age_hours,
+        window_floor=view.window_floor,
         account_line_limit=view.account_line_limit,
         auto_toggle_log_seconds=view.auto_toggle_log_seconds,
     )
@@ -1424,6 +1438,8 @@ def register_mission_routes(app: FastAPI) -> None:
                 bot_revisit_hours=payload.bot_revisit_hours,
                 protection_exclusion_hours=payload.protection_exclusion_hours,
                 unreadable_exclusion_hours=payload.unreadable_exclusion_hours,
+                score_max_age_hours=payload.score_max_age_hours,
+                window_floor=payload.window_floor,
                 account_line_limit=payload.account_line_limit,
                 auto_toggle_log_seconds=payload.auto_toggle_log_seconds,
             )

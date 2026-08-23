@@ -178,6 +178,42 @@ def test_the_military_first_switch_is_gone_from_the_page(client: TestClient) -> 
     assert "militaryDispatch.hidden = true" not in body
 
 
+def test_the_score_window_boxes_are_gone_from_the_task_row(client: TestClient) -> None:
+    """「读数有效期」和「窗口门限」两个框**整个从任务行上撤掉了**（2026-08-23）。
+
+    用户口径（2026-08-23）：「军力攻击的有效期 门限 改为全局设置，不再根据单个星系
+    进行调整」。任务页改版之后一个任务对应一个出发点银河系，那两个框留在这一行上
+    就是「按星系分别配」的入口。
+
+    ⚠️ **撤掉框，不是把它们置灰、也不是让它们变成只读。** 一个填得进去（或者
+    看得见一个数）却不生效的框，是这条链路每一次事故共同的形状——用户改了、
+    看着像生效了，而判据读的是另一个数。
+
+    ⚠️ **「军力上限」必须留着**，它仍然是任务级的：上限取决于这个任务用哪个预设
+    出击，而预设是按任务配的。删掉它这条用例同样要红，否则「撤掉两个框」很容易顺手
+    把三个都撤了。
+
+    ⚠️ 断言打在**代码构造**上，不是裸类名：那两个类名如今只出现在几句「这里从前有
+    两个框」的注释里，而那几句注释是有意留下的。整页搜会被自己的注释喂饱。
+    """
+    body = _page_body(client.get("/missions").text)
+
+    assert "makeInput('military-score-max-age'" not in body, "有效期那个框又长回来了"
+    assert "makeInput('military-top-n'" not in body, "窗口门限那个框又长回来了"
+    assert "querySelector('.military-score-max-age')" not in body, "还有代码在读那个框"
+    assert "querySelector('.military-top-n')" not in body, "还有代码在读那个框"
+    # 军力上限**仍然是任务级的**，一个字都没动。
+    assert "makeInput('military-max-score'" in body, "军力上限被顺手一起撤了"
+    assert "makeField('军力上限 ', maximum)" in body
+    # 保存时把那三个已失效的键从 `params_json` 里清掉——否则后端每一轮派遣都要为
+    # 它们打一条 WARNING，而那条告警必须有尽头，不然等于没有告警。
+    assert "delete payload.top_n;" in body
+    assert "delete payload.score_max_age_hours;" in body
+    assert "delete payload.rescan_after_hours;" in body
+    # 页面要说清那两格搬去哪了：用户是在这一行上找不到它们之后才去找的。
+    assert "攻击配置" in body
+
+
 def test_the_save_button_sits_with_the_rows_it_saves(client: TestClient) -> None:
     """「保存军力方案」摆在它要保存的那几行旁边，并且运行中会被锁上。
 
@@ -1063,8 +1099,12 @@ def test_the_units_do_not_stick_to_the_next_label(client: TestClient) -> None:
     css = _console_css()
 
     assert "function makeUnit(text)" in body
-    assert "makeField('读数有效期 ', maxAge, makeUnit('小时'))" in body
-    assert "makeField('窗口门限 ', topN, makeUnit('个'))" in body
+    # ⚠️ **原先钉的是「读数有效期 [6] 小时」和「窗口门限 [200] 个」那两格，
+    # 它们 2026-08-23 撤掉了**（有效期与窗口门限改成全局设置，搬去了攻击配置页）。
+    # 这条用例守的**不是那两个字段**，是「单位必须是元素」这条判据——所以改成钉
+    # 现存的那两处单位，而不是跟着删掉整条用例：判据还活着，钉子就得还在。
+    assert "makeField('航线 ', lines, makeUnit('条'))" in body
+    assert "makeField(fleetLines, makeUnit('条'))" in body
     # ⚠️ 反面也要钉，但只在**那一段**上找：`makeUnit` 上方那段注释里逐字引用着
     # 从前那句裸文本节点，整页搜会被自己的注释喂饱。
     appended = body[body.index("settings.append(") :]

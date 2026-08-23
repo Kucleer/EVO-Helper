@@ -44,7 +44,6 @@ from evo_helper.domain.scheduler import (
     scheduling_order,
     status_of,
 )
-from evo_helper.domain.target_order import WINDOW_POOL_FLOOR
 from evo_helper.storage import models as orm
 from evo_helper.storage.intel import (
     DISPATCH_BLOCKED,
@@ -1530,7 +1529,7 @@ class MissionConsoleService:
             tiers = json.loads(row.tiers_json)
         except json.JSONDecodeError as exc:  # pragma: no cover - 写侧校验
             raise ServiceError("全局军力档位配置损坏") from exc
-        return MilitaryAttackConfigView(tuple(tiers), **_knobs_of(row))
+        return _config_view(row, tuple(tiers))
 
     def replace_military_attack_tiers(
         self,
@@ -1544,6 +1543,8 @@ class MissionConsoleService:
         bot_revisit_hours: object = None,
         protection_exclusion_hours: object = None,
         unreadable_exclusion_hours: object = None,
+        score_max_age_hours: object = None,
+        window_floor: object = None,
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
     ) -> MilitaryAttackConfigView:
@@ -1573,6 +1574,8 @@ class MissionConsoleService:
             unreadable = self._scheduler.validate_unreadable_exclusion_hours(
                 unreadable_exclusion_hours
             )
+            max_age = self._scheduler.validate_score_max_age_hours(score_max_age_hours)
+            floor = self._scheduler.validate_window_floor(window_floor)
             account_lines = self._scheduler.validate_account_line_limit(account_line_limit)
             toggle_window = self._scheduler.validate_auto_toggle_log_seconds(
                 auto_toggle_log_seconds
@@ -1589,11 +1592,13 @@ class MissionConsoleService:
             bot_revisit_hours=revisit,
             protection_exclusion_hours=protection,
             unreadable_exclusion_hours=unreadable,
+            score_max_age_hours=max_age,
+            window_floor=floor,
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
         )
         self._invalidate_scheduler_view()
-        return MilitaryAttackConfigView(tuple(json.loads(row.tiers_json)), **_knobs_of(row))
+        return _config_view(row, tuple(json.loads(row.tiers_json)))
 
     def create_mission(
         self,
@@ -2120,13 +2125,17 @@ class MissionConsoleService:
     def _bot_summary(self, params: dict[str, Any]) -> str:
         """区间里有几个已记录的 bot。N=0 就禁止启用，所以 N 必须先看得见。"""
         if params.get("by_military") is True:
-            # ⚠️ **这句话 2026-08-18 改过，别按旧版本理解 `top_n`。**
-            # 从前写的是「军力截断前 N 名 · 按出发点就近分配」，而那两件事都不再
-            # 发生了：军力硬截断取消、出击顺序也不再是「就近」，现在只有一条判据
-            # ——`军力 ÷ 往返小时`。`top_n` 只剩「窗口门限」这一个身份。
+            # ⚠️ **这句话 2026-08-23 又改过一次，别按任何旧版本理解它。**
+            #
+            # 2026-08-18 之前写的是「军力截断前 N 名 · 按出发点就近分配」——那两件
+            # 事都不再发生了（硬截断取消、出击顺序也不再是就近）。之后写的是
+            # 「窗口门限 N 个」，那个 N 取自这个任务的 `top_n`。
+            #
+            # 现在有效期与窗口门限都是**全局**的（用户口径 2026-08-23），所以这里
+            # **一个数都不报**：报一个数就得说清它是从哪来的，而这一行讲的是「这个
+            # 任务自己的事实」——一个全局值摆在每一行任务上，读起来像是这一行配的。
             # 同一个数字在页面上和判据里说两件事，是这条链路每一次事故共同的形状。
-            window_floor = params.get("top_n", WINDOW_POOL_FLOOR)
-            return f"按「军力 ÷ 往返小时」出击 · 统一档位 · 窗口门限 {window_floor} 个"
+            return "按「军力 ÷ 往返小时」出击 · 统一档位 · 有效期与窗口门限见攻击配置页"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -2300,12 +2309,12 @@ def _frozen_summary(kind: MissionKind, params: dict[str, Any]) -> str:
         return "未设置半径" if radius is None else f"半径 {radius}"
     if kind is MissionKind.BOT:
         if params.get("by_military") is True:
-            window_floor = params.get("top_n")
-            return (
-                "军力攻击（统一档位）"
-                if not isinstance(window_floor, int) or isinstance(window_floor, bool)
-                else f"军力攻击（统一档位）· 窗口门限 {window_floor} 个"
-            )
+            # ⚠️ 从前这里会把固化记录里的 `top_n` 念出来。2026-08-23 起窗口门限是
+            # 全局的，而**这份记录里没有全局配置的那一份**（固化只抄任务参数与档位）。
+            # 照旧念 `top_n` 等于把一个当时也已经不生效的数摆出来当成「当时配的」
+            # ——这份记录存在的全部意义就是「当时填的是什么」，摆一个没生效的数
+            # 比什么都不摆糟。
+            return "军力攻击（统一档位）"
         galaxy = params.get("galaxy")
         first = params.get("first_system")
         last = params.get("last_system")
@@ -2548,29 +2557,42 @@ def _planet_kind_clause(kind: str):  # type: ignore[no-untyped-def]
     return None
 
 
-def _knobs_of(row: orm.MilitaryAttackConfigRow) -> dict[str, int | None]:
-    """全局攻击配置行上那几个行为旋钮，原样搬进视图。
+def _config_view(
+    row: orm.MilitaryAttackConfigRow, tiers: tuple[dict[str, Any], ...]
+) -> MilitaryAttackConfigView:
+    """一行全局攻击配置翻成页面视图。**读侧与写侧共用这一处。**
 
-    抽成一处是因为读侧与写侧都要组同一份：各写一遍的话，日后再加一个旋钮时
-    必然有一侧漏掉——而漏掉之后页面只是**显示成留空**，看起来完全正常，
-    用户以为配置没保存上，再填一遍。
+    抽成一处是因为读侧（`GET`）与写侧（`PUT` 的回执）要组同一份：各写一遍的话，
+    日后再加一个旋钮时必然有一侧漏掉——而漏掉之后页面只是**显示成留空**，
+    看起来完全正常，用户以为配置没保存上，再填一遍。
+
+    ⚠️ **写成显式的构造，不是 `**_knobs_of(row)` 那种字典展开。** 展开一个
+    `dict[str, float | None]` 会让 strict mypy 拿字典的值类型去对每一个形参，
+    于是 `int | None` 那几格全部报 `arg-type`——而真正的口径写在视图各字段自己的
+    标注上（有效期是 `float`，其余是 `int`）。逐个写出来的另一个好处是漏一格时
+    mypy 当场就报，不必等用户发现页面上那一格总是空的。
 
     ⚠️ **加新旋钮时这里和 `tests/integration/api/test_scheduler_api._ALL_KNOBS`
     要一起加。** 这一页被好几个并行的 PR 各加各的字段，而合并时漏掉一边的症状
-    正是这个字典少一个键——那之后那个配置项就静默失效了。
+    正是这里少一格——那之后那个配置项就静默失效了。
     """
-    return {
-        "blind_scrolls": row.blind_scrolls,
-        "blind_scroll_rows": row.blind_scroll_rows,
-        "report_scan_hours": row.report_scan_hours,
-        "unknown_line_hold_minutes": row.unknown_line_hold_minutes,
-        "reconcile_cooldown_minutes": row.reconcile_cooldown_minutes,
-        "bot_revisit_hours": row.bot_revisit_hours,
-        "protection_exclusion_hours": row.protection_exclusion_hours,
-        "unreadable_exclusion_hours": row.unreadable_exclusion_hours,
-        "account_line_limit": row.account_line_limit,
-        "auto_toggle_log_seconds": row.auto_toggle_log_seconds,
-    }
+    return MilitaryAttackConfigView(
+        tiers,
+        blind_scrolls=row.blind_scrolls,
+        blind_scroll_rows=row.blind_scroll_rows,
+        report_scan_hours=row.report_scan_hours,
+        unknown_line_hold_minutes=row.unknown_line_hold_minutes,
+        reconcile_cooldown_minutes=row.reconcile_cooldown_minutes,
+        bot_revisit_hours=row.bot_revisit_hours,
+        protection_exclusion_hours=row.protection_exclusion_hours,
+        unreadable_exclusion_hours=row.unreadable_exclusion_hours,
+        # 有效期是**浮点**（1.5 小时合法），别顺手把它标成 `int`：那会把用户配好的
+        # 值悄悄取整，而取整是静默的。
+        score_max_age_hours=row.score_max_age_hours,
+        window_floor=row.window_floor,
+        account_line_limit=row.account_line_limit,
+        auto_toggle_log_seconds=row.auto_toggle_log_seconds,
+    )
 
 
 def _pack(coordinate: Coordinate) -> int:

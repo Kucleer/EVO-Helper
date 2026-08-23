@@ -32,7 +32,14 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, dispatch, set_config, task, task_id
+from .test_mission_scheduler import (
+    add_bot_target,
+    dispatch,
+    set_config,
+    set_score_window,
+    task,
+    task_id,
+)
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 
@@ -46,7 +53,7 @@ SECOND = Coordinate(9, 250, 8)
 #: 军力优先的任务参数。`top_n` 现在只是**窗口门限**（第 3 步的尺子），给得足够大
 #: 只有一个后果：窗口更容易被放弃，于是全部有读数的目标都进池——这一整个文件量的
 #: 是航线，池子越大越不会有别的东西悄悄限制发数。
-BY_MILITARY = '{"by_military": true, "top_n": 50}'
+BY_MILITARY = '{"by_military": true}'
 
 
 @pytest.fixture
@@ -59,6 +66,18 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
     scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
     scheduler.prepare()
     return scheduler
+
+
+@pytest.fixture(autouse=True)
+def military_window(repository) -> None:  # type: ignore[no-untyped-def]
+    """本模块的选靶窗口基线，摆在**全局**攻击配置里：有效期 2 小时、窗口门限 50 个。
+
+    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
+    参数——从前它们就写在上面那串 JSON 里，一眼看得见。搬走之后若不摆，每条用例吃的
+    都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
+    会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
+    """
+    set_score_window(repository, max_age_hours=2, window_floor=50)
 
 
 # -- 夹具 ----------------------------------------------------------------------
@@ -100,8 +119,13 @@ def with_lines(  # type: ignore[no-untyped-def]
     set_config(session_factory, fleet_line_limit=6, reserved_lines=0)
     bot = only_military_bot(repository)
     configure_origins(repository, bot, *pairs)
+    # ⚠️ 窗口那两格要一起送：整份替换不带就把 `military_window` 夹具冲掉，
+    # 门限退回默认的 100，于是这个模块的每一条用例都在「放弃窗口」那条路上跑。
     repository.replace_military_attack_tiers(
-        '[{"min_score": 0, "preset": "AAA"}]', account_line_limit=account_limit
+        '[{"min_score": 0, "preset": "AAA"}]',
+        account_line_limit=account_limit,
+        score_max_age_hours=2,
+        window_floor=50,
     )
     return bot
 
@@ -279,7 +303,9 @@ def test_reserved_lines_stay_per_planet_when_the_account_limit_is_blank(  # type
     那个语义一个字都没变。
     """
     set_config(session_factory, fleet_line_limit=6, reserved_lines=2)
-    repository.replace_military_attack_tiers("[]", account_line_limit=None)
+    repository.replace_military_attack_tiers(
+        "[]", account_line_limit=None, score_max_age_hours=2, window_floor=50
+    )
     for row in repository.mission_tasks():
         repository.update_mission_task(row.id, enabled=row.kind == MissionKind.PIRATE.value)
         if row.kind == MissionKind.PIRATE.value:
@@ -508,9 +534,7 @@ def test_an_idle_round_neither_disables_the_task_nor_counts_as_a_failure(  # typ
     bot = with_lines(repository, session_factory, (FIRST, 6), (SECOND, 6), account_limit=9)
     # `max_score` 是军力**上限**：军力高于它的一律不进池（`within_max_score`）。
     # 这两颗目标都远高于 100，于是候选池有货、选中的却是空集。
-    repository.update_mission_task(
-        bot, params_json='{"by_military": true, "top_n": 50, "max_score": 100}'
-    )
+    repository.update_mission_task(bot, params_json='{"by_military": true, "max_score": 100}')
     target_near(session_factory, FIRST, offset=0, score=9_000.0)
     target_near(session_factory, SECOND, offset=1, score=8_000.0)
     scheduler.start()
@@ -774,7 +798,11 @@ def test_the_throttle_window_is_configurable(  # type: ignore[no-untyped-def]
     """
     bot = with_lines(repository, session_factory, (FIRST, 6), account_limit=9)
     repository.replace_military_attack_tiers(
-        '[{"min_score": 0, "preset": "AAA"}]', account_line_limit=9, auto_toggle_log_seconds=0
+        '[{"min_score": 0, "preset": "AAA"}]',
+        account_line_limit=9,
+        auto_toggle_log_seconds=0,
+        score_max_age_hours=2,
+        window_floor=50,
     )
     snapshot = next(item for item in scheduler.snapshot().snapshots if item.task_id == bot)
     recorded.messages.clear()

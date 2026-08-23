@@ -470,7 +470,7 @@
   //
   // 写法沿用这一页顶上那两个 `.tips`（调度器 / 战报补录）：浏览器原生 `title`。
   // 这一页没有前端构建，引一个 tooltip 组件就是给部署添一份麻烦。
-  const MILITARY_SELECTION_TIP = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。';
+  const MILITARY_SELECTION_TIP = '选靶：① 剔除近 24 小时打过的 → ② 只留有军力读数的（从未上榜的不打）→ ③ 只留读数在「分数有效期」之内的 → ④ 过「上限」这道安全线，按「军力 ÷ 往返小时」从高到低分给各出发星球出击。近而弱的和远而强的在同一把尺子上比，不再有截断。「窗口门限」不决定打谁，它只是第 ③ 步的尺子：窗口内不足这么多个时会放弃窗口、改用全部有读数的目标，状态显示「军力读数已放宽窗口」并在日志里打 WARNING——调大有效期或等军力榜再扫一轮都能消掉它。分子用军力是因为用户口径「军力和材料产出正相关」，本仓还没有能拟合曲线的材料数据。第 ③ 步那两格（分数有效期、窗口门限）2026-08-23 起是全局的，所有任务共用一份，在「攻击配置」页改；这一行里只剩「军力上限」还是按任务配的。';
   const MILITARY_ORIGIN_TIP = '每颗出发星球填自己的航线；攻击档位在“攻击配置”页统一维护。';
   // ⚠️ 这里从前有个 `MILITARY_MODE_TIP`，讲的是「军力优先」开关关掉之后会怎样。
   // 开关本身已经删了（用户口径 2026-08-22：「目前原来的攻击模式已经被废弃了，
@@ -915,42 +915,27 @@
     if (task.kind === 'BOT') {
       const settings = document.createElement('span');
       settings.className = 'military-settings';
-      // ⚠️ **这一格 2026-08-18 换了身份，文案必须跟着走。** 从前它是「军力截断
-      // （取前几名）」，那道硬截断已经取消——现在只有一条判据：`军力 ÷ 往返小时`。
+      // ⚠️ **这里从前还有「读数有效期」和「窗口门限」两个框，2026-08-23 撤掉了。**
+      // 用户口径（2026-08-23）：「军力攻击的有效期 门限 改为全局设置，不再根据单个
+      // 星系进行调整」。它们搬到了攻击配置页（`/settings` 的「军力选靶窗口」那一节，
+      // 库里是 `military_attack_config.score_max_age_hours` / `window_floor`）。
       //
-      // 它现在**只剩一个用途**：当「窗口够不够用」的尺子。窗口内不足这么多个时，
-      // 助手会放弃窗口、改用全部有读数的目标，并在页面上标「军力读数已放宽窗口」。
-      // 所以它**不再决定打谁**，只决定「这一轮肯不肯只信新数据」。
+      // ⚠️ **撤掉框而不是把它们置灰。** 一个填得进去却不生效的框，是这条链路每一次
+      // 事故共同的形状——用户改了、看着像生效了，而判据读的是另一个数。
       //
-      // 存进 params_json 的键仍叫 `top_n`（生产库里存着的就是它，改名要迁移）。
-      // 用户看见的是文案，看不见键名。
-      const topN = makeInput('military-top-n', { type: 'number', min: 1, style: 'width:58px', 'aria-label': '窗口门限（窗口内至少几个）', title: '窗口内至少要有这么多个目标，这一轮才肯只用窗口内的。调大=对「新鲜」要求更苛刻，窗口更常被放弃（照样会打，但会告警）；调小=更愿意只用窗口内那批，代价是可选目标少。它不决定打谁——打谁由「军力 ÷ 往返小时」的得分定' });
-      // ⚠️ 这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
+      // 存量任务的 `params_json` 里那两个旧键（`top_n` / `score_max_age_hours` /
+      // `rescan_after_hours`）后端**读到就忽略并打 WARNING**，而 `saveMilitary`
+      // 保存一次会把它们清掉。
+      //
+      // ⚠️ 下面这一格**当前是空转的**（用户口径 2026-08-17：已知周一刷新当日 bot 的
       // 最高战力只有 70 多 K，离打不动还很远），留着是为了哪天 bot 变强。
-      // 别以为页面上填了它就在挡什么。
+      // 别以为页面上填了它就在挡什么。它**仍然是任务级的**：军力上限取决于这个任务
+      // 用哪个预设出击，而预设是按任务配的。
       const maximum = makeInput('military-max-score', { type: 'number', min: 0, placeholder: '不设上限', style: 'width:82px', 'aria-label': '可攻击军力上限', title: '实测 bot 最高战力约 70K，这个上限目前挡不掉任何目标；留着备用' });
-      // ⚠️ 这一格的语义换过三次，文案必须跟着走：
-      // ① 最早叫「榜单超过 N 小时提示重扫」，真的只是提示；
-      // ② 2026-08-17 改成硬判据（超期的整批跳过）——那一版更糟，「一个新鲜分数都
-      //    没有」的夜里军力完全不参与选靶，实机连续停摆 2.5 小时；
-      // ③ PR #176 又降级成提示，选靶交给「时间池」（按读数时间取前 N）——那一版
-      //    最糟：军力榜从强到弱扫，「读数最新」等价于「军力最弱」，于是「军力优先」
-      //    选出了全库最弱的一批（实机 2026-08-18 09:00 那 8 发只有 3.2K~5.7K）；
-      // ④ 现在它**真的会挡**，但挡不住整轮：窗口内不够「窗口门限」那么多个时，
-      //    助手会放弃窗口、并在这一行标出「军力读数已放宽窗口」。
-      // 同一个数字在页面上和判据里说两件事，正是前三次事故共同的形状。
-      const maxAge = makeInput('military-score-max-age', { type: 'number', min: 0.1, step: '0.5', style: 'width:58px', 'aria-label': '军力分数有效期（小时）', title: '只打读数落在这段时间之内的目标。窗口内不足「窗口门限」要的个数时，助手会放弃窗口、改用全部有读数的目标，并在状态里标出「军力读数已放宽窗口」' });
-      // 用户要手动调这两个数，所以最容易搞反的三件事必须够得着：
-      // ① 打谁只由「军力 ÷ 往返小时」定，这一行里没有一个数在决定打谁；
-      // ② 有效期是**划一条线**，不是「取最新的几个」——后者带选择偏差，正是 #176 的错；
-      // ③ 窗口不够用时会被放弃，而那件事会自己在状态里报出来。
-      //
-      // 从前这三件事铺在框下面的一整段 `<div>` 里，每一行任务都逐字重复一遍。
-      // 现在挪进这个 ⓘ（`MILITARY_SELECTION_TIP`，一字未改）：它就贴在这三个框
-      // 旁边，够得着，而不再按任务条数把同一段话乘一遍。
+      // 最容易搞反的几件事必须够得着，所以那段说明留在这个 ⓘ 里
+      // （`MILITARY_SELECTION_TIP`）：打谁只由「军力 ÷ 往返小时」定，有效期是划一条线
+      // 而不是「取最新的几个」，窗口不够用时会被放弃、而那件事会自己在状态里报出来。
       settings.append(
-        makeField('读数有效期 ', maxAge, makeUnit('小时')),
-        makeField('窗口门限 ', topN, makeUnit('个')),
         makeField('军力上限 ', maximum),
         makeTips('军力选靶口径说明', MILITARY_SELECTION_TIP),
       );
@@ -1462,12 +1447,11 @@
         // ⚠️ 这里从前还回显一个 `.military-enabled` 复选框（`by_military`）。
         // 开关删了，回显跟着删——`by_military` 仍然在库里、仍然由后端读，
         // 页面只是不再提供切换入口（用户口径 2026-08-22：那条模式已废弃）。
-        // 没配过时显示后端的默认值（`domain.target_order.WINDOW_POOL_FLOOR`）。
-        row.querySelector('.military-top-n').value = task.params.top_n ?? 100;
+        // ⚠️ 这里从前还回显「窗口门限」与「读数有效期」两格。2026-08-23 那两格
+        // 搬成了全局（攻击配置页），框撤了，回显跟着撤。库里那两个旧键还在，
+        // 但后端已经不读——**所以这里绝不能再把它们显示出来**：显示一个不生效的数
+        // 比不显示糟得多。
         row.querySelector('.military-max-score').value = task.params.max_score ?? '';
-        // 旧任务的 params_json 里还存着从前那个键，回显要认得出来，
-        // 否则页面会把用户配好的数显示成默认值，保存一次就真的改掉了。
-        row.querySelector('.military-score-max-age').value = task.params.score_max_age_hours ?? task.params.rescan_after_hours ?? 2;
         loadMilitaryOrigins(task, row);
       }
       if (task.kind === 'BOT') setMilitaryLock(row, locked);
@@ -1682,14 +1666,16 @@
     // 存量任务里可能存着 `false`，不送就等于让一份已经废弃的模式一直留在库里，
     // 而页面上再也没有地方能把它掰回来。
     const payload = { ...task.params, by_military: true };
-    const topN = Number(row.querySelector('.military-top-n').value);
-    const maxAge = Number(row.querySelector('.military-score-max-age').value);
     const maximumText = row.querySelector('.military-max-score').value.trim();
-    if (!Number.isInteger(topN) || topN < 1) throw new Error('窗口门限必须是大于 0 的整数');
-    if (!Number.isFinite(maxAge) || maxAge <= 0) throw new Error('分数超期提示（小时）必须大于 0');
-    payload.top_n = topN;
-    payload.score_max_age_hours = maxAge;
-    // 存下来的那一份只留新名字，免得两个键各存一个数、以后谁也说不清听哪个。
+    // ⚠️ **保存时把那三个已失效的键从 `params_json` 里清掉**（2026-08-23：有效期与
+    // 窗口门限改成全局设置）。留着的话它们会一直待在库里，而后端每一轮派遣都要为
+    // 它们打一条 WARNING——那条告警是对的（用户配的数确实不生效了），但它必须**有
+    // 尽头**：在这一页保存一次就该消失，否则一条永远响着的告警等于没有告警。
+    //
+    // ⚠️ **只在这里清，不写迁移脚本去改库。** 该不该迁、迁成多少，只有用户知道
+    // （见 `alembic/versions/c7f2a91d4e08_global_score_window.py` 的模块头）。
+    delete payload.top_n;
+    delete payload.score_max_age_hours;
     delete payload.rescan_after_hours;
     if (maximumText === '') delete payload.max_score;
     else {
