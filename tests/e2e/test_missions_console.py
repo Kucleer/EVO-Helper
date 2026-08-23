@@ -1327,3 +1327,48 @@ def test_the_grab_cursor_only_sits_on_the_handle() -> None:
     base = re.search(r"^\.drag-handle\s*\{[^}]*\}", css, re.MULTILINE)
     assert base is not None, "`.drag-handle` 的基础规则不见了"
     assert "user-select: none" in base.group(0)
+
+
+def test_the_handle_is_a_target_you_can_actually_hit() -> None:
+    """⚠️ **把手得是块够点的靶子，不能只有那个字形那么大。**
+
+    「只有 ⠿ 能起拖」这条规则一落地就带来一个新问题：字形本身只有 **11×23px**
+    （2026-08-23 在真浏览器里量的）。起拖点从「整张卡」收窄到「这一个字符」之后，
+    实际结果是**拖不动** —— 人的习惯是抓卡身，而就算瞄着把手也常常差几个像素。
+
+    撑大之后实测 **26×35px**（矩形内九点取样 9/9 命中把手）。
+
+    ⚠️ 字形照旧只画 15px：撑的是可点区域，不是那个字。
+    """
+    css = _console_css()
+
+    import re
+
+    base = re.search(r"^\.drag-handle\s*\{[^}]*\}", css, re.MULTILINE)
+    assert base is not None, "`.drag-handle` 的基础规则不见了"
+    block = base.group(0)
+    # 靶子：撑宽 + 撑满行高 + 内边距。少哪一条都会缩回一个字符的大小。
+    assert "min-width" in block, "把手没有最小宽度，靶子只有字形那么宽"
+    assert "align-self: stretch" in block, "把手没撑满行高，靶子只有一行文字那么高"
+    assert "padding" in block, "把手没有内边距"
+    # 字形不许跟着放大。
+    assert "font-size: 15px" in block
+
+
+def test_the_stylesheet_carries_a_fingerprint(client: TestClient) -> None:
+    """⚠️ **`console.css` 必须带指纹，否则浏览器会一直用缓存里那一份。**
+
+    这一页的行为有一半写在 CSS 里（哪儿能拖、停用怎么画），而它原先是裸路径。
+    2026-08-23 被咬过两次：
+
+    ① 改了配色与勾选框却看不到（用户手动清缓存才好）；
+    ② 改了「只有把手能起拖」之后，**旧 CSS 仍然在卡身上画抓手** —— 用户看着抓手
+       去拖卡身、被新 JS 挡掉，症状是「拖不动」，而 CSS 和 JS 各自都是对的。
+
+    第 ② 种最坏：两边都没坏，所以查起来无从下手。
+    """
+    body = client.get("/missions", headers={"X-Console-Token": TOKEN}).text
+
+    assert "/static/console.css?v=" in body
+    # 裸路径不许再出现，否则两条并存时浏览器仍可能拿旧的那份。
+    assert '"/static/console.css"' not in body

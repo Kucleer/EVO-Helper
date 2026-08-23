@@ -579,6 +579,15 @@ def create_app(
     # 一眼看懂，也没法在测试里对着那八个词断言。Jinja 的 `tojson` 仍会转义
     # `<` `>` `&` `'`，放进 `<script>` 依然是安全的。
     templates.env.policies["json.dumps_kwargs"] = {"sort_keys": True, "ensure_ascii": False}
+    # ⚠️ **静态资源要带指纹。** `/static/console.css` 原先是裸路径，浏览器会一直用
+    # 缓存里那一份，而这一页的行为有一半写在 CSS 里（哪儿能拖、停用怎么画）。
+    # 2026-08-23 实测被咬过两次：改了样式却看不到，以及**改了「只有把手能起拖」之后，
+    # 旧 CSS 仍然在卡身上画抓手** —— 用户看着抓手去拖卡身，被新 JS 挡掉，
+    # 症状是「拖不动」，而两边各自都是对的。
+    #
+    # 取文件的 mtime 当指纹：改一次就变一次，不改就不变（缓存照旧命中）。
+    # 比版本号可靠——版本号要人记得改，而这个不用。
+    templates.env.globals["asset_version"] = _asset_version()
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates.env.globals["game_time"] = game_time
     templates.env.globals["local_time"] = local_time
@@ -1669,6 +1678,18 @@ async def _mission_tick_loop(scheduler: MissionScheduler, interval: float) -> No
             await asyncio.to_thread(scheduler.tick)
         except Exception:
             _LOGGER.exception("调度器 tick 失败，本轮跳过")
+
+
+def _asset_version() -> str:
+    """静态资源的指纹：`console.css` 的 mtime。取不到就退回一个常数。
+
+    ⚠️ **退回常数而不是抛**：取不到 mtime（打包成单文件、只读挂载）时，
+    页面照旧要能出来——带不带指纹是缓存新鲜度的问题，不该变成 500。
+    """
+    try:
+        return str(int((STATIC_DIR / "console.css").stat().st_mtime))
+    except OSError:
+        return "0"
 
 
 def create_persistent_app(

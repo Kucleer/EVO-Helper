@@ -689,7 +689,29 @@ details.foldable > summary > h2 {
 }
 details.foldable[open] > summary { margin-bottom: 12px; }
 
-.drag-handle { color: var(--text-faint); font-size: 15px; user-select: none; }
+/* 排序把手。⚠️ **靶子要够大。**
+   只有它能起拖（用户口径 2026-08-23），而字形本身只有 11×23px —— 一个字符宽。
+   起拖点从「整张卡」收窄到「这一个字形」之后，实际结果是**拖不动**：人的习惯是
+   抓卡身，而就算瞄着把手也常常差几个像素。所以给它撑出一块可点区域，
+   字形照旧只画那么大。 */
+.drag-handle {
+  color: var(--text-faint);
+  font-size: 15px;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  align-self: stretch;
+  margin: -4px 0;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+/* 悬停时把靶子显出来——不然「这里能拖」只有光标一个提示，而光标要先移进去才看得见。 */
+.mission-card[draggable="true"] .drag-handle:hover {
+  color: var(--text);
+  background: var(--bg-panel);
+}
 
 /* ---- history dialog -------------------------------------------------- */
 
