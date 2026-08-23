@@ -31,7 +31,7 @@ from evo_helper.domain.ranking import (
     is_bot_entry,
     mentions_bot,
     repair_ranks,
-    rows_skipped,
+    screens_overlap,
     trusted_scores,
 )
 from evo_helper.domain.records import RankingTarget
@@ -543,19 +543,18 @@ def _wrap_delta(delta: float) -> float:
     return (delta + half) % ROW_PITCH_PX - half
 
 
-def first_rank_of(rows: Sequence[RankingRow]) -> int | None:
-    """这一屏最上面那个**读出来了**的名次。一个都没读出来就是 `None`。
+def coordinates_of(rows: Sequence[RankingRow]) -> set[Coordinate]:
+    """这一屏**反解出坐标**的那些行的坐标。给重叠自查当尺子。
 
-    不是 `rows[0].rank`：榜首三名没有名次数字（是奖章图标），而 OCR 也会漏认，
-    所以要往下找第一个非空的。`None` 的意思是「这一屏的名次一个都没认出来」，
-    那时重叠判据只能答「不知道」。
+    ⚠️ **只收非空坐标。** 名字读错的行大多解不出合法坐标（`coordinate_of` 那道
+    区间硬闸），于是它们只是不参与比较——而不是像原先那道名次判据一样，
+    拿一个读错的数去减出一个假的「漏掉 N 名」。整段账在
+    `domain.ranking.screens_overlap` 上。
+
+    ⚠️ 交**集合**而不是列表：判据只问「有没有共同的」，而一屏里同一个坐标
+    出现两次（上下两行名字读成同一个）不该影响这个问题的答案。
     """
-    return next((row.rank for row in rows if row.rank is not None), None)
-
-
-def last_rank_of(rows: Sequence[RankingRow]) -> int | None:
-    """这一屏最下面那个**读出来了**的名次。理由同 `first_rank_of`。"""
-    return next((row.rank for row in reversed(rows) if row.rank is not None), None)
+    return {row.coordinate for row in rows if row.coordinate is not None}
 
 
 def screen_scores(rows: Sequence[RankingRow], *, anchor: float | None) -> list[float | None]:
@@ -571,18 +570,36 @@ def screen_scores(rows: Sequence[RankingRow], *, anchor: float | None) -> list[f
 
 
 def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> float | None:
-    """交给**下一屏**的锚点：这一屏最后一个可信值；一个都没有就沿用旧锚点。
+    """交给**下一屏**的锚点：这一屏可信值里的**最大值**；一个都没有就沿用旧锚点。
+
+    ## ⚠️⚠️ 取最大值，不是取末行
+
+    第一版取的是「最后一个可信值」，那是错的：**相邻两屏必然重叠**（一次拖动推进
+    约 8 行，而一屏可见 9–14 行），所以本屏头几行就是上屏的中段，它们的军力
+    **理应高于上屏末行**。拿末行当降序基准，每屏开头那 4–5 行会被整段判成
+    「破坏降序」：
+
+        上屏  … 10690 10660 10640 10620      末行 10620 当锚点
+        本屏  10690 10660 10640 10620 10600 10580
+        判据  ✗     ✗     ✗     ✓     ✓     ✓      ← 前三行全被丢
+
+    取上屏的**最大值**（= 它第一行的分数）就对了：那是「下一屏合法可见的最高分」
+    ——榜单降序，往下滚只可能看到更小或相等的值。而 93,670 那类偏大 10 倍的
+    读数照样挡得住（上屏最大约 9,700，93,670 远超它）。
+
+    ⚠️ 后果本来只是日志噪声（被丢的那几行早在上一屏就以真值入过库，
+    `take_batch_targets` 按坐标去重不会写回估算值），但那一行「军力值不可信」
+    几乎每屏都会打一次——**而这道判据存在的意义就是让那句话有信号**。
+    每屏都喊等于没喊。
 
     ⚠️ **沿用而不是清空。** 整屏读废（或整屏都被判为不可信）是常态之一，
     清成 `None` 就等于把下一屏也放行——而那正是这道判据要挡的情形。
 
-    ⚠️ **只找正值。** 0 不许当锚点：它当上锚点之后此后每一屏都会被全丢，
+    ⚠️ **只取正值。** 0 不许当锚点：它当上锚点之后此后每一屏都会被全丢，
     而且不报错。整段账在 `domain.ranking.trusted_scores` 上。
     """
-    return next(
-        (value for value in reversed(screen_scores(rows, anchor=anchor)) if value),
-        anchor,
-    )
+    trusted = [value for value in screen_scores(rows, anchor=anchor) if value]
+    return max(trusted) if trusted else anchor
 
 
 def targets_from_rows(
@@ -1360,14 +1377,15 @@ def scan(
     def record_log(message: str, payload: dict[str, Any]) -> None:
         record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
 
-    # 重叠账：`previous_last_rank` 是上一屏末行的名次，`missed` 是整趟累计漏掉的名次数。
-    # 见 `domain.ranking.rows_skipped`。
+    # 重叠账：`previous_coordinates` 是上一屏读出来的那些坐标，
+    # `screens_without_overlap` 是整趟有几屏和上一屏一个坐标都没对上。
+    # 见 `domain.ranking.screens_overlap`（那里还记着为什么这道判据**不看名次**）。
     #
     # ⚠️ **提到 `try` 之前**，理由和下面那句收尾一样：被 Ctrl+C / 调度器抢占打断时
-    # 也要报得出「这一趟漏了多少」。定义在循环里的话，`finally` 会撞 `NameError`
+    # 也要报得出「这一趟有几屏没接上」。定义在循环里的话，`finally` 会撞 `NameError`
     # ——而那会把一次干净的中断变成一条堆栈。
-    previous_last_rank: int | None = None
-    missed = 0
+    previous_coordinates: set[Coordinate] = set()
+    screens_without_overlap = 0
     # ⚠️ **军力锚点要跨屏活着。** 上一屏最后一个可信的军力值，用来判下一屏的
     # 第一行——`descending_breaks` 是按屏跑的，屏首那一行原先没有任何约束，
     # 而 2026-08-23 生产实测正是从那里漏进去一个 10 倍偏大的值
@@ -1462,7 +1480,7 @@ def scan(
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
             dry = 0
-            previous_last_rank = last_rank_of(rows)
+            previous_coordinates = coordinates_of(rows)
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 progress.collect_scrolls = extra
                 step = nav.scroll_once()
@@ -1510,21 +1528,28 @@ def scan(
                 # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
                 dry = 0 if fresh else dry + 1
                 screens.append(fresh)
-                # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.rows_skipped`：
-                # 跳过去的名次压根没被读过，所以「采到的 bot 数」看起来完全正常
+                # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
+                # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
                 # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
-                # 这里只观测不拦（名次只是校验和，认错一个数字就中断整趟不值），
+                # 这里只观测不拦（名字也会读错，一次没对上就中断整趟不值），
                 # 拦不拦等推进量提上去再定。
-                skipped = rows_skipped(previous_last_rank, first_rank_of(rows))
-                if skipped:
-                    missed += skipped
-                    say(f"  ⚠️ 与上一屏之间漏掉 {skipped} 名（重叠断了）")
-                # ⚠️ **不许写 `or previous_last_rank`。** 这一屏名次全读不出时，
-                # 保留上一屏的值会让下一屏拿「隔两屏」的名次去比，凭空报出一个
-                # 8–16 名的**假漏采**——而假警报比不报更坏：它会把这条判据教成
-                # 「经常喊狼来了」，真断的那次就没人看了。读不出就该是 `None`，
-                # 让下一次比较答「不知道」（见 `rows_skipped` 那条口径）。
-                previous_last_rank = last_rank_of(rows)
+                #
+                # ⚠️ **只说「可能」，也不说「漏了几行」。** 跳过去的行没被读过，
+                # 「几行」这个数在原理上就无从得知——原先那道名次判据敢报「漏掉
+                # 8922 名」（整趟只走了 570 名），正因为它是从两个带噪声的名次
+                # 减出来的。整段账在 `screens_overlap` 上。
+                seen_here = coordinates_of(rows)
+                overlap = screens_overlap(previous_coordinates, seen_here)
+                if overlap is False:
+                    screens_without_overlap += 1
+                    say("  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）")
+                # ⚠️ **不许写 `or previous_coordinates`。** 这一屏坐标全读不出时，
+                # 保留上一屏的集合会让下一屏拿「隔两屏」的坐标去比——而隔两屏本来
+                # 就不该有共同坐标（一次拖动推约 8 行，两次就推出一整屏），于是
+                # 每一次读废都要连带造出一条**假警报**。而假警报比不报更坏：
+                # 它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
+                # 读不出就该是空集，让下一次比较答「不知道」。
+                previous_coordinates = seen_here
                 # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
                 #
                 # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
@@ -1543,7 +1568,11 @@ def scan(
                         "rows_read": len(rows),
                         "bots_fresh": len(fresh),
                         "dry_screens": dry,
-                        "rows_skipped": skipped,
+                        # `True` 重叠上了 / `False` 一个坐标都没对上 /
+                        # `None` 有一屏坐标全读不出，答「不知道」。
+                        # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
+                        # （连名字都读不出的）在日志里长得像「重叠断了」。
+                        "overlap_intact": overlap,
                     },
                 )
                 if reached_limit:
@@ -1572,12 +1601,15 @@ def scan(
                 progress, written=written, suspect=written - len(kept), outcome=outcome
             )
         )
-        # ⚠️ **漏掉的名次单独报一行，不塞进 `completion_message`。**
-        # 那句话是「这一趟干了多少」，这句是「这一趟漏了多少」——后者是异常信号，
-        # 混进前者会被当成正常统计扫过去。为 0 时不打，省得每趟都有一行噪声。
-        if missed:
-            say(f"⚠️ 本趟重叠断了，累计漏掉 {missed} 名（没被读过，事后判据救不了）")
-            record_log("采集重叠断裂", {"rows_missed": missed})
+        # ⚠️ **没接上的屏单独报一行，不塞进 `completion_message`。**
+        # 那句话是「这一趟干了多少」，这句是「这一趟有几屏没接上」——后者是异常
+        # 信号，混进前者会被当成正常统计扫过去。为 0 时不打，省得每趟都有一行噪声。
+        if screens_without_overlap:
+            say(
+                f"⚠️ 本趟有 {screens_without_overlap} 屏与上一屏没有共同坐标"
+                f"（重叠可能断了；中间的行没被读过，事后判据救不了）"
+            )
+            record_log("采集重叠断裂", {"screens_without_overlap": screens_without_overlap})
     return outcome
 
 
@@ -1863,8 +1895,7 @@ __all__ = [
     "name_column_text",
     "name_excerpt",
     "read_name_column_confirming",
-    "first_rank_of",
-    "last_rank_of",
+    "coordinates_of",
     "release_stuck_mouse",
     "next_score_anchor",
     "renderable_score",
