@@ -77,7 +77,7 @@ def military_window(repository) -> None:  # type: ignore[no-untyped-def]
     都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
     会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
     """
-    set_score_window(repository, max_age_hours=2, window_floor=50)
+    set_score_window(repository, max_age_hours=2, window_floor=1)
 
 
 # -- 夹具 ----------------------------------------------------------------------
@@ -125,7 +125,7 @@ def with_lines(  # type: ignore[no-untyped-def]
         '[{"min_score": 0, "preset": "AAA"}]',
         account_line_limit=account_limit,
         score_max_age_hours=2,
-        window_floor=50,
+        window_floor=1,
     )
     return bot
 
@@ -304,7 +304,7 @@ def test_reserved_lines_stay_per_planet_when_the_account_limit_is_blank(  # type
     """
     set_config(session_factory, fleet_line_limit=6, reserved_lines=2)
     repository.replace_military_attack_tiers(
-        "[]", account_line_limit=None, score_max_age_hours=2, window_floor=50
+        "[]", account_line_limit=None, score_max_age_hours=2, window_floor=1
     )
     for row in repository.mission_tasks():
         repository.update_mission_task(row.id, enabled=row.kind == MissionKind.PIRATE.value)
@@ -740,6 +740,17 @@ class RecordingLog:
         self.messages.append(message)
         self.payloads.append(dict(payload or {}))
 
+    def clear(self) -> None:
+        """两个清单**一起**清。
+
+        ⚠️ 只清 `messages` 会让两个清单错位，而错位之后 `payloads[i]` 指的是另一条
+        日志——2026-08-24 就这么被咬过一次：调度器在 `snapshot()` 时打了一句
+        「让给军力榜去补货」，它进了 `payloads[0]`，于是用例里 `payloads[1]` 从
+        「第二条停用」变成了「第一条停用」，断言看着莫名其妙。
+        """
+        self.messages.clear()
+        self.payloads.clear()
+
 
 @pytest.fixture
 def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
@@ -765,7 +776,7 @@ def test_repeated_auto_disables_are_throttled_into_one_line_per_window(  # type:
     bot = with_lines(repository, session_factory, (FIRST, 6), account_limit=9)
     task_row = row_of(repository, bot)
     snapshot = next(item for item in scheduler.snapshot().snapshots if item.task_id == bot)
-    recorded.messages.clear()
+    recorded.clear()
 
     # 窗口 120 秒；每 10 秒抖一次，反复停用 / 恢复共 6 轮 = 一分钟。
     for index in range(6):
@@ -802,10 +813,10 @@ def test_the_throttle_window_is_configurable(  # type: ignore[no-untyped-def]
         account_line_limit=9,
         auto_toggle_log_seconds=0,
         score_max_age_hours=2,
-        window_floor=50,
+        window_floor=1,
     )
     snapshot = next(item for item in scheduler.snapshot().snapshots if item.task_id == bot)
-    recorded.messages.clear()
+    recorded.clear()
 
     for index in range(3):
         clock.now = NOW + timedelta(seconds=index)
@@ -825,7 +836,7 @@ def test_disable_and_resume_are_throttled_separately(  # type: ignore[no-untyped
     """
     bot = with_lines(repository, session_factory, (FIRST, 6), account_limit=9)
     snapshot = next(item for item in scheduler.snapshot().snapshots if item.task_id == bot)
-    recorded.messages.clear()
+    recorded.clear()
 
     scheduler._disable_task(
         row_of(repository, bot), snapshot, "航线不足", recovery=DisabledRecovery.FREE_LINES

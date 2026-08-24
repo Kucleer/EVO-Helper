@@ -73,7 +73,7 @@ def military_window(repository) -> None:  # type: ignore[no-untyped-def]
     都是代码默认值（2 小时 / **100 个**），而这个模块的候选池只有两三个目标：门限 100
     会让每一条用例都走「放弃窗口」那一支，于是本该量到的东西量不到，而用例照样是绿的。
     """
-    set_score_window(repository, max_age_hours=2, window_floor=2)
+    set_score_window(repository, max_age_hours=2, window_floor=1)
 
 
 class RecordingLog:

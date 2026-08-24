@@ -17,9 +17,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from evo_helper.application.mission_scheduler import MissionScheduler
-from evo_helper.domain.scheduler import SCAN_YIELD_PATIENCE, MilitaryWindowPool
+from evo_helper.domain.scheduler import SCAN_YIELD_PATIENCE, MilitaryWindowPool, has_work
 
 from .conftest import Clock, make_supervisor
+from .test_mission_scheduler import set_score_window
+from .test_multi_origin_lines import FIRST, target_near, with_lines
 
 NOW = datetime(2026, 8, 24, 8, 0, tzinfo=UTC)
 
@@ -31,12 +33,12 @@ def clock() -> Clock:
 
 @pytest.fixture
 def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[no-untyped-def]
-    """⚠️ 刻意**不** `prepare()`、也不跑 tick。
-
-    这个模块钉的是 `_scan_can_still_help` 那段**记账**（涨没涨、停滞多久），
-    它不碰库、不碰 supervisor。起一整套调度器只是为了拿到那个方法所在的实例。
-    """
-    return MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    """本模块大多数用例只问 `_scan_can_still_help` 那段记账（涨没涨、停滞多久），
+    不碰库也不碰 supervisor；但最后那条要从真实的 `_facts` 走，需要配置行。
+    所以照常 `prepare()`。"""
+    scheduler = MissionScheduler(repository, make_supervisor(launcher, clock), clock=clock)
+    scheduler.prepare()
+    return scheduler
 
 
 def _pool(in_window: int, floor: int = 100) -> MilitaryWindowPool:
@@ -155,3 +157,37 @@ def test_a_pool_back_above_the_floor_clears_the_books(scheduler) -> None:  # typ
 def test_no_pool_at_all_never_yields(scheduler) -> None:  # type: ignore[no-untyped-def]
     """不是军力优先那条链路的任务没有这个池子，一律不让位、也不留记账。"""
     assert scheduler._scan_can_still_help(1, None, NOW) is False
+
+
+def test_a_real_military_task_actually_yields_through_the_facts(  # type: ignore[no-untyped-def]
+    scheduler, repository, session_factory, launcher, clock, run_id
+) -> None:
+    """⚠️⚠️ **接线本身要有用例——判据和记账各自绿，不代表它们被接上了。**
+
+    2026-08-24 生产实测踩到：`yields_to_a_scan` 与 `_scan_can_still_help` 的用例
+    全绿，而生产上一条「让给军力榜去补货」都没有。原因是 `_facts` 里有**两处**
+    构造 `TaskFacts`，军力任务走的是 `replace(base, ...)` 然后 `continue`，
+    而那两格被加在了它走不到的另一支上 —— `military_window` 恒为 `None`，
+    整条判据成了死代码。
+
+    症状极具迷惑性：「扫描间隔让路」照常喊（它读的是**账号级**窗口，那个填得好好的），
+    看上去一切正常，只是攻击从不让位。
+
+    所以这条用例**必须从 `_facts` 走**，不能自己拼 `TaskFacts`：它钉的就是那根线。
+    """
+    bot = with_lines(repository, session_factory, (FIRST, 1), account_limit=9)
+    # 池子里有目标、读数也新鲜，但**窗口门限设得比它多**，于是必然低于门限。
+    for offset in range(3):
+        target_near(session_factory, FIRST, offset=offset, score=9_000.0 - offset * 100)
+    set_score_window(repository, max_age_hours=24, window_floor=99)
+    scheduler.start()
+
+    snapshot = scheduler.snapshot()
+    facts = snapshot.facts
+    snap = next(item for item in snapshot.snapshots if item.task_id == bot)
+
+    pool = facts.of(snap).military_window
+    assert pool is not None, "军力任务的 TaskFacts 上没有窗口存货——那两格没接上"
+    assert pool.below_floor, f"这组夹具本该低于门限，实际 {pool.in_window}/{pool.floor}"
+    assert facts.of(snap).scan_can_still_help, "第一次缺货就该判「补得进来」"
+    assert not has_work(snap, facts), "窗口不够、补得进来 → 这一跳该让给军力榜"
