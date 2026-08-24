@@ -89,8 +89,26 @@ from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
 from evo_helper.domain.target_order import DEFAULT_PROTECTION_EXCLUSION
 from evo_helper.game import pirate_ui
+from evo_helper.game.nav_bar import (
+    FLEET_LABEL,
+    NAV_LABEL_HOME_TOLERANCE_PX,
+    NAV_MAX_DRAGS,
+    PLANET_LABEL,
+    label_x,
+    merged_labels,
+)
+
+# ⚠️ **底栏那套要起别名。** `system_navigator.NAV_LABEL_ROI` 是**顶部**恒星系
+# 导航栏 (740, 88, 1190, 115)，而 `nav_bar` 那个是**底部**导航条
+# (760, 880, 1220, 906)——同名不同物，不起别名就是一次静默的 ROI 张冠李戴。
+from evo_helper.game.nav_bar import NAV_BAR_Y as BOTTOM_NAV_BAR_Y
+from evo_helper.game.nav_bar import NAV_DRAG_FROM_X as BOTTOM_NAV_DRAG_FROM_X
+from evo_helper.game.nav_bar import NAV_DRAG_TO_X as BOTTOM_NAV_DRAG_TO_X
+from evo_helper.game.nav_bar import NAV_DRAG_WAIT_S as BOTTOM_NAV_DRAG_WAIT_S
+from evo_helper.game.nav_bar import RIGHT_SEGMENT_LABELS as BOTTOM_NAV_RIGHT_LABELS
+from evo_helper.game.nav_bar import nav_label_words as bottom_nav_label_words
 from evo_helper.game.overlay import look_at_close_button
-from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult
+from evo_helper.game.planet_list import NavTargets, PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
     NAV_LABEL_ROI,
@@ -3771,8 +3789,100 @@ class PirateLoop:
             say=say,
             record_evidence=self._record_planet_list_overlay,
             see_close_button=self._close_button_visible,
+            # ⚠️⚠️ **这一行就是整个改动的回退点。** 删掉它，`PlanetSwitcher` 的默认值
+            # 会交回写死的 `NAV_PLANET` / `NAV_FLEET`，行为一行回到 2026-08-24 之前。
+            nav_targets=self._bottom_nav_targets,
             dry_run=dry_run,
         )
+
+    def _bottom_nav_targets(self) -> NavTargets | None:
+        """点底栏之前先看一眼条停在哪一段，交回这一次该点的两个 x。
+
+        ## 判据是**肯定式**的：看见「行星」和「舰队」才算在基线上
+
+        否定式（「没看见排名」）在这里不够用：条停在中间某个位置时，「排名」可能已经
+        滚出 ROI 右界、而「行星」还没滚进左界，此时否定式说「已还原」，可
+        (840, 862) 底下是什么谁也不知道。
+
+        ## 四档
+
+            读到行星 + 舰队          条在基线段 → 直接用读到的 x，一下都不拖
+            读到排名 / 设置          条在右段（确凿）→ 往右拨一次再读
+            读到别的、但不含上面两组  中间态 → 同上
+            一个标签都读不出来        多半被浮层盖着 → **不拖也不猜**，交 None
+
+        最后一档交 `None` 而不是「照标定像素走」：读不出来时**条在哪一段是未知的**，
+        而这次事故的全部代价就来自「未知时照旧点」。上层收到 `None` 会走
+        `UNREADABLE` 那一档——不计永久失败、不指着用户的配置说话。
+
+        ## ⚠️ 拨回基线这一拖不引入任何新像素
+
+        按下 `NAV_DRAG_TO_X`(860)、松手 `NAV_DRAG_FROM_X`(1122)，就是军力榜那一拖的
+        **反向**，两个点都落在两个导航项**之间**、已经在生产上跑过。而且只在「确认不在
+        基线」时才拨——所以「条已经在最左端时再往右拖会怎样」这个未知**结构上碰不到**。
+        """
+        for attempt in range(NAV_MAX_DRAGS + 1):
+            runs = merged_labels(self._bottom_nav_words())
+            planet = label_x(runs, PLANET_LABEL)
+            fleet = label_x(runs, FLEET_LABEL)
+            if planet is not None and fleet is not None:
+                self._warn_if_nav_drifted(planet, fleet)
+                return NavTargets(
+                    planet=(planet, BOTTOM_NAV_BAR_Y), fleet=(fleet, BOTTOM_NAV_BAR_Y)
+                )
+            seen = [text for _x, text in runs]
+            if not seen:
+                # 一个标签都读不出来：多半有浮层盖着条。**不拖**——拖动会落在浮层里。
+                say("  底部导航条一个标签都读不出来（多半被浮层盖着）；不拖也不点")
+                return None
+            if attempt == NAV_MAX_DRAGS:
+                say(f"  拨了 {NAV_MAX_DRAGS} 次仍判不出底部导航条在哪一段；读到的是 {seen}")
+                return None
+            where = "右段" if any(x in seen for x in BOTTOM_NAV_RIGHT_LABELS) else "中间态"
+            say(f"  底部导航条在{where}（读到 {seen}）；往右拨回基线")
+            self._drag_bottom_nav_home()
+        return None
+
+    def _drag_bottom_nav_home(self) -> None:
+        """把底栏拨回基线段：军力榜那一拖的**反向**，分步慢拖。
+
+        ⚠️ 两个点都是军力榜那一拖用过的（`NAV_DRAG_TO_X` 860 → `NAV_DRAG_FROM_X`
+        1122），落在两个导航项**之间**，已经在生产上跑过——这是这次改动里安全论证
+        最强的一处：不引入任何新像素。
+        """
+        slow_drag_across(
+            self._driver,
+            BOTTOM_NAV_DRAG_TO_X,
+            BOTTOM_NAV_DRAG_FROM_X,
+            y=BOTTOM_NAV_BAR_Y,
+        )
+        self._driver.wait(BOTTOM_NAV_DRAG_WAIT_S)
+
+    def _bottom_nav_words(self) -> list[tuple[int, str]]:
+        """读底栏标签行。截不到图就交空清单——上层据此走「不拖也不点」。"""
+        capture = getattr(self._driver, "capture", None)
+        if not callable(capture):
+            return []
+        import pytesseract
+
+        return bottom_nav_label_words(capture(), pytesseract)
+
+    def _warn_if_nav_drifted(self, planet: int, fleet: int) -> None:
+        """读到的 x 与标定像素差得太多就说一句。**它不拦动作**，只留痕迹。
+
+        版面漂了是一件该被看见的事，而它今天唯一的症状会是「点偏了几像素」——
+        那种偏差在日志上看不出来，只会表现成莫名其妙的失败。
+        """
+        for name, got, calibrated in (
+            ("行星", planet, pirate_ui.NAV_PLANET[0]),
+            ("舰队", fleet, pirate_ui.NAV_FLEET[0]),
+        ):
+            drift = abs(got - calibrated)
+            if drift > NAV_LABEL_HOME_TOLERANCE_PX:
+                say(
+                    f"  ⚠️ 底栏「{name}」读到 x={got}，标定值是 {calibrated}"
+                    f"（差 {drift}px）；版面可能漂了"
+                )
 
     def _close_button_visible(self) -> bool:
         """关浮层之前那一眼：`OVERLAY_CLOSE_BUTTON` 上现在是不是那个 ✕。
@@ -4385,6 +4495,39 @@ def slow_drag(driver: LiveDriver, from_y: int, to_y: int, *, x: int = 960, steps
         gui.moveTo(
             origin_x + x + random.randint(-1, 1),
             origin_y + int(from_y + (to_y - from_y) * ratio),
+            random.uniform(0.02, 0.05),
+        )
+    time.sleep(random.uniform(0.12, 0.25))
+    gui.mouseUp()
+    time.sleep(1.4)
+
+
+def slow_drag_across(
+    driver: LiveDriver, from_x: int, to_x: int, *, y: int, steps: int = 12
+) -> None:
+    """**横向**慢拖。时序与 `slow_drag` 逐条相同，只是变的是 x 不是 y。
+
+    ⚠️ 为什么另写一个而不是给 `slow_drag` 加个方向参数：那个函数的签名
+    `(driver, from_y, to_y, *, x=960)` 已经被四处调用按位置传参，加方向参数要么
+    改签名、要么塞一个布尔开关——而「一个布尔决定两条几何」正是最容易读错的写法。
+    两个名字各自说清自己拖哪个方向，调用点一眼看得出。
+
+    ⚠️ **那条「必须分步移动」的实测教训对两个方向都成立**（整段在 `slow_drag` 上）：
+    一步到位的 `dragTo` 会被游戏面板当成点击。
+    """
+    import random
+
+    driver.focus()
+    origin_x, origin_y = driver.origin()
+    gui = driver._gui  # noqa: SLF001 - 同 `slow_drag`：慢拖需要分步控制
+    gui.moveTo(origin_x + from_x, origin_y + y, random.uniform(0.2, 0.4))
+    gui.mouseDown()
+    time.sleep(random.uniform(0.10, 0.20))
+    for index in range(1, steps + 1):
+        ratio = index / steps
+        gui.moveTo(
+            origin_x + int(from_x + (to_x - from_x) * ratio),
+            origin_y + y + random.randint(-1, 1),
             random.uniform(0.02, 0.05),
         )
     time.sleep(random.uniform(0.12, 0.25))
