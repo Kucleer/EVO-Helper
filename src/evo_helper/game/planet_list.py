@@ -141,6 +141,18 @@ class PlanetListDriver(Protocol):
     def wait(self, seconds: float) -> None: ...
 
 
+@dataclass(frozen=True)
+class NavTargets:
+    """这一次该点底栏的哪两个点。
+
+    ⚠️ **y 仍旧写死**（`NAV_BAR_Y`）：标签在 880–906、点击落在图标行 862，
+    这个纵向关系是版面定的，横向滚动只改 x。
+    """
+
+    planet: tuple[int, int]
+    fleet: tuple[int, int]
+
+
 @dataclass
 class PlanetSwitcher:
     """把当前星球切到指定坐标。
@@ -174,6 +186,34 @@ class PlanetSwitcher:
     #: 桩）走的是「从不关浮层」，而不是「照旧盲点」。判据本身在 `game.overlay`，
     #: 实机由 `tools.pirate_loop` 接到 `LiveDriver.capture()`。
     see_close_button: Callable[[], bool] = lambda: False
+    #: 「这一次点『行星』/『舰队』该落在哪两个 x 上」。返回 `None` = 判不出来，
+    #: 这一轮**不点**。
+    #:
+    #: ## ⚠️ 为什么不能再信写死的像素
+    #:
+    #: 底部导航条**可以横向滚动**，而军力榜那条链为了露出「排名」会把它往左拖。
+    #: 拖之前实测词框是 `行星 839 · 舰队 920`，正好对着 `NAV_PLANET` (840) 与
+    #: `NAV_FLEET` (920)；拖到右段之后同样这两个像素底下换成了别的项 ——
+    #: 2026-08-24 生产上点出来的是**太空舱**（用户实机确认）。
+    #:
+    #: 而太空舱面板会把整条导航条连同行星列表一起盖住，于是形成自维持的闭环：
+    #: 点 (840,862) → 开出太空舱 → 盖住条 → 标签读不出 → 关掉浮层重试 →
+    #: **又点 (840,862)**。当天「行星列表坐标 OCR 全空」25 次，每次都以
+    #: 「这一轮一发都不派」收场。
+    #:
+    #: ## ⚠️ 默认值是**今天的行为**，这是有意的
+    #:
+    #: 默认交回写死的那两个常量、不读也不拖。于是：
+    #:
+    #: - 没接这个回调的调用方（轻量工具、单元测试桩）行为逐字不变；
+    #: - **回退只要删掉 `pirate_loop` 里注入的那一个参数**，一行回到 08-24 之前。
+    #:
+    #: 代价是「接线漏了会静默退化」，由 `pirate_loop` 那边一条接线用例兜住 ——
+    #: 这个仓栽过一次「代码写了但从没接上、单元测试全绿、实机上那个 ROI 从落地起
+    #: 就没读出过东西」（`FLIGHT_RECIPES` 那段账）。
+    nav_targets: Callable[[], NavTargets | None] = lambda: NavTargets(
+        planet=NAV_PLANET, fleet=NAV_FLEET
+    )
     #: **找目标时**每一屏读到的行，按顺序记下来，找不到时原样说出去
     #: （照 `PresetNotFound` 的做法）。
     #:
@@ -190,8 +230,17 @@ class PlanetSwitcher:
         """切到 `target`，返回结局。**任何一步认不出都不点**。"""
         self.screens = []
         self.top_screens = []
-        row = self._open_and_locate(target)
+        # ⚠️ **点底栏之前先看一眼条停在哪一段**，判不出来就一下都不点。
+        # 整段账在 `nav_targets` 上：点错的代价不是「这一次没成」，而是开出太空舱
+        # 面板、盖住导航条，把后面每一轮都拖下水。
+        targets = self._nav_targets_or_refuse()
+        if targets is None:
+            return SwitchResult.UNREADABLE
+        row = self._open_and_locate(target, targets)
         if row is None and self._read_nothing_at_all():
+            # ⚠️ 重试那一遍要**重新问一次**：关掉浮层之后导航条才露出来，
+            # 这一问正是自愈发生的地方——2026-08-24 那 25 轮里的任何一轮，
+            # 关掉太空舱面板之后就能读到「排名」、拨回基线、真的开出行星列表。
             row = self._retry_behind_overlays(target)
         if row is None:
             # ⚠️ 判据看的是**整趟逐屏读到了什么**（含重读那一遍），不是「找没找到」。
@@ -224,11 +273,28 @@ class PlanetSwitcher:
         #
         # 反过来，顺手在这里补一个 `_close()` 同样是错的：那时点的 (750, 71) 落在
         # 新星球的画面上，那个位置上有什么本仓没有标定过。
-        return self._confirm(target)
+        return self._confirm(target, targets)
 
     # -- 开列表、找那一行 ---------------------------------------------------
 
-    def _open_and_locate(self, target: Coordinate) -> PlanetRow | None:
+    def _nav_targets_or_refuse(self) -> NavTargets | None:
+        """问一次「这一次该点底栏的哪两个点」，判不出来时留痕并交 `None`。
+
+        ⚠️ 交 `UNREADABLE` 那一档由调用方给（`switch_to`），而不是 `NOT_FOUND`：
+        判不出条在哪一段时，「列表里有没有这颗星球」我们**根本没去看**。
+        指着用户的配置说一件自己并不知道的事，这个仓已经挨过一次打。
+        """
+        targets = self.nav_targets()
+        if targets is not None:
+            return targets
+        self.say("  判不出底部导航条在哪一段；这一轮什么都不点")
+        self.record_evidence(
+            "判不出底部导航条在哪一段，没点底栏",
+            {"reason": "nav_targets 返回 None"},
+        )
+        return None
+
+    def _open_and_locate(self, target: Coordinate, targets: NavTargets) -> PlanetRow | None:
         """点开行星列表浮层 → **先拖回顶部** → 然后一屏一屏往下找。找不到返回 None。
 
         ⚠️ **回顶这一步不许省。** 实机 2026-08-19：关掉再打开，列表停在上一趟拖到的
@@ -236,7 +302,7 @@ class PlanetSwitcher:
         一屏就判到底、`NOT_FOUND`，「这一轮一发都不派」。整段账在
         `domain.planet_switch.reached_top` 与模块头。
         """
-        self.driver.click(*NAV_PLANET, label="行星列表")
+        self.driver.click(*targets.planet, label="行星列表")
         self.driver.wait(PLANET_LIST_OPEN_WAIT_S)
         self._scroll_to_top()
         return self._locate(target)
@@ -364,7 +430,15 @@ class PlanetSwitcher:
                 # 不点，也不重开列表——重开只会再读一张同样的画面。
                 self.say("  关闭键那个位置上认不出 ✕；一下都不点，本轮就此退出")
                 break
-            row = self._open_and_locate(target)
+            # ⚠️ **关掉浮层之后要重新问一次导航条在哪一段**，不能沿用进来时那一份。
+            #
+            # 这一问正是自愈发生的地方：2026-08-24 那 25 轮里，进来时条被太空舱面板
+            # 盖着、一个标签都读不出；关掉面板之后条才露出来，这时读得到「排名」→
+            # 拨回基线 → 真的开出行星列表。沿用旧的那一份等于把自己关在闭环里。
+            retry_targets = self._nav_targets_or_refuse()
+            if retry_targets is None:
+                break
+            row = self._open_and_locate(target, retry_targets)
             if row is not None:
                 break
         after = [list(screen) for screen in self.screens[len(before) :]]
@@ -446,7 +520,7 @@ class PlanetSwitcher:
 
     # -- 回读 ---------------------------------------------------------------
 
-    def _confirm(self, target: Coordinate) -> SwitchResult:
+    def _confirm(self, target: Coordinate, targets: NavTargets) -> SwitchResult:
         """开派遣面板读「起点」，确认当前星球真的是 `target`；读不出算没切成。
 
         开的是**舰队**那个入口（`NAV_FLEET`）而不是从某个目标点「攻击」：
@@ -459,7 +533,9 @@ class PlanetSwitcher:
         要是量的是另一条路径开出来的面板，单元测试与离线实拍会全绿，
         实机上却永远读不出「起点」——于是每一轮都判「没切成」、一发都不派。
         """
-        self.driver.click(*NAV_FLEET, label="舰队面板")
+        # ⚠️ **这一下同样不能信写死的像素。** 条在右段时 `NAV_FLEET`(920) 底下是
+        # 「商店」（918，只差 2px）——只改开列表那一下是修不干净的。
+        self.driver.click(*targets.fleet, label="舰队面板")
         self.driver.wait(FLEET_PANEL_OPEN_WAIT_S)
         raw = self.read_origin()
         self._close()

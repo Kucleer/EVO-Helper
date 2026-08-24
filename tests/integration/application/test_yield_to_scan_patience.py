@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.application.mission_scheduler import REPEATED_LOG_WINDOW, MissionScheduler
 from evo_helper.domain.scheduler import SCAN_YIELD_PATIENCE, MilitaryWindowPool, has_work
 
 from .conftest import Clock, make_supervisor
@@ -43,6 +43,40 @@ def scheduler(repository, launcher, clock) -> MissionScheduler:  # type: ignore[
 
 def _pool(in_window: int, floor: int = 100) -> MilitaryWindowPool:
     return MilitaryWindowPool(in_window=in_window, floor=floor)
+
+
+class RecordingLog:
+    """把 `record_system_log` 的调用记下来。签名与真的那一个一致。"""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, str, dict[str, object]]] = []
+
+    def __call__(self, level, source, message, *, payload=None, logged_at_utc=None, **_):  # type: ignore[no-untyped-def]
+        self.entries.append((level, message, dict(payload or {})))
+
+    @property
+    def yielding(self) -> list[tuple[str, str, dict[str, object]]]:
+        """「让给军力榜去补货」那条 INFO。"""
+        return [item for item in self.entries if item[1].startswith("窗口内只剩")]
+
+    @property
+    def gave_up(self) -> list[tuple[str, str, dict[str, object]]]:
+        """「不再让位」那条 WARNING。"""
+        return [item for item in self.entries if item[1].startswith("让位 ")]
+
+
+@pytest.fixture
+def recorded(monkeypatch: pytest.MonkeyPatch) -> RecordingLog:
+    log = RecordingLog()
+    monkeypatch.setattr(
+        "evo_helper.application.mission_scheduler.record_system_log", log, raising=True
+    )
+    return log
+
+
+def _tick_until(scheduler, task_id: int, pool: MilitaryWindowPool, moments) -> None:  # type: ignore[no-untyped-def]
+    for moment in moments:
+        scheduler._scan_can_still_help(task_id, pool, moment)  # noqa: SLF001
 
 
 def test_a_growing_pool_keeps_the_slice_with_the_scan(scheduler) -> None:  # type: ignore[no-untyped-def]
@@ -157,6 +191,139 @@ def test_a_pool_back_above_the_floor_clears_the_books(scheduler) -> None:  # typ
 def test_no_pool_at_all_never_yields(scheduler) -> None:  # type: ignore[no-untyped-def]
     """不是军力优先那条链路的任务没有这个池子，一律不让位、也不留记账。"""
     assert scheduler._scan_can_still_help(1, None, NOW) is False
+
+
+# -- 这两条日志的限流 ----------------------------------------------------------
+#
+# 生产实测 2026-08-24 20:47–22:44：「不再让位」这条 WARNING 写了 2,084 行，
+# `signature_changed` **全为 True**、`suppressed_since_last_log` 全是 0 或 1，
+# 而按「态 + 窗口存货」去重之后只有 68 种内容。成因是签名当时取的是
+# `_line_signature(message, payload)`，而正文与 payload 里都带着**每跳都在涨**的
+# `stalled_seconds` —— 闸门于是每一跳都判成「状态变了」，限流整个失效。
+
+
+def test_the_give_up_warning_is_written_once_per_window_not_once_per_tick(  # type: ignore[no-untyped-def]
+    scheduler, clock, recorded: RecordingLog
+) -> None:
+    """⚠️⚠️ **只有「已经让了多久」在变时，不算状态变了。**
+
+    「不再让位」是个**停在那里的**状态：判死之后 `_scan_can_still_help` 不再清任何
+    账，于是每一跳都会再走一次这一支，而 `stalled` 一直在涨。把那个数算进签名，
+    这条 WARNING 就变成每秒一条 —— 而它恰恰是「门限配得比榜上能采到的还高」
+    唯一的可行动信号，刷屏等于把它埋掉。
+
+    这里连打 60 跳，只有 `stalled` 在变：**只许写一条**。
+    """
+    scheduler._scan_can_still_help(1, _pool(89), NOW)  # noqa: SLF001
+    # 第二次观察才起停滞的表（水位没涨）。
+    stall_from = NOW + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), stall_from)  # noqa: SLF001
+
+    gave_up = stall_from + SCAN_YIELD_PATIENCE + timedelta(seconds=1)
+    assert scheduler._scan_can_still_help(1, _pool(89), gave_up) is False  # noqa: SLF001
+    assert len(recorded.gave_up) == 1
+    level, message, payload = recorded.gave_up[0]
+    assert level == "WARNING", "限流不许顺手把告警降级"
+    assert "门限可能配得比榜上能采到的还高" in message, f"可行动的那句话没了：{message}"
+    assert payload["stalled_seconds"] == 181, "排障要的那个数不许从 payload 里消失"
+
+    _tick_until(
+        scheduler,
+        1,
+        _pool(89),
+        (gave_up + timedelta(seconds=second) for second in range(1, 60)),
+    )
+
+    assert len(recorded.gave_up) == 1, (
+        f"只有 stalled 在涨却又写了 {len(recorded.gave_up)} 条：签名把时长算成状态了"
+    )
+
+
+def test_a_stuck_yield_still_gets_one_line_per_window(  # type: ignore[no-untyped-def]
+    scheduler, clock, recorded: RecordingLog
+) -> None:
+    """⚠️ **压归压，不许压成沉默**：越过窗口那一条要照写，而且要如实交代压了几次。
+
+    只断言「写了一条」是不够的 —— 把这条 WARNING 干脆不打也能让那条用例变绿，
+    而那就把唯一的可行动信号删掉了。所以这里连**兜底那一条**和
+    `suppressed_since_last_log` 的数一起钉。
+    """
+    stall_from = NOW + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), NOW)  # noqa: SLF001
+    scheduler._scan_can_still_help(1, _pool(89), stall_from)  # noqa: SLF001
+    gave_up = stall_from + SCAN_YIELD_PATIENCE + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), gave_up)  # noqa: SLF001
+
+    # 59 跳被压掉，第 60 跳（窗口 +1 秒）落库。
+    _tick_until(
+        scheduler,
+        1,
+        _pool(89),
+        (gave_up + timedelta(seconds=second) for second in range(1, 60)),
+    )
+    after = gave_up + REPEATED_LOG_WINDOW + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), after)  # noqa: SLF001
+
+    assert len(recorded.gave_up) == 2, "窗口过完了却一个字都不写：这叫压成沉默"
+    _, message, payload = recorded.gave_up[1]
+    assert payload["signature_changed"] is False, "状态没变，却被当成跃迁"
+    assert payload["suppressed_since_last_log"] == 59
+    assert payload["suppressed_span_seconds"] == round(REPEATED_LOG_WINDOW.total_seconds()) + 1
+    assert "59 次" in message, f"被压掉几次没写进消息里：{message}"
+    # 落库这一条上的 `stalled_seconds` 仍是它自己那一刻的实数。
+    assert payload["stalled_seconds"] == round((after - stall_from).total_seconds())
+
+
+def test_the_window_stock_changing_is_a_transition_and_writes_at_once(  # type: ignore[no-untyped-def]
+    scheduler, clock, recorded: RecordingLog
+) -> None:
+    """⚠️ **「窗口内还剩几个」变了才叫状态变了** —— 那一条不受窗口压制，立刻写。
+
+    这是限流最危险的失效方式的反面：签名要是缩得只剩一个布尔，存货从 89 掉到 85
+    就会被压成沉默，而库里留着的上一条还在说 89。
+    """
+    stall_from = NOW + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), NOW)  # noqa: SLF001
+    scheduler._scan_can_still_help(1, _pool(89), stall_from)  # noqa: SLF001
+    gave_up = stall_from + SCAN_YIELD_PATIENCE + timedelta(seconds=1)
+    scheduler._scan_can_still_help(1, _pool(89), gave_up)  # noqa: SLF001
+    assert len(recorded.gave_up) == 1
+
+    # 窗口内掉了几个（读数过期）：窗口远没走完，但这一条要立刻写。
+    moved = gave_up + timedelta(seconds=5)
+    scheduler._scan_can_still_help(1, _pool(85), moved)  # noqa: SLF001
+
+    assert len(recorded.gave_up) == 2, "存货变了却被压掉了：库里那条还在说 89"
+    _, message, payload = recorded.gave_up[1]
+    assert payload["in_window"] == 85
+    assert payload["signature_changed"] is True
+    assert "85 个" in message
+
+
+def test_the_yield_notice_says_it_once_per_episode(  # type: ignore[no-untyped-def]
+    scheduler, clock, recorded: RecordingLog
+) -> None:
+    """让位那条 INFO（`stalled=None` 那一支）不许有同样的毛病。
+
+    它今天靠的是水位那道门（`seen is None` 才说话），不是靠限流；这条用例把那个
+    结论钉住，免得往后有人挪动那道门时把 INFO 也放成每跳一条。
+
+    形状：一整段让位期里池子一边涨一边停，跨过几十跳 —— 「这一跳让给军力榜」
+    只该说一次。
+    """
+    scheduler._scan_can_still_help(1, _pool(40), NOW)  # noqa: SLF001
+    assert len(recorded.yielding) == 1
+    level, _, payload = recorded.yielding[0]
+    assert level == "INFO", "让位本身是正常运转，不该是 WARNING"
+    assert payload["stalled_seconds"] is None
+
+    for second in range(1, 40):
+        moment = NOW + timedelta(seconds=second)
+        # 一半的跳数上池子在涨，另一半停着：两种都不该再说一遍。
+        scheduler._scan_can_still_help(1, _pool(40 + second // 2), moment)  # noqa: SLF001
+
+    assert len(recorded.yielding) == 1, "「让给军力榜去补货」变成了每跳一条"
+    assert recorded.gave_up == [], "池子还在涨，不该有「不再让位」"
 
 
 def test_a_real_military_task_actually_yields_through_the_facts(  # type: ignore[no-untyped-def]
