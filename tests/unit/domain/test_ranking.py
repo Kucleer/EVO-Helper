@@ -17,7 +17,7 @@ from evo_helper.domain.ranking import (
     is_bot_entry,
     mentions_bot,
     repair_ranks,
-    rows_skipped,
+    screens_overlap,
 )
 
 #: 实机军事榜那一屏（`ScreenShot_2026-08-14_113055`），名次 639–650。
@@ -327,52 +327,76 @@ def test_interpolated_scores_must_not_be_fed_to_this_judge() -> None:
 # -- 这一屏接得上上一屏吗（重叠自查）-------------------------------------------
 
 
-def test_an_overlapping_screen_reports_no_gap() -> None:
-    """一次拖动推进得比一屏少时，本屏首行**回头**落在上屏里——这是常态。
+def test_two_screens_that_share_a_coordinate_overlap() -> None:
+    """一次拖动推进得比一屏少时，本屏开头那几行**回头**落在上屏里——这是常态。
 
-    实测推进 4–12 行而可见 13–14 行，所以大多数屏的首行名次都小于上屏末行名次。
-    这种情形答案必须是 0（「一名都没漏」），不是一个负数：负数会被
-    `if skipped:` 当成真值，于是每一屏都报一次「漏掉 -5 名」。
+    2026-08-23 生产实测（run `91c7f9ec`）70 屏走了 572 名，平均 8.2 行/屏，
+    而一屏可见 11–14 行，所以正常情况下相邻两屏共享 3–6 行。
+    共享一行就够回答「中间没有整段跳掉」。
     """
-    assert rows_skipped(857, 850) == 0
-    assert rows_skipped(857, 857) == 0
+    previous = [Coordinate(4, 30, 12), Coordinate(4, 100, 13), Coordinate(4, 183, 20)]
+    current = [Coordinate(4, 183, 20), Coordinate(4, 160, 9), Coordinate(4, 360, 15)]
+
+    assert screens_overlap(previous, current) is True
 
 
-def test_the_very_next_rank_is_continuous_not_a_gap() -> None:
-    """⚠️ **边界：末行 850、首行 851 中间什么都没有。**
+def test_two_screens_with_nothing_in_common_may_have_skipped_rows() -> None:
+    """⚠️ **这是这道判据唯一要抓的事。**
 
-    榜单名次严格连续（`repair_ranks` 的全部依据），所以 851 紧接着 850。
-    这里差一就意味着**每一屏都凭空报漏 1 名**——而一条天天喊的告警等于
-    没有告警，真断的那次也就没人看了。
+    一个坐标都没对上，说明这一次拖动可能推过了一整屏，中间那几行**压根没被
+    读过**——而采集段只按坐标去重，「采到的 bot 数」看起来完全正常，
+    `is_bot_entry` 那种事后判据也救不了没读过的行。
     """
-    assert rows_skipped(850, 851) == 0
-    assert rows_skipped(850, 852) == 1
+    previous = [Coordinate(4, 30, 12), Coordinate(4, 100, 13)]
+    current = [Coordinate(4, 360, 15), Coordinate(4, 44, 10)]
+
+    assert screens_overlap(previous, current) is False
 
 
-def test_a_real_gap_is_counted_by_name_not_by_screen() -> None:
-    """推进 12 行那一屏（2026-08-23 实机十屏里最狠的一次）重叠只剩 1–2 行。
+def test_the_judge_never_looks_at_ranks() -> None:
+    """⚠️⚠️ **判据不看名次——这条钉的就是 2026-08-23 那次误报的根因。**
 
-    再多漂一点重叠就断了，而断掉的那几名**压根没被读过**：采集段只按坐标去重，
-    「采到的 bot 数」看起来完全正常。这个数是那次静默失败唯一的痕迹，
-    所以它数的是**名次**（漏了几个 bot），不是「漏了几屏」。
+    run `91c7f9ec` 整趟只从第 771 名走到第 1343 名（约 570 名），却报了 12 次
+    「漏掉 N 名」、累计 8922 名。原因是名次列的 OCR 会串出高位噪声：上屏末行
+    `1008` 读成 `8`，下屏首行 `1005` 照旧，`1005 − 8 − 1` 就是那个反复出现
+    5 次的 `996`。
+
+    坐标对上了就是对上了，名次读成什么都改不了这个答案——这里刻意把两屏的
+    名次都写成生产上那个形状，判据必须一声不吭。
     """
-    assert rows_skipped(853, 860) == 6
-    assert rows_skipped(639, 651) == 11
+    shared = Coordinate(4, 183, 20)
+    previous = [Coordinate(4, 30, 12), shared]
+    current = [shared, Coordinate(4, 160, 9)]
+
+    assert screens_overlap(previous, current) is True
 
 
-def test_an_unreadable_rank_answers_i_do_not_know_instead_of_no_gap() -> None:
-    """⚠️⚠️ **`None` 不是 0，这条是整道判据的要害。**
+def test_a_screen_with_no_coordinates_answers_i_do_not_know() -> None:
+    """⚠️⚠️ **`None` 不是 `False`，这条是整道判据的要害。**
 
-    名次读不出有两个常态来源：榜首三名是奖章图标（`rows_from_image` 那条用例），
-    以及 OCR 漏认。那时正确答案是「不知道」——答 0 就等于宣布「重叠完好」，
-    于是**恰恰是最可疑的那几屏（连名次都读不出的）会伪装成最干净的**。
-
-    下一个人一定会想把它写成 `max(0, ...)` 配上 `or 0` 把 `None` 抹平，
-    这条用例就是拦它的。
+    一屏坐标全读不出是常态（离页、面板没铺开、名字列整列没认出来）。那时正确
+    答案是「不知道」——答 `False` 就等于宣布「重叠断了」，于是**恰恰是最可疑的
+    那几屏（连名字都读不出的）会额外挨一次假警报**。而假警报比不报更坏：
+    它把这条判据教成经常喊狼来了，真断的那次就没人看了。
     """
-    assert rows_skipped(None, 851) is None
-    assert rows_skipped(850, None) is None
-    assert rows_skipped(None, None) is None
-    # 写成 `is None` 而不是 `== 0`：`None == 0` 为假，但 `not None` 与 `not 0`
-    # 都是真——只在真值上断言的话，把 None 换成 0 的实现照样绿。
-    assert rows_skipped(850, 851) == 0
+    coordinates = [Coordinate(4, 30, 12)]
+
+    assert screens_overlap([], coordinates) is None
+    assert screens_overlap(coordinates, []) is None
+    assert screens_overlap([], []) is None
+    # 写成 `is False` 而不是 `not ...`：`None` 和 `False` 在真值上一模一样，
+    # 只断真值的话，把 `None` 抹成 `False` 的实现照样绿。
+    assert screens_overlap(coordinates, [Coordinate(4, 100, 13)]) is False
+
+
+def test_a_repeated_coordinate_inside_one_screen_changes_nothing() -> None:
+    """一屏里同一个坐标出现两次（上下两行名字读成同一个）不影响这个问题的答案。
+
+    判据只问「有没有共同的」，所以进来的是列表也当集合看——这条守的是别有人
+    改成「共同坐标要有几个」那种按数量的写法：共享行本来就少到 1 行，
+    按数量卡就等于天天喊狼来了。
+    """
+    previous = [Coordinate(4, 30, 12), Coordinate(4, 30, 12)]
+
+    assert screens_overlap(previous, [Coordinate(4, 30, 12)]) is True
+    assert screens_overlap(previous, [Coordinate(4, 100, 13)]) is False
