@@ -49,9 +49,9 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Protocol
 
-from evo_helper.domain.text import snap_to_vocabulary
+from evo_helper.game.nav_bar import label_x, merged_labels, nav_label_words
 from evo_helper.game.ranking_ui import (
     CLOSE_ATTEMPTS,
     DRAG_PRESS_HOLD_S,
@@ -64,11 +64,6 @@ from evo_helper.game.ranking_ui import (
     NAV_DRAG_FROM_X,
     NAV_DRAG_TO_X,
     NAV_DRAG_WAIT_S,
-    NAV_LABEL_MAX_DISTANCE,
-    NAV_LABEL_ROI,
-    NAV_LABEL_UPSCALE,
-    NAV_LABEL_WORD_GAP_PX,
-    NAV_LABELS,
     NAV_MAX_DRAGS,
     PANEL_OPEN_WAIT_S,
     PANEL_READY_ROW_SLACK,
@@ -768,84 +763,14 @@ class RankingNavigator[RowT]:
             self.driver.release()
 
 
-def merged_labels(entries: Sequence[tuple[int, str]]) -> list[tuple[int, str]]:
-    """把靠得足够近的相邻词框合成一个标签，返回 `(中心 x, 完整标签)`。
-
-    见 `ranking_ui.NAV_LABEL_WORD_GAP_PX`：tesseract 对中文按字切词，
-    不合并的话「排名」永远只读到「排」或「名」，贴不回词表，于是永远找不到。
-
-    中心 x 取整段的中点而不是首字——点在标签正中离相邻的导航项最远。
-
-    与 `preset_picker.merged_names` 同形而不共用：那边的阈值
-    （`PRESET_WORD_GAP_PX`）是在预设条上量的（字距 10 / 项距 237），
-    这边是在导航条上量的（项距 80）。两个数各自会变，共用一个就会出现
-    「改了预设条的容差，导航条跟着认错」。
-    """
-    ordered = sorted(entries)
-    runs: list[list[tuple[int, str]]] = []
-    for x, text in ordered:
-        if runs and x - runs[-1][-1][0] <= NAV_LABEL_WORD_GAP_PX:
-            runs[-1].append((x, text))
-        else:
-            runs.append([(x, text)])
-    return [((run[0][0] + run[-1][0]) // 2, "".join(text for _x, text in run)) for run in runs]
-
-
 def ranking_label_x(runs: Sequence[tuple[int, str]]) -> int | None:
-    """这一屏里「排名」的中心 x，没有就 None。
+    """这一屏里「排名」的中心 x，没有就 `None`。
 
-    **贴回封闭词表**（`ranking_ui.NAV_LABELS`）而不是做子串判断：实机上
-    `chi_sim` 把「攻击」读成过「政击」、把「派遣」读成过「派遗」，
-    差一个字 `in` 就直接漏掉。而放宽成「含『名』就算」又会让别的项蒙混过关。
-    `snap_to_vocabulary` 要求**唯一命中**，两个候选并列时判不出来而不是猜。
-
-    ⚠️ 落在标签行 ROI 之外的 x 一律不当候选。眼下这道闸**打不着**——
-    x 是从 ROI 裁出来的图上换算回来的，真实读数出不了界。留着它是因为
-    ROI 和「用什么坐标去点」是两件各自会变的事：哪天有人改成整窗 OCR，
-    这道闸就是唯一还站着的东西。**不要因为「测试构造不出真实场景」删掉它**
-    （同 `preset_picker._clickable_hit` 里那条）。
+    2026-08-24 起是 `nav_bar.label_x` 的一层薄壳——那条条上现在有两条链在找标签
+    （军力榜找「排名」、攻击链找「行星」/「舰队」），泛化成 `label_x(runs, wanted)`
+    之后这里只剩「要找的是排名」这一条信息。行为逐字不变，包括那道 ROI 闸。
     """
-    for x, text in sorted(runs):
-        snapped = snap_to_vocabulary(text, NAV_LABELS, max_distance=NAV_LABEL_MAX_DISTANCE)
-        if snapped != RANKING_LABEL:
-            continue
-        if not NAV_LABEL_ROI[0] <= x <= NAV_LABEL_ROI[2]:
-            continue
-        return x
-    return None
-
-
-def nav_label_words(image: Any, ocr: Any) -> list[tuple[int, str]]:
-    """从一张整窗截图里读出底部导航标签行的 `(中心 x, 文字)`。
-
-    与 `preset_picker.name_words` 同形（那边找预设、这边找导航项），
-    配方是实机 2026-08-14 用的那一套：`chi_sim`、`--psm 6`、3×。
-    用词框而不是整行文本：要拿 x 去点。
-
-    ⚠️ 只跑 `chi_sim` 不跑 `eng`：这五个标签全是中文，掺进 `eng` 只会多一份
-    把「排」认成字母的机会。
-    """
-    crop = image.crop(NAV_LABEL_ROI).convert("L")
-    grey = crop.resize(
-        (crop.width * NAV_LABEL_UPSCALE, crop.height * NAV_LABEL_UPSCALE),
-        _lanczos(),
-    )
-    data = ocr.image_to_data(grey, lang="chi_sim", config="--psm 6", output_type=ocr.Output.DICT)
-    words: list[tuple[int, str]] = []
-    for index, word in enumerate(data["text"]):
-        text = word.strip()
-        if not text:
-            continue
-        left = NAV_LABEL_ROI[0] + data["left"][index] // NAV_LABEL_UPSCALE
-        width = data["width"][index] // NAV_LABEL_UPSCALE
-        words.append((left + width // 2, text))
-    return words
-
-
-def _lanczos() -> Any:
-    from PIL import Image
-
-    return Image.Resampling.LANCZOS
+    return label_x(runs, RANKING_LABEL)
 
 
 __all__ = [
