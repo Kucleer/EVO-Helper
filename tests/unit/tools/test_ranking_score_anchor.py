@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.ranking import RankingRow, trusted_scores
+from evo_helper.domain.ranking import RankingRow
 from evo_helper.domain.records import RankingTarget
 from evo_helper.game.ranking_nav import ScrollOutcome, ScrollStep
 from evo_helper.game.ranking_ui import BLIND_SCROLL_MARGIN_ROWS, BLIND_SCROLL_ROWS
@@ -101,52 +101,22 @@ def test_the_two_nets_together_catch_both_directions() -> None:
 # -- 交给下一屏的锚点 -----------------------------------------------------------
 
 
-def test_the_anchor_handed_on_is_the_biggest_trusted_reading_not_the_last() -> None:
-    """⚠️⚠️ **锚点取这一屏的最大值，不是末行。**
-
-    守的是 2026-08-23 自己踩的一个设计错误：第一版取「最后一个可信值」，
-    而**相邻两屏必然重叠**（一次拖动推进约 8 行，一屏可见 9–14 行），
-    所以本屏头几行就是上屏的中段、军力**理应高于上屏末行**。拿末行当降序基准，
-    每屏开头那 4–5 行会被整段判成「破坏降序」：
-
-        上屏  … 10690 10660 10640 10620       末行 10620 当锚点
-        本屏  10690 10660 10640 10620 10600 10580
-        判据  ✗     ✗     ✗     ✓     ✓     ✓
-
-    后果本来只是日志噪声（被丢的那几行早在上一屏就以真值入过库，
-    `take_batch_targets` 按坐标去重不会写回估算值），但那句「军力值不可信」
-    会**每屏都打一次**——而这道判据存在的意义就是让那句话有信号。每屏都喊等于没喊。
-    """
+def test_the_anchor_handed_on_is_the_last_trusted_reading_of_the_screen() -> None:
+    """正常一屏交出末行那个值——它才是下一屏第一行唯一的可比对象。"""
     rows = _rows([10_980.0, 10_900.0, 10_810.0])
 
-    assert next_score_anchor(rows, anchor=13_200.0) == 10_980.0
+    assert next_score_anchor(rows, anchor=13_200.0) == 10_810.0
 
 
-def test_the_overlapping_head_of_the_next_screen_is_not_refused() -> None:
-    """接着上一条：拿最大值当锚点之后，**重叠那几行必须全部放行**。
+def test_the_last_trusted_reading_is_not_the_last_row() -> None:
+    """末行本身不可信时，往上找**最后一个可信的**，而不是交出那个坏值。
 
-    这是这个改动唯一真正要证明的事——上一条只说锚点取哪个数，这一条说那个数
-    用下去的效果。
-    """
-    previous = _rows([10_690.0, 10_660.0, 10_640.0, 10_620.0])
-    anchor = next_score_anchor(previous, anchor=None)
-
-    # 本屏前四行就是上屏的后四行（重叠），后两行是新露出来的。
-    overlapping = [10_690.0, 10_660.0, 10_640.0, 10_620.0, 10_600.0, 10_580.0]
-
-    assert trusted_scores(overlapping, anchor=anchor) == overlapping
-
-
-def test_a_refused_last_row_is_not_handed_on_as_the_anchor() -> None:
-    """不可信的读数不许当锚点——哪怕它是这一屏最大的那个。
-
-    这里末行 10,920 比上一行大（屏内破坏降序）被判掉；它同时也是三个数里最大的，
-    所以「取最大值」这条实现如果写成 `max(所有读数)` 而不是 `max(可信的那些)`，
-    就会把一个已经判定不可信的读数立成下一屏的基准。
+    这里末行 10,920 比上一行大（屏内破坏降序），交它出去就等于把一个已经判定
+    不可信的读数立成下一屏的基准——下一屏的正常读数会被它一起判错。
     """
     rows = _rows([10_900.0, 10_880.0, 10_920.0])
 
-    assert next_score_anchor(rows, anchor=13_200.0) == 10_900.0
+    assert next_score_anchor(rows, anchor=13_200.0) == 10_880.0
 
 
 def test_a_screen_whose_every_reading_is_refused_keeps_the_old_anchor() -> None:

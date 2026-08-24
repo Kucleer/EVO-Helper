@@ -1,28 +1,19 @@
-"""采集段的重叠自查**接线**：相邻两屏接不上有没有留下痕迹。
+"""采集段的重叠自查**接线**：漏掉的名次有没有留下痕迹。
 
-判据本身住在 `domain.ranking.screens_overlap`（用例在 `tests/unit/domain/test_ranking.py`），
-「这一屏读出了哪些坐标」那把尺子住在 `tools.ranking_scan.coordinates_of`
-（用例在 `test_ranking_scan.py`）。这个文件量的是**采集循环有没有真的把它们接上**，
-以及接上之后的三条口径：
+判据本身住在 `domain.ranking.rows_skipped`（用例在 `tests/unit/domain/test_ranking.py`），
+头尾名次那两把尺子住在 `tools.ranking_scan`（用例在 `test_ranking_scan.py`）。
+这个文件量的是**采集循环有没有真的把它们接上**，以及接上之后的三条口径：
 
 1. 真断了要在**三个地方**留痕：当场那一行、`record_log("采集一屏")` 的 payload、
    以及收尾那条 `采集重叠断裂`。少任何一处都等于这次改动没做——
-   跳过去的那几行压根没被读过，「采到的 bot 数」看起来完全正常。
+   跳过去的那几名压根没被读过，「采到的 bot 数」看起来完全正常。
 2. 没断就**一个字都不许多打**。收尾那句是**异常信号**，每趟都打就成了噪声，
    而噪声里的告警等于没有告警。
-3. 一屏坐标全读不出时，那一屏和**紧接着的下一屏**都答「不知道」。
+3. 一屏名次全读不出时，那一屏和**紧接着的下一屏**都答「不知道」。
 
-## ⚠️⚠️ 账：这道判据原先建在名次上，而名次不可信
-
-第一版是 `rows_skipped(上屏末行名次, 本屏首行名次)`，报「漏掉 N 名」。生产
-run `91c7f9ec`（2026-08-23 20:35）整趟只从第 771 名走到第 1343 名（约 570 名），
-它却喊了 12 次、累计「漏掉 8922 名」——一次都不是真的。根因是名次列的 OCR 会串出
-高位噪声，而那 5 个一模一样的 `996` 就是指纹（`= 1000 − 4`：千位丢了 + 真实重叠
-4 行）。用户口径（2026-08-23）：「名次字段可以忽略，我们只需要使用军力进行判断」。
-
-所以判据换到**坐标**上：一次拖动推约 8 行而一屏可见 11–14 行（同一趟 70 屏实测
-572/70 = 8.2 行/屏），相邻两屏正常共享 3–6 行；共享行一个都没有才可疑。
-下面 `test_ranks_read_wrong_never_produce_an_alert` 就是那次误报的回归用例。
+账在这里：采集段原先没有这道校验，靠的是「一次拖动推进得比一屏少」这个从未被
+校验过的隐含前提。2026-08-23 实机十屏实测推进 `+8 +8 +7 +10 +8 +8 +4 +12 +8`
+——**4 到 12 行**，而可见 13–14 行。推进 12 那一屏重叠只剩 1–2 行。
 
 ⚠️ 全程不起游戏、不驱动鼠标、不碰任何数据库：驱动、导航、OCR、仓储全是替身，
 读到的那几屏是喂进来的清单。
@@ -40,11 +31,7 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import RankingRow
 from evo_helper.domain.records import RankingTarget
 from evo_helper.game.ranking_nav import ScrollOutcome, ScrollStep
-from evo_helper.game.ranking_ui import (
-    BLIND_SCROLL_MARGIN_ROWS,
-    BLIND_SCROLL_ROWS,
-    ROWS_PER_SCREEN,
-)
+from evo_helper.game.ranking_ui import BLIND_SCROLL_MARGIN_ROWS, BLIND_SCROLL_ROWS
 from evo_helper.tools import ranking_scan
 from evo_helper.tools.ranking_scan import HumanStretch
 
@@ -56,54 +43,31 @@ from evo_helper.tools.ranking_scan import HumanStretch
 ROWS_TO_BOT_AREA = BLIND_SCROLL_ROWS + BLIND_SCROLL_MARGIN_ROWS + 17
 
 
-#: 一次拖动推进几行。2026-08-23 生产实测 70 屏平均 8.2 行/屏，取 8——
-#: 于是相邻两屏共享 5 行，正是实机上那个形状。
-ADVANCE_PER_SCROLL = 8
+def _screen(ranks: Sequence[int | None], *, system: int) -> list[RankingRow]:
+    """一屏 bot 行：名次照 `ranks` 给，坐标按**每屏换一个恒星系**排。
 
+    换恒星系是为了让每一屏都有新 bot：`take_batch_targets` 按坐标去重，全屏都是
+    见过的坐标时 `fresh` 为空、`dry` 开始累加，到 `DRY_SCREENS` 就提前收工——
+    那会让循环在断言点之前就停下来，用例变成绿的假证明。
 
-def _bot(index: int) -> Coordinate:
-    """榜上第 `index` 个 bot 的坐标。**同一个 index 永远是同一个坐标。**
+    军力值取 10 的整数倍且逐行递减：`renderable_score` 和 `descending_breaks`
+    这两道网在这几条用例里一句话都不该说（它们各有自己的用例），说了就会多出
+    一行「军力值破坏降序」，而这里量的恰恰是「有没有多打一行」。
 
-    这是这一整个文件的地基：判据问的是「相邻两屏有没有共同坐标」，所以
-    「哪一行是哪一个 bot」必须是喂进来的事实，而不是每屏随便换一个恒星系。
-    （原先的 `_screen(..., system=137)` 就是每屏换一个恒星系——那在新判据下
-    等于每一屏都报「重叠断了」，用例会变成红的假证明。）
-
-    位号 5–20：1–4 号位是游戏固定生成的海盗，`is_bot_entry` 会整行剔掉，
-    所以一个恒星系装 16 个 bot，装满换下一个。
+    位号从 5 起：1–4 号位是游戏固定生成的海盗，`is_bot_entry` 会整行剔掉。
     """
-    return Coordinate(4, 137 + index // 16, 5 + index % 16)
-
-
-def _screen(
-    start: int, *, rows: int = ROWS_PER_SCREEN, ranks: Sequence[int | None] | None = None
-) -> list[RankingRow]:
-    """从第 `start` 个 bot 起的一屏。名次默认按 `850 + index` 连续给。
-
-    `ranks` 是给那条回归用例开的口子：名次读成什么都不该改变这道判据的答案。
-
-    ⚠️ **军力值全屏取同一个数**（不是逐行递减）。真榜是降序的，而重叠行的军力
-    **高于上一屏末行**——跨屏锚点（`domain.ranking.trusted_scores` 的
-    `out_of_order`）会把它们整段判成「破坏降序」，于是每一屏都多打一行
-    「军力值不可信，丢掉这几行的分数」。那是另一条判据的事（它有自己的用例），
-    混进来只会把这个文件里「一个字都不多打」那几条断言弄脏。取同一个数则三道
-    军力判据（`renderable_score` / `out_of_order` / 断崖）一句话都不说。
-    """
-    given = list(ranks) if ranks is not None else [850 + start + offset for offset in range(rows)]
-    return [
-        RankingRow(
-            rank=given[offset],
-            name=f"bot_4_{_bot(start + offset).system}_{_bot(start + offset).position}",
-            score=29_000.0,
-            coordinate=_bot(start + offset),
+    rows: list[RankingRow] = []
+    for index, rank in enumerate(ranks):
+        position = 5 + index
+        rows.append(
+            RankingRow(
+                rank=rank,
+                name=f"bot_4_{system}_{position}",
+                score=29_000.0 - index * 10,
+                coordinate=Coordinate(4, system, position),
+            )
         )
-        for offset in range(rows)
-    ]
-
-
-def _walk(screens: int, *, advance: int = ADVANCE_PER_SCROLL) -> list[list[RankingRow]]:
-    """连着 `screens` 屏、每屏推进 `advance` 行的一趟。重叠完好的那种。"""
-    return [_screen(index * advance) for index in range(screens)]
+    return rows
 
 
 class _NoOcr:
@@ -232,9 +196,9 @@ class _Run:
     def payloads(self, message: str) -> list[dict[str, Any]]:
         return [payload for logged, payload in self.logs if logged == message]
 
-    def overlap(self) -> list[bool | None]:
-        """每一屏 `record_log("采集一屏")` 里那个 `overlap_intact`。"""
-        return [payload["overlap_intact"] for payload in self.payloads("采集一屏")]
+    def skipped(self) -> list[int | None]:
+        """每一屏 `record_log("采集一屏")` 里那个 `rows_skipped`。"""
+        return [payload["rows_skipped"] for payload in self.payloads("采集一屏")]
 
 
 def _reached_bots(**kwargs: Any) -> HumanStretch:
@@ -297,77 +261,51 @@ def _harness(
 def test_a_broken_overlap_is_reported_on_the_spot_and_in_the_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """⚠️⚠️ **这是这道判据要抓的那种静默失败。**
+    """⚠️⚠️ **这是这次改动要抓的那种静默失败。**
 
-    第三屏从第 40 个 bot 起，而第二屏只到第 20 个——中间第 21–39 个**压根没被
-    读过**。采集段只按坐标去重，所以「采到的 bot 数」看起来完全正常，
-    `is_bot_entry` 那种事后判据也救不了没读过的行。唯一的痕迹就是下面这三处。
+    第三屏首行是 860，而第二屏末行是 855——中间 856–859 那四名**压根没被读过**。
+    采集段只按坐标去重，所以「采到的 bot 数」看起来完全正常，`is_bot_entry` 那种
+    事后判据也救不了没读过的行。这四名唯一的痕迹就是下面这三处。
 
-    第二屏是**正常重叠**（从第 8 个起，和第一屏共享 5 行），它答 `True`——把这一屏
-    一起放进来是为了钉住「重叠上了就不打那一行」：真断的那次要能从一屏噪声里认出来。
-    """
-    run = _harness(monkeypatch, [_screen(0), _screen(8), _screen(40)])
-
-    assert run.scan() == 0
-
-    assert run.overlap() == [True, False], "接没接上要进 `采集一屏` 的 payload，事后才查得出"
-    assert "⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）" in run.lines()
-    assert ("采集重叠断裂", {"screens_without_overlap": 1}) in run.logs
-    assert (
-        "⚠️ 本趟有 1 屏与上一屏没有共同坐标（重叠可能断了；中间的行没被读过，事后判据救不了）"
-        in run.lines()
-    )
-
-
-def test_the_broken_screens_add_up_across_the_whole_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """收尾报的是**整趟累计**，不是最后一屏那一个。
-
-    一趟要滚几百屏。只报最后一次的话，中间断过五次、每次跳掉一整段，收尾照样说
-    「0 屏」——那正好是这条判据最该说话的一趟。
-
-    ⚠️ 数的是**屏**，不是「漏了几行」：跳过去的行没被读过，「几行」这个数在原理上
-    就无从得知。原先那道名次判据敢报「漏掉 8922 名」，正因为它是从两个带噪声的
-    名次减出来的。
-    """
-    run = _harness(monkeypatch, [_screen(0), _screen(40), _screen(200)])
-
-    assert run.scan() == 0
-
-    assert run.overlap() == [False, False]
-    assert ("采集重叠断裂", {"screens_without_overlap": 2}) in run.logs
-
-
-# -- 名次读成什么都不许影响这道判据 ---------------------------------------------
-
-
-def test_ranks_read_wrong_never_produce_an_alert(monkeypatch: pytest.MonkeyPatch) -> None:
-    """⚠️⚠️ **2026-08-23 那 12 条假告警的回归用例。**
-
-    生产 run `91c7f9ec` 上反复出现的形状：上一屏末行名次 `1008` 的千位被 OCR 吃掉、
-    读成 `8`，而本屏首行 `1005` 读得没错。旧判据算 `1005 − 8 − 1 = 996`，于是
-    报「与上一屏之间漏掉 996 名（重叠断了）」——那一趟整个只走了约 570 名，
-    这一条就号称漏了 996。同一趟里这个数出现了 5 次。
-
-    而这两屏**共享 5 行**，重叠好得很。坐标对上了就是对上了，名次读成什么都
-    改不了这个答案，所以这一趟必须一个字都不提「重叠」。
+    第二屏是**正常重叠**（首行 852 回头落在第一屏里），它答 0——把这一屏一起放进来
+    是为了钉住「0 不打那一行」：真断的那次要能从一屏噪声里认出来。
     """
     run = _harness(
         monkeypatch,
         [
-            # 末行名次的千位被吃掉：…1006, 1007, 8
-            _screen(0, ranks=[1000 + offset for offset in range(ROWS_PER_SCREEN - 1)] + [8]),
-            # 本屏首行 1005 读得没错，往下还串出个 `4781`（实机读到过的形状）。
-            _screen(
-                8, ranks=[1005, 4781] + [1007 + offset for offset in range(ROWS_PER_SCREEN - 2)]
-            ),
+            _screen([850, 851, 852, 853], system=137),
+            _screen([852, 853, 854, 855], system=138),
+            _screen([860, 861, 862, 863], system=139),
         ],
     )
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True]
-    assert not [line for line in run.lines() if "重叠" in line or "漏掉" in line]
-    assert run.payloads("采集重叠断裂") == []
+    assert run.skipped() == [0, 4], "漏了几名要进 `采集一屏` 的 payload，事后才查得出"
+    assert "⚠️ 与上一屏之间漏掉 4 名（重叠断了）" in run.lines()
+    assert ("采集重叠断裂", {"rows_missed": 4}) in run.logs
+    assert "⚠️ 本趟重叠断了，累计漏掉 4 名（没被读过，事后判据救不了）" in run.lines()
+
+
+def test_the_gaps_add_up_across_the_whole_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """收尾报的是**整趟累计**，不是最后一屏那一个。
+
+    一趟要滚几百屏。只报最后一次的话，中间断过五次、每次漏十名，收尾照样说
+    「漏掉 0 名」——那正好是这条判据最该说话的一趟。
+    """
+    run = _harness(
+        monkeypatch,
+        [
+            _screen([850, 851], system=137),
+            _screen([856, 857], system=138),  # 漏 4（852–855）
+            _screen([860, 861], system=139),  # 漏 2（858–859）
+        ],
+    )
+
+    assert run.scan() == 0
+
+    assert run.skipped() == [4, 2]
+    assert ("采集重叠断裂", {"rows_missed": 6}) in run.logs
 
 
 # -- 没断：一个字都不多打 -------------------------------------------------------
@@ -378,88 +316,90 @@ def test_a_run_whose_overlap_never_broke_says_nothing_about_it(
 ) -> None:
     """⚠️ **收尾那句是异常信号，每趟都打就成了噪声。**
 
-    没断时 `采集重叠断裂` 那条记录和那句话都不许出现。一趟几百屏、一天八趟，
-    把它打成常态之后真断的那一次就淹在里面了——而这条判据存在的全部理由
-    就是让那一次被看见。
+    `missed` 为 0 时 `采集重叠断裂` 那条记录和那句话都不许出现。一趟几百屏、
+    一天八趟，把它打成常态之后真断的那一次就淹在里面了——而这条判据存在的
+    全部理由就是让那一次被看见。
 
-    payload 里的 `overlap_intact` **照旧要记 `True`**：那是「量过了，接上了」，
+    payload 里的 `rows_skipped` **照旧要记 0**：那是「量过了，没漏」，
     和「没量」（`None`）是两件事，日志上必须分得开。
     """
-    run = _harness(monkeypatch, _walk(4))
+    run = _harness(
+        monkeypatch,
+        [
+            _screen([850, 851, 852, 853], system=137),
+            _screen([852, 853, 854, 855], system=138),
+            _screen([856, 857, 858, 859], system=139),  # 紧接着 855，连续
+        ],
+    )
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True, True, True]
+    assert run.skipped() == [0, 0]
     assert run.payloads("采集重叠断裂") == []
-    assert not [line for line in run.lines() if "重叠" in line or "漏掉" in line]
+    assert not [line for line in run.lines() if "漏掉" in line or "重叠断" in line]
 
 
-def test_one_shared_row_is_enough(monkeypatch: pytest.MonkeyPatch) -> None:
-    """⚠️ **推进一整屏差一行也算接上了**，别按「共享几行」卡门。
-
-    2026-08-23 实机十屏里最狠的一次推进 12 行，而那一屏可见 13 行——重叠只剩 1 行。
-    共享行本来就能少到 1 行，按数量卡就等于天天喊狼来了。
-    """
-    run = _harness(monkeypatch, _walk(3, advance=ROWS_PER_SCREEN - 1))
-
-    assert run.scan() == 0
-
-    assert run.overlap() == [True, True]
-    assert not [line for line in run.lines() if "重叠" in line]
+# -- 名次读不出：这一屏和下一屏都答「不知道」 -----------------------------------
 
 
-# -- 坐标读不出：这一屏和下一屏都答「不知道」 -----------------------------------
-
-
-def test_a_screen_with_no_readable_coordinate_does_not_poison_the_next_comparison(
+def test_a_screen_with_no_readable_rank_does_not_poison_the_next_comparison(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """⚠️⚠️ **`previous_coordinates` 不许写成 `coordinates_of(rows) or previous_coordinates`。**
+    """⚠️⚠️ **`previous_last_rank` 不许写成 `last_rank_of(rows) or previous_last_rank`。**
 
-    那个 `or` 在「这一屏坐标全读不出」时会**保留上一屏的集合**，于是下一屏拿
-    **隔了两屏**的坐标去比——而隔两屏本来就不该有共同坐标（一次推约 8 行，
-    两次就推出一整屏）。于是每一次读废都要连带造出一条假警报。而假警报比不报
-    更坏：它把这条判据教成经常喊狼来了，真断的那次就没人看了。
+    那个 `or` 在「这一屏名次全读不出」时会**保留上一屏的值**，于是下一屏拿
+    **隔了两屏**的名次去比，凭空报出一个 8–16 名的假漏采。而假警报比不报更坏：
+    它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
 
-    这里第二屏名字整列没认出来（实机常态：`rows_from_image` 名字读不出就丢行），
-    第三屏正常接在第二屏该在的位置上。按 `or` 那种写法会拿第一屏去比，
-    报「重叠断了」——而一行都没跳。
+    这里第二屏名次全读不出（OCR 整列没认出来是实机常态），第三屏首行 870。
+    按 `or` 那种写法会拿 853 去比，报「漏掉 16 名」——而真实推进只有四行，
+    一名都没漏。读不出就该是 `None`，让下一次比较答「不知道」。
 
-    第四屏钉的是**恢复**：拿到读得出的坐标之后，正常比较立刻接上，
+    第四屏钉的是**恢复**：拿到读得出的名次之后，正常比较立刻接上，
     不会因为中间断过一屏就此永远闭嘴。
     """
     run = _harness(
         monkeypatch,
-        [_screen(0), [], _screen(16), _screen(24)],
+        [
+            _screen([850, 851, 852, 853], system=137),
+            _screen([None, None, None, None], system=138),
+            _screen([870, 871, 872, 873], system=139),
+            _screen([874, 875, 876, 877], system=140),
+        ],
     )
 
     assert run.scan() == 0
 
-    assert run.overlap() == [None, None, True], (
-        "坐标全读不出的那一屏答 None，紧接着的下一屏也答 None；第四屏恢复正常比较"
+    assert run.skipped() == [None, None, 0], (
+        "读不出名次的那一屏答 None，紧接着的下一屏也答 None；第四屏恢复正常比较"
     )
-    assert not [line for line in run.lines() if "重叠" in line], "一行都没跳，不许报"
+    assert not [line for line in run.lines() if "漏掉" in line], "一名都没漏，不许报"
     assert run.payloads("采集重叠断裂") == []
 
 
-def test_an_unreadable_screen_is_never_counted_as_a_broken_overlap(
+def test_an_unreadable_screen_is_never_counted_as_a_clean_overlap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """⚠️ **`None` 不许在 payload 里落成 `False`。**
+    """⚠️ **`None` 不许在 payload 里落成 0。**
 
-    落成 `False` 的话，日志上「这一屏量过、接不上」和「这一屏连坐标都没读出来」
-    长得一模一样——而后者恰恰是最可疑的那种屏，还会因此白挨一条告警。
-    查库的人分不开这两件事，就等于这条判据没记住任何东西。
+    落成 0 的话，日志上「这一屏量过、没漏」和「这一屏连名次都没读出来」长得
+    一模一样——而后者恰恰是最可疑的那种屏。查库的人分不开这两件事，就等于
+    这条判据没记住任何东西。
     """
-    run = _harness(monkeypatch, [_screen(0), []])
+    run = _harness(
+        monkeypatch,
+        [
+            _screen([850, 851], system=137),
+            _screen([None, None], system=138),
+        ],
+    )
 
     assert run.scan() == 0
 
-    # 断 `is None` 而不是 `not ...`：`None` 和 `False` 在真值上一模一样，
-    # 而那个键**必须在**（不是「漏记了」）。
-    assert "overlap_intact" in run.payloads("采集一屏")[0]
-    assert run.payloads("采集一屏")[0]["overlap_intact"] is None
-    assert run.payloads("采集重叠断裂") == []
+    # 断 `is None` 而不是 `== 0`：那个键**必须在**（不是「漏记了」），
+    # 而它的值必须是「不知道」。
+    assert "rows_skipped" in run.payloads("采集一屏")[0]
+    assert run.payloads("采集一屏")[0]["rows_skipped"] is None
 
 
 # -- 被打断也要报得出来 ---------------------------------------------------------
@@ -468,20 +408,22 @@ def test_an_unreadable_screen_is_never_counted_as_a_broken_overlap(
 def test_an_interrupted_run_still_reports_what_it_missed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """⚠️ **`screens_without_overlap` 与 `previous_coordinates` 是提到 `try` 之前的，
-    这条守的就是那件事。**
+    """⚠️ **`missed` 与 `previous_last_rank` 是提到 `try` 之前的，这条守的就是那件事。**
 
     实机上打断这个循环的是 Ctrl+C 和调度器抢占，两者都进不了任何 `except`，
     只走 `finally`。而收尾那条 `采集重叠断裂` 就在 `finally` 里——两个变量要是
     定义在 `try` 里面（或者循环里面），`finally` 读它们会撞 `NameError`：
-    一次干净的中断被变成一条堆栈，而**这一趟已经断掉的那一屏连带被吞掉**。
+    一次干净的中断被变成一条堆栈，而**这一趟已经漏掉的四名连带被吞掉**。
 
     所以这里既断言异常**原样穿出去**（撞了 `NameError` 的话 `pytest.raises`
     收到的就不是 `KeyboardInterrupt` 了），也断言那条记录照样落下来。
     """
     run = _harness(
         monkeypatch,
-        [_screen(0), _screen(40)],  # 第二屏跳过了第 13–39 个 bot
+        [
+            _screen([850, 851], system=137),
+            _screen([856, 857], system=138),  # 漏 4（852–855）
+        ],
         interrupt_after=2,
         scrolls=2,
     )
@@ -489,5 +431,5 @@ def test_an_interrupted_run_still_reports_what_it_missed(
     with pytest.raises(KeyboardInterrupt):
         run.scan()
 
-    assert ("采集重叠断裂", {"screens_without_overlap": 1}) in run.logs
+    assert ("采集重叠断裂", {"rows_missed": 4}) in run.logs
     assert run.nav.closed == 1, "面板照样要关，不然下一趟开在一个开着的面板上"
