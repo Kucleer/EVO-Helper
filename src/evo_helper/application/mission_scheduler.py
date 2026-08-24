@@ -288,6 +288,13 @@ def _line_signature(message: str, payload: Mapping[str, Any]) -> tuple[object, .
     已经变了的日志压成沉默，而库里留着的上一条还在假装现状没变——那是本仓库最
     忌讳的那种缺陷（「日志说假话比不说更糟」）。由结构保证「凡是会被写出去的东西
     都在签名里」，比由纪律保证可靠得多。
+
+    ⚠️ **有一类日志用不了它：正文里带着「这个状态已经持续了多久」的那些。**
+    那个数每一跳都在涨，取全文等于让每一跳都判成「状态变了」，限流当场失效
+    ——症状是刷屏，不是沉默。这一类改喂显式签名（只认状态，不认时长），
+    眼下有两处：`_log_the_scan_cooldown`（还差几分钟）与 `_log_the_yield`
+    （让位多久）。**别顺手把它推广到别的日志上**：显式签名要靠人去维护
+    「哪几个数算数」，漏一个就是那种最危险的沉默。
     """
     return (message, tuple(sorted((key, repr(value)) for key, value in payload.items())))
 
@@ -2174,9 +2181,12 @@ class MissionScheduler:
 
         ⚠️ **限流不许把信息丢掉。** 被压掉的次数与它们横跨的时长都写进下一条
         （`suppressed_since_last_log` / `suppressed_span_seconds`，消息里也说一遍）。
-        被压掉的那些**按构造与上一条落库的一字不差**（签名相等才会被压），所以那句
+        被压掉的那些**按构造与上一条落库的状态相同**（签名相等才会被压），所以那句
         补充说的是「**上一条**在那之后又原样重复了 N 次」——主语是上一条，不是眼前
-        这一条。两种情形的措辞因此**分开写**（`_merged_note`）：判定变了的那一条要是
+        这一条。（喂 `_line_signature` 的那些是一字不差；喂显式签名的那两条
+        ——`_log_the_scan_cooldown`、`_log_the_yield`——正文里那个「已经多久了」
+        的数在被压掉的那一段里仍在走，那是它们**故意**不算进状态的东西。）
+        两种情形的措辞因此**分开写**（`_merged_note`）：判定变了的那一条要是
         也说成「这一判定持续了 N 次」，那就是把被压掉的旧状态算到新状态头上，
         而仓库的规矩是「日志说假话比不说更糟」——压缩可以，撒谎不行。
 
@@ -3192,6 +3202,24 @@ class MissionScheduler:
 
         ⚠️ **停止让位那一条必须是 WARNING**，而且要把「门限可能配得太高」写进正文
         ——那是这一档唯一的可行动信息。让位本身是正常运转，INFO 就够。
+
+        ⚠️⚠️ **签名只认「此刻让不让位」这个态，不认「已经让了多久」。**
+        `stalled` 每一跳都在涨（正文里那句「让位 6.3 分钟」和 payload 里的
+        `stalled_seconds` 是同一个数），拿 `_line_signature(message, payload)`
+        去算的话每一跳的签名都不同 → 闸门每一跳都判成「状态变了」→ 立刻写，
+        限流整个失效。生产实测 2026-08-24 20:47–22:44：这条 WARNING 写了 2,084 行，
+        `signature_changed` **全为 True**、`suppressed_since_last_log` 全是 0 或 1
+        （那个 1 只是同一秒里转两圈、`round()` 之后恰好撞上）；而按「态 + 存货」
+        去重之后只有 68 种内容。
+
+        所以这里喂**显式签名** `(让不让位, 窗口内几个, 门限几个)`——先例是
+        `_log_the_scan_cooldown`（那条的「还差几分钟」是同一个毛病）。
+        代价是被压掉的那一段里 `stalled` 在涨而库里不记，那没有信息量：
+        「超过 `SCAN_YIELD_PATIENCE` 才会写这一条」是常量，落库那一条上的
+        `stalled_seconds` 又是它自己那一刻的实数。
+
+        ⚠️ **`stalled_seconds` 照旧留在 payload 里**——排障要它。要拦的是签名，
+        不是内容：日志少说一个数和日志说假话是两回事。
         """
         if stalled is None:
             message = (
@@ -3216,7 +3244,9 @@ class MissionScheduler:
         self._log_a_repeated_line(
             key=(task_id, "military_yield_to_scan"),
             mission_kind=MissionKind.BOT.value,
-            signature=_line_signature(message, payload),
+            # ⚠️ 不是 `_line_signature(message, payload)`：`stalled` 每跳都在涨。
+            # 理由与实测数字在上面的 docstring 里。
+            signature=(stalled is not None, window.in_window, window.floor),
             level=level,
             message=message,
             payload=payload,
