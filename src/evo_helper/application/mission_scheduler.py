@@ -57,6 +57,7 @@ from evo_helper.application.mission_supervisor import (
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, phase_of
 from evo_helper.domain.distance import nearest_first
 from evo_helper.domain.military_attack import (
+    MILITARY_SPARE_FACTOR,
     AssignedTarget,
     AttackOrigin,
     MilitaryTier,
@@ -93,6 +94,7 @@ from evo_helper.domain.report_wait import (
 )
 from evo_helper.domain.rules import cycle_start_utc
 from evo_helper.domain.scheduler import (
+    SCAN_YIELD_PATIENCE,
     Action,
     Decision,
     DisabledRecovery,
@@ -807,6 +809,11 @@ class MissionScheduler:
         #: （不是原地改），因为页面线程也会调 `_facts`：整份换掉的话，读的人拿到的
         #: 要么是上一份、要么是新的一份，不会撞见改到一半的中间态。
         self._military_pool_readings: dict[int, MilitaryPoolReading] = {}
+        #: **按任务**记：上一次判「让位还有用」时这个任务窗口内的数量。
+        #: 账在 `_scan_can_still_help` 与 `domain.scheduler.yields_to_a_scan` 上。
+        self._yield_watermark: dict[int, int] = {}
+        #: **按任务**记：数量停滞是从哪一刻开始的。缺键 = 上一趟还在涨。
+        self._yield_stalled_since: dict[int, datetime] = {}
         #: 每个军力 bot 任务「池子全超期」这一段是从什么时候开始的，以及连着看到了
         #: 几个 tick。只记在内存里，理由同上面那几份：判据每 tick 现算，这里记的
         #: 只是「这一段持续多久了」，好让 WARNING 不至于每秒刷一条。
@@ -3025,6 +3032,11 @@ class MissionScheduler:
                     target_kind, origin=task.origin
                 ),
                 next_line_free_at_utc=next_free[task.origin],
+                # 这个任务自己的窗口存货，以及「让位补货还有没有用」。
+                # ⚠️ 两格都按任务算——口径是「轮到**该星系**时它自己够不够」，
+                # 整段账在 `domain.scheduler.yields_to_a_scan` 上。
+                military_window=(window := _window_of(readings.get(task.task_id))),
+                scan_can_still_help=self._scan_can_still_help(task.task_id, window, now),
             )
 
         # 整份换上去而不是原地改：页面线程也会调 `_facts`（`snapshot`），
@@ -3088,6 +3100,102 @@ class MissionScheduler:
             origin=task.origin,
         )
         return self._planner.plan(pending, now_utc=now).action is WaitAction.COLLECT
+
+    def _scan_can_still_help(
+        self, task_id: int, window: MilitaryWindowPool | None, now: datetime
+    ) -> bool:
+        """这个任务让位给军力榜还有没有用——**看它窗口内的数量还在不在涨**。
+
+        用户口径（2026-08-24）：「轮到该星系 bot 攻击时，如果不足就去采集
+        （现在的采集效率很高）采集够了就开始攻击，而不是轮空星系」。
+
+        ⚠️ **判据是「还在涨」，不是「扫过没有」。** 池子是**逐屏写库**的
+        （日志「逐屏写入 N 条」），所以扫描一开跑这个数就往上爬 —— 拿涨势当判据
+        比去查「上一趟扫描几点跑的」简单得多，也不必新加一份运行记录的读法。
+
+        ⚠️ **停滞要给足时间。** 军力榜落下第一行之前要先开榜、盲滚、检测 bot 区，
+        实测约 50 秒；这段时间数量一动不动，而它并不是「补不进来」。
+        所以停滞计时到 `SCAN_YIELD_PATIENCE`（3 分钟）才判死。
+
+        ⚠️ **这是唯一的防死锁闸**：门限配得比榜上能采到的还高时（今天差点这样：
+        门限 200、本周期总共才采到 227 个），扫描每趟都跑、池子每趟都不涨，
+        没有这道闸的话 BOT 会永远让位、一发不打，而页面显示的是「没活干」
+        ——一句听起来正常、实际相反的话。
+
+        ⚠️ **按任务记账。** 每个军力任务有自己的出发点，能打到的目标不一样，
+        所以「够不够」「补得进来吗」都是各自的事（同 `TaskFacts.military_window`）。
+        """
+        if window is None or not window.below_floor:
+            self._yield_watermark.pop(task_id, None)
+            self._yield_stalled_since.pop(task_id, None)
+            return False
+
+        seen = self._yield_watermark.get(task_id)
+        if seen is None or window.in_window > seen:
+            if seen is None:
+                self._log_the_yield(task_id, window, now, stalled=None)
+            self._yield_watermark[task_id] = window.in_window
+            self._yield_stalled_since.pop(task_id, None)
+            return True
+
+        since = self._yield_stalled_since.get(task_id)
+        if since is None:
+            self._yield_stalled_since[task_id] = now
+            return True
+
+        stalled = now - since
+        if stalled < SCAN_YIELD_PATIENCE:
+            return True
+        self._log_the_yield(task_id, window, now, stalled=stalled)
+        return False
+
+    def _log_the_yield(
+        self,
+        task_id: int,
+        window: MilitaryWindowPool,
+        now: datetime,
+        *,
+        stalled: timedelta | None,
+    ) -> None:
+        """让位 / 停止让位都走**同一个**闸门，因为它们是同一个状态机的两个态。
+
+        ⚠️ 走 `_log_a_repeated_line` 而不是自己判「只在跃迁时说」：那个闸门已经是
+        「状态变了立刻写、没变就一个窗口最多一条」，而 `_facts` 每 tick 都跑
+        （页面线程也会调），自己写一份必然要么刷屏、要么漏掉跃迁那一刻。
+
+        ⚠️ **停止让位那一条必须是 WARNING**，而且要把「门限可能配得太高」写进正文
+        ——那是这一档唯一的可行动信息。让位本身是正常运转，INFO 就够。
+        """
+        if stalled is None:
+            message = (
+                f"窗口内只剩 {window.in_window} 个候选、门限 {window.floor} 个："
+                "这一跳让给军力榜去补货，补够了再打"
+            )
+            level = "INFO"
+        else:
+            message = (
+                f"让位 {stalled.total_seconds() / 60:.1f} 分钟，窗口内仍停在 "
+                f"{window.in_window} 个、够不着门限 {window.floor} 个："
+                "不再让位，放弃窗口照旧打——**门限可能配得比榜上能采到的还高**"
+            )
+            level = "WARNING"
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "mission_kind": MissionKind.BOT.value,
+            "in_window": window.in_window,
+            "floor": window.floor,
+            "stalled_seconds": None if stalled is None else round(stalled.total_seconds()),
+        }
+        self._log_a_repeated_line(
+            key=(task_id, "military_yield_to_scan"),
+            mission_kind=MissionKind.BOT.value,
+            signature=_line_signature(message, payload),
+            level=level,
+            message=message,
+            payload=payload,
+            now=now,
+            repeat_noun="告警" if stalled is not None else "提示",
+        )
 
     def _bot_remaining(self, task: TaskSnapshot) -> int:
         """本轮范围内还有几个 bot 没走完。
@@ -3223,15 +3331,30 @@ class MissionScheduler:
             raise MissionIdle("本轮没有可派遣的军力攻击目标")
         origin = self._origin_taking_its_turn(assignments)
         group = [item for item in assignments if item.origin == origin]
-        # `len(group)` 已经被这颗星球的**两道闸预算**卡过一次了
+        # ⚠️ **`budget` 只数正选，备胎一个都不算。**
+        #
+        # 备胎是 2026-08-24 加的（`MILITARY_SPARE_FACTOR`）：分配阶段按
+        # 「航线数 × 2」放行，多出来的那些标了 `reserve=True`，用来顶替撞上保护期
+        # 的目标。它们**绝不能让这一轮多派几发**——而 `max_dispatches` 有默认值
+        # `None`，那条路上 budget 会退回 `len(group)`，若拿整组去数就等于翻倍。
+        #
+        # 正选的个数已经被这颗星球的两道闸预算卡过一次了
         # （`_military_assignments` 把预算喂给了 `assign_by_capacity_and_value`），
         # 所以这里不必、也不该再去查一次库：再查一次就是第二把尺子。
-        budget = min(max_dispatches if max_dispatches is not None else len(group), len(group))
+        primaries = [item for item in group if not item.reserve]
+        budget = min(
+            max_dispatches if max_dispatches is not None else len(primaries), len(primaries)
+        )
         if budget < 1:
             # 结构上到不了（`facts.free_lines` 是各出发点里最能派的那一个，
             # 而这颗星球恰恰是分到了目标的那些之一）。留着它是为了让「万一走到了」
             # 也走 `MissionIdle` 那条路——不停用、不记失败、下一 tick 重算。
             raise MissionIdle(f"出发点 {origin} 此刻没有可用航线")
+        # ⚠️ **坐标交整组（含备胎），派出数交 `budget`（只含正选）。**
+        # runner 按这个次序往下试，撞上保护期弹窗就跳过那一个、拿下一个顶上
+        # （`pirate_loop._handle_dialog`），直到派满 `max_dispatches` 发。
+        # 交整组是「这一轮的攻击必须发出去」唯一的兑现方式：只交正选的话，
+        # 一个被保护的目标就白白吃掉一条航线。
         return bot_command(
             [item.coordinate for item in group],
             origin=origin,
@@ -3323,6 +3446,11 @@ class MissionScheduler:
             dispatchable,
             fallback_preset=BOT_ATTACK_PRESET,
             tiers=self.validate_military_tiers(global_tiers),
+            # 每条航线多配一个备胎，用来顶替撞上保护期的目标（用户口径 2026-08-24）。
+            # ⚠️ 备胎与正选出自**同一个 `pool`**，而 `pool` 是
+            # `reading.eligible`——已经过完窗口那一步。所以「必须是新鲜的数据」
+            # 这半句是结构性成立的，不靠调用方自觉。
+            spare_factor=MILITARY_SPARE_FACTOR,
         )
         # AI 选靶（影子）观测：在 `assign_by_capacity_and_value` 算完之后、组命令行
         # 之前插一次。**只读，返回值一个字不动**——这一行是纯观测，AI 挂掉、
@@ -4128,6 +4256,18 @@ class MissionScheduler:
             origin=origin,
             max_dispatches=max_dispatches,
         )
+
+
+def _window_of(reading: MilitaryPoolReading | None) -> MilitaryWindowPool | None:
+    """把一份任务级的池子账目折成调度判据要的那两个数。
+
+    ⚠️ 和 `_most_starved_window` 共用同一个 `MilitaryWindowPool`，但问的问题不同：
+    那个跨任务取最饿的（扫描安全阀要的），这个只看一个任务（让位判据要的）。
+    共用类型是有意的——两个数的口径必须完全一致，各写一份迟早分家。
+    """
+    if reading is None:
+        return None
+    return MilitaryWindowPool(in_window=len(reading.in_window), floor=reading.window_floor)
 
 
 def _most_starved_window(readings: Iterable[MilitaryPoolReading]) -> MilitaryWindowPool | None:

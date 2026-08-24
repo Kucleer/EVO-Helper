@@ -837,3 +837,63 @@ def test_disable_and_resume_are_throttled_separately(  # type: ignore[no-untyped
     assert "已被自动停用" in recorded.messages[0]
     assert "自动恢复" in recorded.messages[1]
     assert task(repository, MissionKind.BOT).disabled_reason is None
+
+
+def test_spares_ride_along_without_raising_the_dispatch_cap(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock, session_factory, run_id
+) -> None:
+    """⚠️⚠️ **备胎跟着上命令行，但绝不许让这一轮多派几发。**
+
+    用户口径（2026-08-24）：「如果目标是保护状态无法攻击，也需要继续根据军力列表
+    进行攻击。原则上这次的攻击必须发出去」——所以命令行上要有备胎；
+    而「先按 2 倍来执行」说的是**候选**翻倍，不是**派出数**翻倍。
+
+    这条用例是那道结构闸唯一的看守。`_military_command` 里 `budget` 只数正选
+    （`reserve=False`）；写成 `len(group)` 的话备胎会被算进去，实际派出数直接翻倍
+    ——而症状是「这一轮多派了几发」，在页面上和「航线本来就多」分不开。
+
+    ⚠️ 现场刻意配成「航线 1 条、池子 4 个」：命令行上应该有 1 个正选 + 1 个备胎，
+    而 `--max-dispatches` 必须是 **1**。
+    """
+    bot = with_lines(repository, session_factory, (FIRST, 1), account_limit=9)
+    for offset in range(4):
+        target_near(session_factory, FIRST, offset=offset, score=9_000.0 - offset * 100)
+    scheduler.start()
+
+    command = scheduler._military_command(  # noqa: SLF001 - 钉的就是这一层组出来的命令行
+        row_of(repository, bot), max_dispatches=free_lines(scheduler, bot)
+    )
+
+    cap = command[command.index("--max-dispatches") + 1]
+    assert cap == "1", f"一条航线只许派一发，命令行上却是 {cap}"
+    targets = command[command.index("--targets") + 1 : command.index("--origin")]
+    assert len(targets) == 2, f"应该是 1 个正选 + 1 个备胎，实际 {targets}"
+
+
+def test_the_cap_falls_back_to_the_primaries_not_the_whole_group(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, clock, session_factory, run_id
+) -> None:
+    """⚠️ **不传 `max_dispatches` 时，上限退回「正选个数」，不是整组长度。**
+
+    生产那唯一的调用方总是传 `max_dispatches=facts.free_lines`，所以
+    `min(free_lines, len(group))` 怎么写都卡在航线数上——上一条用例因此**抓不住**
+    「budget 把备胎也数进去」这个错（变异之后它照样绿）。
+
+    真正会出事的是 `max_dispatches` 的默认值 `None` 那条路：那时 budget 退回
+    「组有多长」，而 2026-08-24 起组里含备胎（`MILITARY_SPARE_FACTOR` = 2）
+    ——于是一条航线会派出两发。眼下只有测试走这条路，但默认值就在签名上，
+    哪天有人加个不传的调用方，多派是静默的。
+
+    ⚠️ **别因为「生产走不到」就删掉那个过滤**（同 `ranking_nav.ranking_label_x`
+    里那道打不着的 ROI 闸）：它挡的是签名上那个默认值，而默认值是会被用的。
+    """
+    bot = with_lines(repository, session_factory, (FIRST, 1), account_limit=9)
+    for offset in range(4):
+        target_near(session_factory, FIRST, offset=offset, score=9_000.0 - offset * 100)
+    scheduler.start()
+
+    # 刻意**不传** max_dispatches，走签名上那个默认值。
+    command = scheduler._military_command(row_of(repository, bot))  # noqa: SLF001
+
+    cap = command[command.index("--max-dispatches") + 1]
+    assert cap == "1", f"一条航线只许派一发，退回默认值那条路上却是 {cap}"
