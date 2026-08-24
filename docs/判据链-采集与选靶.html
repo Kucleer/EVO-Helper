@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采集与选靶的判据</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #f4f6f8;
+    --panel: #ffffff;
+    --raised: #eef1f4;
+    --line: #d2dae2;
+    --line-soft: #e3e9ee;
+    --ink: #17212b;
+    --ink-muted: #5a6a78;
+    --ink-faint: #8794a1;
+    --scan: #0d7f8c;
+    --atk: #a8641a;
+    --warn: #b8392c;
+    --knob: #6b4fa8;
+    --knob-wash: #efeaf8;
+    --sans: "IBM Plex Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "PingFang SC", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0d1117;
+      --panel: #151b24;
+      --raised: #1b232e;
+      --line: #2b3542;
+      --line-soft: #212a35;
+      --ink: #e6edf3;
+      --ink-muted: #97a4b1;
+      --ink-faint: #66737f;
+      --scan: #45c3cf;
+      --atk: #e0a844;
+      --warn: #ef6a5c;
+      --knob: #ab8ce0;
+      --knob-wash: #221c33;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0d1117;
+    --panel: #151b24;
+    --raised: #1b232e;
+    --line: #2b3542;
+    --line-soft: #212a35;
+    --ink: #e6edf3;
+    --ink-muted: #97a4b1;
+    --ink-faint: #66737f;
+    --scan: #45c3cf;
+    --atk: #e0a844;
+    --warn: #ef6a5c;
+    --knob: #ab8ce0;
+    --knob-wash: #221c33;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 24px 88px; }
+
+  header { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 40px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(28px, 4vw, 40px); font-weight: 600; letter-spacing: -0.01em;
+    margin: 0 0 12px; text-wrap: balance;
+  }
+  .lede { margin: 0; max-width: 62ch; color: var(--ink-muted); font-size: 16.5px; }
+
+  h2 {
+    font-size: 20px; font-weight: 600; margin: 52px 0 6px;
+    padding-top: 28px; border-top: 1px solid var(--line-soft); text-wrap: balance;
+  }
+  h2 .n {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    color: var(--ink-faint); margin-right: 10px;
+  }
+  h3 { font-size: 15.5px; font-weight: 600; margin: 30px 0 6px; }
+  p { max-width: 68ch; }
+  code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--raised); padding: 1px 5px; border-radius: 3px;
+  }
+
+  figure { margin: 32px 0 8px; }
+  figure svg {
+    display: block; width: 100%; height: auto;
+    /* ⚠️ 有下限，不许一路缩下去。图里的字是 11–13px（按 viewBox 1000 宽画的），
+       等比缩到 500px 宽时它们就成了 5px——图还在，但读不了。给个下限之后，
+       窄屏改成在 figure 里横向滚动，字始终是可读的那个尺寸。 */
+    min-width: 940px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  }
+  figcaption {
+    margin-top: 12px; font-size: 13.5px; color: var(--ink-muted); max-width: 72ch;
+  }
+  .scroller { overflow-x: auto; }
+
+  table { width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-faint); font-weight: 500;
+    border-bottom: 1px solid var(--line);
+  }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td .sub { display: block; font-size: 12px; color: var(--ink-muted); }
+
+  .knob-tag {
+    display: inline-block; font-family: var(--mono); font-size: 12px;
+    color: var(--knob); background: var(--knob-wash);
+    border: 1px solid var(--knob); border-radius: 3px;
+    padding: 0 5px; white-space: nowrap;
+  }
+
+  .note {
+    border-left: 3px solid var(--warn); background: var(--panel);
+    padding: 14px 18px; margin: 24px 0; border-radius: 0 6px 6px 0;
+  }
+  .note p { margin: 0; max-width: 66ch; }
+  .note p + p { margin-top: 10px; }
+  .note strong { color: var(--warn); }
+
+  .measured {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 20px 8px; margin: 22px 0;
+  }
+
+  ul { max-width: 68ch; padding-left: 20px; }
+  li { margin: 6px 0; }
+  li::marker { color: var(--ink-faint); }
+</style>
+<style>
+  /* 本地独立页专用。Artifact 宿主会注入一份最小 reset，本地得自己带。
+     `data-theme="dark"` 钉在 <html> 上是有意的——这一页是控制台的配套文档，
+     跟着控制台走深色。想看浅色改成 light，想跟随系统就把那个属性整个删掉。 */
+  html { -webkit-text-size-adjust: 100%; }
+  img, svg { max-width: 100%; }
+  a { color: var(--scan); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <p class="eyebrow">EVO-Helper · 军力链路</p>
+  <h1>采集与选靶的判据</h1>
+  <p class="lede">
+    军力榜采集和攻击派遣不是两条独立的链——它们互相喂料，而且共用同一个旋钮。
+    这一页把每一处判断画出来，以及每个数落在哪一步。
+  </p>
+</header>
+
+<h2><span class="n">01</span>两条链怎么互相喂料</h2>
+<p>
+  调度器每一跳只选一个任务，判据是 <code>(是不是填空隙, priority)</code> 升序，同分按 id。
+  军力榜属于「填空隙」，<strong>结构性地排在所有攻击任务之后</strong>——所以它只在攻击说「没活干」时才拿到时间片。
+  「先扫再打」不是另写的一条规则，是这个次序的自然结果。
+</p>
+
+<figure class="scroller">
+  <svg viewBox="0 0 1000 1130" role="img" aria-label="流程图：调度器按填空隙与优先级选出攻击或采集任务。攻击链四步筛选：候选池、本周期读数、有效期窗口、得分排序；窗口内不足门限时放弃窗口并告警。采集链：扫描冷却、盲滚过真人段、检测 bot 区、逐屏采集、采够门限个收工。门限同时控制放弃窗口的阈值、扫描安全阀、采集批次上限三处。">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
+        <polygon points="0,0 10,4 0,8" fill="currentColor"></polygon>
+      </marker>
+      <marker id="arw" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
+        <polygon points="0,0 10,4 0,8" fill="#b8392c"></polygon>
+      </marker>
+      <marker id="ars" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
+        <polygon points="0,0 10,4 0,8" fill="#0d7f8c"></polygon>
+      </marker>
+      <marker id="ara" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
+        <polygon points="0,0 10,4 0,8" fill="#a8641a"></polygon>
+      </marker>
+    </defs>
+
+    <g font-family="IBM Plex Sans, PingFang SC, sans-serif" fill="currentColor">
+
+      <rect x="300" y="26" width="400" height="54" rx="7" fill="var(--raised)" stroke="currentColor" stroke-width="1.2"></rect>
+      <text x="500" y="49" text-anchor="middle" font-size="14" font-weight="600">调度器一跳</text>
+      <text x="500" y="68" text-anchor="middle" font-size="11.5" fill="var(--ink-muted)" font-family="IBM Plex Mono, monospace">按 (填空隙, priority) 升序，同分按 id</text>
+
+      <line x1="500" y1="80" x2="500" y2="102" stroke="currentColor" stroke-width="1.2"></line>
+      <line x1="250" y1="102" x2="750" y2="102" stroke="currentColor" stroke-width="1.2"></line>
+      <line x1="250" y1="102" x2="250" y2="130" stroke="#a8641a" stroke-width="1.6" marker-end="url(#ara)"></line>
+      <line x1="750" y1="102" x2="750" y2="130" stroke="#0d7f8c" stroke-width="1.6" marker-end="url(#ars)"></line>
+      <text x="242" y="97" text-anchor="end" font-size="11.5" fill="var(--atk)" font-weight="600">攻击有活干</text>
+      <text x="758" y="97" font-size="11.5" fill="var(--scan)" font-weight="600">攻击没活干</text>
+
+      <text x="60" y="124" font-size="12" font-weight="600" fill="var(--atk)" font-family="IBM Plex Mono, monospace" letter-spacing="0.08em">攻击 · BOT</text>
+
+      <rect x="60" y="132" width="380" height="62" rx="6" fill="var(--panel)" stroke="var(--atk)" stroke-width="1.4"></rect>
+      <text x="78" y="156" font-size="13.5" font-weight="600">① 候选池</text>
+      <text x="78" y="175" font-size="11.5" fill="var(--ink-muted)">排除 24h 内已打 · 撞过保护期 · 本轮走完</text>
+      <line x1="250" y1="194" x2="250" y2="226" stroke="currentColor" stroke-width="1.2" marker-end="url(#ar)"></line>
+
+      <rect x="60" y="228" width="380" height="72" rx="6" fill="var(--panel)" stroke="var(--atk)" stroke-width="1.4"></rect>
+      <text x="78" y="252" font-size="13.5" font-weight="600">② 只留有「本周期」读数的</text>
+      <text x="78" y="271" font-size="11.5" fill="var(--ink-muted)">周一 UTC+0 bot 军力刷新 → 上周读数全库作废</text>
+      <text x="78" y="290" font-size="11.5" fill="var(--ink-faint)">这一档筛空 → 攻击说「没活干」</text>
+      <line x1="250" y1="300" x2="250" y2="332" stroke="currentColor" stroke-width="1.2" marker-end="url(#ar)"></line>
+
+      <rect x="60" y="334" width="380" height="62" rx="6" fill="var(--panel)" stroke="var(--atk)" stroke-width="1.4"></rect>
+      <text x="78" y="358" font-size="13.5" font-weight="600">③ 只留读数在有效期窗口内的</text>
+      <text x="78" y="377" font-size="11.5" fill="var(--ink-muted)">窗口宽度 = score_max_age_hours</text>
+      <line x1="250" y1="396" x2="250" y2="424" stroke="currentColor" stroke-width="1.2" marker-end="url(#ar)"></line>
+
+      <rect x="60" y="426" width="380" height="58" rx="6" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.8"></rect>
+      <text x="250" y="450" text-anchor="middle" font-size="13.5" font-weight="600" fill="var(--knob)">窗口内数量 ≥ 门限？</text>
+      <text x="250" y="469" text-anchor="middle" font-size="11.5" fill="var(--knob)" font-family="IBM Plex Mono, monospace">window_floor</text>
+
+      <line x1="150" y1="484" x2="150" y2="618" stroke="currentColor" stroke-width="1.2" marker-end="url(#ar)"></line>
+      <text x="158" y="508" font-size="11.5" font-weight="600">是 · 用窗口内这批</text>
+
+      <line x1="350" y1="484" x2="350" y2="518" stroke="#b8392c" stroke-width="1.4" marker-end="url(#arw)"></line>
+      <text x="358" y="502" font-size="11.5" font-weight="600" fill="var(--warn)">否</text>
+      <rect x="240" y="520" width="200" height="64" rx="6" fill="var(--panel)" stroke="var(--warn)" stroke-width="1.4" stroke-dasharray="5 3"></rect>
+      <text x="340" y="543" text-anchor="middle" font-size="12.5" font-weight="600" fill="var(--warn)">放弃窗口</text>
+      <text x="340" y="561" text-anchor="middle" font-size="11" fill="var(--ink-muted)">改用全部有读数的</text>
+      <text x="340" y="577" text-anchor="middle" font-size="11" fill="var(--warn)">并告警 WIDENED</text>
+      <path d="M 340 584 L 340 602 L 150 602" fill="none" stroke="#b8392c" stroke-width="1.4"></path>
+
+      <rect x="60" y="620" width="380" height="72" rx="6" fill="var(--panel)" stroke="var(--atk)" stroke-width="1.4"></rect>
+      <text x="78" y="644" font-size="13.5" font-weight="600">④ 过军力上限，按得分降序</text>
+      <text x="78" y="664" font-size="12" fill="var(--ink-muted)" font-family="IBM Plex Mono, monospace">得分 = 军力 ÷ 往返小时</text>
+      <text x="78" y="683" font-size="11.5" fill="var(--ink-faint)">近而弱的与远而强的在同一把尺子上比</text>
+      <line x1="250" y1="692" x2="250" y2="720" stroke="currentColor" stroke-width="1.2" marker-end="url(#ar)"></line>
+
+      <rect x="60" y="722" width="380" height="62" rx="6" fill="var(--raised)" stroke="var(--atk)" stroke-width="2"></rect>
+      <text x="78" y="746" font-size="13.5" font-weight="600">按航线预算配对 → 派遣</text>
+      <text x="78" y="765" font-size="11.5" fill="var(--ink-muted)">航线用尽就不再配对——这才是这一轮打几发的闸</text>
+
+      <text x="560" y="124" font-size="12" font-weight="600" fill="var(--scan)" font-family="IBM Plex Mono, monospace" letter-spacing="0.08em">采集 · RANKING</text>
+
+      <rect x="560" y="132" width="380" height="82" rx="6" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.8"></rect>
+      <text x="578" y="156" font-size="13.5" font-weight="600" fill="var(--knob)">扫描间隔冷却是哪一档</text>
+      <text x="578" y="175" font-size="11.5" fill="var(--ink-muted)" font-family="IBM Plex Mono, monospace">OFF · ELAPSED · BLOCKING</text>
+      <text x="578" y="196" font-size="11.5" fill="var(--knob)" font-family="IBM Plex Mono, monospace">OVERRIDDEN</text>
+      <text x="672" y="196" font-size="11.5" fill="var(--knob)">← 窗口低于门限，安全阀让路</text>
+      <line x1="750" y1="214" x2="750" y2="244" stroke="#0d7f8c" stroke-width="1.2" marker-end="url(#ars)"></line>
+
+      <rect x="560" y="246" width="380" height="72" rx="6" fill="var(--panel)" stroke="var(--scan)" stroke-width="1.4"></rect>
+      <text x="578" y="270" font-size="13.5" font-weight="600">开军力榜 → 盲滚过真人段</text>
+      <text x="578" y="290" font-size="11.5" fill="var(--ink-muted)" font-family="IBM Plex Mono, monospace">行数 = min(最近 5 次实测) − 余量</text>
+      <text x="578" y="309" font-size="11.5" fill="var(--ink-faint)">样本不够就用写死的默认值</text>
+      <line x1="750" y1="318" x2="750" y2="348" stroke="#0d7f8c" stroke-width="1.2" marker-end="url(#ars)"></line>
+
+      <rect x="560" y="350" width="380" height="62" rx="6" fill="var(--panel)" stroke="var(--scan)" stroke-width="1.4"></rect>
+      <text x="578" y="374" font-size="13.5" font-weight="600">检测 bot 区</text>
+      <text x="578" y="393" font-size="11.5" fill="var(--ink-muted)">逐屏读名字列，直到真人段走完</text>
+      <line x1="750" y1="412" x2="750" y2="444" stroke="#0d7f8c" stroke-width="1.2" marker-end="url(#ars)"></line>
+
+      <rect x="560" y="446" width="380" height="98" rx="6" fill="var(--panel)" stroke="var(--scan)" stroke-width="1.4"></rect>
+      <text x="578" y="470" font-size="13.5" font-weight="600">逐屏采集</text>
+      <text x="578" y="489" font-size="11.5" fill="var(--ink-muted)">量出行位置 → 逐格读名字 / 名次 / 军力</text>
+      <text x="578" y="508" font-size="11.5" fill="var(--ink-muted)">判据：渲染得出来 · 不破坏降序 · 跨屏锚点</text>
+      <text x="578" y="528" font-size="11.5" fill="var(--ink-faint)">判不过的丢分数、留坐标，由上下邻居插值</text>
+      <line x1="750" y1="544" x2="750" y2="574" stroke="#0d7f8c" stroke-width="1.2" marker-end="url(#ars)"></line>
+
+      <rect x="560" y="576" width="380" height="62" rx="6" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.8"></rect>
+      <text x="578" y="600" font-size="13.5" font-weight="600" fill="var(--knob)">采够「门限」个 bot 就收工</text>
+      <text x="578" y="620" font-size="11.5" fill="var(--knob)" font-family="IBM Plex Mono, monospace">--bot-limit = window_floor</text>
+
+      <path d="M 560 607 L 498 607 L 498 263 L 440 263" fill="none" stroke="#0d7f8c" stroke-width="1.4" marker-end="url(#ars)"></path>
+      <rect x="452" y="372" width="94" height="36" rx="4" fill="var(--panel)" stroke="var(--scan)" stroke-width="1"></rect>
+      <text x="499" y="388" text-anchor="middle" font-size="10.5" fill="var(--scan)" font-weight="600">读数入库</text>
+      <text x="499" y="401" text-anchor="middle" font-size="10.5" fill="var(--scan)">喂给 ②</text>
+
+      <path d="M 440 289 L 522 289 L 522 172 L 560 172" fill="none" stroke="#a8641a" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#ara)"></path>
+      <text x="532" y="148" font-size="10.5" fill="var(--atk)" font-weight="600">没活干</text>
+      <text x="532" y="161" font-size="10.5" fill="var(--atk)">让出时间片</text>
+
+      <path d="M 440 455 L 510 455 L 510 205 L 560 205" fill="none" stroke="#b8392c" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arw)"></path>
+
+      <rect x="60" y="830" width="880" height="88" rx="7" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.6"></rect>
+      <text x="82" y="856" font-size="13.5" font-weight="600" fill="var(--knob)">同一个「门限」出现在三处，而三处对它的期望方向不同</text>
+      <text x="82" y="879" font-size="11.5" fill="var(--ink-muted)">③ 放弃窗口的阈值 —— 越小越好，别动不动退回旧读数</text>
+      <text x="82" y="898" font-size="11.5" fill="var(--ink-muted)">采集 · 扫描安全阀 —— 低于它就允许提前开扫</text>
+      <text x="540" y="879" font-size="11.5" fill="var(--ink-muted)">采集 · 一趟采多少个 —— 越大越好，一趟多采点</text>
+      <text x="540" y="898" font-size="11.5" fill="var(--knob)" font-weight="600">⇒ 任何单一取值都是妥协</text>
+
+      <text x="60" y="958" font-size="12" font-weight="600" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace" letter-spacing="0.08em">次序本身就是判据</text>
+      <line x1="60" y1="968" x2="940" y2="968" stroke="var(--line)" stroke-width="1"></line>
+
+      <text x="60" y="994" font-size="12" font-weight="600">① 必须在最前</text>
+      <text x="60" y="1012" font-size="11.5" fill="var(--ink-muted)">先挑再排除的话，首批都打过时候选池会缩成</text>
+      <text x="60" y="1028" font-size="11.5" fill="var(--ink-muted)">空集，从未打过的目标永远轮不到。</text>
+
+      <text x="360" y="994" font-size="12" font-weight="600">周期边界必须在 ②</text>
+      <text x="360" y="1012" font-size="11.5" fill="var(--ink-muted)">放在 ③ 的话，放弃窗口会把上周期的失效读数</text>
+      <text x="360" y="1028" font-size="11.5" fill="var(--ink-muted)">整批捞回来，而页面只显示一句正常告警。</text>
+
+      <text x="660" y="994" font-size="12" font-weight="600">不足时放弃窗口，不往下补</text>
+      <text x="660" y="1012" font-size="11.5" fill="var(--ink-muted)">往下补捞到的正是刚出窗口那一批，而军力榜</text>
+      <text x="660" y="1028" font-size="11.5" fill="var(--ink-muted)">从强扫到弱 —— 那一批恰恰是最弱的。</text>
+
+      <text x="60" y="1070" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">实线 = 正常路径　　虚线 = 兜底 / 让路　　紫框 = 受「门限」这一个数控制</text>
+      <text x="60" y="1090" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">周期起点由 cycle_start_utc 算（周一 UTC+0）——它是游戏规则，不是旋钮</text>
+    </g>
+  </svg>
+  <figcaption>
+    两条链的全部判断点。紫色框标出的三处都由 <code>window_floor</code> 这一个数控制——
+    而它在「放弃窗口的阈值」上希望小、在「一趟采多少个」上希望大，所以任何取值都是妥协。
+  </figcaption>
+</figure>
+
+<h2><span class="n">02</span>每个数落在哪一步</h2>
+<div class="scroller">
+<table>
+  <thead>
+    <tr><th>旋钮</th><th>落在哪一步</th><th>调大的后果</th><th>调小的后果</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="knob-tag">score_max_age_hours</span><span class="sub">有效期</span></td>
+      <td>③ 窗口宽度</td>
+      <td>池子更大，但打的是更旧的军力数</td>
+      <td>数更新鲜，但更容易掉到门限以下、被迫放弃窗口</td>
+    </tr>
+    <tr>
+      <td><span class="knob-tag">window_floor</span><span class="sub">门限</span></td>
+      <td>③ 放弃窗口的阈值<br>采集 · 扫描安全阀<br>采集 · 一趟采多少个</td>
+      <td>一趟采得多，但窗口几乎每轮都被放弃</td>
+      <td>窗口守得住，但一趟采得少</td>
+    </tr>
+    <tr>
+      <td><span class="knob-tag">max_score</span><span class="sub">军力上限</span></td>
+      <td>④ 安全线</td>
+      <td>敢打更强的目标</td>
+      <td>更保守，候选变少</td>
+    </tr>
+    <tr>
+      <td><span class="knob-tag">扫描间隔</span></td>
+      <td>采集 · 冷却</td>
+      <td>采集更少，池子长得慢</td>
+      <td>采集更频繁，但抢攻击的时间片</td>
+    </tr>
+    <tr>
+      <td><span class="knob-tag">航线数</span></td>
+      <td>④ 之后的派遣预算</td>
+      <td>一轮派更多发</td>
+      <td>一轮派更少发</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <p><strong>周期起点不是旋钮。</strong>bot 军力每周一 UTC+0 刷新，那一刻全库读数同时作废。判据由 <code>cycle_start_utc</code> 算——改它只会让结果变错，所以刻意不做成可配置。</p>
+  <p>这也是周一那几个小时特别难看的原因：池子要从零重建，而重建速度被「扫描间隔」和「一趟采多少个」两头夹住。</p>
+</div>
+
+<h2><span class="n">03</span>今天实测到的数</h2>
+<div class="measured">
+<div class="scroller">
+<table>
+  <thead><tr><th>量</th><th>实测</th><th>来源</th></tr></thead>
+  <tbody>
+    <tr><td>派出速率</td><td class="num">中位 6 发/小时，峰值 30</td><td>近 7 天 <code>attack_dispatches</code></td></tr>
+    <tr><td>一趟采集</td><td class="num">18 屏 / 100 条 / 约 1.5 分钟</td><td>08-24 08:02 那趟</td></tr>
+    <tr><td>本周期已采到</td><td class="num">227 个读数</td><td>周一 00:00 UTC 重置后 10 小时</td></tr>
+    <tr><td>窗口内候选</td><td class="num">179 – 204，贴着门限 200 摆动</td><td>08-24 09:41 – 10:11</td></tr>
+  </tbody>
+</table>
+</div>
+<p style="padding-bottom:10px">
+  <strong>所以门限 200 的症状</strong>：一趟采 200 个、门限也是 200，池子必然贴着线走。
+  每次掉到 200 以下就是一次「放弃窗口」——退回用旧读数并告警。
+  填 100 的话池子 227 稳在线上，而 100 仍是峰值消耗的 6 倍以上。
+</p>
+</div>
+
+<h2><span class="n">04</span>采集侧那三道军力值判据</h2>
+<p>第 ④ 步排序全靠军力值，所以采集时它是这张榜上唯一承重的一列。三道判据各挡一类读错：</p>
+<ul>
+  <li><strong>渲染得出来</strong> —— 游戏把军力渲染成 <code>X.XXK</code>，所以 ≥1000 的值必然是 10 的整数倍。不是的，就是 OCR 多插了一位。</li>
+  <li><strong>不破坏降序</strong> —— 榜单按军力降序，比上一行大就是读错了。挡得住「多一位」，挡不住「少一位」。</li>
+  <li><strong>跨屏锚点</strong> —— 拿上一屏的最大值当基准，两个方向都按倍数判。挡的是整屏偏移 10 倍那一类，屏内判据看不见它。</li>
+</ul>
+<p>判不过的<strong>只丢分数、保留坐标</strong>，再由上下邻居插值补中点并标成估算值——猜出来的数不许长得像量出来的。</p>
+
+</div>
+</body>
+</html>

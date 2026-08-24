@@ -61,6 +61,20 @@ class AssignedTarget:
     coordinate: Coordinate
     origin: Coordinate
     preset: str
+    #: **备胎**：航线预算之外多配的那些，用来顶替撞上保护期的目标。
+    #:
+    #: 用户口径（2026-08-24）：「如果目标是保护状态无法攻击，也需要继续根据军力
+    #: 列表进行攻击。原则上这次的攻击必须发出去，并且需要是新鲜的数据」。
+    #:
+    #: ⚠️ **它绝不能让这一轮多派几发。** `_military_command` 的 `budget` 只数
+    #: 正选（`reserve=False`），备胎只是把坐标一起交给 runner —— runner 撞上
+    #: 保护期弹窗时跳过那一个、往下顶（`pirate_loop._handle_dialog`），
+    #: 而 `max_dispatches` 仍旧卡住实际派出数。
+    #:
+    #: ⚠️ 标出来而不是「让 budget 去数 group 有多长」：`_military_command` 里
+    #: `max_dispatches` 是有默认值 `None` 的，那条路上 budget 会退回 `len(group)`
+    #: ——容量翻倍之后那就等于把派出数也翻倍。标记让这件事在结构上不可能发生。
+    reserve: bool = False
 
 
 def tier_for(score: float | None, tiers: Sequence[MilitaryTier]) -> MilitaryTier | None:
@@ -70,12 +84,27 @@ def tier_for(score: float | None, tiers: Sequence[MilitaryTier]) -> MilitaryTier
     return next((tier for tier in tiers if score >= tier.min_score), None)
 
 
+#: 每条航线多配几个候选。`1` = 不配备胎（就是 2026-08-24 之前的行为）。
+#:
+#: 用户口径（2026-08-24）：「先按 2 倍来执行」。
+#:
+#: 为什么需要它：保护期**只能撞上了才知道**（游戏的 8 小时保护期任何人打过都会
+#: 触发）。而分配阶段原先只按航线数配同样多的目标，于是两条航线配两个目标、
+#: 两个都在保护期时这一轮就空转 —— 实测 2026-08-18 20:29 那一轮当场确认
+#: **四个目标全在保护期**、11.5 分钟一发未发。
+#:
+#: ⚠️ 备胎不是白配的：它们会占掉分配阶段的算力，而且**一旦被派出去就算这一轮
+#: 走过**。所以不宜太大。2 倍的意思是「每条航线备一个」。
+MILITARY_SPARE_FACTOR = 2
+
+
 def assign_by_capacity_and_value(
     targets: Sequence[ScoredTarget],
     origins: Sequence[AttackOrigin],
     *,
     fallback_preset: str,
     tiers: Sequence[MilitaryTier] = (),
+    spare_factor: int = 1,
 ) -> tuple[AssignedTarget, ...]:
     """把候选按航线预算分到星球，再在每组内按得分从高到低下发。
 
@@ -109,9 +138,14 @@ def assign_by_capacity_and_value(
     所以组内也必须是得分高的在前，否则「按得分出击」会在最后一步被悄悄抹掉，
     正如从前「按军力截断」被第 5 步按距离重排抹掉过一次。
     """
-    remaining = {
+    if spare_factor < 1:
+        raise ValueError("spare_factor 至少为 1")
+    # 真实航线数（`budget` 的上限）与放行给分配的容量分开：多出来的那些是备胎。
+    capacity = {
         origin.coordinate: origin.fleet_lines for origin in origins if origin.fleet_lines > 0
     }
+    remaining = {origin: lines * spare_factor for origin, lines in capacity.items()}
+    taken: dict[Coordinate, int] = {}
     assigned: list[tuple[Coordinate, tuple[bool, float, int, int, int], AssignedTarget]] = []
     pending = list(enumerate(targets))
     while pending:
@@ -133,6 +167,7 @@ def assign_by_capacity_and_value(
             ),
         )
         tier = tier_for(target.military_score, tiers)
+        taken[origin.coordinate] = taken.get(origin.coordinate, 0) + 1
         assigned.append(
             (
                 origin.coordinate,
@@ -141,16 +176,25 @@ def assign_by_capacity_and_value(
                     target.coordinate,
                     origin.coordinate,
                     fallback_preset if tier is None else tier.preset,
+                    # 这颗星球上超出真实航线数的那些就是备胎。贪心是**每次取最优**，
+                    # 所以先被取走的天然是得分高的 —— 备胎正好落在得分低的那一段。
+                    reserve=taken[origin.coordinate] > capacity[origin.coordinate],
                 ),
             )
         )
         remaining[origin.coordinate] -= 1
         pending = [item for item in pending if item[0] != target_index]
     # runner 每次只能从一颗星球出发；这里排成连续组，不能为每个目标来回切星球。
-    return tuple(item for _, _, item in sorted(assigned, key=lambda row: (row[0], row[1])))
+    # ⚠️ **组内先正选、后备胎**：runner 是按这个次序往下试的，备胎混在前面就等于
+    # 用得分低的顶掉了得分高的。贪心本来就让正选的得分更高，显式排一次是为了让
+    # 这条契约不依赖贪心的实现细节。
+    return tuple(
+        item for _, _, item in sorted(assigned, key=lambda row: (row[0], row[2].reserve, row[1]))
+    )
 
 
 __all__ = [
+    "MILITARY_SPARE_FACTOR",
     "AssignedTarget",
     "AttackOrigin",
     "MilitaryTier",

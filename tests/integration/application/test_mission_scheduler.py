@@ -1736,7 +1736,10 @@ def test_the_military_pool_dispatches_the_best_value_first(  # type: ignore[no-u
     targets = command[command.index("--targets") + 1 : command.index("--origin")]
     # 这组夹具只留一条空航线；军力 runner 会先取池中得分最高的那颗，并把实际使用的
     # 预设记进命令行，不能再把 `=BBB` 当成坐标的一部分丢掉。
-    assert targets == ["2:140:6=BBB"]
+    #
+    # ⚠️ 2026-08-24 起后面还跟着**备胎**（`MILITARY_SPARE_FACTOR`），所以这里只钉
+    # 第一个 —— 「得分最高的那颗排在最前」才是这条用例要守的东西。
+    assert targets[0] == "2:140:6=BBB"
 
 
 def test_military_attack_never_selects_fixed_pirate_positions(  # type: ignore[no-untyped-def]
@@ -1943,6 +1946,20 @@ def _targets_of(command: list[str]) -> list[str]:
     return command[command.index("--targets") + 1 : command.index("--origin")]
 
 
+def _primary_of(command: list[str]) -> str:
+    """`--targets` 里**第一个**目标，也就是这一轮的正选。
+
+    ⚠️ 2026-08-24 起命令行还带着**备胎**（`MILITARY_SPARE_FACTOR`，用户口径：
+    「如果目标是保护状态无法攻击，也需要继续根据军力列表进行攻击」），
+    所以「哪个目标胜出」这件事要问第一个，不能再断言「列表里只有它」。
+
+    ⚠️ 备胎排在正选之后由 `assign_by_capacity_and_value` 保证（组内先正选后备胎），
+    而「备胎不许让这一轮多派几发」由 `--max-dispatches` 保证 —— 两条各有专门的
+    用例钉着（`test_reserves_ride_along_without_raising_the_cap`）。
+    """
+    return _targets_of(command)[0]
+
+
 def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory, run_id
 ) -> None:
@@ -1987,7 +2004,7 @@ def test_excluding_the_last_24_hours_never_collapses_the_pool(  # type: ignore[n
     scheduler.tick()
 
     assert launcher.kinds == [MissionKind.BOT], "剔除必须在最前，否则派的是刚打过的那个"
-    assert _targets_of(launcher.latest.command) == ["2:141:6=BBB"]
+    assert _primary_of(launcher.latest.command) == "2:141:6=BBB"
 
 
 def test_a_target_that_never_made_the_board_is_not_attacked(  # type: ignore[no-untyped-def]
@@ -2012,7 +2029,7 @@ def test_a_target_that_never_made_the_board_is_not_attacked(  # type: ignore[no-
     scheduler.start()
     scheduler.tick()
 
-    assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
+    assert _primary_of(launcher.latest.command) == "2:400:5=BBB"
 
 
 def test_a_pool_where_everything_expired_still_attacks(  # type: ignore[no-untyped-def]
@@ -2055,7 +2072,7 @@ def test_a_pool_where_everything_expired_still_attacks(  # type: ignore[no-untyp
 
     assert launcher.kinds == [MissionKind.BOT], "全都超期不该让这一轮空手"
     # 这组夹具只留一条空航线，所以派出去的就是得分最高的 `2:140`。
-    assert _targets_of(launcher.latest.command) == ["2:140:6=BBB"]
+    assert _primary_of(launcher.latest.command) == "2:140:6=BBB"
 
 
 def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ignore[no-untyped-def]
@@ -2097,7 +2114,7 @@ def test_a_target_outside_the_window_stays_out_however_strong_it_is(  # type: ig
     scheduler.tick()
 
     command = launcher.latest.command
-    assert _targets_of(command) == ["2:401:6=BBB"]
+    assert _primary_of(command) == "2:401:6=BBB"
     assert not any(part.startswith("2:400:5") for part in command), "窗口外的目标不许被选中"
 
 
@@ -2140,7 +2157,7 @@ def test_a_short_window_gives_up_the_window_and_says_so_out_loud(  # type: ignor
     scheduler.start()
     scheduler.tick()
 
-    assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
+    assert _primary_of(launcher.latest.command) == "2:400:5=BBB"
     widened = [item for item in recorded.warnings() if "放宽窗口" in item[1]]
     assert len(widened) == 1, "放宽了窗口却没打 WARNING，就是「用了旧数据却没人告诉你」"
     _, message, payload = widened[0]
@@ -2195,7 +2212,7 @@ def test_a_short_window_is_not_topped_up_with_the_next_newest(  # type: ignore[n
     scheduler.tick()
 
     command = launcher.latest.command
-    assert _targets_of(command) == ["2:140:5=BBB"], "放宽之后该按得分挑，不是按时间"
+    assert _primary_of(command) == "2:140:5=BBB", "放宽之后该按得分挑，不是按时间"
     assert not any(part.startswith("2:402:7") for part in command), (
         "窗口内那个最弱的不该因为「它在窗口内」就保送"
     )
@@ -2275,7 +2292,7 @@ def test_a_far_but_strong_target_can_now_outrank_a_near_weak_one(  # type: ignor
     scheduler.start()
     scheduler.tick()
 
-    assert _targets_of(launcher.latest.command) == ["2:400:5=BBB"]
+    assert _primary_of(launcher.latest.command) == "2:400:5=BBB"
 
 
 def test_a_pool_with_no_readings_at_all_says_so_instead_of_saying_it_finished(  # type: ignore[no-untyped-def]

@@ -55,12 +55,19 @@ ORIGIN_A = Coordinate(4, 277, 15)
 
 #: 池子刻意给五个：预算 2，算法挑走两个之后还剩得下「完全不同」的另外两个。
 #: 只给三个的话，AI 想不重合都做不到，用例就钉不住「合法但完全不同」这一档。
+#: ⚠️ **池子要比「正选 + 备胎」再多留几个。**
+#:
+#: `_a_completely_different_but_legal_answer` 要从**没被算法挑中**的那些里凑出
+#: 一份同样大小的 picks。2026-08-24 起分配阶段每条航线多配一个备胎
+#: （`MILITARY_SPARE_FACTOR`），于是被挑中的数量翻倍、剩下的不够凑 —— 加两个。
 POOL = (
     Coordinate(4, 269, 8),
     Coordinate(4, 393, 10),
     Coordinate(9, 245, 14),
     Coordinate(9, 244, 13),
     Coordinate(8, 80, 19),
+    Coordinate(8, 214, 7),
+    Coordinate(8, 311, 12),
 )
 
 
@@ -208,7 +215,12 @@ def _a_completely_different_but_legal_answer(assignments: Any) -> dict[str, obje
     """
     chosen = {item.coordinate for item in assignments}
     others = [coordinate for coordinate in POOL if coordinate not in chosen]
-    assert len(others) >= len(assignments), "池子不够大，凑不出「完全不同」的一份"
+    # ⚠️ **要凑的份数按正选算，不按 `assignments` 的长度算。**
+    # 2026-08-24 起 `assignments` 里还含备胎（`MILITARY_SPARE_FACTOR`，每条航线
+    # 多配一个），于是它的长度是正选的两倍 —— 拿它当「要凑几个」会让这个前置条件
+    # 凭空翻倍，而这条用例要的只是「和算法挑的完全不重合」。
+    wanted = sum(1 for item in assignments if not item.reserve)
+    assert len(others) >= wanted, "池子不够大，凑不出「完全不同」的一份"
     preset = assignments[0].preset
     origin = assignments[0].origin
     content = {
@@ -220,7 +232,7 @@ def _a_completely_different_but_legal_answer(assignments: Any) -> dict[str, obje
                 "rank": index + 1,
                 "reason": "刻意与算法完全不同",
             }
-            for index, coordinate in enumerate(others[: len(assignments)])
+            for index, coordinate in enumerate(others[:wanted])
         ],
         "pool_warnings": [],
         "confidence": "high",

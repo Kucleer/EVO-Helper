@@ -380,6 +380,16 @@ class TaskFacts:
     #: 判定放在 `application` 那层（它才看得见候选池里各行的读取时刻），
     #: 这里只收结论。
     scores_are_missing: bool = False
+    #: **这个任务自己**的窗口内存货与门限。`None` = 不是军力优先那条链路。
+    #:
+    #: ⚠️ **和 `SchedulerFacts.military_window` 不是一回事，两个都要。**
+    #: 那一个是账号级「最饿的那个」，扫描安全阀读它——任何一个任务缺货都值得去扫。
+    #: 这一个是任务级，让位判据读它：用户口径（2026-08-24）说的是
+    #: 「轮到**该星系**bot 攻击时，如果不足就去采集」。
+    #: 拿账号级那个去判让位的话，一个星系缺货会让**所有**星系一起让位。
+    military_window: MilitaryWindowPool | None = None
+    #: 这个任务此刻让位给军力榜还值不值得（`application` 那边按任务记账）。
+    scan_can_still_help: bool = False
     #: 仅军力优先：**这一轮是放宽了有效期窗口才凑出来的**——窗口内不够**窗口门限**
     #: 要的那么多个，于是改用全部有读数的目标，池子里因此混进了窗口外的旧读数。
     #:
@@ -900,6 +910,66 @@ def bot_round_complete(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     return facts.of(task).targets_remaining <= 0
 
 
+#: 让位给军力榜之后，窗口内数量**停滞多久**就判定「补不进来了」，回落到
+#: 「放弃窗口照旧打并告警」。
+#:
+#: ⚠️ **按时长而不是按 tick 数**：tick 间隔是配置项，按 tick 数写死会让这道闸
+#: 随它一起漂。
+#:
+#: 取 3 分钟的账：军力榜落下第一行之前要先开榜、盲滚、检测 bot 区，实测约 50 秒；
+#: 而一趟采集 1.5–3 分钟。比 1 分钟短会在扫描还没落第一行时就判它没用；
+#: 比 5 分钟长则一个配错的门限要卡五分钟才回落。
+#:
+#: ⚠️ 它是**保险丝的时长，不是判据本身**——判据是「数量还在不在涨」
+#: （`application` 那边比对相邻两趟）。池子是逐屏写库的，所以扫描一开跑
+#: 这个数就会往上爬，正常情形下根本走不到这道闸。
+SCAN_YIELD_PATIENCE = timedelta(minutes=3)
+
+
+def yields_to_a_scan(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
+    """窗口内不够用、而且补得进来 —— 这一跳把时间片让给军力榜。
+
+    用户口径（2026-08-24）：「轮到该星系 bot 攻击时，如果不足就去采集
+    （现在的采集效率很高）采集够了就开始攻击，而不是轮空星系」。
+
+    ## 为什么原先不让位
+
+    军力榜是填空隙任务，结构性排在所有攻击之后（`scheduling_order`），所以它只在
+    攻击说「没活干」时才拿到时间片。而 `has_work` 判 BOT 有没有活干看的是
+    `targets_remaining`（= `MilitaryPoolReading.usable`，**第 2 步之后**的数），
+    与窗口无关——于是窗口不够时选靶只是「放弃窗口、改用旧读数」，BOT 照旧有活干、
+    照旧占着前台，而补货的那一趟永远排在后面。
+
+    生产实测（2026-08-24 08:26 → 08:32，连着四趟攻击）：本周期读数
+    **56 → 54 → 52 → 51 单调下降**，中间一趟扫描都没插进来 —— 采集只在航线被
+    占满、BOT 真的动不了时才轮到。而 51 个要摊到 7 个出发星系，必然有星系分不到
+    目标，那一轮就空转（「完成：目标 0 个」08-24 十八次、08-22 二十次）。
+
+    ⚠️ `ScanCooldown.OVERRIDDEN` 那道安全阀**不解决这件事**：它解除的是**冷却**，
+    不是排队次序。阀门开着，BOT 仍然站在门前面。
+
+    ## ⚠️ 为什么还要看 `scan_can_still_help`
+
+    只看「不够用」就让位会开出一条**静默停摆**的路：门限配得比榜上能采到的还高时
+    （今天就差点这样：门限 200、本周期总共才采到 227 个），扫描每趟都跑、池子每趟
+    都不涨，BOT 每一跳都让位、一发不打。页面会显示「没活干」——一句听起来正常、
+    实际相反的话，而这个仓反复在防的就是这种失败。
+
+    所以第二档是硬要求：**让位没用了就不让，回落到「放弃窗口照旧打并告警」**。
+    告警本来就有（`TaskStatus.WIDENED_SCORE_WINDOW`），用户看得见。
+
+    ## ⚠️ 按**任务**问，不是按账号
+
+    读的是 `facts.of(task).military_window`，不是 `facts.military_window`。
+    后者是账号级「最饿的那个」，扫描安全阀该读它（任何一个星系缺货都值得去扫）；
+    而让位是「轮到**该星系**时它自己够不够」——拿账号级那个去判，一个星系缺货会让
+    所有星系一起让位，而那些本来还有货的星系就白白轮空了，正是这条口径要治的事。
+    """
+    task_facts = facts.of(task)
+    pool = task_facts.military_window
+    return pool is not None and pool.below_floor and task_facts.scan_can_still_help
+
+
 def has_work(
     task: TaskSnapshot,
     facts: SchedulerFacts,
@@ -995,6 +1065,10 @@ def has_work(
 
     if task.kind is MissionKind.BOT:
         if bot_round_complete(task, facts):
+            return False
+        # ⚠️ **窗口内不够就先让军力榜去补货**（用户口径 2026-08-24）。
+        # 整段账在 `yields_to_a_scan` 上，连「为什么不能只看不够用」一起。
+        if yields_to_a_scan(task, facts):
             return False
         # ⚠️ **这里没有 `or facts.of(task).reports_due`，别加回去。** 理由在上面
         # 的 docstring 里：bot 的两条命令行都带航线闸，航线满时那半边判据
