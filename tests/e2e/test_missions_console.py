@@ -367,36 +367,30 @@ def test_a_new_task_is_created_military_first(client: TestClient) -> None:
     assert created.json()["params"]["by_military"] is True
 
 
-def test_the_scan_row_cannot_be_reordered_and_says_why(client: TestClient) -> None:
-    """扫描恒在最后一位，页面上就不能给它一对能点的箭头。
+def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
+    """扫描恒在最后一位，页面上就不能给它一个能拖的把手。
 
     它永远有活干，排在谁前面谁就永远轮不到——拖到海盗之前等于当天 32 次
     配额悄无声息地全流失。后端会拒（带 priority 的 PATCH 返回 400），
-    但用户不该点完了才发现。
+    但用户不该拖完了才发现。
 
     **卡片现在由页面脚本按 `/api/scheduler` 下发的任务列表建**（同一 kind 可以有
     多张，服务端渲染不出固定几张），所以断言落在建卡那一段的判据上：
-    `data-sortable` 取值只由「这条链路填不填空隙」决定，而且换位那一路
-    （`moveCard`）还要再挡一次「把别人换到它后面」。
-
-    ⚠️ 判据原先挂在 `draggable` 上，2026-08-23 拖拽整套换成上下箭头之后改挂
-    `data-sortable`（用户口径：「你还是用上下箭头来调整排序把，不要拖拽方案了」）。
-    钉的行为一个字没变。
+    `draggable` 取值只由「这条链路填不填空隙」决定，而且拖动那一路还要再挡一次
+    「把别人拖到它后面」。
 
     ⚠️ 判据从「是不是 SCAN」换成了 `FILLS_GAPS`（2026-08-22 改版），钉的行为
     没变、还多守了一条：军力榜（RANKING）同样恒在最后一位，带 priority 的 PATCH
-    打到它身上也是 400，而旧写法让它是可排序的——动一下就吃一个 400。
+    打到它身上也是 400，而旧写法让它是可拖的——拖一下就吃一个 400。
     """
     body = _page_body(client.get("/missions").text)
 
     # 与 `domain.scheduler.GAP_FILLERS` 同一批。
     assert "const FILLS_GAPS = ['SCAN', 'RANKING'];" in body
-    # 建卡时：填空隙的不可排序，别的都可以。写成常量 'false' 就等于全都不能排。
-    assert "row.dataset.sortable = fillsGaps ? 'false' : 'true';" in body
-    # 换位时只在「可排序」那些卡里找邻居，填空隙的既不参与也不会被换到它后面。
-    assert "box.querySelectorAll('.mission-row[data-sortable=\"true\"]')" in body
-    # 填空隙的那几张连箭头都不画，只给一个「·」。
-    assert "order.title = '填空隙的链路恒在最后一位，不参与排序';" in body
+    # 建卡时：填空隙的不可拖，别的都可拖。写成常量 'false' 就等于全都不能拖。
+    assert "row.setAttribute('draggable', fillsGaps ? 'false' : 'true')" in body
+    # 拖动过程中也不许把别人插到它后面。
+    assert "if (row.getAttribute('draggable') !== 'true') return;" in body
     assert "始终填空隙" in body
 
 
@@ -881,8 +875,8 @@ def test_the_page_disables_every_edit_control_while_running(client: TestClient) 
     assert "config_locked" in body
     for control in (".mission-param", ".mission-enabled"):
         assert control in body, control
-    # 换位认的是 `data-sortable`，所以锁上必须真的去改它，不能只把箭头画灰。
-    assert "row.dataset.sortable = locked || FILLS_GAPS.includes(task.kind)" in body
+    # 拖拽认的是 `draggable` 属性，所以锁上必须真的去改它，不能只把把手画灰。
+    assert "setAttribute('draggable'" in body
     assert "disabled = locked" in body
 
 
@@ -1284,129 +1278,97 @@ def test_ten_galaxies_never_share_a_hue(client: TestClient) -> None:
     assert closest >= 15, f"最接近的两个色相只差 {closest}°，分不开"
 
 
-def test_reordering_swaps_two_priorities_not_the_whole_block(client: TestClient) -> None:
-    """⚠️ **上下箭头一次只换两张卡，发两个 PATCH。**
+def test_only_the_handle_starts_a_drag_not_the_whole_card(client: TestClient) -> None:
+    """⚠️ **拖拽只许从 ⠿ 起，不许从卡身任何位置起。**
 
-    用户口径（2026-08-23）：「你还是用上下箭头来调整排序把，不要拖拽方案了」。
+    用户口径（2026-08-23）：「整张卡都能拖，应只有 ⠿ 能拖」。
 
-    拖拽那一版是「把这一块里原有的那些 priority 值升序发给新的排列」，于是一次
-    操作要给**每张卡各发一个** PATCH（生产那一屏 7 张 = 7 个串行请求）。两两交换
-    只动两张，也同样不会碰到别的容器里那些任务的相对位置（海盗的 priority 本来
-    可能夹在两个 bot 之间）。
+    守的是真实的误操作：卡上有出发点下拉框、航线数输入框、军力上限输入框和一串
+    说明文字。`draggable` 设在整张卡上时，想选中输入框里的文字、或者想划选那行
+    说明，按下去一移动就变成了一次重排——而重排会给这一块里**每张卡各发一个
+    PATCH**，用户根本没想改优先级。
 
-    ⚠️ **两个 PATCH 必须串行。** 并发发的话后端按到达顺序写，而这两个值互为对方的
-    目标——交叉之后两张卡会一起变成同一个数，次序彻底丢掉。
+    ⚠️ **`draggable` 属性本身仍然设在卡上，不能挪到把手上。** HTML5 拖拽只拖
+    「带 draggable 的那个元素」，要拖的是整张卡；而且这一页有三处拿
+    `draggable === 'true'` 当「这张卡能不能排序」的判据
+    （`onCardDragStart` / `onCardDragOver` / `onCardDragEnd` 里那个
+    `querySelectorAll`）。所以限制起拖点只能在 `dragstart` 里挡，
+    而不是去动那个属性。
     """
-    body = _page_body(client.get("/missions").text)
+    body = client.get("/missions", headers={"X-Console-Token": TOKEN}).text
 
-    assert "function moveCard(row, delta)" in body
-    # 交换的是两张卡原有的那两个值，不是重新发 0..n-1。
-    assert "const mine = Number(row.dataset.priority);" in body
-    assert "const theirs = Number(other.dataset.priority);" in body
-    # 串行：第二个在第一个的 then 里。
-    assert "patch(row.dataset.taskId, { priority: theirs })" in body
-    assert ".then(() => patch(other.dataset.taskId, { priority: mine }))" in body
-    # 只在同一块容器里找邻居。
-    assert "const box = row.parentNode;" in body
+    # 按下时记住落点，`dragstart` 时据此决定放不放行。
+    assert "box.addEventListener('pointerdown', onCardPointerDown)" in body
+    assert "event.target.closest('.drag-handle')" in body
+    # 不是从把手起的那些拖动要被真的挡掉，不能只是 return（return 之后浏览器
+    # 照样把卡拖起来，只是这一页不再跟着重排——落点错了却看着像能拖）。
+    assert "if (grabbedHandleRow !== row) {" in body
+    assert "event.preventDefault();" in body
+    # 一次拖完要清掉，否则下一次从卡身按下也会被当成「还按着把手」。
+    assert "grabbedHandleRow = null;" in body
 
 
-def test_the_two_arrows_are_real_buttons_wired_to_the_click_delegate(client: TestClient) -> None:
-    """箭头是**真按钮**，而且点击走已有的那个委托。
+def test_the_grab_cursor_only_sits_on_the_handle() -> None:
+    """抓手光标只画在 ⠿ 上——它是「哪里能拖」唯一的可见提示。
 
-    真按钮换来三样东西，装饰性的 `<span>` 一样都没有：键盘能 Tab 到、
-    `:disabled` 有原生语义（禁用时点击根本不派事件）、读屏念得出。
-
-    ⚠️ 守的是拖拽那三轮踩过的坑：靶子必须是个能点的东西。上一版把手只有
-    11×23px 的一个字形，收窄起拖点之后实际结果是拖不动。
+    画在整张卡上就等于把规则教错：用户会去拖卡身，然后发现没反应。这一条和
+    `test_only_the_handle_starts_a_drag_not_the_whole_card` 是一件事的两半，
+    少哪一半都会让另一半看起来像坏了。
     """
-    body = _page_body(client.get("/missions").text)
-
-    assert "button.type = 'button';" in body
-    assert "['mission-up', '▲', '上移']" in body
-    assert "['mission-down', '▼', '下移']" in body
-    # 读屏念得出：带任务名的 aria-label，不是 aria-hidden 的装饰字符。
-    assert "button.setAttribute('aria-label', `${word}「${task.label}」`);" in body
-    # 点击走 onCardClick 那个委托。
-    assert "if (event.target.closest('.mission-up')) {" in body
-    assert "if (event.target.closest('.mission-down')) {" in body
-
-
-def test_the_arrows_at_both_ends_are_disabled(client: TestClient) -> None:
-    """⚠️ **到顶的 ▲ 和到底的 ▼ 要真的禁用。**
-
-    点一个无处可去的箭头会发出「把 priority 设成它自己」的 PATCH：不报错、
-    什么都不改，但用户看到的是「点了没反应」——和「坏了」分不开。这一页刚因为
-    「点了没反应」被误判成坏了三轮，不该再留一个同形状的坑。
-
-    首尾要**每一块各自算**：海盗摆在另一块里，把两块拼起来算的话，bot 段最后一张
-    的 ▼ 会看着可点，而点下去要么越块、要么打到填空隙那几张身上（一律 400）。
-    """
-    body = _page_body(client.get("/missions").text)
-
-    assert "if (up) up.disabled = index === 0;" in body
-    assert "if (down) down.disabled = index === sortable.length - 1;" in body
-    # 每一块各自算首尾。
-    assert "for (const box of BOXES) {" in body
-
     css = _console_css()
-    # 光淡掉不够，但淡掉也要有——禁用的箭头得看得出来是禁用的。
-    assert ".mission-order button:disabled { opacity: 0.25; cursor: default; }" in css
+
+    assert '.mission-card[draggable="true"] .drag-handle { cursor: grab; }' in css
+    # ⚠️ 旧规则打在整张卡上，别留着——两条并存时卡身照旧显示抓手。
+    assert '.mission-card[draggable="true"] { cursor: grab; }' not in css
+    # 把手不许被选中：`user-select` 没关掉的话，按住它拖会变成划选那个字符。
+    #
+    # ⚠️ 用行首锚定找**基础**规则，不能拿 `_rule_block(css, ".drag-handle {")`
+    # ——它是子串匹配，会先撞上上面那条 `.mission-card[...] .drag-handle {`。
+    base = re.search(r"^\.drag-handle\s*\{[^}]*\}", css, re.MULTILINE)
+    assert base is not None, "`.drag-handle` 的基础规则不见了"
+    assert "user-select: none" in base.group(0)
 
 
-def test_the_arrow_buttons_are_a_target_you_can_actually_hit() -> None:
-    """⚠️ **箭头靶子要够点。**
+def test_the_handle_is_a_target_you_can_actually_hit() -> None:
+    """⚠️ **把手得是块够点的靶子，不能只有那个字形那么大。**
 
-    上一轮的教训：拖拽把手只有 **11×23px** 的一个字形（在真浏览器里量的），
-    起拖点从「整张卡」收窄到那个字符之后，实际结果是**拖不动**。
+    「只有 ⠿ 能起拖」这条规则一落地就带来一个新问题：字形本身只有 **11×23px**
+    （2026-08-23 在真浏览器里量的）。起拖点从「整张卡」收窄到「这一个字符」之后，
+    实际结果是**拖不动** —— 人的习惯是抓卡身，而就算瞄着把手也常常差几个像素。
 
-    两个箭头竖排，每个 `min-width: 20px` × `line-height: 13px`，合起来约 20×27
-    —— 比那个字形宽，而且是真按钮。
+    撑大之后实测 **26×35px**（矩形内九点取样 9/9 命中把手）。
+
+    ⚠️ 字形照旧只画 15px：撑的是可点区域，不是那个字。
     """
     css = _console_css()
 
     import re
 
-    block = re.search(r"^\.mission-order button\s*\{[^}]*\}", css, re.MULTILINE)
-    assert block is not None, "`.mission-order button` 的规则不见了"
-    assert "min-width: 20px" in block.group(0), "箭头没有最小宽度，靶子只有字形那么宽"
-    assert "cursor: pointer" in block.group(0)
+    base = re.search(r"^\.drag-handle\s*\{[^}]*\}", css, re.MULTILINE)
+    assert base is not None, "`.drag-handle` 的基础规则不见了"
+    block = base.group(0)
+    # 靶子：撑宽 + 撑满行高 + 内边距。少哪一条都会缩回一个字符的大小。
+    assert "min-width" in block, "把手没有最小宽度，靶子只有字形那么宽"
+    assert "align-self: stretch" in block, "把手没撑满行高，靶子只有一行文字那么高"
+    assert "padding" in block, "把手没有内边距"
+    # 字形不许跟着放大。
+    assert "font-size: 15px" in block
 
-    column = re.search(r"^\.mission-order\s*\{[^}]*\}", css, re.MULTILINE)
-    assert column is not None
-    assert "flex-direction: column" in column.group(0), "两个箭头不是竖排的"
 
+def test_the_stylesheet_carries_a_fingerprint(client: TestClient) -> None:
+    """⚠️ **`console.css` 必须带指纹，否则浏览器会一直用缓存里那一份。**
 
-def test_the_drag_and_drop_is_gone_for_good(client: TestClient) -> None:
-    """⚠️ **整套 HTML5 拖拽必须删干净，别照着旧版本加回来。**
+    这一页的行为有一半写在 CSS 里（哪儿能拖、停用怎么画），而它原先是裸路径。
+    2026-08-23 被咬过两次：
 
-    这一页的拖拽试了三轮都没成：整张卡可拖会把「想选输入框里的文字」变成一次重排；
-    收窄到只有把手能起拖之后，那个字形只有 11×23px，实际结果是拖不动；撑大靶子
-    并给 CSS 加了缓存指纹之后，用户报的仍是拖不动，而我在真浏览器里复现不出来。
+    ① 改了配色与勾选框却看不到（用户手动清缓存才好）；
+    ② 改了「只有把手能起拖」之后，**旧 CSS 仍然在卡身上画抓手** —— 用户看着抓手
+       去拖卡身、被新 JS 挡掉，症状是「拖不动」，而 CSS 和 JS 各自都是对的。
 
-    用户口径（2026-08-23）：「你还是用上下箭头来调整排序把，不要拖拽方案了」。
-
-    留一条用例盯着，是因为「加个把手让它能拖」在这一页上看起来永远像个好主意。
+    第 ② 种最坏：两边都没坏，所以查起来无从下手。
     """
-    body = _page_body(client.get("/missions").text)
+    body = client.get("/missions", headers={"X-Console-Token": TOKEN}).text
 
-    # ⚠️ **盯代码，不盯字面提及。** 上面那几段注释里就写着 `dragstart` / `drag-handle`
-    # ——那是有意留的「别加回来」的说明，不是残留。所以判据挑的都是只可能出现在
-    # 真代码里的形状：函数定义、事件注册、类名赋值、属性写入。
-    for gone in (
-        "function onCardDragStart",
-        "function onCardDragOver",
-        "function onCardDragEnd",
-        "function onCardPointerDown",
-        "addEventListener('dragstart'",
-        "addEventListener('dragover'",
-        "addEventListener('dragend'",
-        "addEventListener('drop'",
-        "= 'drag-handle'",
-        "setAttribute('draggable'",
-    ):
-        assert gone not in body, f"拖拽的残留：{gone}"
-
-    css = _console_css()
-    # CSS 里连注释都不该再提把手——那一整块已经换成 `.mission-order` 了。
-    assert "drag-handle" not in css
-    assert "cursor: grab" not in css
+    assert "/static/console.css?v=" in body
+    # 裸路径不许再出现，否则两条并存时浏览器仍可能拿旧的那份。
+    assert '"/static/console.css"' not in body

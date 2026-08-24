@@ -424,6 +424,11 @@ tbody tr.kind-pirate td.coord { color: var(--pirate); }
    子元素的 `opacity` 与父级**相乘**，父卡 0.6 × 子 1 还是 0.6，捞不回来。
    （所以它必须是卡的**直接子元素**——见 missions.html 里 `row.prepend(checkbox)`。）*/
 .mission-card.off > *:not(.mission-enabled) { opacity: 0.6; }
+/* ⚠️ **抓手只画在 ⠿ 上，不画在整张卡上。** 用户口径（2026-08-23）：只有把手能
+   起拖（挡在 `missions.html` 的 `onCardDragStart` 里）。光标是这条规则唯一的
+   可见提示——画在整张卡上就等于把「哪里能拖」教错，用户会去拖卡身然后发现没反应。 */
+.mission-card[draggable="true"] .drag-handle { cursor: grab; }
+.mission-card[draggable="true"] .drag-handle:active { cursor: grabbing; }
 
 /* 每个银河系一套配色（用户口径 2026-08-22：「每个银河系一套框体配色」）。
 
@@ -684,40 +689,29 @@ details.foldable > summary > h2 {
 }
 details.foldable[open] > summary { margin-bottom: 12px; }
 
-/* 排序控件：上下箭头。
-   ⚠️ **拖拽整套换掉了**（用户口径 2026-08-23：「你还是用上下箭头来调整排序把，
-   不要拖拽方案了」）。拖拽在这一页上试了三轮都没成，最后一轮连「靶子太小」和
-   「缓存里的旧 CSS 在卡身上画抓手」都堵了，用户报的仍是拖不动。
-   箭头没有这一整类问题：靶子是个真按钮，点了就是点了。 */
-.mission-order {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: -3px 0;
-}
-.mission-order button {
-  /* ⚠️ **靶子要够点。** 上一轮的教训：拖拽把手只有 11×23px，收窄起拖点之后
-     实际结果是拖不动。两个箭头竖排，每个 20×13、合起来 20×27 —— 比那个字形宽，
-     而且是真按钮（键盘 Tab 得到、`:disabled` 有原生语义）。 */
-  min-width: 20px;
-  padding: 0 2px;
-  line-height: 13px;
-  font-size: 9px;
+/* 排序把手。⚠️ **靶子要够大。**
+   只有它能起拖（用户口径 2026-08-23），而字形本身只有 11×23px —— 一个字符宽。
+   起拖点从「整张卡」收窄到「这一个字形」之后，实际结果是**拖不动**：人的习惯是
+   抓卡身，而就算瞄着把手也常常差几个像素。所以给它撑出一块可点区域，
+   字形照旧只画那么大。 */
+.drag-handle {
   color: var(--text-faint);
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 3px;
-  cursor: pointer;
+  font-size: 15px;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  align-self: stretch;
+  margin: -4px 0;
+  padding: 0 4px;
+  border-radius: 4px;
 }
-.mission-order button:hover:not(:disabled) {
+/* 悬停时把靶子显出来——不然「这里能拖」只有光标一个提示，而光标要先移进去才看得见。 */
+.mission-card[draggable="true"] .drag-handle:hover {
   color: var(--text);
   background: var(--bg-panel);
-  border-color: var(--border);
 }
-/* 到顶/到底那一个禁掉。⚠️ 光淡掉不够，`disabled` 才让点击真的不发请求——
-   点一个无处可去的箭头会发出「把 priority 设成它自己」的 PATCH：不报错、
-   什么都不改，但用户看到的是「点了没反应」，和坏了分不开。 */
-.mission-order button:disabled { opacity: 0.25; cursor: default; }
 
 /* ---- history dialog -------------------------------------------------- */
 

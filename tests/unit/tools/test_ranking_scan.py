@@ -25,9 +25,10 @@ from evo_helper.game.ranking_ui import (
     SELF_ROW_BOTTOM_Y,
 )
 from evo_helper.tools.ranking_scan import (
-    coordinates_of,
+    first_rank_of,
     is_self_row,
     keep_screens,
+    last_rank_of,
     name_column_text,
     parse_score,
     progress_mark,
@@ -811,51 +812,64 @@ def test_the_rank_is_carried_into_storage() -> None:
     assert [t.military_rank for t in targets] == [639, 640, 641]
 
 
-# -- 这一屏读出了哪些坐标：给重叠自查当尺子 ------------------------------------
+# -- 这一屏的头尾名次：给重叠自查当尺子 ----------------------------------------
 
 
-def test_the_ruler_is_the_coordinate_column_not_the_rank_column() -> None:
-    """⚠️⚠️ **重叠自查量的是坐标，不是名次。**
+def test_the_first_rank_skips_the_medal_rows_instead_of_reading_none() -> None:
+    """⚠️ **不是 `rows[0].rank`。** 榜首前三名显示的是**奖章图标**，名次列一个字
+    都读不出（`test_the_top_three_have_medals_instead_of_rank_numbers` 那一屏）。
 
-    2026-08-23 生产（run `91c7f9ec`）那 12 条「漏掉 N 名」全是名次列的高位噪声
-    造出来的（整段账在 `domain.ranking.screens_overlap`）。所以这把尺子刻意不看
-    `row.rank`：这一屏三行名次分别是奖章（读不出）、串成 `4781`、正常，
-    而交出来的坐标一个不少、也一个不多。
-    """
-    rows = [
-        RankingRow(None, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
-        RankingRow(4781, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
-        RankingRow(851, "bot_4_183_20", 28_510.0, Coordinate(4, 183, 20)),
-    ]
-
-    assert coordinates_of(rows) == {
-        Coordinate(4, 30, 12),
-        Coordinate(4, 100, 13),
-        Coordinate(4, 183, 20),
-    }
-
-
-def test_rows_whose_name_yields_no_coordinate_stay_out_of_the_ruler() -> None:
-    """名字读错的行（区间越界、真人名、榜首那几个）解不出坐标，就不参与比较。
-
-    ⚠️ **不参与 ≠ 造一个假数。** 原先那道名次判据拿一个读错的数去减，减出来的
-    就是「漏掉 996 名」；这里读不出的行只是不在集合里，最坏的结果是这一屏的
-    尺子短一点。
+    照 `rows[0].rank` 写的话，开榜第一屏交出来的就是 `None`——于是重叠自查在
+    **最该看的那一屏**（榜首、军力最高的那批 bot 所在的一段）永远答「不知道」。
     """
     rows = [
         RankingRow(None, "unkn0wn", 404_170_000.0, None),
-        RankingRow(850, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(None, "XXxxNAZIMxxXX", 160_120_000.0, None),
+        RankingRow(None, "halo", 115_900_000.0, None),
+        RankingRow(4, "Cocyte", 93_290_000.0, None),
     ]
 
-    assert coordinates_of(rows) == {Coordinate(4, 30, 12)}
+    assert first_rank_of(rows) == 4
 
 
-def test_a_screen_with_no_coordinate_at_all_answers_an_empty_ruler() -> None:
+def test_the_last_rank_skips_unreadable_rows_from_the_bottom() -> None:
+    """末行同理：OCR 漏认一行是常态（名次列本来就是最不准的一列）。
+
+    照 `rows[-1].rank` 写的话，末行恰好没读出来就把整屏的下界丢掉，而下一屏
+    拿到的 `previous_last_rank` 是 `None`——一次可修的漏认被放大成
+    「这两屏之间接不接得上，不知道」。
+    """
+    rows = [
+        RankingRow(850, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(851, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
+        RankingRow(None, "bot_4_183_20", 28_510.0, Coordinate(4, 183, 20)),
+    ]
+
+    assert last_rank_of(rows) == 851
+    assert first_rank_of(rows) == 850
+
+
+def test_a_screen_with_no_readable_rank_at_all_answers_none() -> None:
+    """⚠️ **一屏名次全读不出时答 `None`，不是 0。**
+
+    0 是个合法名次的位置（`rows_skipped` 会拿它当数算），而这一屏的真实含义是
+    「这一屏的名次一个都没认出来」。答 0 就会让下一屏算出一个凭空的巨大漏采。
+    """
+    rows = [
+        RankingRow(None, "bot_4_30_12", 29_590.0, Coordinate(4, 30, 12)),
+        RankingRow(None, "bot_4_100_13", 28_730.0, Coordinate(4, 100, 13)),
+    ]
+
+    assert first_rank_of(rows) is None
+    assert last_rank_of(rows) is None
+
+
+def test_an_empty_screen_answers_none_instead_of_blowing_up() -> None:
     """整屏读不出来（离页、面板没铺开）时 `read_rows()` 交的就是空列表。
 
     这一路是**常态**而不是异常：`rows_from_image` 只要名字读不出就丢行，
-    一屏全丢就是空的。空集会让 `screens_overlap` 答「不知道」，
-    而不是「重叠断了」——那两件事在日志上必须分得开。
+    一屏全丢就是空的。`rows[0]` 那种写法在这里是 `IndexError`——
+    而它会从采集循环里抛出去，把一次「这一屏没读到」变成整趟崩掉。
     """
-    assert coordinates_of([]) == set()
-    assert coordinates_of([RankingRow(850, "unkn0wn", None, None)]) == set()
+    assert first_rank_of([]) is None
+    assert last_rank_of([]) is None
