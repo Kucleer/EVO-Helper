@@ -3005,6 +3005,27 @@ class MissionScheduler:
                         (item for item in last_dispatches if item is not None), default=None
                     ),
                     next_line_free_at_utc=min(free_moments, default=None),
+                    # 这个任务自己的窗口存货，以及「让位补货还有没有用」。
+                    #
+                    # ⚠️⚠️ **必须接在这一支上。** 军力任务走的就是这个
+                    # `replace(base, ...)` 然后 `continue`，下面那一支它一步都走不到。
+                    # 2026-08-24 第一 版接错了地方，结果 `military_window` 恒为
+                    # 默认值 `None`、`yields_to_a_scan` 成了死代码：生产上
+                    # 「扫描间隔让路」照常喊（那读的是账号级窗口），而
+                    # 「让给军力榜去补货」一条都没有。
+                    military_window=(window := _window_of(reading)),
+                    # ⚠️ **`speaks` 只管说不说话，不管判据本身。**
+                    #
+                    # 池子空或没航线的任务本来就因为别的理由不跑，根本轮不到让位；
+                    # 而记账不管这个的话会照样打一句「让给军力榜去补货」、三分钟后
+                    # 再打一句「不再让位」——两句说的都是**没发生过的事**，
+                    # 而这个仓的规矩是「日志说假话比不说更糟」。
+                    #
+                    # 但 `military_window` 与这个布尔本身照常算：它们是**事实**
+                    # （这个任务窗口内有几个、补得进来吗），页面和判据都要用。
+                    scan_can_still_help=self._scan_can_still_help(
+                        task.task_id, window, now, speaks=bool(reading.usable and free)
+                    ),
                 )
                 continue
             if task.origin not in inflight:
@@ -3032,11 +3053,6 @@ class MissionScheduler:
                     target_kind, origin=task.origin
                 ),
                 next_line_free_at_utc=next_free[task.origin],
-                # 这个任务自己的窗口存货，以及「让位补货还有没有用」。
-                # ⚠️ 两格都按任务算——口径是「轮到**该星系**时它自己够不够」，
-                # 整段账在 `domain.scheduler.yields_to_a_scan` 上。
-                military_window=(window := _window_of(readings.get(task.task_id))),
-                scan_can_still_help=self._scan_can_still_help(task.task_id, window, now),
             )
 
         # 整份换上去而不是原地改：页面线程也会调 `_facts`（`snapshot`），
@@ -3049,6 +3065,11 @@ class MissionScheduler:
             # 各算一份的结果是安全阀在「其实还够用」时乱放行（或者反过来），
             # 而两种走样在页面上都看不出来。
             military_window=_most_starved_window(readings.values()),
+            # 有没有一个能跑的军力榜任务 —— 让位判据要先问这一句，理由在
+            # `domain.scheduler.SchedulerFacts.scan_is_available` 上。
+            scan_is_available=any(
+                item.kind is MissionKind.RANKING and _participating(item) for item in tasks
+            ),
             pirate_dispatches_today=(
                 self._repository.count_dispatches_since(
                     TARGET_KIND_PIRATE, since=quota_day_start_utc(now)
@@ -3102,7 +3123,12 @@ class MissionScheduler:
         return self._planner.plan(pending, now_utc=now).action is WaitAction.COLLECT
 
     def _scan_can_still_help(
-        self, task_id: int, window: MilitaryWindowPool | None, now: datetime
+        self,
+        task_id: int,
+        window: MilitaryWindowPool | None,
+        now: datetime,
+        *,
+        speaks: bool = True,
     ) -> bool:
         """这个任务让位给军力榜还有没有用——**看它窗口内的数量还在不在涨**。
 
@@ -3132,7 +3158,7 @@ class MissionScheduler:
 
         seen = self._yield_watermark.get(task_id)
         if seen is None or window.in_window > seen:
-            if seen is None:
+            if seen is None and speaks:
                 self._log_the_yield(task_id, window, now, stalled=None)
             self._yield_watermark[task_id] = window.in_window
             self._yield_stalled_since.pop(task_id, None)
@@ -3146,7 +3172,8 @@ class MissionScheduler:
         stalled = now - since
         if stalled < SCAN_YIELD_PATIENCE:
             return True
-        self._log_the_yield(task_id, window, now, stalled=stalled)
+        if speaks:
+            self._log_the_yield(task_id, window, now, stalled=stalled)
         return False
 
     def _log_the_yield(

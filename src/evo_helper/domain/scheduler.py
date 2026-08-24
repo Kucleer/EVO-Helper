@@ -485,6 +485,12 @@ class SchedulerFacts:
     #: 有多个军力优先的 bot 任务时取**最饿的那一个**（`in_window - floor` 最小），
     #: 理由是安全阀防的是「整池归零」，而最先归零的就是它。
     military_window: MilitaryWindowPool | None = None
+    #: 此刻**有没有一个能跑的军力榜任务**（启用、没被停用、参与调度）。
+    #:
+    #: ⚠️ 让位判据要问这一句：没有扫描可跑时让位是**纯粹的浪费**——攻击停下来了，
+    #: 而没有人去补货，一直空转到耐心耗尽为止。没建军力榜任务、或者把它停用了，
+    #: 都会落到这一档。
+    scan_is_available: bool = False
     #: 按 `task_id` 挂的逐任务事实。查不到的任务看到的是 `NO_FACTS`。
     per_task: Mapping[int, TaskFacts] = field(default_factory=dict)
 
@@ -955,6 +961,12 @@ def yields_to_a_scan(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     都不涨，BOT 每一跳都让位、一发不打。页面会显示「没活干」——一句听起来正常、
     实际相反的话，而这个仓反复在防的就是这种失败。
 
+    ## ⚠️ 还要先问「有扫描可跑吗」
+
+    没有一个能跑的军力榜任务时（没建、或者停用了），让位换不来任何补货 ——
+    攻击停下来了，而没有人去补货，一直空转到耐心耗尽。所以 `scan_is_available`
+    为假时一律不让位。
+
     所以第二档是硬要求：**让位没用了就不让，回落到「放弃窗口照旧打并告警」**。
     告警本来就有（`TaskStatus.WIDENED_SCORE_WINDOW`），用户看得见。
 
@@ -966,6 +978,9 @@ def yields_to_a_scan(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
     所有星系一起让位，而那些本来还有货的星系就白白轮空了，正是这条口径要治的事。
     """
     task_facts = facts.of(task)
+    if not facts.scan_is_available:
+        # 没有军力榜可跑：让位换不来任何补货，只会白白停下攻击。
+        return False
     pool = task_facts.military_window
     return pool is not None and pool.below_floor and task_facts.scan_can_still_help
 

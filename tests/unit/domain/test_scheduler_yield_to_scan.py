@@ -45,10 +45,14 @@ def _facts(
     can_help: bool = True,
     free_lines: int = 2,
     remaining: int = 50,
+    scan_available: bool = True,
 ) -> SchedulerFacts:
     window = None if in_window is None else MilitaryWindowPool(in_window=in_window, floor=floor)
     return SchedulerFacts(
         now_utc=NOW,
+        # ⚠️ 默认给 True：这个夹具造的是「有军力榜可跑」的常态。没有可跑的扫描时
+        # 让位是纯粹的浪费，那一档由 `test_no_scan_to_run_means_no_point_yielding` 钉。
+        scan_is_available=scan_available,
         per_task={
             task.task_id: TaskFacts(
                 free_lines=free_lines,
@@ -121,6 +125,7 @@ def test_the_pool_is_read_per_task_not_account_wide() -> None:
     task = _task()
     facts = SchedulerFacts(
         now_utc=NOW,
+        scan_is_available=True,
         # 账号级：最饿的那个报 0 —— 扫描安全阀该据此放行，但让位判据不许读它。
         military_window=MilitaryWindowPool(in_window=0, floor=100),
         per_task={
@@ -134,6 +139,18 @@ def test_the_pool_is_read_per_task_not_account_wide() -> None:
     )
 
     assert yields_to_a_scan(task, facts) is False
+
+
+def test_no_scan_to_run_means_no_point_yielding() -> None:
+    """⚠️ **没有一个能跑的军力榜任务时，一律不让位。**
+
+    没建军力榜、或者把它停用了，让位换不来任何补货——攻击停下来了，而没有人去补货，
+    一直空转到耐心耗尽为止。这一档是纯粹的浪费，所以判据先问这一句。
+    """
+    task = _task()
+
+    assert yields_to_a_scan(task, _facts(task, in_window=51, scan_available=False)) is False
+    assert has_work(task, _facts(task, in_window=51, scan_available=False)) is True
 
 
 # -- 接进 has_work ---------------------------------------------------------------
@@ -166,6 +183,7 @@ def test_yielding_does_not_touch_the_gap_fillers() -> None:
     ranking = _task(task_id=2, kind=MissionKind.RANKING)
     facts = SchedulerFacts(
         now_utc=NOW,
+        scan_is_available=True,
         per_task={
             ranking.task_id: TaskFacts(
                 military_window=MilitaryWindowPool(in_window=0, floor=100),
