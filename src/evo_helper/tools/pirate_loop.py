@@ -113,6 +113,7 @@ from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_wor
 from evo_helper.game.system_navigator import (
     NAV_BOX_LABELS,
     NAV_LABEL_ROI,
+    NAV_LABELS,
     NAV_VALUE_MIN_VOTES,
     NAV_VALUE_RECIPES,
     NAV_VALUE_ROIS,
@@ -123,6 +124,7 @@ from evo_helper.game.system_navigator import (
     agreed_value,
     crop_reader,
     digits_on_screen,
+    on_system_view,
     reads_like_a_dropped_digit,
     value_box_crops,
 )
@@ -584,6 +586,16 @@ class ReportIngest(Enum):
 #: 导航栏三个值框在日志里怎么念。顺序与 `NAV_VALUE_ROIS` 一一对应。
 #: ⚠️ 真相在 `system_navigator`（和 `NAV_VALUE_ROIS` 住一起）。这里只留个别名，
 #: 免得「加了第四个框、只改了一边」。
+
+
+@dataclass(frozen=True)
+class _WatchedLabels:
+    """一个会把读数记下来的标签读屏函数。见 `PirateLoop._watched_nav_labels`。"""
+
+    #: 交给 `ensure_system_view` 用的读屏函数。
+    read: Callable[[], str]
+    #: 它读过的每一次，按顺序。**同一个列表对象**，调用之后再看即可。
+    seen: list[str]
 
 
 @dataclass(frozen=True)
@@ -1125,6 +1137,14 @@ class PirateLoop:
     #: 24 这个数：覆盖那 27 种里的绝大部分，一轮几 KB × 24 也就几百 KB。
     MAX_NAV_VALUE_CROPS: int = 24
 
+    #: 切不回恒星系视图时最多存这么多张现场图（标签行裁片 + 整帧缩略图）。
+    #:
+    #: ⚠️ **文字每次都记，只有图封顶** —— 同 `MAX_NAV_READBACK_FRAMES`。
+    #: `label_reads` 才是这条告警的主证据，图是用来回答「那一刻屏上到底是什么」的，
+    #: 而几张几乎一样的图没有增量。留 4 是因为这一支一轮可能触发两次
+    #: （重开之前 + 重开之后），4 张够覆盖两轮。
+    MAX_VIEW_FAILURE_FRAMES: int = 4
+
     #: 起点核对不过时最多存这么多张现场图。**封顶的理由和 `MAX_COORD_DUMPS` 一样**，
     #: 只是这里本来就跑不了几张：核不过就停轮，一轮最多存一张。留 2 是给
     #: 「同一进程里被复用」留的余量，不是预期值。
@@ -1161,6 +1181,7 @@ class PirateLoop:
         self._nav_readback_dumps = 0
         #: 已经存过裁片的读数形态。见 `MAX_NAV_VALUE_CROPS`：按形态去重，不按次数。
         self._nav_value_crop_shapes: set[str] = set()
+        self._view_failure_dumps = 0
         #: 本趟开工时刻。本轮派出去的侦察/攻击，其报告一定比它新——
         #: 翻信箱时据此早停（见 `MailRow.is_older_than`）。
         self._started_at = datetime.now(UTC)
@@ -3807,8 +3828,10 @@ class PirateLoop:
         （`_require_origin_before_dispatch`），下一轮开工时重新切一次。
         **闸门是兜底，这一处是止血；两条都要有。**
         """
-        if self._navigator.ensure_system_view(self._nav_labels):
+        first = self._watched_nav_labels()
+        if self._navigator.ensure_system_view(first.read):
             return
+        self._record_system_view_failure(what_failed, first.seen, stage="重开之前")
         say(f"  {what_failed}；关窗重开一次再试（兜底策略）")
         outcome = self._keeper().restart_and_reenter(what_failed)
         if not outcome.ready:
@@ -3821,11 +3844,81 @@ class PirateLoop:
         # 出发星球那份记忆同样作废：重开的落点是主星，不是本轮配的那颗。见上面那段。
         self._current_planet = None
         say("  关窗重开之后落点是主星；「本轮已经切到哪」这份记忆作废")
-        if not self._navigator.ensure_system_view(self._nav_labels):
+        again = self._watched_nav_labels()
+        if not self._navigator.ensure_system_view(again.read):
+            self._record_system_view_failure(what_failed, again.seen, stage="重开之后")
             raise SessionUnavailable(
                 f"{what_failed}；重开之后仍然切不回来；安全停止",
                 recoverable=outcome.restarts_left > 0,
             )
+
+    def _watched_nav_labels(self) -> _WatchedLabels:
+        """把 `_nav_labels` 包一层，**记下每一次读到了什么**。
+
+        ⚠️ 不改 `ensure_system_view` 的签名：它有六个调用点，而只有这一处需要留痕。
+        包一层读屏函数是唯一不牵动其余五处的做法。
+        """
+        seen: list[str] = []
+
+        def read() -> str:
+            text = self._nav_labels()
+            seen.append(text)
+            return text
+
+        return _WatchedLabels(read=read, seen=seen)
+
+    def _record_system_view_failure(
+        self, what_failed: str, seen: Sequence[str], *, stage: str
+    ) -> None:
+        """切不回恒星系视图时，把**标签读成了什么**连同标签行的原分辨率裁片落库。
+
+        ## 为什么必须有这一条
+
+        2026-08-25 查这条告警时撞了墙：一天 24 次「派出之后切不回恒星系视图」，
+        每次都以关窗重开 Chrome（40–70 秒）收场，其中还有整轮作废的。而日志里
+        只有「切不回」三个字，**说不出画面上是什么**。于是两种成因分不开：
+
+        - 画面**真的**不在恒星系视图（派出后有动画或浮层没散）；
+        - 画面就在恒星系视图，是**标签 OCR 读不出**。
+
+        第二种不是瞎猜：这排标签和值框是同一条导航栏、纵向只隔 30px，而值框那一半
+        在实机上会大面积读不出（`9` 五套配方全空）。
+
+        ⚠️ 同一天已经为「只记结论不记证据」付过一次账了：导航栏值框那条上线以来
+        28 次回读 28 次对不上，而 `payload_json` 是 `{}`，一帧都没留。这条是同一个
+        形状，趁还没开始猜先把证据补上。
+
+        ## 时间指纹也一起记
+
+        24 次里 19 次落在派出后 **26–29 秒**——正好是 `ensure_system_view` 三次重试
+        的预算（等待 1+2、1+4、1+6 = 15 秒，加 4 次标签 OCR）。也就是说三次机会
+        **一次都没读到**，不是「偶尔卡一下」。`label_reads` 的长度把这件事记死：
+        少于 4 条就说明中途成功过，那是另一回事。
+
+        ⚠️ **裁片按原分辨率存**，理由同 `value_box_crops`：整帧缩略图是 480 宽，
+        1920 → 480 是 4×，450×27 的标签行变成 112×7，中文字全糊，事后什么都看不出。
+        标签行一块几 KB，比那张缩略图还小。
+        """
+        payload: dict[str, Any] = {
+            "what_failed": what_failed,
+            "stage": stage,
+            "label_roi": list(NAV_LABEL_ROI),
+            # 每一次重试读到的原文，按顺序。见 docstring：长度本身是判据。
+            "label_reads": list(seen),
+            # 逐条按 `on_system_view` 判一遍。**读到了什么**和**判成了什么**要分开记：
+            # 「读到『银河系 恒星糸 行星』却判不通过」和「读到空串」是两回事。
+            "on_system_view": [on_system_view(text) for text in seen],
+            "criterion": f"on_system_view：{NAV_LABELS} 里读到两个以上才算在恒星系视图",
+        }
+        capture = getattr(getattr(self, "_driver", None), "capture", None)
+        if callable(capture) and self._view_failure_dumps < self.MAX_VIEW_FAILURE_FRAMES:
+            self._view_failure_dumps += 1
+            frame = capture()
+            payload["label_row_png_base64"] = crop_png_base64(frame.crop(NAV_LABEL_ROI))
+            payload["thumbnail_png_base64"] = thumbnail_base64(frame)
+        record_system_log(
+            "WARNING", "tools.pirate_loop", "切不回恒星系视图：标签读数留痕", payload=payload
+        )
 
     # -- 出发星球 -----------------------------------------------------------
 
