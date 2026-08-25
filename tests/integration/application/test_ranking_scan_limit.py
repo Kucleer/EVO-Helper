@@ -132,26 +132,92 @@ def test_a_configured_scan_count_caps_this_run(  # type: ignore[no-untyped-def]
     ]
 
 
-def test_the_configured_count_and_the_attack_batch_size_take_the_smaller_one(  # type: ignore[no-untyped-def]
-    scheduler, repository, launcher
-) -> None:
-    """两个上限同时在场时取**小**的那个。
+def _wants_military_targets(repository) -> None:  # type: ignore[no-untyped-def]
+    """开一条「按军力选靶」的 bot 任务 —— 有它在等，这一趟榜单才算「有批次」。
 
-    军力批次（`by_military` 的 bot 任务）本来就会给榜单带一个 `--bot-limit`
-    ——它是「这一批攻击需要几个目标」。用户在军力榜这一行配的数量是另一回事：
-    它是这条链路的天花板。取大的会越过用户划的线，取任务那个又会让批次采不满，
-    所以只能取小的。
+    没有它时 `_military_batch_task()` 交 `None`，「窗口门限」那条默认路根本不该走：
+    没有任何军力任务在等这批目标，拿一个攻击侧的数去卡扫描链路是没有道理的。
     """
-    _only_ranking(repository, '{"bot_limit": 3}')
     repository.update_mission_task(
         _task_id(repository, MissionKind.BOT),
         enabled=True,
         params_json='{"by_military": true}',
     )
 
-    command = _launched(scheduler, launcher)
 
-    assert command[-2:] == ["--bot-limit", "3"]
+def test_a_configured_scan_count_wins_over_the_window_floor(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """⚠️⚠️ **用户填了「扫描数量」就听用户的，「窗口门限」不许把它压小。**
+
+    页面上那两个数说的是不同的事：
+
+        扫描数量（任务中心 · 扫描军力榜那一行）   用户给扫描链路划的上限
+        窗口门限（攻击配置 · 军力选靶窗口）       攻击那边至少要看到多少个
+
+    这里曾经取两者的 `min`，理由写着「取大的会越过用户划的线，取任务那个又会让
+    批次采不满」。**那是反的**：用户填「扫描数量 700、窗口门限 500」时，`min` 把
+    批次压成 500 —— 而 500 正是攻击要达到的数，扣掉「24h 内已打」之类的排除项之后
+    **必然低于门限**。于是它恰好造成了自己想避免的「批次采不满」，而且是结构上
+    永远不可能满。
+
+    2026-08-25 生产实测：一趟写入 500 条、窗口内 396–468、门限 500，连着十几趟都
+    够不着；让位判据每轮白等 3 分钟耐心才回落到照旧打，攻击一直在用旧读数。
+
+    700 既没越过用户划的线，又超额满足了门限 —— 这才是两条都守住。
+
+    ⚠️ 构造成 700 > 500，两个数**必须朝这个方向**差开：老用例填的是 3、门限 50，
+    `min` 与「听用户的」给出同一个答案，于是它绿着看了一整周，什么都没钉住。
+    """
+    _only_ranking(repository, '{"bot_limit": 700}')
+    _wants_military_targets(repository)
+    set_score_window(repository, window_floor=500)
+
+    assert _launched(scheduler, launcher)[-2:] == ["--bot-limit", "700"]
+
+
+def test_a_scan_count_below_the_floor_is_also_honoured(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """⚠️ 填得**比门限小**时同样听用户的 —— 那条线是他自己划的。
+
+    这一条守的是反方向：别好心替用户放大。够不够是另一回事，日志里那句
+    「不再让位（门限可能配得比榜上能采到的还高）」会把它说出来。
+    """
+    _only_ranking(repository, '{"bot_limit": 20}')
+    _wants_military_targets(repository)
+    set_score_window(repository, window_floor=500)
+
+    assert _launched(scheduler, launcher)[-2:] == ["--bot-limit", "20"]
+
+
+def test_the_window_floor_is_the_default_only_when_nothing_was_configured(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """留空时「窗口门限」当默认值 —— 那时它表达的是「这一批攻击至少要这么多」。
+
+    ⚠️ 这一条和上面两条是一对：少了它，「拿掉 `min`」会退化成「门限在这里彻底没用了」，
+    于是留空那条路变成全扫（一趟几百屏），把攻击饿死。
+    """
+    _only_ranking(repository, "{}")
+    _wants_military_targets(repository)
+    set_score_window(repository, window_floor=500)
+
+    assert _launched(scheduler, launcher)[-2:] == ["--bot-limit", "500"]
+
+
+def test_no_waiting_military_task_means_no_floor_is_imposed(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher
+) -> None:
+    """⚠️ 没有军力任务在等这批目标时，留空还是**全扫**，不许套门限。
+
+    「窗口门限」是攻击侧的数。一条军力任务都没在等的时候拿它去卡扫描链路，
+    等于凭空给「留空 = 全扫」加了个上限，而页面上看不出来。
+    """
+    _only_ranking(repository, "{}")
+    set_score_window(repository, window_floor=500)
+
+    assert "--bot-limit" not in _launched(scheduler, launcher)
 
 
 # -- 拒掉不可能的取值 ----------------------------------------------------------

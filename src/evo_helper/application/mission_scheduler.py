@@ -2684,22 +2684,34 @@ class MissionScheduler:
         try:
             batch_task = self._military_batch_task() if task.kind is MissionKind.RANKING else None
             if task.kind is MissionKind.RANKING:
-                # 两个上限，取**小**的那个：任务上配的「扫描数量」是用户给这条
-                # 链路划的天花板（留空 = 不划），军力批次要的**窗口门限**是「这一批
-                # 攻击要在窗口内看到多少个目标才肯只信新数据」。取大的会越过用户
-                # 划的线，取任务那个又会让批次采不满——`min` 是唯一同时守得住两条的。
+                # 两个数，**用户填了就听用户的**。
                 #
-                # ⚠️ 窗口门限 2026-08-18 起不再是「打前几名」（军力硬截断取消了），
-                # 但它在这里的用法没变：扫够那么多个，这一轮才不必放弃窗口。
+                # 页面上那个「扫描数量」是**用户给扫描链路划的上限**（留空 = 全扫），
+                # 而「窗口门限」是攻击那边**至少要看到多少个**才肯只信新数据。
                 #
-                # ⚠️ 2026-08-23 起它是**全局**的一个数（`_window_floor`），所以这里
-                # 不再看 `batch_task` 的参数——但 `batch_task is None` 这个分支必须
-                # 留着：它表达的是「这一趟没有任何军力任务在等这批目标」，那时不该
-                # 拿一个攻击侧的门限去卡用户给扫描链路划的上限。
+                # ⚠️⚠️ **这里曾经取两者的 `min`，那是反的。**
+                #
+                # 当初的理由写着「取大的会越过用户划的线，取任务那个又会让批次采不满
+                # ——`min` 是唯一同时守得住两条的」。但用户填「扫描数量 700、窗口门限
+                # 500」时，`min` 把批次压成 500，而 500 正是攻击那边要达到的数——
+                # 扣掉「24h 内已打」之类的排除项之后必然低于门限。**于是它恰好造成了
+                # 自己想避免的「批次采不满」，而且是结构上永远不可能满。**
+                #
+                # 2026-08-25 实测：一趟写入 500 条，窗口内 396–468，门限 500，
+                # 连着十几趟都够不着；让位判据每轮白等 3 分钟耐心才回落到照旧打。
+                #
+                # 正确的口径是**用户填了就听用户的**：700 既没越过他划的线，又超额
+                # 满足了门限。门限只在用户**没划线**时当默认值——那时它表达的是
+                # 「这一批攻击至少要这么多」，拿它当上限是合理的。
+                #
+                # ⚠️ `batch_task is None` 那个分支必须留着：它表达的是「这一趟没有
+                # 任何军力任务在等这批目标」，那时不该拿一个攻击侧的数去卡扫描链路。
+                configured = _ranking_bot_limit(row.params_json)
                 command = ranking_command(
-                    bot_limit=_smallest_limit(
-                        _ranking_bot_limit(row.params_json),
-                        None if batch_task is None else self._window_floor(),
+                    bot_limit=(
+                        configured
+                        if configured is not None
+                        else (None if batch_task is None else self._window_floor())
                     ),
                     blind_rows=self._blind_rows(),
                 )
@@ -5055,12 +5067,6 @@ def _report_scan_hours(value: object) -> int | None:
             "要救更早的战报请用手动补录（那一条不受这个下限约束）。"
         )
     return hours
-
-
-def _smallest_limit(*limits: int | None) -> int | None:
-    """几个上限里最紧的那个；一个都没有就是「不设限」。"""
-    values = [limit for limit in limits if limit is not None]
-    return min(values) if values else None
 
 
 def _bot_by_military(raw: str) -> bool:
