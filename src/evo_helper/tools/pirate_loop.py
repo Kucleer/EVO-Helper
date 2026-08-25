@@ -4053,9 +4053,12 @@ class PirateLoop:
                 label: list(row) for label, row in zip(NAV_BOX_LABELS, reading.reads, strict=True)
             },
             "verdict": reading.describe_against(origin),
+            # ⚠️ 这句话是**给日后复盘的人看的**：`tools.nav_readback_replay` 拿这些
+            # 读数给候选规则打分时，得知道当时跑的是哪一条。改了规则就要改这里，
+            # 否则几个月后的复盘会拿新规则的名字去解释旧读数。
             "criterion": (
                 f"agreed_value：同一个值至少 {NAV_VALUE_MIN_VOTES} 票、取最长、"
-                "其余非空读数必须是它漏字后的样子"
+                "等长两个则作废、有配方读出更多位则作废"
             ),
         }
         # 名额只在**真的存下了一张图**时才扣。截不了图（轻量驱动、单元测试桩）时
