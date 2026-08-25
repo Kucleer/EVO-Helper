@@ -1,49 +1,59 @@
-"""导航栏三个**值框**的 ROI、配方与汇总规则，跑在 43 张真实截图上。
+"""导航栏三个**值框**的 ROI、配方与汇总规则，跑在真实截图上。
 
 ## ⚠️ 为什么语料和真值都不在仓库里
 
-本仓是**公开仓库**，而截图与坐标都是能反推账号的东西（`.gitignore` 第二段写着
-2026-08-18 那次把 34 份战报面板当夹具提交、只能整个撤回的事）。所以这里照
-`test_resource_grid_corpus_live.py` 的规矩办：图和真值都放 `var/` 下，本机有才跑，
-CI 里跳过；**committed 的这份只断言统计量**，不写任何一个具体坐标。
+本仓是**公开仓库**，而值框里写的就是坐标（`.gitignore` 第二段写着 2026-08-18 那次
+把 34 份战报面板当夹具提交、只能整个撤回的事）。所以图和真值都放 `var/` 下，
+本机有才跑，CI 里跳过；**committed 的这份只断言统计量**，不写任何一个具体坐标。
 
-## 语料长什么样、怎么备齐
+## ⚠️⚠️ 原先那 43 张语料**已经不存在了**（2026-08-25 查明）
 
-- 图：`var/logs/*.png`，1920×917 的 client 空间整帧，导航栏标签行读得出
-  「银河系 / 恒星系 / 行星」两个以上（`on_system_view`）的那些。
-- 真值：`var/fixtures/vision/nav_bar_values.json`，`{文件名: [银河系, 恒星系, 行星]}`，
-  **逐张目视放大核对过**。它是这套识别唯一的裁判。
+这个文件从前说自己跑在 43 张上。实际上 `var/fixtures/vision/nav_bar_values.json`
+在任何一台还找得到的机器上都没有，`var/logs` 里也没有那批图——**这条用例一直在
+skip**，而且不知道 skip 了多久。
+
+后果不是「少跑了几条用例」：2026-08-25 生产读数证伪了「每套配方错法只有丢位」
+那条性质，而本机**没有任何东西因此变红**，因为守着它的用例根本没在跑。
+
+## 现在这份：9 张，从生产实机取回（2026-08-25）
+
+用户从实机 `var/logs` 取回的 226 张 dump 里，停在恒星系视图、三个值框读得出的
+只有 `dump-bot-coord-mismatch-*` 与 `dump-preset-not-found-*` 这两类，共 9 张。
+真值逐张放大目视核对。
+
+⚠️ **另有两张 `184800`／`184824` 没有收**：它们和 `184737` 是同一个坐标、只是被
+浮层压暗了。收进来会把语料从 9 张「涨」到 11 张，而多出来的两张一个新字形都不带
+——**用近似重复把语料撑大，正是当年「九张里八张都是 137」那个坑的另一种形状**。
+
+## 这份语料头一次证明了什么
+
+**「每套配方错法只有丢位」在真像素上是假的。** 135 次读屏里有 6 处替换或凭空多位，
+分布在五套里的三套：
+
+    2x/th140/tight   9  → 3        1x/th170/tight   95 → 35
+    1x/th170/tight   15 → 6        2x/th140/tight  297 → 237
+    3x/th170/tight  297 → 37       3x/th170/tight  189 → 1893
+
+其中 **`15 → 6` 正是生产上那条**（`['6','1','15','15','15']`）—— 从前只在生产日志
+的文字读数里见过，现在有了对应的真像素。
 
 ## 这里守的是什么
 
-**上一版的结论在实机上是错的，这份语料就是为了不再错第二次。** 老注释说选中的
-三套配方「只会读空，不会读错」，依据是九张实拍上「八张全对、零张读错」——可那
-九张里八张的恒星系框都是 `137`，而 `137` 是这套字体里最结实的数，每套配方都读得对。
-语料里压根没有「首位是 2 的多位数」，于是那个结论从来没被考验过。生产
-`system_log` 2026-08-18 给出了反例：**28 次回读、28 次对不上**，`277` 读成 `77`、
-`250` 读成 `50`。同一种错法在这 43 张里也复现得到（`27`→`7`、`52`→`5`）。
-
-所以判据换成两条，**缺一不可**：
-
-1. `PERFECT_SHOTS` / `MISREAD_CELLS` —— 汇总规则跑下来的成绩，读错必须是 0。
-2. `test_every_recipe_in_the_pool_only_ever_drops_digits` —— **池子里每一套配方
-   单独看，在这 43 张上错法只能是漏字**。含替换错法的配方大量进池会把汇总规则
-   带崩（实测把 18 套候选全塞进去，读错格从 0 涨到 9）。
+1. `MISREAD_CELLS` —— **必须是 0，永远只能是 0**。这是整份文件的承重墙。
+2. `PERFECT_SHOTS` / `UNREADABLE_CELLS` —— 成绩，两个方向都不许悄悄变。
+3. `SUBSTITUTING_READS` —— 上面那 6 处。**它不是 0，也不假装是 0**；
+   重挑配方时这个数要降，那才是「配方变好了」的判据。
 
 ## ⚠️⚠️ 这份语料只有成功样本，**它证明不了实机上不出错**
 
-2026-08-25 又栽了一次，还是同一个坑。`agreed_value` 当时的最后一条判据
-（「其余非空读数都必须能解释成漏字」）明写着安全性架在上面第 2 条那条性质上。
-生产读数把那条性质否掉了：`15` 被读成 `6`、`391` 被读成 `3931`、`117` 被读成 `7`
-——替换和凭空多位都有。**而这 43 张里恰好没有 `15`／`6`／`117`／`261`／`391`／`9`
-这几个字形**，所以第 2 条一直是绿的。
+9 张里没有 `117`／`261`／`391` 这几个生产上天天错的字形。这份语料回答的是
+「本来就读得对的格子会不会被弄坏」，另一半在 `tools.nav_readback_replay`——
+它拿几百条**生产失败读数**给候选规则打分。
 
-后果不是「读得差一点」：那条判据反过来否决了正确读数，生产 1290 个值框里
-丢掉 123 个。判据已经窄化，不再依赖那条性质（账在 `agreed_value` 的注释里）。
+**两边都要过。改配方或改汇总规则时只跑一边，就是把这个坑再踩一次。**
 
-⇒ **这份语料回答的是「本来就读得对的格子会不会被弄坏」，不是「实机上会不会出错」。**
-另一半在 `tools.nav_readback_replay`：它拿几百条**生产失败读数**给候选规则打分。
-两边都要过。改配方或改汇总规则时**只跑一边，就是把这个坑再踩一次**。
+字形还在攒：`pirate_loop._value_box_evidence` 每遇到一种没见过的读数形态就把
+三个值框按原分辨率落库，`tools.nav_value_corpus` 把它们捞成这里能用的语料。
 """
 
 from __future__ import annotations
@@ -65,27 +75,60 @@ Image = pytest.importorskip("PIL.Image", reason="requires the vision extra")
 SHOTS = Path("var/logs")
 TRUTH_FILE = Path("var/fixtures/vision/nav_bar_values.json")
 
-#: 语料份数（43 张 × 3 个值框 = 129 个格子），2026-08-18 那一批，全部人工核过。
-CORPUS_SIZE = 43
+#: 语料份数（9 张 × 3 个值框 = 27 个格子），2026-08-25 从实机取回那一批，全部人工核过。
+#:
+#: ⚠️ **这个数只该因为「攒到了新字形」而涨。** 拿近似重复（同一坐标、只是浮层压暗）
+#: 把它撑大，等于回到「九张里八张都是 137」那个坑——数字好看了，覆盖一点没变。
+CORPUS_SIZE = 9
 
 #: 三个格子全读对的份数。
 #:
 #: ⚠️ **这个数是判据，两个方向都不许悄悄变。** 涨上去说明识别变准了（好事，改大），
-#: 掉下来说明有东西回归了。老配方 + 老规则（「首个非空」）在同一批语料上也是 35，
-#: 但那 35 是**带着 3 个读错格**换来的——见下面 `MISREAD_CELLS`。
-PERFECT_SHOTS = 36
+#: 掉下来说明有东西回归了。
+#:
+#: 2026-08-25 窄化否决判据之后，这批语料上按格子算是 **21 对 / 6 空 / 0 错**；
+#: 老判据是 19 / 8 / 0。救回的两格是 `95`（被那个 `35` 一票否决）和
+#: `15`（被那个 `6` 一票否决）——**和生产上救回的 123 格是同一种成因**。
+PERFECT_SHOTS = 4
 
-#: 汇不拢、交空串的格子数（129 格里 7 格）。空串走「读不通就不确认」那一支，
-#: 代价只是下一个目标白设两个字段。**这是承认，不是豁免**：剩下的 7 格是
-#: 6 个「行星框写着两位数、每套配方都只读出一位」加 1 个「单个数字一套都读不出」。
-UNREADABLE_CELLS = 7
+#: 汇不拢、交空串的格子数（27 格里 6 格）。空串走「读不通就不确认」那一支，
+#: 代价只是下一个目标白设两个字段。**这是承认，不是豁免**，六格各自的成因：
+#:
+#:     9   ← ['', '3', '', '', '']                 只有一票，还是替换
+#:     11  ← ['', '1', '', '', '']    （两张）      两位数只读出一位，一票
+#:     12  ← ['', '12', '2', '', '']               对的那个只有一票
+#:     297 ← ['297','237','27','37','97']          五套各说各话，没有一个够票
+#:     189 ← ['189','189','189','1893','189']      ⚠️ 四票的 `189` 被那个 `1893` 否掉
+#:
+#: 最后一条值得单说：**一套配方凭空多读一位，就能否掉四票一致的正确读数。**
+#: 老判据同样交空（`1893` 解释不成 `189` 漏字），所以不是这次窄化造成的；
+#: 但它和生产上 `391 ← [...,'3931',...]` 是同一个形状，说明「尾部多一位」是这套
+#: 配方的一种**反复出现**的错法，重挑配方时该拿它当靶子。
+UNREADABLE_CELLS = 6
 
 #: 读错的格子数。**必须是 0，而且永远只能是 0。**
 #:
 #: ⚠️ 这一条是整份文件的承重墙。读空只是白设两个字段，读错要付的是缓存与导航栏
 #: 分岔——`SystemNavigator` 类注释里那次 136→9，连续 44 个目标核对全不过、13 分钟
-#: 一发没派。老配方 + 老规则在这批语料上是 3。
+#: 一发没派。
 MISREAD_CELLS = 0
+
+#: 单套配方读出「替换或凭空多一位」的次数（27 格 × 5 套 = 135 次读屏里 6 次）。
+#:
+#: ⚠️⚠️ **这个数不是 0，也不许假装是 0。** 这里从前有一条断言它必须是 0 的用例，
+#: 依据是「池子里每套配方错法只有丢位」——`agreed_value` 最后一条判据的安全性
+#: 整个架在那句话上。2026-08-25 生产读数否掉了它，而这份语料头一次在**真像素**上
+#: 复现了：
+#:
+#:     2x/th140/tight   9  → 3        1x/th170/tight   95 → 35
+#:     1x/th170/tight   15 → 6        2x/th140/tight  297 → 237
+#:     3x/th170/tight  297 → 37       3x/th170/tight  189 → 1893
+#:
+#: 五套里有三套会替换。判据已经窄化，不再依赖那条性质。
+#:
+#: 留着这个数是因为它是**重挑配方唯一的靶子**：降下去才叫配方变好了。
+#: 而「把它断言成 0」只会让人再一次挑一批「在手上这点语料里恰好不出错」的配方。
+SUBSTITUTING_READS = 6
 
 pytestmark = pytest.mark.skipif(
     not (SHOTS.exists() and TRUTH_FILE.exists()),
@@ -167,38 +210,59 @@ def test_the_cells_that_stay_unreadable_are_counted_not_hidden(reads, truth) -> 
     assert blank == UNREADABLE_CELLS
 
 
-def test_every_recipe_in_the_pool_only_ever_drops_digits(reads, truth) -> None:  # type: ignore[no-untyped-def]
-    """池子里每一套配方**单独看**，在这 43 张上错法只能是「漏掉了某几位」。
+def test_the_substituting_reads_are_counted_not_wished_away(reads, truth) -> None:  # type: ignore[no-untyped-def]
+    """⚠️⚠️ **单套配方会替换、会凭空多一位。数出来，别断言它是 0。**
 
-    这是**选配方的判据**：被剔掉的 `(3,140)` / `(4,140)` 就是栽在这里，
-    实拍上它们把 `9` 读成 `93`（凭空多一位）。留着它是为了让下一个往池子里加配方
-    的人先过这一关。
+    这里从前是 `test_every_recipe_in_the_pool_only_ever_drops_digits`，断言
+    「池子里每套配方错法只能是漏字」。`agreed_value` 最后一条判据的安全性整个架在
+    那句话上——而**它是假的**。2026-08-25 生产读数先否掉了它，这份语料随后在真像素上
+    复现：135 次读屏里 6 次替换或多位，分布在五套里的三套。
 
-    ## ⚠️⚠️ 但它**不是** `agreed_value` 的安全性依据 —— 这句话曾经写在这里，是错的
+    其中 `15 → 6` 正是生产上那条（`['6','1','15','15','15']`）。
 
-    2026-08-25 之前这段注释写着「`agreed_value` 的安全性整个架在这条性质上」，
-    而那条汇总规则的最后一条判据（「其余非空读数都必须能解释成漏字」）确实照着
-    这句话写的。**生产读数否掉了它**：`15`→`6`、`391`→`3931`、`117`→`7`，
-    替换和多位都有。
+    ⚠️ **为什么改成数而不是继续断言 0。** 那条断言从前一直是绿的，不是因为性质成立，
+    是因为语料里恰好没有会出错的字形——绿灯来自盲区。把它留成 0 只会让下一个人
+    再挑一批「在手上这点语料里恰好不出错」的配方，第三次踩同一个坑。
 
-    这条用例当时是绿的，因为**这 43 张里恰好没有那几个字形**。绿灯来自语料的盲区，
-    不是来自性质成立。判据已经窄化成「只否决『有配方看见了更多位』」，
-    不再依赖这条性质。
-
-    ⇒ 这条用例**红了要重挑配方，绿了什么都不能推论**。实机会不会出错，
-    去看 `tools.nav_readback_replay`。
+    这个数是**重挑配方唯一的靶子**：降下去才叫配方变好了。所以两个方向都钉住——
+    涨了是回归，降了是好事、连同 `SUBSTITUTING_READS` 一起改小。
     """
     from evo_helper.game.system_navigator import _is_dropped_from
 
-    bad = []
-    for name, wanted in truth.items():
-        for index, want in enumerate(wanted):
-            for recipe, text in zip(NAV_VALUE_RECIPES, reads[name][index], strict=True):
-                if not text or text == want:
-                    continue
-                if not (text.isdigit() and _is_dropped_from(text, want)):
-                    bad.append(f"{name} 第 {index} 格 配方 {recipe}：错法不是漏字")
-    assert bad == [], bad
+    substituting = [
+        f"{name} 第 {index} 格 配方 {recipe}：{want} → {text}"
+        for name, wanted in truth.items()
+        for index, want in enumerate(wanted)
+        for recipe, text in zip(NAV_VALUE_RECIPES, reads[name][index], strict=True)
+        if text and text != want and not (text.isdigit() and _is_dropped_from(text, want))
+    ]
+
+    assert len(substituting) == SUBSTITUTING_READS, substituting
+
+
+def test_the_pool_still_has_recipes_that_never_substitute(reads, truth) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 五套里**至少要有两套**从不替换。
+
+    汇总规则的底线是「一票不通过」：一个值要被采纳，得有两套配方读出同一个东西。
+    如果每一套都会替换，那么「两套配方犯同一个臆造」就不再是残余风险，而是常态
+    ——`agreed_value` 注释里明写着那是它挡不住的那一种。
+
+    实测这批语料上 `2x/th200/tight` 与 `2x/th170/wide` 两套一次都没替换过。
+    """
+    from evo_helper.game.system_navigator import _is_dropped_from
+
+    clean = [
+        recipe
+        for position, recipe in enumerate(NAV_VALUE_RECIPES)
+        if not any(
+            text and text != want and not (text.isdigit() and _is_dropped_from(text, want))
+            for name, wanted in truth.items()
+            for index, want in enumerate(wanted)
+            for text in [reads[name][index][position]]
+        )
+    ]
+
+    assert len(clean) >= 2, f"只剩 {clean} 这几套不会替换"
 
 
 def test_at_least_two_recipes_back_every_value_that_gets_adopted(reads, truth) -> None:  # type: ignore[no-untyped-def]
