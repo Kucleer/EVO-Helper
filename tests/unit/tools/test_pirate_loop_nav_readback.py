@@ -396,6 +396,26 @@ class TestTheEvidenceThatGoesIntoTheDatabase:
         assert len(framed) == loop.MAX_NAV_READBACK_FRAMES
 
 
+def _synthetic_frame(digits: tuple[int, int, int]) -> Any:
+    """一张 1920×917 的假整帧：每个值框里画 N 个白方块，当作 N 位数字。
+
+    ⚠️ 合成而不是用实拍：这个文件跑在 CI 里，而**实拍一张都不许进 Git**
+    （`.gitignore` 第二段：公开仓库，值框上就是坐标）。方块之间留 3 列空白，
+    与实测的字间距 1–3 列同量级。
+
+    真像素上的标定另有其处：`tests/integration/vision/test_nav_bar_values_live.py`。
+    """
+    from PIL import Image, ImageDraw
+
+    frame = Image.new("RGB", (1920, 917), (0, 0, 0))
+    pen = ImageDraw.Draw(frame)
+    for count, roi in zip(digits, NAV_VALUE_ROIS, strict=True):
+        for index in range(count):
+            left = roi[0] + 20 + index * 11
+            pen.rectangle([left, roi[1] + 8, left + 7, roi[3] - 8], fill=(255, 255, 255))
+    return frame
+
+
 class TestReadingTheNavigationBar:
     """`_read_navigation_bar` 自己：一帧上跑完全部配方，再交给 `agreed_value` 汇总。"""
 
@@ -419,9 +439,13 @@ class TestReadingTheNavigationBar:
 
         def frame_reader() -> Any:
             loop._captures += 1
-            return read
+            return _synthetic_frame(loop._digits), read
 
         loop._frame_reader = frame_reader
+        #: 这一帧上每个框画几位数字。⚠️ **位数判据是真跑的，不是桩掉的**——
+        #: 用例给的是像素，`digits_on_screen` 自己去数。桩掉它就等于把这一步
+        #: 从「接进去了没有」的检查里摘出去，而这个仓刚为同一类漏子付过账。
+        loop._digits = (1, 3, 2)
         return loop
 
     def _all_recipes(self, values: tuple[str, str, str]) -> dict[tuple[Any, int, int, bool], str]:
@@ -469,15 +493,84 @@ class TestReadingTheNavigationBar:
 
         assert loop._read_navigation_bar().values == ORIGIN_READS
 
-    def test_a_value_only_one_recipe_could_read_is_not_adopted(self) -> None:
-        """一票不算数：只有一套配方读出来的值，交空串。
+    def test_one_recipe_backed_by_the_digit_count_is_enough(self) -> None:
+        """⚠️⚠️ **一票 + 位数对得上 = 采纳。这是 2026-08-25 位数判据带来的改变。**
 
-        这是 `NAV_VALUE_MIN_VOTES` 在读屏这一层的体现。老实现恰恰相反——
-        第一套读出什么就是什么。
+        从前这里断言「一票一律不算数」。那条规矩挡的是老实现「第一套读出什么就是
+        什么」，方向没错，但它把生产上 **134 个格子**一起挡掉了：
+
+            真值 261 ← ['261', '26', '26', '6', '61']
+
+        `261` 只有一票，够票的是截断的 `26`——于是每次都交空串。而屏上明明白白是
+        3 位数字。
+
+        位数是**独立于 OCR 的第二个证人**：`26` 和 `6` 因为位数不符当场出局，
+        剩下唯一的 `261` 就不再是「孤证」了。两份互不依赖的证据，够。
+
+        ⚠️ **孤证还得有旁证。** 这里照生产那一格的形状造：一套读出完整的 `277`，
+        其余读成 `77`、`7` —— 它们**都能解释成 `277` 漏了字**，说的是同一件事，
+        只是各自少看见几位。其余读数一个字都没有时不算旁证，由下一条钉。
+        """
+        answers = self._all_recipes(ORIGIN_READS)
+        truncated = ["77", "7", "77", "7"]
+        for (upscale, threshold, tight), text in zip(NAV_VALUE_RECIPES[1:], truncated):
+            answers[(NAV_VALUE_ROIS[1], upscale, threshold, tight)] = text
+        loop = self._loop_reading(answers)
+
+        assert loop._read_navigation_bar().values == ORIGIN_READS
+
+    def test_a_lone_read_with_nothing_backing_it_is_still_refused(self) -> None:
+        """⚠️⚠️ **孤证 + 没有旁证 = 交空串**，哪怕位数对得上。
+
+        实拍上撞见的那一格：真值 `9`，五套里只有一套吐出 `3`，其余全空。位数数出
+        1 位、`3` 也是 1 位 —— 只看位数就会采纳它，而**没有任何东西支持那个 `3`**。
+
+        这一条是「一票就够」那条放宽的另一半闸。第一版没有它，当场在实拍语料上
+        多出一个读错。
+        """
+        answers = self._all_recipes(ORIGIN_READS)
+        for upscale, threshold, tight in NAV_VALUE_RECIPES:
+            answers.pop((NAV_VALUE_ROIS[0], upscale, threshold, tight), None)
+        first = NAV_VALUE_RECIPES[0]
+        answers[(NAV_VALUE_ROIS[0], first[0], first[1], first[2])] = "3"
+        loop = self._loop_reading(answers)
+
+        assert loop._read_navigation_bar().values == ("", "277", "15")
+
+    def test_a_lone_read_whose_length_contradicts_the_screen_is_refused(self) -> None:
+        """⚠️ 反过来：孤证 + **位数对不上** —— 交空串。
+
+        这一条和上一条是一对，缺了它「一票就够」会退化成无条件的一票通过，
+        也就是 2026-08-18 那个缺陷本体。
+
+        构造：屏上恒星系框是 3 位（`loop._digits` 的中间那个），而唯一读出来的
+        是两位的 `27`。位数这个证人明说「你只看见了一部分」。
         """
         answers = self._all_recipes(ORIGIN_READS)
         for upscale, threshold, tight in NAV_VALUE_RECIPES[1:]:
             answers.pop((NAV_VALUE_ROIS[1], upscale, threshold, tight))
+        first = NAV_VALUE_RECIPES[0]
+        answers[(NAV_VALUE_ROIS[1], first[0], first[1], first[2])] = "27"
+        loop = self._loop_reading(answers)
+
+        assert loop._read_navigation_bar().values == ("4", "", "15")
+
+    def test_the_digit_count_kills_a_unanimous_but_truncated_read(self) -> None:
+        """⚠️⚠️ **五套一致地少读一位，位数判据照样否决。**
+
+        生产 98 次的那一格：真值 `117`，四套读成 `7`、一套读空。票数上它是
+        压倒性的一致，裁决规则里没有任何东西看得出屏上还有两位——**老规则和窄化
+        之后的规则都交出 `7`**，一个错的坐标。
+
+        今天它没闯祸只因为调用方拿它和出发星球比、`7 ≠ 117` 就作废了。可万一哪天
+        出发星球真是 `8:7:6` 而导航栏停在 `8:117:6`，这一格会假确认，接着三格全对
+        就被采纳——正是 `SystemNavigator` 类注释里 136→9 那次事故的形状。
+
+        位数判据是唯一堵得住它的东西：屏上 3 位，`7` 是 1 位，出局。
+        """
+        answers = self._all_recipes(ORIGIN_READS)
+        for upscale, threshold, tight in NAV_VALUE_RECIPES:
+            answers[(NAV_VALUE_ROIS[1], upscale, threshold, tight)] = "7"
         loop = self._loop_reading(answers)
 
         assert loop._read_navigation_bar().values == ("4", "", "15")
