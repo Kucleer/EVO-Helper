@@ -285,3 +285,88 @@ def test_a_driver_that_cannot_screenshot_still_records_the_text(looper) -> None:
     assert recorder.payloads[0]["expected"] == "4:277:15"
     assert "thumbnail_png_base64" not in recorder.payloads[0]
     assert "value_box_png_base64" in recorder.payloads[0]
+
+
+# -- 版本指纹与位数记账 -----------------------------------------------------------
+
+
+def test_the_counted_digits_land_in_the_payload(looper) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **数出来的位数要记进日志。**
+
+    位数是裁决里**唯一不经过 OCR** 的输入，而 `reads` 只记得住 OCR 那一半。
+    少了它，日志里「五套配方读出 `7`、却交了空串」这种事说不清是位数闸挡的、
+    还是别的判据挡的 —— 排障时又要靠猜，而这条链路的规矩是「出事时能只靠库里的
+    日志定位」。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    obj, recorder, module = looper
+    reading = module.NavBarReading(
+        values=("4", "", "15"),
+        reads=(("4",) * 5, ("", "7", "7", "7", "7"), ("15",) * 5),
+        frame=_frame(),
+        digits=(1, 3, 2),
+    )
+
+    obj._record_navigation_bar_mismatch(Coordinate(4, 277, 15), reading)
+
+    assert recorder.payloads[0]["digits_on_screen"] == [1, 3, 2]
+
+
+def test_the_criterion_describes_the_digit_gate_it_actually_ran(looper) -> None:  # type: ignore[no-untyped-def]
+    """⚠️⚠️ **`criterion` 是版本指纹，改了裁决就必须改它。**
+
+    这个字段的用处是让日后复盘（`tools.nav_readback_replay`）知道「这条读数是哪条
+    规则产生的」。2026-08-25 加位数判据时**没改它**，于是 #260 与 #262 两版的
+    `criterion` 一字不差 —— 那条最准的指纹分不出它们，追踪生产版本时只能退回去看
+    行为（`adopted` 里那个 `7` 还在不在）。**判据自述说了假话，比没有更糟。**
+
+    钉法：payload 里既然记了 `digits_on_screen`，那句自述就必须提到位数。
+    这挡不住「加了新判据又忘了改」的所有情形，但挡得住已经犯过的这一种。
+    """
+    from evo_helper.domain.models import Coordinate
+
+    obj, recorder, module = looper
+
+    obj._record_navigation_bar_mismatch(
+        Coordinate(4, 277, 15), _reading(module, ("6", "1", "15", "15", "15"))
+    )
+
+    criterion = recorder.payloads[0]["criterion"]
+    assert "位数" in criterion, f"记了位数却没在判据自述里说：{criterion}"
+    for word in ("票", "取最长", "更多位"):
+        assert word in criterion, f"判据自述漏了「{word}」：{criterion}"
+
+
+def test_the_digits_are_counted_off_the_frame_that_was_read(looper) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 位数和读数必须来自**同一帧**。
+
+    位数是第二个证人，而证人看的必须是同一个现场。两次截屏之间画面动过的话，
+    「屏上 3 位」说的是后一帧、「读出 `26`」说的是前一帧，两份证据各说各话 ——
+    这恰恰是它要解决的那类问题的反面。
+
+    构造：帧上银河系框画 2 个方块、恒星系框 3 个、行星框 1 个，
+    `_read_navigation_bar` 数出来必须正好是 `(2, 3, 1)`。
+    """
+    from PIL import ImageDraw
+
+    from evo_helper.game.system_navigator import NAV_VALUE_RECIPES
+
+    obj, _recorder, module = looper
+    frame = Image.new("RGB", (1920, 917), (0, 0, 0))
+    pen = ImageDraw.Draw(frame)
+    for count, roi in zip((2, 3, 1), NAV_VALUE_ROIS, strict=True):
+        for index in range(count):
+            left = roi[0] + 20 + index * 11
+            pen.rectangle([left, roi[1] + 8, left + 7, roi[3] - 8], fill=(255, 255, 255))
+
+    obj._ocr = lambda *_a, **_k: ""
+    obj._ensure_geometry = lambda: None
+    obj._driver.frame = frame
+    obj._frame_reader = lambda: (frame, lambda *_a, **_k: "")
+
+    reading = obj._read_navigation_bar()
+
+    assert reading.digits == (2, 3, 1)
+    assert reading.frame is frame
+    assert len(reading.reads[0]) == len(NAV_VALUE_RECIPES)
