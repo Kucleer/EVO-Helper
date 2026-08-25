@@ -112,7 +112,9 @@ def _loop(
     loop._outcome = Outcome()
     loop._current_planet = None
     loop._driver = driver
+    # 两个证据预算各自独立：整帧缩略图（排障用）与值框裁片（标定用）。
     loop._nav_readback_dumps = 0
+    loop._nav_value_crop_shapes = set()
     loop._navigator = SystemNavigator(driver)
     # 切完星球停在新星球地表，所以第一次读标签读不到导航栏；切过视图才读得到。
     labels = iter(["行星 舰队 太空舱 商店 联盟"] + ["银河系 恒星系 行星"] * 8)
