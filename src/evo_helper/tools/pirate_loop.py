@@ -111,6 +111,7 @@ from evo_helper.game.overlay import look_at_close_button
 from evo_helper.game.planet_list import NavTargets, PlanetSwitcher, SwitchResult
 from evo_helper.game.preset_picker import PresetNotFound, PresetPicker, name_words
 from evo_helper.game.system_navigator import (
+    NAV_BOX_LABELS,
     NAV_LABEL_ROI,
     NAV_VALUE_MIN_VOTES,
     NAV_VALUE_RECIPES,
@@ -122,6 +123,7 @@ from evo_helper.game.system_navigator import (
     agreed_value,
     crop_reader,
     reads_like_a_dropped_digit,
+    value_box_crops,
 )
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
@@ -130,6 +132,7 @@ from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
+    crop_png_base64,
     make_ocr,
     origin,
     run_with_foreground_guard,
@@ -578,7 +581,8 @@ class ReportIngest(Enum):
 
 
 #: 导航栏三个值框在日志里怎么念。顺序与 `NAV_VALUE_ROIS` 一一对应。
-NAV_BOX_LABELS = ("galaxy", "system", "position")
+#: ⚠️ 真相在 `system_navigator`（和 `NAV_VALUE_ROIS` 住一起）。这里只留个别名，
+#: 免得「加了第四个框、只改了一边」。
 
 
 @dataclass(frozen=True)
@@ -1078,13 +1082,26 @@ class PirateLoop:
     #: 无关。没做成可配置——同 `MAX_COORD_DUMPS`。
     MAX_MAIL_DUMPS: int = 3
 
-    #: 导航栏回读对不上时，最多往 `system_log` 里塞这么多张缩略图（见
+    #: 导航栏回读对不上时，最多往 `system_log` 里塞这么多张**整帧**缩略图（见
     #: `_record_navigation_bar_mismatch`）。**文字每次都记，只有图封顶。**
     #:
     #: 一轮最多触发一次（切出发星球一轮只切一次），所以留 2 是给「同一进程里跑好
     #: 几轮」留的余量。分类同 `MAX_COORD_DUMPS`：**低优先级旋钮，没做成可配置**——
     #: 它只影响排障时手上有几张图，不影响任何判据。
     MAX_NAV_READBACK_FRAMES: int = 2
+
+    #: 值框裁片最多存这么多**种**读数形态。⚠️ **按形态封顶，不是按次数。**
+    #:
+    #: 这两者差别极大：生产 2026-08-19 → 08-25 的 430 次告警里，去重之后只有
+    #: **27 种**读数形态，其中 134 次全是同一颗星球的同一格。按次数封顶（像上面
+    #: 那个整帧缩略图一样留 2 张）会把名额全花在头两次上，而那两次多半是重复的
+    #: —— 攒一个月也只有一两种字形。
+    #:
+    #: 而这些裁片存在的唯一意义是**给标定攒字形**：两次翻车都栽在「语料里恰好没有
+    #: 会出错的那几个数」。所以名额要花在**没见过的形态**上。
+    #:
+    #: 24 这个数：覆盖那 27 种里的绝大部分，一轮几 KB × 24 也就几百 KB。
+    MAX_NAV_VALUE_CROPS: int = 24
 
     #: 起点核对不过时最多存这么多张现场图。**封顶的理由和 `MAX_COORD_DUMPS` 一样**，
     #: 只是这里本来就跑不了几张：核不过就停轮，一轮最多存一张。留 2 是给
@@ -1120,6 +1137,8 @@ class PirateLoop:
         self._mail_dumps = 0
         self._origin_dumps = 0
         self._nav_readback_dumps = 0
+        #: 已经存过裁片的读数形态。见 `MAX_NAV_VALUE_CROPS`：按形态去重，不按次数。
+        self._nav_value_crop_shapes: set[str] = set()
         #: 本趟开工时刻。本轮派出去的侦察/攻击，其报告一定比它新——
         #: 翻信箱时据此早停（见 `MailRow.is_older_than`）。
         self._started_at = datetime.now(UTC)
@@ -4002,6 +4021,41 @@ class PirateLoop:
         )
         self._record_navigation_bar_mismatch(origin, reading)
 
+    def _value_box_evidence(self, frame: Any, reading: NavBarReading) -> dict[str, Any]:
+        """三个值框的**原分辨率**裁片，一种读数形态只存一次。
+
+        ## 为什么整帧缩略图不够用
+
+        那张图是整帧缩到 480 宽的（`EVIDENCE_THUMBNAIL_WIDTH`），1920 → 480 是 4×，
+        于是 135×33 的值框变成 **34×8**，14px 高的数字剩 3.5px。实测那一格是两团
+        糊斑——**数不出屏上是三位数**。而「屏上有几位」正是剩下那 336 个读不出的
+        格子唯一的出路（`agreed_value` 注释里那两组投票形态一样的读数）。
+
+        ## 为什么按形态去重
+
+        生产 2026-08-19 → 08-25 的 430 次告警去重之后只有 **27 种**读数形态，
+        其中 134 次是同一颗星球的同一格。按次数封顶会把名额全花在重复上；
+        而这些裁片存在的唯一意义是**给标定攒字形**——两次翻车都栽在
+        「语料里恰好没有会出错的那几个数」。所以名额要花在没见过的形态上。
+
+        ⚠️ **裁片不做任何预处理**（不缩放、不转灰、不二值化）。配方本身就在调
+        放大倍数和二值化阈值，先处理一道等于把标定的自由度提前焊死——
+        存下来的将是「按今天这套参数处理过的样子」，而不是屏上的样子。
+        """
+        shape = "|".join("/".join(row) for row in reading.reads)
+        if shape in self._nav_value_crop_shapes:
+            return {}
+        if len(self._nav_value_crop_shapes) >= self.MAX_NAV_VALUE_CROPS:
+            return {}
+        try:
+            crops = {label: crop_png_base64(crop) for label, crop in value_box_crops(frame)}
+        except Exception:  # noqa: BLE001 - 同 thumbnail_base64：证据不许把链路弄死
+            return {}
+        if not all(crops.values()):
+            return {}
+        self._nav_value_crop_shapes.add(shape)
+        return {"value_box_png_base64": crops}
+
     def _read_navigation_bar(self) -> NavBarReading:
         """在**同一帧**上把三个值框 × 全部配方读一遍，汇出读数并留下全部原始证据。
 
@@ -4053,17 +4107,23 @@ class PirateLoop:
                 label: list(row) for label, row in zip(NAV_BOX_LABELS, reading.reads, strict=True)
             },
             "verdict": reading.describe_against(origin),
+            # ⚠️ 这句话是**给日后复盘的人看的**：`tools.nav_readback_replay` 拿这些
+            # 读数给候选规则打分时，得知道当时跑的是哪一条。改了规则就要改这里，
+            # 否则几个月后的复盘会拿新规则的名字去解释旧读数。
             "criterion": (
                 f"agreed_value：同一个值至少 {NAV_VALUE_MIN_VOTES} 票、取最长、"
-                "其余非空读数必须是它漏字后的样子"
+                "等长两个则作废、有配方读出更多位则作废"
             ),
         }
         # 名额只在**真的存下了一张图**时才扣。截不了图（轻量驱动、单元测试桩）时
         # 白扣一个名额，等于让后面真能截图的那几轮无图可留。
         capture = getattr(getattr(self, "_driver", None), "capture", None)
-        if callable(capture) and self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
-            self._nav_readback_dumps += 1
-            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
+        if callable(capture):
+            frame = capture()
+            if self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
+                self._nav_readback_dumps += 1
+                payload["thumbnail_png_base64"] = thumbnail_base64(frame)
+            payload.update(self._value_box_evidence(frame, reading))
         record_system_log(
             "WARNING", "tools.pirate_loop", "导航栏回读对不上出发星球", payload=payload
         )

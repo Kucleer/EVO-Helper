@@ -1032,6 +1032,30 @@ def thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
         return ""
 
 
+def crop_png_base64(image: Any) -> str:
+    """一小块裁片，**原分辨率**存成 PNG，base64。失败返回空串。
+
+    与 `thumbnail_base64` 的分工：那个把整帧缩到 480 宽，用来回答「当时屏上大致
+    是什么」；这个一个像素都不缩，用来回答「这几个字到底长什么样」。
+
+    ⚠️ 缩略图那条路**回答不了后一个问题**：1920 → 480 是 4×，导航栏 135×33 的值框
+    变成 34×8，数字剩 3.5px 高，实测就是两团糊斑。而正是「屏上有几位数字」卡住了
+    导航栏回读剩下那 336 个读不出的格子。
+
+    只在裁片上用。整帧原分辨率存进 `system_log` 是另一回事（几百 KB 一张），
+    这里的前提是**块小**——导航栏三个值框合计几 KB。
+    """
+    import base64
+    import io
+
+    try:
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001 - 同 thumbnail_base64：诊断路径不许抛
+        return ""
+
+
 def record_unrecognised_screen(
     image: Any, *, nav_text: str, entry_text: str, now: Callable[[], float] = time.monotonic
 ) -> bool:
