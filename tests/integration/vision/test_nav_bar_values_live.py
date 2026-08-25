@@ -89,22 +89,19 @@ CORPUS_SIZE = 9
 #: 2026-08-25 窄化否决判据之后，这批语料上按格子算是 **21 对 / 6 空 / 0 错**；
 #: 老判据是 19 / 8 / 0。救回的两格是 `95`（被那个 `35` 一票否决）和
 #: `15`（被那个 `6` 一票否决）——**和生产上救回的 123 格是同一种成因**。
-PERFECT_SHOTS = 4
+PERFECT_SHOTS = 5
 
-#: 汇不拢、交空串的格子数（27 格里 6 格）。空串走「读不通就不确认」那一支，
-#: 代价只是下一个目标白设两个字段。**这是承认，不是豁免**，六格各自的成因：
+#: 汇不拢、交空串的格子数（27 格里 4 格）。空串走「读不通就不确认」那一支，
+#: 代价只是下一个目标白设两个字段。**这是承认，不是豁免**，四格各自的成因：
 #:
-#:     9   ← ['', '3', '', '', '']                 只有一票，还是替换
-#:     11  ← ['', '1', '', '', '']    （两张）      两位数只读出一位，一票
-#:     12  ← ['', '12', '2', '', '']               对的那个只有一票
-#:     297 ← ['297','237','27','37','97']          五套各说各话，没有一个够票
-#:     189 ← ['189','189','189','1893','189']      ⚠️ 四票的 `189` 被那个 `1893` 否掉
+#:     9   ← ['', '3', '', '', '']                 孤证且无旁证 —— 见 `_needs_a_second_recipe`
+#:     11  ← ['', '1', '', '', '']    （两张）      屏上 2 位，唯一的读数只有 1 位
+#:     297 ← ['297','237','27','37','97']          过完位数闸剩 297 与 237，各一票，裁不了
 #:
-#: 最后一条值得单说：**一套配方凭空多读一位，就能否掉四票一致的正确读数。**
-#: 老判据同样交空（`1893` 解释不成 `189` 漏字），所以不是这次窄化造成的；
-#: 但它和生产上 `391 ← [...,'3931',...]` 是同一个形状，说明「尾部多一位」是这套
-#: 配方的一种**反复出现**的错法，重挑配方时该拿它当靶子。
-UNREADABLE_CELLS = 6
+#: ⚠️ 2026-08-25 加位数判据之前是 6 格。救回的两格是 `12`（`['','12','2','','']`，
+#: 孤证但 `2` 是它漏字后的样子）和 `189`（`['189','189','189','1893','189']`，
+#: 那个凭空多一位的 `1893` 被位数闸挡掉，剩下四票一致）。
+UNREADABLE_CELLS = 4
 
 #: 读错的格子数。**必须是 0，而且永远只能是 0。**
 #:
@@ -112,6 +109,9 @@ UNREADABLE_CELLS = 6
 #: 分岔——`SystemNavigator` 类注释里那次 136→9，连续 44 个目标核对全不过、13 分钟
 #: 一发没派。
 MISREAD_CELLS = 0
+
+#: 阈值两侧至少要留这么多余量，见 `test_the_ink_threshold_keeps_room_on_both_sides`。
+DIGIT_THRESHOLD_MARGIN = 40
 
 #: 单套配方读出「替换或凭空多一位」的次数（27 格 × 5 套 = 135 次读屏里 6 次）。
 #:
@@ -168,12 +168,87 @@ def reads(ocr, truth):  # type: ignore[no-untyped-def]
     return table
 
 
+@pytest.fixture(scope="module")
+def counted(truth):  # type: ignore[no-untyped-def]
+    """`{文件名: (每个框数出来的位数, ...)}` —— `digits_on_screen` 在真像素上的成绩。"""
+    from evo_helper.game.system_navigator import digits_on_screen
+
+    return {
+        name: tuple(digits_on_screen(Image.open(SHOTS / name).crop(roi)) for roi in NAV_VALUE_ROIS)
+        for name in truth
+    }
+
+
+def _adopted(reads, counted, name: str, index: int) -> str:  # type: ignore[no-untyped-def]
+    """⚠️ 走**线上真正那条路**：位数闸 + 裁决。
+
+    从前这里只调 `agreed_value(reads)`，于是位数判据上线之后这个文件量的仍是
+    没有它的成绩——「守着的东西」和「跑着的东西」是两回事，而这正是这条链路
+    反复付账的那一类漏子。
+    """
+    return agreed_value(reads[name][index], digits=counted[name][index])
+
+
+def test_the_digit_count_is_right_on_every_cell(counted, truth) -> None:  # type: ignore[no-untyped-def]
+    """⚠️⚠️ **位数必须逐格数对。** 这是整个位数判据的地基。
+
+    数错的两个方向都会出事，而且方向相反：
+
+    - **少数**（相邻数字粘成一块）→ `261` 数成 2 位就会采纳截断的 `26`，一个缺了位
+      的坐标；
+    - **多数**（一个数字裂成两块）→ `391` 数成 4 位反而正好配上某套配方臆造的
+      `3931`。
+
+    所以 `NAV_DIGIT_INK_THRESHOLD` 取的是实测安全区间的**正中**，不偏向任何一边。
+    """
+    wrong = [
+        f"{name} 第 {index} 格：真值 {want}（{len(want)} 位）数成了 {counted[name][index]} 位"
+        for name, wanted in truth.items()
+        for index, want in enumerate(wanted)
+        if counted[name][index] != len(want)
+    ]
+
+    assert wrong == [], wrong
+
+
+def test_the_ink_threshold_keeps_room_on_both_sides(truth) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ 阈值不能只是「在这批语料上恰好行」，两边都要留出余量。
+
+    逐格算出「数得对」的阈值区间，取交集。2026-08-25 在 48 格上量到的公共区间是
+    **[130, 236]**（21 张生产裁片 + 这里 27 格），而 `NAV_DIGIT_INK_THRESHOLD = 180`
+    落在正中，两侧各有 50 上下。
+
+    这一条钉的是**余量**而不是那个数本身：哪天新语料把区间挤窄了，它会先红，
+    那时该重新标定，而不是把常量往边上挪一点糊过去。
+    """
+    from evo_helper.game.system_navigator import NAV_DIGIT_INK_THRESHOLD, digits_on_screen
+
+    low, high = 0, 255
+    for name, wanted in truth.items():
+        image = Image.open(SHOTS / name)
+        for roi, want in zip(NAV_VALUE_ROIS, wanted, strict=True):
+            crop = image.crop(roi)
+            import evo_helper.game.system_navigator as nav
+
+            ok = []
+            for value in range(100, 251, 2):
+                nav.NAV_DIGIT_INK_THRESHOLD = value
+                if digits_on_screen(crop) == len(want):
+                    ok.append(value)
+            nav.NAV_DIGIT_INK_THRESHOLD = NAV_DIGIT_INK_THRESHOLD
+            low, high = max(low, min(ok)), min(high, max(ok))
+
+    assert (
+        low + DIGIT_THRESHOLD_MARGIN <= NAV_DIGIT_INK_THRESHOLD <= high - DIGIT_THRESHOLD_MARGIN
+    ), f"安全区间只剩 [{low}, {high}]，而阈值是 {NAV_DIGIT_INK_THRESHOLD}"
+
+
 def test_the_corpus_is_the_size_this_file_talks_about(truth) -> None:  # type: ignore[no-untyped-def]
     """底下几个数都是按这批语料量的；语料换了，那几个数就得重量。"""
     assert len(truth) == CORPUS_SIZE
 
 
-def test_the_pooled_reading_never_gets_a_number_wrong(reads, truth) -> None:  # type: ignore[no-untyped-def]
+def test_the_pooled_reading_never_gets_a_number_wrong(reads, counted, truth) -> None:  # type: ignore[no-untyped-def]
     """⚠️ **一个格子都不许读错。** 读空可以，读错不行。
 
     这正是老版本失守的地方：老注释断言「只会读空不会读错」，实机上却把
@@ -182,30 +257,31 @@ def test_the_pooled_reading_never_gets_a_number_wrong(reads, truth) -> None:  # 
     wrong = []
     for name, wanted in truth.items():
         for index, want in enumerate(wanted):
-            got = agreed_value(reads[name][index])
+            got = _adopted(reads, counted, name, index)
             if got and got != want:
                 # 报错里只说形状，不抄坐标——本仓是公开仓库。
                 wrong.append(f"{name} 第 {index} 格：读出 {len(got)} 位，真值 {len(want)} 位")
     assert len(wrong) == MISREAD_CELLS, wrong
 
 
-def test_the_pooled_reading_gets_this_many_shots_completely_right(reads, truth) -> None:  # type: ignore[no-untyped-def]
+def test_the_pooled_reading_gets_this_many_shots_completely_right(reads, counted, truth) -> None:  # type: ignore[no-untyped-def]
     """三格全对的份数。掉下来就是回归，涨上去把常量改大。"""
     perfect = sum(
         1
         for name, wanted in truth.items()
-        if tuple(agreed_value(row) for row in reads[name]) == tuple(wanted)
+        if tuple(_adopted(reads, counted, name, index) for index in range(len(wanted)))
+        == tuple(wanted)
     )
     assert perfect == PERFECT_SHOTS
 
 
-def test_the_cells_that_stay_unreadable_are_counted_not_hidden(reads, truth) -> None:  # type: ignore[no-untyped-def]
+def test_the_cells_that_stay_unreadable_are_counted_not_hidden(reads, counted, truth) -> None:  # type: ignore[no-untyped-def]
     """读不出来的格子有几个，明写出来。**这是承认，不是豁免。**"""
     blank = sum(
         1
         for name, wanted in truth.items()
         for index in range(len(wanted))
-        if not agreed_value(reads[name][index])
+        if not _adopted(reads, counted, name, index)
     )
     assert blank == UNREADABLE_CELLS
 
@@ -265,19 +341,40 @@ def test_the_pool_still_has_recipes_that_never_substitute(reads, truth) -> None:
     assert len(clean) >= 2, f"只剩 {clean} 这几套不会替换"
 
 
-def test_at_least_two_recipes_back_every_value_that_gets_adopted(reads, truth) -> None:  # type: ignore[no-untyped-def]
-    """采纳的值必须真的有 `NAV_VALUE_MIN_VOTES` 套配方读出来过。
+def test_every_adopted_value_has_either_two_recipes_or_a_corroborated_one(  # type: ignore[no-untyped-def]
+    reads, counted, truth
+) -> None:
+    """采纳一个值要么有两套配方背书，要么**一票 + 位数 + 旁证**三样齐全。
 
-    守的是「一票不通过」这条规矩在真语料上确实兑现了——老规则的「首个非空」
-    等价于一票通过，那就是这次修的缺陷本体。
+    ⚠️ 这里从前断言「必须有 `NAV_VALUE_MIN_VOTES` 票」。2026-08-25 加位数判据时
+    那条口径变了，而**变的理由不是放松，是多了一个证人**：位数
+    （`digits_on_screen`）不经过 OCR，屏上是 3 位这件事和「某套配方读出 261」
+    是两份互不依赖的证据。
+
+    生产上被旧口径挡掉的是 **134 个**格子：
+
+        真值 261 ← ['261', '26', '26', '6', '61']    `261` 只有一票，够票的是截断的 `26`
+
+    ⚠️⚠️ **放宽要带旁证**：其余非空读数必须都能解释成胜出者漏了字（`26`/`6`/`61`
+    对 `261` 就是）。少了这一条，`9 ← ['', '3', '', '', '']` 会被采纳成 `3`
+    ——第一版就是这样，当场在这批语料上多出一个读错。
     """
+    from evo_helper.game.system_navigator import _is_dropped_from
+
     for name, wanted in truth.items():
         for index in range(len(wanted)):
-            got = agreed_value(reads[name][index])
+            got = _adopted(reads, counted, name, index)
             if not got:
                 continue
-            votes = sum(1 for text in reads[name][index] if text == got)
-            assert votes >= NAV_VALUE_MIN_VOTES, f"{name} 第 {index} 格只有 {votes} 票"
+            row = [text for text in reads[name][index] if text.isdigit()]
+            votes = sum(1 for text in row if text == got)
+            if votes >= NAV_VALUE_MIN_VOTES:
+                continue
+            assert len(got) == counted[name][index], f"{name} 第 {index} 格：孤证而位数对不上"
+            others = [text for text in row if text != got]
+            assert others and all(_is_dropped_from(text, got) for text in others), (
+                f"{name} 第 {index} 格：孤证 {got!r} 没有旁证，其余读数是 {others}"
+            )
 
 
 def test_the_value_boxes_sit_above_the_label_row_and_never_overlap_it() -> None:

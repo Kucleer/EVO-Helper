@@ -147,6 +147,60 @@ APPLY_WAIT_S = 2.6
 VIEW_SWITCH_WAIT_S = 2.0
 
 
+#: 数「这一格有几位数字」时，多亮才算墨迹。
+#:
+#: ⚠️ **标定常量。** 2026-08-25 在 48 个真值框上量的（21 张生产裁片 + 27 格本机实拍，
+#: 覆盖 `117`／`261`／`391`／`9` 这些生产上天天错的字形）：**全部数对的公共区间是
+#: [130, 236]，宽 107**，180 落在正中，两边各有 50 上下的余量。
+#:
+#: ⚠️⚠️ **两个方向都会出错，所以取中间而不是偏一边。** 这一点第一版想岔了，
+#: 以为「多数是安全的」：
+#:
+#: - 阈值太低 → 相邻数字粘成一块 → **少数**。`261` 数成 2 位就会采纳截断的 `26`，
+#:   一个缺了位的坐标。
+#: - 阈值太高 → 一个数字裂成两块 → **多数**。`391` 数成 4 位反而正好配上某套配方
+#:   臆造的 `3931`，同样是错的坐标。
+#:
+#: 实测数字之间只隔 1–3 列空白，所以「粘连」不是理论风险；而 240 上就真有格子裂开。
+NAV_DIGIT_INK_THRESHOLD = 180
+
+
+def digits_on_screen(crop: Any) -> int:
+    """这一格里有几位数字。**不认它们是什么，只数有几个。**
+
+    ## 为什么需要一个不认字的数
+
+    `agreed_value` 只看得见「配方读出了什么」。而生产上剩下读不出的那些，
+    **光看读数救不回来**——这两组的投票形态一模一样：
+
+        真值 261 ← ['261','26','26','6','61']       2 票短值 + 1 票长值 → 长的对
+        真值 391 ← ['3','3931','391','331','391']   2 票短值 + 1 票长值 → 短的对
+
+    一个是漏字、一个是多字，票数分不开。**位数是独立于 OCR 的第二个证人**：
+    知道屏上是 3 位，`26` 和 `3931` 当场出局，剩下的那个就是答案。
+
+    ## 怎么数
+
+    按**列投影**：二值化之后，每一列有没有墨迹；连续有墨的列算一段，段数就是位数。
+    对横排数字，这比二维连通块简单也更稳——数字之间必有整列空白，而数字内部没有
+    （实测 48 格，单字最宽 8px，字间空 1–3 列）。
+
+    ⚠️ 不做形态学（腐蚀/膨胀）、不去噪。值框二值化之后本来就干净（见
+    `NAV_VALUE_RECIPES` 那段实测），多一道处理只会多一个要标定的参数。
+    """
+    grey = crop.convert("L")
+    width, height = grey.size
+    pixels = grey.load()
+    digits = 0
+    inked = False
+    for x in range(width):
+        here = any(pixels[x, y] >= NAV_DIGIT_INK_THRESHOLD for y in range(height))
+        if here and not inked:
+            digits += 1
+        inked = here
+    return digits
+
+
 def value_box_crops(image: Any) -> list[tuple[str, Any]]:
     """三个值框的**原分辨率**裁片，`[(框名, 图), ...]`。不缩放、不转灰、不二值化。
 
@@ -194,7 +248,12 @@ def _is_dropped_from(shorter: str, longer: str) -> bool:
     return all(character in remaining for character in shorter)
 
 
-def agreed_value(reads: Sequence[str], *, min_votes: int = NAV_VALUE_MIN_VOTES) -> str:
+def agreed_value(
+    reads: Sequence[str],
+    *,
+    min_votes: int = NAV_VALUE_MIN_VOTES,
+    digits: int | None = None,
+) -> str:
     """一个值框在各套配方下的读数，汇成一个能采纳的值；汇不拢就交空串。
 
     规矩四条：
@@ -255,9 +314,16 @@ def agreed_value(reads: Sequence[str], *, min_votes: int = NAV_VALUE_MIN_VOTES) 
     它不可能等于任何一个坐标分量，当读不出处理。**但调用方仍要把原文记进日志**——
     「读成了什么」是下次校准唯一的线索。
     """
-    values = [text for text in reads if text.isdigit()]
+    everything = [text for text in reads if text.isdigit()]
+    values = everything
+    if digits is not None:
+        # 位数闸：只有长度对得上屏上位数的读数才有资格。见 `digits_on_screen`。
+        values = [text for text in values if len(text) == digits]
+        if not values:
+            return ""
     tally = Counter(values)
-    candidates = [text for text, votes in tally.items() if votes >= min_votes]
+    needed = min_votes if _needs_a_second_recipe(tally, everything, digits) else 1
+    candidates = [text for text, votes in tally.items() if votes >= needed]
     if not candidates:
         return ""
     longest = max(len(text) for text in candidates)
@@ -268,6 +334,38 @@ def agreed_value(reads: Sequence[str], *, min_votes: int = NAV_VALUE_MIN_VOTES) 
     if any(_is_dropped_from(winner, text) for text in values):
         return ""
     return winner
+
+
+def _needs_a_second_recipe(
+    tally: Counter[str], everything: Sequence[str], digits: int | None
+) -> bool:
+    """孤证够不够用。`False` = 一票就可以采纳。
+
+    位数是**独立于 OCR 的第二个证人**，所以「一套配方读出 `261`」+「屏上确实是
+    3 位」原则上是两份互不依赖的证据。少了这条放宽，
+    `261 ← ['261','26','26','6','61']` 过完位数闸只剩一票的 `261`，照旧交空串
+    ——那正是生产上 **134 个**读不出的格子。
+
+    ⚠️⚠️ **但光有位数还不够，还要有旁证。** 第一版只写了「过闸后只剩一个值就放宽」，
+    当场在实拍上引入一个读错：
+
+        真值 9 ← ['', '3', '', '', '']     位数数出 1，`3` 也是 1 位 → 采纳 `3`
+
+    这一格**没有任何东西**支持那个 `3`：其余四套一个字都没读出来。而 `261` 那一格
+    不同——`26`、`6`、`61` 三个读数**全都能解释成 `261` 漏了字**，它们和胜出者说的
+    是同一件事，只是各自少看见了几位。
+
+    所以放宽的条件是：过闸后只剩一个值，**且其余每一个非空读数都是它漏字后的样子**。
+
+    ⚠️ 有意思的是，这正是被 2026-08-25 判掉的那条老判据（「其余非空读数必须能解释成
+    漏字」）。它当年错在被用作**否决胜出者**的一票否决权；用作**给孤证找旁证**的
+    条件却恰到好处——同一句话，位置不同，一个是错的一个是对的。
+    """
+    if digits is None or len(tally) != 1:
+        return True
+    winner = next(iter(tally))
+    others = [text for text in everything if text != winner]
+    return not others or not all(_is_dropped_from(text, winner) for text in others)
 
 
 def reads_like_a_dropped_digit(read: str, wanted: str) -> bool:

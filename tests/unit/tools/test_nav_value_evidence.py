@@ -80,10 +80,11 @@ def test_the_crops_are_not_pre_processed() -> None:
 class _Driver:
     def __init__(self) -> None:
         self.captures = 0
+        self.frame: Any = None
 
     def capture(self) -> Any:
         self.captures += 1
-        return _frame()
+        return self.frame if self.frame is not None else _frame()
 
 
 class _Recorder:
@@ -111,10 +112,63 @@ def looper(monkeypatch):  # type: ignore[no-untyped-def]
 
 
 def _reading(module: Any, position: tuple[str, ...]) -> Any:
+    """⚠️ **`frame` 带的是「读出这些字的那一帧」**，不是随手截的另一张。
+
+    见 `NavBarReading.frame`：第一版落证据时自己又 `capture()` 了一次，存下来的
+    像素与记下来的读数对不上。夹具照着真实契约给，才测得出这件事。
+    """
     return module.NavBarReading(
         values=("4", "277", ""),
         reads=(("4",) * 5, ("277",) * 5, position),
+        frame=_frame(),
     )
+
+
+def test_the_crops_come_from_the_frame_that_was_read(looper) -> None:  # type: ignore[no-untyped-def]
+    """⚠️⚠️ **裁片取自 `reading.frame`，不许另截一张。**
+
+    构造成两者可分辨：`reading.frame` 是纯黑，而驱动的 `capture()` 交的是纯白。
+    存下的裁片必须是黑的——若实现回到「自己再截一张」，它会是白的，当场红。
+
+    这一条钉的是 2026-08-25 撞见的真事：同一条告警日志记着
+    `['261','26','26','6','61']`，拿存下的裁片重跑五套配方却给出
+    `['261','261','26','6','261']` —— 两次截屏之间画面动过。
+    这份语料**唯一的用途**就是拿真像素去标定配方，错配的像素会把标定引向一个
+    根本不存在的问题。
+    """
+    import base64
+    import io
+
+    from evo_helper.domain.models import Coordinate
+
+    obj, recorder, module = looper
+    obj._driver.frame = Image.new("RGB", (1920, 917), (255, 255, 255))
+    black = module.NavBarReading(
+        values=("4", "277", ""),
+        reads=(("4",) * 5, ("277",) * 5, ("6", "1", "15", "15", "15")),
+        frame=Image.new("RGB", (1920, 917), (0, 0, 0)),
+    )
+
+    obj._record_navigation_bar_mismatch(Coordinate(4, 277, 15), black)
+
+    encoded = recorder.payloads[0]["value_box_png_base64"]["galaxy"]
+    saved = Image.open(io.BytesIO(base64.b64decode(encoded)))
+    assert saved.getpixel((0, 0)) == (0, 0, 0), "裁片来自另一帧，不是读出那些字的那一帧"
+
+
+def test_no_frame_means_no_crops_but_the_text_still_lands(looper) -> None:  # type: ignore[no-untyped-def]
+    """轻量驱动截不了图时 `frame` 是 None —— 不落裁片，但那条告警照记。"""
+    from evo_helper.domain.models import Coordinate
+
+    obj, recorder, module = looper
+    reading = module.NavBarReading(
+        values=("4", "277", ""), reads=(("4",) * 5, ("277",) * 5, ("15",) * 5)
+    )
+
+    obj._record_navigation_bar_mismatch(Coordinate(4, 277, 15), reading)
+
+    assert recorder.payloads[0]["expected"] == "4:277:15"
+    assert "value_box_png_base64" not in recorder.payloads[0]
 
 
 def test_the_value_boxes_ride_along_with_the_mismatch_record(looper) -> None:  # type: ignore[no-untyped-def]
@@ -211,7 +265,10 @@ def test_the_whole_frame_thumbnail_keeps_its_own_separate_budget(looper) -> None
 
 
 def test_a_driver_that_cannot_screenshot_still_records_the_text(looper) -> None:  # type: ignore[no-untyped-def]
-    """⚠️ 截不了图（轻量驱动、单元测试桩）时，**文字照记**。
+    """⚠️ 驱动截不了整帧时，**文字照记**，而且裁片照落。
+
+    两者的来源不同：裁片来自 `reading.frame`（读那些字时就已经在手上了），
+    整帧缩略图才需要现截一张。所以「截不了图」只该少掉缩略图那一样。
 
     证据是锦上添花，不许把这条告警本身弄没了——「这一轮一发都不派」的原因
     首先要有一句话说得清。
@@ -226,4 +283,5 @@ def test_a_driver_that_cannot_screenshot_still_records_the_text(looper) -> None:
     )
 
     assert recorder.payloads[0]["expected"] == "4:277:15"
-    assert "value_box_png_base64" not in recorder.payloads[0]
+    assert "thumbnail_png_base64" not in recorder.payloads[0]
+    assert "value_box_png_base64" in recorder.payloads[0]

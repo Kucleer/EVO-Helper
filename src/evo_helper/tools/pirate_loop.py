@@ -122,6 +122,7 @@ from evo_helper.game.system_navigator import (
     SystemNavigator,
     agreed_value,
     crop_reader,
+    digits_on_screen,
     reads_like_a_dropped_digit,
     value_box_crops,
 )
@@ -598,6 +599,19 @@ class NavBarReading:
     values: tuple[str, str, str]
     #: 每个框 × 每套配方的原始读数，外层顺序同 `NAV_VALUE_ROIS`、内层同 `NAV_VALUE_RECIPES`。
     reads: tuple[tuple[str, ...], ...]
+    #: **产生上面那些读数的那一帧。** 落证据时从它裁值框，不许另截一张。
+    #:
+    #: ⚠️⚠️ 第一版就是另截一张（`_record_navigation_bar_mismatch` 里再调一次
+    #: `capture()`），于是**存下来的像素不是读出那些字的像素**。2026-08-25 当场撞见：
+    #: 同一条告警，日志里记的是 `['261','26','26','6','61']`，而拿存下的裁片重跑
+    #: 五套配方给出 `['261','261','26','6','261']` —— 两次截屏之间画面动过。
+    #:
+    #: 后果不是「差一点」：这份语料的**唯一用途**是拿真像素去标定配方，而错配的
+    #: 像素会把标定引向一个不存在的问题。`_frame_reader` 的注释里为「三个框必须同
+    #: 一帧」讲过一模一样的道理，证据这条路当时漏了。
+    #:
+    #: 可空：轻量驱动与单元测试桩截不了图，那时只记文字。
+    frame: Any = None
 
     def describe_against(self, expected: Coordinate) -> str:
         """逐格说清「和期望差在哪」，供日志措辞用。
@@ -1177,16 +1191,24 @@ class PirateLoop:
             roi, digits=digits, upscale=upscale, threshold=threshold
         )
 
-    def _frame_reader(self) -> Callable[..., str]:
-        """抓一帧，交出一个「同一帧上想读几块就读几块」的取字函数。
+    def _frame_reader(self) -> tuple[Any, Callable[..., str]]:
+        """抓一帧，交出 `(那一帧, 同一帧上想读几块就读几块的取字函数)`。
 
         ⚠️ **和 `_read` 的分工：一次判断要读同一帧的多块时走这里。** `_read` 每调
         一次就重新截一张图，而导航栏三个值框 × 五套配方是 15 次读屏——那样不但白截
         15 张，三个框还会来自三个**不同时刻**的画面，而这三个数是要当成一个坐标
         一起判定的。判据里绝不该混进「读第一个框和读第三个框之间画面变了」这种可能。
+
+        ⚠️⚠️ **帧本身也交出去**，因为同一条判据链上还有两处要看这一帧的像素：
+        位数判据（`digits_on_screen`）和落证据的值框裁片。2026-08-25 证据那条路
+        就是自己另截了一张，于是**存下来的像素不是读出那些字的像素**——当场撞见
+        同一条告警日志记着 `['261','26','26','6','61']`、而拿存下的裁片重跑五套配方
+        给出 `['261','261','26','6','261']`。同一个道理、同一个坑，隔了几个方法
+        又踩一次；把帧交出去是从结构上堵住它。
         """
         self._ensure_geometry()
-        return crop_reader(self._driver.capture(), self._ocr)
+        frame = self._driver.capture()
+        return frame, crop_reader(frame, self._ocr)
 
     def _ensure_geometry(self) -> None:
         """每次读屏前核一次视口尺寸，漂了就调回来。
@@ -4067,7 +4089,7 @@ class PirateLoop:
         代价是 15 次 OCR 而不是 3–9 次。实测本机 97 ms/次，合计约 1.5 秒，
         **一轮只跑一次**；而它省下的是 1–2 个字段、每个 6.6 秒。
         """
-        read = self._frame_reader()
+        frame, read = self._frame_reader()
         reads = tuple(
             tuple(
                 read(roi, digits=True, upscale=upscale, threshold=threshold, tight=tight)
@@ -4075,8 +4097,13 @@ class PirateLoop:
             )
             for roi in NAV_VALUE_ROIS
         )
-        values = tuple(agreed_value(row) for row in reads)
-        return NavBarReading(values=(values[0], values[1], values[2]), reads=reads)
+        # ⚠️ 位数从**同一帧**上数。见 `digits_on_screen`：它是独立于 OCR 的第二个
+        # 证人，而证人看的必须是同一个现场。
+        values = tuple(
+            agreed_value(row, digits=digits_on_screen(crop))
+            for row, (_label, crop) in zip(reads, value_box_crops(frame), strict=True)
+        )
+        return NavBarReading(values=(values[0], values[1], values[2]), reads=reads, frame=frame)
 
     def _record_navigation_bar_mismatch(self, origin: Coordinate, reading: NavBarReading) -> None:
         """回读对不上时把证据落库：三个框 × 每套配方的原始读数，外加封顶的一帧。
@@ -4117,13 +4144,15 @@ class PirateLoop:
         }
         # 名额只在**真的存下了一张图**时才扣。截不了图（轻量驱动、单元测试桩）时
         # 白扣一个名额，等于让后面真能截图的那几轮无图可留。
+        # ⚠️ **裁片必须来自读出那些字的那一帧**（`reading.frame`），不许另截一张——
+        # 账在 `NavBarReading.frame` 上。整帧缩略图无所谓：它回答的是「当时屏上大致
+        # 是什么」，晚几百毫秒不影响那句话。
+        if reading.frame is not None:
+            payload.update(self._value_box_evidence(reading.frame, reading))
         capture = getattr(getattr(self, "_driver", None), "capture", None)
-        if callable(capture):
-            frame = capture()
-            if self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
-                self._nav_readback_dumps += 1
-                payload["thumbnail_png_base64"] = thumbnail_base64(frame)
-            payload.update(self._value_box_evidence(frame, reading))
+        if callable(capture) and self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
+            self._nav_readback_dumps += 1
+            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
         record_system_log(
             "WARNING", "tools.pirate_loop", "导航栏回读对不上出发星球", payload=payload
         )
