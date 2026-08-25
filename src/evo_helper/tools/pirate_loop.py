@@ -612,6 +612,14 @@ class NavBarReading:
     #:
     #: 可空：轻量驱动与单元测试桩截不了图，那时只记文字。
     frame: Any = None
+    #: 每个框**数出来**的位数（`digits_on_screen`），顺序同 `NAV_VALUE_ROIS`。
+    #:
+    #: ⚠️ 落进日志是刚需，不是锦上添花。位数是裁决里**唯一不经过 OCR** 的输入，
+    #: 而 `reads` 只记得住 OCR 那一半。少了它，日志里「读出 `7`、却交了空串」
+    #: 这种事说不清是位数闸挡的、还是别的判据挡的——排障时又要靠猜。
+    #:
+    #: 可空：没有帧就数不出位数，那时裁决也不走位数闸。
+    digits: tuple[int, ...] | None = None
 
     def describe_against(self, expected: Coordinate) -> str:
         """逐格说清「和期望差在哪」，供日志措辞用。
@@ -4099,11 +4107,13 @@ class PirateLoop:
         )
         # ⚠️ 位数从**同一帧**上数。见 `digits_on_screen`：它是独立于 OCR 的第二个
         # 证人，而证人看的必须是同一个现场。
+        counted = tuple(digits_on_screen(crop) for _label, crop in value_box_crops(frame))
         values = tuple(
-            agreed_value(row, digits=digits_on_screen(crop))
-            for row, (_label, crop) in zip(reads, value_box_crops(frame), strict=True)
+            agreed_value(row, digits=count) for row, count in zip(reads, counted, strict=True)
         )
-        return NavBarReading(values=(values[0], values[1], values[2]), reads=reads, frame=frame)
+        return NavBarReading(
+            values=(values[0], values[1], values[2]), reads=reads, frame=frame, digits=counted
+        )
 
     def _record_navigation_bar_mismatch(self, origin: Coordinate, reading: NavBarReading) -> None:
         """回读对不上时把证据落库：三个框 × 每套配方的原始读数，外加封顶的一帧。
@@ -4134,13 +4144,21 @@ class PirateLoop:
                 label: list(row) for label, row in zip(NAV_BOX_LABELS, reading.reads, strict=True)
             },
             "verdict": reading.describe_against(origin),
-            # ⚠️ 这句话是**给日后复盘的人看的**：`tools.nav_readback_replay` 拿这些
-            # 读数给候选规则打分时，得知道当时跑的是哪一条。改了规则就要改这里，
-            # 否则几个月后的复盘会拿新规则的名字去解释旧读数。
+            # ⚠️⚠️ 这两个字段是**版本指纹**，`criterion` 尤其是：`tools.nav_readback_replay`
+            # 拿这些读数给候选规则打分时，得知道当时跑的是哪一条规则。
+            #
+            # **改了裁决就必须改这里。** 上面这句话第一版就写着，而 2026-08-25 加位数
+            # 判据时我没改它——于是 #260 和 #262 两版的 `criterion` 一字不差，那条最准的
+            # 指纹分不出它们，只能退回去看行为（`adopted` 里那个 `7` 还在不在）。
+            # 判据自述说了假话，比没有更糟。
             "criterion": (
-                f"agreed_value：同一个值至少 {NAV_VALUE_MIN_VOTES} 票、取最长、"
-                "等长两个则作废、有配方读出更多位则作废"
+                f"agreed_value：数出屏上位数后只留长度相符的读数；同一个值至少 "
+                f"{NAV_VALUE_MIN_VOTES} 票（过闸后只剩一个值、且其余读数都是它漏字后的"
+                "样子时一票即可）、取最长、等长两个则作废、有配方读出更多位则作废"
             ),
+            # 数出来的位数。见 `NavBarReading.digits`：裁决里唯一不经过 OCR 的输入，
+            # 不记下来的话「为什么交了空串」在日志里说不清。
+            "digits_on_screen": None if reading.digits is None else list(reading.digits),
         }
         # 名额只在**真的存下了一张图**时才扣。截不了图（轻量驱动、单元测试桩）时
         # 白扣一个名额，等于让后面真能截图的那几轮无图可留。
