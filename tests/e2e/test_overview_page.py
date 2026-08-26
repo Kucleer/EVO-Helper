@@ -40,8 +40,8 @@ from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.web import app as web_package
 from evo_helper.web import overview_routes
 from evo_helper.web.app import create_persistent_app
+from support.attack_config import set_score_window
 from support.database import scratch_database_url
-from tests.integration.application.test_mission_scheduler import set_score_window
 
 NOW = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
 TOKEN = "test-token"
