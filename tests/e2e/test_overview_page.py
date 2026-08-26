@@ -41,6 +41,7 @@ from evo_helper.web import app as web_package
 from evo_helper.web import overview_routes
 from evo_helper.web.app import create_persistent_app
 from support.database import scratch_database_url
+from tests.integration.application.test_mission_scheduler import set_score_window
 
 NOW = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
 TOKEN = "test-token"
@@ -510,6 +511,112 @@ def test_the_candidate_pool_still_counts_the_disabled_planets(
     assert "没有配着出发星球，算不出往返时长" not in html, "池子不该因为任务停用就算不出分档"
 
 
+def _seed_score(repository: SqlAlchemyRepository, at: Coordinate, *, hours_ago: float) -> None:
+    """给一个坐标写一条军力读数，时刻是 **`NOW` 之前几小时**。
+
+    ⚠️ **必须相对 `NOW`，不是 `datetime.now()`。** 这个文件里页面的时钟是冻结的
+    （`clock=lambda: NOW`），而真实当下是别的日子 —— 按真实时间种读数等于种到页面
+    眼里的**未来**，于是不管配的有效期多短，它永远算「新鲜」，用例测不出任何东西。
+    """
+    from evo_helper.domain.records import RankingTarget
+
+    repository.save_ranking_targets(
+        [
+            RankingTarget(
+                coordinate=at,
+                military_score=4321.0,
+                military_score_at_utc=NOW - timedelta(hours=hours_ago),
+                military_score_estimated=False,
+                military_rank=None,
+            )
+        ]
+    )
+
+
+def _galaxy_row(html: str, galaxy: int) -> str:
+    """候选池那张表里某个银河那一行的原文。"""
+    import re
+
+    match = re.search(rf'<td class="who">{galaxy} 系.*?</tr>', html, re.S)
+    assert match, f"候选池表里没有 {galaxy} 系那一行"
+    return match.group(0)
+
+
+def test_the_three_cards_share_the_window_from_the_attack_config(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️⚠️ **三格共用攻击配置里的「有效期」，不是这一页自己定的数。**
+
+    用户口径（2026-08-26）：「统一为读取攻击配置，跟着配置走。我这里要看的就是
+    动态数据来让我决策的」。从前「各银河新鲜读数」那格写死 6 小时 —— 一个只有这一页
+    认的数。用户把有效期从 3 小时改成 1 小时，页面照旧按 6 小时报「读数很足」，
+    而选靶那边早就一个都不认了：**页面说的话和派遣做的事相反**。
+
+    两个不同的值各断言一次：只断言一个的话，写死成那个数照样绿。
+    """
+    set_score_window(repository, max_age_hours=3.0)
+    assert client.get("/overview").text.count("有效期 3.0h 内") == 2
+
+    set_score_window(repository, max_age_hours=1.5)
+    assert client.get("/overview").text.count("有效期 1.5h 内") == 2
+
+
+def test_a_stale_reading_is_left_out_of_every_card(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️⚠️ 读数过期的目标**三格都不算**。
+
+    用户口径（2026-08-26）：「候选池 · 按星系 这里的数据范围也要新鲜度一致」。
+
+    ⚠️ 构造成读数 **4 小时前**：比配的有效期（2 小时）旧、却比从前写死的 6 小时新。
+    只有这样才分得出「真读了配置」和「照旧按 6 小时算」—— 两个窗口都覆盖得到的读数，
+    两种实现给出的答案一样，测不出任何东西。
+    """
+    set_score_window(repository, max_age_hours=2.0)
+    _seed_score(repository, Coordinate(FAR_GALAXY, 123, 7), hours_ago=4.0)
+
+    html = client.get("/overview").text
+
+    assert f"{FAR_GALAXY} 系" not in html, "过期读数还留在页面上（写死 6 小时的话它会在）"
+
+
+def test_a_fresh_reading_shows_up_in_the_pool_table(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """反过来：窗口内的读数要出现在候选池那张表里，并且带上银河的配置状态。
+
+    这一条和上一条是一对 —— 少了它，「一个都不显示」也能让上一条绿。
+    """
+    set_score_window(repository, max_age_hours=2.0)
+    _seed_score(repository, Coordinate(FAR_GALAXY, 123, 7), hours_ago=0.2)
+
+    row = _galaxy_row(client.get("/overview").text, FAR_GALAXY)
+
+    assert "未配" in row, "没配星球的银河要标出来"
+
+
+def test_the_pool_table_still_lists_a_disabled_galaxy(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️⚠️ **任务停用的银河照样列在候选池表里。**
+
+    用户口径（2026-08-26）：「候选池不用跟着走，我就是根据候选池的情况来调整攻击
+    航路以达到最大化」。要判断那条航路值不值得开，就得先看得见它开了之后有多少目标
+    ——跟着「未启用不显示」走的话，那个问题再也问不出来。
+
+    ⚠️ 和航线卡片那一侧**故意不同口径**：那边停用就不画（用户口径第一条），
+    这边停用照列。两处不一致是有意的，不是漏改。
+    """
+    set_score_window(repository, max_age_hours=2.0)
+    _seed_score(repository, SECOND, hours_ago=0.2)
+    repository.update_mission_task(_bot_task_id(repository), enabled=False)
+
+    html = client.get("/overview").text
+
+    assert "航线 · " not in html, "航线卡片那一侧该跟着停用走"
+    assert "停" in _galaxy_row(html, SECOND.galaxy), "候选池表里该标着「停」"
+
+
 def test_the_galaxy_freshness_card_lists_every_galaxy(
     client: TestClient, repository: SqlAlchemyRepository, planets: None
 ) -> None:
@@ -795,7 +902,7 @@ def test_the_unread_card_ignores_the_historic_backlog(
     )
 
     html = client.get("/overview").text
-    card = html[html.index("未读战报") : html.index("候选池按往返时长")]
+    card = html[html.index("未读战报") : html.index("候选池 · 按星系")]
     big = re.search(r'<div class="value[^"]*">\s*(\d+)', card)
 
     assert big is not None

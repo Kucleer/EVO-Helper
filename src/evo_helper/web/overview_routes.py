@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -51,7 +52,7 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.application.mission_scheduler import MissionScheduler
+from evo_helper.application.mission_scheduler import ConfiguredOrigin, MissionScheduler
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.flight_time import round_trip_hours
 from evo_helper.domain.models import Coordinate
@@ -78,6 +79,7 @@ from evo_helper.domain.overview import (
     utilisation,
 )
 from evo_helper.domain.records import BattleResourceEntry
+from evo_helper.domain.target_order import ScoredTarget
 from evo_helper.domain.uptime import partially_observed, uptime_seconds
 from evo_helper.infrastructure.system_log import record_system_log
 from evo_helper.storage.overview import (
@@ -93,8 +95,15 @@ from evo_helper.web.resource_icons import PANEL_SIZE, ResourceIconCache
 
 _LOGGER = logging.getLogger(__name__)
 
-#: 「各银河 N 小时内新鲜读数」那一格的窗口。
-FRESHNESS_WINDOW = timedelta(hours=6)
+#: ⚠️ **「新鲜」的窗口不在这里定，它读攻击配置里的有效期。**
+#:
+#: 从前这里是 `FRESHNESS_WINDOW = timedelta(hours=6)`，一个只有这一页认的数。
+#: 用户口径（2026-08-26）：「统一为读取攻击配置，跟着配置走。我这里要看的就是
+#: 动态数据来让我决策的」。走 `MissionScheduler.score_max_age()`
+#: （`military_attack_config.score_max_age_hours`，页面上叫**有效期**）。
+#:
+#: 「此刻」区那三格（候选池按星系、星系质量、各银河新鲜读数）**共用这一个窗口**：
+#: 它们摆在同一行给人横着比，窗口不一致的话比出来的结论是假的。
 
 #: 候选池按往返时长分的档（**小时**上界，最后一档是「以上」）。
 #:
@@ -220,6 +229,36 @@ class PoolBucket:
 
 
 @dataclass(frozen=True, slots=True)
+class GalaxyPool:
+    """候选池在**一个银河**里的样子：按往返时长分档 + 一个成色系数。
+
+    用户口径（2026-08-26）：「我关心的是每个星系内 0-30 分钟有多少、30-60 分钟有
+    多少……如果近距离航线太少了，我会考虑减少航线数量」，以及后来那句
+    「候选池 · 按星系 这里的数据范围也要新鲜度一致」。
+
+    ⚠️ **只数有效期内有读数的目标。** 池子里还有几千个读数早就过期的，选靶那一步
+    根本不认它们——把它们算进来，这一格会报出一个攻击链此刻用不上的数。
+    """
+
+    galaxy: int
+    #: 这个银河配了几条航线；没配星球时 0。
+    lines: int
+    configured: bool
+    enabled: bool
+    #: 各档个数，与 `POOL_BUCKETS` 对齐（最后一项是「以上」那一档）。
+    bands: tuple[int, ...]
+    #: 成色：**每个 bot 各自**「军力 ÷ 往返小时」，再取均值。
+    #:
+    #: ⚠️ 用户口径（2026-08-26）：「记得你是需要按各个 bot 星球去单独做除法，
+    #: 再合计。而不是反过来」——即 `mean(军力ᵢ ÷ 往返ᵢ)`，不是
+    #: `总军力 ÷ 总往返`。后者会被一个又远又肥的目标拉偏，而选靶真正按的是前者
+    #: （`domain.target_order` 里那条 `军力 ÷ 往返小时`）。
+    quality: float | None
+    #: 参与算成色的个数（取前 `window_floor` 个，不足就是全部）。
+    counted: int
+
+
+@dataclass(frozen=True, slots=True)
 class TodayCard:
     rare: tuple[ResourceCell, ...]
     yesterday: dict[int, int]
@@ -292,6 +331,14 @@ class NowView:
     unread: UnreadReports
     pool_total: int
     pool_buckets: tuple[PoolBucket, ...]
+    #: 候选池按银河拆开的那张卡。
+    pool_galaxies: tuple[GalaxyPool, ...]
+    #: 上面那张卡里参与统计的总数（有效期内有读数的），不是 `pool_total`。
+    pool_fresh_total: int
+    #: 各档的表头，与 `GalaxyPool.bands` 一一对应。
+    pool_band_labels: tuple[str, ...]
+    #: 那三格共用的窗口，页面照抄不解释——来自攻击配置的有效期。
+    score_max_age_hours: float
     pool_unscored: int
     galaxies: tuple[GalaxyFreshness, ...]
     today: TodayCard
@@ -512,7 +559,18 @@ def build_now_view(
     reachable = [
         (item.coordinate, item.fleet_lines) for item in scheduler.configured_line_origins()
     ]
-    pool_total, pool_buckets, pool_unscored = _pool_view(scheduler, reachable)
+    pool = scheduler.military_candidate_pool()
+    max_age = scheduler.score_max_age()
+    pool_total, pool_buckets, pool_unscored = _pool_view(pool, reachable)
+    # ⚠️ 「此刻」区那三格（候选池按星系、星系质量、各银河新鲜读数）**共用这一份**：
+    # 它们摆在同一行给人横着比，各筛各的话比出来的结论是假的。
+    fresh = _fresh_enough(pool, now_utc=now_utc, window=max_age)
+    galaxies = _pool_by_galaxy(
+        fresh,
+        configured=scheduler.configured_line_origins(),
+        enabled_tasks=scheduler.configured_line_origins(enabled_tasks_only=True),
+        floor=scheduler.window_floor(),
+    )
     cards = tuple(_line_card(item) for item in usage)
     return NowView(
         now_utc=now_utc,
@@ -523,7 +581,11 @@ def build_now_view(
         pool_total=pool_total,
         pool_buckets=pool_buckets,
         pool_unscored=pool_unscored,
-        galaxies=repository.galaxy_freshness(now_utc=now_utc, window=FRESHNESS_WINDOW),
+        pool_galaxies=galaxies,
+        pool_fresh_total=len(fresh),
+        pool_band_labels=_bucket_labels(),
+        score_max_age_hours=round(max_age.total_seconds() / 3600, 1),
+        galaxies=_galaxy_freshness(fresh),
         today=_today_card(repository, now_utc=now_utc, today_start=today_start, hold=hold),
     )
 
@@ -585,8 +647,106 @@ def _run_outcome(exit_code: int | None, stopped_by: str | None) -> str:
     )
 
 
+def _fresh_enough(
+    pool: Sequence[ScoredTarget], *, now_utc: datetime, window: timedelta
+) -> tuple[ScoredTarget, ...]:
+    """池子里**读数还在有效期内**的那些。
+
+    ⚠️ 从同一个元组上分，**不是各查一遍库**。抄一份筛选出来，下次有人在攻击配置页
+    加一条排除规则，那几格就又分岔了——而这种分岔是**看不出来的**：2026-08-26 实测
+    「候选池」与「各银河新鲜读数」两格数字碰巧一模一样（891 = 891），因为刚扫到的
+    bot 恰好都还在池子里。巧合不是保证。
+    """
+    since = now_utc - window
+    return tuple(
+        target
+        for target in pool
+        if target.military_score is not None
+        and target.military_score_at_utc is not None
+        and target.military_score_at_utc >= since
+    )
+
+
+def _pool_by_galaxy(
+    fresh: Sequence[ScoredTarget],
+    *,
+    configured: Sequence[ConfiguredOrigin],
+    enabled_tasks: Sequence[ConfiguredOrigin],
+    floor: int,
+) -> tuple[GalaxyPool, ...]:
+    """候选池按银河拆开：各档个数 + 成色。
+
+    ## 往返时长从哪颗星球算
+
+    有本银河的出发星球就用它；**没配星球的银河按最近的那颗算**（同 `_pool_view`
+    的口径）。那种银河的目标会整体落进最后一档——那正是实情：要跨银河飞过去。
+    3 系、6 系今天就是这样，池子最大却一个近的都没有。
+
+    ## ⚠️ 停用的银河照样列出来
+
+    用户口径（2026-08-26）：「候选池不用跟着走，我就是根据候选池的情况来调整攻击
+    航路以达到最大化」。要判断「9 系那条航路值不值得开」，就得先看得见它开了之后
+    有多少目标、成色如何——跟着「未启用不显示」走的话，那个问题再也问不出来。
+    """
+    homes = {item.coordinate.galaxy: item for item in configured}
+    on = {item.coordinate.galaxy for item in enabled_tasks if item.enabled}
+    anywhere = [item.coordinate for item in configured]
+    grouped: dict[int, list[ScoredTarget]] = {}
+    for target in fresh:
+        grouped.setdefault(target.coordinate.galaxy, []).append(target)
+
+    def hours(target: ScoredTarget, galaxy: int) -> float:
+        home = homes.get(galaxy)
+        if home is not None:
+            return round_trip_hours(target.coordinate, home.coordinate)
+        return min(round_trip_hours(target.coordinate, other) for other in anywhere)
+
+    out: list[GalaxyPool] = []
+    for galaxy, targets in grouped.items():
+        if not anywhere:
+            # 一颗星球都没配时算不出往返时长，这一格整块交空——同 `_pool_view`。
+            return ()
+        bands = [0] * (len(POOL_BUCKETS) + 1)
+        values: list[float] = []
+        for target in targets:
+            spent = hours(target, galaxy)
+            bands[
+                next(
+                    (slot for slot, ceiling in enumerate(POOL_BUCKETS) if spent < ceiling),
+                    len(POOL_BUCKETS),
+                )
+            ] += 1
+            # ⚠️ **逐个 bot 各自相除**，不是总军力 ÷ 总往返。见 `GalaxyPool.quality`。
+            values.append(cast(float, target.military_score) / spent)
+        values.sort(reverse=True)
+        taken = values[:floor] if floor > 0 else values
+        out.append(
+            GalaxyPool(
+                galaxy=galaxy,
+                lines=homes[galaxy].fleet_lines if galaxy in homes else 0,
+                configured=galaxy in homes,
+                enabled=galaxy in on,
+                bands=tuple(bands),
+                quality=statistics.mean(taken) if taken else None,
+                counted=len(taken),
+            )
+        )
+    # 按成色降序：这一格是拿来挑「该给谁加线」的，最肥的排最上面。
+    # 并列按银河号，免得次序随字典序抖。
+    return tuple(sorted(out, key=lambda item: (-(item.quality or 0.0), item.galaxy)))
+
+
+def _galaxy_freshness(fresh: Sequence[ScoredTarget]) -> tuple[GalaxyFreshness, ...]:
+    """各银河有几个新鲜读数。**从上面那一份分**，不另查一遍库。"""
+    tally = Counter(target.coordinate.galaxy for target in fresh)
+    return tuple(
+        GalaxyFreshness(galaxy=galaxy, fresh=count)
+        for galaxy, count in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+
+
 def _pool_view(
-    scheduler: MissionScheduler, origins: list[tuple[Coordinate, int]]
+    pool: Sequence[ScoredTarget], origins: list[tuple[Coordinate, int]]
 ) -> tuple[int, tuple[PoolBucket, ...], int]:
     """候选池按**往返时长**分档。
 
@@ -597,7 +757,6 @@ def _pool_view(
     往返时长按**最近的那颗出发星球**算：一个目标只要有一颗星球够得着就够得着，
     拿最远的那颗去分档会把它整体推到「跨银河」那一档里。
     """
-    pool = scheduler.military_candidate_pool()
     if not origins:
         return len(pool), (), sum(1 for item in pool if item.military_score is None)
     buckets = [0] * (len(POOL_BUCKETS) + 1)
@@ -858,6 +1017,11 @@ def _empty_now_view(now: datetime) -> NowView:
         pool_total=0,
         pool_buckets=(),
         pool_unscored=0,
+        # 查询整趟失败时这三格一个字都不写：宁可空着，也不许摆一个看着正常的 0。
+        pool_galaxies=(),
+        pool_fresh_total=0,
+        pool_band_labels=(),
+        score_max_age_hours=0.0,
         galaxies=(),
         today=TodayCard(
             rare=(),
@@ -889,8 +1053,8 @@ def _empty_now_view(now: datetime) -> NowView:
 
 
 __all__ = [
-    "FRESHNESS_WINDOW",
     "POOL_BUCKETS",
+    "GalaxyPool",
     "LineCard",
     "LineTotals",
     "NowView",
