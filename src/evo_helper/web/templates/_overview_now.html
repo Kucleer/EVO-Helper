@@ -35,6 +35,32 @@
     </b></div>
   </div>
 
+  {#
+    航线合计，**摆在各星球卡片之前**：它是总览，读的人先看总数再看是哪一颗满了
+    （用户口径 2026-08-26「增加总航线卡片显示合计情况」）。
+
+    ⚠️ **不画格子。** 格子说的是「这颗星球上的这几条航线」；把两颗星球的格子并
+    成一排等于说它们能互相顶替，而一颗星球上空着的航线派不了另一颗星球的舰队。
+
+    一张卡都没有时不画它——那时候下面那条空态分支已经把话说完了，再摆一张
+    「0 / 0 条占用」只是让人多看一遍 0。
+  #}
+  {% if now.lines %}
+    <div class="tile overview-card">
+      <div class="label">航线合计 <span class="muted">共 {{ now.line_totals.origins }} 颗星球</span></div>
+      <div class="value {% if now.line_totals.all_full %}tone-warn{% else %}tone-accent{% endif %}">
+        {{ now.line_totals.holding }}<span class="overview-unit">/ {{ now.line_totals.configured_lines }} 条占用{% if now.line_totals.all_full %}（全满）{% endif %}</span>
+      </div>
+      <div class="overview-note">最早空出
+        {% if now.line_totals.next_free_at_utc %}
+          <b class="tone-accent">{{ local_time(now.line_totals.next_free_at_utc) }}</b>
+        {% else %}
+          <b class="muted">—</b>
+        {% endif %}
+      </div>
+    </div>
+  {% endif %}
+
   {% for line in now.lines %}
     <div class="tile overview-card">
       <div class="label">航线 · {{ line.origin }} <span class="muted">配置 {{ line.configured_lines }} 条</span></div>
@@ -62,10 +88,19 @@
       </div>
     </div>
   {% else %}
+    {#
+      ⚠️ 这句话原先写的是「没有配着出发星球的军力攻击任务」，而自 2026-08-26 起
+      这一支还会被「配着、但停用了」走到（用户口径：未启用的任务不显示），那时候
+      那句话就是**假的**——任务配得好好的，只是勾去掉了。改成「没有启用的」之后，
+      三种情形（没有这条链路 / 任务停用 / 星球那个勾去掉）说的都是同一件真事：
+      此刻一颗都派不出去。⚠️ 不在这里分辨是哪一种：那要么得把三句话都写上、要么
+      得加一行小字，而用户口径 2026-08-19 是「不留小字」；哪个任务停着，
+      任务管理页上一眼就看得见。
+    #}
     <div class="tile overview-card">
       <div class="label">航线</div>
       <div class="value muted">—</div>
-      <div class="overview-note">没有配着出发星球的军力攻击任务</div>
+      <div class="overview-note">没有启用的军力攻击出发星球</div>
     </div>
   {% endfor %}
 </div>
@@ -90,6 +125,10 @@
     {% for bucket in now.pool_buckets %}
       <div class="overview-kv"><span>{{ bucket.label }}</span><b class="{% if loop.last %}tone-accent{% elif bucket.count == 0 %}muted{% endif %}">{{ bucket.count }} 个</b></div>
     {% else %}
+      {# ⚠️ 这里仍然是「配着的」，**没有**跟着上面那张航线卡改成「启用的」。
+         候选池按**所有配着的**出发星球算往返时长（用户口径 2026-08-26：
+         「候选池不用跟着走，我就是根据候选池的情况来调整攻击航路以达到最大化」），
+         所以这句话只在一颗都没配的时候才成立，那时它是真的。 #}
       <div class="overview-note">没有配着出发星球，算不出往返时长</div>
     {% endfor %}
     {% if now.pool_unscored %}

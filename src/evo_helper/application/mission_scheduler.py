@@ -1238,8 +1238,10 @@ class MissionScheduler:
         """
         return self._unknown_line_hold()
 
-    def configured_line_origins(self) -> tuple[ConfiguredOrigin, ...]:
-        """**参与调度的军力攻击任务**此刻配着的那几颗出发星球，含停用的。
+    def configured_line_origins(
+        self, *, enabled_tasks_only: bool = False
+    ) -> tuple[ConfiguredOrigin, ...]:
+        """军力攻击任务此刻配着的那几颗出发星球，含停用的。
         **读侧的公开入口**，同 `unknown_line_hold`。
 
         公开出来是给数据概览页画航线格子用的（需求文档 8.3）：格子数必须按
@@ -1254,6 +1256,20 @@ class MissionScheduler:
         同一批航线，分成两行画等于把一条航线画两遍。眼下只有一个军力任务，
         这一条是为多任务那天先把语义定死。
 
+        ⚠️ **「停用」有两级，返回值里只带得动一级。** 出发星球那个勾走
+        `ConfiguredOrigin.enabled`（`mission_task_origins.enabled`）；而**任务
+        自己那个复选框**（`mission_tasks.enabled`）在返回值里一个字都没有——
+        坐标合并之后连是哪个任务配的都看不出来了。所以「任务停用了就当没配」
+        这件事只能在这里判，`enabled_tasks_only=True` 就是那道闸。
+        少了这道闸的症状：用户把整个军力任务的勾去掉，数据概览页照旧给那几颗
+        星球画卡片（0 条占用、格子全空），看上去像是链路活着只是没派出去。
+
+        默认 `False`（照旧连停用的任务一起带出来），因为固化与统计两侧要的正是
+        「配着什么」而不是「此刻会不会派」：`_configured_line_total` 写进
+        `mission_runs.configured_lines` 的是那一轮的分母，
+        `web.origin_efficiency` 要把停用的星球也列进当天的账
+        （它当天真把活打出去了）。**要按「此刻会不会派」看的只有数据概览页**。
+
         按坐标排序，好让页面上的卡片次序不随库里的行序抖动。
         """
         merged: dict[Coordinate, ConfiguredOrigin] = {}
@@ -1261,6 +1277,8 @@ class MissionScheduler:
             if MissionKind(row.kind) is not MissionKind.BOT or not _bot_by_military(
                 row.params_json
             ):
+                continue
+            if enabled_tasks_only and not row.enabled:
                 continue
             for item in self._configured_origins(row):
                 seen = merged.get(item.coordinate)

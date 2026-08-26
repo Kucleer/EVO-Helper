@@ -49,6 +49,10 @@ TOKEN = "test-token"
 HOME = Coordinate(4, 277, 15)
 SECOND = Coordinate(9, 250, 8)
 HOME_LINES = 5
+
+#: 一颗星球都没配的银河。用来钉「新鲜读数那张卡列全部星系」——拿配着星球的银河
+#: 试是试不出来的，那种银河两种口径下都会出现。
+FAR_GALAXY = 6
 SECOND_LINES = 4
 
 
@@ -108,11 +112,17 @@ def planets(repository: SqlAlchemyRepository) -> None:
 
     两颗配成同一个数的话，「格子按每颗星球各自的配置画」这条就守不住了——
     写死一个常量也能过。
+
+    ⚠️ **任务还得勾上**（`enabled=True`）：种子行建出来是不参与调度的
+    （`_MISSION_SEEDS` 里 BOT 那一行是 False），而自 2026-08-26 起页面只画
+    **启用中**的任务配着的星球（用户口径：未启用的任务不显示在数据概览）。
+    不勾的话这一份里凡是断言航线卡片的用例都会撞在空态卡上——那是这条新判据
+    在起作用，不是它们各自守的东西坏了。
     """
     home = repository.create_attack_planet(HOME)
     second = repository.create_attack_planet(SECOND)
     task = next(row for row in repository.mission_tasks() if row.kind == MissionKind.BOT.value)
-    repository.update_mission_task(task.id, params_json='{"by_military": true}')
+    repository.update_mission_task(task.id, params_json='{"by_military": true}', enabled=True)
     repository.replace_mission_task_origins(
         task.id, [(home.id, HOME_LINES, True), (second.id, SECOND_LINES, True)]
     )
@@ -275,6 +285,12 @@ def _utilisation_card(html: str) -> str:
     return html[head : html.index('<div class="tile overview-card">', head + 1)]
 
 
+def _totals_card(html: str) -> str:
+    """「此刻」区那张航线合计卡——调度器之后、各星球之前的那一张。"""
+    head = html.rindex('<div class="tile overview-card">', 0, html.index("航线合计"))
+    return html[head : html.index('<div class="tile overview-card">', head + 1)]
+
+
 def _slot_classes(html: str) -> list[list[str]]:
     """每一张航线卡片上的格子，按出现顺序。"""
     return [
@@ -427,6 +443,247 @@ def test_the_unknown_duration_lines_are_shown_apart_from_the_flying_ones(
 
     assert second_grid == ["fly", "unk", "unk", "free"]
     assert "2 条是「时长未知」" in html
+
+
+# -- 用户口径 2026-08-26：未启用的不显示 -----------------------------------------
+#
+# ⚠️ 「停用」有两级，页面必须两级都挡：**任务自己那个复选框**
+# （`mission_tasks.enabled`）和**出发星球那个勾**（`mission_task_origins.enabled`）。
+# 只挡后者是这次改之前的样子——用户把整个军力任务停掉，页面照旧给那几颗星球画着
+# 「0 / N 条占用」的空卡片，看上去像是链路活着、只是这会儿没派。
+
+
+def _bot_task_id(repository: SqlAlchemyRepository) -> int:
+    return next(row.id for row in repository.mission_tasks() if row.kind == MissionKind.BOT.value)
+
+
+def _planet_ids(repository: SqlAlchemyRepository) -> dict[Coordinate, int]:
+    """坐标 → `attack_planets` 的行 id。按下标取会随排序规则漂。"""
+    return {
+        Coordinate(row.galaxy, row.system, row.position): row.id
+        for row in repository.attack_planets()
+    }
+
+
+def test_a_disabled_task_draws_no_line_card(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """任务停用之后，那几颗星球一张卡都不该剩（用户口径 2026-08-26 第一条）。
+
+    ⚠️ 连合计卡也不许留：合计只加页面真的画出来的那几张，两边不一致的话
+    「合计 9 条」和下面一张卡都没有会同时摆在一页上。
+    """
+    repository.update_mission_task(_bot_task_id(repository), enabled=False)
+
+    html = client.get("/overview").text
+
+    assert "航线 · " not in html
+    assert "航线合计" not in html
+    assert "没有启用的军力攻击出发星球" in html
+
+
+def test_the_candidate_pool_still_counts_the_disabled_planets(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️⚠️ **候选池那张卡故意不跟着「未启用不显示」走。**
+
+    用户口径（2026-08-26，逐字）：
+
+        「候选池不用跟着走，我就是根据候选池的情况来调整攻击航路以达到最大化」
+
+    那张卡是**决策用的**，不是「此刻在跑什么」的镜子：要决定「9 系那条航路值不值得
+    开」，就得先看得见「开了之后有多少目标落进 30–60 分那一档」。跟着过滤的话，
+    停用的星球一从分母里消失，那个问题就再也问不出来了 —— 而那恰恰是用户停用它、
+    又回来看这一页的原因。
+
+    ⚠️ 这一条钉的是**两处口径故意不同**。少了它，下一个人看见
+    `build_now_view` 里算了两份出发星球，会当成漏改，顺手并成一份 —— 页面不会报错，
+    只是那几档数字悄悄变小，而用户正拿它做决定。
+
+    构造：任务整个停用（航线卡片全没了），而池子的往返时长分档照旧算得出来。
+    """
+    repository.update_mission_task(_bot_task_id(repository), enabled=False)
+
+    html = client.get("/overview").text
+
+    assert "航线合计" not in html, "航线卡片这一侧该跟着停用走"
+    assert "没有配着出发星球，算不出往返时长" not in html, "池子不该因为任务停用就算不出分档"
+
+
+def test_the_galaxy_freshness_card_lists_every_galaxy(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️⚠️ **「各银河新鲜读数」列全部星系，不按配了哪几颗星球筛。**
+
+    用户口径（2026-08-26，逐字）：
+
+        「新鲜读数，我也需要全部星系，不根据我的星球配置来」
+
+    和候选池那张卡同一个道理：这两张都是**决策用的**。这一张回答的是「哪个银河
+    扫不到」，而那正是决定下一趟军力榜往哪儿扫的依据 —— 按已配的星球筛掉之后，
+    没配星球的银河就永远显示不出「读数不新鲜」，于是永远轮不到被扫。
+
+    `galaxy_freshness()` 本来就不接 `origins`，所以今天它是对的。钉这一条是因为
+    **没人守着**：2026-08-26 候选池就是这么被顺手一起过滤掉的（同一次改动里），
+    而那一处直到用户说出用途才被发现。
+
+    构造：在**一颗星球都没配的银河**（`FAR_GALAXY`）里放一个新鲜读数，再把任务
+    整个停用。航线卡片全没了，而那个银河照旧要出现在这一列里。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from evo_helper.domain.records import RankingTarget
+
+    repository.save_ranking_targets(
+        [
+            RankingTarget(
+                coordinate=Coordinate(FAR_GALAXY, 123, 7),
+                military_score=4321.0,
+                military_score_at_utc=datetime.now(UTC) - timedelta(minutes=5),
+                military_score_estimated=False,
+                military_rank=None,
+            )
+        ]
+    )
+    repository.update_mission_task(_bot_task_id(repository), enabled=False)
+
+    html = client.get("/overview").text
+
+    assert "航线合计" not in html, "航线卡片这一侧该跟着停用走"
+    assert f"{FAR_GALAXY} 系" in html, "没配星球的银河也必须列出来"
+
+
+def test_a_disabled_origin_draws_no_line_card_either(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """星球那个勾去掉，那一颗也不该再画（两级里的第二级）。
+
+    这一条和上一条分开写：两级停用各有各的入口，合成一条用例的话，其中一道闸
+    漏掉时另一条还照样绿。
+    """
+    ids = _planet_ids(repository)
+    repository.replace_mission_task_origins(
+        _bot_task_id(repository),
+        [(ids[HOME], HOME_LINES, True), (ids[SECOND], SECOND_LINES, False)],
+    )
+
+    html = client.get("/overview").text
+
+    assert str(SECOND) not in html
+    assert [len(cells) for cells in _slot_classes(html)] == [HOME_LINES]
+    # 合计跟着只剩一颗——第一条与第二条同口径，否则合计和下面几张卡加起来对不上。
+    assert "共 1 颗星球" in _totals_card(html)
+    assert f"/ {HOME_LINES} 条占用" in _totals_card(html)
+
+
+def test_the_empty_line_card_does_not_claim_nothing_is_configured(
+    client: TestClient, repository: SqlAlchemyRepository, planets: None
+) -> None:
+    """⚠️ 空态那句话在「配着、但停用了」的情形下必须仍然是真的。
+
+    原先写的是「没有配着出发星球的军力攻击任务」——任务配得好好的、两颗星球
+    也都在，只是勾去掉了，那句话就是假的。
+
+    ⚠️ **候选池那张卡不在此列。** 它按所有配着的星球算往返时长
+    （用户口径 2026-08-26：「候选池不用跟着走，我就是根据候选池的情况来调整攻击
+    航路以达到最大化」），所以任务停用时它照旧算得出分档、根本走不到空态。
+    这里连带断言它**没有**空态，是为了钉住这个差别——两张卡的空态措辞一度被
+    一起改掉过。
+    """
+    repository.update_mission_task(_bot_task_id(repository), enabled=False)
+
+    html = client.get("/overview").text
+
+    assert "没有配着出发星球的军力攻击任务" not in html
+    assert "没有启用的军力攻击出发星球" in html
+    assert "算不出往返时长" not in html, "池子不该因为任务停用就走空态"
+
+
+# -- 用户口径 2026-08-26：总航线卡片 ---------------------------------------------
+
+
+def test_the_totals_card_sits_between_the_scheduler_and_the_planets(
+    client: TestClient, planets: None
+) -> None:
+    """合计是总览：调度器那张卡之后、各星球卡片之前。"""
+    html = client.get("/overview").text
+    section = html[html.index("此刻") :]
+
+    assert section.index("调度器") < section.index("航线合计") < section.index("航线 · ")
+
+
+def test_the_totals_add_up_the_cards_the_page_draws(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """配置数、占用数各自相加，「最早空出」取各星球里**最早**的那一个。
+
+    两颗星球的返航时刻故意差得远：取成最晚的那个（或者取成第一颗的）都能过一个
+    只种一颗星球的用例，而页面上那句话会指向一个还早得很的时刻——读的人据此
+    以为「这会儿派不出去」。
+    """
+    for _ in range(2):
+        _dispatch(
+            factory,
+            run_id,
+            origin=HOME,
+            dispatched_at_utc=NOW - timedelta(minutes=5),
+            line_free_at_utc=NOW + timedelta(hours=2),
+        )
+    _dispatch(
+        factory,
+        run_id,
+        origin=SECOND,
+        dispatched_at_utc=NOW - timedelta(minutes=5),
+        line_free_at_utc=NOW + timedelta(minutes=30),
+    )
+
+    card = _totals_card(client.get("/overview").text)
+
+    assert "共 2 颗星球" in card
+    assert f'3<span class="overview-unit">/ {HOME_LINES + SECOND_LINES} 条占用' in card
+    # UTC+8：10:30Z 就是 18:30（全站同一口径）。
+    assert "2026-08-19 18:30:00" in card
+
+
+def test_the_totals_card_draws_no_slot_grid(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ 合计卡**不画格子**。
+
+    格子说的是「这颗星球上的这几条航线」；把两颗星球的格子并成一排等于说它们能
+    互相顶替，而一颗星球上空着的航线派不了另一颗星球的舰队。
+    """
+    _dispatch(factory, run_id, origin=HOME, dispatched_at_utc=NOW - timedelta(minutes=5))
+
+    html = client.get("/overview").text
+
+    assert 'class="overview-slots"' not in _totals_card(html)
+    # 格子仍然只有两排：两颗星球各一排。
+    assert [len(cells) for cells in _slot_classes(html)] == [HOME_LINES, SECOND_LINES]
+
+
+def test_the_totals_say_full_only_when_every_planet_is_full(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ 「全满」按**每颗都满**判，不按「占用合计 ≥ 配置合计」。
+
+    先把主星占到 7 条（配的只有 5 条）、另一颗占 2 条（配 4 条）：合计正好
+    9 / 9，按合计判就会写「全满」——而那颗星球上还空着两条，这会儿明明派得出去。
+    """
+    for _ in range(7):
+        _dispatch(factory, run_id, origin=HOME, dispatched_at_utc=NOW - timedelta(minutes=5))
+    for _ in range(2):
+        _dispatch(factory, run_id, origin=SECOND, dispatched_at_utc=NOW - timedelta(minutes=5))
+
+    card = _totals_card(client.get("/overview").text)
+
+    assert f'9<span class="overview-unit">/ {HOME_LINES + SECOND_LINES} 条占用' in card
+    assert "全满" not in card
+
+    for _ in range(2):
+        _dispatch(factory, run_id, origin=SECOND, dispatched_at_utc=NOW - timedelta(minutes=5))
+
+    assert "全满" in _totals_card(client.get("/overview").text)
 
 
 # -- 8.4 资源列旁边必须有读回战报数与回收率 ---------------------------------------
@@ -808,7 +1065,7 @@ def test_the_scheduler_card_comes_first(client: TestClient, planets: None) -> No
 def test_the_task_row_kind_is_not_needed_for_the_page_to_render(
     client: TestClient, factory: sessionmaker[Session]
 ) -> None:
-    """没有军力攻击任务时，航线那一块说「没有配着出发星球」，而不是 500。"""
+    """没有军力攻击任务时，航线那一块说「没有启用的出发星球」，而不是 500。"""
     with factory() as session:
         for row in session.query(MissionTaskRow).all():
             session.delete(row)
@@ -817,7 +1074,7 @@ def test_the_task_row_kind_is_not_needed_for_the_page_to_render(
     response = client.get("/overview")
 
     assert response.status_code == 200
-    assert "没有配着出发星球的军力攻击任务" in response.text
+    assert "没有启用的军力攻击出发星球" in response.text
 
 
 # -- 利用率的分母：周期总时长 × 航线数（用户口径 2026-08-20） ---------------------

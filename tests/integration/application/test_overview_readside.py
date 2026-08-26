@@ -127,6 +127,29 @@ def test_a_disabled_origin_is_still_reported_so_the_page_can_tell(  # type: igno
     assert [item.enabled for item in origins] == [True, False]
 
 
+def test_a_disabled_task_is_dropped_only_when_the_caller_asks_for_it(  # type: ignore[no-untyped-def]
+    repository, scheduler
+) -> None:
+    """⚠️ **任务自己那个复选框只有这里看得见。**
+
+    坐标合并之后返回值里连是哪个任务配的都没有，所以「任务停用了就当没配」这件事
+    只能在这一层判。数据概览页要的是「此刻会不会派」
+    （用户口径 2026-08-26：未启用的任务不显示），而固化与统计两侧要的是
+    「配着什么」——`mission_runs.configured_lines` 记的是那一轮的分母，
+    出发星球效率那张表还要把停用的星球列进当天的账。所以默认仍旧连停用的一起带，
+    只有点名要的那一侧少掉。
+    """
+    task_id = _configure_origins(repository)
+    repository.update_mission_task(task_id, enabled=True)
+
+    assert len(scheduler.configured_line_origins(enabled_tasks_only=True)) == 2
+
+    repository.update_mission_task(task_id, enabled=False)
+
+    assert scheduler.configured_line_origins(enabled_tasks_only=True) == ()
+    assert len(scheduler.configured_line_origins()) == 2
+
+
 def test_a_task_without_configured_origins_reports_nothing(  # type: ignore[no-untyped-def]
     repository, scheduler
 ) -> None:

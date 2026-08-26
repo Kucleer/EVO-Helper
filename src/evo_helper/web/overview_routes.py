@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import cast
@@ -136,6 +137,43 @@ class LineCard:
     @property
     def full(self) -> bool:
         return self.holding >= self.configured_lines > 0
+
+
+@dataclass(frozen=True, slots=True)
+class LineTotals:
+    """各星球那几张航线卡的合计（用户口径 2026-08-26：「增加总航线卡片显示合计情况」）。
+
+    ⚠️ **从卡片本身加，不另走一趟查询。** 另查一份的话，「合计」与它下面那几张卡
+    会在同一页上对不起来——而读这一页的人正是拿这两处判「此刻还能不能派」，
+    一个和明细矛盾的合计比根本不显示合计更糟。同理它只加**页面真的画出来的**那
+    几张卡：停用的那些在 `build_now_view` 就没进来，所以合计里也不会有
+    （用户口径 2026-08-26 的第一条与第二条必须同口径）。
+    """
+
+    #: 参与合计的出发星球数——也就是下面画了几张卡。
+    origins: int
+    configured_lines: int
+    holding: int
+    #: 各星球「最早空出」里最早的那一个；一个都算不出时 None，页面写「—」。
+    next_free_at_utc: datetime | None
+    #: **每一颗星球都满**才算满。
+    #:
+    #: ⚠️ **不按「占用合计 ≥ 配置合计」判。** 那个式子在「一颗超配、另一颗全空」
+    #: 时也成立，而那种时候明明还派得出去——航线是按星球各占各的，一颗星球上超
+    #: 出来的占用填不平另一颗的空位（`configured_line_origins` 的合并语义）。
+    all_full: bool
+
+    @classmethod
+    def of(cls, cards: Sequence[LineCard]) -> LineTotals:
+        """把页面这一轮真的要画的那几张卡加起来。**入参就是模板遍历的那个元组。**"""
+        moments = [card.next_free_at_utc for card in cards if card.next_free_at_utc is not None]
+        return cls(
+            origins=len(cards),
+            configured_lines=sum(card.configured_lines for card in cards),
+            holding=sum(card.holding for card in cards),
+            next_free_at_utc=min(moments) if moments else None,
+            all_full=bool(cards) and all(card.full for card in cards),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +287,8 @@ class NowView:
     now_utc: datetime
     scheduler: SchedulerCard
     lines: tuple[LineCard, ...]
+    #: 上面那几张卡的合计，摆在它们前面（用户口径 2026-08-26）。
+    line_totals: LineTotals
     unread: UnreadReports
     pool_total: int
     pool_buckets: tuple[PoolBucket, ...]
@@ -445,18 +485,40 @@ def build_now_view(
     早该放手的派遣画成「占着」（需求文档 8.1）。
     """
     hold = scheduler.unknown_line_hold()
+    # ⚠️ **两级「停用」各挡一次**（用户口径 2026-08-26：「未启用的任务，不应显示在
+    # 数据概览」）：`enabled_tasks_only` 挡的是任务自己那个复选框
+    # （`mission_tasks.enabled`，只有调度器那一侧看得见那一行），`item.enabled`
+    # 挡的是出发星球那个勾。少了前一道闸的症状用户截图过：整个军力任务的勾去掉
+    # 之后，页面照旧给那几颗星球画着「0 / 1 条占用」的卡片——链路停着，页面上却
+    # 像是活着只是这会儿没派。
     origins = [
         (item.coordinate, item.fleet_lines)
-        for item in scheduler.configured_line_origins()
+        for item in scheduler.configured_line_origins(enabled_tasks_only=True)
         if item.enabled
     ]
     usage = repository.line_usage(now_utc=now_utc, hold=hold, origins=origins)
     today_start = day_start(now_utc)
-    pool_total, pool_buckets, pool_unscored = _pool_view(scheduler, origins)
+    # ⚠️⚠️ **候选池那张卡**故意用**没过滤**的那一份出发星球，和上面的航线卡片
+    # **不同口径**。用户口径 2026-08-26：
+    #
+    #     「候选池不用跟着走，我就是根据候选池的情况来调整攻击航路以达到最大化」
+    #
+    # 也就是说这张卡是**决策用的**，不是「此刻在跑什么」的镜子：要决定「9 系那条
+    # 航路值不值得开」，就得先看得见「开了之后有多少目标落进 30–60 分那一档」。
+    # 跟着过滤的话，停用的星球一从分母里消失，那个问题就再也问不出来了——
+    # 而那恰恰是用户停用它、又回来看这一页的原因。
+    #
+    # ⚠️ 所以下面这一行**不许**改成 `origins`。两处口径不同是有意的，不是漏改。
+    reachable = [
+        (item.coordinate, item.fleet_lines) for item in scheduler.configured_line_origins()
+    ]
+    pool_total, pool_buckets, pool_unscored = _pool_view(scheduler, reachable)
+    cards = tuple(_line_card(item) for item in usage)
     return NowView(
         now_utc=now_utc,
         scheduler=_scheduler_card(console),
-        lines=tuple(_line_card(item) for item in usage),
+        lines=cards,
+        line_totals=LineTotals.of(cards),
         unread=repository.unread_reports(now_utc=now_utc, day_start_utc=today_start),
         pool_total=pool_total,
         pool_buckets=pool_buckets,
@@ -784,6 +846,8 @@ def _empty_now_view(now: datetime) -> NowView:
             last_run_outcome="",
         ),
         lines=(),
+        # 一张卡都没有，合计自然是空的；页面在没有卡片时也不画那张合计卡。
+        line_totals=LineTotals.of(()),
         unread=UnreadReports(
             unread=0,
             in_flight=0,
@@ -828,6 +892,7 @@ __all__ = [
     "FRESHNESS_WINDOW",
     "POOL_BUCKETS",
     "LineCard",
+    "LineTotals",
     "NowView",
     "PeriodRow",
     "ResourceCell",
