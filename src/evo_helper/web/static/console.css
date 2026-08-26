@@ -1122,3 +1122,42 @@ tr:hover .log-shot { width: 480px; opacity: 1; }
   background: var(--bg-panel-raised);
   font-weight: 600;
 }
+
+/* 「此刻」区那四张卡（未读战报 / 候选池按星系 / 星系质量 / 各银河新鲜读数）。
+   ⚠️ **下限从 250px 收到 210px**：四张要塞进一行，250 的话 1440 上就折了。
+   `min-width: 0` 不能少——没有它，Grid 里的卡片会被表格内容顶宽，列怎么收都还是
+   横向滚（用户 2026-08-26：「我不要左右拖拽」）。 */
+.overview-grid-three { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.overview-card { min-width: 0; }
+
+/* 候选池按星系那张表。
+   ⚠️ **行距照抄 `.overview-kv`（padding: 2px 0; font-size: 12px）**，条形与行分隔线
+   都不要。这四张卡是同一行 Grid，行高由最高的那张决定，而这张有九行——每行多 6px
+   就把整行顶高 54px。同 `.overview-kv.overview-basics` 那条先例：只许更矮，不许更高。 */
+table.pool-galaxies { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+table.pool-galaxies th {
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: right;
+  padding: 0 2px 4px;
+  border-bottom: 1px solid var(--line);
+}
+table.pool-galaxies th.who { text-align: left; width: 38%; }
+table.pool-galaxies td {
+  padding: 2px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  vertical-align: baseline;
+}
+table.pool-galaxies td.who {
+  text-align: left;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* 航线状态贴在星系号后面，省一整列。**纯文字不带底色**——九行卡里九个色块太吵。 */
+.tag { margin-left: 5px; font-size: 10px; font-style: normal; }
+.tag.on { color: var(--text-faint); }
+.tag.off { color: var(--tone-warn, #a08a7a); }

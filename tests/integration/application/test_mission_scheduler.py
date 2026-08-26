@@ -43,6 +43,7 @@ from evo_helper.domain.scheduler import (
 )
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
+from support.attack_config import set_score_window
 
 from .conftest import Clock, make_supervisor
 
@@ -97,49 +98,9 @@ def enable(repository: SqlAlchemyRepository, kind: MissionKind, **fields: object
     repository.update_mission_task(task_id(repository, kind), enabled=True, **fields)  # type: ignore[arg-type]
 
 
-def set_score_window(
-    repository: SqlAlchemyRepository,
-    *,
-    max_age_hours: float | None = None,
-    window_floor: int | None = None,
-) -> None:
-    """把「选靶窗口」那两格写进**全局**攻击配置。
-
-    2026-08-23 起有效期与窗口门限是全局的（`military_attack_config`），不再是任务
-    参数——用户口径：「军力攻击的有效期 门限 改为全局设置，不再根据单个星系进行
-    调整」。所以要摆一个窗口，摆的地方是这里，不是 `params_json`。
-
-    ⚠️ **必须把现有的其它旋钮原样带回去。** `replace_military_attack_tiers` 是
-    **整份替换**（那是它有意的语义：页面上就是整份 PUT），只送这两格等于把档位和
-    其余十来个旋钮一起冲成空的——而症状会落在一条与本用例无关的判据上，
-    排查起来是最贵的那一类。
-    """
-    try:
-        row = repository.military_attack_config()
-    except ValueError:
-        # 配置行还没建（`prepare()` 才建它）。这条路上没有「其它旋钮」要保留，
-        # 而 `replace_military_attack_tiers` 会顺手把 id=1 那一行建出来。
-        repository.replace_military_attack_tiers(
-            "[]", score_max_age_hours=max_age_hours, window_floor=window_floor
-        )
-        return
-    repository.replace_military_attack_tiers(
-        row.tiers_json,
-        blind_scrolls=row.blind_scrolls,
-        blind_scroll_rows=row.blind_scroll_rows,
-        report_scan_hours=row.report_scan_hours,
-        unknown_line_hold_minutes=row.unknown_line_hold_minutes,
-        reconcile_cooldown_minutes=row.reconcile_cooldown_minutes,
-        bot_revisit_hours=row.bot_revisit_hours,
-        protection_exclusion_hours=row.protection_exclusion_hours,
-        unreadable_exclusion_hours=row.unreadable_exclusion_hours,
-        score_max_age_hours=max_age_hours,
-        window_floor=window_floor,
-        account_line_limit=row.account_line_limit,
-        auto_toggle_log_seconds=row.auto_toggle_log_seconds,
-    )
-
-
+# ⚠️ **真身在 `support/attack_config.py`**，这里只是转发。2026-08-26 之前它就写在
+# 这个文件里，于是 `tests/e2e` 那边写了 `from tests.integration...` 去引 ——
+# 本机绿、CI 收集就失败（`tests` 本来就不是可导入的包，见那个模块的说明）。
 def only_gap_filler(repository: SqlAlchemyRepository, kept: MissionKind | None = None) -> None:
     """把填空隙的那几种（扫描 / 军力榜）全关掉，只留 `kept`。
 
