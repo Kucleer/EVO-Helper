@@ -1,5 +1,5 @@
 ---
-issue: 267
+issue: 266
 agent: game-runner
 type: Fixed
 date: 2026-08-27
