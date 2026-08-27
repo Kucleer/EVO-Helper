@@ -1487,6 +1487,54 @@ class PirateLoop:
         """
         return pirate_ui.snap_dialog(self._read(pirate_ui.DIALOG_TEXT_ROI))
 
+    #: 取证时裁的那一块，比 `DIALOG_TEXT_ROI` 四周各留一圈。
+    #:
+    #: ⚠️ **故意比读字的框大。** 只裁 ROI 那一块，回答得了「这几个字长什么样」，
+    #: 回答不了「这句话有没有溢出框外」——而 2026-08-27 卡住的正是后一个问题：
+    #: 缩略图上量出字迹只有 88px 宽，短得不像词表里任何一句，可到底是**这句话本来
+    #: 就短**，还是**框把它裁掉了一半**，从那张图上分不出来。留一圈才分得出。
+    DIALOG_EVIDENCE_ROI = (790, 425, 1130, 515)
+
+    def _dialog_evidence(self) -> dict[str, Any]:
+        """弹窗那一格的取证：**同一帧**上的 OCR 原文 + 原分辨率裁片。
+
+        ## 为什么非要有这个
+
+        2026-08-27，4 系一天 17 轮全死在同一个目标上，起点每次都读成空。存下来的
+        证据只有一张 480 宽的缩略图——1920 → 480 是 4×，那句弹窗被压成一条 22 像素
+        的糊斑。我只能去**量字迹的宽度**（88px）反推字数（约 5–6 个字），再拿它去
+        排除词表里那三句（9 / 8 / 14 个字）。结论是「不是已知的那三句」，可**到底
+        是哪一句，从那张图上永远读不出来**。
+
+        于是修不下去：不知道措辞就写不进 `DIALOG_MESSAGES`，写不进词表
+        `snap_dialog` 就永远认不出它，`_handle_dialog` 就永远交 True，循环照旧。
+
+        ⚠️ 同一条教训 `crop_png_base64` 的注释里已经写着（导航栏值框缩成 34×8、
+        数字剩 3.5px 高，「实测就是两团糊斑」）。**那一次是补了原分辨率裁片才解开的，
+        这一次一模一样，而我在这条路上重新踩了一遍。**
+
+        ## 一帧读两样
+
+        文字和裁片**必须来自同一帧**，否则两者不一致时反而更难判。这不是假设：
+        2026-08-25 导航栏那条证据链就是自己另截了一张图，于是同一条告警里日志记着
+        `['261','26','26','6','61']`、存下来的裁片重读却是 `['261','261','26','6','261']`
+        ——两份都对，只是不是同一刻的画面，而判据只能建立在其中一份上。
+
+        取不到帧（轻量驱动、单元测试桩）就只交文字，**不抛**：证据不许把链路弄死
+        （同 `thumbnail_base64`）。
+        """
+        evidence: dict[str, Any] = {"dialog_roi": list(pirate_ui.DIALOG_TEXT_ROI)}
+        try:
+            frame, read = self._frame_reader()
+            raw = read(pirate_ui.DIALOG_TEXT_ROI)
+            evidence["dialog_raw_text"] = raw
+            evidence["dialog_snapped"] = pirate_ui.snap_dialog(raw)
+            evidence["dialog_evidence_roi"] = list(self.DIALOG_EVIDENCE_ROI)
+            evidence["dialog_png_base64"] = crop_png_base64(frame.crop(self.DIALOG_EVIDENCE_ROI))
+        except Exception as error:  # noqa: BLE001 - 见 docstring：取证不许抛
+            evidence["dialog_evidence_error"] = str(error)
+        return evidence
+
     def _handle_dialog(self, coordinate: Coordinate) -> bool:
         """认出弹窗就关掉它，并决定这一轮还能不能继续。
 
@@ -1942,8 +1990,13 @@ class PirateLoop:
         # ⚠️ 见 docstring：读不出**未必**是起点漂了，保护期弹窗会盖住这一格。
         # `_handle_dialog` 认不出弹窗时交 True，那时才落到下面的拒绝逻辑；
         # 认出资源耗尽那几种时它自己抛 `RoundExhausted`，照旧停轮。
-        if shown is None and not self._handle_dialog(coordinate):
-            return False
+        dialog: dict[str, Any] = {"dialog_checked": False}
+        if shown is None:
+            if not self._handle_dialog(coordinate):
+                return False
+            # 走到这儿 = 问过了、认不出。**这一档就是 2026-08-27 那个循环卡住的地方**，
+            # 而它此前在日志上和「屏上什么都没有」长得一模一样。把那一格拍下来。
+            dialog = {"dialog_checked": True, **self._dialog_evidence()}
         note = (
             f"  派遣面板起点回读 {shown or '（读不出）'}（原文 {raw!r}），"
             f"对不上这一轮的出发星球 {expected}；这一发不派，这一轮到此为止"
@@ -1951,7 +2004,9 @@ class PirateLoop:
         say(note)
         self._outcome.refused.append((coordinate, f"起点对不上（读到 {shown or '读不出'}）"))
         self._dump_origin_mismatch()
-        self._record_origin_mismatch(coordinate, expected=expected, shown=shown, raw=raw)
+        self._record_origin_mismatch(
+            coordinate, expected=expected, shown=shown, raw=raw, dialog=dialog
+        )
         # 那份「本轮已经切到哪」的记忆刚刚被证伪，留着它只会让同一个进程里的下一次
         # `switch_needed` 说「不用切」。清掉的代价至多是多切一次，而多切一次无害
         # （点自己那一行只是回到自己的地表），与 `_ensure_session` 里那段同理。
@@ -1981,6 +2036,7 @@ class PirateLoop:
         expected: Coordinate,
         shown: Coordinate | None,
         raw: str,
+        dialog: dict[str, Any] | None = None,
     ) -> None:
         """把这次核不过写进 `system_log`——落库不落文件。
 
@@ -1990,6 +2046,16 @@ class PirateLoop:
 
         **不限流。** 这一支每轮最多走一次（走到就停轮），不是「每 tick 都可能触发」
         的那一类；限流反而会把仅有的那一条证据吞掉。
+
+        ## `dialog_checked` 是版本指纹
+
+        「读不出先问一句弹窗」这道支线（#266）落地时**一行新日志都没留**，于是它
+        和改动前在库里长得一字不差。2026-08-27 用户问「生产跑的是哪个版本」，我
+        只能答「看不出」——而这正是仓库里那条既定口径要防的事：
+        **出事时能只靠库里的日志定位**。
+
+        所以这个键**只有新代码写得出来**：payload 里有 `dialog_checked` 就是问过
+        弹窗的那一版，`true` 还表示当时真走到了「问了、认不出」那一档。
         """
         capture = getattr(self._driver, "capture", None)
         payload: dict[str, Any] = {
@@ -1999,6 +2065,7 @@ class PirateLoop:
             "origin_raw_text": raw,
             "roi": list(pirate_ui.FLEET_ORIGIN_ROI),
             "target_kind": self.TARGET_KIND,
+            **(dialog or {"dialog_checked": False}),
         }
         if callable(capture):
             payload["thumbnail_png_base64"] = thumbnail_base64(capture())
@@ -2006,7 +2073,15 @@ class PirateLoop:
             "WARNING",
             "tools.pirate_loop",
             f"派出 {coordinate} 之前起点核对不过：期望 {expected}，"
-            f"派遣面板读到 {shown or '（读不出）'}；这一发没派，这一轮到此为止",
+            f"派遣面板读到 {shown or '（读不出）'}"
+            # 认不出的弹窗原文直接写进正文——`payload_json` 要 `::jsonb` 才查得动，
+            # 而这一句 `LIKE` 一下就能按措辞分组，正是眼下最想问的那个问题。
+            + (
+                f"；屏上有认不出的弹窗（读到 {(dialog or {}).get('dialog_raw_text') or '空'}）"
+                if (dialog or {}).get("dialog_checked")
+                else ""
+            )
+            + "；这一发没派，这一轮到此为止",
             payload=payload,
         )
 

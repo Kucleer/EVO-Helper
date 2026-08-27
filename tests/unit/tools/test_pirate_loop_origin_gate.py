@@ -192,6 +192,30 @@ def _loop(
     loop._current_planet = current_planet
     loop._origin_dumps = 0
     loop._read = _read
+
+    class _Frame:
+        """一张能被 `crop` 的假帧。`crop` 交出记得自己来自哪一块的对象。"""
+
+        def __init__(self) -> None:
+            self.cropped: list[tuple[int, int, int, int]] = []
+
+        def crop(self, box: tuple[int, int, int, int]) -> Any:
+            self.cropped.append(box)
+            return SimpleNamespace(box=box)
+
+    frame = _Frame()
+    loop.frame = frame
+
+    def _frame_reader() -> tuple[Any, Any]:
+        events.append("抓帧")
+
+        def read(roi: tuple[int, int, int, int], **_kwargs: Any) -> str:
+            events.append("read:弹窗")
+            return dialog if roi == pirate_ui.DIALOG_TEXT_ROI else ""
+
+        return frame, read
+
+    loop._frame_reader = _frame_reader
     loop._read_coord_line = _read_coord_line
     loop.dumped = []
     loop._dump_frame = lambda name, roi=None: loop.dumped.append(name)
@@ -631,3 +655,156 @@ def test_a_drifted_origin_does_not_get_excused_by_a_dialog(
 
     assert loop._repository.protections == [], "把真漂了的那一发记成了保护期"
     assert loop._current_planet is None
+
+
+# -- (f) 认不出的那个弹窗：证据得说得出它是哪一句 ------------------------------
+
+
+def _mismatch_payload(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> dict[str, Any]:
+    """跑一发注定核不过的攻击，交出写进 `system_log` 的那份 payload。"""
+    written: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module,
+        "record_system_log",
+        lambda level, source, message, payload=None: written.append(
+            {"level": level, "message": message, **(payload or {})}
+        ),
+    )
+    monkeypatch.setattr(module, "crop_png_base64", lambda crop: f"PNG<{crop.box}>")
+    monkeypatch.setattr(module, "thumbnail_base64", lambda frame: "THUMB")
+    loop = _loop(monkeypatch, **kwargs)
+    with pytest.raises(OriginDrifted):
+        loop.attack(TARGET, preset="AAA")
+    return written[0]
+
+
+UNKNOWN_DIALOG = "目标已消失。"  # 词表里没有的一句，长度也对不上任何一句
+
+
+def test_an_unrecognised_dialog_is_photographed_at_full_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **本节的重点。** 认不出的弹窗要按**原分辨率**存下来。
+
+    2026-08-27 卡死在这里：证据只有一张 480 宽的缩略图，1920 → 480 是 4×，那句
+    弹窗被压成一条 22 像素的糊斑。只能去量字迹宽度（88px）反推字数（约 5–6 个字），
+    再拿它排除词表里那三句（9 / 8 / 14 个字）。结论「不是已知那三句」够用，
+    **但到底是哪一句，从那张图上永远读不出来** —— 于是修不下去：不知道措辞就写不进
+    `DIALOG_MESSAGES`，写不进词表 `snap_dialog` 就永远认不出它，循环照旧。
+
+    同一条教训 `crop_png_base64` 的注释里早写着（导航栏值框缩成 34×8、数字剩
+    3.5px 高，「实测就是两团糊斑」），那一次就是补原分辨率裁片解开的。
+    """
+    payload = _mismatch_payload(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
+
+    assert payload["dialog_raw_text"] == UNKNOWN_DIALOG
+    assert payload["dialog_snapped"] is None, "这一句本来就不该贴上词表"
+    assert payload["dialog_png_base64"] == f"PNG<{PirateLoop.DIALOG_EVIDENCE_ROI}>"
+
+
+def test_the_evidence_crop_is_wider_than_the_reading_roi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ 裁的那块要**比读字的框大一圈**。
+
+    只裁 `DIALOG_TEXT_ROI` 回答得了「这几个字长什么样」，回答不了「这句话有没有
+    溢出框外」—— 而 2026-08-27 恰恰卡在后一个问题：字迹只有 88px，是**这句话本来
+    就短**还是**框把它裁掉了一半**，分不出来。而框裁掉一半这事有先例：
+    `DIALOG_TEXT_ROI` 上一版就把 14 个字的那句读成了 `'[派遣的舰队数量已达上'`。
+    """
+    left, top, right, bottom = PirateLoop.DIALOG_EVIDENCE_ROI
+    r_left, r_top, r_right, r_bottom = pirate_ui.DIALOG_TEXT_ROI
+
+    assert left < r_left and right > r_right, "左右没留出余量，看不出有没有溢出"
+    assert top < r_top and bottom > r_bottom, "上下没留出余量"
+
+
+def test_the_text_and_the_picture_come_from_one_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ OCR 原文与裁片**必须来自同一帧**，所以只抓一次。
+
+    这不是假设：2026-08-25 导航栏那条证据链自己另截了一张图，于是同一条告警里
+    日志记着 `['261','26','26','6','61']`、存下来的裁片重读却是
+    `['261','261','26','6','261']` —— 两份都对，只是不是同一刻的画面，而判据只能
+    建立在其中一份上。两者不一致时，证据反而比没有更难用。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
+    monkeypatch.setattr(module, "crop_png_base64", lambda crop: "PNG")
+    monkeypatch.setattr(module, "thumbnail_base64", lambda frame: "THUMB")
+
+    with pytest.raises(OriginDrifted):
+        loop.attack(TARGET, preset="AAA")
+
+    assert loop.events.count("抓帧") == 1, "抓了不止一帧，文字和图就可能不是同一刻的"
+    assert loop.frame.cropped == [PirateLoop.DIALOG_EVIDENCE_ROI]
+
+
+def test_the_payload_says_whether_the_dialog_was_consulted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ `dialog_checked` 是**版本指纹**。
+
+    「读不出先问一句弹窗」那道支线（#266）落地时一行新日志都没留，于是它和改动前
+    在库里长得一字不差。2026-08-27 用户问「生产跑的是哪个版本」，我只能答「看不出」
+    —— 而仓库那条既定口径正是要防这个：**出事时能只靠库里的日志定位**。
+
+    ⚠️ 两档必须分得开：读不出（问过弹窗）与读到别的坐标（按设计不问），
+    只用「有没有这个键」是不够的，值本身也要说得出走的是哪一档。
+    """
+    unreadable = _mismatch_payload(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
+    drifted = _mismatch_payload(monkeypatch, origin_readings=[str(MAIN_PLANET)])
+
+    assert unreadable["dialog_checked"] is True
+    assert drifted["dialog_checked"] is False
+
+
+def test_a_drifted_origin_is_not_photographed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 读到**别的坐标**时不问弹窗，也就没有弹窗证据可留。
+
+    照样拍一张的话，那张图会让排障从「弹窗挡住了」这条错路开始查 —— 而真相是
+    脚底下换了星球，屏上根本没有弹窗。**证据说假话比没有更糟。**
+    """
+    payload = _mismatch_payload(monkeypatch, origin_readings=[str(MAIN_PLANET)])
+
+    assert "dialog_png_base64" not in payload
+    assert "dialog_raw_text" not in payload
+
+
+def test_the_unrecognised_wording_reaches_the_message_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ 认不出的原文也写进**正文**，不是只塞进 payload。
+
+    `payload_json` 存的是 text，按键取值得 `::jsonb` 转一道；而正文 `LIKE` 一下就能
+    按措辞分组 —— 「这句弹窗到底是哪一句、出现过几次」正是眼下最想问的那个问题。
+    """
+    payload = _mismatch_payload(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
+
+    assert UNKNOWN_DIALOG in payload["message"]
+
+
+def test_evidence_never_kills_the_round(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 取不到帧就只交文字，**不抛**（同 `thumbnail_base64` 那条）。
+
+    轻量驱动、单元测试桩都没有 `capture`。为了留一张图把整轮弄死，是拿主链路
+    给诊断路径陪葬。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
+    written: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module,
+        "record_system_log",
+        lambda level, source, message, payload=None: written.append(dict(payload or {})),
+    )
+
+    def _boom() -> tuple[Any, Any]:
+        raise RuntimeError("截不了图")
+
+    loop._frame_reader = _boom
+
+    with pytest.raises(OriginDrifted):
+        loop.attack(TARGET, preset="AAA")
+
+    assert written[0]["dialog_checked"] is True
+    assert "截不了图" in written[0]["dialog_evidence_error"]
