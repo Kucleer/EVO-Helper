@@ -189,6 +189,34 @@ class BotTargetRow(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
 
+    #: **拉黑的时刻。永久，没有窗口。** NULL = 没拉黑。
+    #:
+    #: ⚠️ **这一列和上面那两个排除列不是一类东西，别照着它们理解。**
+    #: `protection_seen_at_utc` / `unreadable_seen_at_utc` 记的都是「什么时候撞上的」，
+    #: 排除多久由攻击配置里的旋钮回答——**时刻是事实，窗口是策略**。这一列没有窗口，
+    #: 因为它记的事实本身就是永久的：**这个坐标压根不是 bot**。
+    #:
+    #: 用户口径（2026-08-27，逐字）：
+    #:
+    #:     「4:268:5 这个坐标做特殊处理，永久移出军力榜，做黑名单
+    #:      1.这个坐标是玩家，他的 ID 是模仿 bot 命名
+    #:      2.因为军力差距过大，所以我们无法发起攻击」
+    #:
+    #: 这两条合起来正是「窗口治不好」的定义：等多久他都还是玩家，军力差距只会越拉
+    #: 越大。实测代价——2026-08-27 一天里 4 系起了 17 轮，**每一轮都挑中他**（军力
+    #: 10580、离主星又近，排序上永远靠前），每一轮都在派遣面板上撞一个我们认不出的
+    #: 弹窗，整轮作废。他一个人吃掉了 4 系一整天。
+    #:
+    #: ⚠️ **可空且没有 `server_default`**，同上面那两列：NULL = 没拉黑，不是某个时刻。
+    blacklisted_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+    #: 为什么拉黑他。**自由文本，代码一个字都不解析。**
+    #:
+    #: 存它是因为拉黑是**永久**的：三个月后翻到这一行，「他是模仿 bot 命名的玩家」
+    #: 与「那阵子扫描坏了误判的」是完全不同的两件事，而**只有一个时刻的话，两者
+    #: 长得一模一样**。没有理由就没人敢把它放回来，于是错拉的黑永远拉着。
+    blacklist_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class AttackIntentRow(Base):
     __tablename__ = "attack_intents"

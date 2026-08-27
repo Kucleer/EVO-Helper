@@ -322,6 +322,10 @@ class MilitaryRankingRepository:
             base = select(orm.BotTargetRow).where(
                 orm.BotTargetRow.military_score.is_not(None),
                 orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+                # ⚠️ 拉黑的不上榜（用户口径 2026-08-27：「永久移出军力榜」）。
+                # 和紧挨着那条海盗位一样是**坐标级、永久、无窗口**的排除，
+                # 不是「这会儿不打他」——他压根不是 bot。
+                orm.BotTargetRow.blacklisted_at_utc.is_(None),
             )
             if window_start is not None:
                 # 时间窗和 `total` 是同一条语句上的两件事：计数必须也在窗内，
@@ -345,6 +349,10 @@ class MilitaryRankingRepository:
                 select(func.max(orm.BotTargetRow.military_score_at_utc)).where(
                     orm.BotTargetRow.military_score.is_not(None),
                     orm.BotTargetRow.position.not_in(PIRATE_POSITIONS),
+                    # 这一句和上面 `base` 那道闸必须同进同退：拉黑的行军力值冻结在
+                    # 拉黑那一刻，漏掉它「数据更新时间」会被一个不再更新的行钉死在
+                    # 过去，而榜上每一行都是新的。
+                    orm.BotTargetRow.blacklisted_at_utc.is_(None),
                 )
             )
         return MilitaryBoardPage(
