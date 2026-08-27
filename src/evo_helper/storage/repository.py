@@ -490,6 +490,14 @@ class SqlAlchemyRepository:
                     continue
                 _require_utc(record.military_score_at_utc, "military_score_at_utc")
                 target = _bot_target_for(session, record.coordinate)
+                # ⚠️ **拉黑的行连军力值都不更新**（用户口径 2026-08-27：「扫描时就
+                # 丢掉，库里不再更新它」）。只在选靶那头拦是不够的：军力榜页面直读
+                # `bot_targets`，那一行照旧会随每趟扫描往上涨，看起来像个还在跟的目标。
+                #
+                # 代价是这一行的军力值冻结在拉黑那一刻，往后查不到「他现在多少军力」
+                # ——用户当面选的就是这一档，理由是那个数对我们已经没有用处了。
+                if target is not None and target.blacklisted_at_utc is not None:
+                    continue
                 if target is None:
                     session.add(
                         orm.BotTargetRow(
@@ -511,6 +519,49 @@ class SqlAlchemyRepository:
                 target.military_score_estimated = record.military_score_estimated
                 target.military_rank = record.military_rank
             session.commit()
+
+    def blacklist_bot_target(
+        self, coordinate: Coordinate, *, reason: str, at_utc: datetime | None = None
+    ) -> bool:
+        """把一个坐标永久拉黑。已经拉黑过就只更新理由，交 False。
+
+        ⚠️ **理由是必填的，不给默认值。** 拉黑是永久的：三个月后翻到这一行，
+        「他是模仿 bot 命名的玩家」与「那阵子扫描坏了误判的」是完全不同的两件事，
+        而只有一个时刻的话两者长得一模一样。没有理由就没人敢把它放回来。
+
+        行不存在时**不新建**，交 False：拉黑的前提是这个坐标已经在库里被当成过
+        目标，凭空造一行等于替扫描链路作主。
+        """
+        if not reason.strip():
+            raise ValueError("拉黑必须写理由：没有理由的黑名单条目日后没人敢删")
+        with self._session_factory() as session:
+            target = _bot_target_for(session, coordinate)
+            if target is None:
+                return False
+            already = target.blacklisted_at_utc is not None
+            if not already:
+                target.blacklisted_at_utc = at_utc or datetime.now(UTC)
+            target.blacklist_reason = reason
+            session.commit()
+            return not already
+
+    def blacklisted_bot_targets(self) -> list[orm.BotTargetRow]:
+        """拉黑过的行，按坐标定序。**只有这一个入口看得见它们。**
+
+        `list_bot_targets` 把它们挡在外面，所以「现在黑了哪些、为什么」必须有一条
+        单独的路问得出来——否则拉完黑就再也看不见，错拉的黑连发现都发现不了。
+        """
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.BotTargetRow)
+                .where(orm.BotTargetRow.blacklisted_at_utc.is_not(None))
+                .order_by(
+                    orm.BotTargetRow.galaxy,
+                    orm.BotTargetRow.system,
+                    orm.BotTargetRow.position,
+                )
+            ).all()
+            return list(rows)
 
     def clear_pirate_position_bot_candidates(self) -> int:
         """撤销 1--4 号位误写成 bot 的候选，保留坐标扫描原始记录。
@@ -1138,10 +1189,26 @@ class SqlAlchemyRepository:
     # -- query helpers ---------------------------------------------------------
 
     def list_bot_targets(self) -> list[orm.BotTargetRow]:
+        """所有已记录的 bot，**拉黑的除外**。
+
+        ⚠️ **黑名单这道闸装在这里，是因为这里是最深的那一层。** 上面挂着三条路：
+        选靶（`_scored_bot_targets` → `_military_candidates`）、概览页那四格
+        （`military_candidate_pool`，页面不许自己写一遍筛选）、区域攻击
+        （`bot_targets_in_range`）。装在 `_military_candidates` 只盖得住前两条。
+
+        而且它和那一层的东西**不是一类**：那里放的是「暂时排除」（24 小时内打过、
+        保护期、面板读不出），每一条都带窗口、到点自动回池。拉黑没有窗口——记的
+        事实是「这个坐标压根不是 bot」，等多久都不会变。混进带窗口那一堆里，下一个
+        人自然会去找「拉黑多久」那个旋钮，而它不存在。
+
+        与紧挨着的 `is_bot_coordinate`（固定海盗位）同层同性质：**坐标级、永久、
+        无窗口**。
+        """
         with self._session_factory() as session:
             rows = session.scalars(
                 select(orm.BotTargetRow)
                 .where(orm.BotTargetRow.is_bot)
+                .where(orm.BotTargetRow.blacklisted_at_utc.is_(None))
                 .order_by(
                     orm.BotTargetRow.galaxy,
                     orm.BotTargetRow.system,

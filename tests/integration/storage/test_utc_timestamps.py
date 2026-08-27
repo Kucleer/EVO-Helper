@@ -48,6 +48,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "attack_intents.target_military_score_at_utc",
         "battle_report_screenshots.captured_at_utc",
         "battle_reports.reported_at_utc",
+        "bot_targets.blacklisted_at_utc",
         "bot_targets.last_attack_at_utc",
         "bot_targets.last_dispatch_at_utc",
         "bot_targets.last_report_at_utc",
@@ -131,6 +132,8 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         # a3c81f5d2b64（挂机心跳）随新表建的，那条迁移里也写着 `timezone=True`。
         "scheduler_uptime_segments.started_at_utc",
         "scheduler_uptime_segments.last_beat_at_utc",
+        # a7d3e91c05b2（永久拉黑的时刻）加的，那条迁移里也写着 `timezone=True`。
+        "bot_targets.blacklisted_at_utc",
     }
 )
 
