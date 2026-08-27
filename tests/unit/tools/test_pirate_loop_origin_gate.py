@@ -30,17 +30,43 @@
 不等于跳过去了」才改成**只信回读确认过的坐标**。出发星球这一层缺的正是这条——
 切换那一次是「记下来」，本文件钉的是「每次用之前再问一遍」。
 
-## 本文件钉住的四条
+## 第二次事故（生产，2026-08-27）：读不出**未必**是漂了
+
+4 系一天起了 8 轮，**7 轮死在同一个目标 `4:268:5` 上**，每轮都是这个形状：
+
+    08:43:18  出发星球：切到 4:277:15
+    08:43:44    起点回读 '4:277:15'，确认当前星球是 4:277:15
+    08:43:51    导航栏回读 ('4','277','15')，确认停在 4:277:15
+    08:44:14    派遣面板起点回读 （读不出）（原文 ''）
+    08:44:15    起点核对不过；这一发没派，这一轮到此为止
+
+存下来的现场图（`system_log` id 109168）上，那一刻屏幕上是**保护期弹窗**
+（「没有可执行的任务。」）盖住了面板 —— 所以起点那一格自然读空。星球明明切对了，
+上面两行刚确认过。
+
+而 `OriginDrifted` 是 `RoundExhausted` 的子类，抛出去就是整轮结束，于是它**赶在
+`_handle_dialog` 之前**把这一轮杀掉了。后果是个自维持的循环：`_note_protection_period`
+没跑到 → `protection_seen_at_utc` 一直是 `None` → 目标没被排除、军力 10580 又离得近
+→ 下一轮又被挑中 → 又撞同一个弹窗。次数一路在涨：08-25 四次 → 08-26 六次 →
+08-27 十四次。
+
+⇒ 读不出时**先把屏交给 `_handle_dialog` 按弹窗类型认**。⚠️ 只在「读不出」那一档问，
+读出来是**别的坐标**时不问 —— 那是真漂了，弹窗解释不了它。
+
+## 本文件钉住的五条
 
 1. 起点与期望一致 → 照常派（攻击、侦察各一条）。
 2. 不一致 → 不派、记 `refused`、留现场、写 `system_log`、停下这一轮。
-3. **读不出要重读；重读完仍读不出按「核不过」收场，绝不当成一致。**
-4. 简报任务类型那道既有闸门不受影响——两道闸门各拦各的，谁也别顶替谁。
+3. **读不出要重读；重读完仍读不出、且屏上没有认得的弹窗，按「核不过」收场。**
+4. **读不出且屏上是保护期弹窗 → 记保护期、跳过这个目标、这一轮继续。**
+5. 简报任务类型那道既有闸门不受影响——两道闸门各拦各的，谁也别顶替谁。
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -91,6 +117,17 @@ class _Repository:
     def __init__(self) -> None:
         self.intents: list[Any] = []
         self.dispatches: list[Any] = []
+        #: `_note_protection_period` 落进 `bot_targets.protection_seen_at_utc` 的那一笔。
+        #: 2026-08-27 的循环就是因为这一笔一直没写成。
+        self.protections: list[Coordinate] = []
+
+    def note_protection_period(self, coordinate: Coordinate, *, seen_at_utc: Any) -> bool:
+        del seen_at_utc
+        self.protections.append(coordinate)
+        return True
+
+    def military_attack_config(self) -> Any:
+        return SimpleNamespace(protection_exclusion_hours=None)
 
     def save_attack_intent(self, intent: Any) -> None:
         self.intents.append(intent)
@@ -107,6 +144,7 @@ def _loop(
     *,
     origin_readings: list[str],
     briefing: str = "攻击",
+    dialog: str = "",
     current_planet: Coordinate | None = ORIGIN,
     configured_origin: Coordinate = ORIGIN,
 ) -> Any:
@@ -132,6 +170,8 @@ def _loop(
             return "8分3秒"
         if roi == pirate_ui.BRIEFING_MISSION_ROI:
             return briefing
+        if roi == pirate_ui.DIALOG_TEXT_ROI:
+            return dialog
         return ""
 
     readings = list(origin_readings)
@@ -147,7 +187,8 @@ def _loop(
     loop._options = LoopOptions(systems=(), scout=True, attack=True, origin=configured_origin)
     loop._outcome = Outcome()
     loop._repository = _Repository()
-    loop._run_id = None
+    # 给一个真 run_id，`_ensure_run` 才会短路到上面那个假仓库而不是去连库。
+    loop._run_id = uuid4()
     loop._current_planet = current_planet
     loop._origin_dumps = 0
     loop._read = _read
@@ -455,3 +496,138 @@ def test_the_two_gates_do_not_share_a_refusal_reason(
         drifted.attack(TARGET, preset="AAA")
 
     assert mission._outcome.refused[0][1] != drifted._outcome.refused[0][1]
+
+
+# -- (e) 读不出且屏上有弹窗 → 按弹窗类型走，不算起点漂了 ----------------------
+
+
+def test_a_protection_dialog_skips_the_target_instead_of_killing_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**本节的重点**（生产 2026-08-27）：保护期弹窗盖住面板 ≠ 起点漂了。
+
+    弹窗就压在起点那一行上，那一格自然读空。当成漂了的代价是整轮作废，而且
+    **一笔保护期都没记下**——于是同一个目标下一轮又被挑中，撞同一个弹窗，
+    一天十四次。
+
+    这里断言的是「回到既有的那一档」：跳过这个目标、这一轮继续。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=pirate_ui.DIALOG_NO_MISSION)
+
+    assert loop.attack(TARGET, preset="AAA") is False, "整轮被杀掉了"
+
+    assert "click:出发" not in loop.events, "起点读不出还把舰队派了出去"
+    assert "click:关闭弹窗" in loop.events, "弹窗没点掉，下一发照样被它挡着"
+    assert loop.dumped == [], "这不是核不过，不该按核不过留现场"
+    # 弹窗点掉之后画面停在派遣面板/列表上，和「弹窗挡下」那一支一样要自己退出来——
+    # 不退的话下一个目标的 `goto` 会在列表页上朝导航栏盲点（实机点到过「取消」）。
+    assert "离开飞行中列表" in loop.events
+
+
+def test_the_protection_period_actually_reaches_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **这一笔是这个循环唯一的出口。**
+
+    `bot_targets.protection_seen_at_utc` 是保护期唯一的证据——游戏那 8 小时推不
+    出来，只能撞上了才知道。不写进去，选靶那边查不到，`4:268:5` 会被一轮一轮
+    重新挑中（军力 10580、离得又近，排序上永远靠前）。
+
+    生产实测：出事那几天这一列一直是 `NULL`，正是因为 `OriginDrifted` 抢在
+    `_handle_dialog` 之前把这一轮结束掉了。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=pirate_ui.DIALOG_NO_MISSION)
+
+    loop.attack(TARGET, preset="AAA")
+
+    assert loop._repository.protections == [TARGET]
+
+
+def test_a_protection_dialog_skips_the_scout_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """侦察那一支同样会撞上——两个调用点必须一起改，只改一个是半个修。"""
+    loop = _loop(
+        monkeypatch,
+        origin_readings=[""],
+        briefing="侦察",
+        dialog=pirate_ui.DIALOG_NO_MISSION,
+    )
+
+    assert loop.scout(TARGET) is False
+    assert "click:确认终点" not in loop.events
+    assert loop._repository.protections == [TARGET]
+
+
+def test_the_round_memory_survives_a_protection_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ 「本轮已经切到哪」这份记忆**不该清**。
+
+    清掉是「记忆被证伪」那一档的动作，而这一档恰恰相反：星球切对了，只是被弹窗
+    盖住看不见。清掉的代价是下一个目标白切一次星球（约 3 秒 × 每颗），而这一轮
+    还要接着打十几个目标。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=pirate_ui.DIALOG_NO_MISSION)
+
+    loop.attack(TARGET, preset="AAA")
+
+    assert loop._current_planet == ORIGIN
+
+
+def test_an_exhausted_dialog_still_stops_the_round(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 另一半：「未选择任何战舰」是资源耗尽，**照旧停轮**。
+
+    两类弹窗处理方式相反（`pirate_ui.DialogKind`）。把这一档也放成「跳过这个
+    目标」，一轮会拿着一支派不出去的舰队把余下每个目标都空跑一遍。
+
+    ⚠️ 停的形式是 `RoundExhausted` 而**不是** `OriginDrifted`：起点根本没漂，
+    报成漂了会让排障从「星球切错了」那条死路开始查。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog=pirate_ui.DIALOG_NO_SHIPS)
+
+    with pytest.raises(RoundExhausted) as caught:
+        loop.attack(TARGET, preset="AAA")
+
+    assert not isinstance(caught.value, OriginDrifted)
+    assert "click:出发" not in loop.events
+
+
+def test_an_unreadable_origin_with_no_dialog_still_stops_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **2026-08-18 那道闸门必须原样还在。**
+
+    这一次的放宽只多认了一档：「读不出**而且**屏上有认得的弹窗」。屏上什么都
+    没有时读不出，仍旧说不出脚底下是哪一颗——照旧按核不过收场、照旧停这一轮。
+
+    少了这条，上面那几条用例会在闸门被整个拆掉时全部照绿。
+    """
+    loop = _loop(monkeypatch, origin_readings=[""], dialog="")
+
+    with pytest.raises(OriginDrifted):
+        loop.attack(TARGET, preset="AAA")
+
+    assert loop.dumped == ["origin-mismatch"]
+    assert loop._repository.protections == []
+
+
+def test_a_drifted_origin_does_not_get_excused_by_a_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **读出来是别的坐标时不问弹窗。**
+
+    弹窗解释得了「读空」，解释不了「读到 4:277:15」——那一行是从面板上读出来的
+    真坐标，说明脚底下真的换了星球。此时若也交给 `_handle_dialog`，撞上保护期就
+    会把一次真正的起点漂移降级成「跳过这个目标」，而这一轮余下每一发都会从错的
+    星球飞出去、按对的星球记账（那正是 2026-08-18 事故的全貌）。
+    """
+    loop = _loop(
+        monkeypatch,
+        origin_readings=[str(MAIN_PLANET)],
+        dialog=pirate_ui.DIALOG_NO_MISSION,
+    )
+
+    with pytest.raises(OriginDrifted):
+        loop.attack(TARGET, preset="AAA")
+
+    assert loop._repository.protections == [], "把真漂了的那一发记成了保护期"
+    assert loop._current_planet is None

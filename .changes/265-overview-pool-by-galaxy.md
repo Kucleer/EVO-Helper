@@ -1,5 +1,5 @@
 ---
-issue: 266
+issue: 265
 agent: web-api
 type: Changed
 date: 2026-08-26

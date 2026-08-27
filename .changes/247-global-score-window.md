@@ -1,5 +1,5 @@
 ---
-issue: 246
+issue: 247
 agent: root
 type: Changed
 date: 2026-08-23

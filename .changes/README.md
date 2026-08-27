@@ -1,4 +1,37 @@
 # Change fragments
 
-Add one Markdown file per issue using `template.md`. Root consolidates accepted fragments into
+Add one Markdown file per change using `template.md`. Root consolidates accepted fragments into
 `CHANGELOG.md` before release.
+
+## 编号 = **合它的那个 PR 号**
+
+文件名前缀与 frontmatter 里的 `issue:` 都写**这个片段最终由哪个 PR 合进 main**。
+
+### ⚠️ 先开 PR，再写片段 —— 不许猜号
+
+猜号一定会漂，而且**漂了没人看得出来**：文件名与 PR 号对不上时，两边都长得像个
+合法的号。仓库里已经这样漂过四次：
+
+| 片段 | 实际合它的 PR |
+|---|---|
+| `233-*` | #234 |
+| `237-*` | #238 |
+| `246-*` | #247 |
+| `266-*` | #265 |
+
+前三次是「按当前最大号 + 1」猜的，而中间有别人开了 PR。第四次不一样，更值得记：
+**PR #265 一口气合了两个片段**（`265-*` 与当时叫 `266-*` 的那个），于是后面每一个
+猜出来的号都往后错一位 —— 一次并号把偏移永久传了下去。
+
+所以顺序是：
+
+1. 先把代码改动提交、推分支、`gh pr create` —— 拿到真号 `N`
+2. 再写 `.changes/N-<slug>.md`，单独一个提交推上去
+
+多花一次推送，换来的是**不可能猜错**。
+
+### 一个 PR 带多个片段就重号，这是对的
+
+`.changes/` 里早就有六个 `6-*`、八个 `14-*`。片段是按「一件事」分的文件，而一个 PR
+可以合好几件事 —— 那几件事**本来就同属一个号**。把第二件事顺手写成 `N+1` 才是错的：
+那个号还没发生，而且它马上会被下一个真 PR 占掉。

@@ -1843,10 +1843,41 @@ class PirateLoop:
             payload=payload,
         )
 
-    def _require_origin_before_dispatch(self, coordinate: Coordinate) -> None:
+    def _require_origin_before_dispatch(self, coordinate: Coordinate) -> bool:
         """**每一发派遣之前**回读派遣面板的「起点」，与这一轮记账用的出发星比对。
 
-        对不上（含读不出）就抛 `OriginDrifted`：这一发不派，这一轮到此为止。
+        交 `True` 照常往下派；交 `False` 表示「这个目标跳过，这一轮继续」
+        （屏上是保护期弹窗那一档，见下）。真的对不上就抛 `OriginDrifted`：
+        这一发不派，这一轮到此为止。
+
+        ## ⚠️ 读不出**未必**是起点漂了 —— 先问一句屏上有没有弹窗
+
+        2026-08-27 生产：4 系一天起了 8 轮，7 轮死在同一个目标 `4:268:5` 上，
+        每轮都是这个形状：
+
+            08:43:44  起点回读 '4:277:15'，确认当前星球是 4:277:15
+            08:43:51  导航栏回读 ('4','277','15')，确认停在 4:277:15
+            08:44:14  派遣面板起点回读 （读不出）（原文 ''）
+            08:44:15  起点核对不过；这一发没派，这一轮到此为止
+
+        存下来的现场图上，那一刻屏幕上是**保护期弹窗**（「没有可执行的任务。」），
+        它盖住了面板，所以起点那一格自然读空。星球明明切对了 —— 前两行刚确认过。
+
+        而 `OriginDrifted` 是 `RoundExhausted` 的子类，**抛出去就是整轮结束**。
+        于是它在走到 `_handle_dialog` 之前就把这一轮杀掉了，后果是个自维持的循环：
+
+        1. `_note_protection_period` 没跑到 → `protection_seen_at_utc` 一直是 `None`
+        2. 目标没被排除，军力 10580、离得又近 → 下一轮又被挑中
+        3. 又撞同一个弹窗 → 又整轮作废
+
+        次数一路在涨：08-25 四次 → 08-26 六次 → 08-27 十四次。
+
+        ⇒ 所以读不出时**先把屏交给 `_handle_dialog` 按弹窗类型认**，它已有的语义
+        正好：保护期 → 跳过这个目标、整轮继续；资源耗尽 → `RoundExhausted`。
+        认不出弹窗，才轮到下面那条「读不出算核不过」。
+
+        ⚠️ **只在「读不出」那一档问弹窗。** 读出来却是**别的坐标**时不问 ——
+        那是真漂了，弹窗解释不了它，而放行的代价正是下面那段说的假账。
 
         ## 这道闸门补的是什么
 
@@ -1907,7 +1938,12 @@ class PirateLoop:
 
         self._settle(read_once, tries=ORIGIN_SETTLE_TRIES)
         if shown == expected:
-            return
+            return True
+        # ⚠️ 见 docstring：读不出**未必**是起点漂了，保护期弹窗会盖住这一格。
+        # `_handle_dialog` 认不出弹窗时交 True，那时才落到下面的拒绝逻辑；
+        # 认出资源耗尽那几种时它自己抛 `RoundExhausted`，照旧停轮。
+        if shown is None and not self._handle_dialog(coordinate):
+            return False
         note = (
             f"  派遣面板起点回读 {shown or '（读不出）'}（原文 {raw!r}），"
             f"对不上这一轮的出发星球 {expected}；这一发不派，这一轮到此为止"
@@ -2008,7 +2044,11 @@ class PirateLoop:
         self._driver.wait(DISPATCH_WAIT_S)
         # 面板刚铺开、还没点绿✓，起点那一行就在眼前：**每一发都核一次脚底下的星球**。
         # 侦察也要核——它一样占航线、一样按出发坐标记账，从错的星球飞出去同样是假账。
-        self._require_origin_before_dispatch(coordinate)
+        if not self._require_origin_before_dispatch(coordinate):
+            # 交 False = 屏上是保护期弹窗，这个目标跳过、这一轮继续。弹窗已经点掉了，
+            # 但派遣列表还开着，和下面「弹窗挡下」那一支一样要自己退出来。
+            self._leave_dispatch_list()
+            return False
         self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
         self._driver.wait(BRIEFING_WAIT_S)
         # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
@@ -2055,7 +2095,11 @@ class PirateLoop:
         # ⚠️ **必须排在展开预设条之前。** `PRESET_TOGGLE` 就坐在起点那一行的右端，
         # 条一展开，「预设 N/10」那一栏整个把起点盖住（实拍 `var/logs/atk-2-presets.png`），
         # 那时再读只会读到预设名。顺带还省下一次翻预设条：核不过的那一发本来就不派。
-        self._require_origin_before_dispatch(coordinate)
+        if not self._require_origin_before_dispatch(coordinate):
+            timer.lap("核起点")
+            timer.say_total("保护期弹窗挡下")
+            self._leave_dispatch_list()
+            return False
         timer.lap("核起点")
 
         picker = PresetPicker(

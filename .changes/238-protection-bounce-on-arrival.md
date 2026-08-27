@@ -1,5 +1,5 @@
 ---
-issue: 237
+issue: 238
 agent: root
 type: Fixed
 date: 2026-08-21
