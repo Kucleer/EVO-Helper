@@ -746,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
         keeper = make_session_keeper(driver, ocr)
         # 「确保窗口在」也要落进重开的保护圈——2026-08-28 昨夜就是死在这一行的
         # 前身（裸 `driver.window()`）上，整段账在 `ensure_window_or_restart`。
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
         outcome = BotLoop(driver, ocr, options, session_keeper=keeper).run()
         say(
             f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"

@@ -222,7 +222,7 @@ def enter_game_exit_code(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> 
     # `driver.window()`——窗口没了的时候，这条链路根本走不到能重开的那一级。
     # 2026-08-28 昨夜六个任务里的 RANKING 那一条就是这么倒的，整段账在
     # `scan_coordinates.ensure_window_or_restart`。配额与下面这个守护共用一份。
-    ensure_window_or_restart(driver, keeper)
+    ensure_window_or_restart(driver, keeper, chain="tools.ranking_scan")
     session = keeper.ensure_connected(force=True)
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
     session = wait_for_login_if_unrecognised(session, keeper)
