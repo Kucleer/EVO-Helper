@@ -46,19 +46,21 @@ def _columns(database_url: str, table: str) -> dict[str, dict[str, object]]:
     }
 
 
-def test_this_revision_is_the_single_head() -> None:
-    """链上只有一个 head，而且就是这一条。
+def test_this_revision_is_on_a_single_headed_chain() -> None:
+    """链上只有一个 head，而这一条在链上。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前一个字
     都看不出来。
 
-    ⚠️ 「head 就是我」这句话只有**最新那一条**该说；等下一条迁移接上来，这里要跟着
-    退回成「我在链上」（同 `test_bot_target_unreadable_migration.py` 里那一段）。
+    ⚠️ 这条**不再断言「head 就是我」**：后面又接了新的迁移（`f2c04b8ae153`，
+    退避自动恢复的那两列），而「谁是 head」这句话只该由**最新那一条**的用例来说
+    ——这正是上一版这段注释里写好的退法。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {revision.revision for revision in script.walk_revisions()}
 
 
 def test_both_columns_are_nullable_with_no_default(database_url: str) -> None:

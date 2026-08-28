@@ -66,6 +66,7 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "mission_tasks.enabled_from_utc",
         "mission_tasks.enabled_until_utc",
         "mission_tasks.quota_exhausted_until_utc",
+        "mission_tasks.retry_after_utc",
         "mission_tasks.round_started_at_utc",
         "mission_tasks.updated_at_utc",
         "planet_scout_alerts.delivered_at_utc",
@@ -134,6 +135,8 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "scheduler_uptime_segments.last_beat_at_utc",
         # a7d3e91c05b2（永久拉黑的时刻）加的，那条迁移里也写着 `timezone=True`。
         "bot_targets.blacklisted_at_utc",
+        # f2c04b8ae153（退避到期自动恢复）加的，那条迁移里也写着 `timezone=True`。
+        "mission_tasks.retry_after_utc",
     }
 )
 

@@ -123,18 +123,116 @@ class DisabledRecovery(Enum):
     就静默失效，而失效的样子正是「任务停用之后再也没人放它出来」。
 
     `MANUAL` 是**默认**，也是唯一安全的默认：认不出来的一律要用户动手。
-    连续失败达上限就属于这一档——它说的是「这不是暂时的」，自动放它出来只会
-    让调度循环回到那个满速空转的重启循环里。
 
     `FREE_LINES` 那一档的成立条件由 `application.mission_scheduler` 每 tick
     **现算**（此刻这个任务那颗出发星球上到底有没有空闲航线），不挂定时器：
     调度器进程会重启，内存里的闹钟一重启就没了，现算的判定重启后照样成立。
+
+    `BACKOFF` 是时间驱动的那一档，所以「什么时候可以重试」**必须落列**
+    （`mission_tasks.retry_after_utc`）而不是记在内存里——同一个理由：进程会重启。
+    判据仍然每 tick 现算，只是它算的是「库里那个时刻到了没有」。
+
+    ⚠️ **判据一律认这一列的枚举值，绝不去比对 `disabled_reason` 里那句中文。**
+    新加一档不改这条规矩：措辞改一次判据就静默失效，而失效的样子正是
+    「任务停用之后再也没人放它出来」。
     """
 
     #: 只有人能放它出来（页面上那个「恢复」按钮，或者改一次任务配置）。
     MANUAL = "MANUAL"
     #: 出现空闲航线就自己回来。停用它的是 `domain.missions.NoFreeLineError`。
     FREE_LINES = "FREE_LINES"
+    #: 冷却到期就自己回来，连着再崩就把冷却拉长（`BACKOFF_STEPS`）。
+    #: 「连续失败达上限」这一档归它，见 `BACKOFF_STEPS` 上那段。
+    BACKOFF = "BACKOFF"
+
+
+#: 「连崩到上限」自动停用之后，第 1 / 2 / 3 轮各等多久；第 4 轮起一直用最后一格。
+#: 用户口径（2026-08-28）：「15 分 → 30 分 → 1 小时，之后一直 1 小时封顶」，
+#: 而且**不设终点**——永远按封顶间隔重试，不存在「试够 N 次就转成等人工」。
+#:
+#: ## 为什么这一档不再是 `MANUAL`
+#:
+#: 原先的理由是对的：连崩到上限说的是「这不是暂时的」，自动恢复会让调度循环
+#: 退回那个满速空转的重启循环。**但防空转靠的是冷却，不是永不恢复。**
+#:
+#: 2026-08-28 生产实况：00:01 游戏窗口没了，六个任务每轮起来约 1 秒就死；
+#: 环境故障豁免（`MAX_ENVIRONMENT_EXEMPTIONS`）用尽后 01:02 全部自动停用成
+#: `MANUAL`，然后**一直关到早上用户手动打开**（bot 约 07:2x、军力榜 09:32），
+#: 而环境早就自己好了。军力榜多关了两个多小时才被发现。
+#: 换成这条曲线，那一夜会在 **01:17** 自己回来。
+#:
+#: ## 为什么封顶 1 小时、而且不设终点
+#:
+#: 真环境故障（掉线 / 维护 / 窗口被抢 / 机器休眠）多半半小时内好，第一次重试
+#: 就接上了。真坏了的链路每小时白试一次、每次约 1 秒——一天最多 24 次、24 秒，
+#: 代价远小于整夜一动不动。**「试够 N 次转人工」等于把昨夜那个坑照原样留着**，
+#: 只是把它推迟到第 N 次之后。
+#:
+#: ## 为什么一轮只白试一次而不是三次
+#:
+#: 恢复时**不清 `consecutive_failures`**（见 `repository.resume_mission_task`）：
+#: 它已经等于上限，所以放回来之后再崩一次就立刻重新停用。上面那个「一天 24 次」
+#: 的账正是这么算出来的；顺手清零的话每轮要白试三次，代价翻三倍。
+BACKOFF_STEPS: tuple[timedelta, ...] = (
+    timedelta(minutes=15),
+    timedelta(minutes=30),
+    timedelta(hours=1),
+)
+
+#: 写进每一条退避日志 payload 的**版本指纹**：只有带自动退避恢复的代码写得出这个键。
+#:
+#: 实机在另一台机器上，事后只能靠库里的 `system_log` 判断「生产那会儿跑的到底是
+#: 哪一版」。`disabled_recovery` 那一列不够用——它是 `BACKOFF` 只说明列写对了，
+#: 说不出退避曲线是哪一条。曲线变了这个字符串要跟着变（`test_domain_backoff.py`
+#: 里有一条用例钉着它和 `BACKOFF_STEPS` 不许走散）。
+BACKOFF_SCHEME = "auto-retry/v1:15m-30m-60m"
+
+
+def backoff_delay(round_number: int) -> timedelta:
+    """第 `round_number` 轮自动停用之后要等多久才自动重试。轮次从 1 起数。
+
+    超出 `BACKOFF_STEPS` 长度的一律用最后一格（封顶，不是继续翻倍）：用户明确
+    要求「之后一直 1 小时封顶」，而指数增长到第 10 轮就是 128 小时——那和
+    「再也不恢复」没有区别，正是这次要修的毛病。
+
+    `round_number < 1` 当 1 算而不是抛异常：这个函数落在**收退出码**那条路上，
+    为一个算错的轮次把调度循环整个弄停，比多等 15 分钟糟得多。
+    """
+    index = max(round_number, 1) - 1
+    return BACKOFF_STEPS[min(index, len(BACKOFF_STEPS) - 1)]
+
+
+def due_for_a_backoff_retry(
+    *,
+    disabled_reason: str | None,
+    disabled_recovery: str | None,
+    retry_after_utc: datetime | None,
+    now: datetime,
+) -> bool:
+    """这一行现在该不该被自动放回来。
+
+    ⚠️⚠️ **`enabled` 一个字都不看，这是本函数存在的全部理由。**
+    用户自己关掉的任务（生产上那四个：侦查+攻击海盗、扫描全星系 bot、5 系攻击、
+    9 系攻击）必须一直关着，而它们与自动停用的任务在库里的区别只有一处：
+
+    - 用户手动关的：`enabled = False`，`disabled_reason` **为 NULL**
+      （`update_mission_task` 会把停用标记连同 recovery 一起清掉）
+    - 自动停用的：`disabled_reason IS NOT NULL` + `disabled_recovery` 有值
+
+    所以判据只认 `disabled_reason IS NOT NULL`。改成看 `enabled`，或者干脆去掉
+    这一条，就等于**替用户把他自己关掉的任务打开**——那是这次改动唯一不能出的错。
+
+    抽成纯函数而不是写在调度器的列表推导里，是为了让它**能被直接钉住**：
+    上面那个错误改法在集成用例里会被 `resume_mission_task` 的事务内二次确认
+    悄悄兜住（行没变、日志没写、用例照样绿），只有在这一层才看得见。
+    """
+    if disabled_reason is None:
+        return False
+    if disabled_recovery != DisabledRecovery.BACKOFF.value:
+        return False
+    if retry_after_utc is None:
+        return False
+    return retry_after_utc <= now
 
 
 #: **填空隙**的那几种任务：不派遣舰队、没有完成态、排最后、可被攻击抢占。

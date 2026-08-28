@@ -803,8 +803,13 @@ def test_three_consecutive_crashes_disable_the_chain(  # type: ignore[no-untyped
 
     assert task(repository, MissionKind.PIRATE).disabled_reason is not None
 
-    clock.now = NOW + timedelta(days=1)
-    scheduler.tick()
+    # ⚠️ 2026-08-28 起自动停用不再是永久的：退避冷却到期它会自己回来
+    # （`test_backoff_auto_recovery.py`）。这里钉的仍是原来那件事——**冷却期内一发
+    # 都不许再起**，也就是那个满速空转的重启循环确实被挡住了；挡它的是冷却，
+    # 不是「永不恢复」。停用发生在 NOW+12 分，第一轮退避 15 分钟 → NOW+27 分到期。
+    for minutes in range(13, 27):
+        clock.now = NOW + timedelta(minutes=minutes)
+        scheduler.tick()
     assert len(launcher.spawned) == MAX_CONSECUTIVE_FAILURES
 
 

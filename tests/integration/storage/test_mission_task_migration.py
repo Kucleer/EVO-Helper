@@ -43,6 +43,9 @@ EXPECTED_MISSION_TASK_COLUMNS = frozenset(
         "consecutive_failures",
         "disabled_reason",
         "disabled_recovery",
+        # 退避自动恢复的两列（`f2c04b8ae153`）：什么时候重试、这是第几轮。
+        "retry_after_utc",
+        "backoff_rounds",
         "created_at_utc",
         "updated_at_utc",
     }

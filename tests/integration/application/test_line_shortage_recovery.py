@@ -354,14 +354,18 @@ def test_the_recovery_is_written_into_the_system_log(  # type: ignore[no-untyped
 # -- 别的停用原因：一律不动 ----------------------------------------------------
 
 
-def test_a_chain_disabled_by_consecutive_failures_is_never_resumed_automatically(  # type: ignore[no-untyped-def]
+def test_a_chain_disabled_by_consecutive_failures_is_not_resumed_by_the_line_pass(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, clock, session_factory
 ) -> None:
-    """**这条最重要。** 连崩到上限说的是「这不是暂时的」。
+    """**这条最重要。** 连崩到上限与「等航线」是两件事，恢复路径不许混。
 
     航线一条都没被占（空闲航线管够），所以「有空闲航线」这个条件成立得不能再
-    成立——任何把恢复判据放宽到「所有自动停用都自愈」的改法，都会让这条转红。
-    自动放它出来的后果是调度循环退回那个满速空转的重启循环。
+    成立——任何把**航线那条**恢复判据放宽到「所有自动停用都自愈」的改法，都会
+    让这条转红：它会在退避冷却还没到期的时候就把任务放出来。
+
+    ⚠️ 2026-08-28 起连崩这一档的标记是 `BACKOFF` 而不是 `MANUAL`，冷却到期之后
+    它**会**自己回来（见 `test_backoff_auto_recovery.py`）。这里钉的是**冷却期内**
+    一动不动，以及标记绝不是 `FREE_LINES`——两条恢复路径各认各的标记。
     """
     set_config(session_factory, fleet_line_limit=6, reserved_lines=0)
     for row in repository.mission_tasks():
@@ -376,16 +380,17 @@ def test_a_chain_disabled_by_consecutive_failures_is_never_resumed_automatically
 
     disabled = row_of(repository, MissionKind.PIRATE)
     assert disabled.disabled_reason is not None
-    assert disabled.disabled_recovery == DisabledRecovery.MANUAL.value
+    assert disabled.disabled_recovery == DisabledRecovery.BACKOFF.value
 
     started = len(launcher.spawned)
-    clock.now = NOW + timedelta(hours=4)
+    # 停用发生在 NOW+18 分，第一轮退避 15 分钟 → NOW+33 分才到期。停在 30 分。
+    clock.now = NOW + timedelta(minutes=30)
     for _ in range(5):
         scheduler.tick()
 
     still = row_of(repository, MissionKind.PIRATE)
     assert still.disabled_reason is not None
-    assert still.disabled_recovery == DisabledRecovery.MANUAL.value
+    assert still.disabled_recovery == DisabledRecovery.BACKOFF.value
     assert len(launcher.spawned) == started
 
 

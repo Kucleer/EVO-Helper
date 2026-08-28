@@ -529,7 +529,9 @@ def test_a_disabled_scan_is_revived_by_enabling_it_again(console: Console) -> No
     「连续 3 次异常退出」停掉的扫描在页面上永远没有恢复的办法，用户只能去改库。
     计数也必须一起清零，否则下一次崩溃立刻又满三次。
     """
-    console.repository.record_mission_failure(console.task_id("SCAN"), exit_code=1, limit=1)
+    console.repository.record_mission_failure(
+        console.task_id("SCAN"), exit_code=1, limit=1, now_utc=datetime.now(UTC)
+    )
     assert console.task("SCAN")["disabled_reason"] is not None
 
     response = console.patch("SCAN", {"enabled": True})
@@ -711,7 +713,9 @@ def test_a_disabled_chain_can_still_be_revived_while_the_scheduler_runs(
     不动固化记录里的任何一个字段。
     """
     _start(console)
-    console.repository.record_mission_failure(console.task_id("SCAN"), exit_code=1, limit=1)
+    console.repository.record_mission_failure(
+        console.task_id("SCAN"), exit_code=1, limit=1, now_utc=datetime.now(UTC)
+    )
     assert console.task("SCAN")["disabled_reason"] is not None
 
     response = console.patch("SCAN", {"enabled": True})
