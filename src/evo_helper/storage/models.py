@@ -806,6 +806,27 @@ class MissionTaskRow(Base):
     #: **NULL 一律当 `MANUAL` 读**：没停用的行是 NULL，本列上线之前的历史行也是
     #: NULL。认不出来就要用户动手，这是唯一安全的默认。
     disabled_recovery: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: `DisabledRecovery.BACKOFF` 那一档的闹钟：**到了这个时刻就自动放回来。**
+    #:
+    #: **NULL = 「没有在等冷却」**——没停用的行、别的恢复方式停用的行、以及本列
+    #: 上线之前的历史行都是 NULL。判据（`domain.scheduler.due_for_a_backoff_retry`）
+    #: 把 NULL 一律读成「不该恢复」，认不出来就不动它，这是唯一安全的默认。
+    #:
+    #: ⚠️ **必须落列，不能是内存里的闹钟。** 调度器进程会重启（改配置、装新版本
+    #: 都会），内存里那个一重启就没了，于是任务又变回「关了就再也不开」——正是
+    #: 2026-08-28 那一夜的样子。同一个理由写在 `DisabledRecovery` 的文档里。
+    retry_after_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 这个任务**连着**被自动停用了几轮，退避间隔按它查 `BACKOFF_STEPS`。
+    #:
+    #: 0 = 「当前这一串还没开始」。非空、默认 0，与 `consecutive_failures` 同形：
+    #: 它是个计数，「不知道」这个状态对它没有意义，可空只会让每一处读它的地方
+    #: 都要写一遍 `or 0`。
+    #:
+    #: ⚠️ **归零点是「任何任务跑出退出码 0」**，不是「这个任务恢复了」：那一刻
+    #: 环境被证明是好的（窗口在、会话在、鼠标是我们的），之前那一串退避说的
+    #: 「环境坏着」已经不成立。与 `MAX_ENVIRONMENT_EXEMPTIONS` 的归零共用
+    #: `_finish` 里的同一处，两个计数说的是同一件事的两半。
+    backoff_rounds: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
 

@@ -55,7 +55,7 @@ from evo_helper.domain.report_wait import (
     vet_flight_time,
 )
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
-from evo_helper.domain.scheduler import DisabledRecovery, MissionKind
+from evo_helper.domain.scheduler import DisabledRecovery, MissionKind, backoff_delay
 from evo_helper.domain.scout_verdict import verdict_of_record
 from evo_helper.domain.state_machine import require_transition
 from evo_helper.infrastructure.system_log import record_system_log
@@ -293,6 +293,33 @@ class ProtectionBounceOutcome:
     def closed(self) -> bool:
         """那一发被结掉了吗——**这一趟结的，或者早先已经结过的**。"""
         return self.already_recorded or self.report_id is not None
+
+
+@dataclass(frozen=True)
+class MissionFailureOutcome:
+    """记完一次异常退出之后，这个任务变成了什么样。**主要为写日志而存在。**
+
+    ⚠️ **`disabled_now` 说的是「这一次调用把它关掉了」，不是「它现在关着」。**
+    两者只在跃迁那一下相同，而日志只该在跃迁那一下写：库里现在是停用状态这件事
+    上一轮就已经成立，照它写就是每次失败都刷一条，把真正的那一刻埋掉。
+
+    退避那两个数一起带出来（第几轮、什么时候重试），是因为调用方要把它们写进
+    `system_log`——实机在另一台机器上，「这是第几轮退避、下次几点」除了日志之外
+    没有第二个地方查得到：库里那两列会被下一次停用覆盖掉。
+    """
+
+    #: 记完这一次之后的连续失败次数。
+    failures: int
+    #: 这一次调用是不是**刚刚**把它关掉的。
+    disabled_now: bool
+    #: 任务名（可能是空串，显示层自己回落）。带出来省一次回头查库。
+    name: str
+    #: 库里此刻那句停用原因；没被停用就是 None。
+    disabled_reason: str | None
+    #: 连着被自动停用了几轮。没停用过就是 0。
+    backoff_round: int
+    #: 什么时候自动放回来。None = 没有在等冷却。
+    retry_after_utc: datetime | None
 
 
 @dataclass(frozen=True)
@@ -3124,6 +3151,14 @@ class SqlAlchemyRepository:
             # 迟早有人照它做判断。
             row.disabled_recovery = None
             row.consecutive_failures = 0
+            # 退避那两列同理，而且这一处是**用户手动关掉的任务不被自动打开**
+            # 那条性质的第一道闸：页面上勾掉复选框走的就是这里
+            # （`enabled=False`），走完这一行的 `disabled_reason` 是 NULL，
+            # 而自愈判据只认「`disabled_reason IS NOT NULL`」。
+            # 留着一个过了期的 `retry_after_utc`，等于给一个已经不存在的停用
+            # 留着闹钟——判据哪天松一点就会照它把任务打开。
+            row.retry_after_utc = None
+            row.backoff_rounds = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
 
@@ -3300,28 +3335,59 @@ class SqlAlchemyRepository:
             ).all()
         return {int(task_id): started_at for task_id, started_at in rows}
 
-    def record_mission_failure(self, task_id: int, *, exit_code: int | None, limit: int) -> int:
-        """记一次异常退出，返回当前连续次数；到 `limit` 就自动停用。
+    def record_mission_failure(
+        self, task_id: int, *, exit_code: int | None, limit: int, now_utc: datetime
+    ) -> MissionFailureOutcome:
+        """记一次异常退出；到 `limit` 就自动停用，并**给它定下重试的时刻**。
 
-        没有这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。
+        没有自动停用这条，调度循环会在一个坏掉的任务上变成满速空转的重启循环。
         失败多半是「窗口抢不到前台」或「甩鼠标触发 FAILSAFE」，重启只会再来一遍。
+
+        ⚠️ **停用之后是 `BACKOFF` 而不是 `MANUAL`。** 原先给 `MANUAL` 的理由
+        （「连崩到上限说的是这不是暂时的，自动恢复会让调度循环退回那个满速空转的
+        重启循环」）只对了一半：**防空转靠的是冷却，不是永不恢复。**
+        2026-08-28 那一夜六个任务 01:02 全部停用、一直关到早上用户手动打开，
+        而环境早就自己好了。整段账（曲线怎么取、为什么不设终点）在
+        `domain.scheduler.BACKOFF_STEPS` 上。
+
+        `now_utc` 是**必填**的：重试时刻要跟调度器的钟走。这个方法原先只用
+        `datetime.now(UTC)` 写 `updated_at_utc`，谁也不看；现在它要写一个会被判据
+        读回去的时刻，两个钟差一点，事后按日志排时间线就会把恢复排在停用之前，
+        而时间相关的用例拿真实时钟一律恒绿。
+
+        返回的 `MissionFailureOutcome` 里带着「**这一次调用**有没有把它关掉」：
+        调用方要在跃迁那一下写 `system_log`，而「库里现在是停用状态」回答不了
+        这个问题——它上一轮就已经是了。
         """
+        _require_utc(now_utc, "now_utc")
         with self._session_factory() as session:
             row = _mission_task(session, task_id)
             row.consecutive_failures += 1
+            disabled_now = False
             if row.consecutive_failures >= limit and row.disabled_reason is None:
                 # 退出码可能为 None：停顿看门狗掐掉的那一档是我们自己动的手，
                 # 收不到 runner 的表态（见 `MissionSupervisor.stop`）。
                 # 写「未知」而不是 None，那一行是要给用户看的。
                 code = "未知" if exit_code is None else str(exit_code)
                 row.disabled_reason = f"连续 {row.consecutive_failures} 次异常退出（退出码 {code}）"
-                # 连崩到上限说的是「这不是暂时的」，只能由用户动手放它出来。
-                # 自动恢复会让调度循环退回那个满速空转的重启循环。
-                row.disabled_recovery = DisabledRecovery.MANUAL.value
-            failures = row.consecutive_failures
-            row.updated_at_utc = datetime.now(UTC)
+                row.disabled_recovery = DisabledRecovery.BACKOFF.value
+                # 轮次先加再查曲线：第一轮（刚从 0 加成 1）等 15 分钟。
+                # **累加而不是置 1**——「恢复之后又崩」要落到下一档，从头再来
+                # 就等于每小时都白试一次、永远退不出去。
+                row.backoff_rounds += 1
+                row.retry_after_utc = now_utc + backoff_delay(row.backoff_rounds)
+                disabled_now = True
+            outcome = MissionFailureOutcome(
+                failures=row.consecutive_failures,
+                disabled_now=disabled_now,
+                name=row.name,
+                disabled_reason=row.disabled_reason,
+                backoff_round=row.backoff_rounds,
+                retry_after_utc=row.retry_after_utc,
+            )
+            row.updated_at_utc = now_utc
             session.commit()
-            return failures
+            return outcome
 
     def clear_mission_failures(self, task_id: int) -> None:
         """跑完一轮且退出码为 0。「连续」是连续，中间成功过就重新数。
@@ -3336,6 +3402,34 @@ class SqlAlchemyRepository:
             row.consecutive_failures = 0
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
+
+    def clear_backoff_rounds(self) -> int:
+        """**任何一个任务跑出退出码 0** 之后，把全部任务的退避轮次清零，返回清了几行。
+
+        那一刻环境被证明是好的：窗口在、会话在、鼠标是我们的。之前那一串退避说的
+        「环境坏着」已经不成立，让下一次停用还从第 4 轮（1 小时）起数，等于拿昨夜
+        的账去罚今天——而这个计数唯一的用途就是量「这一串坏了多久」。
+        与 `MAX_ENVIRONMENT_EXEMPTIONS` 的归零同源、同一处触发（`_finish`）。
+
+        **按全库清，不按任务清**，和那个豁免计数一样：证明环境好了的那一轮可能是
+        另一条链路跑的，而它们共用同一个游戏窗口、同一只鼠标。
+
+        ⚠️ **不碰 `retry_after_utc`。** 清了就等于「另一条链路跑通 → 立刻把还在
+        冷却里的任务全放出来」，那是一条**没人要求过**的旁路：它绕开了整条退避
+        判据，一条真坏了的链路会跟着每一次别人的成功被反复起起来。到点自己回来
+        就够；那时它已经从第 1 轮重新起数了。
+        """
+        with self._session_factory() as session:
+            rows = list(
+                session.scalars(
+                    select(orm.MissionTaskRow).where(orm.MissionTaskRow.backoff_rounds != 0)
+                ).all()
+            )
+            for row in rows:
+                row.backoff_rounds = 0
+            if rows:
+                session.commit()
+            return len(rows)
 
     def disable_mission_task(
         self,
@@ -3371,9 +3465,19 @@ class SqlAlchemyRepository:
         或者这条链路刚被另一个原因重新停用（标记已经换成 `MANUAL`）。两种情况下
         都不能动它，尤其后者——那会把一条「连续失败」停用的链路悄悄放出来。
 
-        **不碰 `consecutive_failures`。** 会自愈的那几档停用（当前只有航线不足）
-        本来就不是失败，那个计数与它无关；顺手清掉等于把一条真在连崩的链路的
-        账抹平，下次它离自动停用又远了三次。
+        **不碰 `consecutive_failures`。** 航线不足那一档本来就不是失败，那个计数
+        与它无关；顺手清掉等于把一条真在连崩的链路的账抹平，下次它离自动停用又
+        远了三次。
+
+        ⚠️ **`BACKOFF` 那一档更要不碰，而且理由相反**：它恰恰是连崩到上限才停的，
+        计数此刻正等于上限。留着，放回来之后再崩一次就立刻重新停用——**一轮只白
+        试一次**，这正是「一天最多白试 24 次、每次约 1 秒」那笔账的来处
+        （见 `domain.scheduler.BACKOFF_STEPS`）。清掉的话每轮要白试三次。
+
+        **`retry_after_utc` 清掉，`backoff_rounds` 留着。** 前者是这一次停用的
+        闹钟，停用结束了它就该消失（留着等于给一个已经不存在的停用留着闹钟）；
+        后者量的是「这一串坏了多久」，留着才有「恢复之后又崩就落到下一档」。
+        它的归零点只有一个：任何任务跑出退出码 0（`clear_backoff_rounds`）。
         """
         with self._session_factory() as session:
             row = session.get(orm.MissionTaskRow, task_id)
@@ -3383,6 +3487,7 @@ class SqlAlchemyRepository:
                 return False
             row.disabled_reason = None
             row.disabled_recovery = None
+            row.retry_after_utc = None
             row.updated_at_utc = datetime.now(UTC)
             session.commit()
             return True

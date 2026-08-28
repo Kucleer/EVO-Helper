@@ -122,7 +122,7 @@ def test_three_consecutive_failures_disable_the_task(repository) -> None:  # typ
 
     pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(3):
-        repository.record_mission_failure(pirate, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.consecutive_failures == 3
@@ -134,7 +134,7 @@ def test_two_failures_are_not_enough(repository) -> None:  # type: ignore[no-unt
 
     pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(2):
-        repository.record_mission_failure(pirate, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.disabled_reason is None
@@ -145,10 +145,10 @@ def test_a_clean_exit_resets_the_streak(repository) -> None:  # type: ignore[no-
     repository.ensure_mission_rows(now_utc=NOW)
     pirate = task_id(repository, MissionKind.PIRATE)
     for _ in range(2):
-        repository.record_mission_failure(pirate, exit_code=1, limit=3)
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
 
     repository.clear_mission_failures(pirate)
-    repository.record_mission_failure(pirate, exit_code=1, limit=3)
+    repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
 
     row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
     assert row.consecutive_failures == 1
@@ -165,6 +165,135 @@ def test_disabling_for_bad_parameters_says_why(repository) -> None:  # type: ign
 
     row = next(item for item in repository.mission_tasks() if item.kind == "BOT")
     assert row.disabled_reason == "该范围内没有已记录的 bot；先跑扫描"
+
+
+# -- 退避自动恢复的写侧 --------------------------------------------------------
+#
+# 判据在 `domain.scheduler`（有它自己那份用例），端到端在
+# `tests/integration/application/test_backoff_auto_recovery.py`。这里钉的是**写库
+# 那几下**：哪一列被谁改、谁绝不许碰谁。
+
+
+def test_the_auto_disable_marks_it_as_a_backoff_and_sets_the_alarm(repository) -> None:  # type: ignore[no-untyped-def]
+    """连崩到上限之后，恢复方式是 `BACKOFF`，并且**当场定下重试时刻**。
+
+    ⚠️ 2026-08-28 之前这里写的是 `MANUAL`，于是那一夜六个任务一直关到早上用户
+    手动打开。防满速空转靠的是冷却，不是永不恢复。
+
+    时刻按传进来的钟算，不是 `datetime.now()`：两个钟差一点，事后按日志排时间线
+    就会把恢复排在停用之前，而时间相关的用例拿真实时钟一律恒绿。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
+
+    for _ in range(3):
+        outcome = repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
+
+    row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
+    assert row.disabled_recovery == "BACKOFF"
+    assert row.backoff_rounds == 1
+    assert row.retry_after_utc == NOW + timedelta(minutes=15)
+    # 返回值说的是「**这一次调用**把它关掉了」，日志只该在跃迁那一下写。
+    assert outcome.disabled_now is True
+    assert outcome.backoff_round == 1
+    assert outcome.retry_after_utc == row.retry_after_utc
+
+
+def test_a_failure_on_an_already_disabled_task_is_not_a_new_transition(repository) -> None:  # type: ignore[no-untyped-def]
+    """已经停用着的任务再记一次失败，不许当成新的一次跃迁。
+
+    当成跃迁的话，日志里会出现一个**根本没发生过**的停用时刻，而且退避轮次会
+    被多推一档——曲线凭空跳过 15 分钟那一格。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
+    for _ in range(3):
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
+
+    again = repository.record_mission_failure(
+        pirate, exit_code=1, limit=3, now_utc=NOW + timedelta(minutes=1)
+    )
+
+    assert again.disabled_now is False
+    row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
+    assert row.backoff_rounds == 1
+    assert row.retry_after_utc == NOW + timedelta(minutes=15)
+
+
+def test_resuming_clears_the_alarm_but_keeps_the_round_and_the_streak(repository) -> None:  # type: ignore[no-untyped-def]
+    """放回来时清闹钟、**留轮次、留连续失败计数**。三样各有各的理由。
+
+    - 闹钟：这一次停用结束了，留着就是给一个已经不存在的停用留着闹钟。
+    - 轮次：留着才有「恢复之后又崩就落到下一档」。它的归零点只有一个——
+      任何任务跑出退出码 0。
+    - 连续失败计数：它此刻正等于上限，留着意味着放回来之后**再崩一次就重新
+      停用**，也就是一轮只白试一次。清掉的话每轮要白试三次，「一天最多 24 次、
+      每次约 1 秒」那笔账当场翻三倍。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
+    for _ in range(3):
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
+
+    from evo_helper.domain.scheduler import DisabledRecovery
+
+    assert repository.resume_mission_task(pirate, recovery=DisabledRecovery.BACKOFF) is True
+
+    row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
+    assert row.disabled_reason is None
+    assert row.disabled_recovery is None
+    assert row.retry_after_utc is None
+    assert row.backoff_rounds == 1
+    assert row.consecutive_failures == 3
+
+
+def test_a_user_edit_wipes_every_trace_of_the_backoff(repository) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **用户动手改一次任务，退避状态一个字都不许留下。**
+
+    页面上勾掉复选框走的就是这里（`enabled=False`）。走完之后 `disabled_reason`
+    是 NULL，而自愈判据只认「`disabled_reason IS NOT NULL`」——这是「用户自己
+    关掉的任务永远不被自动打开」那条性质的第一道闸。
+
+    闹钟同样要清掉：留着一个过了期的 `retry_after_utc`，等于给一个已经不存在的
+    停用留着闹钟，判据哪天松一点就会照它把任务打开。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
+    for _ in range(3):
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
+
+    repository.update_mission_task(pirate, enabled=False)
+
+    row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
+    assert row.enabled is False
+    assert row.disabled_reason is None
+    assert row.disabled_recovery is None
+    assert row.retry_after_utc is None
+    assert row.backoff_rounds == 0
+    assert row.consecutive_failures == 0
+
+
+def test_clearing_the_rounds_is_global_and_leaves_the_alarm_alone(repository) -> None:  # type: ignore[no-untyped-def]
+    """归零按**全库**清，而且只清轮次。
+
+    按全库清：证明环境好了的那一轮可能是另一条链路跑的，而它们共用同一个游戏
+    窗口、同一只鼠标（同 `MAX_ENVIRONMENT_EXEMPTIONS` 的归零）。
+
+    只清轮次：把闹钟也清掉，就等于「另一条链路跑通 → 立刻把还在冷却里的任务全
+    放出来」，那是一条**没人要求过**的旁路——它绕开整条退避判据，一条真坏了的
+    链路会跟着每一次别人的成功被反复起起来。到点自己回来就够。
+    """
+    repository.ensure_mission_rows(now_utc=NOW)
+    pirate = task_id(repository, MissionKind.PIRATE)
+    for _ in range(3):
+        repository.record_mission_failure(pirate, exit_code=1, limit=3, now_utc=NOW)
+
+    assert repository.clear_backoff_rounds() == 1
+
+    row = next(item for item in repository.mission_tasks() if item.kind == "PIRATE")
+    assert row.backoff_rounds == 0
+    assert row.retry_after_utc == NOW + timedelta(minutes=15)
+    assert row.disabled_reason is not None
 
 
 def test_two_tasks_of_one_kind_have_their_own_last_start(repository) -> None:  # type: ignore[no-untyped-def]
@@ -227,7 +356,7 @@ def test_failures_are_counted_per_task_not_per_kind(repository) -> None:  # type
     )
 
     for _ in range(3):
-        repository.record_mission_failure(main, exit_code=1, limit=3)
+        repository.record_mission_failure(main, exit_code=1, limit=3, now_utc=NOW)
 
     rows = {row.id: row for row in repository.mission_tasks()}
     assert rows[main].disabled_reason is not None

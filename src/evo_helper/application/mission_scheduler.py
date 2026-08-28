@@ -94,6 +94,7 @@ from evo_helper.domain.report_wait import (
 )
 from evo_helper.domain.rules import cycle_start_utc
 from evo_helper.domain.scheduler import (
+    BACKOFF_SCHEME,
     SCAN_YIELD_PATIENCE,
     Action,
     Decision,
@@ -107,6 +108,7 @@ from evo_helper.domain.scheduler import (
     TaskSnapshot,
     account_free_lines,
     decide,
+    due_for_a_backoff_retry,
     fills_gaps,
     free_lines_for,
     has_work,
@@ -144,7 +146,7 @@ from evo_helper.infrastructure.system_log import (
     record_system_log,
 )
 from evo_helper.storage import models as orm
-from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.storage.repository import MissionFailureOutcome, SqlAlchemyRepository
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1620,6 +1622,11 @@ class MissionScheduler:
             # 白等一个 tick。放在循环外面是因为它按 tick 算一次就够——`_step`
             # 一个 tick 里会转好几圈，每圈都去数一遍在飞舰队纯属白付。
             self._resume_tasks_waiting_for_a_line(self._clock())
+            # 退避那一档同理，而且**两条恢复路径刻意分开走**：一条问「此刻有没有
+            # 空闲航线」，一条问「库里那个时刻到了没有」，事实、判据、日志措辞
+            # 没有一样是共用的。搅在一起的代价是其中一条的判据松一点，另一条
+            # 跟着松——而它们各自放错人的后果完全不同。
+            self._resume_tasks_after_a_backoff(self._clock())
             # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
             # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
             for _ in range(len(MissionKind)):
@@ -2048,6 +2055,82 @@ class MissionScheduler:
                     "mission_kind": task.kind.value,
                     "free_lines": free,
                     "disabled_recovery": DisabledRecovery.FREE_LINES.value,
+                },
+                now=now,
+            )
+
+    # -- 因连续失败停用的自动恢复（退避） ------------------------------------------
+
+    def _resume_tasks_after_a_backoff(self, now: datetime) -> None:
+        """把「连崩到上限而自动停用」的任务放回来——**只在退避冷却到期之后**。
+
+        **为什么这一类也该自愈。** 2026-08-28 00:01 游戏窗口没了，六个任务每轮
+        起来约 1 秒就死；豁免用尽后 01:02 全部自动停用成 `MANUAL`，然后一直关到
+        早上用户手动打开（bot 约 07:2x、军力榜 09:32）——**环境早就自己好了**，
+        军力榜多关了两个多小时才被发现。用户口径：「我的预期是这些任务都应该
+        自动重启才对」。按现在这条曲线，那一夜会在 01:17 自己回来。
+
+        原先那句「自动恢复会让调度循环退回满速空转的重启循环」担心得对，但
+        **防空转靠的是冷却，不是永不恢复**：退避 15 分 → 30 分 → 1 小时封顶，
+        一轮只白试一次（恢复时不清 `consecutive_failures`），一天最多 24 次
+        × 约 1 秒。整段账在 `domain.scheduler.BACKOFF_STEPS`。
+
+        ⚠️⚠️ **绝不能打开用户自己关掉的任务。** 生产上「侦查+攻击海盗」「扫描
+        全星系 bot」「5 系攻击」「9 系攻击」四个是用户手动关的，必须一直关着。
+        判据只认 `disabled_reason IS NOT NULL`（自动停用才写它），**一个字都不看
+        `enabled`**——手动关掉那一下走 `update_mission_task`，它把停用标记连同
+        退避两列一起清成 NULL。判据本身在 `domain.scheduler.due_for_a_backoff_retry`，
+        抽成纯函数是为了让改错它的那几种改法能被直接钉住。
+
+        **判据每 tick 现算，但算的是库里那一列。** 挂内存闹钟不行：调度器进程会
+        重启，闹钟一重启就没了，任务又变回「关了就再也不开」。同一个理由与
+        `_resume_tasks_waiting_for_a_line` 那句「不挂定时器」是一回事，只是这一档
+        的事实存在 `retry_after_utc` 上而不是现算得出来。
+
+        **恢复要写 `system_log`。** 任务突然又开始跑而日志里一个字都没有，事后
+        没人查得出是自己回来的还是有人点了「恢复」——所以 payload 里那个
+        `resumed_by` 必须有。
+        """
+        rows = [
+            row
+            for row in self._repository.mission_tasks()
+            if due_for_a_backoff_retry(
+                disabled_reason=row.disabled_reason,
+                disabled_recovery=row.disabled_recovery,
+                retry_after_utc=row.retry_after_utc,
+                now=now,
+            )
+        ]
+        if not rows:
+            # 绝大多数 tick 走这里：一次 `mission_tasks()` 之外一个查询都不多付。
+            # 那张表只有个位数行，判据整个在内存里跑完。
+            return
+        for row in rows:
+            waited = row.retry_after_utc
+            rounds = row.backoff_rounds
+            if not self._repository.resume_mission_task(row.id, recovery=DisabledRecovery.BACKOFF):
+                # 这期间用户自己点了「恢复」，或者它已经被别的原因重新停用。
+                continue
+            name = row.name or row.kind
+            self._log_auto_toggle(
+                task_id=row.id,
+                mission_kind=row.kind,
+                event="resumed",
+                level="INFO",
+                message=(
+                    f"任务「{name}」曾因连续异常退出被自动停用，"
+                    f"第 {rounds} 轮退避的冷却已到期，已自动恢复参与调度"
+                ),
+                payload={
+                    "task_id": row.id,
+                    "mission_kind": row.kind,
+                    "disabled_recovery": DisabledRecovery.BACKOFF.value,
+                    "backoff_round": rounds,
+                    "retry_after_utc": None if waited is None else waited.isoformat(),
+                    # ⚠️ 事后要分得清「是自己回来的」还是「有人点了恢复」——
+                    # 用户点的那一下走 API，库里两种情形长得一模一样。
+                    "resumed_by": "scheduler-backoff",
+                    "backoff_scheme": BACKOFF_SCHEME,
                 },
                 now=now,
             )
@@ -2852,6 +2935,10 @@ class MissionScheduler:
             # 这一刻环境被证明是好的：窗口在、会话在、鼠标是我们的。之前那几次
             # 「多条一起倒」的豁免因此各自成立，不该再占着谁的额度。
             self._exemptions.clear()
+            # 退避轮次同一刻归零，**刻意用同一处**：两个计数量的是同一件事的两半
+            # （「环境坏了多久」），分两处清迟早会走散——清了一个没清另一个的话，
+            # 下一次停用会从 1 小时起数，而豁免却说「这是全新的一串」。
+            self._repository.clear_backoff_rounds()
             self._repository.clear_mission_failures(exited.task_id)
             return
         if exited.stopped_by not in (StopReason.SELF, StopReason.STALLED):
@@ -2868,8 +2955,59 @@ class MissionScheduler:
         self._last_fault_at[exited.task_id] = exited.ended_at_utc
         if self._excused_as_an_environment_fault(exited):
             return
-        self._repository.record_mission_failure(
-            exited.task_id, exit_code=exited.exit_code, limit=MAX_CONSECUTIVE_FAILURES
+        outcome = self._repository.record_mission_failure(
+            exited.task_id,
+            exit_code=exited.exit_code,
+            limit=MAX_CONSECUTIVE_FAILURES,
+            now_utc=exited.ended_at_utc,
+        )
+        if outcome.disabled_now:
+            self._log_a_backoff_disable(exited, outcome)
+
+    def _log_a_backoff_disable(self, exited: MissionExit, outcome: MissionFailureOutcome) -> None:
+        """连崩到上限被自动停用的那一刻，写一条能**只靠库**回答四个问题的日志。
+
+        四个问题（仓库硬口径：实机在另一台机器上，出事时只有 `system_log`）：
+        什么时候被自动停用的、下次什么时候重试、这是第几轮退避、以及——由恢复
+        那一侧的 `resumed_by` 回答——自动放回来那一刻是谁放的。
+
+        ⚠️ **这条链路原先整个是哑的。** 自动停用写在 `repository.record_mission_failure`
+        里，不走 `_disable_task`，所以 2026-08-28 那一夜六个任务被关掉的那一刻，
+        `system_log` 里一个字都没有——只能从 `mission_tasks.disabled_reason` 反推，
+        而那一列会被下一次停用覆盖掉。
+
+        走 `_log_auto_toggle`（而不是直接 `record_system_log`）是因为
+        「停用 → 恢复 → 停用」每一下都是真跃迁，按内容去重一条都拦不住；
+        2026-08-18 那一小时就是这么写出 1368 行的。这一档的抖动周期至少 15 分钟，
+        平时压不到什么，但闸门必须在——退避曲线是可以被改小的。
+        """
+        retry_after = outcome.retry_after_utc
+        name = outcome.name or exited.kind.value
+        when = "未知" if retry_after is None else retry_after.isoformat(timespec="seconds")
+        self._log_auto_toggle(
+            task_id=exited.task_id,
+            mission_kind=exited.kind.value,
+            event="disabled",
+            level="WARNING",
+            message=(
+                f"任务「{name}」已被自动停用：{outcome.disabled_reason}；"
+                f"这是第 {outcome.backoff_round} 轮退避，{when} 之后会自动重试一次"
+            ),
+            payload={
+                "task_id": exited.task_id,
+                "mission_kind": exited.kind.value,
+                "disabled_reason": outcome.disabled_reason,
+                "disabled_recovery": DisabledRecovery.BACKOFF.value,
+                "consecutive_failures": outcome.failures,
+                "exit_code": exited.exit_code,
+                "backoff_round": outcome.backoff_round,
+                "retry_after_utc": None if retry_after is None else retry_after.isoformat(),
+                # ⚠️ **版本指纹。** 只有带自动退避恢复的代码写得出这个键，事后能
+                # 从库里直接分辨生产跑的是哪一版——`disabled_recovery` 那一列只
+                # 说明列写对了，说不出退避曲线是哪一条。
+                "backoff_scheme": BACKOFF_SCHEME,
+            },
+            now=exited.ended_at_utc,
         )
 
     def _excused_as_an_environment_fault(self, exited: MissionExit) -> bool:

@@ -215,6 +215,14 @@ class _Keeper:
 
 
 class _NoopDriver:
+    def window(self) -> object:
+        """开工第一步是「确保窗口在」（`ensure_window_or_restart`）。
+
+        这里给一个现成的窗口：本文件钉的是**会话回不来时的退出码**，窗口那一步
+        的分档另有一份用例（`test_window_restart_guard.py`）。
+        """
+        return object()
+
     def click(self, _x: int, _y: int, *, label: str = "") -> None:
         pass
 

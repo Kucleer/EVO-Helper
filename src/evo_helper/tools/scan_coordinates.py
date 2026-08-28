@@ -32,7 +32,11 @@ from evo_helper.domain.records import CoordinateScan
 from evo_helper.domain.scan_bounds import ScanBounds
 from evo_helper.domain.scan_plan import iter_scan_coordinates, planned_segments, total_coordinates
 from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, exit_code_for_environment_fault
-from evo_helper.game.game_window import ForegroundUnavailable
+from evo_helper.game.game_window import (
+    ForegroundUnavailable,
+    GameWindowError,
+    GameWindowMissing,
+)
 from evo_helper.game.overlay import dismiss_overlays, look_at_close_button
 from evo_helper.game.ranking_ui import WHEEL_DELTA
 from evo_helper.game.system_navigator import NAV_LABEL_ROI, SystemNavigator, crop_reader
@@ -1456,6 +1460,182 @@ def run_with_foreground_guard(body: Callable[[], int]) -> int:
         return EXIT_ENVIRONMENT_BUSY
 
 
+#: 「确保窗口在」这一步的版本指纹，跟着每一条 `system_log` 一起入库。
+#:
+#: ⚠️ **仓库刚为「上线了却分不出生产跑的是哪一版」吃过亏。** 一个改动只留下
+#: 「出事时才写的那句新日志」是不够的：平安无事的一晚里，日志里没有那句话既可能
+#: 是「这一版在跑、只是没出事」，也可能是「根本没上线」，事后分不开。
+#:
+#: 所以这个键在**顺利那一轮也写**：库里有它 = 生产跑的就是带这一档保护的版本，
+#: 没有 = 不是。真要再改这条保护圈的行为，把版本号往上抬一格，别改语义不改号。
+WINDOW_GUARD_VERSION = "window-restart-guard/1"
+
+
+def ensure_window_or_restart(driver: Any, keeper: Any) -> Any:
+    """确保手上有一个能用的游戏窗口；**窗口不见了就地关窗重开一次再试**。
+
+    ## 为什么要有这一层
+
+    2026-08-28 昨夜 00:00–01:15，游戏窗口没了（Chrome 挂掉 / 机器休眠）。六个任务
+    每一轮起来约 1 秒就 `exit=1`，库里每轮只留下开工那一行「模式：真打；目标 …」，
+    之后一个字都没有；`game.session_keeper` 整个故障时段**一行日志都没写**。
+
+    原因是层次错了：会重开 Chrome 的 `SessionKeeper.restart_and_reenter` 是在
+    `BotLoop.run()` **内部**调的，而进程死在它上面一行的 `driver.window()`。
+    那套自愈机制的前提是「窗口已经在、只是走岔了」——窗口本身没了的时候，
+    它够不着。这个函数就是把「确保窗口在」这一步也放进同一个保护圈。
+
+    ## 三档，判据是异常类型不是消息文本
+
+    - `ForegroundUnavailable` → **原样抛出去，一个字都不改**。那一档的语义是
+      「什么都不做、纯粹让路」（`game.game_window.ForegroundUnavailable` 整段讲的
+      就是它），`run_with_foreground_guard` 会把它收成 `EXIT_ENVIRONMENT_BUSY`。
+      在这一档上重开，等于趁用户正在用别的窗口时把游戏窗口关掉、再去抢一次前台
+      ——比什么都不做糟得多。
+    - `GameWindowMissing` → 重开一次再试。哪些失败归这一档、为什么，整段写在
+      那个异常类上（一句话：**同样的一步再走一遍，结论会不会不一样**）。
+    - 其余 `GameWindowError`（标定、配置、桌面上多出一个同名窗口）→ 不重开，
+      如实抛。新窗口照样调不到标定视口、照样读同一份配置，重开只是白关一次
+      用户的窗口，还要多花 40–70 秒。
+
+    ## 只重开一次，配额是 `keeper` 自己那一份
+
+    `keeper` 必须是**这一轮后面还要接着用的那一个** `SessionKeeper`。
+    重开是有代价、有上限的动作（3 次 / 滚动 1 小时，见 `MAX_WINDOW_RESTARTS`），
+    在这里另建一个守护就等于凭空多出一份配额、把上限翻倍——`_require_system_view`
+    与死会话那条共用一份计数器，正是为了这件事。
+
+    这里自己也不循环：重开完再拿不到窗口就老实抛。做成循环的话，Chrome 起不来的
+    夜里就成了「关一次、开一次、再关」一直折腾到有人来看。
+
+    ## 收场是硬失败，不是 `EXIT_ENVIRONMENT_BUSY`
+
+    走到「重开也没救回来」说明这一轮已经关过窗、重开过 Chrome，窗口还是拉不起来。
+    那多半是 Chrome 挂了 / 机器休眠 / profile 被别的进程锁着——**不会因为等一轮
+    就好**，而 75 那一档的准入条件恰恰是「没人管也会自己好」。豁免它就是把整夜
+    静默空转合法化（整段道理在 `domain.scheduler.exit_code_for_environment_fault`）。
+    """
+    # 调用方那一层的模块名。六个任务同时倒下时，「是哪一条链路」是第一个要回答
+    # 的问题，而这个共用实现住在 `scan_coordinates` 里，照模块名记就全记错了。
+    source = _caller_source()
+    try:
+        return _window_up(driver, source)
+    except ForegroundUnavailable:
+        # ⚠️ **这一档一个字都不动**：不重开、不记日志、不改退出码，原样交给
+        # `run_with_foreground_guard`。理由见上面第一档。
+        raise
+    except GameWindowMissing as missing:
+        return _restart_for_missing_window(driver, keeper, missing, source=source)
+    except GameWindowError as blocked:
+        # 重开救不了的那一档。**照样入库**：昨夜查不动，正是因为库里什么都没有。
+        _record_window_guard(
+            source,
+            level="ERROR",
+            message="确保窗口在：这一档重开救不了，没有关窗口",
+            payload=_first_failure_payload(blocked)
+            | {
+                "outcome": "not_recoverable_by_restart",
+                "restart_attempted": False,
+                "criterion": "只有 GameWindowMissing 那一档重开能救，判据见该异常类",
+            },
+        )
+        raise
+
+
+def _window_up(driver: Any, source: str) -> Any:
+    """`driver.window()` 成功的那条路。顺利也记一条，理由见 `WINDOW_GUARD_VERSION`。"""
+    window = driver.window()
+    _record_window_guard(
+        source,
+        level="INFO",
+        message="确保窗口在：窗口已经在，没有关窗重开",
+        payload={"outcome": "window_already_up", "restart_attempted": False},
+    )
+    return window
+
+
+def _restart_for_missing_window(
+    driver: Any, keeper: Any, missing: GameWindowMissing, *, source: str
+) -> Any:
+    """窗口不见了：关窗重开一次，成了就接着跑，没成就说清卡在哪一步。"""
+    from evo_helper.game.session_keeper import MAX_WINDOW_RESTARTS
+
+    left_before = keeper.restarts_left()
+    say(f"拿不到游戏窗口：{missing}；关窗重开一次再试（兜底策略）")
+    reason = f"开工时拿不到游戏窗口：{missing}"
+    outcome = keeper.restart_and_reenter(reason)
+    payload = _first_failure_payload(missing) | {
+        "restart_attempted": True,
+        "restart_reason": reason,
+        # 「第几次」：这两个数一减就是本次用掉的那一次，配额上限也一起记着，
+        # 免得事后还要去翻代码里的常量。
+        "restarts_left_before": left_before,
+        "restarts_left_after": outcome.restarts_left,
+        "max_restarts": MAX_WINDOW_RESTARTS,
+        "restart_ready": bool(outcome.ready),
+        # 卡在哪一步：`ReconnectOutcome.detail` 是原文（配额耗尽 / 重开动作自己
+        # 抛了 / 入口序列没走到游戏内），照抄，不要在这里改写成结论。
+        "restart_detail": outcome.detail,
+    }
+
+    if not outcome.ready:
+        _record_window_guard(
+            source,
+            level="ERROR",
+            message="确保窗口在：窗口不见了，关窗重开也没救回来",
+            payload=payload | {"outcome": "restart_did_not_bring_the_window_back"},
+        )
+        raise GameWindowMissing(
+            f"拿不到游戏窗口（{missing}）；关窗重开也没能救回来（{outcome.detail}）；安全停止"
+        ) from missing
+
+    try:
+        window = driver.window()
+    except GameWindowError as again:
+        # 重开报告「已经回到游戏内」，窗口却仍然拿不到。**不再重开第二次**：
+        # 一次没救回来就是没救回来，循环只会把用户的桌面一直关了又开。
+        _record_window_guard(
+            source,
+            level="ERROR",
+            message="确保窗口在：重开之后回到了游戏内，窗口却仍然拿不到",
+            payload=payload
+            | {
+                "outcome": "window_still_missing_after_restart",
+                "second_error_type": type(again).__name__,
+                "second_error": str(again),
+            },
+        )
+        raise GameWindowMissing(
+            f"拿不到游戏窗口（{missing}）；关窗重开之后已经回到游戏内，"
+            f"但窗口仍然拿不到（{again}）；安全停止"
+        ) from again
+
+    say("  关窗重开之后拿到了游戏窗口；这一轮接着跑")
+    _record_window_guard(
+        source,
+        level="WARNING",
+        message="确保窗口在：窗口不见了，关窗重开之后回来了",
+        payload=payload | {"outcome": "restarted_and_window_came_back"},
+    )
+    return window
+
+
+def _first_failure_payload(failure: BaseException) -> dict[str, Any]:
+    """把「是什么把它逼到这一步」原文照抄进 payload。
+
+    只记类型名不记消息的话，「拉起游戏后 120s 内没等到窗口出现」和「窗口在校验
+    尺寸后消失了」在库里长得一模一样，而这两者要去查的东西完全不同。
+    """
+    return {"first_error_type": type(failure).__name__, "first_error": str(failure)}
+
+
+def _record_window_guard(source: str, *, level: str, message: str, payload: dict[str, Any]) -> None:
+    """这一步的全部证据只有库里这一条——实机在另一台机器上，本机文件取不到。"""
+    record_system_log(
+        level, source, message, payload={"guard_version": WINDOW_GUARD_VERSION} | payload
+    )
+
+
 def run_scan(
     *,
     limit: int | None,
@@ -1482,10 +1662,12 @@ def run_scan(
     say(f"游标 {cursor if cursor is not None else '（尚未开始）'}；已确认坐标 {len(done)} 个")
 
     driver = LiveDriver()
-    driver.window()  # 窗口不见了就在这一步拉起来，而不是等到第一次点击才失败
     ocr = make_ocr()
     navigator = SystemNavigator(driver)
     keeper = make_session_keeper(driver, ocr)
+    # 窗口不见了就在这一步拉起来，而不是等到第一次点击才失败；拉不起来还要关窗
+    # 重开一次（配额与下面巡检那条共用同一个守护）。整段账在这个函数上。
+    ensure_window_or_restart(driver, keeper)
 
     def read_nav_labels() -> str:
         return str(ocr(driver.capture().crop(NAV_LABEL_ROI), digits=False, upscale=3))
