@@ -5084,7 +5084,7 @@ def main(argv: list[str] | None = None) -> int:
         # 在这里另建一个就等于把 `MAX_WINDOW_RESTARTS` 翻倍。
         keeper = make_session_keeper(driver, ocr)
         # 「确保窗口在」也要落进重开的保护圈，整段账在 `ensure_window_or_restart`。
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.pirate_loop")
         loop = PirateLoop(driver, ocr, options, session_keeper=keeper)
         outcome = loop.run()
 

@@ -1471,7 +1471,7 @@ def run_with_foreground_guard(body: Callable[[], int]) -> int:
 WINDOW_GUARD_VERSION = "window-restart-guard/1"
 
 
-def ensure_window_or_restart(driver: Any, keeper: Any) -> Any:
+def ensure_window_or_restart(driver: Any, keeper: Any, *, chain: str) -> Any:
     """确保手上有一个能用的游戏窗口；**窗口不见了就地关窗重开一次再试**。
 
     ## 为什么要有这一层
@@ -1515,9 +1515,19 @@ def ensure_window_or_restart(driver: Any, keeper: Any) -> Any:
     就好**，而 75 那一档的准入条件恰恰是「没人管也会自己好」。豁免它就是把整夜
     静默空转合法化（整段道理在 `domain.scheduler.exit_code_for_environment_fault`）。
     """
-    # 调用方那一层的模块名。六个任务同时倒下时，「是哪一条链路」是第一个要回答
-    # 的问题，而这个共用实现住在 `scan_coordinates` 里，照模块名记就全记错了。
-    source = _caller_source()
+    # 六个任务同时倒下时，「是哪一条链路」是第一个要回答的问题，而这个共用实现住在
+    # `scan_coordinates` 里，照它自己的模块名记就全记错了。
+    #
+    # ⚠️ **由调用方传字面量，不走 `_caller_source()`。** 第一版就是走那条的，生产
+    # 上（2026-08-28 14:40:12）写出来是 `source='__main__'` —— 三条链路一模一样，
+    # 设计意图整个落空。原因是四个调用点**都在各自模块的 `main()` 里，而那几个模块
+    # 是当脚本跑的**，`__name__` 就是 `"__main__"`。栈上取模块名这招只对「被 import
+    # 的模块里的函数」成立，对入口本身恰恰不成立 —— 而这里全是入口。
+    #
+    # 传字面量的代价是新加一条链路时要记得填；`chain` 做成**必填关键字参数**就是为了
+    # 让漏填变成 TypeError 而不是又一条说谎的日志。这与 `say` 那边的取舍不同：那边
+    # 136 个调用点，改签名要全改一遍、漏一个就说谎；这里只有四个。
+    source = chain
     try:
         return _window_up(driver, source)
     except ForegroundUnavailable:
@@ -1667,7 +1677,7 @@ def run_scan(
     keeper = make_session_keeper(driver, ocr)
     # 窗口不见了就在这一步拉起来，而不是等到第一次点击才失败；拉不起来还要关窗
     # 重开一次（配额与下面巡检那条共用同一个守护）。整段账在这个函数上。
-    ensure_window_or_restart(driver, keeper)
+    ensure_window_or_restart(driver, keeper, chain="tools.scan_coordinates")
 
     def read_nav_labels() -> str:
         return str(ocr(driver.capture().crop(NAV_LABEL_ROI), digits=False, upscale=3))

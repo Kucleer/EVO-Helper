@@ -154,7 +154,7 @@ def test_a_window_that_comes_back_after_one_restart_lets_the_round_go_on(
     keeper = _Keeper(_ready())
 
     def body() -> int:
-        assert ensure_window_or_restart(driver, keeper) is WINDOW
+        assert ensure_window_or_restart(driver, keeper, chain="tools.bot_loop") is WINDOW
         return 0
 
     assert run_with_foreground_guard(body) == 0
@@ -169,7 +169,7 @@ def test_the_restart_that_saved_the_round_says_so_in_the_database(
     driver = _Driver([GameWindowMissing("拉起游戏后 120s 内没等到窗口出现"), WINDOW])
     keeper = _Keeper(_ready(restarts_left=2), left_before=3)
 
-    ensure_window_or_restart(driver, keeper)
+    ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
 
     payload = recorder.payloads[-1]
     assert payload["restart_attempted"] is True, "重开被触发了吗"
@@ -195,7 +195,7 @@ def test_a_restart_that_did_not_help_is_told_apart_from_the_first_failure(
     keeper = _Keeper(_refused())
 
     with pytest.raises(GameWindowError) as failure:
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
 
     assert "重开" in str(failure.value), "异常本身就要说得出是重开没救回来"
     assert len(keeper.reasons) == 1
@@ -207,7 +207,7 @@ def test_a_restart_that_did_not_help_is_told_apart_from_the_first_failure(
     )
 
     # 反面：顺利那一轮写进库的是另一句话、另一个 `outcome`。分不开就白记了。
-    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()))
+    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()), chain="tools.bot_loop")
     assert recorder.messages[-1] != recorder.messages[-2]
     assert recorder.payloads[-1]["outcome"] != payload["outcome"]
 
@@ -225,7 +225,7 @@ def test_the_round_ends_non_zero_when_the_restart_could_not_bring_the_window_bac
     keeper = _Keeper(_refused())
 
     def body() -> int:
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
         return 0
 
     with pytest.raises(GameWindowError):
@@ -240,7 +240,7 @@ def test_a_window_that_is_still_missing_after_a_successful_re_entry_stops_too(
     keeper = _Keeper(_ready())
 
     with pytest.raises(GameWindowError):
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
 
     assert len(keeper.reasons) == 1, "第二次也拿不到窗口时不许再重开一次"
     assert recorder.payloads[-1]["outcome"] == "window_still_missing_after_restart"
@@ -261,7 +261,7 @@ def test_losing_the_foreground_race_never_triggers_a_restart(recorder: _Recorder
     keeper = _Keeper(_ready())
 
     def body() -> int:
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
         return 0
 
     assert run_with_foreground_guard(body) == EXIT_ENVIRONMENT_BUSY, "退出码逐字不变"
@@ -301,7 +301,7 @@ def test_failures_a_restart_cannot_fix_are_not_restarted(
     keeper = _Keeper(_ready())
 
     with pytest.raises(GameWindowError):
-        ensure_window_or_restart(driver, keeper)
+        ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
 
     assert keeper.reasons == [], why
     assert driver.calls == 1
@@ -342,12 +342,15 @@ def test_the_restart_budget_is_the_session_keeper_s_own(recorder: _Recorder) -> 
     missing = GameWindowMissing("拉起游戏后 120s 内没等到窗口出现")
 
     # 第一次：配额够，重开一次就救回来了。
-    assert ensure_window_or_restart(_Driver([missing, WINDOW]), keeper) is WINDOW
+    assert (
+        ensure_window_or_restart(_Driver([missing, WINDOW]), keeper, chain="tools.bot_loop")
+        is WINDOW
+    )
     assert restarts == ["restarted"]
 
     # 第二次：同一个 keeper，配额已经用完——不再关窗口，直接失败。
     with pytest.raises(GameWindowError):
-        ensure_window_or_restart(_Driver([missing, WINDOW]), keeper)
+        ensure_window_or_restart(_Driver([missing, WINDOW]), keeper, chain="tools.bot_loop")
     assert restarts == ["restarted"], "配额用尽之后一次都不许再关窗口"
     assert recorder.payloads[-1]["restart_ready"] is False
     assert "budget" in recorder.payloads[-1]["restart_detail"]
@@ -365,7 +368,7 @@ def test_every_round_leaves_a_fingerprint_only_this_version_can_write(
     「生产到底跑没跑这一版」只能靠猜。这一条钉的就是那个键——它在**顺利那一轮**
     也要写，否则一个平安夜过后什么都分辨不出来。
     """
-    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()))
+    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()), chain="tools.bot_loop")
 
     payload = recorder.payloads[-1]
     assert payload["guard_version"] == WINDOW_GUARD_VERSION
@@ -374,15 +377,61 @@ def test_every_round_leaves_a_fingerprint_only_this_version_can_write(
 
 
 def test_the_log_line_says_which_runner_it_came_from(recorder: _Recorder) -> None:
-    """`source` 要指向**调用方**那条链路，不是这个共用实现住的模块。
+    """`source` 就是调用方交进来的那条链路名，一个字都不加工。
 
     六个任务同时倒下时，「是哪一条链路」是第一个要回答的问题。
     """
-    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()))
+    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()), chain="tools.ranking_scan")
 
-    assert recorder.rows[-1][1].endswith("test_window_restart_guard"), (
-        "`source` 取的是调用方那一层的模块名——这里就是本测试模块"
-    )
+    assert recorder.rows[-1][1] == "tools.ranking_scan"
+
+
+def test_the_chain_is_named_by_the_caller_not_sniffed_off_the_stack(
+    recorder: _Recorder,
+) -> None:
+    """⚠️⚠️ **链路名必须由调用方传字面量，不许从调用栈上取模块名。**
+
+    第一版走的是 `_caller_source()`（`sys._getframe(2).f_globals["__name__"]`）。
+    单元测试里它一直是对的，**而生产上一上线就写错**——2026-08-28 14:40:12 那一条
+    是 `source='__main__'`，三条链路一模一样，设计意图整个落空。
+
+    差别在**调用方是谁**：四个调用点都在各自模块的 `main()` 里，而那几个模块是
+    **当脚本跑的**，`__name__` 就是 `"__main__"`。栈上取模块名这招只对「被 import
+    的模块里的函数」成立，对入口本身恰恰不成立——而这里全都是入口。
+
+    ⚠️ 上一版的用例**接不住这个错**，而且不是写漏了：它断言 `source` 以
+    `test_window_restart_guard` 结尾，在测试里恒真——因为测试模块是被 import 的。
+    **测试环境与生产环境在这一点上语义相反**，所以那条用例越绿越说明不了问题。
+    这一条改成钉「交进去什么就记什么」，与调用方叫什么名字无关。
+    """
+    ensure_window_or_restart(_Driver([WINDOW]), _Keeper(_ready()), chain="随便什么字符串")
+
+    source = recorder.rows[-1][1]
+    assert source == "随便什么字符串"
+    assert source != "__main__", "又从栈上取模块名了"
+    assert "test_window_restart_guard" not in source, "还是在猜调用方是谁"
+
+
+def test_every_entry_point_names_a_different_chain() -> None:
+    """⚠️ 四个入口各报各的名字，**互不相同**。
+
+    全都报同一个名字的话，这个参数就白加了——那正是 `__main__` 那一版的症状：
+    键在、值没用。这一条直接读源码里的调用点，因为「四个入口都填对了」这件事
+    没法靠跑一遍来证明（跑起来要真窗口）。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3] / "src" / "evo_helper" / "tools"
+    found: dict[str, str] = {}
+    for name in ("bot_loop", "pirate_loop", "ranking_scan", "scan_coordinates"):
+        text = (root / f"{name}.py").read_text(encoding="utf-8")
+        calls = re.findall(r'ensure_window_or_restart\([^)]*chain="([^"]+)"', text)
+        assert len(calls) == 1, f"{name} 里的调用点不是一处，是 {len(calls)} 处"
+        found[name] = calls[0]
+
+    assert len(set(found.values())) == 4, f"有入口报了重名：{found}"
+    assert "__main__" not in set(found.values())
 
 
 # -- 三个入口都接上了 -----------------------------------------------------------
@@ -525,3 +574,21 @@ def test_a_loop_built_without_one_still_makes_its_own(monkeypatch: pytest.Monkey
     loop = BotLoop(object(), object(), BotOptions(targets=(), attack=False))  # type: ignore[arg-type]
 
     assert loop._keeper() is made  # noqa: SLF001 - 同上
+
+
+def test_naming_the_chain_is_not_optional() -> None:
+    """⚠️ `chain` **必填**，不许给默认值。
+
+    给了默认值，新加一条链路时漏填就不再是 `TypeError`，而是又一条说谎的日志 ——
+    正是 `__main__` 那一版的症状：键在、值没用、而且要等上了生产才看得出来。
+    这一条钉的是「漏填会当场炸」，因为那是这个参数唯一比自动嗅探强的地方。
+    """
+    import inspect
+
+    from evo_helper.tools.scan_coordinates import ensure_window_or_restart
+
+    chain = inspect.signature(ensure_window_or_restart).parameters["chain"]
+    assert chain.kind is inspect.Parameter.KEYWORD_ONLY, (
+        "必须是关键字参数，位置传容易和 keeper 串位"
+    )
+    assert chain.default is inspect.Parameter.empty, "给了默认值，漏填就不会炸了"
