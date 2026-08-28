@@ -109,8 +109,10 @@ from evo_helper.tools.pirate_loop import (
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
+    ensure_window_or_restart,
     make_console_encoding_safe,
     make_ocr,
+    make_session_keeper,
     run_with_foreground_guard,
     say,
 )
@@ -165,7 +167,14 @@ class BotLoop(PirateLoop):
     RECONCILE_KIND: ReportKind = ReportKind.ATTACK
     REPORT_LABEL: str = "攻击战报"
 
-    def __init__(self, driver: LiveDriver, ocr: Any, options: BotOptions) -> None:
+    def __init__(
+        self,
+        driver: LiveDriver,
+        ocr: Any,
+        options: BotOptions,
+        *,
+        session_keeper: Any = None,
+    ) -> None:
         # 父类要一个 LoopOptions。`scout=False`：这条链路不派任何前置侦查发了。
         # `origin` 必须原样带过去——父类的 `_record_intent` 读的是**父类那一份**
         # options，漏传的话这条链路写进 `attack_intents` 的出发坐标会退回全局
@@ -181,6 +190,9 @@ class BotLoop(PirateLoop):
                 origin=options.origin,
                 force_reconcile=options.force_reconcile,
             ),
+            # 开工时「确保窗口在」那一步可能已经花掉一次重开配额，而配额只有
+            # 守护自己那一份——漏传就等于把上限翻倍。见 `PirateLoop._keeper`。
+            session_keeper=session_keeper,
         )
         self._bot = options
         #: 最近一次 `check_target` 读到的面板，按坐标存。
@@ -728,8 +740,14 @@ def main(argv: list[str] | None = None) -> int:
 
     def go() -> int:
         driver = LiveDriver(allow_actions=args.attack)
-        driver.window()
-        outcome = BotLoop(driver, make_ocr(), options).run()
+        ocr = make_ocr()
+        # 守护提到这里建、并原样交给循环：**整轮只许有一份关窗重开配额**。
+        # 在这里另建一个就等于把 `MAX_WINDOW_RESTARTS` 翻倍。
+        keeper = make_session_keeper(driver, ocr)
+        # 「确保窗口在」也要落进重开的保护圈——2026-08-28 昨夜就是死在这一行的
+        # 前身（裸 `driver.window()`）上，整段账在 `ensure_window_or_restart`。
+        ensure_window_or_restart(driver, keeper)
+        outcome = BotLoop(driver, ocr, options, session_keeper=keeper).run()
         say(
             f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
             f"拦下 {len(outcome.refused)} 次"

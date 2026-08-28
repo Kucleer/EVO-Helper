@@ -208,6 +208,7 @@ def enter_game_exit_code(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> 
     del attempts  # 重试与等待都由 SessionKeeper 自己管
     from evo_helper.tools.scan_coordinates import (
         dismiss_overlays_if_unrecognised,
+        ensure_window_or_restart,
         exit_code_for_unusable_session,
         make_ocr,
         make_session_keeper,
@@ -217,6 +218,11 @@ def enter_game_exit_code(driver: LiveDriver, ocr: Any, *, attempts: int = 8) -> 
 
     del ocr
     keeper = make_session_keeper(driver, make_ocr())
+    # ⚠️ **排在巡检之前**：巡检的第一件事是 `driver.capture()`，而它内部就是
+    # `driver.window()`——窗口没了的时候，这条链路根本走不到能重开的那一级。
+    # 2026-08-28 昨夜六个任务里的 RANKING 那一条就是这么倒的，整段账在
+    # `scan_coordinates.ensure_window_or_restart`。配额与下面这个守护共用一份。
+    ensure_window_or_restart(driver, keeper)
     session = keeper.ensure_connected(force=True)
     session = dismiss_overlays_if_unrecognised(session, driver, keeper)
     session = wait_for_login_if_unrecognised(session, keeper)

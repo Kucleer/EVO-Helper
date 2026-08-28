@@ -126,6 +126,45 @@ class ForegroundUnavailable(GameWindowError):
     """
 
 
+class GameWindowMissing(GameWindowError):
+    """**窗口本该在，却不在了**——关窗重开有可能救得回来。
+
+    ⚠️ **单独成一个类型，是为了把「重开能救」和「重开救不了」分开。**
+    `GameWindowError` 底下的失败原先全长一个样，于是调用方只能二选一：要么一律
+    重开（在标定不对、Chrome 没装、桌面上多出一个同名窗口的时候白关一次用户的
+    窗口，而且下一轮照样失败），要么一律不重开——后者就是生产 2026-08-28 昨夜
+    的形状：00:00 起窗口没了，六个任务每轮约 1 秒就 `exit=1`，
+    `session_keeper` 整个故障时段**一行日志都没写**，一直到早上人工介入。
+
+    ## 分档的判据：**同样的一步再走一遍，结论会不会不一样**
+
+    重开这个动作本身就是「关掉窗口 →`ensure_game_window()` 重走一遍」。所以判据
+    很实：**如果失败发生在那一步的前面（配置、Chrome 位置、DPR、桌面上有几个
+    同名窗口），或者发生在窗口已经拿到之后的几何校验上，那么再走一遍必然得到
+    同一个结论**，重开只是白关一次用户的窗口。
+
+    归到这一档（重开能救）：
+
+    - 「拉起游戏后 N 秒内没等到窗口出现」——Chrome 挂了 / 机器休眠 / 页面没画出来。
+      这正是昨夜那一档。
+    - 「调整尺寸时窗口消失了」「窗口在校验尺寸后消失了」——窗口在半路没的，
+      跟上一条是同一件事的两个瞬间。
+
+    **不**归到这一档（重开救不了，照旧抛）：
+
+    - 「页面 DPR 配成了 X」——配置问题。`ensure_game_window` 第一句就再校验一次，
+      重开必然倒在同一处。
+    - 「找不到 Chrome」「配置里的 Chrome 路径不存在」——重开一样要 `chrome_path()`。
+    - 「有 N 个标题为 EVO 的窗口」——`restart_game_window` 第一句 `find()` 就抛同一个
+      错；而且它的消息本来就写着「请手动关掉多余的那个」，要的是人不是重试。
+    - 「调了 N 次仍收敛不到标定 client」「窗口视口是 AxB，标定值是 CxD」——标定问题，
+      新窗口在同一台机器上照样调不到。
+    - 「已有窗口在加载游戏，但 N 秒内标题没变成 EVO」——`find_game_window()` 按
+      **精确**标题匹配，那个窗口的标题还是域名，所以重开根本关不掉它，只会
+      再等一遍同样的 180 秒。这一档的消息同样写着「请人工确认那个窗口的状态」。
+    """
+
+
 @dataclass(frozen=True)
 class ViewportPlan:
     """目标页面视口与它对应的 client 尺寸。
@@ -312,7 +351,8 @@ class _Win32Driver:
 
         current = find_game_window()
         if current is None:  # pragma: no cover - 窗口在调整过程中被关掉
-            raise GameWindowError("调整尺寸时窗口消失了")
+            # 窗口没了，不是几何不对：归「重开能救」那一档，见 `GameWindowMissing`。
+            raise GameWindowMissing("调整尺寸时窗口消失了")
         box = client_box(current)
         return (box[2] - box[0], box[3] - box[1])
 
@@ -435,7 +475,9 @@ def ensure_game_window(
             launch_game()
             window = _wait_for_game_window(timeout_s, pause)
             if window is None:
-                raise GameWindowError(f"拉起游戏后 {timeout_s:.0f}s 内没等到窗口出现")
+                # ⚠️ **这一句就是 2026-08-28 昨夜那一档**：Chrome 挂掉 / 机器休眠，
+                # 拉不起来。归「重开能救」，理由整段在 `GameWindowMissing`。
+                raise GameWindowMissing(f"拉起游戏后 {timeout_s:.0f}s 内没等到窗口出现")
 
     target = plan or ViewportPlan()
     actual = resize_to_viewport(window, target)
@@ -446,7 +488,8 @@ def ensure_game_window(
         )
     found = find_game_window()
     if found is None:  # pragma: no cover - 竞态
-        raise GameWindowError("窗口在校验尺寸后消失了")
+        # 同 `measure_client`：窗口没了，归「重开能救」那一档。
+        raise GameWindowMissing("窗口在校验尺寸后消失了")
     return found
 
 

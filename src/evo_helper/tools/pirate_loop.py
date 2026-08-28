@@ -136,7 +136,9 @@ from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
     crop_png_base64,
+    ensure_window_or_restart,
     make_ocr,
+    make_session_keeper,
     origin,
     run_with_foreground_guard,
     say,
@@ -1165,7 +1167,14 @@ class PirateLoop:
     #: 上面那一档在日志里怎么念。只影响措辞，不影响判据。
     REPORT_LABEL: str = "海盗攻击报告"
 
-    def __init__(self, driver: LiveDriver, ocr: Any, options: LoopOptions) -> None:
+    def __init__(
+        self,
+        driver: LiveDriver,
+        ocr: Any,
+        options: LoopOptions,
+        *,
+        session_keeper: Any = None,
+    ) -> None:
         self._driver = driver
         self._ocr = ocr
         self._options = options
@@ -1174,7 +1183,11 @@ class PirateLoop:
         self._repository: SqlAlchemyRepository | None = None
         self._session_factory: Any = None
         self._run_id: UUID | None = None
-        self._session_keeper: Any = None
+        #: 本轮的会话守护。**入口点会把开工时用过的那一个传进来**：关窗重开的滚动
+        #: 配额住在它里面，另建一个就等于凭空多出一份配额、把 `MAX_WINDOW_RESTARTS`
+        #: 翻倍——这正是 `_restart_now` 那段注释一再强调的「只此一份」。
+        #: 不传（手工调子方法、老测试）时仍旧惰性自建，见 `_keeper`。
+        self._session_keeper: Any = session_keeper
         self._coord_dumps = 0
         self._mail_dumps = 0
         self._origin_dumps = 0
@@ -3811,7 +3824,11 @@ class PirateLoop:
     # -- 会话 ---------------------------------------------------------------
 
     def _keeper(self) -> Any:
-        """惰性建一个会话守护，整轮共用一个（它内部按时间节流巡检）。"""
+        """整轮共用的会话守护（它内部按时间节流巡检）。
+
+        入口点传进来的话就用那一个——开工时「确保窗口在」那一步可能已经花掉一次
+        重开配额，而配额只有它自己那一份。没传才惰性自建。
+        """
         from evo_helper.tools.scan_coordinates import make_session_keeper
 
         if self._session_keeper is None:
@@ -5062,8 +5079,13 @@ def main(argv: list[str] | None = None) -> int:
     def go() -> int:
         # 只有 `--scout` / `--attack` 才需要动作能力。开关只有这一处。
         driver = LiveDriver(allow_actions=args.scout or args.attack)
-        driver.window()
-        loop = PirateLoop(driver, make_ocr(), options)
+        ocr = make_ocr()
+        # 守护提到这里建、并原样交给循环：**整轮只许有一份关窗重开配额**。
+        # 在这里另建一个就等于把 `MAX_WINDOW_RESTARTS` 翻倍。
+        keeper = make_session_keeper(driver, ocr)
+        # 「确保窗口在」也要落进重开的保护圈，整段账在 `ensure_window_or_restart`。
+        ensure_window_or_restart(driver, keeper)
+        loop = PirateLoop(driver, ocr, options, session_keeper=keeper)
         outcome = loop.run()
 
         say(

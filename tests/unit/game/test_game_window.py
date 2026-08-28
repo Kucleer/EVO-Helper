@@ -634,3 +634,110 @@ class TestSelfCalibratingResize:
         game_window.resize_to_viewport(object(), driver=driver, pause=lambda _s: None)  # type: ignore[arg-type]
 
         assert driver.restored == 1
+
+
+class TestRestartabilityGrading:
+    """哪一档「关窗重开能救」，哪一档救不了。**判据是异常类型，不是消息文本。**
+
+    ⚠️ 这个分档是 2026-08-28 那次事故的修复面。当晚游戏窗口没了，六个任务每一轮
+    起来约 1 秒就 `exit=1`，而会重开 Chrome 的那套机制在 `BotLoop.run()` 内部、
+    够不着上面那一行的 `driver.window()`——整夜没有任何东西尝试重开过窗口。
+
+    分档的判据写在 `GameWindowMissing` 上，一句话：**同样的一步再走一遍，结论会不会
+    不一样**。重开本身就是「关掉窗口 → `ensure_game_window()` 重走一遍」，所以失败
+    发生在那一步之前（配置、Chrome 位置、DPR、桌面上有几个同名窗口）或者发生在
+    窗口已经拿到之后的几何校验上时，再走一遍必然是同一个结论。
+
+    钉在**抛出的那一处**而不是异常类上：类本身怎么继承是它自己的事，真正会改错的
+    是某个 `raise` 挑错了类型，而那只有从这一头才看得见。
+    """
+
+    def test_a_window_that_never_appears_is_worth_a_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **这一句就是昨夜那一档**：Chrome 挂了 / 机器休眠，窗口拉不起来。"""
+        from evo_helper.game import game_window
+
+        monkeypatch.setattr(game_window, "launch_game", lambda: None)
+        monkeypatch.setattr(game_window, "find_loading_game_window", lambda: None)
+        monkeypatch.setattr(game_window, "find_game_window", lambda: None)
+
+        with pytest.raises(game_window.GameWindowMissing):
+            game_window.ensure_game_window(timeout_s=0.0, sleep=lambda _s: None)
+
+    def test_a_wrong_viewport_is_not_worth_a_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """几何调不到标定值是**标定**问题：新窗口在同一台机器上照样调不到。"""
+        from evo_helper.game import game_window
+
+        monkeypatch.setattr(game_window, "find_game_window", lambda: object())
+        monkeypatch.setattr(game_window, "resize_to_viewport", lambda w, p: (1920, 992))
+
+        with pytest.raises(game_window.GameWindowError) as failure:
+            game_window.ensure_game_window(sleep=lambda _s: None)
+        assert not isinstance(failure.value, game_window.GameWindowMissing)
+
+    def test_a_resize_that_never_converges_is_not_worth_a_restart(self) -> None:
+        """同上，只是失败发生在更里面一层。"""
+        from evo_helper.game import game_window
+
+        class _Stubborn(_FakeWindowDriver):
+            def measure_client(self) -> tuple[int, int]:
+                return (800, 600)
+
+        with pytest.raises(game_window.GameWindowError) as failure:
+            game_window.resize_to_viewport(  # type: ignore[arg-type]
+                object(), driver=_Stubborn((0, 0)), pause=lambda _s: None
+            )
+        assert not isinstance(failure.value, game_window.GameWindowMissing)
+
+    def test_a_misconfigured_dpr_is_not_worth_a_restart(self) -> None:
+        """配置问题。`ensure_game_window` 第一句就再校验一次，重开必然倒在同一处。"""
+        from evo_helper.game import game_window
+
+        with pytest.raises(game_window.GameWindowError) as failure:
+            game_window.verified_scale_factor(1.0)
+        assert not isinstance(failure.value, game_window.GameWindowMissing)
+
+    def test_two_windows_with_the_same_title_are_not_worth_a_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`restart_game_window` 第一句 `find()` 就抛同一个错。
+
+        而且这一档的消息本来就写着「请手动关掉多余的那个」——它要的是人，不是重试。
+        """
+        from evo_helper.game import game_window
+
+        monkeypatch.setattr(game_window, "_windows_titled", lambda _t: [object(), object()])
+
+        with pytest.raises(game_window.GameWindowError) as failure:
+            game_window.find_game_window()
+        assert not isinstance(failure.value, game_window.GameWindowMissing)
+
+    def test_a_window_stuck_on_the_loading_title_is_not_worth_a_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`find_game_window()` 按**精确**标题匹配，那个窗口的标题还是域名。
+
+        所以重开根本关不掉它（`WM_CLOSE` 送不到），只会再等一遍同样的 180 秒，
+        然后留下同一个卡住的窗口。
+        """
+        from evo_helper.game import game_window
+
+        monkeypatch.setattr(game_window, "find_game_window", lambda: None)
+        monkeypatch.setattr(game_window, "find_loading_game_window", lambda: object())
+        monkeypatch.setattr(game_window, "_wait_for_game_window", lambda *_a, **_k: None)
+
+        with pytest.raises(game_window.GameWindowError) as failure:
+            game_window.ensure_game_window(sleep=lambda _s: None)
+        assert not isinstance(failure.value, game_window.GameWindowMissing)
+
+    def test_the_foreground_race_stays_its_own_grade(self) -> None:
+        """「抢不到前台」和「窗口不见了」是兄弟，不是父子。
+
+        混成一档的代价是把「什么都不做、纯粹让路」那一档变成「关掉窗口再抢前台」
+        ——用户正在用别的窗口的时候，那比什么都不做糟得多。
+        """
+        from evo_helper.game import game_window
+
+        assert not issubclass(game_window.ForegroundUnavailable, game_window.GameWindowMissing)
+        assert not issubclass(game_window.GameWindowMissing, game_window.ForegroundUnavailable)
