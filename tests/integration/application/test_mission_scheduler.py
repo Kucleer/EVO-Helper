@@ -272,10 +272,35 @@ def attach_report(  # type: ignore[no-untyped-def]
 
 
 def set_config(session_factory, **fields: int) -> None:  # type: ignore[no-untyped-def]
+    """改 `scheduler_config` 上的旋钮。
+
+    ⚠️ **认不出的字段当场炸。** SQLAlchemy 的模型对 `setattr` 一个不存在的列不报错，
+    只是挂一个普通 Python 属性上去——于是用例静默地什么都没配到，却因为别的原因绿了。
+    2026-09-02 就这么栽过：`set_config(bot_revisit_hours=1)` 一个字都没写进去
+    （那一列在 `military_attack_config` 上，见 `set_attack_config`），而用例照样绿，
+    因为默认的 24 小时复访窗口把目标挡住了——它验的根本不是它自称在验的东西。
+    """
     with session_factory() as session:
         row = session.get(orm.SchedulerConfigRow, 1)
         assert row is not None
         for name, value in fields.items():
+            assert hasattr(type(row), name), (
+                f"`scheduler_config` 上没有 {name!r} 这一列——是不是该走 `set_attack_config`？"
+            )
+            setattr(row, name, value)
+        session.commit()
+
+
+def set_attack_config(session_factory, **fields: int) -> None:  # type: ignore[no-untyped-def]
+    """改 `military_attack_config` 上的旋钮（复访窗口、保护期排除、有效期、门限…）。
+
+    与 `set_config` 分开是因为它们是**两张表**，而写错表不会报错、只会静默失效。
+    """
+    with session_factory() as session:
+        row = session.get(orm.MilitaryAttackConfigRow, 1)
+        assert row is not None
+        for name, value in fields.items():
+            assert hasattr(type(row), name), f"`military_attack_config` 上没有 {name!r} 这一列"
             setattr(row, name, value)
         session.commit()
 
@@ -1776,17 +1801,69 @@ def test_military_pool_skips_targets_attacked_within_the_last_24_hours(  # type:
 def test_the_military_pool_does_not_re_pick_a_target_that_drew(  # type: ignore[no-untyped-def]
     scheduler, repository, launcher, session_factory, run_id
 ) -> None:
-    """**军力优先这一侧也不再补刀平局。**
+    """**军力优先这一侧不在复访窗口内补刀平局。**
 
     用户口径（2026-08-17）：「bot 攻击移除平局再打一次机制」。范围模式那一条在
-    `test_a_target_whose_shot_was_a_draw_no_longer_counts_as_remaining`，
-    这一条守的是另一半——两种模式共用 `domain.bot_round.phase_of`，但各有各的
-    候选池代码（`_bot_remaining` / `_military_candidates`），只验一边会漏。
+    `test_a_target_whose_shot_was_a_draw_no_longer_counts_as_remaining`。
 
-    ⚠️ **那一发刻意放在 24 小时以外。** 24 小时内的目标本来就被
-    `attacked_bot_targets_since` 挡掉，无论平局与否——拿那种目标来验，
-    这条用例在旧规则下也是绿的，什么都守不住。放到 25 小时以外，
-    唯一还拦得住它的就只剩 `phase_of` 那一条。
+    ## ⚠️ 2026-09-02 起这条守的边界变了，值得说清楚
+
+    原先这一发刻意放在 **25 小时前**，因为那时唯一还拦得住它的是 `phase_of` 的
+    `DONE`——「打过就出局」，而且由于 `round_started_at_utc` 恒为 NULL，那实际上是
+    **永久出局**。用户口径（2026-09-02，逐字）：
+
+        「只要能有最新取到的军力，实际上，是否打过不应该进行计量」
+
+    所以「永久」那一半删掉了（整段账在 `_military_candidates` 的 docstring）。
+    ⚠️ **但「不补刀」这条口径本身没有变**，只是改由**复访窗口**来守：平局之后
+    24 小时内不许再打，窗口过了就和别的目标一视同仁。
+
+    这一条因此改成钉住那个边界：**窗口内不许，窗口外可以**。放在 25 小时前那一版
+    现在会绿得毫无意义（它验的是一条已经不存在的规则）。
+    """
+    from evo_helper.domain.battle_outcome import OUTCOME_DRAW
+
+    drew = Coordinate(2, 140, 5)
+    untouched = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, drew, military_score=9_000.0)
+    add_bot_target(session_factory, untouched, military_score=8_000.0)
+    # 复访窗口（默认 24 小时）**之内**平局的那一发：不许补刀。
+    dispatch_id = dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=drew,
+        dispatched_at=NOW - timedelta(hours=3),
+        preset_name=BOT_ATTACK_PRESET,
+        flight=timedelta(minutes=1),
+    )
+    attach_report(session_factory, dispatch_id, drew, NOW - timedelta(hours=2), OUTCOME_DRAW)
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command), "复访窗口之内还去补刀平局"
+
+
+def test_a_draw_can_be_attacked_again_once_the_revisit_window_has_passed(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """⚠️⚠️ **窗口过了就一视同仁 —— 平局不再是终身标记。**
+
+    用户口径（2026-09-02，逐字）：「只要能有最新取到的军力，实际上，是否打过不应该
+    进行计量」。
+
+    这一条是上面那条的反面，两条一起才钉得住边界。少了它，把判据写回
+    `is BotPhase.NEEDS_ATTACK`（也就是「打过就永久出局」）时上面那条照样绿——
+    而那正是 2026-09-02 之前的缺陷形状：军力榜按军力降序扫，最肥最近的目标最早
+    被打、最早永久出局，链路被迫越飞越远越打越瘦。实测两套判据取前 11 发：
+    价值合计 204,115/h → 481,143/h，往返中位 1.02 小时 → 0.56 小时。
+
+    这里让平局那一颗**同时是得分最高的**（军力 9000 对 8000，且更近），
+    所以「它有没有回到候选池」直接体现在派谁上，不用去翻内部状态。
     """
     from evo_helper.domain.battle_outcome import OUTCOME_DRAW
 
@@ -1810,8 +1887,9 @@ def test_the_military_pool_does_not_re_pick_a_target_that_drew(  # type: ignore[
     scheduler.tick()
 
     command = launcher.latest.command
-    assert "2:141:6=BBB" in command
-    assert not any(part.startswith("2:140:5") for part in command)
+    assert any(part.startswith("2:140:5") for part in command), (
+        "复访窗口早就过了，这一颗该回到候选池——「打过」不是终身标记"
+    )
 
 
 def test_without_the_switch_the_chain_still_attacks_by_region(  # type: ignore[no-untyped-def]
@@ -2629,3 +2707,128 @@ def test_a_pool_of_only_stale_scores_is_never_reported_as_starved(  # type: igno
 
     assert [item for item in recorded.warnings() if "筛不出能打的目标" in item[1]] == []
     assert launcher.kinds == [MissionKind.BOT], "分数超期不妨碍它去打"
+
+
+def test_a_shot_still_in_flight_keeps_its_target_out_of_the_pool(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """⚠️⚠️ **「还在飞」和「打过」是两件事，只删了后者。**
+
+    用户口径（2026-09-02）把「打过就出局」删掉之后，`phase_of` 只剩这一档还在守。
+    它守的东西整段写在 `domain.bot_round.phase_of`：「不等的话，第一发还在飞时这个
+    目标就会被再补一发，**几趟下来同一个坐标上摞着四五支舰队**」。
+
+    ⚠️ **构造必须让复访窗口挡不住它**，否则这条用例在判据被删掉之后照样绿——
+    而那正是它唯一要防的事。所以复访窗口调到 1 小时，那一发放在 2 小时前、
+    战报没回来（2 小时 < `MAX_REPORT_AGE` 6 小时，所以仍算「在飞」）。
+
+    在飞的那一颗**同时是得分最高的**（军力 9000 对 8000，且更近），所以「有没有被
+    挡住」直接体现在派谁上。
+    """
+    flying = Coordinate(2, 140, 5)
+    untouched = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, flying, military_score=9_000.0)
+    add_bot_target(session_factory, untouched, military_score=8_000.0)
+    set_attack_config(session_factory, bot_revisit_hours=1)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=flying,
+        dispatched_at=NOW - timedelta(hours=2),
+        preset_name=BOT_ATTACK_PRESET,
+        flight=timedelta(minutes=20),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command), (
+        "那一发还在飞、战报没回，又给同一个坐标补了一发"
+    )
+
+
+def test_the_pool_does_not_care_how_many_times_a_target_was_hit_before(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """⚠️ **打过几次都不计量** —— 只要复访窗口过了、军力读数还新鲜。
+
+    用户口径（2026-09-02，逐字）：「只要能有最新取到的军力，实际上，是否打过不应该
+    进行计量」。
+
+    上面那条只验了「打过一次」；这里堆三发历史战报，钉的是**次数也不进判据**。
+    少了它，有人把判据写成「打过 N 次就出局」时上面那两条都拦不住。
+    """
+    veteran = Coordinate(2, 140, 5)
+    untouched = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, veteran, military_score=9_000.0)
+    add_bot_target(session_factory, untouched, military_score=8_000.0)
+    for days in (3, 2, 1):
+        dispatch_id = dispatch(
+            repository,
+            run_id,
+            TARGET_KIND_BOT,
+            target=veteran,
+            dispatched_at=NOW - timedelta(days=days, hours=1),
+            preset_name=BOT_ATTACK_PRESET,
+            flight=timedelta(minutes=1),
+        )
+        attach_report(session_factory, dispatch_id, veteran, NOW - timedelta(days=days))
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    scheduler.start()
+    scheduler.tick()
+
+    assert any(part.startswith("2:140:5") for part in launcher.latest.command), (
+        "打过三次就不打了——「打过」被当成了计量项"
+    )
+
+
+def test_the_in_flight_guard_does_not_depend_on_the_round_start(  # type: ignore[no-untyped-def]
+    scheduler, repository, launcher, session_factory, run_id
+) -> None:
+    """⚠️⚠️ **「在不在飞」按 `MAX_REPORT_AGE` 判，不看 `round_started_at_utc`。**
+
+    2026-09-02 的成因正是那一列：它只有页面上「重开一轮」按钮会写，没有任何东西
+    自动推进，生产上七个 BOT 任务**全是 NULL**——`since=None` 安静地退化成「看全部
+    历史」，不报错、不告警。判据不该依赖一个会这样退化的值。
+
+    ⚠️ **这一条必须把轮次起点设成「比那一发更晚」**，否则它证明不了任何事：
+    `round_started_at_utc` 为 NULL 时（也就是不设的话），两种写法给出同样的答案，
+    把 `since` 换回那一列的变异照样绿。这里轮次起点在 30 分钟前、而那一发在
+    2 小时前，两种写法当场分家：
+
+    - 按 `MAX_REPORT_AGE`（6 小时）→ 看得见那一发 → 判「在飞」→ 挡下
+    - 按轮次起点（30 分钟前）→ 看不见那一发 → 判「该打」→ **给同一个坐标补第二发**
+    """
+    flying = Coordinate(2, 140, 5)
+    untouched = Coordinate(2, 141, 6)
+    add_bot_target(session_factory, flying, military_score=9_000.0)
+    add_bot_target(session_factory, untouched, military_score=8_000.0)
+    set_attack_config(session_factory, bot_revisit_hours=1)
+    dispatch(
+        repository,
+        run_id,
+        TARGET_KIND_BOT,
+        target=flying,
+        dispatched_at=NOW - timedelta(hours=2),
+        preset_name=BOT_ATTACK_PRESET,
+        flight=timedelta(minutes=20),
+    )
+    enable(repository, MissionKind.BOT, params_json=BOT_BY_MILITARY)
+    only_gap_filler(repository)
+    # 轮次起点推到那一发**之后**：只有不看这一列的写法才拦得住。
+    repository.begin_bot_round(
+        task(repository, MissionKind.BOT).id, now_utc=NOW - timedelta(minutes=30)
+    )
+    scheduler.start()
+    scheduler.tick()
+
+    command = launcher.latest.command
+    assert "2:141:6=BBB" in command
+    assert not any(part.startswith("2:140:5") for part in command), (
+        "「在不在飞」跟着轮次起点走了——那一列恒为 NULL 时会退化成看全部历史"
+    )

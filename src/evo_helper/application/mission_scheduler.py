@@ -4095,8 +4095,8 @@ class MissionScheduler:
         )
 
     def _military_candidates(self, row: orm.MissionTaskRow) -> list[ScoredTarget]:
-        """**第 1 步，必须在最前**：排除本轮已走完的、「重复攻击间隔」之内已攻击的、
-        **刚撞上过保护期**的、以及**刚刚面板名读不出**的 bot。
+        """**第 1 步，必须在最前**：排除「重复攻击间隔」之内已攻击的、**刚撞上过
+        保护期**的、**刚刚面板名读不出**的、以及**还有一发在飞、战报没回**的 bot。
 
         若先挑一批再排除，首批刚好都打过时军力任务会把候选池缩成空集，排名靠后、
         从未攻击的目标永远轮不到。排除必须在窗口筛选与得分排序的前面，随后再按得分
@@ -4112,6 +4112,52 @@ class MissionScheduler:
         三个窗口都是策略、都可在攻击配置页上改，不是游戏规则：
         见 `DEFAULT_BOT_REVISIT`、`DEFAULT_PROTECTION_EXCLUSION` 与
         `DEFAULT_UNREADABLE_EXCLUSION`。
+
+        ## ⚠️⚠️ 「打过就出局」这一条已经删掉了 —— 别再加回来
+
+        用户口径（2026-09-02，逐字）：
+
+            「只要能有最新取到的军力，实际上，是否打过不应该进行计量」
+
+        原先这里写的是 `phase_of(...) is BotPhase.NEEDS_ATTACK`，也就是**打过并且
+        战报回来了（`DONE`）就出局**。它按 `row.round_started_at_utc` 分轮，而生产上
+        七个 BOT 任务那一列**全是 NULL**——只有页面上那个「重开一轮」按钮会写它，
+        没有任何东西自动推进。`since=None` 的实际效果是**看全部历史**：打过一次，
+        永久出局。
+
+        ⚠️ 而这条闸砍掉的恰恰是**最好的那批**。军力榜按军力降序扫，最近最肥的目标
+        最早被挑中、最早出局，于是链路被迫越飞越远、越打越瘦——一个单调恶化的过程。
+        2026-09-02 拿生产数据实跑两套判据，取前 11 发（账号航线上限）：
+
+            池子        358  →  748
+            价值合计    204,115/h  →  481,143/h    （2.36 倍）
+            往返中位    1.02 小时  →  0.56 小时    （少一半）
+            前 15 名重合 0 个
+
+        又近又肥，两头都赢：出发星球里有 4:277:15 与 5:261:8，而新判据挑出的头几名
+        是 4:278:7、5:259:10、5:257:7 —— **就在自家门口，全被那条闸永久挡着**。
+
+        ## 但 `AWAITING_ATTACK_REPORT` 必须留着
+
+        `phase_of` 同时管两件事，只有一件是「是否打过」：
+
+        - `DONE`（打完了、战报回来了）→ 用户口径：**不该计量**，已删
+        - `AWAITING_ATTACK_REPORT`（**有一发还在飞**）→ 留着
+
+        留的理由整段在 `domain.bot_round.phase_of` 里：「不等的话，第一发还在飞时
+        这个目标就会被再补一发，**几趟下来同一个坐标上摞着四五支舰队**」。
+        「还在飞」不是「打过」，是「这一发还没落地」，两件事。
+
+        ⚠️ 它此刻是**冗余的保险**：`bot_revisit_hours` 默认 24 小时，而战报最长只等
+        `MAX_REPORT_AGE`（6 小时），24 > 6 所以在飞的早被 24 小时那条盖住了。留着是
+        因为那个旋钮**可以在页面上调**——调到 6 小时以下，这一条就成了唯一的防线。
+
+        ## `since` 取 `MAX_REPORT_AGE`，不再读 `round_started_at_utc`
+
+        判「在不在飞」只需要看这么久：超过 `MAX_REPORT_AGE` 还没回的战报，
+        `bot_dispatch_facts_many` 自己就按同一个常量剔掉了，再往前翻一秒都是白翻。
+        而 `round_started_at_utc` 恒为 NULL 这件事**不报错、不告警**，安静地退化成
+        「全部历史」——正是这次的成因。不留这种参数。
 
         ## 保护期这一条在修什么
 
@@ -4140,7 +4186,8 @@ class MissionScheduler:
         now = self._clock()
         facts_by_target = self._repository.bot_dispatch_facts_many(
             [target.coordinate for target in targets],
-            since=row.round_started_at_utc,
+            # 见 docstring：只判「在不在飞」，看 `MAX_REPORT_AGE` 就够。
+            since=now - MAX_REPORT_AGE,
             now_utc=now,
         )
         attacked_last_day = self._repository.attacked_bot_targets_since(
@@ -4158,7 +4205,9 @@ class MissionScheduler:
             if target.coordinate not in attacked_last_day
             and target.coordinate not in protected
             and target.coordinate not in unreadable
-            and phase_of(facts_by_target[target.coordinate]) is BotPhase.NEEDS_ATTACK
+            # ⚠️ 判的是「有没有一发还在飞」，**不是**「打没打过」。见 docstring：
+            # `DONE` 那一档按用户口径已经不计量了，写成 `is NEEDS_ATTACK` 会把它加回来。
+            and phase_of(facts_by_target[target.coordinate]) is not BotPhase.AWAITING_ATTACK_REPORT
         ]
 
     def _frozen_origins(self, row: orm.MissionTaskRow) -> tuple[FrozenOrigin, ...]:
