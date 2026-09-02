@@ -52,7 +52,14 @@ from evo_helper.storage import models as orm
 from evo_helper.storage.repository import SqlAlchemyRepository
 
 from .conftest import Clock, make_supervisor
-from .test_mission_scheduler import add_bot_target, dispatch, enable, set_score_window, task
+from .test_mission_scheduler import (
+    add_bot_target,
+    attach_report,
+    dispatch,
+    enable,
+    set_score_window,
+    task,
+)
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
@@ -155,12 +162,30 @@ def _pool(repository: SqlAlchemyRepository, session_factory) -> None:  # type: i
     enable(repository, MissionKind.BOT, params_json=BY_MILITARY)
 
 
+def _mark_reported(session_factory: sessionmaker[Session], dispatch_id: Any, target: Any) -> None:
+    """给这一发挂一份战报，让它不再算「还在飞」。
+
+    ⚠️ **这一步不能省，但理由 2026-09-02 变了。**
+
+    从前这里调的是 `_round_started_at`：第 1 步有一道 `phase_of` 判据，本轮里派过的
+    目标一律不再进候选，所以「刚打过却仍在候选池里」只可能发生在上一轮打的。
+    那条判据现在只剩一半——用户口径（2026-09-02）「是否打过不应该进行计量」，
+    `DONE` 那一档删了，**`AWAITING_ATTACK_REPORT`（有一发还在飞）留着**。
+
+    于是构造方式换了：不再去挪轮次起点，而是**让那一发落地**（挂上战报）。
+    这也更贴近实机——3 小时前打的那一发，战报早该回来了（实测入库中位 14 分钟）。
+
+    ⚠️ 不挂战报的话这一颗会停在「在飞」被挡掉，用例的前提断言会当场转红并说明原因。
+    """
+    attach_report(session_factory, dispatch_id, target, NOW - timedelta(hours=2, minutes=30))
+
+
 def _round_started_at(session_factory: sessionmaker[Session], moment: datetime) -> None:
     """把本轮起点推到 `moment`。
 
-    ⚠️ **这一步不能省。** 第 1 步还有一道 `phase_of` 判据：本轮里已经派过的目标
-    一律不再进候选（战报没回来是「在等」、回来了是「走完」）。所以「刚打过却仍在
-    候选池里」只可能发生在**上一轮打的、这一轮又轮到它**——正是这里构造的样子。
+    ⚠️ **选靶那侧已经不读这一列了**（2026-09-02，见
+    `MissionScheduler._military_candidates` 的 docstring）。留着是因为别处还在用它，
+    但**别再拿它来把目标弄回候选池**——那条路已经不通了，用 `_mark_reported`。
     """
     with session_factory() as session:
         row = next(
@@ -225,8 +250,8 @@ def test_a_pick_we_attacked_three_hours_ago_is_flagged(  # type: ignore[no-untyp
     observer_scheduler.prepare()
     _configure(session_factory, bot_revisit_hours=2)
     _pool(repository, session_factory)
-    # 上一轮打的（本轮起点之后就不会再进候选，见 `_round_started_at`）。
-    dispatch(
+    # 3 小时前打的，战报已经回来了 —— 复访窗口调成 2 小时，所以它又回到了候选池。
+    dispatch_id = dispatch(
         repository,
         run_id,
         TARGET_KIND_BOT,
@@ -235,13 +260,14 @@ def test_a_pick_we_attacked_three_hours_ago_is_flagged(  # type: ignore[no-untyp
         origin=ORIGIN_A,
         flight=timedelta(minutes=20),
     )
-    _round_started_at(session_factory, NOW - timedelta(hours=1))
+    _mark_reported(session_factory, dispatch_id, HOT)
 
     row = task(repository, MissionKind.BOT)
     # 前提：这一颗真的还在候选池里，否则这条用例什么都没验到。
     reading = observer_scheduler._military_pool_reading(row)  # noqa: SLF001
     assert HOT in {item.coordinate for item in reading.candidates}, (
-        "前提没成立：3 小时前打过的那一颗没能回到候选池，复访窗口没调下来？"
+        "前提没成立：3 小时前打过的那一颗没能回到候选池——"
+        "复访窗口没调下来，或者那一发还被当成「在飞」（战报没挂上）？"
     )
 
     fake = FakeHttpx(_answer_picking(HOT))
