@@ -15,7 +15,7 @@ import statistics
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -612,6 +612,58 @@ def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> fl
     """
     trusted = [value for value in screen_scores(rows, anchor=anchor) if value]
     return max(trusted) if trusted else anchor
+
+
+def _backfill_from_the_curve(
+    repository: Any,
+    unread: Sequence[RankingTarget],
+    *,
+    history: Sequence[tuple[int, float]],
+) -> int:
+    """拿这一趟攒下来的曲线，把没读出军力值的那些行补上，交出补了几条。
+
+    用户口径（2026-09-02，逐字）：
+
+        「后续的读到正确的判据，可以对之前没有读出的读数进行回填补数，
+         这样只需要几个节点 就能补很多的数据了」
+
+    ## 为什么补得到
+
+    一屏里读废的那几行，**后面几屏读到的可信值会把曲线延长过它的名次**。榜单按军力
+    降序、邻近名次的军力相近，所以曲线一旦盖过那个位置，就推得出它该是多少——这正是
+    `curve_reference` 在判据里用的同一套东西，只是这次用来补而不是用来拦。
+
+    ⚠️ 它比屏内插值（`interpolate_scores`）能补的多一档：那个只看**同一屏**的上下
+    邻居，屏首屏尾没有邻居就补不了。2026-09-02 实测全库 575 行「有名次、没军力值」，
+    其中 **495 个（86%）**在 ±60 名内凑得够 5 个已知点。
+
+    ## ⚠️ 三条边界
+
+    1. **只填空，绝不覆盖**（落实在 `repository.backfill_missing_military_scores`）：
+       补进去的是估算值，而库里已有的可能是量出来的。
+    2. **一律标 `military_score_estimated`**：猜出来的数不许长得像量出来的。
+    3. **凑不够历史点就不补**（`curve_reference` 交 `None`）。名次读错到离谱的那些
+       （实测有 11,200 这种）在 ±60 名内一个邻居都没有，自然被这一条挡在外面——
+       不需要另写一道判据。
+    """
+    if not unread or not history:
+        return 0
+    filled = [
+        replace(target, military_score=reference, military_score_estimated=True)
+        for target in unread
+        if target.military_rank is not None
+        and (reference := curve_reference(history, target.military_rank)) is not None
+    ]
+    if not filled:
+        say(f"曲线补数：{len(unread)} 行没读出军力值，一条都补不了（历史 {len(history)} 点）")
+        return 0
+    written = int(repository.backfill_missing_military_scores(filled))
+    say(
+        f"曲线补数：{len(unread)} 行没读出军力值，曲线推得出 {len(filled)} 条，"
+        f"真正补进库 {written} 条（其余那些库里已经有值了，不覆盖）"
+        f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点]"
+    )
+    return written
 
 
 def _no_bracket_because(scores: Sequence[float | None]) -> str:
@@ -1448,6 +1500,12 @@ def scan(
     def collect(targets: Sequence[RankingTarget]) -> tuple[list[RankingTarget], bool]:
         """只保留本批前 N 个不同 bot；相邻滚屏的重叠行不重复计数。"""
         picked = take_batch_targets(targets, seen=collected, limit=bot_limit)
+        # ⚠️ **这一屏没读出军力值的，记下来等收尾补。** 见 `_backfill_from_the_curve`：
+        # 后面几屏读到的可信值会把曲线延长，而曲线一旦盖过这个名次，就推得出它该是
+        # 多少——「只需要几个节点就能补很多数据」（用户口径 2026-09-02）。
+        # ⚠️ 「有没有名次」不在这里判 —— `_backfill_from_the_curve` 里判了一次，
+        # 两处各判一遍就是同一个判断两份实现（同 #272 删掉的那道冗余锚点闸）。
+        unread.extend(target for target in picked if target.military_score is None)
         persist(picked)
         reached = bot_limit is not None and len(collected) >= bot_limit
         return picked, reached
@@ -1478,6 +1536,8 @@ def scan(
     # ⚠️ **不跨趟复用。** bot 军力每周一 UTC+0 刷新，而两趟之间还隔着几十分钟的
     # 攻击——拿上一趟的历史当这一趟的参照，就是拿过期的曲线去判新读数。
     score_history: list[tuple[int, float]] = []
+    # 这一趟里读到名次却没读出军力值的目标，收尾时用曲线补（`_backfill_from_the_curve`）。
+    unread: list[RankingTarget] = []
     #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
     blind_score_screens = 0
 
@@ -1680,6 +1740,10 @@ def scan(
                     break
             if outcome == 0:
                 progress.stage = ScanStage.CLOSED
+        # ⚠️ **补数放在这里，不放 `finally`。** 被 Ctrl+C / 调度器抢占打断时曲线只盖到
+        # 一半，那时补出来的是半条曲线上的外推值——而收尾那句话必须照打（它在
+        # `finally` 里），两件事的要求正好相反。补不成没有代价：那些行本来就空着。
+        _backfill_from_the_curve(repository, unread, history=score_history)
     finally:
         if not nav.close():
             say("排行榜已关闭，但导航条还原未确认")

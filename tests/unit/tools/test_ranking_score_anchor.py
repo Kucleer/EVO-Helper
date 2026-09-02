@@ -335,9 +335,19 @@ class _Repository:
 
     def __init__(self) -> None:
         self.saved: list[RankingTarget] = []
+        self.backfilled: list[RankingTarget] = []
 
     def save_ranking_targets(self, targets: Sequence[RankingTarget]) -> None:
         self.saved.extend(targets)
+
+    def backfill_missing_military_scores(self, records: Sequence[RankingTarget]) -> int:
+        """收尾时的曲线补数。⚠️ 假仓储也要实现它，否则「接进去之后的样子」没被测到。
+
+        真仓储那一版只填 `military_score IS NULL` 的行；这里只记下被补的是哪些，
+        由用例断言。
+        """
+        self.backfilled.extend(records)
+        return len(records)
 
 
 def _reached_bots(**kwargs: Any) -> HumanStretch:
@@ -358,8 +368,24 @@ def _reached_bots(**kwargs: Any) -> HumanStretch:
     )
 
 
-def _collect(
+def _collect_with_repository(
     monkeypatch: pytest.MonkeyPatch, screens: Sequence[Sequence[RankingRow]]
+) -> _Repository:
+    """同 `_collect`，但把**假仓储本身**交回来——补数写的不是 `saved` 那一份。"""
+    _collect(monkeypatch, screens, _keep=True)
+    assert _LAST_REPOSITORY[0] is not None
+    return _LAST_REPOSITORY[0]
+
+
+#: `_collect` 用过的最后一个假仓储。补数那条路要看它的 `backfilled`。
+_LAST_REPOSITORY: list[_Repository | None] = [None]
+
+
+def _collect(
+    monkeypatch: pytest.MonkeyPatch,
+    screens: Sequence[Sequence[RankingRow]],
+    *,
+    _keep: bool = False,
 ) -> list[RankingTarget]:
     """把 `scan()` 架空到只剩采集循环，跑完，交回**落库的那一批目标**。
 
@@ -386,6 +412,7 @@ def _collect(
     monkeypatch.setattr(ranking_scan, "record_system_log", lambda *_a, **_k: None)
 
     assert ranking_scan.scan(bot_scrolls=len(board.screens) - 1) == 0
+    _LAST_REPOSITORY[0] = repository
     return repository.saved
 
 
@@ -524,3 +551,32 @@ def test_the_log_and_the_rule_read_the_same_input(monkeypatch: pytest.MonkeyPatc
     assert "区间 9750–9770" in line.replace(",", ""), f"日志用了未过滤的读数算区间：{line}"
     assert "10259" in line.replace(",", ""), "被挑掉的那一行也要出现在被丢清单里"
     assert "渲染不出" in line, "渲染不出来的那一行要照实说，不能留空洞"
+
+
+def test_the_scan_actually_calls_the_curve_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️⚠️ **补数真的接进了扫描循环，不是一个没人调的函数。**
+
+    `_backfill_from_the_curve` 自己那几条用例（`test_ranking_curve_backfill.py`）
+    只证明它算得对；把整句调用删掉时那些用例照样全绿——2026-09-02 变异验证当场
+    抓到的就是这个。仓库里同形的教训不止一次：**测了新东西，没测它接进去之后的样子。**
+
+    这里前三屏读得干净（把曲线撑起来），第四屏**末行**读不出（`None`）。
+
+    ⚠️ **必须是末行，不能放中间。** 中间那一行有上下邻居，`interpolate_scores`
+    在屏内就补掉了，根本不会进「没读出」那一份——第一版就是这么写的，用例当场
+    变红并说明了原因。补数比屏内插值多的正是这一档：**没有邻居可插的边缘行**。
+    """
+    repository = _collect_with_repository(
+        monkeypatch,
+        [
+            _rows([9_800.0, 9_790.0, 9_780.0], system=137, first_rank=850),
+            _rows([9_770.0, 9_760.0, 9_750.0], system=138, first_rank=853),
+            _rows([9_740.0, 9_730.0, 9_720.0], system=139, first_rank=856),
+            _rows([9_710.0, 9_700.0, None], system=140, first_rank=859),
+        ],
+    )
+
+    assert repository.backfilled, "扫描收尾没调曲线补数——那个函数没人调"
+    filled = repository.backfilled[0]
+    assert filled.military_score is not None
+    assert filled.military_score_estimated is True

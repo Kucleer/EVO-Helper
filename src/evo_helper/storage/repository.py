@@ -590,6 +590,44 @@ class SqlAlchemyRepository:
             ).all()
             return list(rows)
 
+    def backfill_missing_military_scores(self, records: Sequence[RankingTarget]) -> int:
+        """把军力值**补进那些还空着的行**，交出真正补上的条数。
+
+        用户口径（2026-09-02，逐字）：
+
+            「后续的读到正确的判据，可以对之前没有读出的读数进行回填补数，
+             这样只需要几个节点 就能补很多的数据了」
+
+        ⚠️⚠️ **只填 `military_score IS NULL` 的行，一个已有的值都不许覆盖。**
+
+        这不是谨慎，是必须：补进来的是**估算值**（由 `domain.ranking.curve_reference`
+        从邻近名次的可信读数推出来的），而库里已有的可能是**量出来的**。拿估算盖掉
+        实测，就是这个仓库那条硬规矩「猜出来的数不许长得像量出来的」的反面。
+
+        ⚠️ 也**不建新行**：没见过的坐标谈不上「补」，那是扫描该干的事。
+
+        与 `save_ranking_targets` 的分工：那个是「这一屏读到了什么」，会无条件覆盖；
+        这个是「这一屏没读到的，用曲线补一个」，只填空。两个入口分开，是因为**写错
+        方向的代价完全不同** —— 合成一个迟早有人给它传错一批记录。
+        """
+        filled = 0
+        with self._session_factory() as session:
+            for record in records:
+                if record.military_score is None:
+                    continue
+                target = _bot_target_for(session, record.coordinate)
+                if target is None or target.military_score is not None:
+                    continue
+                target.military_score = record.military_score
+                target.military_score_at_utc = record.military_score_at_utc
+                # ⚠️ **一律标估算。** 它是推出来的，不是读出来的。
+                target.military_score_estimated = True
+                if target.military_rank is None:
+                    target.military_rank = record.military_rank
+                filled += 1
+            session.commit()
+        return filled
+
     def clear_pirate_position_bot_candidates(self) -> int:
         """撤销 1--4 号位误写成 bot 的候选，保留坐标扫描原始记录。
 
