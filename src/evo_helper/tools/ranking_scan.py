@@ -24,6 +24,8 @@ from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
 from evo_helper.domain.ranking import (
+    SCORE_RULE_VERSION,
+    SCREEN_SPREAD_LIMIT,
     RankingRow,
     bot_area_reached_rows_message,
     coordinate_of,
@@ -31,6 +33,8 @@ from evo_helper.domain.ranking import (
     is_bot_entry,
     mentions_bot,
     repair_ranks,
+    score_drop_reasons,
+    screen_bracket,
     screens_overlap,
     trusted_scores,
 )
@@ -608,6 +612,25 @@ def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> fl
     return max(trusted) if trusted else anchor
 
 
+def _no_bracket_because(scores: Sequence[float | None]) -> str:
+    """区间为什么不作数——**说人话，且和 `screen_bracket` 的三条一一对应**。
+
+    ⚠️ 只在日志里用。它复述判据而不是重新判：`screen_bracket` 已经说了「不作数」，
+    这里只回答「哪一条否的」。三条的处置完全不同：
+
+    - 读得出的太少 → 这一屏 OCR 整体失手，看采集那一层
+    - 首尾不递减   → 至少一个端点读错了
+    - 首尾跨度过大 → 端点被数量级读错（丢首位那类）
+    """
+    known = [score for score in scores if score is not None and score > 0]
+    if len(known) < 2:
+        return f"能读出的正读数只有 {len(known)} 个"
+    head, tail = known[0], known[-1]
+    if tail > head:
+        return f"首尾不递减：首 {head:.0f} < 末 {tail:.0f}"
+    return f"首尾跨度 {head / tail:.1f} 倍，超过上限 {SCREEN_SPREAD_LIMIT:.0f}"
+
+
 def targets_from_rows(
     rows: list[RankingRow], *, observed_at: datetime, anchor: float | None = None
 ) -> list[RankingTarget]:
@@ -632,22 +655,42 @@ def targets_from_rows(
     """
     repaired = repair_ranks([row.rank for row in rows])
     read = [row.score for row in rows]
-    trusted = screen_scores(rows, anchor=anchor)
+    # ⚠️ **判据和日志必须吃同一份输入。** `screen_scores` 会先过 `renderable_score`
+    # 把多插一位的挑掉，再交给 `trusted_scores`；日志若拿未过滤的 `read` 去算区间，
+    # 报出来的区间就不是判据真正用的那个——那正是这段代码自己在警告的「两处各算
+    # 一遍会分家」。所以过滤只做一次，两边共用。
+    renderable = [row.score if renderable_score(row.score) else None for row in rows]
+    trusted = trusted_scores(renderable, anchor=anchor)
     dropped = [
         (index, read[index])
         for index, score in enumerate(trusted)
         if score is None and read[index] is not None
     ]
     if dropped:
-        # ⚠️ **把锚点和被丢的值一起打出来。**
+        # ⚠️ **把判据、区间、锚点和被丢的值一起打出来。**
         #
-        # 原先这一句只说「破坏降序」加一串下标，而现在有三条拒收理由
-        # （比前一行大 / 比基准大一个数量级 / 比基准小一个数量级），事后分不清是
-        # 「读数真错了」还是「锚点本身错了、把好读数误伤了」——那两件事的处置完全
-        # 相反。带上锚点和原值就能一眼判：值和锚点差 10 倍是前者，差不到 2 倍是后者。
+        # 原先这一句只说「破坏降序」加一串下标，而拒收理由有四条，事后分不清是
+        # 「读数真错了」还是「好读数被误伤了」——那两件事的处置完全相反。
+        #
+        # 2026-09-02 查这件事时最费劲的一步正是这个：只能拿「值 ÷ 锚点」去反推是哪
+        # 一条，而 71.5% 的被丢值其实 ≤ 锚点，那个比值什么都说明不了。现在**理由直接
+        # 由判据自己交出来**（`score_drop_reasons`，与 `trusted_scores` 同一次遍历）。
+        #
+        # 区间也要打：它作不作数决定了走的是区间判据还是逐行兜底，而这两条的宽严
+        # 差着 3 倍的丢弃率。作不作数、以及不作数时是被哪一条否掉的，都得看得见。
+        why = score_drop_reasons(renderable, anchor=anchor)
+        bracket = screen_bracket(renderable)
+        window = (
+            f"区间 {bracket[0]:.0f}–{bracket[1]:.0f}"
+            if bracket
+            else f"区间不作数（{_no_bracket_because(renderable)}）"
+        )
         say(
             f"军力值不可信，丢掉这几行的分数（坐标保留）"
-            f"[锚点 {anchor}]: {[(i, v) for i, v in dropped]}"
+            f"[判据 {SCORE_RULE_VERSION} · {window} · 锚点 {anchor}]: "
+            # ⚠️ 渲染不出来的那几行 `why` 是 None（它们在进判据之前就被
+            # `renderable_score` 挑掉了）——照实写「渲染不出」，不要留一个空洞。
+            f"{[(i, v, why[i] or '渲染不出') for i, v in dropped]}"
         )
     filled = interpolate_scores(trusted)
     targets: list[RankingTarget] = []

@@ -437,3 +437,90 @@ def test_the_anchor_is_carried_from_one_screen_to_the_next(
     assert [target.coordinate for target in saved] == [
         Coordinate(4, system, 5 + index) for system in (137, 138, 139, 140) for index in range(3)
     ], "丢的是分数不是行，十二个坐标一个都不许少"
+
+
+# -- 那一行日志得说得清是被哪条判据拦的 -------------------------------------------
+
+
+def _log_line(monkeypatch: pytest.MonkeyPatch, scores: list[float], *, anchor: float) -> str:
+    """跑一遍 `targets_from_rows`，交出它打的那句「军力值不可信」。"""
+    said: list[str] = []
+    monkeypatch.setattr(ranking_scan, "say", said.append)
+    targets_from_rows(_rows(scores), observed_at=NOW, anchor=anchor)
+    hits = [line for line in said if "军力值不可信" in line]
+    return hits[0] if hits else ""
+
+
+def test_the_log_says_which_rule_dropped_the_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️⚠️ **四条判据各有各的处置，日志必须分得开。**
+
+    2026-09-02 查这件事时最费劲的一步就是这个：日志只说「不可信」加一串下标，只能
+    拿「值 ÷ 锚点」去反推是哪一条——而实测 71.5% 的被丢值其实 **≤ 锚点**，那个比值
+    什么都说明不了，白花了半天。
+
+    - `出界` / `破坏降序` → 低位读错，上下邻居插值补得回来
+    - `比基准大/小一个数量级` → 丢首位或多一位，是 ROI / 小数点那类缺陷
+    """
+    line = _log_line(monkeypatch, [9_770.0, 3_760.0, 9_750.0], anchor=9_800.0)
+
+    assert "出界" in line, "被区间判掉的那一行要说「出界」"
+    assert "3760" in line.replace(",", ""), "原值要照抄，不能只留下标"
+
+    magnitude = _log_line(monkeypatch, [9_770.0, 93_700.0, 9_730.0], anchor=9_800.0)
+    assert "数量级" in magnitude, "数量级错了要报数量级，不能混进「出界」"
+
+
+def test_the_log_shows_the_bracket_it_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 区间作不作数决定了走区间判据还是逐行兜底，**两条的宽严差着 3 倍的丢弃率**。
+
+    所以区间是多少、或者为什么不作数，都得看得见——否则事后无法判断某一屏是被
+    哪一档处置的。
+    """
+    line = _log_line(monkeypatch, [9_770.0, 3_760.0, 9_750.0], anchor=9_800.0)
+
+    assert "区间 9750–9770" in line.replace(",", ""), f"没写出用的是哪个区间：{line}"
+
+
+def test_the_log_says_why_the_bracket_did_not_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 不作数时要说**被哪一条否的** —— 三条的下一步完全不同。
+
+    这里首尾跨度 5.6 倍（末行丢了首位），属于「端点自己读错了」那一档，该去查 ROI，
+    而不是去查降序判据。区间既然不作数，这一屏就退回逐行兜底 —— 9,800 破坏降序、
+    1,740 跌掉一个数量级，两条都该在日志里说清楚。
+    """
+    line = _log_line(monkeypatch, [9_740.0, 9_800.0, 1_740.0], anchor=9_800.0)
+
+    assert "区间不作数" in line
+    assert "跨度" in line, f"没说清是被哪一条否的：{line}"
+
+
+def test_the_log_carries_the_rule_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 版本指纹进日志 —— **只靠库里的日志就要能判断生产跑没跑上这一版**。
+
+    仓库里有过教训：#266 那道支线落地时一行新日志都没留，用户问「生产跑的是哪个
+    版本」时只能答「看不出」。
+    """
+    from evo_helper.domain.ranking import SCORE_RULE_VERSION
+
+    line = _log_line(monkeypatch, [9_770.0, 3_760.0, 9_750.0], anchor=9_800.0)
+
+    assert SCORE_RULE_VERSION in line
+
+
+def test_the_log_and_the_rule_read_the_same_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️⚠️ **日志报的区间，必须是判据真正用的那个。**
+
+    `screen_scores` 先过 `renderable_score` 把多插一位的挑掉，再交给判据。日志若拿
+    未过滤的原始读数去算区间，两边就分家了——而分家之后日志会**理直气壮地说错话**。
+    我 2026-09-02 写这段时就这么错过一次，是这条用例的来处。
+
+    这里 `10259` 是渲染不出来的（多插了一位，真值约 1,025.9），它会在进判据之前被
+    挑掉。⚠️ **它必须放在首行**：放中间的话首尾不变，两份输入算出同一个区间，
+    这条用例就什么都证明不了（我第一版就这么写的，变异照样绿）。放首行之后，
+    未过滤那份的上界是 10,259，判据真正用的是 9,770。
+    """
+    line = _log_line(monkeypatch, [10_259.0, 9_770.0, 3_760.0, 9_750.0], anchor=9_800.0)
+
+    assert "区间 9750–9770" in line.replace(",", ""), f"日志用了未过滤的读数算区间：{line}"
+    assert "10259" in line.replace(",", ""), "被挑掉的那一行也要出现在被丢清单里"
+    assert "渲染不出" in line, "渲染不出来的那一行要照实说，不能留空洞"

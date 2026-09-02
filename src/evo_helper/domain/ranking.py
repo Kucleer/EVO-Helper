@@ -319,6 +319,106 @@ def descending_breaks(scores: Sequence[float | None]) -> list[int]:
 #: 而误判的代价是把一批好读数丢成估算值。
 SCORE_CLIFF_FACTOR = 5.0
 
+#: 一屏首尾之间**最多**差几倍，超过就认为首尾自己读错了、这一屏的区间不作数。
+#:
+#: 取 2 的依据（2026-09-02 生产实测，近 3 天 1,099 组被丢行）：真实的一屏跨度
+#: **中位 0.31%、P90 4%**，与代码里早就量过的「跨 12 行只差 1.3%」一致；而端点被
+#: 数量级读错时跨度会直接跳到 99%。2 倍留在两者中间，宽到真实跌幅永远够不着，
+#: 窄到一个丢首位的端点（10 倍）必然出界。
+#:
+#: ⚠️ **它只用来判「区间作不作数」，不用来判单个读数。** 单个读数的数量级仍由
+#: `SCORE_CLIFF_FACTOR` 那两条管——两套阈值各管一件事，别合并。
+SCREEN_SPREAD_LIMIT = 2.0
+
+#: 这一版判据的**版本指纹**。改了判据就必须改它。
+#:
+#: ⚠️ 用途是**只靠库里的日志判断生产跑没跑上这一版**。仓库里有过教训：#266 那道
+#: 支线落地时一行新日志都没留，用户问「生产跑的是哪个版本」时只能答「看不出」；
+#: 而 #260 与 #262 两版的 `criterion` 一字不差，最准的那条指纹分不出它们。
+SCORE_RULE_VERSION = "screen-bracket/1"
+
+#: 一行军力读数被丢的**理由**，逐条对应一道判据。日志按它分组，事后才说得清
+#: 「这一屏是被哪条判据拦的」——三条的处置完全不同，混成一句「不可信」等于没说。
+DROP_OUT_OF_BRACKET = "出界"
+DROP_OUT_OF_ORDER = "破坏降序"
+DROP_TOO_BIG = "比基准大一个数量级"
+DROP_TOO_SMALL = "比基准小一个数量级"
+
+
+def screen_bracket(
+    scores: Sequence[float | None],
+    *,
+    spread_limit: float = SCREEN_SPREAD_LIMIT,
+) -> tuple[float, float] | None:
+    """这一屏首尾读得出、且自身站得住时，交出可信区间 `(下界, 上界)`；否则 `None`。
+
+    用户口径（2026-09-02，逐字）：
+
+        「只要该屏内首尾能读出，并且与上一屏保持递减，我能接受全部的估算值」
+        「所有这几行 首尾在的话，不应该被丢弃啊」
+
+    ## ⚠️⚠️ 这是为了止住**屏内**的级联误伤
+
+    `trusted_scores` 原先只有一条降序判据：**比屏内上一个可信值大就丢**。它防得住
+    「读大了」，防不住「读小了却仍然递减」——那种错读会**顺利通过判据、当上基准**，
+    然后把它后面每一行正确的值都判成逆序：
+
+        真值    9770  9760  9750  9740  9730
+        读成    9770  3760  9750  9740  9730      ← 只有第 2 行读错（9 → 3）
+        判据    ✓     ✓     ✗     ✗     ✗        ← 基准掉到 3760，后面全陪葬
+
+    2026-09-02 生产实测（近 3 天，被丢 ≥2 行的 1,099 组）：
+
+        整组自身完美降序   867 组   78.9%    ← 被丢的那些行彼此严格递减
+        只有 1 处逆序      192 组   17.5%
+        2 处以上逆序        40 组    3.7%
+
+        落在「完美降序」组里的行：3,827 / 5,090 = **75.2%**
+        那些组的组内跨度：中位 **0.31%**
+
+    **一批彼此严格递减、总跨度 0.3% 的读数不可能是读错了**，它们是被误伤的。
+    同一批数据里另外两个指标也指向级联：被丢的值 71.5% 其实 ≤ 锚点（是真值），
+    而末行被丢的次数是首行的 **7 倍**（越靠后越容易被前面的错读连累）。
+
+    ## 区间怎么算，以及为什么这四条缺一不可
+
+    榜单降序、且 `targets_from_rows` 只在采集段被调用（那时早已滚进 bot 段，
+    屏内值差得极近），所以**首尾两个读数就框住了这一屏的全部合法取值**。
+
+    1. **至少两个正读数**——一个点框不出区间。
+    2. **末 ≤ 首**：首尾自己就不递减的话，至少有一个端点是错的，区间不作数。
+    3. **首 ≤ 末 × `spread_limit`**：跨度过大说明端点本身被数量级读错了。
+       ⚠️ 没有这一条，一个丢首位的末行（真值 9,740 读成 1,740）会把下界拉到
+       1,740，于是整屏连同真正的错读一起放行——**比不做这个改动还糟**。
+
+    判不出区间就交 `None`，调用方退回原来那条逐行降序判据——**放宽只在证据齐全时
+    发生**，证据不齐时行为逐字不变。
+
+    ## ⚠️⚠️ 这里**故意不看锚点**，别再加回来
+
+    用户口径那句话有两半：「屏内首尾能读出」**并且**「与上一屏保持递减」。第一半就是
+    上面三条；第二半**已经由 `trusted_scores` 的 `too_big` / `too_small` 守着**——
+    它们拿锚点当基准逐行判，而这个区间只替换 `out_of_order` 那一条，一个字都没碰它们。
+
+    我写第一版时在这里加了第四条「首 ≤ 锚点 × `cliff_factor`」，**变异验证证明它是
+    死代码**：把它删掉，59 条用例全绿。构造不出只有它拦得住的情形——整屏偏高时
+    `too_big` 会逐行挡掉，区间作不作数结果一样。
+
+    而卡得更严（「首 ≤ 锚点」）是**有害的**，有用例钉着
+    （`test_a_slightly_low_anchor_does_not_disable_the_bracket`）：锚点自己可能被上一屏
+    误判压低（实测「锚点 25190、被丢的值 29130」），拿一个偏低的锚点去卡本屏首行，
+    就是把 `trusted_scores` 里整段讲的**跨屏级联**换个地方再犯一次。
+    """
+    known = [score for score in scores if score is not None and score > 0]
+    if len(known) < 2:
+        return None
+    head, tail = known[0], known[-1]
+    if tail > head:
+        return None
+    if head > tail * spread_limit:
+        return None
+    return tail, head
+
 
 def trusted_scores(
     scores: Sequence[float | None],
@@ -326,7 +426,25 @@ def trusted_scores(
     anchor: float | None = None,
     cliff_factor: float = SCORE_CLIFF_FACTOR,
 ) -> list[float | None]:
-    """把不可信的军力读数换成 `None`。三条拒收理由：
+    """把不可信的军力读数换成 `None`。判据整段在 `_judge` 上。
+
+    要知道**每一行为什么**被丢，用 `score_drop_reasons`——它和这里走同一次遍历。
+    """
+    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor)[0]
+
+
+def _judge(
+    scores: Sequence[float | None],
+    *,
+    anchor: float | None = None,
+    cliff_factor: float = SCORE_CLIFF_FACTOR,
+) -> tuple[list[float | None], list[str | None]]:
+    """判一屏读数，交出 `(可信值, 每一行被丢的理由)`。
+
+    ⚠️ **值和理由必须出自同一次遍历。** 拆成两个函数各走一遍就是「同一件事两份
+    实现」，两边迟早分家——而分家之后日志会**理直气壮地说错话**，比不记更糟。
+
+    三条拒收理由：
 
     - `out_of_order`：比**屏内**上一个可信值大 —— 榜单降序，这一定是读错了。
     - `too_big` / `too_small`：比基准差出 `cliff_factor` 倍 —— 多一位或丢一位。
@@ -407,23 +525,63 @@ def trusted_scores(
     # 它抗单点异常（一个坏值动不了它），够挡住整趟第一屏那个偏大的首行。
     # 取正值的中位数——理由见上面那段。
     basis = anchor if anchor else (statistics.median(positive) if positive else None)
+    # 与 `trusted` 一一对应：可信的那几位是 None，被丢的那几位是丢它的理由。
+    # ⚠️ **判据和理由必须出自同一次遍历。** 另写一个函数去复算理由就是「同一件事两份
+    # 实现」，两边迟早分家——而分家之后日志会理直气壮地说错话。
+    reasons: list[str | None] = []
+
+    # ⚠️ 首尾框得住这一屏时，**逐行降序那条判据换成区间判据**，理由整段在
+    # `screen_bracket` 上：逐行判会被一个「读小了却仍然递减」的错读带跑基准，
+    # 把它后面每一行正确的值都判成逆序（实测被丢的行里 75.2% 是这么来的）。
+    # 框不住（首尾自己就不站得住）就交 `None`，下面原样走逐行判据。
+    bracket = screen_bracket(scores)
 
     trusted: list[float | None] = []
     for score in scores:
         if score is None:
             trusted.append(None)
+            reasons.append(None)
             continue
-        out_of_order = last is not None and score > last
+        if bracket is not None:
+            low, high = bracket
+            # ⚠️ 区间是闭的：首尾两行自己必须留得住，否则下一屏的锚点就没了来源。
+            order_reason = None if low <= score <= high else DROP_OUT_OF_BRACKET
+        else:
+            order_reason = DROP_OUT_OF_ORDER if (last is not None and score > last) else None
         too_big = basis is not None and score > basis * cliff_factor
         too_small = basis is not None and score * cliff_factor < basis
-        if out_of_order or too_big or too_small:
+        # ⚠️ **理由按这个次序取第一个命中的，而不是拼成一串。** 一行同时撞上两条时
+        # 处置只看最要紧那条：数量级错了就是读错了，跟它在不在区间里无关。
+        why = DROP_TOO_BIG if too_big else DROP_TOO_SMALL if too_small else order_reason
+        if why is not None:
             trusted.append(None)
+            reasons.append(why)
             continue
         trusted.append(score)
+        reasons.append(None)
         if score > 0:
             last = score
             basis = score
-    return trusted
+    return trusted, reasons
+
+
+def score_drop_reasons(
+    scores: Sequence[float | None],
+    *,
+    anchor: float | None = None,
+    cliff_factor: float = SCORE_CLIFF_FACTOR,
+) -> list[str | None]:
+    """每一行**为什么**被丢：可信的位置是 `None`，被丢的位置是理由。
+
+    ⚠️ 它和 `trusted_scores` **走同一次遍历**（内部共用 `_judge`），不是复算一遍。
+    日志据此说「这一行是被哪条判据拦的」——三条判据的处置完全不同：
+
+    - `出界` / `破坏降序` → 识别层读错了低位，上下邻居插值补得回来
+    - `比基准大/小一个数量级` → 丢首位或多一位，是 ROI / 小数点那类缺陷
+
+    混成一句「不可信」等于没说，而这正是 2026-09-02 查这件事时最费劲的一步。
+    """
+    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor)[1]
 
 
 def interpolate_scores(scores: Sequence[float | None]) -> list[float | None]:
@@ -647,6 +805,10 @@ def calibrated_blind_rows(
 
 
 __all__ = [
+    "SCORE_RULE_VERSION",
+    "SCREEN_SPREAD_LIMIT",
+    "score_drop_reasons",
+    "screen_bracket",
     "BOT_AREA_REACHED_PREFIX",
     "POSITIONS_PER_SYSTEM",
     "RankingRow",
