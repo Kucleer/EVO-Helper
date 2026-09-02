@@ -859,3 +859,41 @@ def test_a_screen_with_no_coordinate_at_all_answers_an_empty_ruler() -> None:
     """
     assert coordinates_of([]) == set()
     assert coordinates_of([RankingRow(850, "unkn0wn", None, None)]) == set()
+
+
+def test_the_curve_asks_the_repaired_rank_not_the_raw_one() -> None:
+    """⚠️ 曲线参照按**修过的名次**去问，不按 OCR 原始名次。
+
+    名次是严格连续的，所以 `repair_ranks` 能把读错的那一行修回来（它自己的用例在
+    `domain.ranking`）。而曲线是按名次取邻居的——拿一个读错的名次去问，就是去问
+    曲线上错误的位置，**而那恰恰发生在这一屏识别本来就不稳的时候**。
+
+    ⚠️ **构造要让兜底判据放行、只有曲线拦得住**，否则两条路结果一样，这条用例
+    什么都证明不了（第一版就是这样：把错读放在中间，区间判据自己就丢掉了它）。
+
+    所以错读放在**末行**：区间因此作不作数都拦不住它——首尾跨度 9790/3770 超过
+    2 倍上限，区间不作数；退回逐行判据时 3,770 比上一行小、也没到 5 倍断崖，
+    **被放行**。而它的名次读成了 `5`（真值 642），按原始名次去问曲线会落到 5 号
+    附近、历史里一个邻居都没有 → 没参照 → 同样放行。只有按修过的名次问，
+    才会拿 9,800 当参照、算出偏离 61% 而拦下。
+    """
+    from evo_helper.tools.ranking_scan import targets_from_rows
+
+    history = [(600 + i, 9800.0) for i in range(8)]
+    rows = [
+        RankingRow(640, "bot_4_30_12", 9790.0, Coordinate(4, 30, 12)),
+        RankingRow(641, "bot_4_100_13", 9780.0, Coordinate(4, 100, 13)),
+        RankingRow(5, "bot_4_183_20", 3770.0, Coordinate(4, 183, 20)),
+    ]
+
+    targets = targets_from_rows(
+        rows, observed_at=datetime(2026, 9, 2, tzinfo=UTC), anchor=9800.0, history=history
+    )
+
+    # ⚠️ 断言看**分数本身**，不看 `military_score_estimated`：末行没有右邻居，
+    # `interpolate_scores` 补不出中点，所以它被丢之后是 None 而不是估算值。
+    assert targets[2].military_score is None, (
+        "名次读错的那一行没被曲线拦住——多半是拿原始名次去问了曲线"
+    )
+    assert targets[0].military_score == 9790.0, "前两行是真值，不许误伤"
+    assert targets[1].military_score == 9780.0

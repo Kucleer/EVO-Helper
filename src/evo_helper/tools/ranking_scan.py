@@ -24,11 +24,13 @@ from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
 from evo_helper.domain.ranking import (
+    CURVE_TOLERANCE,
     SCORE_RULE_VERSION,
     SCREEN_SPREAD_LIMIT,
     RankingRow,
     bot_area_reached_rows_message,
     coordinate_of,
+    curve_reference,
     interpolate_scores,
     is_bot_entry,
     mentions_bot,
@@ -632,7 +634,11 @@ def _no_bracket_because(scores: Sequence[float | None]) -> str:
 
 
 def targets_from_rows(
-    rows: list[RankingRow], *, observed_at: datetime, anchor: float | None = None
+    rows: list[RankingRow],
+    *,
+    observed_at: datetime,
+    anchor: float | None = None,
+    history: list[tuple[int, float]] | None = None,
 ) -> list[RankingTarget]:
     """修名次、**丢掉破坏降序的军力值**、插补空缺，并留下「这个数是估算的」的证据。
 
@@ -660,7 +666,9 @@ def targets_from_rows(
     # 报出来的区间就不是判据真正用的那个——那正是这段代码自己在警告的「两处各算
     # 一遍会分家」。所以过滤只做一次，两边共用。
     renderable = [row.score if renderable_score(row.score) else None for row in rows]
-    trusted = trusted_scores(renderable, anchor=anchor)
+    # ⚠️ **名次用修过的那一份**（`repair_ranks`）。原始名次读错时曲线会去问一个错的
+    # 位置，而那正好是最需要它答对的时候。
+    trusted = trusted_scores(renderable, anchor=anchor, ranks=repaired, history=history)
     dropped = [
         (index, read[index])
         for index, score in enumerate(trusted)
@@ -678,12 +686,33 @@ def targets_from_rows(
         #
         # 区间也要打：它作不作数决定了走的是区间判据还是逐行兜底，而这两条的宽严
         # 差着 3 倍的丢弃率。作不作数、以及不作数时是被哪一条否掉的，都得看得见。
-        why = score_drop_reasons(renderable, anchor=anchor)
+        # ⚠️ 理由要**重算一次**：`score_drop_reasons` 会再走一遍判据，而判据会往
+        # `history` 里追加采信点。传一份拷贝，免得同一屏被记进历史两次——那会让中位数
+        # 悄悄偏向这一屏。
+        why = score_drop_reasons(
+            renderable,
+            anchor=anchor,
+            ranks=repaired,
+            history=list(history) if history is not None else None,
+        )
         bracket = screen_bracket(renderable)
+        reference = (
+            curve_reference(history, repaired[0])
+            if history and repaired and repaired[0] is not None
+            else None
+        )
         window = (
-            f"区间 {bracket[0]:.0f}–{bracket[1]:.0f}"
-            if bracket
-            else f"区间不作数（{_no_bracket_because(renderable)}）"
+            f"曲线参照 {reference:.0f}（±{CURVE_TOLERANCE * 100:.0f}%，"
+            f"历史 {len(history or [])} 点）"
+            if reference is not None
+            else (
+                f"曲线没参照（历史 {len(history or [])} 点）· "
+                + (
+                    f"区间 {bracket[0]:.0f}–{bracket[1]:.0f}"
+                    if bracket
+                    else f"区间不作数（{_no_bracket_because(renderable)}）"
+                )
+            )
         )
         say(
             f"军力值不可信，丢掉这几行的分数（坐标保留）"
@@ -1440,6 +1469,15 @@ def scan(
     # 而 2026-08-23 生产实测正是从那里漏进去一个 10 倍偏大的值
     # （账在 `domain.ranking.trusted_scores`）。
     score_anchor: float | None = None
+    # ⚠️ **曲线的历史要跨屏活着，而且只在这一趟里活着。**
+    #
+    # 「几个锚点对整个长链路」（用户口径 2026-09-02）落地成这个列表：每采信一个读数
+    # 就往里追加 `(名次, 军力)`，判下一屏时取名次相近的中位数当参照。中位数抗少数
+    # 坏点，这是它比单点锚点强的全部理由（整段账在 `domain.ranking.curve_reference`）。
+    #
+    # ⚠️ **不跨趟复用。** bot 军力每周一 UTC+0 刷新，而两趟之间还隔着几十分钟的
+    # 攻击——拿上一趟的历史当这一趟的参照，就是拿过期的曲线去判新读数。
+    score_history: list[tuple[int, float]] = []
     #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
     blind_score_screens = 0
 
@@ -1522,7 +1560,12 @@ def scan(
             progress.stage = ScanStage.COLLECTING
             rows = read_rows()
             first, reached_limit = collect(
-                targets_from_rows(rows, observed_at=datetime.now(UTC), anchor=score_anchor)
+                targets_from_rows(
+                    rows,
+                    observed_at=datetime.now(UTC),
+                    anchor=score_anchor,
+                    history=score_history,
+                )
             )
             score_anchor = next_score_anchor(rows, anchor=score_anchor)
             screens.append(first)
@@ -1539,7 +1582,12 @@ def scan(
                     break
                 rows = list(step.rows)
                 fresh, reached_limit = collect(
-                    targets_from_rows(rows, observed_at=datetime.now(UTC), anchor=score_anchor)
+                    targets_from_rows(
+                        rows,
+                        observed_at=datetime.now(UTC),
+                        anchor=score_anchor,
+                        history=score_history,
+                    )
                 )
                 score_anchor = next_score_anchor(rows, anchor=score_anchor)
                 # ⚠️ **自愈阀：连着几屏整屏被判掉，就把锚点撤掉重新起头。**

@@ -335,10 +335,87 @@ SCREEN_SPREAD_LIMIT = 2.0
 #: ⚠️ 用途是**只靠库里的日志判断生产跑没跑上这一版**。仓库里有过教训：#266 那道
 #: 支线落地时一行新日志都没留，用户问「生产跑的是哪个版本」时只能答「看不出」；
 #: 而 #260 与 #262 两版的 `criterion` 一字不差，最准的那条指纹分不出它们。
-SCORE_RULE_VERSION = "screen-bracket/1"
+SCORE_RULE_VERSION = "curve/1"
+
+#: 一个读数偏离曲线多远就算读错。**这个数是量出来的，不是挑的。**
+#:
+#: 2026-09-02 拿生产数据反推（近 3 天 8 趟扫描、574 个非估算点，每个点对着「同名次
+#: ±60 名邻居的中位数」算偏差）：
+#:
+#:     偏差   0– 2%   460  80.1%   ← 真值紧贴曲线
+#:     偏差   2–15%    82  14.3%
+#:     偏差  15–30%     6   1.1%
+#:     偏差  30–40%     0   0.0%   ← **空隙**
+#:     偏差  40–70%    24   4.1%   ← 错读簇
+#:     偏差  70%+       2   0.3%
+#:
+#: 30–40% 那一档一个点都没有，阈值落在里面。而 >30% 那 26 个里有 20 个（77%）
+#: **把首位换回邻居中位的首位就对上了**——确凿的首位互串错读。
+#:
+#: ⚠️ **不要往 15% 调。** 15–30% 那 6 个点是真值（屏边界、名次跨度大的地方），
+#: 收到那里会开始误伤，而误伤的代价是把好读数换成插值。
+CURVE_TOLERANCE = 0.35
+
+#: 曲线参照要几个历史点才作数。少于这个数就不表态，退回原来那几条判据。
+#:
+#: 取 5 的理由：中位数要抗住少数坏点，5 个点里混进 2 个坏的中位数才会被带跑，
+#: 而实测错读率约 4%——5 个点里出 2 个坏的概率极低。再多要求就会让每趟头几屏
+#: 一直没有参照（榜首那几屏本来就是断崖最陡的地方）。
+CURVE_MIN_POINTS = 5
+
+#: 参照取「名次相差不超过这么多」的历史点。
+#:
+#: ⚠️ 窗口太窄会在名次稀疏的地方凑不够点，太宽会跨过曲率大的段。取 60 是实测
+#: 那个分布用的窗口——上面那张表就是在 ±60 下量出来的，阈值和窗口是**一对**，
+#: 改一个必须重新量另一个。
+CURVE_RANK_SPAN = 60
+
+
+def curve_reference(
+    history: Sequence[tuple[int, float]],
+    rank: int,
+    *,
+    span: int = CURVE_RANK_SPAN,
+    min_points: int = CURVE_MIN_POINTS,
+) -> float | None:
+    """这一名次**该是**多少军力：取名次相近的历史可信点的中位数。交不出就 `None`。
+
+    用户口径（2026-09-02，逐字）：
+
+        「军力的降序速度是可预估范围内的，实际上仅需要几个锚点就可以对其整个长链路」
+
+    ## ⚠️⚠️ 参照物必须来自**多个**点，这是它比锚点强的全部理由
+
+    原先的判据（`out_of_order` / `too_big` / `too_small`）参照的都是**单个**值——
+    上一行、或者上一屏交下来的锚点。而那个单点自己可能就是错的，于是：
+
+    - 一个「读小了却仍然递减」的错读会顺利当上基准，把后面每一行正确的值都判成逆序
+      （2026-09-02 实测：被丢的行里 75.2% 是这么来的）
+    - 首尾框住这一屏那一版（`screen-bracket/1`）也一样——端点被打中就整个失效，
+      实测 28% 的屏是这样
+
+    中位数**抗少数坏点**：窗口里混进一两个错读，中位数纹丝不动。这就是「几个锚点
+    对整个长链路」的落地形式。
+
+    ## 为什么用中位数而不是拟合一条线
+
+    榜单不是一条直线：整段 570 名从 10.6K 跌到 9.5K，但不同区段的斜率差得远，
+    榜首那几屏还能从 5.97M 跌到十万级。拟合要选参数形式，选错了到处都是系统偏差；
+    而滚动中位数**不假设形状**，只假设「邻近名次的军力相近」——那是榜单按军力降序
+    排这个事实的直接推论。
+
+    ⚠️ **交不出参照就交 `None`，不许拿全局中位数凑数。** 每趟头几屏历史还不够，
+    那时唯一诚实的回答是「说不上来」，由调用方退回原来那几条判据。
+    """
+    near = [score for known, score in history if abs(known - rank) <= span and score > 0]
+    if len(near) < min_points:
+        return None
+    return statistics.median(near)
+
 
 #: 一行军力读数被丢的**理由**，逐条对应一道判据。日志按它分组，事后才说得清
 #: 「这一屏是被哪条判据拦的」——三条的处置完全不同，混成一句「不可信」等于没说。
+DROP_OFF_CURVE = "偏离曲线"
 DROP_OUT_OF_BRACKET = "出界"
 DROP_OUT_OF_ORDER = "破坏降序"
 DROP_TOO_BIG = "比基准大一个数量级"
@@ -425,12 +502,14 @@ def trusted_scores(
     *,
     anchor: float | None = None,
     cliff_factor: float = SCORE_CLIFF_FACTOR,
+    ranks: Sequence[int | None] | None = None,
+    history: list[tuple[int, float]] | None = None,
 ) -> list[float | None]:
     """把不可信的军力读数换成 `None`。判据整段在 `_judge` 上。
 
     要知道**每一行为什么**被丢，用 `score_drop_reasons`——它和这里走同一次遍历。
     """
-    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor)[0]
+    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history)[0]
 
 
 def _judge(
@@ -438,6 +517,8 @@ def _judge(
     *,
     anchor: float | None = None,
     cliff_factor: float = SCORE_CLIFF_FACTOR,
+    ranks: Sequence[int | None] | None = None,
+    history: list[tuple[int, float]] | None = None,
 ) -> tuple[list[float | None], list[str | None]]:
     """判一屏读数，交出 `(可信值, 每一行被丢的理由)`。
 
@@ -537,22 +618,36 @@ def _judge(
     bracket = screen_bracket(scores)
 
     trusted: list[float | None] = []
-    for score in scores:
+    for index, score in enumerate(scores):
         if score is None:
             trusted.append(None)
             reasons.append(None)
             continue
-        if bracket is not None:
-            low, high = bracket
-            # ⚠️ 区间是闭的：首尾两行自己必须留得住，否则下一屏的锚点就没了来源。
-            order_reason = None if low <= score <= high else DROP_OUT_OF_BRACKET
+        # ⚠️⚠️ **有曲线参照时，只听曲线的。**
+        #
+        # 下面那三条（区间 / 逐行降序 / 断崖）参照的都是**单个**值——旁边那一行、
+        # 本屏首尾、或上一屏交下来的锚点——而那个单点自己可能就是错的。曲线参照取
+        # 的是名次相近的多个历史点的中位数，少数坏点动不了它（整段账在
+        # `curve_reference`）。两套一起跑等于让那个坏的单点仍有否决权，
+        # 前面两版栽的正是这个。
+        rank = ranks[index] if ranks is not None and index < len(ranks) else None
+        reference = (
+            curve_reference(history, rank) if history is not None and rank is not None else None
+        )
+        if reference is not None:
+            why = DROP_OFF_CURVE if abs(score / reference - 1) > CURVE_TOLERANCE else None
         else:
-            order_reason = DROP_OUT_OF_ORDER if (last is not None and score > last) else None
-        too_big = basis is not None and score > basis * cliff_factor
-        too_small = basis is not None and score * cliff_factor < basis
-        # ⚠️ **理由按这个次序取第一个命中的，而不是拼成一串。** 一行同时撞上两条时
-        # 处置只看最要紧那条：数量级错了就是读错了，跟它在不在区间里无关。
-        why = DROP_TOO_BIG if too_big else DROP_TOO_SMALL if too_small else order_reason
+            if bracket is not None:
+                low, high = bracket
+                # ⚠️ 区间是闭的：首尾两行自己必须留得住，否则锚点就没了来源。
+                order_reason = None if low <= score <= high else DROP_OUT_OF_BRACKET
+            else:
+                order_reason = DROP_OUT_OF_ORDER if (last is not None and score > last) else None
+            too_big = basis is not None and score > basis * cliff_factor
+            too_small = basis is not None and score * cliff_factor < basis
+            # ⚠️ **理由按这个次序取第一个命中的，而不是拼成一串。** 一行同时撞上两条
+            # 时处置只看最要紧那条：数量级错了就是读错了，跟它在不在区间里无关。
+            why = DROP_TOO_BIG if too_big else DROP_TOO_SMALL if too_small else order_reason
         if why is not None:
             trusted.append(None)
             reasons.append(why)
@@ -562,6 +657,11 @@ def _judge(
         if score > 0:
             last = score
             basis = score
+            # ⚠️ **只有被采信的点才进历史。** 一个判错的读数进了历史就会把中位数
+            # 往错的方向拽，而这条链路是自我强化的——同 `trusted_scores` 里那条
+            # 「锚点只跟着可信值走」。
+            if history is not None and rank is not None:
+                history.append((rank, score))
     return trusted, reasons
 
 
@@ -570,6 +670,8 @@ def score_drop_reasons(
     *,
     anchor: float | None = None,
     cliff_factor: float = SCORE_CLIFF_FACTOR,
+    ranks: Sequence[int | None] | None = None,
+    history: list[tuple[int, float]] | None = None,
 ) -> list[str | None]:
     """每一行**为什么**被丢：可信的位置是 `None`，被丢的位置是理由。
 
@@ -581,7 +683,7 @@ def score_drop_reasons(
 
     混成一句「不可信」等于没说，而这正是 2026-09-02 查这件事时最费劲的一步。
     """
-    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor)[1]
+    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history)[1]
 
 
 def interpolate_scores(scores: Sequence[float | None]) -> list[float | None]:
@@ -805,7 +907,11 @@ def calibrated_blind_rows(
 
 
 __all__ = [
+    "CURVE_MIN_POINTS",
+    "CURVE_RANK_SPAN",
+    "CURVE_TOLERANCE",
     "SCORE_RULE_VERSION",
+    "curve_reference",
     "SCREEN_SPREAD_LIMIT",
     "score_drop_reasons",
     "screen_bracket",

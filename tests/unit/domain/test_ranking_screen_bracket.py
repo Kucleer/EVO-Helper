@@ -206,7 +206,83 @@ def test_the_rule_version_is_a_fingerprint_only_this_version_writes() -> None:
     """
     from evo_helper.domain.ranking import SCORE_RULE_VERSION
 
-    assert SCORE_RULE_VERSION == "screen-bracket/1"
+    assert SCORE_RULE_VERSION == "curve/1"
     assert screen_bracket([9770.0, 9730.0]) is not None, (
         "指纹说自己是 screen-bracket 版，那区间判据就得真的在"
     )
+
+
+# -- 曲线判据：参照多个历史点，不参照旁边那一行 ---------------------------------
+
+
+def test_the_curve_survives_a_reference_that_is_itself_wrong() -> None:
+    """⚠️⚠️ **本次改动的重点。** 历史里混进一个坏点，判据不该跟着跑偏。
+
+    前两版都栽在「参照物是单个值」上：逐行判被上一行带跑（75.2% 的误伤），
+    首尾框住这一屏被端点带跑（28% 的屏失效）。中位数抗少数坏点。
+    """
+    from evo_helper.domain.ranking import curve_reference
+
+    history = [(100, 9800.0), (101, 9790.0), (102, 3780.0), (103, 9770.0), (104, 9760.0)]
+
+    assert curve_reference(history, 105) == 9770.0, "一个坏点把中位数带跑了"
+
+
+def test_a_leading_digit_misread_is_caught_by_the_curve() -> None:
+    """生产实况：名次 1634 读到 3,480，而邻居中位是 9,540（9 读成 3）。
+
+    这个值**现在就在库里**——它过了所有既有判据（比上一行小、没到 5 倍断崖）。
+    """
+    history = [(1600 + i, 9540.0) for i in range(6)]
+
+    kept = trusted_scores([3480.0], anchor=9600.0, ranks=[1634], history=list(history))
+
+    assert kept == [None]
+
+
+def test_a_real_reading_hugs_the_curve_and_is_kept() -> None:
+    """真值紧贴曲线（实测中位偏差 0.71%），一个都不许误伤。"""
+    history = [(1600 + i, 9540.0) for i in range(6)]
+
+    kept = trusted_scores([9500.0], anchor=9600.0, ranks=[1634], history=list(history))
+
+    assert kept == [9500.0]
+
+
+def test_the_curve_says_nothing_until_it_has_enough_history() -> None:
+    """⚠️ 历史不够就**不表态**，退回原来那几条判据——不许拿全局中位数凑数。
+
+    每趟头几屏历史本来就少，而榜首那几段恰恰是断崖最陡的地方，硬给一个参照
+    只会在最不该出错的位置出错。
+    """
+    from evo_helper.domain.ranking import CURVE_MIN_POINTS, curve_reference
+
+    thin = [(100 + i, 9800.0) for i in range(CURVE_MIN_POINTS - 1)]
+
+    assert curve_reference(thin, 105) is None
+
+
+def test_history_only_takes_readings_the_rule_trusted() -> None:
+    """⚠️ 判错的读数不许进历史——进去就会把中位数往错的方向拽，而这条链路自我强化。"""
+    history: list[tuple[int, float]] = [(1600 + i, 9540.0) for i in range(6)]
+    trusted_scores([3480.0, 9500.0], anchor=9600.0, ranks=[1634, 1635], history=history)
+
+    assert (1634, 3480.0) not in history, "被判错的值进了历史"
+    assert (1635, 9500.0) in history, "被采信的值该进历史，否则曲线不往前走"
+
+
+def test_the_curve_overrides_the_single_point_rules() -> None:
+    """⚠️⚠️ 有曲线参照时**只听曲线的**，那三条单点判据不再有否决权。
+
+    两套一起跑等于让那个可能读错的单点仍能否决——前两版栽的正是这个。
+    这里锚点被压到 3,000（模拟上一屏被误判压低），而真值 9,500 贴着曲线：
+    旧的 `too_big`（3,000 × 5 = 15,000）碰巧放行，但 `out_of_order` 会拦；
+    曲线判据认得出它是对的。
+    """
+    history = [(1600 + i, 9540.0) for i in range(6)]
+
+    kept = trusted_scores(
+        [9600.0, 9500.0], anchor=3000.0, ranks=[1634, 1635], history=list(history)
+    )
+
+    assert kept == [9600.0, 9500.0]
