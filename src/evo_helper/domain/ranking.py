@@ -513,7 +513,33 @@ def curve_reference(
     if not slopes:
         return None
     slope = statistics.median(slopes)
-    return statistics.median([score - slope * (known - rank) for known, score in near])
+    reference = statistics.median([score - slope * (known - rank) for known, score in near])
+    # ⚠⚠ **参照自己必须站得住：恒为正，且与窗口自身水平同一个数量级。**
+    #
+    # 没这一道闸时，拟合会交出**负数**，而负参照让 `abs(score / reference - 1)`
+    # 恒大于任何容差 —— 整屏全丢。而全丢之后一个点也进不了历史，下一屏照旧
+    # 拿同一批坏点去拟合、外推得更远、参照更荒——**这是个吸收态**，与
+    # `judge_scores` 里「0 永远不许当基准」那一段是同一类缺陷。
+    #
+    # 2026-09-03 生产实况（#275 上线后第一趟，20:29–20:30 连着 10 屏）：
+    #
+    #     参照 -357 → -3,110 → -13,750 → -37,862 → -48,203 → -49,304
+    #     历史卡在 426 → 461 → 462 点几乎不长，锚点反复变成 None
+    #
+    # 那一趟 302 个被丢行里 **101 行（33%）出自这 10 屏**，不是真误读。
+    #
+    # 闸本身不花钱：同一批 493 个健康拟合上，它**一个都没否掉**（留下的误差
+    # 中位 0.16% / P90 1.08%），而要跌到 -48,000 得跑到窗口水平的 -530%。
+    #
+    # 倍数用现成的 `SCORE_CLIFF_FACTOR`：它管的就是「多一位 / 丢一位」，同一件事。
+    level = statistics.median([score for _, score in near])
+    if (
+        reference <= 0
+        or reference * SCORE_CLIFF_FACTOR < level
+        or reference > level * SCORE_CLIFF_FACTOR
+    ):
+        return None
+    return reference
 
 
 #: 「这一屏是被哪条判据拦的」——三条的处置完全不同，混成一句「不可信」等于没说。
