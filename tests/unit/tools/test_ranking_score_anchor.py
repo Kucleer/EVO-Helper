@@ -497,6 +497,34 @@ def test_the_log_says_which_rule_dropped_the_row(monkeypatch: pytest.MonkeyPatch
     assert "数量级" in magnitude, "数量级错了要报数量级，不能混进「出界」"
 
 
+def test_the_log_carries_the_rank_of_every_dropped_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠⚠ **名次和屏内行号都要记，缺一个就问不出话。**
+
+    两个数回答的是不同的问题，而且不能互相代替：
+
+    - **屏内行号** → 「屏的哪个位置容易被丢」。2026-08-24 靠它量出「末行被丢的
+      次数是首行的 7 倍」，那是级联误伤的证据。
+    - **名次** → 跟趟的那个问题：**每一趟被丢的是不是同一批行？**
+
+    后一条直接决定一个方案成不成立。用户口径（2026-09-03，逐字）：
+
+        「你是否可以在扫完一轮后，再去补遗漏的数据」
+
+    每趟换一批 → 误读是噪声，重读一遍救得回来；每趟同一批 → 误读是确定性的，
+    重读白跑。而这个问题**只能靠名次回答** —— 而 2026-09-03 之前这条日志里没有它，
+    所以用户问起时我只能答「现有日志答不了」。
+
+    ⚠️ 名次必须是 `repair_ranks` 修过的那一份 —— 判据问曲线时用的就是它。
+    记原始读数会让「同一行」在两趟里对不上号。
+    """
+    # `_rows` 的名次从 850 起，所以被丢的那一行（屏内第 1 行）名次是 851。
+    line = _log_line(monkeypatch, [9_770.0, 3_760.0, 9_750.0], anchor=9_800.0)
+
+    assert "(1, 851, 3760.0," in line, f"被丢行没按「屏内行号, 名次, 值」记下来：{line}"
+
+
 def test_the_log_shows_the_bracket_it_used(monkeypatch: pytest.MonkeyPatch) -> None:
     """⚠️ 区间作不作数决定了走区间判据还是逐行兜底，**两条的宽严差着 3 倍的丢弃率**。
 
