@@ -658,10 +658,15 @@ def _backfill_from_the_curve(
         say(f"曲线补数：{len(unread)} 行没读出军力值，一条都补不了（历史 {len(history)} 点）")
         return 0
     written = int(repository.backfill_missing_military_scores(filled))
+    ranks = sorted(t.military_rank for t in filled if t.military_rank is not None)
     say(
-        f"曲线补数：{len(unread)} 行没读出军力值，曲线推得出 {len(filled)} 条，"
-        f"真正补进库 {written} 条（其余那些库里已经有值了，不覆盖）"
-        f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点]"
+        f"曲线补数：{len(unread)} 行没读出军力值，曲线推得出 {len(filled)} 条"
+        f"（名次 {ranks[0]}–{ranks[-1]}），真正补进库 {written} 条"
+        f"（其余那些库里已经有值了，不覆盖）"
+        # ⚠️ 推不出的那几行多半是**这一趟最末的几行**：`curve_reference` 不许单边
+        # 外推，而它们下方还没有点。那是有意的，下一趟会重新读到它们。
+        f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点 · "
+        f"推不出 {len(unread) - len(filled)} 行]"
     )
     return written
 
@@ -754,7 +759,7 @@ def targets_from_rows(
             else None
         )
         window = (
-            f"曲线参照 {reference:.0f}（±{CURVE_TOLERANCE * 100:.0f}%，"
+            f"曲线参照 {reference:.0f}（±{CURVE_TOLERANCE * 100:.1f}%，"
             f"历史 {len(history or [])} 点）"
             if reference is not None
             else (
