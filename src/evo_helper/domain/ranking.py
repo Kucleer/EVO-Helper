@@ -335,7 +335,7 @@ SCREEN_SPREAD_LIMIT = 2.0
 #: ⚠️ 用途是**只靠库里的日志判断生产跑没跑上这一版**。仓库里有过教训：#266 那道
 #: 支线落地时一行新日志都没留，用户问「生产跑的是哪个版本」时只能答「看不出」；
 #: 而 #260 与 #262 两版的 `criterion` 一字不差，最准的那条指纹分不出它们。
-SCORE_RULE_VERSION = "curve/2"
+SCORE_RULE_VERSION = "curve/3"
 
 #: 一个读数偏离曲线多远就算读错。**这个数是量出来的，不是挑的。**
 #:
@@ -386,6 +386,28 @@ CURVE_FIT_POINTS = 4
 #: 而「直线」这个假设只在小跨度上成立——同一屏跨 12 行只差 1.3%。
 CURVE_RANK_SPAN = 60
 
+#: 拟合窗口**内部**允许的最大名次空洞。超过就不表态。
+#:
+#: ⚠️ **这不是 `CURVE_RANK_SPAN` 的重复。** 跨度管的是窗口多宽，这一条管的是窗口多密：
+#: 四个点里三个挤在一块、第四个隔着一个大洞，跨度看着很小，而斜率中位数会被那个
+#: 紧密小簇**重重地带跑**（三个点两两组合就是 3 对，占了 6 对中的一半）。
+#:
+#: 2026-09-03 拿当时榜上 638 个实测点做前向留一验证，按窗口内最大空洞分组：
+#:
+#:     空洞 ≤ 2   470 个点   中位 0.20%   超 3% 的  7.0%
+#:     空洞 3–4   111 个点   中位 0.23%   超 3% 的  9.9%
+#:     空洞 5–8    21 个点   中位 1.92%   超 3% 的 47.6%     ← 塔了
+#:     空洞 >16     9 个点   中位 9.82%   超 3% 的 66.7%
+#:
+#: （前两档那七八个百分点大半不是估算误差，是库里本来就漏过去的错读——它们连 10%
+#: 都超了。）取 4：它只拦住 5.6% 的情形，而那 5.6% 里将近一半的参照是错的。
+#:
+#: ⚠⚠ **这一条是被一条现有用例逗出来的**，不是想出来的：
+#: `test_the_anchor_is_carried_from_one_screen_to_the_next` 里连两屏被丢光，历史于是
+#: 剩下「三个旧点 + 一个新点」，曲线据此去否决了两行正确读数。那正是级联误伤
+#: 换了个机制又回来了，而不是用例该改。
+CURVE_MAX_GAP = 4
+
 
 def curve_reference(
     history: Sequence[tuple[int, float]],
@@ -393,6 +415,8 @@ def curve_reference(
     *,
     points: int = CURVE_FIT_POINTS,
     span: int = CURVE_RANK_SPAN,
+    max_gap: int = CURVE_MAX_GAP,
+    require_both_sides: bool = True,
 ) -> float | None:
     """这一名次**该是**多少军力：拿最近的几个已知点做局部稳健拟合。交不出就 `None`。
 
@@ -417,10 +441,38 @@ def curve_reference(
     两种算法给出同样的答案（2026-09-03 变异验证证实：把中位数换成平均，全部用例
     照绿）。所以改这一行不会有用例变红，**但它会让整体精度退回 0.6%**。
 
-    ## ⚠️ 上下都要有点，不许单边外推
+    ## ⚠⚠ `require_both_sides` 分开两个调用处境，不是一个可选项
 
-    单边就是外推，而外推在曲率大的地方错得最狠。两侧各有点时目标夹在中间，直线
-    假设只需要在这一小段上成立——实测同一屏跨 12 行只差 1.3%。
+    两侧各有点时目标夹在中间，插值而不外推，精度最好（留一验证中位 0.08%）。
+    可是**能不能凑齐两侧，取决于谁在问**：
+
+    - **边扫边判那一段**（`trusted_scores`）是严格的前向单程：一屏判完才进历史，
+      所以历史里**只有名次更小的点**，「上方」永远凑不齐。而生产实测每滚推进
+      15.6 个名次、读出 12 行——**屏与屏之间没有重叠**，一点都借不到。
+    - **整趟收尾补数那一步**（`tools.ranking_scan._backfill_from_the_curve`）历史是全的，
+      两侧要求在那里正好拦住「往扫描末端外推」——那几行下方本来就没点。
+
+    → 所以**判定传 `False`，补数维持 `True`**。
+
+    ⚠⚠ **这一条是拿生产事故换来的。** #274 把两侧要求当成无条件的，于是曲线判据
+    在生产上**一次都没生效过**，而 CI 全绿、日志还报「89.5% 有曲线参照」（那个数是
+    事后补算的，拿到了判据当时没有的历史）。2026-09-03 拿生产一整趟的真实名次
+    前向重放，覆盖率：
+
+        两侧各 2 点        判 750 行，拿到参照   0 =  0.0%
+        最近 4 点不限侧    判 750 行，拿到参照 717 = 95.6%
+
+    单侧确实是外推，但 `span` 把它的跃度封住了，而量出来的代价很小（同一趟 573 个
+    实测点，只用名次更小的历史做留一验证）：
+
+        单侧最近 4 点    中位 0.12%   P90 0.67%
+        两侧各 2 点      中位 0.08%   P90 0.44%
+
+    两者差不到 0.05 个百分点，而 `CURVE_TOLERANCE` 是 3% —— 差这么远的两个量级里，
+    「拿不拿得到参照」才是要害，精度那一点差别无关痛涒。
+
+    —— 而不管哪一条路，拟合窗口的**跨度始终 ≤ `span`**：直线假设只在小跨度上
+    成立（实测同一屏跨 12 行只差 1.3%）。
 
     ## 与 `curve/1` 那一版（±60 名窗口中位数）的分别
 
@@ -432,13 +484,25 @@ def curve_reference(
     交不出参照就交 `None`（点不够、或跨度超限），调用方退回原来那几条判据 ——
     **放宽只在证据齐全时发生**。
     """
-    half = max(points // 2, 1)
-    below = sorted((p for p in history if p[0] < rank and p[1] > 0), key=lambda p: rank - p[0])
-    above = sorted((p for p in history if p[0] > rank and p[1] > 0), key=lambda p: p[0] - rank)
-    if len(below) < half or len(above) < half:
+    if require_both_sides:
+        half = max(points // 2, 1)
+        below = sorted((p for p in history if p[0] < rank and p[1] > 0), key=lambda p: rank - p[0])
+        above = sorted((p for p in history if p[0] > rank and p[1] > 0), key=lambda p: p[0] - rank)
+        if len(below) < half or len(above) < half:
+            return None
+        near = below[:half] + above[:half]
+    else:
+        # 不限侧时按「离目标名次多远」取最近的几个，两侧有点就自然都用上。
+        nearby = [p for p in history if p[1] > 0 and abs(p[0] - rank) <= span]
+        near = sorted(nearby, key=lambda p: abs(p[0] - rank))[:points]
+        if len(near) < points:
+            return None
+    known_ranks = sorted(r for r, _ in near)
+    if known_ranks[-1] - known_ranks[0] > span:
         return None
-    near = below[:half] + above[:half]
-    if max(r for r, _ in near) - min(r for r, _ in near) > span:
+    # 窗口里有大洞就不表态——洞那一边的斜率无从得知，而剩下那个紧密小簇
+    # 会把斜率中位数带到它自己那一段上去。数据在 `CURVE_MAX_GAP` 上。
+    if any(b - a > max_gap for a, b in zip(known_ranks, known_ranks[1:])):
         return None
     slopes = [
         (near[j][1] - near[i][1]) / (near[j][0] - near[i][0])
@@ -543,22 +607,51 @@ def trusted_scores(
     ranks: Sequence[int | None] | None = None,
     history: list[tuple[int, float]] | None = None,
 ) -> list[float | None]:
-    """把不可信的军力读数换成 `None`。判据整段在 `_judge` 上。
+    """把不可信的军力读数换成 `None`。判据整段在 `judge_scores` 上。
 
     要知道**每一行为什么**被丢，用 `score_drop_reasons`——它和这里走同一次遍历。
     """
-    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history)[0]
+    return judge_scores(
+        scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history
+    ).trusted
 
 
-def _judge(
+@dataclass(frozen=True)
+class Judgement:
+    """一屏读数判完之后的全部结果，三份名单一一对应。
+
+    ⚠️ **三份必须出自同一次遍历。** 拆成几个函数各走一遍就是「同一件事几份实现」，
+    而判据会往 `history` 里追采信点——第二遍看到的历史比第一遍多，于是它会
+    走到**第一遍根本到不了的分支**，交出一套看上去很像真的假话。
+    #275 之前日志就是这么坏的（整段在 `references` 上）。
+    """
+
+    #: 可信的读数；被丢的那几位是 `None`。
+    trusted: list[float | None]
+    #: 与 `trusted` 一一对应：可信的那几位是 `None`，被丢的那几位是丢它的理由。
+    reasons: list[str | None]
+    #: 与 `trusted` 一一对应：判这一行时**真正用上的**曲线参照；`None` = 那一行没参照、
+    #: 退回了区间 / 逐行降序 / 断崖那几条。
+    #:
+    #: ⚠⚠ **日志只允许报这份，不允许事后自己再算一遍。** #274 上线后日志报
+    #: 「89.5% 有曲线参照」，而真实覆盖率是 **0%**：那个数是在判完之后拿
+    #: `curve_reference(history, 首行名次)` 补算的，而那时 `history` 里已经多了**这一屏
+    #: 自己**，于是“上方”凑齐了。同一个坑让理由也全错：一行本来是被「出界」拦的，
+    #: 补算时曲线反而采信它，于是日志把它标成了「渲染不出」。
+    #:
+    #: 而这个数本身就是能在第一天抳住那次回归的信号——它会一直是 0。
+    references: list[float | None]
+
+
+def judge_scores(
     scores: Sequence[float | None],
     *,
     anchor: float | None = None,
     cliff_factor: float = SCORE_CLIFF_FACTOR,
     ranks: Sequence[int | None] | None = None,
     history: list[tuple[int, float]] | None = None,
-) -> tuple[list[float | None], list[str | None]]:
-    """判一屏读数，交出 `(可信值, 每一行被丢的理由)`。
+) -> Judgement:
+    """判一屏读数，交出 `Judgement`（可信值、理由、真正用上的曲线参照）。
 
     ⚠️ **值和理由必须出自同一次遍历。** 拆成两个函数各走一遍就是「同一件事两份
     实现」，两边迟早分家——而分家之后日志会**理直气壮地说错话**，比不记更糟。
@@ -656,10 +749,12 @@ def _judge(
     bracket = screen_bracket(scores)
 
     trusted: list[float | None] = []
+    references: list[float | None] = []
     for index, score in enumerate(scores):
         if score is None:
             trusted.append(None)
             reasons.append(None)
+            references.append(None)
             continue
         # ⚠️⚠️ **有曲线参照时，只听曲线的。**
         #
@@ -669,9 +764,16 @@ def _judge(
         # `curve_reference`）。两套一起跑等于让那个坏的单点仍有否决权，
         # 前面两版栽的正是这个。
         rank = ranks[index] if ranks is not None and index < len(ranks) else None
+        # ⚠⚠ **`require_both_sides=False` 不是把判据放宽，是这条分支能不能走到的前提。**
+        # 这里是严格的前向单程（下面采信一个值才 `history.append`），所以判到某一行时
+        # 历史里只有名次更小的点——要求两侧等于让这整条分支永远不执行。
+        # 整段在 `curve_reference` 上；那里也记了为何补数那一步得反过来。
         reference = (
-            curve_reference(history, rank) if history is not None and rank is not None else None
+            curve_reference(history, rank, require_both_sides=False)
+            if history is not None and rank is not None
+            else None
         )
+        references.append(reference)
         if reference is not None:
             why = DROP_OFF_CURVE if abs(score / reference - 1) > CURVE_TOLERANCE else None
         else:
@@ -700,7 +802,7 @@ def _judge(
             # 「锚点只跟着可信值走」。
             if history is not None and rank is not None:
                 history.append((rank, score))
-    return trusted, reasons
+    return Judgement(trusted=trusted, reasons=reasons, references=references)
 
 
 def score_drop_reasons(
@@ -713,7 +815,7 @@ def score_drop_reasons(
 ) -> list[str | None]:
     """每一行**为什么**被丢：可信的位置是 `None`，被丢的位置是理由。
 
-    ⚠️ 它和 `trusted_scores` **走同一次遍历**（内部共用 `_judge`），不是复算一遍。
+    ⚠️ 它和 `trusted_scores` **走同一次遍历**（内部共用 `judge_scores`），不是复算一遍。
     日志据此说「这一行是被哪条判据拦的」——三条判据的处置完全不同：
 
     - `出界` / `破坏降序` → 识别层读错了低位，上下邻居插值补得回来
@@ -721,7 +823,9 @@ def score_drop_reasons(
 
     混成一句「不可信」等于没说，而这正是 2026-09-02 查这件事时最费劲的一步。
     """
-    return _judge(scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history)[1]
+    return judge_scores(
+        scores, anchor=anchor, cliff_factor=cliff_factor, ranks=ranks, history=history
+    ).reasons
 
 
 def interpolate_scores(scores: Sequence[float | None]) -> list[float | None]:
@@ -946,6 +1050,7 @@ def calibrated_blind_rows(
 
 __all__ = [
     "CURVE_FIT_POINTS",
+    "CURVE_MAX_GAP",
     "CURVE_RANK_SPAN",
     "CURVE_TOLERANCE",
     "SCORE_RULE_VERSION",
@@ -971,6 +1076,8 @@ __all__ = [
     "interpolate_scores",
     "is_bot_coordinate",
     "is_bot_entry",
+    "Judgement",
+    "judge_scores",
     "mentions_bot",
     "repair_ranks",
 ]

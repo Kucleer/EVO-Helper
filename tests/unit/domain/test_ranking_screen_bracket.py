@@ -204,11 +204,18 @@ def test_the_rule_version_is_a_fingerprint_only_this_version_writes() -> None:
     它们，只能退回去看行为。这一条把指纹和判据钉在一起——区间那道闸还在，指纹就得
     还是这一版。
     """
-    from evo_helper.domain.ranking import SCORE_RULE_VERSION
+    from evo_helper.domain.ranking import SCORE_RULE_VERSION, curve_reference
 
-    assert SCORE_RULE_VERSION == "curve/2"
+    assert SCORE_RULE_VERSION == "curve/3"
     assert screen_bracket([9770.0, 9730.0]) is not None, (
         "指纹说自己是 screen-bracket 版，那区间判据就得真的在"
+    )
+    # `curve/3` 与 `curve/2` 的分别全在「什么时候拿得到参照」上，而那正是两版行为
+    # 差得最远的地方：单侧历史（前向扫描唯一拿得出的形状）下 `curve/2` 交 `None`，
+    # 于是整条曲线分支在生产上一次都没执行过。指纹必须分得出这两版。
+    forward_only = [(1600 + offset, 9_560.0 - 10.0 * offset) for offset in range(4)]
+    assert curve_reference(forward_only, 1604, require_both_sides=False) is not None, (
+        "指纹说自己是 curve/3，那单侧历史就得真的能交出参照"
     )
 
 
@@ -304,11 +311,14 @@ def test_the_curve_refuses_points_that_are_too_far_apart() -> None:
 
 def test_history_only_takes_readings_the_rule_trusted() -> None:
     """⚠️ 判错的读数不许进历史——进去就会把中位数往错的方向拽，而这条链路自我强化。"""
+    # ⚠️ 历史用**名次连续**的一段。原先这里是 1630/1631/1640/1641，中间隔着 9 个
+    # 名次的空洞 —— `CURVE_MAX_GAP` 上线后曲线对那种窗口不再表态，于是这条用例会
+    # 悉数跑到「没有曲线时会怎样」那一支上去，它要钉的东西就测不到了。
     history: list[tuple[int, float]] = [
         (1630, 9540.0),
         (1631, 9540.0),
-        (1640, 9500.0),
-        (1641, 9500.0),
+        (1632, 9535.0),
+        (1633, 9530.0),
     ]
     trusted_scores([3480.0, 9520.0], anchor=9600.0, ranks=[1634, 1635], history=history)
 
@@ -347,7 +357,10 @@ def test_the_reference_follows_the_slope_not_just_the_level() -> None:
     from evo_helper.domain.ranking import curve_reference
 
     history = [(1000, 20_000.0), (1010, 19_500.0), (1090, 15_500.0), (1100, 15_000.0)]
-    reference = curve_reference(history, 1020, span=200)
+    # ⚠️ 这一条量的是**拟合本身算得对不对**，所以两道「什么时候敢表态」的闸都显式绕开：
+    # 宽度闸（`span`）和密度闸（`max_gap`）。这四个点隔得很开，真实扫描里
+    # `curve_reference` 会直接不表态（数据在 `CURVE_MAX_GAP` 上）。
+    reference = curve_reference(history, 1020, span=200, max_gap=200)
 
     assert reference is not None
     assert 18_700.0 <= reference <= 19_300.0, (
@@ -368,7 +381,8 @@ def test_one_bad_point_cannot_drag_the_slope() -> None:
     from evo_helper.domain.ranking import curve_reference
 
     history = [(1000, 9_000.0), (1010, 3_000.0), (1030, 8_980.0), (1040, 8_970.0)]
-    reference = curve_reference(history, 1020, span=200)
+    # 同上：两道闸显式绕开，这里只问斜率中位数抳不抳得住一个坏点。
+    reference = curve_reference(history, 1020, span=200, max_gap=200)
 
     assert reference is not None
     assert 8_900.0 <= reference <= 9_100.0, (
