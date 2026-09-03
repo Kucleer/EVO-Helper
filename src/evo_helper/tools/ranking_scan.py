@@ -1717,13 +1717,35 @@ def scan(
                     if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
                         say(
                             f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
-                            f"（锚点 {score_anchor}）：撤掉锚点重新起头"
+                            f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
+                            f"锚点和历史一起撤掉重新起头"
                         )
                         record_log(
                             "军力锚点重置",
-                            {"screens": blind_score_screens, "anchor": score_anchor},
+                            {
+                                "screens": blind_score_screens,
+                                "anchor": score_anchor,
+                                "history": len(score_history),
+                            },
                         )
                         score_anchor = None
+                        # ⚠⚠ **曲线的历史也得一起撤。**
+                        #
+                        # 这道阀当年只有锚点要救，而曲线（#272 之后）是**同一个吸收态的第二个
+                        # 入口**，还是个优先级更高的入口：有参照时只听曲线的，所以单撤锚点
+                        # **一点用都没有**。
+                        #
+                        # 2026-09-03 生产实况（#275 上线后第一趟，20:28–20:30）：这句
+                        # 「撤掉锚点重新起头」**响了 8 次**，而屏幕照旧一屏一屏全丢，
+                        # 参照一路跑到 -48,203。那一趟 302 个被丢行里 101 行出自这一段。
+                        #
+                        # 成因：两个**相邻**的错读被采信进了历史，而 Theil–Sen 只抗得住少数
+                        # 坏点 —— 4 个点的窗口里坏 2 个就到了一半，斜率中位数当场跑飞。
+                        # 而跑飞之后每屏全丢、一个新点也进不了历史，于是它自己维持着自己。
+                        #
+                        # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
+                        # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
+                        score_history.clear()
                         blind_score_screens = 0
                 # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
                 # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
