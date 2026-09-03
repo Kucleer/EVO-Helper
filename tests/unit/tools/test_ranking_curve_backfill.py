@@ -125,3 +125,24 @@ def test_the_count_comes_back_from_the_repository_not_from_the_wish_list() -> No
     repo = _Repository(refuse=1)
 
     assert _run(repo, [_unread(1604), _unread(1605)], list(HISTORY)) == 1
+
+
+def test_backfill_still_reaches_across_a_hole_in_the_readings() -> None:
+    """⚠️⚠️ **补数这一步刻意不吃密度闸（`CURVE_MAX_GAP`），别顺手给它加上。**
+
+    2026-09-03 给**边扫边判**那一段加了密度闸：单侧外推时，窗口里隔着大洞的参照有
+    47.6% 偏出 3%，而它在那里会**否决好读数**，代价远大于收益。
+
+    补数这一步的处境不同（两侧、整趟收尾、历史是全的），代价也反过来 ——
+    同一批数据上加了闸，这一轮能补的从 **147/160（92%）掉到 84/160（52%）**。
+    要不要拿 40 个百分点的覆盖率去换那 28%，是范围决定，归用户。
+
+    所以这条用例钉的是「隔着洞也照样补」。它红了不代表回归，代表**有人替用户做了
+    那个决定** —— 那时候要改的是这段注释和用户的口径，不是悄悄让它变绿。
+    """
+    repo = _Repository()
+    # 名次 1600 与 1610 之间整整 9 个名次没有读数，远超 CURVE_MAX_GAP（4）。
+    holed = [(1598, 9_560.0), (1600, 9_550.0), (1610, 9_500.0), (1612, 9_490.0)]
+
+    assert _run(repo, [_unread(1605)], holed) == 1, "补数被密度闸挡住了 —— 那不是这一步该吃的闸"
+    assert repo.backfilled[0].military_score_estimated is True

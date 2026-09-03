@@ -24,6 +24,7 @@ from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
 from evo_helper.domain.ranking import (
+    CURVE_RANK_SPAN,
     CURVE_TOLERANCE,
     SCORE_RULE_VERSION,
     SCREEN_SPREAD_LIMIT,
@@ -33,9 +34,9 @@ from evo_helper.domain.ranking import (
     curve_reference,
     interpolate_scores,
     is_bot_entry,
+    judge_scores,
     mentions_bot,
     repair_ranks,
-    score_drop_reasons,
     screen_bracket,
     screens_overlap,
     trusted_scores,
@@ -652,7 +653,33 @@ def _backfill_from_the_curve(
         replace(target, military_score=reference, military_score_estimated=True)
         for target in unread
         if target.military_rank is not None
-        and (reference := curve_reference(history, target.military_rank)) is not None
+        # ⚠️ 补数这一步**必须要求两侧**（默认就是，这里写明）：它在整趟收尾跑，
+        # 历史是全的，于是「两侧都要有点」正好拦住「往扫描末端外推」。
+        # 边扫边判那一段反过来（`judge_scores` 传 `False`），理由在 `curve_reference` 上。
+        #
+        # ⚠⚠ **密度闸（`CURVE_MAX_GAP`）在这一步先不加 —— 待定的取舍，不是忘了。**
+        #
+        # 2026-09-03 量过两侧处境下空洞的影响（同一批 640 个实测点留一验证）：
+        #
+        #     空洞 ≤ 4   552 个点   超 3% 的  6%
+        #     空洞 5–8    57 个点   超 3% 的 28%
+        #     空洞 >16     17 个点   超 3% 的 59%
+        #
+        # 闸在这里也站得住，但代价差很多：加上它，这一轮能补的从
+        # **147/160（92%）掉到 84/160（52%）**，而补数才上线三个小时（#273）。
+        # 拿 40 个百分点的覆盖率去换那 28% 是范围决定，归用户，不归这一趟修复。
+        #
+        # 边扫边判那一段没这个纠结：它是单侧外推（空洞 5–8 时 47.6% 超 3%），
+        # 而且在那里一个错参照会**否决好读数**，不只是少补一行。
+        and (
+            reference := curve_reference(
+                history,
+                target.military_rank,
+                require_both_sides=True,
+                max_gap=CURVE_RANK_SPAN,
+            )
+        )
+        is not None
     ]
     if not filled:
         say(f"曲线补数：{len(unread)} 行没读出军力值，一条都补不了（历史 {len(history)} 点）")
@@ -663,12 +690,31 @@ def _backfill_from_the_curve(
         f"曲线补数：{len(unread)} 行没读出军力值，曲线推得出 {len(filled)} 条"
         f"（名次 {ranks[0]}–{ranks[-1]}），真正补进库 {written} 条"
         f"（其余那些库里已经有值了，不覆盖）"
-        # ⚠️ 推不出的那几行多半是**这一趟最末的几行**：`curve_reference` 不许单边
+        # ⚠️ 推不出的那几行多半是**这一趟最末的几行**：这一步不许单边
         # 外推，而它们下方还没有点。那是有意的，下一趟会重新读到它们。
         f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点 · "
         f"推不出 {len(unread) - len(filled)} 行]"
     )
     return written
+
+
+def _drop_label(renderable: float | None, why: str | None) -> str:
+    """一行被丢时日志里写什么。
+
+    两个来源必须分开：
+
+    - `renderable is None` → 它在进判据**之前**就被 `renderable_score` 挑掉了，
+      判据根本没看见它，理由当然是空的 —— 这才是「渲染不出」。
+    - 判据丢了它却没给理由 → **这不应该发生**，报成「说不上来」让它显形。
+
+    ⚠⚠ 原先两者共用一个 `why[i] or '渲染不出'`。#274 上线后后者真的发生了（日志
+    另起一遍重算理由，而那一遍采信了判据丢掉的行），于是 6450 这种完全渲染得出来的
+    值被标成「渲染不出」，真实理由（出界）被盖掉。**一个 `or` 就能让日志理直气壮地
+    说错话，而那比不记更糟。**
+    """
+    if renderable is None:
+        return "渲染不出"
+    return why or "说不上来"
 
 
 def _no_bracket_because(scores: Sequence[float | None]) -> str:
@@ -725,43 +771,42 @@ def targets_from_rows(
     renderable = [row.score if renderable_score(row.score) else None for row in rows]
     # ⚠️ **名次用修过的那一份**（`repair_ranks`）。原始名次读错时曲线会去问一个错的
     # 位置，而那正好是最需要它答对的时候。
-    trusted = trusted_scores(renderable, anchor=anchor, ranks=repaired, history=history)
+    verdict = judge_scores(renderable, anchor=anchor, ranks=repaired, history=history)
+    trusted = verdict.trusted
     dropped = [
         (index, read[index])
         for index, score in enumerate(trusted)
         if score is None and read[index] is not None
     ]
     if dropped:
-        # ⚠️ **把判据、区间、锚点和被丢的值一起打出来。**
+        # ⚠️ **把判据、参照、区间、锚点和被丢的值一起打出来。**
         #
         # 原先这一句只说「破坏降序」加一串下标，而拒收理由有四条，事后分不清是
         # 「读数真错了」还是「好读数被误伤了」——那两件事的处置完全相反。
         #
         # 2026-09-02 查这件事时最费劲的一步正是这个：只能拿「值 ÷ 锚点」去反推是哪
-        # 一条，而 71.5% 的被丢值其实 ≤ 锚点，那个比值什么都说明不了。现在**理由直接
-        # 由判据自己交出来**（`score_drop_reasons`，与 `trusted_scores` 同一次遍历）。
+        # 一条，而 71.5% 的被丢值其实 ≤ 锚点，那个比值什么都说明不了。
         #
         # 区间也要打：它作不作数决定了走的是区间判据还是逐行兜底，而这两条的宽严
         # 差着 3 倍的丢弃率。作不作数、以及不作数时是被哪一条否掉的，都得看得见。
-        # ⚠️ 理由要**重算一次**：`score_drop_reasons` 会再走一遍判据，而判据会往
-        # `history` 里追加采信点。传一份拷贝，免得同一屏被记进历史两次——那会让中位数
-        # 悄悄偏向这一屏。
-        why = score_drop_reasons(
-            renderable,
-            anchor=anchor,
-            ranks=repaired,
-            history=list(history) if history is not None else None,
-        )
+        #
+        # ⚠⚠ **理由和参照只能取自 `verdict`，不允许在这里重算。**
+        #
+        # 原先这里又调一遍 `score_drop_reasons`、并拿 `curve_reference(history, 首行名次)`
+        # 补算参照——而上面那一遍已经把**这一屏自己**追进了 `history`。于是重算的
+        # 那一遍看到的历史比判据当时多，「上方」凑齐了，于是它走了判据根本到不了的
+        # 曲线分支，交出一套**看上去很像真的假话**（#274 上线后日志报「89.5% 有曲线
+        # 参照」而真实覆盖率是 0%；48% 的被丢行标着「偏离曲线」而它们其实是被区间拦的）。
+        why = verdict.reasons
+        used = [reference for reference in verdict.references if reference is not None]
         bracket = screen_bracket(renderable)
-        reference = (
-            curve_reference(history, repaired[0])
-            if history and repaired and repaired[0] is not None
-            else None
-        )
         window = (
-            f"曲线参照 {reference:.0f}（±{CURVE_TOLERANCE * 100:.1f}%，"
+            # 参照逐行不同（每一行问的是自己那个名次），所以报中位数加覆盖行数。
+            # **覆盖行数才是那个关键信号**：它一直是 0 就是曲线判据没生效。
+            f"曲线参照 {statistics.median(used):.0f}"
+            f"（±{CURVE_TOLERANCE * 100:.1f}%，{len(used)}/{len(renderable)} 行用上了，"
             f"历史 {len(history or [])} 点）"
-            if reference is not None
+            if used
             else (
                 f"曲线没参照（历史 {len(history or [])} 点）· "
                 + (
@@ -774,9 +819,8 @@ def targets_from_rows(
         say(
             f"军力值不可信，丢掉这几行的分数（坐标保留）"
             f"[判据 {SCORE_RULE_VERSION} · {window} · 锚点 {anchor}]: "
-            # ⚠️ 渲染不出来的那几行 `why` 是 None（它们在进判据之前就被
-            # `renderable_score` 挑掉了）——照实写「渲染不出」，不要留一个空洞。
-            f"{[(i, v, why[i] or '渲染不出') for i, v in dropped]}"
+            # ⚠️ 标签走 `_drop_label`：「预筛掉的」和「理由真缺了」不允许共用一个说法。
+            f"{[(i, v, _drop_label(renderable[i], why[i])) for i, v in dropped]}"
         )
     filled = interpolate_scores(trusted)
     targets: list[RankingTarget] = []
