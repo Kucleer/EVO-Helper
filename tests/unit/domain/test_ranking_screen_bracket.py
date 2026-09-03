@@ -206,7 +206,7 @@ def test_the_rule_version_is_a_fingerprint_only_this_version_writes() -> None:
     """
     from evo_helper.domain.ranking import SCORE_RULE_VERSION
 
-    assert SCORE_RULE_VERSION == "curve/1"
+    assert SCORE_RULE_VERSION == "curve/2"
     assert screen_bracket([9770.0, 9730.0]) is not None, (
         "指纹说自己是 screen-bracket 版，那区间判据就得真的在"
     )
@@ -223,9 +223,12 @@ def test_the_curve_survives_a_reference_that_is_itself_wrong() -> None:
     """
     from evo_helper.domain.ranking import curve_reference
 
-    history = [(100, 9800.0), (101, 9790.0), (102, 3780.0), (103, 9770.0), (104, 9760.0)]
+    # 上下各两个点，其中一个（3,780）是误读。真值那条线在 9,7xx 上。
+    history = [(100, 9800.0), (101, 9790.0), (103, 3780.0), (104, 9770.0)]
+    reference = curve_reference(history, 102)
 
-    assert curve_reference(history, 105) == 9770.0, "一个坏点把中位数带跑了"
+    assert reference is not None
+    assert 9_700.0 <= reference <= 9_850.0, f"一个坏点把拟合带跑了：{reference}"
 
 
 def test_a_leading_digit_misread_is_caught_by_the_curve() -> None:
@@ -233,7 +236,8 @@ def test_a_leading_digit_misread_is_caught_by_the_curve() -> None:
 
     这个值**现在就在库里**——它过了所有既有判据（比上一行小、没到 5 倍断崖）。
     """
-    history = [(1600 + i, 9540.0) for i in range(6)]
+    # ⚠️ 上下都要有点：新参照不许单边外推（整段理由在 `curve_reference`）。
+    history = [(1630, 9540.0), (1631, 9540.0), (1635, 9540.0), (1636, 9540.0)]
 
     kept = trusted_scores([3480.0], anchor=9600.0, ranks=[1634], history=list(history))
 
@@ -242,7 +246,7 @@ def test_a_leading_digit_misread_is_caught_by_the_curve() -> None:
 
 def test_a_real_reading_hugs_the_curve_and_is_kept() -> None:
     """真值紧贴曲线（实测中位偏差 0.71%），一个都不许误伤。"""
-    history = [(1600 + i, 9540.0) for i in range(6)]
+    history = [(1630, 9540.0), (1631, 9540.0), (1635, 9540.0), (1636, 9540.0)]
 
     kept = trusted_scores([9500.0], anchor=9600.0, ranks=[1634], history=list(history))
 
@@ -250,25 +254,66 @@ def test_a_real_reading_hugs_the_curve_and_is_kept() -> None:
 
 
 def test_the_curve_says_nothing_until_it_has_enough_history() -> None:
-    """⚠️ 历史不够就**不表态**，退回原来那几条判据——不许拿全局中位数凑数。
+    """⚠️ 点不够就**不表态**，退回原来那几条判据——不许拿一个凑出来的参照顶上。
 
     每趟头几屏历史本来就少，而榜首那几段恰恰是断崖最陡的地方，硬给一个参照
     只会在最不该出错的位置出错。
     """
-    from evo_helper.domain.ranking import CURVE_MIN_POINTS, curve_reference
+    from evo_helper.domain.ranking import curve_reference
 
-    thin = [(100 + i, 9800.0) for i in range(CURVE_MIN_POINTS - 1)]
+    assert curve_reference([(100, 9800.0), (101, 9790.0), (102, 9780.0)], 103) is None
 
-    assert curve_reference(thin, 105) is None
+
+def test_the_curve_refuses_to_extrapolate_off_one_side() -> None:
+    """⚠️⚠️ **上下都要有点，单边一律不表态。**
+
+    单边就是外推，而外推在曲率大的地方错得最狠（榜首几屏能从 5.97M 跌到十万级）。
+    两侧各有点时目标夹在中间，直线假设只需要在这一小段上成立。
+
+    ⚠️ 代价要知道：**一趟扫描最末那几行永远补不上**（它们下面还没有点）。这是有意的
+    ——那几行的下一趟会被重新读到，而外推出来的错值会一直躺在库里。
+    """
+    from evo_helper.domain.ranking import curve_reference
+
+    below_only = [(100, 9800.0), (101, 9790.0), (102, 9780.0), (103, 9770.0)]
+
+    assert curve_reference(below_only, 110) is None, "往下外推了"
+    assert curve_reference(below_only, 99) is None, "往上外推了"
+    # 正面对照：两侧各两个点时照常表态。
+    both_sides = [*below_only, (105, 9760.0), (106, 9750.0)]
+    assert curve_reference(both_sides, 104) is not None
+
+
+def test_the_curve_refuses_points_that_are_too_far_apart() -> None:
+    """⚠️ 跨度超限就不表态。
+
+    实测生产上有名次 273 与 821 被当成邻居（军力 10,000 vs 23,780）——隔着五百多名
+    连一条直线，估出来的东西毫无意义。而「直线」这个假设只在小跨度上成立。
+    """
+    from evo_helper.domain.ranking import CURVE_RANK_SPAN, curve_reference
+
+    far = [
+        (100, 10_000.0),
+        (101, 10_000.0),
+        (100 + CURVE_RANK_SPAN + 2, 23_780.0),
+        (100 + CURVE_RANK_SPAN + 3, 23_640.0),
+    ]
+
+    assert curve_reference(far, 120) is None
 
 
 def test_history_only_takes_readings_the_rule_trusted() -> None:
     """⚠️ 判错的读数不许进历史——进去就会把中位数往错的方向拽，而这条链路自我强化。"""
-    history: list[tuple[int, float]] = [(1600 + i, 9540.0) for i in range(6)]
-    trusted_scores([3480.0, 9500.0], anchor=9600.0, ranks=[1634, 1635], history=history)
+    history: list[tuple[int, float]] = [
+        (1630, 9540.0),
+        (1631, 9540.0),
+        (1640, 9500.0),
+        (1641, 9500.0),
+    ]
+    trusted_scores([3480.0, 9520.0], anchor=9600.0, ranks=[1634, 1635], history=history)
 
     assert (1634, 3480.0) not in history, "被判错的值进了历史"
-    assert (1635, 9500.0) in history, "被采信的值该进历史，否则曲线不往前走"
+    assert (1635, 9520.0) in history, "被采信的值该进历史，否则曲线不往前走"
 
 
 def test_the_curve_overrides_the_single_point_rules() -> None:
@@ -279,10 +324,107 @@ def test_the_curve_overrides_the_single_point_rules() -> None:
     旧的 `too_big`（3,000 × 5 = 15,000）碰巧放行，但 `out_of_order` 会拦；
     曲线判据认得出它是对的。
     """
-    history = [(1600 + i, 9540.0) for i in range(6)]
+    history = [(1630, 9560.0), (1631, 9550.0), (1640, 9500.0), (1641, 9490.0)]
 
     kept = trusted_scores(
-        [9600.0, 9500.0], anchor=3000.0, ranks=[1634, 1635], history=list(history)
+        [9540.0, 9530.0], anchor=3000.0, ranks=[1634, 1635], history=list(history)
     )
 
-    assert kept == [9600.0, 9500.0]
+    assert kept == [9540.0, 9530.0]
+
+
+def test_the_reference_follows_the_slope_not_just_the_level() -> None:
+    """⚠️⚠️ **参照要跟着斜率走，不能只给「这一段大概什么水平」。**
+
+    这是 `curve/2` 相对 `curve/1` 的全部改进。`curve/1` 取 ±60 名窗口的中位数，
+    在斜坡上会给整个窗口同一个值，靠近两端系统性偏（实测中位误差 0.843%，而顺着
+    斜率插值是 0.060%）。
+
+    这里造一段陡坡：名次 1000 是 20,000，1100 是 15,000（用户 2026-09-03 举的那个
+    例子）。目标名次 1050 的真值该在 17,500 附近；**取中位数会给出 17,500 左右也
+    碰巧对**，所以目标放在 1020 —— 真值 19,000，而四个点的中位数是 17,500。
+    """
+    from evo_helper.domain.ranking import curve_reference
+
+    history = [(1000, 20_000.0), (1010, 19_500.0), (1090, 15_500.0), (1100, 15_000.0)]
+    reference = curve_reference(history, 1020, span=200)
+
+    assert reference is not None
+    assert 18_700.0 <= reference <= 19_300.0, (
+        f"参照没跟着斜率走（{reference:,.0f}）—— 取水平值会给出约 17,500"
+    )
+
+
+def test_one_bad_point_cannot_drag_the_slope() -> None:
+    """⚠️⚠️ **斜率取中位数，不取平均。**
+
+    窗口里混着误读时，平均会被一个坏点整体拽偏（实测最小二乘中位误差 0.607%，
+    Theil–Sen 是 0.441%），而中位数需要一半以上的点都坏才会被带跑。
+
+    这里四个点里有一个是误读（9,000 读成 3,000）。真值那条线几乎是平的
+    （9,000 → 8,970），而那个坏点会让「平均斜率」变得很陡：
+    以它为端点的三条斜率都是每名次几百，平均下来把参照拽到低处。
+    """
+    from evo_helper.domain.ranking import curve_reference
+
+    history = [(1000, 9_000.0), (1010, 3_000.0), (1030, 8_980.0), (1040, 8_970.0)]
+    reference = curve_reference(history, 1020, span=200)
+
+    assert reference is not None
+    assert 8_900.0 <= reference <= 9_100.0, (
+        f"一个坏点把斜率带跑了（{reference:,.0f}）—— 中位数不该被单点影响"
+    )
+
+
+def test_the_fourteen_percent_misreads_that_curve_one_let_through_are_caught() -> None:
+    """⚠️⚠️ **容差必须收到 3%，35% 拦不住生产上真实漏过去的那一批。**
+
+    `curve/1` 用 35% 容差，实测放行了这些（都躺在生产库里，是 2026-09-03 留一验证
+    从邻居反推出来的）：
+
+        名次 1604–1606  读到 5,970   邻居 6,980 / 6,950   偏 14.5%   6→5
+        名次 1538       读到 6,330   邻居 8,3xx           偏 24.1%   8→6
+        名次  849       读到 15,280  邻居 19,3xx          偏 20.7%   9→5（第二位）
+
+    偏离全在 35% 之下。而 `curve/2` 的参照精度好了一个数量级（中位 0.112%），
+    所以 3% 收得住而不误伤：真值的 P90 只有 1.97%。
+
+    ⚠️ 这一条不许换成一个偏离 60% 的例子 —— 那种 35% 也拦得住，用例就白写了
+    （2026-09-03 变异验证当场抓到：把容差改回 35%，其余用例全绿）。
+    """
+    # 名次 1604 那一组：真值该在 6,970 附近，读到 5,970。
+    history = [(1602, 6_980.0), (1603, 6_980.0), (1607, 6_950.0), (1608, 6_950.0)]
+
+    kept = trusted_scores([5_970.0], anchor=7_000.0, ranks=[1604], history=list(history))
+
+    assert kept == [None], "偏 14% 的误读没被拦下——容差是不是又放宽了？"
+
+    # 反面：同一组邻居下，偏 2% 的真实波动照常留住。
+    fine = trusted_scores([6_840.0], anchor=7_000.0, ranks=[1604], history=list(history))
+    assert fine == [6_840.0], "偏 2% 的真值被误伤了——容差是不是收得太紧？"
+
+
+def test_the_tolerance_is_three_percent_not_ten() -> None:
+    """⚠️ 容差定在 **3%**（用户口径 2026-09-03：「我要3%」），不是 10%。
+
+    ## 这一条钉的是一个**决策**，证据强度要说清楚
+
+    上面那条用例只钉住了「≥14% 拦下、≤2% 放行」——3% 和 10% 之间没有区分（变异验证
+    当场发现：把容差改成 10%，其余用例全绿）。而那一段本身就是混的：
+
+        真值的偏差    P90 1.97%   P95 7.80%
+        5–8% 那一档   16 个点，抽查里约 73% 是确凿误读
+
+    也就是说 5% 附近**不是一条自然分界**，选 3% 是成本权衡的结果：误杀一个好值只是
+    把它换成偏差约 0.1% 的估算（几乎无代价），而漏过一个误读会让库里躺着偏 14–24%
+    的军力值并直接进选靶排序。
+
+    ⚠️ 所以这一条断言的是「**5% 的偏差按误读处置**」——它有 73% 的把握，不是 100%。
+    要是哪天决定放宽到 10%，改这条用例就是了；但**别不改用例就改常量**，那样这个
+    决策会悄悄消失。
+    """
+    history = [(1602, 10_000.0), (1603, 10_000.0), (1607, 10_000.0), (1608, 10_000.0)]
+
+    at_five = trusted_scores([9_500.0], anchor=10_100.0, ranks=[1604], history=list(history))
+
+    assert at_five == [None], "偏 5% 的读数没被拦下——容差是不是放宽到 5% 以上了？"

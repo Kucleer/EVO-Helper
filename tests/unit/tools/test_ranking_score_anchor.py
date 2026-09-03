@@ -560,19 +560,24 @@ def test_the_scan_actually_calls_the_curve_backfill(monkeypatch: pytest.MonkeyPa
     只证明它算得对；把整句调用删掉时那些用例照样全绿——2026-09-02 变异验证当场
     抓到的就是这个。仓库里同形的教训不止一次：**测了新东西，没测它接进去之后的样子。**
 
-    这里前三屏读得干净（把曲线撑起来），第四屏**末行**读不出（`None`）。
+    ## ⚠️ 构造正是用户描述的那个场景
 
-    ⚠️ **必须是末行，不能放中间。** 中间那一行有上下邻居，`interpolate_scores`
-    在屏内就补掉了，根本不会进「没读出」那一份——第一版就是这么写的，用例当场
-    变红并说明了原因。补数比屏内插值多的正是这一档：**没有邻居可插的边缘行**。
+    用户口径（2026-09-02）：「后续的读到正确的判据，可以对之前没有读出的读数进行
+    回填补数」。所以读不出的那一行放在**第三屏的末行**，而第四屏提供它下方的点：
+
+    - 放**末行**：屏内没有右邻居，`interpolate_scores` 补不了（第一版放在中间，
+      屏内插值当场就补掉了，用例什么都没证明）
+    - 放**第三屏**而不是最后一屏：`curve_reference` 不许单边外推，得有后面的屏
+      提供更低名次的点。**一趟最末那几行按设计就是补不上的**（见
+      `test_the_curve_refuses_to_extrapolate_off_one_side`）
     """
     repository = _collect_with_repository(
         monkeypatch,
         [
             _rows([9_800.0, 9_790.0, 9_780.0], system=137, first_rank=850),
             _rows([9_770.0, 9_760.0, 9_750.0], system=138, first_rank=853),
-            _rows([9_740.0, 9_730.0, 9_720.0], system=139, first_rank=856),
-            _rows([9_710.0, 9_700.0, None], system=140, first_rank=859),
+            _rows([9_740.0, 9_730.0, None], system=139, first_rank=856),
+            _rows([9_710.0, 9_700.0, 9_690.0], system=140, first_rank=859),
         ],
     )
 

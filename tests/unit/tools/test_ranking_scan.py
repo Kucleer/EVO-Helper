@@ -875,11 +875,12 @@ def test_the_curve_asks_the_repaired_rank_not_the_raw_one() -> None:
     2 倍上限，区间不作数；退回逐行判据时 3,770 比上一行小、也没到 5 倍断崖，
     **被放行**。而它的名次读成了 `5`（真值 642），按原始名次去问曲线会落到 5 号
     附近、历史里一个邻居都没有 → 没参照 → 同样放行。只有按修过的名次问，
-    才会拿 9,800 当参照、算出偏离 61% 而拦下。
+    才会拿 9,7xx 那条线当参照、算出偏离六成而拦下。
     """
     from evo_helper.tools.ranking_scan import targets_from_rows
 
-    history = [(600 + i, 9800.0) for i in range(8)]
+    # ⚠️ 上下都要有点（`curve_reference` 不许单边外推），所以历史跨在末行两侧。
+    history = [(640, 9790.0), (641, 9780.0), (645, 9750.0), (646, 9740.0)]
     rows = [
         RankingRow(640, "bot_4_30_12", 9790.0, Coordinate(4, 30, 12)),
         RankingRow(641, "bot_4_100_13", 9780.0, Coordinate(4, 100, 13)),
