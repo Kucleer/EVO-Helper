@@ -820,7 +820,20 @@ def targets_from_rows(
             f"军力值不可信，丢掉这几行的分数（坐标保留）"
             f"[判据 {SCORE_RULE_VERSION} · {window} · 锚点 {anchor}]: "
             # ⚠️ 标签走 `_drop_label`：「预筛掉的」和「理由真缺了」不允许共用一个说法。
-            f"{[(i, v, _drop_label(renderable[i], why[i])) for i, v in dropped]}"
+            #
+            # ⚠️⚠️ **名次和屏内行号都要记，缺一个就问不出话。**
+            #
+            # 屏内行号答的是「屏的哪个位置容易被丢」——2026-08-24 靠它量出「末行被丢
+            # 的次数是首行的 7 倍」，那是级联的证据。
+            #
+            # 名次答的是**跨趟**的那个问题：**每一趟被丢的是不是同一批行？**
+            # 是 → 误读是确定性的，重读一遍也白跑；每趟换一批 → 重读救得回来。
+            # 用户口径（2026-09-03）：「你是否可以在扫完一轮后，再去补遗漏的数据」——
+            # 而这个问题**只能靠名次回答**，原先这条日志里没有它，所以答不了。
+            #
+            # ⚠️ 名次用 `repaired` 那一份（`repair_ranks` 修过的），和判据问曲线时
+            # 用的是同一份。记原始读数会让「同一行」在两趟里对不上号。
+            f"{[(i, repaired[i], v, _drop_label(renderable[i], why[i])) for i, v in dropped]}"
         )
     filled = interpolate_scores(trusted)
     targets: list[RankingTarget] = []
