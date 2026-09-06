@@ -1575,6 +1575,124 @@ def scan(
     def record_log(message: str, payload: dict[str, Any]) -> None:
         record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
 
+    def process_screen(rows: list[RankingRow], *, screen_seq: int) -> bool:
+        """判一屏、落库、更新锚点与自愈阀、记账。交回「本批采够了吗」。
+
+        ⚠️ **这一段原先只写在滚动循环里，首屏走的是另一条路。** 于是首屏不打
+        「采集一屏」日志、没有 `dry`、没有重叠判断，**也不进自愈阀的计数** ——
+        它可以把坏点写进曲线历史而永远不被计为一次失败。而 `bot_limit` 在首屏
+        就采够时 `range(1, 0)` 为空，那一趟连一条逐屏日志都不会有。
+
+        抽出来是为了让首屏能走同一条路（`screen_seq=0`）。
+        ⚠️ **自愈阀那一段用 `screen_seq > 0` 闸着**：先只搬代码，首屏进不进阀
+        是下一步单独的决定（账在 `docs/军力榜补数/方案.md` 的 6.1）。
+        """
+        nonlocal score_anchor, blind_score_screens, dry, previous_coordinates
+        nonlocal screens_without_overlap
+        fresh, reached = collect(
+            targets_from_rows(
+                rows,
+                observed_at=datetime.now(UTC),
+                anchor=score_anchor,
+                history=score_history,
+            )
+        )
+        score_anchor = next_score_anchor(rows, anchor=score_anchor)
+        if screen_seq > 0:
+            if any(target.military_score is not None for target in fresh):
+                blind_score_screens = 0
+            else:
+                blind_score_screens += 1
+                if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
+                    say(
+                        f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
+                        f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
+                        f"锚点和历史一起撤掉重新起头"
+                    )
+                    record_log(
+                        "军力锚点重置",
+                        {
+                            "screens": blind_score_screens,
+                            "anchor": score_anchor,
+                            "history": len(score_history),
+                        },
+                    )
+                    score_anchor = None
+                    # ⚠⚠ **曲线的历史也得一起撤。**
+                    #
+                    # 这道阀当年只有锚点要救，而曲线（#272 之后）是**同一个吸收态的第二个
+                    # 入口**，还是个优先级更高的入口：有参照时只听曲线的，所以单撤锚点
+                    # **一点用都没有**。
+                    #
+                    # 2026-09-03 生产实况（#275 上线后第一趟，20:28–20:30）：这句
+                    # 「撤掉锚点重新起头」**响了 8 次**，而屏幕照旧一屏一屏全丢，
+                    # 参照一路跑到 -48,203。那一趟 302 个被丢行里 101 行出自这一段。
+                    #
+                    # 成因：两个**相邻**的错读被采信进了历史，而 Theil–Sen 只抗得住少数
+                    # 坏点 —— 4 个点的窗口里坏 2 个就到了一半，斜率中位数当场跑飞。
+                    # 而跑飞之后每屏全丢、一个新点也进不了历史，于是它自己维持着自己。
+                    #
+                    # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
+                    # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
+                    score_history.clear()
+                    blind_score_screens = 0
+        # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
+        # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
+        # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
+        # 而 bot 段有四千多个。
+        #
+        # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
+        # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
+        dry = 0 if fresh else dry + 1
+        screens.append(fresh)
+        # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
+        # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
+        # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
+        # 这里只观测不拦（名字也会读错，一次没对上就中断整趟不值），
+        # 拦不拦等推进量提上去再定。
+        #
+        # ⚠️ **只说「可能」，也不说「漏了几行」。** 跳过去的行没被读过，
+        # 「几行」这个数在原理上就无从得知——原先那道名次判据敢报「漏掉
+        # 8922 名」（整趟只走了 570 名），正因为它是从两个带噪声的名次
+        # 减出来的。整段账在 `screens_overlap` 上。
+        seen_here = coordinates_of(rows)
+        overlap = screens_overlap(previous_coordinates, seen_here)
+        if overlap is False:
+            screens_without_overlap += 1
+            say("  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）")
+        # ⚠️ **不许写 `or previous_coordinates`。** 这一屏坐标全读不出时，
+        # 保留上一屏的集合会让下一屏拿「隔两屏」的坐标去比——而隔两屏本来
+        # 就不该有共同坐标（一次拖动推约 8 行，两次就推出一整屏），于是
+        # 每一次读废都要连带造出一条**假警报**。而假警报比不报更坏：
+        # 它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
+        # 读不出就该是空集，让下一次比较答「不知道」。
+        previous_coordinates = seen_here
+        # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
+        #
+        # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
+        # 在日志里长得一模一样。2026-08-23 那个漏采一半的缺陷就是这么埋住的：
+        # 生产日志里「12, 8, 6 → 0, 0, 0」被当成「榜单真人与 bot 交错」，
+        # 而真相是那三屏各有 10–12 个 bot、一个都没读出来。要分开这两件事
+        # 当时得临时写只读探针——那正是「出事时能只靠库里日志定位」不成立的样子。
+        say(
+            f"  采集第{screen_seq:>3}滚 读出 {len(rows):>2} 行 本屏 bot {len(fresh)} 连续空屏 {dry}"
+        )
+        record_log(
+            "采集一屏",
+            {
+                "scroll": screen_seq,
+                "rows_read": len(rows),
+                "bots_fresh": len(fresh),
+                "dry_screens": dry,
+                # `True` 重叠上了 / `False` 一个坐标都没对上 /
+                # `None` 有一屏坐标全读不出，答「不知道」。
+                # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
+                # （连名字都读不出的）在日志里长得像「重叠断了」。
+                "overlap_intact": overlap,
+            },
+        )
+        return reached
+
     # 重叠账：`previous_coordinates` 是上一屏读出来的那些坐标，
     # `screens_without_overlap` 是整趟有几屏和上一屏一个坐标都没对上。
     # 见 `domain.ranking.screens_overlap`（那里还记着为什么这道判据**不看名次**）。
@@ -1702,120 +1820,7 @@ def scan(
                     say(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
                     outcome = EXIT_RANKING_INCOMPLETE
                     break
-                rows = list(step.rows)
-                fresh, reached_limit = collect(
-                    targets_from_rows(
-                        rows,
-                        observed_at=datetime.now(UTC),
-                        anchor=score_anchor,
-                        history=score_history,
-                    )
-                )
-                score_anchor = next_score_anchor(rows, anchor=score_anchor)
-                # ⚠️ **自愈阀：连着几屏整屏被判掉，就把锚点撤掉重新起头。**
-                #
-                # 锚点错了的后果是不对称的：它会把**后面每一屏**的好读数都判成
-                # 「破坏降序」，而整屏被判掉又让锚点「沿用」下去——一个错值就能
-                # 让整趟余下的军力值全空，且每屏只打一句「丢掉这几行」，没有累计信号。
-                # （2026-08-23 实测过一种入口：第一屏中位数为 0，见
-                # `domain.ranking.trusted_scores`；那条已经堵了，但堵的是入口，
-                # 不是这个形状本身。）
-                #
-                # 撤掉锚点的代价只是「下一屏按自己的中位数起头」，而收益是把一次
-                # 永久性静默失败压成两屏的颠簸。
-                if any(target.military_score is not None for target in fresh):
-                    blind_score_screens = 0
-                else:
-                    blind_score_screens += 1
-                    if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
-                        say(
-                            f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
-                            f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
-                            f"锚点和历史一起撤掉重新起头"
-                        )
-                        record_log(
-                            "军力锚点重置",
-                            {
-                                "screens": blind_score_screens,
-                                "anchor": score_anchor,
-                                "history": len(score_history),
-                            },
-                        )
-                        score_anchor = None
-                        # ⚠⚠ **曲线的历史也得一起撤。**
-                        #
-                        # 这道阀当年只有锚点要救，而曲线（#272 之后）是**同一个吸收态的第二个
-                        # 入口**，还是个优先级更高的入口：有参照时只听曲线的，所以单撤锚点
-                        # **一点用都没有**。
-                        #
-                        # 2026-09-03 生产实况（#275 上线后第一趟，20:28–20:30）：这句
-                        # 「撤掉锚点重新起头」**响了 8 次**，而屏幕照旧一屏一屏全丢，
-                        # 参照一路跑到 -48,203。那一趟 302 个被丢行里 101 行出自这一段。
-                        #
-                        # 成因：两个**相邻**的错读被采信进了历史，而 Theil–Sen 只抗得住少数
-                        # 坏点 —— 4 个点的窗口里坏 2 个就到了一半，斜率中位数当场跑飞。
-                        # 而跑飞之后每屏全丢、一个新点也进不了历史，于是它自己维持着自己。
-                        #
-                        # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
-                        # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
-                        score_history.clear()
-                        blind_score_screens = 0
-                # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
-                # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
-                # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
-                # 而 bot 段有四千多个。
-                #
-                # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
-                # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
-                dry = 0 if fresh else dry + 1
-                screens.append(fresh)
-                # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
-                # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
-                # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
-                # 这里只观测不拦（名字也会读错，一次没对上就中断整趟不值），
-                # 拦不拦等推进量提上去再定。
-                #
-                # ⚠️ **只说「可能」，也不说「漏了几行」。** 跳过去的行没被读过，
-                # 「几行」这个数在原理上就无从得知——原先那道名次判据敢报「漏掉
-                # 8922 名」（整趟只走了 570 名），正因为它是从两个带噪声的名次
-                # 减出来的。整段账在 `screens_overlap` 上。
-                seen_here = coordinates_of(rows)
-                overlap = screens_overlap(previous_coordinates, seen_here)
-                if overlap is False:
-                    screens_without_overlap += 1
-                    say("  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）")
-                # ⚠️ **不许写 `or previous_coordinates`。** 这一屏坐标全读不出时，
-                # 保留上一屏的集合会让下一屏拿「隔两屏」的坐标去比——而隔两屏本来
-                # 就不该有共同坐标（一次拖动推约 8 行，两次就推出一整屏），于是
-                # 每一次读废都要连带造出一条**假警报**。而假警报比不报更坏：
-                # 它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
-                # 读不出就该是空集，让下一次比较答「不知道」。
-                previous_coordinates = seen_here
-                # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
-                #
-                # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
-                # 在日志里长得一模一样。2026-08-23 那个漏采一半的缺陷就是这么埋住的：
-                # 生产日志里「12, 8, 6 → 0, 0, 0」被当成「榜单真人与 bot 交错」，
-                # 而真相是那三屏各有 10–12 个 bot、一个都没读出来。要分开这两件事
-                # 当时得临时写只读探针——那正是「出事时能只靠库里日志定位」不成立的样子。
-                say(
-                    f"  采集第{extra:>3}滚 读出 {len(rows):>2} 行 "
-                    f"本屏 bot {len(fresh)} 连续空屏 {dry}"
-                )
-                record_log(
-                    "采集一屏",
-                    {
-                        "scroll": extra,
-                        "rows_read": len(rows),
-                        "bots_fresh": len(fresh),
-                        "dry_screens": dry,
-                        # `True` 重叠上了 / `False` 一个坐标都没对上 /
-                        # `None` 有一屏坐标全读不出，答「不知道」。
-                        # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
-                        # （连名字都读不出的）在日志里长得像「重叠断了」。
-                        "overlap_intact": overlap,
-                    },
-                )
+                reached_limit = process_screen(list(step.rows), screen_seq=extra)
                 if reached_limit:
                     say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
                     break
