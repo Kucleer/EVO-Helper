@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -162,17 +163,30 @@ def _reached_bots(**kwargs: Any) -> HumanStretch:
     )
 
 
+@dataclass(frozen=True)
+class _Trace:
+    """一趟跑下来的全部可观测输出。"""
+
+    written: list[str]
+    said: list[str]
+    logged: list[tuple[str, dict[str, Any]]]
+
+    def payloads(self, message: str) -> list[dict[str, Any]]:
+        return [payload for logged, payload in self.logged if logged == message]
+
+
 def _trace(
     monkeypatch: pytest.MonkeyPatch,
     screens: Sequence[Sequence[RankingRow]],
     *,
     bot_limit: int | None = None,
-) -> tuple[list[str], list[str]]:
-    """跑一趟，交回 `(落库清单, say 行)`。两样都是有序的。"""
+) -> _Trace:
+    """跑一趟，交回落库清单 / say 行 / 结构化 payload。三样都是有序的。"""
     board = _Board(screens)
     nav = _Nav(board)
     repository = _Repository()
     said: list[str] = []
+    logged: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setitem(sys.modules, "pytesseract", _NoOcr())
     monkeypatch.setattr(ranking_scan, "Settings", _Settings)
     monkeypatch.setattr(ranking_scan, "LiveDriver", _Driver)
@@ -186,7 +200,11 @@ def _trace(
     monkeypatch.setattr(ranking_scan, "rows_from_image", lambda *_a, **_k: board.first())
     monkeypatch.setattr(ranking_scan, "scroll_through_humans", _reached_bots)
     monkeypatch.setattr(ranking_scan, "say", said.append)
-    monkeypatch.setattr(ranking_scan, "record_system_log", lambda *_a, **_k: None)
+
+    def _record(_level: str, _source: str, message: str, **kwargs: Any) -> None:
+        logged.append((message, dict(kwargs.get("payload") or {})))
+
+    monkeypatch.setattr(ranking_scan, "record_system_log", _record)
 
     kwargs: dict[str, Any] = {"bot_scrolls": len(board.screens) - 1}
     if bot_limit is not None:
@@ -199,7 +217,7 @@ def _trace(
         f" 名次={target.military_rank}"
         for target in repository.saved
     ]
-    return written, said
+    return _Trace(written=written, said=said, logged=logged)
 
 
 #: 六屏。**第 3、4 屏故意重复前两屏的坐标** —— 见模块头「场景是挑过的」那一段。
@@ -215,16 +233,12 @@ SCENARIO = (
 
 def test_the_written_targets_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     """落库的目标序列 —— 坐标、军力、估算标记、名次，按写入顺序。"""
-    written, _ = _trace(monkeypatch, SCENARIO)
-
-    assert written == BASELINE_WRITTEN
+    assert _trace(monkeypatch, SCENARIO).written == BASELINE_WRITTEN
 
 
 def test_the_spoken_lines_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     """所有 `say()` 行 —— 按打印顺序。"""
-    _, said = _trace(monkeypatch, SCENARIO)
-
-    assert said == BASELINE_SAID
+    assert _trace(monkeypatch, SCENARIO).said == BASELINE_SAID
 
 
 def test_a_first_screen_that_fills_the_batch_is_unchanged(
@@ -235,10 +249,68 @@ def test_a_first_screen_that_fills_the_batch_is_unchanged(
     这一趟连一条「采集一屏」都不会打。Phase 0 的重构要让首屏走进逐屏那段，
     而这一条钉住的是「走进去之后，这条路的对外输出仍然一样」。
     """
-    written, said = _trace(monkeypatch, SCENARIO, bot_limit=3)
+    run = _trace(monkeypatch, SCENARIO, bot_limit=3)
 
-    assert written == BASELINE_LIMIT_WRITTEN
-    assert said == BASELINE_LIMIT_SAID
+    assert run.written == BASELINE_LIMIT_WRITTEN
+    assert run.said == BASELINE_LIMIT_SAID
+
+
+# -- Phase 0 的计数与影子评估 ------------------------------------------------
+#
+# 上面那三条钉的是「别变」（只录 `say`）；下面这两条钉的是「新加的计数真的量对了」
+# （只看 payload 里的特定键）。两者分开是故意的：payload 以后还会加字段，
+# 而基准不能因为加字段就变红。
+
+
+def test_the_counters_separate_the_four_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠⚠ **四个来源必须分得开** —— 这是整个 Phase 0 的前提。
+
+    第 3 屏（`scroll=2`）的坐标全是第 1 屏见过的，于是去重后一个新目标都没有；
+    而 OCR 读得完全正确、判据三行全采信、三个点也都进了历史。
+
+        fresh_valued     = 0      ← 自愈阀现在看的就是这个数
+        verdict_trusted  = 3      ← 判据其实完全正常
+        history_appended = 3      ← 曲线也在往前走
+
+    一个数就区分不了「判据失败」和「去重吃掉了」，而那两件事的处置完全相反。
+    """
+    run = _trace(monkeypatch, SCENARIO)
+    duplicate = run.payloads("采集一屏")[2]
+
+    assert duplicate["fresh_valued"] == 0, "第 3 屏全是已见过的坐标，新增带值目标应为 0"
+    assert duplicate["verdict_trusted"] == 3, "判据其实采信了三行"
+    assert duplicate["history_appended"] == 3, "三个点也真的进了历史"
+
+
+def test_the_shadow_evaluation_shows_only_the_current_condition_would_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠⚠ **这一条就是那个「误触发」的定量证据。**
+
+    第 3、4 屏连着两屏全是已见过的坐标，于是：
+
+    - 现行条件（`success_old`）两屏都算失败 → **真阀真的清了 12 个历史点**
+    - 而 `success_verdict` / `success_history` 两屏都算成功 → 它们一次都不会重置
+
+    换句话说：这一次重置把收尾补数的证据销毁了，**而扫描本身什么都没错**。
+
+    ⚠️ 影子评估只记录、不生效 —— 真阀照旧响（下面那两条断言）。
+    轨迹在换条件之后会分叉，所以这里量到的只是「三种条件在现行轨迹上的比较」。
+    """
+    run = _trace(monkeypatch, SCENARIO)
+    screens = run.payloads("采集一屏")
+
+    for index in (2, 3):
+        assert screens[index]["success_old"] is False
+        assert screens[index]["success_verdict"] is True
+        assert screens[index]["success_history"] is True
+
+    assert screens[2]["shadow_reset"] == [], "第一屏失败还不够两屏，谁都不应该重置"
+    assert screens[3]["shadow_reset"] == ["old"], "只有现行条件会在这里重置"
+
+    resets = run.payloads("军力锚点重置")
+    assert len(resets) == 1, "真阀照旧响一次 —— 影子计数不得影响它"
+    assert resets[0]["history"] == 12, "而它销毁的是 12 个健康的历史点"
 
 
 #: ⚠️ 几条超长的带了 `noqa: E501` —— 它们是**录下来的原文**，折行会让重录时对不上。

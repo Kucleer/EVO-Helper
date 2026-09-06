@@ -736,13 +736,50 @@ def _no_bracket_because(scores: Sequence[float | None]) -> str:
     return f"首尾跨度 {head / tail:.1f} 倍，超过上限 {SCREEN_SPREAD_LIMIT:.0f}"
 
 
-def targets_from_rows(
+@dataclass(frozen=True)
+class ScreenOutcome:
+    """一屏判完之后交出来的东西：目标，以及**同一次判定**的几个计数。
+
+    ⚠️ **这几个数必须出自判据那一次，不允许从 `targets` 里反推。**
+
+    `targets` 是**过滤后**的：`coordinate is None or not is_bot_entry(...)` 的行在这之前
+    就 `continue` 掉了，而历史追加发生在**过滤之前**（在 `judge_scores` 内部逐行进行）。
+    所以真人行 / 名字读不出的行上采信的值进了历史，却不出现在 `targets` 里 ——
+    从返回值统计「判据采信了多少」必然偏少。
+
+    四个来源分开记，因为它们失败的方式不同：
+
+    - `verdict_trusted` / `verdict_positive` → 判据本身成没成功
+    - `history_appended` / `history_new_ranks` → 名次缺失会让采信值进不了历史
+    - `bot_measured` → bot / 坐标过滤吃掉了多少
+
+    账在 `docs/军力榜补数/方案.md` 的 1.1。
+    """
+
+    targets: list[RankingTarget]
+    #: `Judgement.trusted` 里**非 `None`** 的个数。影子条件用的是这一个。
+    #:
+    #: ⚠️ 用非空而不是正值，是为了让「新条件只会响得更少」严格成立：
+    #: 判据允许采信 `0`，而 `0` 会让目标带值（旧条件算成功）却不计入正值。
+    #: 那个边界可达范围极窄（要整屏没有任何可读正值），但定义用非空就不留这个口子。
+    verdict_trusted: int
+    #: 其中正值的个数。诊断用 —— 它和上一格相等是常态，不等就是榜上有 0 分行。
+    verdict_positive: int
+    #: 本屏真的追加进历史的条数。
+    history_appended: int
+    #: 其中不同名次的个数。历史不按名次去重，重复名次不算曲线往前走。
+    history_new_ranks: int
+    #: 过滤后 bot 行里的**实读**值个数（非空且非估算）。
+    bot_measured: int
+
+
+def judge_rows(
     rows: list[RankingRow],
     *,
     observed_at: datetime,
     anchor: float | None = None,
     history: list[tuple[int, float]] | None = None,
-) -> list[RankingTarget]:
+) -> ScreenOutcome:
     """修名次、**丢掉破坏降序的军力值**、插补空缺，并留下「这个数是估算的」的证据。
 
     ⚠️ **降序异常必须丢，不能只打印。** 2026-08-15 那一夜的教训：库里 30 个 bot
@@ -863,7 +900,32 @@ def targets_from_rows(
                 military_rank=repaired[index],
             )
         )
-    return targets
+    return ScreenOutcome(
+        targets=targets,
+        verdict_trusted=sum(1 for value in verdict.trusted if value is not None),
+        verdict_positive=sum(1 for value in verdict.trusted if value),
+        history_appended=len(verdict.appended),
+        history_new_ranks=len({rank for rank, _ in verdict.appended}),
+        bot_measured=sum(
+            1
+            for target in targets
+            if target.military_score is not None and not target.military_score_estimated
+        ),
+    )
+
+
+def targets_from_rows(
+    rows: list[RankingRow],
+    *,
+    observed_at: datetime,
+    anchor: float | None = None,
+    history: list[tuple[int, float]] | None = None,
+) -> list[RankingTarget]:
+    """只要目标那一份。判据整段在 `judge_rows` 上。
+
+    要同一次判定的计数（影子条件、自愈阀的上下文）就直接用 `judge_rows`。
+    """
+    return judge_rows(rows, observed_at=observed_at, anchor=anchor, history=history).targets
 
 
 def take_batch_targets(
@@ -1589,15 +1651,32 @@ def scan(
         """
         nonlocal score_anchor, blind_score_screens, dry, previous_coordinates
         nonlocal screens_without_overlap
-        fresh, reached = collect(
-            targets_from_rows(
-                rows,
-                observed_at=datetime.now(UTC),
-                anchor=score_anchor,
-                history=score_history,
-            )
+        outcome = judge_rows(
+            rows,
+            observed_at=datetime.now(UTC),
+            anchor=score_anchor,
+            history=score_history,
         )
+        fresh, reached = collect(outcome.targets)
         score_anchor = next_score_anchor(rows, anchor=score_anchor)
+        # 三个候选条件同屏并行算，各自记失败；**都不影响真阀**。
+        # 账在 `shadow_blind` 那段注释上。
+        fresh_valued = sum(1 for target in fresh if target.military_score is not None)
+        success = {
+            "old": fresh_valued > 0,
+            "verdict": outcome.verdict_trusted > 0,
+            "history": outcome.history_appended > 0,
+        }
+        shadow_reset_here = []
+        for name, ok in success.items():
+            if ok:
+                shadow_blind[name] = 0
+                continue
+            shadow_blind[name] += 1
+            if shadow_blind[name] >= SCORE_ANCHOR_RESET_SCREENS:
+                shadow_resets[name] += 1
+                shadow_blind[name] = 0
+                shadow_reset_here.append(name)
         if screen_seq > 0:
             if any(target.military_score is not None for target in fresh):
                 blind_score_screens = 0
@@ -1693,6 +1772,20 @@ def scan(
                 # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
                 # （连名字都读不出的）在日志里长得像「重叠断了」。
                 "overlap_intact": overlap,
+                # 下面这一批都是 Phase 0 只观测的计数；`say` 一个字没动
+                # —— 特征化基准只录 `say`，这条界线正是它能一直用下去的原因。
+                # 四个来源分开记的理由整段在 `ScreenOutcome` 上。
+                "verdict_trusted": outcome.verdict_trusted,
+                "verdict_positive": outcome.verdict_positive,
+                "history_appended": outcome.history_appended,
+                "history_new_ranks": outcome.history_new_ranks,
+                "bot_measured": outcome.bot_measured,
+                "fresh_valued": fresh_valued,
+                "success_old": success["old"],
+                "success_verdict": success["verdict"],
+                "success_history": success["history"],
+                # 哪几个候选条件会在这一屏触发一次「假想重置」。空列表 = 谁都不会。
+                "shadow_reset": shadow_reset_here,
             },
         )
         return reached
@@ -1724,6 +1817,23 @@ def scan(
     unread: list[RankingTarget] = []
     #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
     blind_score_screens = 0
+    # ⚠⚠ **影子计数：三个候选「成功条件」各自维护一份失败计数，只记录、都不生效。**
+    #
+    # 现行阀看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠 3–6 行 ——
+    # 一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、历史再健康，计数器照样加一**，
+    # 连着两屏就清历史 —— 而收尾补数读的是同一份历史。
+    #
+    # 换条件之前得先知道换了会怎样，所以三个条件同屏并行算、都只进日志：
+    #
+    #     success_old      任一新增目标带值（现行）
+    #     success_verdict  判据采信过任何值（首选候选）
+    #     success_history  本屏有点真的进了曲线历史
+    #
+    # ⚠️ **产出只能称为「三种条件在现行运行轨迹上的比较」。** 换条件后历史会不同、
+    # 后续采信也会不同，轨迹在第一次被去掉的误重置之后就分叉了 ——
+    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
+    shadow_blind = {"old": 0, "verdict": 0, "history": 0}
+    shadow_resets = {"old": 0, "verdict": 0, "history": 0}
 
     account = BlindSpinAccount()
     if blind_rows is None:
@@ -2159,6 +2269,8 @@ __all__ = [
     "sample_overlap",
     "scroll_through_humans",
     "spin_blind_rows",
+    "ScreenOutcome",
+    "judge_rows",
     "targets_from_rows",
     "take_batch_targets",
     "track_progress",
