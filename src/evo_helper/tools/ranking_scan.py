@@ -615,12 +615,29 @@ def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> fl
     return max(trusted) if trusted else anchor
 
 
+@dataclass(frozen=True)
+class BackfillOutcome:
+    """收尾补数的三个数。**分三个而不是一个。**
+
+    「推得出」和「真正写进库」不相等（库里已经有值的不覆盖），
+    而「洞有多少」才是分母 —— 只报一个数时，补上率是算不出来的。
+    账在 `docs/军力榜补数/方案.md` 的5（「分三个数报」）。
+    """
+
+    #: 本趟读到名次却没读出军力值的行数。分母。
+    holes: int
+    #: 其中曲线推得出来的。
+    reachable: int
+    #: 其中真正写进库的（库里已有值的不覆盖）。
+    written: int
+
+
 def _backfill_from_the_curve(
     repository: Any,
     unread: Sequence[RankingTarget],
     *,
     history: Sequence[tuple[int, float]],
-) -> int:
+) -> BackfillOutcome:
     """拿这一趟攒下来的曲线，把没读出军力值的那些行补上，交出补了几条。
 
     用户口径（2026-09-02，逐字）：
@@ -648,7 +665,7 @@ def _backfill_from_the_curve(
        不需要另写一道判据。
     """
     if not unread or not history:
-        return 0
+        return BackfillOutcome(holes=len(unread), reachable=0, written=0)
     filled = [
         replace(target, military_score=reference, military_score_estimated=True)
         for target in unread
@@ -683,7 +700,7 @@ def _backfill_from_the_curve(
     ]
     if not filled:
         say(f"曲线补数：{len(unread)} 行没读出军力值，一条都补不了（历史 {len(history)} 点）")
-        return 0
+        return BackfillOutcome(holes=len(unread), reachable=0, written=0)
     written = int(repository.backfill_missing_military_scores(filled))
     ranks = sorted(t.military_rank for t in filled if t.military_rank is not None)
     say(
@@ -695,7 +712,7 @@ def _backfill_from_the_curve(
         f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点 · "
         f"推不出 {len(unread) - len(filled)} 行]"
     )
-    return written
+    return BackfillOutcome(holes=len(unread), reachable=len(filled), written=written)
 
 
 def _drop_label(renderable: float | None, why: str | None) -> str:
@@ -1650,7 +1667,7 @@ def scan(
         是下一步单独的决定（账在 `docs/军力榜补数/方案.md` 的 6.1）。
         """
         nonlocal score_anchor, blind_score_screens, dry, previous_coordinates
-        nonlocal screens_without_overlap
+        nonlocal screens_without_overlap, last_reset_screen, reset_count
         outcome = judge_rows(
             rows,
             observed_at=datetime.now(UTC),
@@ -1666,6 +1683,17 @@ def scan(
             "old": fresh_valued > 0,
             "verdict": outcome.verdict_trusted > 0,
             "history": outcome.history_appended > 0,
+        }
+        # ⚠️ **这一屏的计数要在阀之前就算好。** 阀是看「连续两屏」才响的，
+        # 而其中一屏就是当前这一屏 —— 算在阀后面的话，重置日志里记的会是
+        # 前两屏，恰好漏掉触发它的那一屏。
+        stats = {
+            "screen_seq": screen_seq,
+            "verdict_trusted": outcome.verdict_trusted,
+            "history_appended": outcome.history_appended,
+            "history_new_ranks": outcome.history_new_ranks,
+            "bot_measured": outcome.bot_measured,
+            "fresh_valued": fresh_valued,
         }
         shadow_reset_here = []
         for name, ok in success.items():
@@ -1694,6 +1722,10 @@ def scan(
                             "screens": blind_score_screens,
                             "anchor": score_anchor,
                             "history": len(score_history),
+                            "screen_seq": screen_seq,
+                            "unread_waiting": len(unread),
+                            # 连续那两屏各自的计数 —— 阀就是看这两屏才响的。
+                            "screens_detail": recent_stats[-1:] + [stats],
                         },
                     )
                     score_anchor = None
@@ -1714,6 +1746,8 @@ def scan(
                     # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
                     # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
                     score_history.clear()
+                    last_reset_screen = screen_seq
+                    reset_count += 1
                     blind_score_screens = 0
         # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
         # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
@@ -1788,6 +1822,9 @@ def scan(
                 "shadow_reset": shadow_reset_here,
             },
         )
+        # 这一屏的计数存起来，下一屏重置时要连着两屏一起记。
+        recent_stats.append(stats)
+        del recent_stats[:-2]
         return reached
 
     # 重叠账：`previous_coordinates` 是上一屏读出来的那些坐标，
@@ -1834,6 +1871,20 @@ def scan(
     # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
     shadow_blind = {"old": 0, "verdict": 0, "history": 0}
     shadow_resets = {"old": 0, "verdict": 0, "history": 0}
+    # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
+    # 重置时一并记下去 —— 事后才分得出「真的两屏都读废了」和「去重吃掉了」。
+    recent_stats: list[dict[str, Any]] = []
+    #: 最后一次重置在第几屏（`None` = 整趟没重置过）。
+    #:
+    #: ⚠⚠ **它比「重置共几次」重要得多。** 收尾补数用的是**最后**那一次重置
+    #: 之后攒起来的历史：一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发
+    #: 率 87.5%，但修掉前七次之后最后那一次照样清空全部历史。
+    last_reset_screen: int | None = None
+    reset_count = 0
+    # ⚠️ **提到 `try` 之前。** 汇总那一条在 `finally` 里，而补数在 `try` 里 ——
+    # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
+    # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
+    backfill = BackfillOutcome(holes=0, reachable=0, written=0)
 
     account = BlindSpinAccount()
     if blind_rows is None:
@@ -1941,7 +1992,7 @@ def scan(
         # ⚠️ **补数放在这里，不放 `finally`。** 被 Ctrl+C / 调度器抢占打断时曲线只盖到
         # 一半，那时补出来的是半条曲线上的外推值——而收尾那句话必须照打（它在
         # `finally` 里），两件事的要求正好相反。补不成没有代价：那些行本来就空着。
-        _backfill_from_the_curve(repository, unread, history=score_history)
+        backfill = _backfill_from_the_curve(repository, unread, history=score_history)
     finally:
         if not nav.close():
             say("排行榜已关闭，但导航条还原未确认")
@@ -1959,6 +2010,26 @@ def scan(
             completion_message(
                 progress, written=written, suspect=written - len(kept), outcome=outcome
             )
+        )
+        # ⚠⚠ **整趟的汇总：最后一次重置在第几屏、收尾历史多少点、补数三个数。**
+        #
+        # 「重置共几次」不够用：收尾补数用的是**最后**那一次重置之后攒的历史。
+        # 一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发率 87.5%，
+        # 但修掉前七次之后最后那一次照样清空全部历史 —— 补数照样很差。
+        #
+        # 影子重置总数也在这里，好直接对比三种条件在这一趟上各会响几次。
+        record_log(
+            "采集收尾汇总",
+            {
+                "screens_collected": progress.collect_scrolls + 1,
+                "reset_count": reset_count,
+                "last_reset_screen": last_reset_screen,
+                "history_at_end": len(score_history),
+                "backfill_holes": backfill.holes,
+                "backfill_reachable": backfill.reachable,
+                "backfill_written": backfill.written,
+                "shadow_resets": dict(shadow_resets),
+            },
         )
         # ⚠️ **没接上的屏单独报一行，不塞进 `completion_message`。**
         # 那句话是「这一趟干了多少」，这句是「这一趟有几屏没接上」——后者是异常

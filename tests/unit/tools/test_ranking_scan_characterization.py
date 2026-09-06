@@ -313,6 +313,54 @@ def test_the_shadow_evaluation_shows_only_the_current_condition_would_reset(
     assert resets[0]["history"] == 12, "而它销毁的是 12 个健康的历史点"
 
 
+def test_the_reset_log_carries_the_two_screens_that_triggered_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠⚠ **阀是看「连续两屏」才响的，所以重置日志必须把那两屏都记下。**
+
+    只记触发当屏的话，事后分不出「真的两屏都读废了」和「去重吃掉了」。
+    这一趟的重置日志里那两屏长这样：
+
+        screen_seq=2   fresh_valued=0   verdict_trusted=3
+        screen_seq=3   fresh_valued=0   verdict_trusted=3
+
+    两屏都是「新增带值目标为 0、而判据其实采信了三行」—— 误触发的指纹。
+
+    ⚠️ 计数得在阀**之前**就算好。算在后面的话，这里记下的会是前两屏，
+    恰好漏掉触发它的那一屏。
+    """
+    run = _trace(monkeypatch, SCENARIO)
+    resets = run.payloads("军力锚点重置")
+
+    assert len(resets) == 1
+    detail = resets[0]["screens_detail"]
+    assert [screen["screen_seq"] for screen in detail] == [2, 3], (
+        f"记的不是触发它的那两屏：{detail}"
+    )
+    assert all(screen["fresh_valued"] == 0 for screen in detail)
+    assert all(screen["verdict_trusted"] == 3 for screen in detail)
+    assert resets[0]["screen_seq"] == 3
+
+
+def test_the_run_summary_says_where_the_last_reset_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ **「重置共几次」不够用，要的是「最后一次在第几屏」。**
+
+    收尾补数用的是**最后**那一次重置之后攒起来的历史。一趟里 7 次前段
+    误重置 + 1 次临近收尾的真重置，误触发率 87.5% —— 但修掉前七次之后，
+    最后那一次照样清空全部历史，补数照样很差。所以位置才是那个关键量。
+    """
+    run = _trace(monkeypatch, SCENARIO)
+    summary = run.payloads("采集收尾汇总")
+
+    assert len(summary) == 1
+    assert summary[0]["reset_count"] == 1
+    assert summary[0]["last_reset_screen"] == 3
+    assert summary[0]["history_at_end"] == 5, "重置清掉 12 点，之后两屏又攒回 5 点"
+    assert summary[0]["shadow_resets"] == {"old": 1, "verdict": 0, "history": 0}
+
+
 #: ⚠️ 几条超长的带了 `noqa: E501` —— 它们是**录下来的原文**，折行会让重录时对不上。
 #: 录于 2026-09-06、`a7c4511`（#277 合并后）。判据版本 `curve/3`。
 #:

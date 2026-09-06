@@ -65,7 +65,8 @@ def _run(repo: Any, unread: list[RankingTarget], history: list[tuple[int, float]
 
     saved, module.say = module.say, _say
     try:
-        return _backfill_from_the_curve(repo, unread, history=history)
+        # 只要「真正写进库」那一个数 —— 三个数的分工在 `BackfillOutcome` 上。
+        return _backfill_from_the_curve(repo, unread, history=history).written
     finally:
         module.say = saved
 
