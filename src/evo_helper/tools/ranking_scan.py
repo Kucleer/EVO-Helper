@@ -1678,6 +1678,130 @@ def scan(
     def record_log(message: str, payload: dict[str, Any]) -> None:
         record_system_log("INFO", "tools.ranking_scan", message, payload=payload)
 
+    # 重叠账：`previous_coordinates` 是上一屏读出来的那些坐标，
+    # `screens_without_overlap` 是整趟有几屏和上一屏一个坐标都没对上。
+    # 见 `domain.ranking.screens_overlap`（那里还记着为什么这道判据**不看名次**）。
+    #
+    # ⚠️ **提到 `try` 之前**，理由和下面那句收尾一样：被 Ctrl+C / 调度器抢占打断时
+    # 也要报得出「这一趟有几屏没接上」。定义在循环里的话，`finally` 会撞 `NameError`
+    # ——而那会把一次干净的中断变成一条堆栈。
+    previous_coordinates: set[Coordinate] = set()
+    screens_without_overlap = 0
+    # ⚠️ **军力锚点要跨屏活着。** 上一屏最后一个可信的军力值，用来判下一屏的
+    # 第一行——`descending_breaks` 是按屏跑的，屏首那一行原先没有任何约束，
+    # 而 2026-08-23 生产实测正是从那里漏进去一个 10 倍偏大的值
+    # （账在 `domain.ranking.trusted_scores`）。
+    score_anchor: float | None = None
+    # ⚠️ **曲线的历史要跨屏活着，而且只在这一趟里活着。**
+    #
+    # 「几个锚点对整个长链路」（用户口径 2026-09-02）落地成这个列表：每采信一个读数
+    # 就往里追加 `(名次, 军力)`，判下一屏时取名次相近的中位数当参照。中位数抗少数
+    # 坏点，这是它比单点锚点强的全部理由（整段账在 `domain.ranking.curve_reference`）。
+    #
+    # ⚠️ **不跨趟复用。** bot 军力每周一 UTC+0 刷新，而两趟之间还隔着几十分钟的
+    # 攻击——拿上一趟的历史当这一趟的参照，就是拿过期的曲线去判新读数。
+    score_history: list[tuple[int, float]] = []
+    # 这一趟里读到名次却没读出军力值的目标，收尾时用曲线补（`_backfill_from_the_curve`）。
+    unread: list[RankingTarget] = []
+    #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
+    blind_score_screens = 0
+    # ⚠⚠ **影子计数：三个候选「成功条件」各自维护一份失败计数，只记录、都不生效。**
+    #
+    # 现行阀看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠 3–6 行 ——
+    # 一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、历史再健康，计数器照样加一**，
+    # 连着两屏就清历史 —— 而收尾补数读的是同一份历史。
+    #
+    # 换条件之前得先知道换了会怎样，所以三个条件同屏并行算、都只进日志：
+    #
+    #     success_old      任一新增目标带值（现行）
+    #     success_verdict  判据采信过任何值（首选候选）
+    #     success_history  本屏有点真的进了曲线历史
+    #
+    # ⚠️ **产出只能称为「三种条件在现行运行轨迹上的比较」。** 换条件后历史会不同、
+    # 后续采信也会不同，轨迹在第一次被去掉的误重置之后就分叉了 ——
+    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
+    shadow_blind = {"old": 0, "verdict": 0, "history": 0}
+    shadow_resets = {"old": 0, "verdict": 0, "history": 0}
+    # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
+    # 重置时一并记下去 —— 事后才分得出「真的两屏都读废了」和「去重吃掉了」。
+    #: 开关打开时，每屏落库**之前**那几个坐标的库内状态。
+    prior_states: list[dict[Coordinate, dict[str, Any]]] = []
+    recent_stats: list[dict[str, Any]] = []
+    #: 最后一次重置在第几屏（`None` = 整趟没重置过）。
+    #:
+    #: ⚠⚠ **它比「重置共几次」重要得多。** 收尾补数用的是**最后**那一次重置
+    #: 之后攒起来的历史：一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发
+    #: 率 87.5%，但修掉前七次之后最后那一次照样清空全部历史。
+    last_reset_screen: int | None = None
+    reset_count = 0
+    # ⚠️ **`dry` 得在这里绑上，不能等到首屏那一句。**
+    #
+    # `process_screen` 拿 `nonlocal` 读它，而 mypy 要求绑定出现在嵌套函数
+    # **之前**（运行时不在乎文本顺序，但 CI 那道门在乎）。
+    dry = 0
+    # ⚠️ **提到 `try` 之前。** 汇总那一条在 `finally` 里，而补数在 `try` 里 ——
+    # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
+    # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
+    backfill = BackfillOutcome(holes=0, reachable=0, written=0)
+    # ⚠⚠ **两条入口在这里汇成一个变量。**
+    #
+    # 调度器走环境变量（`command` 在 `run_id` 生成**之前**就建好了，
+    # 而标记必须和那一趟的 `run_id` 绑在一起）；手工直跑走 `--capture-rows`
+    # （本机是备份挂机机，要能不经调度器就开）。
+    #
+    # ⚠️ 默认关。录一趟约 1,250 行，不能常开。
+    recording = bool(capture_rows) or os.environ.get(ENV_CAPTURE_ROWS) == "1"
+    if recording:
+        say("本趟录逐屏原始行（诊断）：名次 / 坐标 / 分数 / 空值都进日志")
+    # ⚠⚠ **开工记录：语料的完整性检查靠它认「这一批是哪一趟、什么配置、哪个版本」。**
+    #
+    # 版本标识用 `SCORE_RULE_VERSION` + 包版本，**不用 git sha** —— 运行机上不一定
+    # 拿得到（那里可能根本没有 git），而判据版本指纹本来就是为了回答这个问题建的。
+    record_log(
+        "采集开工",
+        {
+            "rule_version": SCORE_RULE_VERSION,
+            "package_version": evo_helper_version,
+            "recording": recording,
+            "bot_limit": bot_limit,
+            "bot_scrolls": bot_scrolls,
+            "blind_rows": blind_rows,
+            "blind_rows_source": blind_rows_source,
+        },
+    )
+
+    account = BlindSpinAccount()
+    if blind_rows is None:
+        # -- 回滚路径：盲滚段退回慢拖 ---------------------------------------
+        # 行 ↔ 屏各换算一次，来回是恒等的（40 屏 × 8.3 = 332 行 → 40 屏）。
+        blind_phase_rows = round(blind_scrolls * ROWS_PER_SCROLL)
+
+        def spin(rows: int) -> BlindWalk:
+            return drag_blind_rows(rows, scroll_blind=nav.scroll_blind, say_line=say)
+    else:
+        blind_phase_rows = blind_rows
+
+        def spin(rows: int) -> BlindWalk:
+            # ⚠️ **「走了多少行」不在这一层测。** `spin_blind` 每一轮都要读一次名次
+            # 才知道要不要补拨，所以那一层手里就有测量值；这里再测一次是另一帧画面，
+            # 而两帧之间列表可能已经动过（原先这里挂着一个 `measure_rows`，
+            # 记进日志的其实是「拨完停在第几名」，不是「走了多少行」）。
+            return spin_blind_rows(
+                rows,
+                spin=lambda requested: nav.spin_blind(rows=requested),
+                account=account,
+            )
+
+    # ⚠️ **开榜放在 try 外面。** 它在读标签行那一步就可能失败，那时面板压根没开，
+    # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
+    # 那是这条链路的硬红线。放在外面就没有「记得判断开没开」这回事：
+    # 抛出去的时候根本走不到 finally。
+    nav.open_military_ranking()
+
+    screens: list[list[RankingTarget]] = []
+    outcome = 0
+    progress = ScanProgress()
+
     def process_screen(rows: list[RankingRow], *, screen_seq: int) -> bool:
         """判一屏、落库、更新锚点与自愈阀、记账。交回「本批采够了吗」。
 
@@ -1866,124 +1990,6 @@ def scan(
         del recent_stats[:-2]
         return reached
 
-    # 重叠账：`previous_coordinates` 是上一屏读出来的那些坐标，
-    # `screens_without_overlap` 是整趟有几屏和上一屏一个坐标都没对上。
-    # 见 `domain.ranking.screens_overlap`（那里还记着为什么这道判据**不看名次**）。
-    #
-    # ⚠️ **提到 `try` 之前**，理由和下面那句收尾一样：被 Ctrl+C / 调度器抢占打断时
-    # 也要报得出「这一趟有几屏没接上」。定义在循环里的话，`finally` 会撞 `NameError`
-    # ——而那会把一次干净的中断变成一条堆栈。
-    previous_coordinates: set[Coordinate] = set()
-    screens_without_overlap = 0
-    # ⚠️ **军力锚点要跨屏活着。** 上一屏最后一个可信的军力值，用来判下一屏的
-    # 第一行——`descending_breaks` 是按屏跑的，屏首那一行原先没有任何约束，
-    # 而 2026-08-23 生产实测正是从那里漏进去一个 10 倍偏大的值
-    # （账在 `domain.ranking.trusted_scores`）。
-    score_anchor: float | None = None
-    # ⚠️ **曲线的历史要跨屏活着，而且只在这一趟里活着。**
-    #
-    # 「几个锚点对整个长链路」（用户口径 2026-09-02）落地成这个列表：每采信一个读数
-    # 就往里追加 `(名次, 军力)`，判下一屏时取名次相近的中位数当参照。中位数抗少数
-    # 坏点，这是它比单点锚点强的全部理由（整段账在 `domain.ranking.curve_reference`）。
-    #
-    # ⚠️ **不跨趟复用。** bot 军力每周一 UTC+0 刷新，而两趟之间还隔着几十分钟的
-    # 攻击——拿上一趟的历史当这一趟的参照，就是拿过期的曲线去判新读数。
-    score_history: list[tuple[int, float]] = []
-    # 这一趟里读到名次却没读出军力值的目标，收尾时用曲线补（`_backfill_from_the_curve`）。
-    unread: list[RankingTarget] = []
-    #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
-    blind_score_screens = 0
-    # ⚠⚠ **影子计数：三个候选「成功条件」各自维护一份失败计数，只记录、都不生效。**
-    #
-    # 现行阀看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠 3–6 行 ——
-    # 一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、历史再健康，计数器照样加一**，
-    # 连着两屏就清历史 —— 而收尾补数读的是同一份历史。
-    #
-    # 换条件之前得先知道换了会怎样，所以三个条件同屏并行算、都只进日志：
-    #
-    #     success_old      任一新增目标带值（现行）
-    #     success_verdict  判据采信过任何值（首选候选）
-    #     success_history  本屏有点真的进了曲线历史
-    #
-    # ⚠️ **产出只能称为「三种条件在现行运行轨迹上的比较」。** 换条件后历史会不同、
-    # 后续采信也会不同，轨迹在第一次被去掉的误重置之后就分叉了 ——
-    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
-    shadow_blind = {"old": 0, "verdict": 0, "history": 0}
-    shadow_resets = {"old": 0, "verdict": 0, "history": 0}
-    # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
-    # 重置时一并记下去 —— 事后才分得出「真的两屏都读废了」和「去重吃掉了」。
-    #: 开关打开时，每屏落库**之前**那几个坐标的库内状态。
-    prior_states: list[dict[Coordinate, dict[str, Any]]] = []
-    recent_stats: list[dict[str, Any]] = []
-    #: 最后一次重置在第几屏（`None` = 整趟没重置过）。
-    #:
-    #: ⚠⚠ **它比「重置共几次」重要得多。** 收尾补数用的是**最后**那一次重置
-    #: 之后攒起来的历史：一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发
-    #: 率 87.5%，但修掉前七次之后最后那一次照样清空全部历史。
-    last_reset_screen: int | None = None
-    reset_count = 0
-    # ⚠️ **提到 `try` 之前。** 汇总那一条在 `finally` 里，而补数在 `try` 里 ——
-    # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
-    # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
-    backfill = BackfillOutcome(holes=0, reachable=0, written=0)
-    # ⚠⚠ **两条入口在这里汇成一个变量。**
-    #
-    # 调度器走环境变量（`command` 在 `run_id` 生成**之前**就建好了，
-    # 而标记必须和那一趟的 `run_id` 绑在一起）；手工直跑走 `--capture-rows`
-    # （本机是备份挂机机，要能不经调度器就开）。
-    #
-    # ⚠️ 默认关。录一趟约 1,250 行，不能常开。
-    recording = bool(capture_rows) or os.environ.get(ENV_CAPTURE_ROWS) == "1"
-    if recording:
-        say("本趟录逐屏原始行（诊断）：名次 / 坐标 / 分数 / 空值都进日志")
-    # ⚠⚠ **开工记录：语料的完整性检查靠它认「这一批是哪一趟、什么配置、哪个版本」。**
-    #
-    # 版本标识用 `SCORE_RULE_VERSION` + 包版本，**不用 git sha** —— 运行机上不一定
-    # 拿得到（那里可能根本没有 git），而判据版本指纹本来就是为了回答这个问题建的。
-    record_log(
-        "采集开工",
-        {
-            "rule_version": SCORE_RULE_VERSION,
-            "package_version": evo_helper_version,
-            "recording": recording,
-            "bot_limit": bot_limit,
-            "bot_scrolls": bot_scrolls,
-            "blind_rows": blind_rows,
-            "blind_rows_source": blind_rows_source,
-        },
-    )
-
-    account = BlindSpinAccount()
-    if blind_rows is None:
-        # -- 回滚路径：盲滚段退回慢拖 ---------------------------------------
-        # 行 ↔ 屏各换算一次，来回是恒等的（40 屏 × 8.3 = 332 行 → 40 屏）。
-        blind_phase_rows = round(blind_scrolls * ROWS_PER_SCROLL)
-
-        def spin(rows: int) -> BlindWalk:
-            return drag_blind_rows(rows, scroll_blind=nav.scroll_blind, say_line=say)
-    else:
-        blind_phase_rows = blind_rows
-
-        def spin(rows: int) -> BlindWalk:
-            # ⚠️ **「走了多少行」不在这一层测。** `spin_blind` 每一轮都要读一次名次
-            # 才知道要不要补拨，所以那一层手里就有测量值；这里再测一次是另一帧画面，
-            # 而两帧之间列表可能已经动过（原先这里挂着一个 `measure_rows`，
-            # 记进日志的其实是「拨完停在第几名」，不是「走了多少行」）。
-            return spin_blind_rows(
-                rows,
-                spin=lambda requested: nav.spin_blind(rows=requested),
-                account=account,
-            )
-
-    # ⚠️ **开榜放在 try 外面。** 它在读标签行那一步就可能失败，那时面板压根没开，
-    # 而 `nav.close()` 会点 `RANKING_CLOSE`(750, 71) ——**在认不出的画面上点击**，
-    # 那是这条链路的硬红线。放在外面就没有「记得判断开没开」这回事：
-    # 抛出去的时候根本走不到 finally。
-    nav.open_military_ranking()
-
-    screens: list[list[RankingTarget]] = []
-    outcome = 0
-    progress = ScanProgress()
     try:
         # -- 第一段：翻真人段，只问「到 bot 区了没有」 ----------------------
         #
@@ -2036,7 +2042,6 @@ def scan(
             # 而 `bot_limit` 在首屏就采够时 `range(1, 0)` 为空，那一趟连一条逐屏日志都没有。
             #
             # ⚠️ `dry` 要在调用之前绑上：`process_screen` 会读它（尽管首屏不更新它）。
-            dry = 0
             reached_limit = process_screen(rows, screen_seq=0)
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
