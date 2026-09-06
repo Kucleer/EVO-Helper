@@ -24,13 +24,20 @@ from typing import Any
 import pytest
 
 from evo_helper.tools.ranking_replay import (
+    _CURRENT,
+    _SUCCESS,
     Corpus,
     ScreenRecord,
     replay,
     rows_from_payload,
     verify,
 )
-from support.ranking_runs import SCENARIO, SCENARIO_BLIND_START, _trace
+from support.ranking_runs import (
+    SCENARIO,
+    SCENARIO_BLIND_START,
+    SCENARIO_TRULY_BLIND,
+    _trace,
+)
 
 
 def _corpus(monkeypatch: pytest.MonkeyPatch, screens_in: object = SCENARIO) -> Corpus:
@@ -66,7 +73,13 @@ def test_the_corpus_covers_every_screen(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert [record.screen_seq for record in corpus.screens] == [0, 1, 2, 3, 4, 5]
     assert all(record.rows for record in corpus.screens)
-    assert corpus.resets == [3], "真阀在第 3 屏响过，语料里必须有这一条"
+    assert corpus.resets == [], (
+        "`SCENARIO` 里那次重置是坐标重复引起的误重置，换了成功条件之后不该再发生"
+    )
+
+    # ⚠️ 但「语料记得下重置」这条性质还得有地方钉住 —— 换个真盲场景验。
+    blind = _corpus(monkeypatch, SCENARIO_TRULY_BLIND)
+    assert blind.resets, "真盲时阀该响，而语料里必须有这一条"
 
 
 def test_the_replay_reproduces_every_recorded_counter(
@@ -85,16 +98,19 @@ def test_the_replay_reproduces_every_recorded_counter(
 
 
 def test_the_replay_finds_the_same_reset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """重置位置也要一样 —— 那是 Phase 1a 唯一关心的那个量。
+    """重置位置也要一样 —— 那是这一整件事唯一关心的那个量。
 
-    场景里第 3、4 屏坐标全部重复，于是去重后 `fresh` 为空、自愈阀在第 3 屏响。
-    回放必须在同一个位置响。
+    ⚠️ 用真盲场景而不是 `SCENARIO`：后者那次是误重置，换了成功条件之后
+    两边都不响了，**位置对不上也看不出来**（空列表等于空列表）。
     """
-    corpus = _corpus(monkeypatch)
+    corpus = _corpus(monkeypatch, SCENARIO_TRULY_BLIND)
 
     result = replay(corpus.screens)
 
-    assert result.resets == [3], f"重置位置对不上：{result.resets}"
+    assert result.resets, "场景已经失效：真循环都没重置，那这条什么也证不了"
+    assert result.resets == corpus.resets, (
+        f"重置位置对不上：真循环 {corpus.resets}，回放 {result.resets}"
+    )
 
 
 def test_null_readings_survive_the_round_trip() -> None:
@@ -136,3 +152,74 @@ def test_the_replay_catches_a_valve_that_drifted(monkeypatch: pytest.MonkeyPatch
     corpus = _corpus(monkeypatch, SCENARIO_BLIND_START)
 
     assert verify(corpus, replay(corpus.screens)) == []
+
+
+def test_the_current_condition_skips_the_dedup_misfire(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️⚠️ **配对回放存在的理由：影子计数看不见级联。**
+
+    `SCENARIO` 的第 3、4 屏坐标重复前两屏，于是去重后 `fresh` 为空 —— 现行条件
+    据此认定「连续两屏什么都没采到」并清掉锚点与历史，**而判据其实把那几行都读对了**。
+
+    换成候选条件之后重置不再发生，于是历史继续长：这一场景里 **5 点 → 17 点**。
+    这个差额是**影子计数答不出来的** —— 它只回答「三个条件在现行轨迹的这一屏上
+    分别成不成立」，而轨迹在第一次被去掉的误重置之后就分叉了。
+
+    2026-09-06 实机第 1 趟（215 屏）上同一件事：现行条件重置 2 次、收尾 2060 点、
+    洞 78 个；候选条件重置 **0** 次、2077 点、洞 72 个 —— 而影子计数预测的是
+    「候选条件还会留下第 2 次重置」。**那第 2 次其实是第 1 次误重置造成的。**
+    """
+    corpus = _corpus(monkeypatch)
+
+    before = replay(corpus.screens, condition="old")
+    after = replay(corpus.screens)  # 默认 = 采集循环此刻在用的条件
+
+    assert before.resets == [3], "旧条件在这一场景里必须误重置，否则场景已经失效"
+    assert after.resets == [], "现行条件不该被「靶被去重挡了」当成一次失败"
+    assert after.history_at_end > before.history_at_end, (
+        f"去掉误重置之后历史该更长：旧条件 {before.history_at_end} 点，"
+        f"现行 {after.history_at_end} 点"
+    )
+
+
+def test_a_genuinely_blind_stretch_still_resets_under_every_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **换条件的风险在反面：别把真盲也一起去掉了。**
+
+    自愈阀唯一的存在理由就是「历史被毒了、判据在拿错参照丢整屏」时能自己脱身。
+    候选条件如果连真盲都不认，阀就等于拆了 —— 而这件事在
+    `SCENARIO`（误重置那一类）上一个字都看不出来。
+
+    `SCENARIO_TRULY_BLIND` 里第 1、2 屏名次读得出、分数全 `None`，三个口径
+    同时不成立。**三个条件都必须在同一屏响。**
+    """
+    corpus = _corpus(monkeypatch, SCENARIO_TRULY_BLIND)
+
+    positions = {name: replay(corpus.screens, condition=name).resets for name in _SUCCESS}
+
+    assert positions["old"], "场景已经失效：现行条件都没重置，那它测不到任何东西"
+    assert len(set(map(tuple, positions.values()))) == 1, (
+        f"真盲时三个条件必须一致，实际 {positions}"
+    )
+
+
+def test_verify_refuses_a_trajectory_from_another_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **换了条件的轨迹拿去核对录下来的统计，对不上是应该的。**
+
+    录语料那一趟跑的是采集循环当时在用的条件。拿别的条件重跑一遍，轨迹本就分叉，
+    此时 `verify` 报出的一堆「逐屏计数对不上」会被读成**两份实现分家** ——
+    而那句结论会让人去改本来对着的代码。所以必须在 `verify` 里就拦住，
+    不能靠调用方记得别这么用。
+    """
+    corpus = _corpus(monkeypatch)
+    other = next(name for name in _SUCCESS if name != _CURRENT)
+
+    problems = verify(corpus, replay(corpus.screens, condition=other))
+
+    assert len(problems) == 1, f"该只报一条「条件不对」，实际 {problems}"
+    assert other in problems[0] and _CURRENT in problems[0], (
+        f"报出来的那句要把两个条件都说清楚：{problems[0]}"
+    )
+    assert verify(corpus, replay(corpus.screens)) == [], "采集循环在用的那个仍然要核对得上"

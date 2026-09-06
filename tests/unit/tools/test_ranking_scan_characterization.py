@@ -32,7 +32,7 @@ from __future__ import annotations
 import pytest
 
 from evo_helper.domain.ranking import SCORE_RULE_VERSION
-from support.ranking_runs import SCENARIO, _trace
+from support.ranking_runs import SCENARIO, SCENARIO_TRULY_BLIND, _trace
 
 
 def test_the_written_targets_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,20 +86,22 @@ def test_the_counters_separate_the_four_sources(monkeypatch: pytest.MonkeyPatch)
     assert duplicate["history_appended"] == 3, "三个点也真的进了历史"
 
 
-def test_the_shadow_evaluation_shows_only_the_current_condition_would_reset(
+def test_the_old_condition_would_still_misfire_here_and_the_valve_no_longer_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """⚠⚠ **这一条就是那个「误触发」的定量证据。**
+    """⚠⚠ **这一条既是那个「误触发」的定量证据，也是它被修掉了的证据。**
 
     第 3、4 屏连着两屏全是已见过的坐标，于是：
 
-    - 现行条件（`success_old`）两屏都算失败 → **真阀真的清了 12 个历史点**
-    - 而 `success_verdict` / `success_history` 两屏都算成功 → 它们一次都不会重置
+    - 旧条件（`success_old`）两屏都算失败 → 它**本来**会清掉 12 个健康的历史点
+    - 而 `success_verdict` / `success_history` 两屏都算成功
 
-    换句话说：这一次重置把收尾补数的证据销毁了，**而扫描本身什么都没错**。
+    换句话说：那一次重置销毁的是收尾补数的证据，**而扫描本身什么都没错**。
 
-    ⚠️ 影子评估只记录、不生效 —— 真阀照旧响（下面那两条断言）。
-    轨迹在换条件之后会分叉，所以这里量到的只是「三种条件在现行轨迹上的比较」。
+    2026-09-06 起真阀看的是 `success_history`（`VALVE_CONDITION`），
+    所以这一场景里**真阀一次都不响** —— 而 `shadow_reset` 里仍然看得见
+    「旧条件本来会在这里响」。那个影子计数是这次改动唯一的效果指标，
+    别把它一起删掉（方案 §1.8 / §1.9）。
     """
     run = _trace(monkeypatch, SCENARIO)
     screens = run.payloads("采集一屏")
@@ -110,11 +112,16 @@ def test_the_shadow_evaluation_shows_only_the_current_condition_would_reset(
         assert screens[index]["success_history"] is True
 
     assert screens[2]["shadow_reset"] == [], "第一屏失败还不够两屏，谁都不应该重置"
-    assert screens[3]["shadow_reset"] == ["old"], "只有现行条件会在这里重置"
+    assert screens[3]["shadow_reset"] == ["old"], "旧条件本来会在这里重置，这一条要留着"
 
-    resets = run.payloads("军力锚点重置")
-    assert len(resets) == 1, "真阀照旧响一次 —— 影子计数不得影响它"
-    assert resets[0]["history"] == 12, "而它销毁的是 12 个健康的历史点"
+    assert run.payloads("军力锚点重置") == [], (
+        "真阀不该再被「靶被去重挡了」触发 —— 这就是 Phase 1a 改的那一行"
+    )
+    assert run.payloads("采集收尾汇总")[0]["shadow_resets"] == {
+        "old": 1,
+        "verdict": 0,
+        "history": 0,
+    }, "收尾要说得出「换之前这一趟本来会误重置几次」"
 
 
 def test_the_reset_log_carries_the_two_screens_that_triggered_it(
@@ -123,27 +130,26 @@ def test_the_reset_log_carries_the_two_screens_that_triggered_it(
     """⚠⚠ **阀是看「连续两屏」才响的，所以重置日志必须把那两屏都记下。**
 
     只记触发当屏的话，事后分不出「真的两屏都读废了」和「去重吃掉了」。
-    这一趟的重置日志里那两屏长这样：
-
-        screen_seq=2   fresh_valued=0   verdict_trusted=3
-        screen_seq=3   fresh_valued=0   verdict_trusted=3
-
-    两屏都是「新增带值目标为 0、而判据其实采信了三行」—— 误触发的指纹。
-
     ⚠️ 计数得在阀**之前**就算好。算在后面的话，这里记下的会是前两屏，
     恰好漏掉触发它的那一屏。
+
+    ⚠️⚠️ **用真盲场景，不能用 `SCENARIO`。** 后者那次是坐标重复引起的误重置，
+    Phase 1a 换了成功条件之后真阀在那里一次都不响 —— 拿它测就成了空断言
+    （`len(resets) == 0`，什么也没验到）。
     """
-    run = _trace(monkeypatch, SCENARIO)
+    run = _trace(monkeypatch, SCENARIO_TRULY_BLIND)
     resets = run.payloads("军力锚点重置")
 
-    assert len(resets) == 1
+    assert len(resets) == 1, "真盲场景里阀必须响一次，否则这一条什么也证不了"
     detail = resets[0]["screens_detail"]
-    assert [screen["screen_seq"] for screen in detail] == [2, 3], (
+    triggered = resets[0]["screen_seq"]
+    assert [screen["screen_seq"] for screen in detail] == [triggered - 1, triggered], (
         f"记的不是触发它的那两屏：{detail}"
     )
+    assert all(screen["history_appended"] == 0 for screen in detail), (
+        f"真盲的指纹是「一点都没进历史」（阀现在看的就是这个）：{detail}"
+    )
     assert all(screen["fresh_valued"] == 0 for screen in detail)
-    assert all(screen["verdict_trusted"] == 3 for screen in detail)
-    assert resets[0]["screen_seq"] == 3
 
 
 def test_the_run_summary_says_where_the_last_reset_was(
@@ -154,15 +160,42 @@ def test_the_run_summary_says_where_the_last_reset_was(
     收尾补数用的是**最后**那一次重置之后攒起来的历史。一趟里 7 次前段
     误重置 + 1 次临近收尾的真重置，误触发率 87.5% —— 但修掉前七次之后，
     最后那一次照样清空全部历史，补数照样很差。所以位置才是那个关键量。
+
+    ⚠️⚠️ **用真盲场景。** `SCENARIO` 那次是误重置，Phase 1a 之后真阀不响了，
+    `last_reset_screen` 会是 `None` —— 那测不到「位置记没记对」这件事。
+    没重置的那一路由 `test_a_run_without_a_reset_says_so` 单独钉。
     """
-    run = _trace(monkeypatch, SCENARIO)
+    run = _trace(monkeypatch, SCENARIO_TRULY_BLIND)
     summary = run.payloads("采集收尾汇总")
+    reset = run.payloads("军力锚点重置")
 
     assert len(summary) == 1
+    assert len(reset) == 1, "真盲场景里阀必须响一次，否则这一条什么也证不了"
     assert summary[0]["reset_count"] == 1
-    assert summary[0]["last_reset_screen"] == 3
-    assert summary[0]["history_at_end"] == 5, "重置清掉 12 点，之后两屏又攒回 5 点"
-    assert summary[0]["shadow_resets"] == {"old": 1, "verdict": 0, "history": 0}
+    assert summary[0]["last_reset_screen"] == reset[0]["screen_seq"], (
+        "收尾报的位置得和那条重置日志说的是同一屏"
+    )
+
+
+def test_a_run_without_a_reset_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 一趟没重置过时，`last_reset_screen` 得是 `None`，不能是 0。
+
+    0 是**第一屏**的合法屏序。混成 0 的话，「整趟没重置」和「首屏就重置了」
+    在日志上长得一模一样 —— 而这两者对收尾补数的含义正好相反。
+
+    `SCENARIO` 在 Phase 1a 之后正好走这一路：旧条件本来会误重置，现行条件不会。
+    """
+    run = _trace(monkeypatch, SCENARIO)
+    summary = run.payloads("采集收尾汇总")[0]
+
+    assert run.payloads("军力锚点重置") == []
+    assert summary["reset_count"] == 0
+    assert summary["last_reset_screen"] is None, (
+        f"没重置过就该是 None，不能是 {summary['last_reset_screen']!r}"
+    )
+    assert summary["shadow_resets"] == {"old": 1, "verdict": 0, "history": 0}, (
+        "而「旧条件本来会误重置一次」这件事仍然要记着"
+    )
 
 
 # -- 逐屏语料采样 ----------------------------------------------------------
@@ -252,12 +285,11 @@ BASELINE_SAID: list[str] = [
     "  采集第  1滚 读出  3 行 本屏 bot 3 连续空屏 0",
     "  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）",
     "  采集第  2滚 读出  3 行 本屏 bot 0 连续空屏 1",
-    "⚠️ 连着 2 屏一个军力值都没采信（锚点 10510.0、曲线历史 12 点）：锚点和历史一起撤掉重新起头",
     "  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）",
     "  采集第  3滚 读出  3 行 本屏 bot 0 连续空屏 2",
     "  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）",
     "  采集第  4滚 读出  3 行 本屏 bot 3 连续空屏 0",
-    "军力值不可信，丢掉这几行的分数（坐标保留）[判据 curve/3 · 曲线参照 10430（±3.0%，1/3 行用上了，历史 5 点） · 锚点 10480.0]: [(1, 866, 1044.0, '渲染不出')]",  # noqa: E501
+    "军力值不可信，丢掉这几行的分数（坐标保留）[判据 curve/3 · 曲线参照 10440（±3.0%，2/3 行用上了，历史 17 点） · 锚点 10480.0]: [(1, 866, 1044.0, '渲染不出')]",  # noqa: E501
     "  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）",
     "  采集第  5滚 读出  3 行 本屏 bot 3 连续空屏 0",
     "军事榜采集完成：真人段走了 800 行（盲滚 700 行 + 检测 0 屏），采集段滚了 5 屏；逐屏写入 12 条，其中末屏可疑 0 条",  # noqa: E501

@@ -440,6 +440,16 @@ def locate_rows(image: Any, ocr: Any, columns: RankingColumns | None = None) -> 
     )
 
 
+#: ⚠️⚠️ **自愈阀认哪一种「这一屏成功了」。** 值是 `success` 那个字典的键。
+#:
+#: 2026-09-06 由 Phase 0 的实机语料定成 `"history"`（本屏有点真的进了曲线历史）。
+#: 三个候选的对照、以及为什么不是 `"verdict"`，见阀那一段的注释与
+#: `docs/军力榜补数/方案.md` §1.8 / §1.9。
+#:
+#: ⚠️ **这是标定常量，不是运维旋钮。** 换它要重跑配对回放
+#: （`tools.ranking_replay --condition`），不该做成配置项让人现场改。
+VALVE_CONDITION = "history"
+
 #: 整列读时，`image_to_data` 里 `conf` 低于这个数的词直接丢。
 #:
 #: tesseract 对非文字区域会吐出 `conf = -1` 的行；而半透明面板透上来的背景字
@@ -1705,21 +1715,21 @@ def scan(
     unread: list[RankingTarget] = []
     #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
     blind_score_screens = 0
-    # ⚠⚠ **影子计数：三个候选「成功条件」各自维护一份失败计数，只记录、都不生效。**
+    # ⚠⚠ **三个「成功条件」同屏并行算，其中 `VALVE_CONDITION` 那一个真的生效，
+    # 另外两个只进日志。**
     #
-    # 现行阀看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠 3–6 行 ——
-    # 一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、历史再健康，计数器照样加一**，
-    # 连着两屏就清历史 —— 而收尾补数读的是同一份历史。
+    #     success_old      任一新增目标带值（2026-09-06 之前的现行条件）
+    #     success_verdict  判据采信过任何值（曾经的首选，已被实机数据否掉）
+    #     success_history  本屏有点真的进了曲线历史 ← **现在生效的就是这个**
     #
-    # 换条件之前得先知道换了会怎样，所以三个条件同屏并行算、都只进日志：
+    # 换成 `history` 的理由在阀那一段（往下找 `VALVE_CONDITION`）与方案 §1.8/§1.9。
+    # 另外两个留着继续算，是为了能一直回答「换之前这一趟本来会误重置几次」——
+    # 那是这次改动唯一的效果指标，而它只有并行算才拿得到。
     #
-    #     success_old      任一新增目标带值（现行）
-    #     success_verdict  判据采信过任何值（首选候选）
-    #     success_history  本屏有点真的进了曲线历史
-    #
-    # ⚠️ **产出只能称为「三种条件在现行运行轨迹上的比较」。** 换条件后历史会不同、
+    # ⚠️ **产出只能称为「三种条件在这一趟实际轨迹上的比较」。** 换条件后历史会不同、
     # 后续采信也会不同，轨迹在第一次被去掉的误重置之后就分叉了 ——
-    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
+    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给
+    # （`tools.ranking_replay --condition`）。
     shadow_blind = {"old": 0, "verdict": 0, "history": 0}
     shadow_resets = {"old": 0, "verdict": 0, "history": 0}
     # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
@@ -1761,6 +1771,9 @@ def scan(
         "采集开工",
         {
             "rule_version": SCORE_RULE_VERSION,
+            # ⚠️ 自愈阀用的是哪个成功条件。日志里得有它 —— 否则事后拿两趟比重置
+            # 次数时，分不出「行为变了」和「口径换了」。
+            "valve_condition": VALVE_CONDITION,
             "package_version": evo_helper_version,
             "recording": recording,
             "bot_limit": bot_limit,
@@ -1854,13 +1867,30 @@ def scan(
                 shadow_blind[name] = 0
                 shadow_reset_here.append(name)
         if screen_seq > 0:
-            if any(target.military_score is not None for target in fresh):
+            # ⚠️⚠️ **成功条件是「本屏有点真的进了曲线历史」（`VALVE_CONDITION`）。**
+            #
+            # 原先看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠
+            # 3–6 行：一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、
+            # 历史再健康，计数器照样加一** —— 连着两屏就把锚点和历史一起清了，
+            # 而收尾补数读的正是同一份历史。
+            #
+            # 2026-09-06 实机第 1 趟（215 屏）配对回放：现行条件重置 2 次、
+            # 收尾 2060 点历史、78 个洞；换成这个条件重置 **0** 次、2077 点、72 个洞。
+            # 而且第 2 次重置**是第 1 次误重置造成的** —— 锚点和 5 点历史被清掉
+            # 之后，后面那两屏才读不出东西。误重置不是「白清一次」，它会造出
+            # 后续的失败（方案 §1.9）。
+            #
+            # ⚠️ **为什么不是 `verdict_trusted > 0`**（方案原先的首选）：
+            # `Judgement.trusted` 把采信的 **0 分**也算进去。实机第 2 趟 13 屏里
+            # 有 11 屏「采信了值但一个正数都没有」（真人段的分数读出来是 `0.0`），
+            # 那个条件会把这种屏判成成功 —— 那不是判据在工作。方案 §1.8。
+            if success[VALVE_CONDITION]:
                 blind_score_screens = 0
             else:
                 blind_score_screens += 1
                 if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
                     say(
-                        f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
+                        f"⚠️ 连着 {blind_score_screens} 屏没有一点进曲线历史"
                         f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
                         f"锚点和历史一起撤掉重新起头"
                     )

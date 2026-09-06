@@ -256,3 +256,23 @@ SCENARIO_BLIND_START = (
     _rows([10_540.0, 10_530.0, 10_520.0], system=139, first_rank=856),
     _rows([10_510.0, 10_500.0, 10_490.0], system=140, first_rank=859),
 )
+
+#: 首屏读得出、随后**两屏一个分数都读不出**、第四屏又读得出。
+#:
+#: ⚠️⚠️ **专门用来钉「换了成功条件之后，真盲还得照样重置」。**
+#:
+#: `SCENARIO` 里那次重置是**误**重置（坐标重复导致 `fresh` 为空，而判据其实读对了），
+#: 候选条件会把它去掉 —— 这是对的。但换条件的风险正好在反面：万一把真盲也一起
+#: 去掉了，自愈阀就等于废了，而那恰恰是它唯一存在的理由。
+#:
+#: 这一份里第 1、2 屏名次读得出、分数全 `None`，于是三个口径同时不成立：
+#: `fresh_valued=0`、`verdict_trusted=0`、`history_appended=0`。三个条件都该在第 2 屏响。
+#:
+#: ⚠️ `SCENARIO_BLIND_START` 顶不上这个用：那里盲的是第 0、1 屏，而首屏不进阀
+#: （`screen_seq > 0`），第 2 屏就又成功了 —— 三个条件一个都不响，什么也证不了。
+SCENARIO_TRULY_BLIND = (
+    _rows([10_600.0, 10_590.0, 10_580.0], system=137, first_rank=850),
+    _rows([None, None, None], system=138, first_rank=853),
+    _rows([None, None, None], system=139, first_rank=856),
+    _rows([10_510.0, 10_500.0, 10_490.0], system=140, first_rank=859),
+)
