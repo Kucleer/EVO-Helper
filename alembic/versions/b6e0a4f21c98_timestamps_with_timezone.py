@@ -97,7 +97,7 @@ def upgrade() -> None:
             existing_type=sa.DateTime(),
             type_=sa.DateTime(timezone=True),
             existing_nullable=nullable,
-            postgresql_using=f'"{column}" AT TIME ZONE \'UTC\'',
+            postgresql_using=f"\"{column}\" AT TIME ZONE 'UTC'",
         )
 
 
@@ -113,5 +113,5 @@ def downgrade() -> None:
             existing_nullable=nullable,
             # 反向同样要写死 UTC：裸转换会按会话时区取挂钟时间，
             # 那样降级一次就把整库的时刻平移掉了。
-            postgresql_using=f'"{column}" AT TIME ZONE \'UTC\'',
+            postgresql_using=f"\"{column}\" AT TIME ZONE 'UTC'",
         )

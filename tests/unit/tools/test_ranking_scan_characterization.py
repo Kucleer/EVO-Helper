@@ -29,206 +29,10 @@ Phase 0 第一步要把逐屏那段抽出来给首屏复用（首屏现在完全
 
 from __future__ import annotations
 
-import sys
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any
-
 import pytest
 
-from evo_helper.domain.models import Coordinate
-from evo_helper.domain.ranking import RankingRow
-from evo_helper.domain.records import RankingTarget
-from evo_helper.game.ranking_nav import ScrollOutcome, ScrollStep
-from evo_helper.game.ranking_ui import BLIND_SCROLL_MARGIN_ROWS, BLIND_SCROLL_ROWS
-from evo_helper.tools import ranking_scan
-from evo_helper.tools.ranking_scan import HumanStretch
-
-#: 真人段直接宣布「翻到 bot 区了」时报的行数。比盲滚行数多留一个余量，
-#: 免得多出一条「盲滚余量告急」的告警（同 `test_ranking_score_anchor.py`）。
-ROWS_TO_BOT_AREA = BLIND_SCROLL_ROWS + BLIND_SCROLL_MARGIN_ROWS + 17
-
-
-def _rows(scores: Sequence[float | None], *, system: int, first_rank: int) -> list[RankingRow]:
-    """一屏 bot 行：军力照 `scores` 给，名次逐行 +1，坐标按 `system` 排。
-
-    位号从 5 起：1–4 号位是游戏固定生成的海盗，`is_bot_entry` 会整行剔掉。
-    """
-    return [
-        RankingRow(
-            rank=first_rank + index,
-            name=f"bot_4_{system}_{5 + index}",
-            score=score,
-            coordinate=Coordinate(4, system, 5 + index),
-        )
-        for index, score in enumerate(scores)
-    ]
-
-
-class _NoOcr:
-    """假 `pytesseract` 模块，塞进 `sys.modules` —— `scan()` 开头那个赋值是进程级的。"""
-
-    class _Binary:
-        tesseract_cmd = ""
-
-    def __init__(self) -> None:
-        self.pytesseract = _NoOcr._Binary()
-
-
-class _Settings:
-    """假配置。三个值都故意填成不可用的：这一趟不碰 OCR，也不碰库。"""
-
-    tesseract_path = "这一趟一次 OCR 都不做"
-    player_name = "Kucleer"
-    database_url = "这一趟一次连接都不建"
-
-
-class _Driver:
-    """假 `LiveDriver`。一次点击、一次移动、一次截图都不发。"""
-
-    def capture(self) -> object:
-        return object()
-
-    def wait(self, _seconds: float) -> None:
-        pass
-
-
-class _Board:
-    """一趟采集会读到的那几屏，按顺序发。"""
-
-    def __init__(self, screens: Sequence[Sequence[RankingRow]]) -> None:
-        self.screens = [list(screen) for screen in screens]
-        self.handed = 0
-
-    def first(self) -> list[RankingRow]:
-        self.handed = 1
-        return list(self.screens[0])
-
-    def scroll_once(self) -> ScrollStep[RankingRow]:
-        rows = self.screens[self.handed]
-        self.handed += 1
-        return ScrollStep(outcome=ScrollOutcome.SCROLLED, rows=tuple(rows))
-
-
-class _Nav:
-    """假 `RankingNavigator`。只交行，不动画面。"""
-
-    def __init__(self, board: _Board) -> None:
-        self.board = board
-        self.closed = 0
-
-    def open_military_ranking(self) -> None:
-        pass
-
-    def scroll_once(self) -> ScrollStep[RankingRow]:
-        return self.board.scroll_once()
-
-    def scroll_blind(self) -> None:
-        raise AssertionError("真人段被替掉了，这一趟一屏都不该慢拖")
-
-    def spin_blind(self, *, rows: int) -> None:
-        raise AssertionError("真人段被替掉了，这一趟一格都不该拨")
-
-    def close(self) -> bool:
-        self.closed += 1
-        return True
-
-
-class _Repository:
-    """假仓储。连引擎都不建 —— 生产库和测试库一样碰不到。"""
-
-    def __init__(self) -> None:
-        self.saved: list[RankingTarget] = []
-        self.backfilled: list[RankingTarget] = []
-
-    def save_ranking_targets(self, targets: Sequence[RankingTarget]) -> None:
-        self.saved.extend(targets)
-
-    def backfill_missing_military_scores(self, records: Sequence[RankingTarget]) -> int:
-        self.backfilled.extend(records)
-        return len(records)
-
-
-def _reached_bots(**kwargs: Any) -> HumanStretch:
-    """替掉真人段：直接宣布「翻到 bot 区了」。"""
-    progress = kwargs["progress"]
-    progress.stage = ranking_scan.ScanStage.DETECTING
-    progress.blind_rows = kwargs["blind_rows"]
-    progress.human_rows = ROWS_TO_BOT_AREA
-    return HumanStretch(
-        reached_bots=True,
-        rows=ROWS_TO_BOT_AREA,
-        detection_scrolls=0,
-        reason="名字列里出现了 bot",
-    )
-
-
-@dataclass(frozen=True)
-class _Trace:
-    """一趟跑下来的全部可观测输出。"""
-
-    written: list[str]
-    said: list[str]
-    logged: list[tuple[str, dict[str, Any]]]
-
-    def payloads(self, message: str) -> list[dict[str, Any]]:
-        return [payload for logged, payload in self.logged if logged == message]
-
-
-def _trace(
-    monkeypatch: pytest.MonkeyPatch,
-    screens: Sequence[Sequence[RankingRow]],
-    *,
-    bot_limit: int | None = None,
-) -> _Trace:
-    """跑一趟，交回落库清单 / say 行 / 结构化 payload。三样都是有序的。"""
-    board = _Board(screens)
-    nav = _Nav(board)
-    repository = _Repository()
-    said: list[str] = []
-    logged: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setitem(sys.modules, "pytesseract", _NoOcr())
-    monkeypatch.setattr(ranking_scan, "Settings", _Settings)
-    monkeypatch.setattr(ranking_scan, "LiveDriver", _Driver)
-    monkeypatch.setattr(ranking_scan, "SlowDragDriver", lambda driver: driver)
-    monkeypatch.setattr(ranking_scan, "release_stuck_mouse", lambda _driver: None)
-    monkeypatch.setattr(ranking_scan, "enter_game_exit_code", lambda *_a, **_k: 0)
-    monkeypatch.setattr(ranking_scan, "RankingNavigator", lambda **_kwargs: nav)
-    monkeypatch.setattr(ranking_scan, "create_database_engine", lambda _url: None)
-    monkeypatch.setattr(ranking_scan, "create_session_factory", lambda _engine: None)
-    monkeypatch.setattr(ranking_scan, "SqlAlchemyRepository", lambda _factory: repository)
-    monkeypatch.setattr(ranking_scan, "rows_from_image", lambda *_a, **_k: board.first())
-    monkeypatch.setattr(ranking_scan, "scroll_through_humans", _reached_bots)
-    monkeypatch.setattr(ranking_scan, "say", said.append)
-
-    def _record(_level: str, _source: str, message: str, **kwargs: Any) -> None:
-        logged.append((message, dict(kwargs.get("payload") or {})))
-
-    monkeypatch.setattr(ranking_scan, "record_system_log", _record)
-
-    kwargs: dict[str, Any] = {"bot_scrolls": len(board.screens) - 1}
-    if bot_limit is not None:
-        kwargs["bot_limit"] = bot_limit
-    ranking_scan.scan(**kwargs)
-
-    written = [
-        f"{target.coordinate.galaxy}:{target.coordinate.system}:{target.coordinate.position}"
-        f" 军力={target.military_score} 估算={target.military_score_estimated}"
-        f" 名次={target.military_rank}"
-        for target in repository.saved
-    ]
-    return _Trace(written=written, said=said, logged=logged)
-
-
-#: 六屏。**第 3、4 屏故意重复前两屏的坐标** —— 见模块头「场景是挑过的」那一段。
-SCENARIO = (
-    _rows([10_600.0, 10_590.0, 10_580.0], system=137, first_rank=850),
-    _rows([10_570.0, 10_560.0, 10_550.0], system=138, first_rank=853),
-    _rows([10_540.0, 10_530.0, 10_520.0], system=137, first_rank=856),
-    _rows([10_510.0, 10_500.0, 10_490.0], system=138, first_rank=859),
-    _rows([10_480.0, 10_470.0, 10_460.0], system=139, first_rank=862),
-    _rows([10_450.0, 1_044.0, 10_430.0], system=140, first_rank=865),
-)
+from evo_helper.domain.ranking import SCORE_RULE_VERSION
+from support.ranking_runs import SCENARIO, _trace
 
 
 def test_the_written_targets_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,6 +163,62 @@ def test_the_run_summary_says_where_the_last_reset_was(
     assert summary[0]["last_reset_screen"] == 3
     assert summary[0]["history_at_end"] == 5, "重置清掉 12 点，之后两屏又攒回 5 点"
     assert summary[0]["shadow_resets"] == {"old": 1, "verdict": 0, "history": 0}
+
+
+# -- 逐屏语料采样 ----------------------------------------------------------
+
+
+def test_nothing_is_recorded_unless_the_switch_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠⚠ **默认关。** 录一趟约 1,250 行，常开会把日志表灌满。"""
+    payload = _trace(monkeypatch, SCENARIO).payloads("采集一屏")[0]
+
+    assert "rows_raw" not in payload
+    assert "prior_states" not in payload
+
+
+def test_the_switch_records_the_raw_rows_and_the_state_before_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开关打开时，每屏带上原始行与落库**之前**的库内状态。
+
+    ⚠️ **原始行要保留空值。** 回放要从同一份输入重建历史，而「名次读不出」
+    「分数读不出」正是判据要处理的情形 —— 抹平了就重建不出来。
+
+    ⚠️ **库内状态必须是写之前的。** 回放要验「已有值」「不可更新（已拉黑）」
+    那几档结果，而那些取决于写之前的样子 —— 写完再查就永远看不到了。
+    """
+    run = _trace(monkeypatch, SCENARIO, capture_rows=True)
+    payload = run.payloads("采集一屏")[0]
+
+    assert [row["rank"] for row in payload["rows_raw"]] == [850, 851, 852]
+    assert [row["score"] for row in payload["rows_raw"]] == [10_600.0, 10_590.0, 10_580.0]
+    assert payload["rows_raw"][0]["coordinate"] == "4:137:5"
+
+    states = payload["prior_states"]
+    assert states["4:137:5"]["military_score"] == 1.0, "已有值那一档"
+    assert states["4:137:6"]["blacklisted"] is True, "不可更新那一档"
+
+
+def test_a_run_that_records_says_so_and_stamps_the_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开工记录带版本标识与生效配置 —— 语料的完整性检查靠它。
+
+    ⚠️ 版本用判据指纹 + 包版本，**不用 git sha** —— 运行机上不一定拿得到。
+    """
+    run = _trace(monkeypatch, SCENARIO, capture_rows=True)
+    start = run.payloads("采集开工")
+
+    assert len(start) == 1
+    assert start[0]["recording"] is True
+    assert start[0]["rule_version"] == SCORE_RULE_VERSION
+    assert start[0]["package_version"]
+
+    summary = run.payloads("采集收尾汇总")[0]
+    assert summary["ended_because"] == "complete"
+    assert summary["recording"] is True
 
 
 #: ⚠️ 几条超长的带了 `noqa: E501` —— 它们是**录下来的原文**，折行会让重录时对不上。

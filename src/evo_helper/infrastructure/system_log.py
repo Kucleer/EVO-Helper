@@ -68,6 +68,14 @@ ENV_RUN_ID = "EVO_HELPER_LOG_RUN_ID"
 ENV_TASK_ID = "EVO_HELPER_LOG_TASK_ID"
 ENV_MISSION_KIND = "EVO_HELPER_LOG_MISSION_KIND"
 
+#: 这一趟要不要把逐屏原始行录进日志（诊断用，默认关）。
+#:
+#: ⚠️ 走环境变量而不是命令行：调度器的 `command` 在 `run_id` 生成**之前**就
+#: 建好了，而这个标记必须和那一趟的 `run_id` 绑在一起（语料的完整性检查要
+#: 回答「这批语料是哪次请求采的」）。手工直跑走扫描入口的命令行参数，
+#: 两条路在扫描器内部汇成同一个变量。
+ENV_CAPTURE_ROWS = "EVO_HELPER_RANKING_CAPTURE_ROWS"
+
 _HOST = socket.gethostname()[:64]
 
 
@@ -124,7 +132,11 @@ def context_from_environment() -> SystemLogContext:
 
 @contextmanager
 def child_environment(
-    *, run_id: UUID | None, task_id: int | None, mission_kind: str | None
+    *,
+    run_id: UUID | None,
+    task_id: int | None,
+    mission_kind: str | None,
+    capture_rows: bool = False,
 ) -> Iterator[None]:
     """在 `os.environ` 上临时挂本轮身份，好让紧接着起的子进程继承过去。
 
@@ -140,6 +152,7 @@ def child_environment(
         ENV_RUN_ID: "" if run_id is None else str(run_id),
         ENV_TASK_ID: "" if task_id is None else str(task_id),
         ENV_MISSION_KIND: (mission_kind or "").lower(),
+        ENV_CAPTURE_ROWS: "1" if capture_rows else "",
     }
     previous = {name: os.environ.get(name) for name in values}
     os.environ.update(values)
@@ -572,6 +585,7 @@ def detach_system_log_handler() -> None:
 __all__ = [
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_CAPACITY",
+    "ENV_CAPTURE_ROWS",
     "ENV_MISSION_KIND",
     "ENV_RUN_ID",
     "ENV_TASK_ID",

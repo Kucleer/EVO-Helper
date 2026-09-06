@@ -71,9 +71,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("report_id", "ship_type", name="uq_scout_trigger_report_ship"),
     )
-    op.create_index(
-        op.f("ix_scout_trigger_ships_report_id"), "scout_trigger_ships", ["report_id"]
-    )
+    op.create_index(op.f("ix_scout_trigger_ships_report_id"), "scout_trigger_ships", ["report_id"])
 
 
 def downgrade() -> None:

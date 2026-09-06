@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import pathlib
 import re
 import statistics
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+from evo_helper import __version__ as evo_helper_version
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
@@ -79,7 +81,7 @@ from evo_helper.game.ranking_ui import (
     SCROLL_STALL_CONFIRMATIONS,
     SPIN_MARK_MIN_ROWS,
 )
-from evo_helper.infrastructure.system_log import record_system_log
+from evo_helper.infrastructure.system_log import ENV_CAPTURE_ROWS, record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
@@ -713,6 +715,21 @@ def _backfill_from_the_curve(
         f"推不出 {len(unread) - len(filled)} 行]"
     )
     return BackfillOutcome(holes=len(unread), reachable=len(filled), written=written)
+
+
+def _row_record(row: RankingRow) -> dict[str, Any]:
+    """一行原始读数的语料形式。**保留空值，不抹平。**
+
+    回放要从同一份输入重建历史，所以名次读不出、分数读不出、坐标反解不出
+    这三种 `None` 都得原样存着 —— 它们正是判据要处理的情形。
+    坐标存成 `4:137:5` 那种字串，因为 JSON 里它比三个字段好认。
+    """
+    return {
+        "rank": row.rank,
+        "name": row.name,
+        "score": row.score,
+        "coordinate": None if row.coordinate is None else str(row.coordinate),
+    }
 
 
 def _drop_label(renderable: float | None, why: str | None) -> str:
@@ -1547,6 +1564,7 @@ def scan(
     detection_budget: int = BOT_DETECTION_BUDGET_SCROLLS,
     bot_scrolls: int = 400,
     bot_limit: int | None = None,
+    capture_rows: bool | None = None,
 ) -> int:
     """跑一趟榜单采集。
 
@@ -1635,6 +1653,12 @@ def scan(
         nonlocal written
         if not targets:
             return
+        # ⚠⚠ **开关打开时，落库之前把这几个坐标当时的库内状态存下来。**
+        #
+        # 回放要验到「已有值」「不可更新（已拉黑）」那几档结果，而那些取决于
+        # 写之前库里是什么样子 —— 写完再查就永远看不到了。
+        if recording:
+            prior_states.append(repository.military_states([t.coordinate for t in targets]))
         repository.save_ranking_targets(targets)
         written += len(targets)
 
@@ -1820,6 +1844,21 @@ def scan(
                 "success_history": success["history"],
                 # 哪几个候选条件会在这一屏触发一次「假想重置」。空列表 = 谁都不会。
                 "shadow_reset": shadow_reset_here,
+                # 开关打开时才带原始行。payload 是 `Text` 无长度限制，而写入路径四层
+                # 吞异常、在后台线程做、队列满只丢最旧 —— 录语料不可能把扫描搞挂。
+                **({"rows_raw": [_row_record(row) for row in rows]} if recording else {}),
+                **(
+                    {
+                        "prior_states": {
+                            str(coordinate): state
+                            for coordinate, state in (
+                                prior_states[-1] if prior_states else {}
+                            ).items()
+                        }
+                    }
+                    if recording
+                    else {}
+                ),
             },
         )
         # 这一屏的计数存起来，下一屏重置时要连着两屏一起记。
@@ -1873,6 +1912,8 @@ def scan(
     shadow_resets = {"old": 0, "verdict": 0, "history": 0}
     # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
     # 重置时一并记下去 —— 事后才分得出「真的两屏都读废了」和「去重吃掉了」。
+    #: 开关打开时，每屏落库**之前**那几个坐标的库内状态。
+    prior_states: list[dict[Coordinate, dict[str, Any]]] = []
     recent_stats: list[dict[str, Any]] = []
     #: 最后一次重置在第几屏（`None` = 整趟没重置过）。
     #:
@@ -1885,6 +1926,32 @@ def scan(
     # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
     # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
     backfill = BackfillOutcome(holes=0, reachable=0, written=0)
+    # ⚠⚠ **两条入口在这里汇成一个变量。**
+    #
+    # 调度器走环境变量（`command` 在 `run_id` 生成**之前**就建好了，
+    # 而标记必须和那一趟的 `run_id` 绑在一起）；手工直跑走 `--capture-rows`
+    # （本机是备份挂机机，要能不经调度器就开）。
+    #
+    # ⚠️ 默认关。录一趟约 1,250 行，不能常开。
+    recording = bool(capture_rows) or os.environ.get(ENV_CAPTURE_ROWS) == "1"
+    if recording:
+        say("本趟录逐屏原始行（诊断）：名次 / 坐标 / 分数 / 空值都进日志")
+    # ⚠⚠ **开工记录：语料的完整性检查靠它认「这一批是哪一趟、什么配置、哪个版本」。**
+    #
+    # 版本标识用 `SCORE_RULE_VERSION` + 包版本，**不用 git sha** —— 运行机上不一定
+    # 拿得到（那里可能根本没有 git），而判据版本指纹本来就是为了回答这个问题建的。
+    record_log(
+        "采集开工",
+        {
+            "rule_version": SCORE_RULE_VERSION,
+            "package_version": evo_helper_version,
+            "recording": recording,
+            "bot_limit": bot_limit,
+            "bot_scrolls": bot_scrolls,
+            "blind_rows": blind_rows,
+            "blind_rows_source": blind_rows_source,
+        },
+    )
 
     account = BlindSpinAccount()
     if blind_rows is None:
@@ -1978,6 +2045,17 @@ def scan(
                 step = nav.scroll_once()
                 if step.outcome is ScrollOutcome.OFF_PAGE:
                     say(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
+                    # ⚠⚠ **离页那一屏也要记一条，否则屏序会断。**
+                    # `break` 在算日志之前，所以这一屏原先一条逐屏记录都没有 ——
+                    # 而语料的完整性检查要求屏序连续不重复。
+                    record_log(
+                        "采集一屏",
+                        {
+                            "scroll": extra,
+                            "rows_read": 0,
+                            "ended_because": "off_page",
+                        },
+                    )
                     outcome = EXIT_RANKING_INCOMPLETE
                     break
                 reached_limit = process_screen(list(step.rows), screen_seq=extra)
@@ -2029,6 +2107,11 @@ def scan(
                 "backfill_reachable": backfill.reachable,
                 "backfill_written": backfill.written,
                 "shadow_resets": dict(shadow_resets),
+                # 结束原因：完成 / 达到上限 / 离页 / 异常；以及收尾补数到底跑没跑。
+                # 两样都是完整性检查要看的 —— 缺结束记录的批次要标为不完整。
+                "ended_because": ("off_page" if outcome == EXIT_RANKING_INCOMPLETE else "complete"),
+                "backfill_ran": backfill.holes > 0 or backfill.written > 0,
+                "recording": recording,
             },
         )
         # ⚠️ **没接上的屏单独报一行，不塞进 `completion_message`。**
@@ -2144,6 +2227,14 @@ def build_parser() -> argparse.ArgumentParser:
             "只在没给 --blind-rows 时才生效"
         ),
     )
+    parser.add_argument(
+        "--capture-rows",
+        action="store_true",
+        help=(
+            "【诊断用】把逐屏原始行（名次/坐标/分数/空值）录进日志，供离线回放。"
+            "调度器那一路走一次性请求（环境变量），这个参数是给手工直跑的"
+        ),
+    )
     for name in ("rank", "name", "score"):
         parser.add_argument(
             f"--{name}-column", nargs=2, type=int, metavar=("LEFT", "RIGHT"), default=None
@@ -2196,6 +2287,7 @@ def main(argv: list[str] | None = None) -> int:
             blind_rows=blind_rows,
             blind_rows_source=blind_rows_source,
             blind_scrolls=BLIND_SCROLLS if args.blind_scrolls is None else args.blind_scrolls,
+            capture_rows=args.capture_rows or None,
         )
     )
 

@@ -49,6 +49,9 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "battle_report_screenshots.captured_at_utc",
         "battle_reports.reported_at_utc",
         "bot_targets.blacklisted_at_utc",
+        # b3e8f1a26d47（一次性的逐屏语料采样请求）随表建的，那条迁移里写着 `timezone=True`。
+        "ranking_capture_requests.requested_at_utc",
+        "ranking_capture_requests.consumed_at_utc",
         "bot_targets.last_attack_at_utc",
         "bot_targets.last_dispatch_at_utc",
         "bot_targets.last_report_at_utc",
@@ -135,6 +138,9 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "scheduler_uptime_segments.last_beat_at_utc",
         # a7d3e91c05b2（永久拉黑的时刻）加的，那条迁移里也写着 `timezone=True`。
         "bot_targets.blacklisted_at_utc",
+        # b3e8f1a26d47（一次性的逐屏语料采样请求）随表建的，那条迁移里写着 `timezone=True`。
+        "ranking_capture_requests.requested_at_utc",
+        "ranking_capture_requests.consumed_at_utc",
         # f2c04b8ae153（退避到期自动恢复）加的，那条迁移里也写着 `timezone=True`。
         "mission_tasks.retry_after_utc",
     }

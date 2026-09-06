@@ -55,6 +55,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     with op.batch_alter_table("scheduler_config") as batch:
         for name, default in _COLUMNS:
-            batch.add_column(
-                sa.Column(name, sa.Integer(), nullable=False, server_default=default)
-            )
+            batch.add_column(sa.Column(name, sa.Integer(), nullable=False, server_default=default))

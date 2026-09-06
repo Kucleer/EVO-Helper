@@ -128,9 +128,7 @@ def upgrade() -> None:
     with op.batch_alter_table(
         "mission_tasks", copy_from=_mission_tasks(with_added=False), recreate="always"
     ) as batch:
-        batch.add_column(
-            sa.Column("name", sa.String(length=60), nullable=False, server_default="")
-        )
+        batch.add_column(sa.Column("name", sa.String(length=60), nullable=False, server_default=""))
         batch.add_column(sa.Column("origin_galaxy", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("origin_system", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("origin_position", sa.Integer(), nullable=True))
@@ -173,9 +171,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     duplicated = bind.execute(
-        sa.text(
-            "SELECT kind, COUNT(*) AS n FROM mission_tasks GROUP BY kind HAVING COUNT(*) > 1"
-        )
+        sa.text("SELECT kind, COUNT(*) AS n FROM mission_tasks GROUP BY kind HAVING COUNT(*) > 1")
     ).all()
     if duplicated:
         listed = "、".join(f"{kind}×{count}" for kind, count in duplicated)
