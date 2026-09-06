@@ -1643,7 +1643,11 @@ def scan(
         #
         # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
         # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
-        dry = 0 if fresh else dry + 1
+        # ⚠️ **`dry` 和自愈阀一样是「决策」机制**（够 `DRY_SCREENS` 就收工），
+        # 所以同样闸在 `screen_seq > 0` 里。首屏这一步只加**记账**（日志、
+        # 重叠判断、计数）；它要不要参与这两个决策，是下一步单独的事。
+        if screen_seq > 0:
+            dry = 0 if fresh else dry + 1
         screens.append(fresh)
         # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
         # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
@@ -1799,20 +1803,15 @@ def scan(
         if outcome == 0:
             progress.stage = ScanStage.COLLECTING
             rows = read_rows()
-            first, reached_limit = collect(
-                targets_from_rows(
-                    rows,
-                    observed_at=datetime.now(UTC),
-                    anchor=score_anchor,
-                    history=score_history,
-                )
-            )
-            score_anchor = next_score_anchor(rows, anchor=score_anchor)
-            screens.append(first)
+            # ⚠️ **首屏走同一条路（`screen_seq=0`）。** 它原先在循环外另写一份，
+            # 于是不打「采集一屏」日志、没有重叠判断、也不进任何计数 ——
+            # 而 `bot_limit` 在首屏就采够时 `range(1, 0)` 为空，那一趟连一条逐屏日志都没有。
+            #
+            # ⚠️ `dry` 要在调用之前绑上：`process_screen` 会读它（尽管首屏不更新它）。
+            dry = 0
+            reached_limit = process_screen(rows, screen_seq=0)
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
-            dry = 0
-            previous_coordinates = coordinates_of(rows)
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 progress.collect_scrolls = extra
                 step = nav.scroll_once()
