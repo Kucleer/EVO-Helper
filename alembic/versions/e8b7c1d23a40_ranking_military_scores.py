@@ -24,11 +24,17 @@ _TIMESTAMP_COLUMNS = (("bot_targets", "military_score_at_utc"),)
 
 def upgrade() -> None:
     with op.batch_alter_table("bot_targets") as batch:
-        batch.add_column(sa.Column("source", sa.String(length=16), nullable=False, server_default="scan"))
-        batch.add_column(sa.Column("military_score", sa.Float(), nullable=True))
-        batch.add_column(sa.Column("military_score_at_utc", sa.DateTime(timezone=True), nullable=True))
         batch.add_column(
-            sa.Column("military_score_estimated", sa.Boolean(), nullable=False, server_default=sa.false())
+            sa.Column("source", sa.String(length=16), nullable=False, server_default="scan")
+        )
+        batch.add_column(sa.Column("military_score", sa.Float(), nullable=True))
+        batch.add_column(
+            sa.Column("military_score_at_utc", sa.DateTime(timezone=True), nullable=True)
+        )
+        batch.add_column(
+            sa.Column(
+                "military_score_estimated", sa.Boolean(), nullable=False, server_default=sa.false()
+            )
         )
 
 

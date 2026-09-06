@@ -36,15 +36,19 @@ def upgrade() -> None:
     if existing:
         return
 
-    rows = connection.execute(
-        sa.text(
-            "SELECT military_rank, latest_owner_name, military_score, galaxy, system, position "
-            "FROM bot_targets "
-            "WHERE military_score IS NOT NULL "
-            "ORDER BY CASE WHEN military_rank IS NULL THEN 1 ELSE 0 END, "
-            "military_rank ASC, military_score DESC, galaxy, system, position"
+    rows = (
+        connection.execute(
+            sa.text(
+                "SELECT military_rank, latest_owner_name, military_score, galaxy, system, position "
+                "FROM bot_targets "
+                "WHERE military_score IS NOT NULL "
+                "ORDER BY CASE WHEN military_rank IS NULL THEN 1 ELSE 0 END, "
+                "military_rank ASC, military_score DESC, galaxy, system, position"
+            )
         )
-    ).mappings().all()
+        .mappings()
+        .all()
+    )
     if not rows:
         return
 

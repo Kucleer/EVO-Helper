@@ -667,6 +667,16 @@ class Judgement:
     #:
     #: 而这个数本身就是能在第一天抳住那次回归的信号——它会一直是 0。
     references: list[float | None]
+    #: 本屏**真的追加进历史**的那几个 `(名次, 军力)`。
+    #:
+    #: ⚠️ **它不等于 `trusted` 里非空的个数。** 追加还要同时满足「名次读得出来」
+    #: 与「值为正」，所以名次全缺失的一屏可以「采信了很多值、却一个点也没进历史」。
+    #: 分开量才分得出「判据失败」和「名次缺失」—— 而自愈阀到底该监测哪一种，
+    #: 正是 `docs/军力榜补数/方案.md` 的 Phase 0 要量的事。
+    #:
+    #: ⚠️ 历史**不按名次去重**，重复名次会让这份变长而曲线并没真的往前走。
+    #: 要分这一层，数「不同名次」而不是数条数。
+    appended: list[tuple[int, float]]
 
 
 def judge_scores(
@@ -776,6 +786,7 @@ def judge_scores(
 
     trusted: list[float | None] = []
     references: list[float | None] = []
+    appended: list[tuple[int, float]] = []
     for index, score in enumerate(scores):
         if score is None:
             trusted.append(None)
@@ -828,7 +839,8 @@ def judge_scores(
             # 「锚点只跟着可信值走」。
             if history is not None and rank is not None:
                 history.append((rank, score))
-    return Judgement(trusted=trusted, reasons=reasons, references=references)
+                appended.append((rank, score))
+    return Judgement(trusted=trusted, reasons=reasons, references=references, appended=appended)
 
 
 def score_drop_reasons(

@@ -701,6 +701,40 @@ class MilitaryRankingSnapshotRow(Base):
     row_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class RankingCaptureRequestRow(Base):
+    """一次性的「下一趟扫描把逐屏原始行录下来」请求。
+
+    用户点一次 → 写一行；调度器起子进程前原子地把待消费的全部标上
+    `consumed_at_utc` 与那一趟的 `run_id`，录完即失效。
+
+    ## ⚠⚠ 为什么不能放在任务参数里
+
+    任务参数是**可重复使用**的：写个布尔进去之后每一趟都会录，
+    而逐屏原始行一趟约 1,250 行。「子进程结束」也不能保证下次不再开 ——
+    它只能保证那一个进程没了。消费必须落库。
+
+    ## ⚠️ 消费时机：**起子进程之前**
+
+    不能绑到 `begin_mission_run` —— 它在子进程起来**之后**才跑。
+    子进程起不来时请求被白白消费掉，用户再点一次就行 ——
+    这个失败方向比「多录一趟」便宜，也没有崩溃窗口。
+
+    `consumed_by_run_id` 不是装饰：语料的完整性检查要回答「这批语料是哪次
+    请求采的」，而只有这一列把两边接上。
+    """
+
+    __tablename__ = "ranking_capture_requests"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    #: 用户点下那一刻。
+    requested_at_utc: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+    #: 被哪一刻消费掉。**`NULL` = 还没被消费**，不是某个具体时刻。
+    #: 原子 claim 就是拿这一列当条件（`WHERE consumed_at_utc IS NULL`）。
+    consumed_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)
+    #: 消费它的那一趟。`NULL` = 还没被消费。
+    consumed_by_run_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+
+
 class MilitaryRankingEntryRow(Base):
     """A ranking line retained with its snapshot so score changes stay auditable."""
 

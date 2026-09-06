@@ -233,7 +233,13 @@ class _Run:
         return [payload for logged, payload in self.logs if logged == message]
 
     def overlap(self) -> list[bool | None]:
-        """每一屏 `record_log("采集一屏")` 里那个 `overlap_intact`。"""
+        """每一屏 `record_log("采集一屏")` 里那个 `overlap_intact`。
+
+        ⚠️ **第 0 项是首屏，恒为 `None`。** 首屏没有上一屏可比，
+        而 `screens_overlap` 对空集答「不知道」——那是对的。
+        首屏原先根本不打这条日志（它走在滚动循环外），
+        现在走同一条路了，所以多出这一项。
+        """
         return [payload["overlap_intact"] for payload in self.payloads("采集一屏")]
 
 
@@ -310,7 +316,7 @@ def test_a_broken_overlap_is_reported_on_the_spot_and_in_the_payload(
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True, False], "接没接上要进 `采集一屏` 的 payload，事后才查得出"
+    assert run.overlap() == [None, True, False], "接没接上要进 `采集一屏` 的 payload，事后才查得出"
     assert "⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）" in run.lines()
     assert ("采集重叠断裂", {"screens_without_overlap": 1}) in run.logs
     assert (
@@ -333,7 +339,7 @@ def test_the_broken_screens_add_up_across_the_whole_run(monkeypatch: pytest.Monk
 
     assert run.scan() == 0
 
-    assert run.overlap() == [False, False]
+    assert run.overlap() == [None, False, False]
     assert ("采集重叠断裂", {"screens_without_overlap": 2}) in run.logs
 
 
@@ -365,7 +371,7 @@ def test_ranks_read_wrong_never_produce_an_alert(monkeypatch: pytest.MonkeyPatch
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True]
+    assert run.overlap() == [None, True]
     assert not [line for line in run.lines() if "重叠" in line or "漏掉" in line]
     assert run.payloads("采集重叠断裂") == []
 
@@ -389,7 +395,7 @@ def test_a_run_whose_overlap_never_broke_says_nothing_about_it(
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True, True, True]
+    assert run.overlap() == [None, True, True, True]
     assert run.payloads("采集重叠断裂") == []
     assert not [line for line in run.lines() if "重叠" in line or "漏掉" in line]
 
@@ -404,7 +410,7 @@ def test_one_shared_row_is_enough(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert run.scan() == 0
 
-    assert run.overlap() == [True, True]
+    assert run.overlap() == [None, True, True]
     assert not [line for line in run.lines() if "重叠" in line]
 
 
@@ -435,7 +441,7 @@ def test_a_screen_with_no_readable_coordinate_does_not_poison_the_next_compariso
 
     assert run.scan() == 0
 
-    assert run.overlap() == [None, None, True], (
+    assert run.overlap() == [None, None, None, True], (
         "坐标全读不出的那一屏答 None，紧接着的下一屏也答 None；第四屏恢复正常比较"
     )
     assert not [line for line in run.lines() if "重叠" in line], "一行都没跳，不许报"

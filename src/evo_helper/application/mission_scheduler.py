@@ -2877,7 +2877,23 @@ class MissionScheduler:
         # 好把自己写进 `system_log` 的每一行都挂到这一轮上。起完再生成就晚了，
         # 那台机器上的日志会全部落成「不属于任何一轮」。
         run_id = uuid4()
-        with child_environment(run_id=run_id, task_id=task.task_id, mission_kind=task.kind.value):
+        # ⚠⚠ **领走「录逐屏原始行」那个一次性请求，就在这里。**
+        #
+        # 不能绑到下面那句 `begin_mission_run` —— 它在子进程起来**之后**才跑，
+        # 而标记必须跟着进程一起出发。领走是一条原子语句（账在
+        # `repository.claim_ranking_capture` 上），所以不会被领两次。
+        #
+        # 子进程起不来时请求白白消费掉，用户再点一次就行 ——
+        # 这个失败方向比「多录一趟 1,250 行」便宜，也没有崩溃窗口。
+        capture_rows = task.kind is MissionKind.RANKING and self._repository.claim_ranking_capture(
+            run_id=run_id, now_utc=datetime.now(UTC)
+        )
+        with child_environment(
+            run_id=run_id,
+            task_id=task.task_id,
+            mission_kind=task.kind.value,
+            capture_rows=capture_rows,
+        ):
             child = self._supervisor.start(task.kind, command, task_id=task.task_id, name=task.name)
         self._run_id = self._repository.begin_mission_run(
             task.kind,

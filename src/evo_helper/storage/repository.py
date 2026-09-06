@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -2068,6 +2069,99 @@ class SqlAlchemyRepository:
             )
             session.commit()
             return int(result.rowcount or 0)
+
+    def military_states(
+        self, coordinates: Sequence[Coordinate]
+    ) -> dict[Coordinate, dict[str, Any]]:
+        """这几个坐标**此刻**在库里长什么样。没有行的不出现在结果里。
+
+        只给逐屏语料用：回放要重建「当时库里是什么状态」，否则验不到
+        「已有值」「不可更新（已拉黑）」那几档结果。
+
+        ⚠️ **不要为了它去改 `save_ranking_targets` 的契约。** 那一步虽然也逐坐标查过
+        一次，但它不交回任何东西 —— 把诊断需要的东西塞进主写入路径，是拿一条
+        常开的契约变动去换一条默认关的诊断功能。多一次查询且只在开关打开时跑。
+        """
+        if not coordinates:
+            return {}
+        states: dict[Coordinate, dict[str, Any]] = {}
+        with self._session_factory() as session:
+            for coordinate in coordinates:
+                target = _bot_target_for(session, coordinate)
+                if target is None:
+                    continue
+                states[coordinate] = {
+                    "military_score": target.military_score,
+                    "estimated": target.military_score_estimated,
+                    "blacklisted": target.blacklisted_at_utc is not None,
+                }
+        return states
+
+    def ranking_capture_payloads(self, run_id: UUID) -> list[tuple[str, dict[str, Any]]]:
+        """某一趟扫描录下的结构化日志，按时间升序。供离线回放读语料。
+
+        ⚠️ 只取 `tools.ranking_scan` 那一个 source —— 同一趟里别的模块也在往
+        `system_log` 写，而回放只认采集循环自己那几条。
+        """
+        rows = (
+            select(orm.SystemLogRow.message, orm.SystemLogRow.payload_json)
+            .where(
+                orm.SystemLogRow.run_id == run_id,
+                orm.SystemLogRow.source == "tools.ranking_scan",
+            )
+            .order_by(orm.SystemLogRow.logged_at_utc)
+        )
+        out: list[tuple[str, dict[str, Any]]] = []
+        with self._session_factory() as session:
+            for message, payload_json in session.execute(rows):
+                try:
+                    payload = json.loads(payload_json or "{}")
+                except ValueError:
+                    payload = {}
+                out.append((str(message), payload if isinstance(payload, dict) else {}))
+        return out
+
+    def request_ranking_capture(self, *, now_utc: datetime) -> None:
+        """记下一次「下一趟扫描把逐屏原始行录下来」的请求。
+
+        用户点一次 → 一行。多点几次不报错 —— 下一趟会把待消费的全部一次消掉，
+        效果与点一次一样（只录一趟）。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            session.add(orm.RankingCaptureRequestRow(requested_at_utc=now_utc))
+            session.commit()
+
+    def claim_ranking_capture(self, *, run_id: UUID, now_utc: datetime) -> bool:
+        """把待消费的请求一次领走，交回「这一趟该不该录」。
+
+        ## ⚠⚠ 一条原子语句，不是「先查再改」
+
+            UPDATE ranking_capture_requests
+               SET consumed_at_utc = :now, consumed_by_run_id = :run_id
+             WHERE consumed_at_utc IS NULL
+
+        再看 `rowcount`。先查再改的写法在两步之间留下窗口，而这个方法的全部
+        意义就是「只能被领走一次」。形状照 `release_attack_lines`，仓库里已有先例。
+
+        ## ⚠️ 谁来调它：调度器，**起子进程之前**
+
+        不能绑到 `begin_mission_run` —— 它在子进程起来**之后**才跑。
+        子进程起不来时请求被白白消费掉，用户再点一次就行；
+        这个失败方向比「多录一趟 1,250 行」便宜，也没有崩溃窗口。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    update(orm.RankingCaptureRequestRow)
+                    .where(orm.RankingCaptureRequestRow.consumed_at_utc.is_(None))
+                    .values(consumed_at_utc=now_utc, consumed_by_run_id=run_id)
+                ),
+            )
+            session.commit()
+            return int(result.rowcount or 0) > 0
 
     def last_dispatch_at(self, target_kind: str, *, origin: Coordinate) -> datetime | None:
         """这种目标最近一次**从这颗星球**真的派出去是什么时候。一次都没有则为 None。

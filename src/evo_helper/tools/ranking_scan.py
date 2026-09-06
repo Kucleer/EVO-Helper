@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import pathlib
 import re
 import statistics
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+from evo_helper import __version__ as evo_helper_version
 from evo_helper.config import Settings
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.quantities import parse_quantity
@@ -79,7 +81,7 @@ from evo_helper.game.ranking_ui import (
     SCROLL_STALL_CONFIRMATIONS,
     SPIN_MARK_MIN_ROWS,
 )
-from evo_helper.infrastructure.system_log import record_system_log
+from evo_helper.infrastructure.system_log import ENV_CAPTURE_ROWS, record_system_log
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.repository import SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
@@ -615,12 +617,29 @@ def next_score_anchor(rows: Sequence[RankingRow], *, anchor: float | None) -> fl
     return max(trusted) if trusted else anchor
 
 
+@dataclass(frozen=True)
+class BackfillOutcome:
+    """收尾补数的三个数。**分三个而不是一个。**
+
+    「推得出」和「真正写进库」不相等（库里已经有值的不覆盖），
+    而「洞有多少」才是分母 —— 只报一个数时，补上率是算不出来的。
+    账在 `docs/军力榜补数/方案.md` 的5（「分三个数报」）。
+    """
+
+    #: 本趟读到名次却没读出军力值的行数。分母。
+    holes: int
+    #: 其中曲线推得出来的。
+    reachable: int
+    #: 其中真正写进库的（库里已有值的不覆盖）。
+    written: int
+
+
 def _backfill_from_the_curve(
     repository: Any,
     unread: Sequence[RankingTarget],
     *,
     history: Sequence[tuple[int, float]],
-) -> int:
+) -> BackfillOutcome:
     """拿这一趟攒下来的曲线，把没读出军力值的那些行补上，交出补了几条。
 
     用户口径（2026-09-02，逐字）：
@@ -648,7 +667,7 @@ def _backfill_from_the_curve(
        不需要另写一道判据。
     """
     if not unread or not history:
-        return 0
+        return BackfillOutcome(holes=len(unread), reachable=0, written=0)
     filled = [
         replace(target, military_score=reference, military_score_estimated=True)
         for target in unread
@@ -683,7 +702,7 @@ def _backfill_from_the_curve(
     ]
     if not filled:
         say(f"曲线补数：{len(unread)} 行没读出军力值，一条都补不了（历史 {len(history)} 点）")
-        return 0
+        return BackfillOutcome(holes=len(unread), reachable=0, written=0)
     written = int(repository.backfill_missing_military_scores(filled))
     ranks = sorted(t.military_rank for t in filled if t.military_rank is not None)
     say(
@@ -695,7 +714,22 @@ def _backfill_from_the_curve(
         f"[判据 {SCORE_RULE_VERSION} · 历史 {len(history)} 点 · "
         f"推不出 {len(unread) - len(filled)} 行]"
     )
-    return written
+    return BackfillOutcome(holes=len(unread), reachable=len(filled), written=written)
+
+
+def _row_record(row: RankingRow) -> dict[str, Any]:
+    """一行原始读数的语料形式。**保留空值，不抹平。**
+
+    回放要从同一份输入重建历史，所以名次读不出、分数读不出、坐标反解不出
+    这三种 `None` 都得原样存着 —— 它们正是判据要处理的情形。
+    坐标存成 `4:137:5` 那种字串，因为 JSON 里它比三个字段好认。
+    """
+    return {
+        "rank": row.rank,
+        "name": row.name,
+        "score": row.score,
+        "coordinate": None if row.coordinate is None else str(row.coordinate),
+    }
 
 
 def _drop_label(renderable: float | None, why: str | None) -> str:
@@ -736,13 +770,50 @@ def _no_bracket_because(scores: Sequence[float | None]) -> str:
     return f"首尾跨度 {head / tail:.1f} 倍，超过上限 {SCREEN_SPREAD_LIMIT:.0f}"
 
 
-def targets_from_rows(
+@dataclass(frozen=True)
+class ScreenOutcome:
+    """一屏判完之后交出来的东西：目标，以及**同一次判定**的几个计数。
+
+    ⚠️ **这几个数必须出自判据那一次，不允许从 `targets` 里反推。**
+
+    `targets` 是**过滤后**的：`coordinate is None or not is_bot_entry(...)` 的行在这之前
+    就 `continue` 掉了，而历史追加发生在**过滤之前**（在 `judge_scores` 内部逐行进行）。
+    所以真人行 / 名字读不出的行上采信的值进了历史，却不出现在 `targets` 里 ——
+    从返回值统计「判据采信了多少」必然偏少。
+
+    四个来源分开记，因为它们失败的方式不同：
+
+    - `verdict_trusted` / `verdict_positive` → 判据本身成没成功
+    - `history_appended` / `history_new_ranks` → 名次缺失会让采信值进不了历史
+    - `bot_measured` → bot / 坐标过滤吃掉了多少
+
+    账在 `docs/军力榜补数/方案.md` 的 1.1。
+    """
+
+    targets: list[RankingTarget]
+    #: `Judgement.trusted` 里**非 `None`** 的个数。影子条件用的是这一个。
+    #:
+    #: ⚠️ 用非空而不是正值，是为了让「新条件只会响得更少」严格成立：
+    #: 判据允许采信 `0`，而 `0` 会让目标带值（旧条件算成功）却不计入正值。
+    #: 那个边界可达范围极窄（要整屏没有任何可读正值），但定义用非空就不留这个口子。
+    verdict_trusted: int
+    #: 其中正值的个数。诊断用 —— 它和上一格相等是常态，不等就是榜上有 0 分行。
+    verdict_positive: int
+    #: 本屏真的追加进历史的条数。
+    history_appended: int
+    #: 其中不同名次的个数。历史不按名次去重，重复名次不算曲线往前走。
+    history_new_ranks: int
+    #: 过滤后 bot 行里的**实读**值个数（非空且非估算）。
+    bot_measured: int
+
+
+def judge_rows(
     rows: list[RankingRow],
     *,
     observed_at: datetime,
     anchor: float | None = None,
     history: list[tuple[int, float]] | None = None,
-) -> list[RankingTarget]:
+) -> ScreenOutcome:
     """修名次、**丢掉破坏降序的军力值**、插补空缺，并留下「这个数是估算的」的证据。
 
     ⚠️ **降序异常必须丢，不能只打印。** 2026-08-15 那一夜的教训：库里 30 个 bot
@@ -863,7 +934,32 @@ def targets_from_rows(
                 military_rank=repaired[index],
             )
         )
-    return targets
+    return ScreenOutcome(
+        targets=targets,
+        verdict_trusted=sum(1 for value in verdict.trusted if value is not None),
+        verdict_positive=sum(1 for value in verdict.trusted if value),
+        history_appended=len(verdict.appended),
+        history_new_ranks=len({rank for rank, _ in verdict.appended}),
+        bot_measured=sum(
+            1
+            for target in targets
+            if target.military_score is not None and not target.military_score_estimated
+        ),
+    )
+
+
+def targets_from_rows(
+    rows: list[RankingRow],
+    *,
+    observed_at: datetime,
+    anchor: float | None = None,
+    history: list[tuple[int, float]] | None = None,
+) -> list[RankingTarget]:
+    """只要目标那一份。判据整段在 `judge_rows` 上。
+
+    要同一次判定的计数（影子条件、自愈阀的上下文）就直接用 `judge_rows`。
+    """
+    return judge_rows(rows, observed_at=observed_at, anchor=anchor, history=history).targets
 
 
 def take_batch_targets(
@@ -1468,6 +1564,7 @@ def scan(
     detection_budget: int = BOT_DETECTION_BUDGET_SCROLLS,
     bot_scrolls: int = 400,
     bot_limit: int | None = None,
+    capture_rows: bool | None = None,
 ) -> int:
     """跑一趟榜单采集。
 
@@ -1556,6 +1653,12 @@ def scan(
         nonlocal written
         if not targets:
             return
+        # ⚠⚠ **开关打开时，落库之前把这几个坐标当时的库内状态存下来。**
+        #
+        # 回放要验到「已有值」「不可更新（已拉黑）」那几档结果，而那些取决于
+        # 写之前库里是什么样子 —— 写完再查就永远看不到了。
+        if recording:
+            prior_states.append(repository.military_states([t.coordinate for t in targets]))
         repository.save_ranking_targets(targets)
         written += len(targets)
 
@@ -1602,6 +1705,70 @@ def scan(
     unread: list[RankingTarget] = []
     #: 连着几屏一个军力值都没采信——自愈阀的计数器，账见循环里那段注释。
     blind_score_screens = 0
+    # ⚠⚠ **影子计数：三个候选「成功条件」各自维护一份失败计数，只记录、都不生效。**
+    #
+    # 现行阀看的是 `fresh`（去重后的新增带值目标），而相邻两屏本来就重叠 3–6 行 ——
+    # 一屏全是已见过的坐标时 `fresh` 必然为空，**OCR 再正确、历史再健康，计数器照样加一**，
+    # 连着两屏就清历史 —— 而收尾补数读的是同一份历史。
+    #
+    # 换条件之前得先知道换了会怎样，所以三个条件同屏并行算、都只进日志：
+    #
+    #     success_old      任一新增目标带值（现行）
+    #     success_verdict  判据采信过任何值（首选候选）
+    #     success_history  本屏有点真的进了曲线历史
+    #
+    # ⚠️ **产出只能称为「三种条件在现行运行轨迹上的比较」。** 换条件后历史会不同、
+    # 后续采信也会不同，轨迹在第一次被去掉的误重置之后就分叉了 ——
+    # 不能拿影子事件当成换条件后的真实重置集合。那个只有逐屏语料回放能给。
+    shadow_blind = {"old": 0, "verdict": 0, "history": 0}
+    shadow_resets = {"old": 0, "verdict": 0, "history": 0}
+    # ⚠️ **阀基于连续两屏，所以只记触发当屏不够。** 留最近两屏的计数，
+    # 重置时一并记下去 —— 事后才分得出「真的两屏都读废了」和「去重吃掉了」。
+    #: 开关打开时，每屏落库**之前**那几个坐标的库内状态。
+    prior_states: list[dict[Coordinate, dict[str, Any]]] = []
+    recent_stats: list[dict[str, Any]] = []
+    #: 最后一次重置在第几屏（`None` = 整趟没重置过）。
+    #:
+    #: ⚠⚠ **它比「重置共几次」重要得多。** 收尾补数用的是**最后**那一次重置
+    #: 之后攒起来的历史：一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发
+    #: 率 87.5%，但修掉前七次之后最后那一次照样清空全部历史。
+    last_reset_screen: int | None = None
+    reset_count = 0
+    # ⚠️ **`dry` 得在这里绑上，不能等到首屏那一句。**
+    #
+    # `process_screen` 拿 `nonlocal` 读它，而 mypy 要求绑定出现在嵌套函数
+    # **之前**（运行时不在乎文本顺序，但 CI 那道门在乎）。
+    dry = 0
+    # ⚠️ **提到 `try` 之前。** 汇总那一条在 `finally` 里，而补数在 `try` 里 ——
+    # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
+    # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
+    backfill = BackfillOutcome(holes=0, reachable=0, written=0)
+    # ⚠⚠ **两条入口在这里汇成一个变量。**
+    #
+    # 调度器走环境变量（`command` 在 `run_id` 生成**之前**就建好了，
+    # 而标记必须和那一趟的 `run_id` 绑在一起）；手工直跑走 `--capture-rows`
+    # （本机是备份挂机机，要能不经调度器就开）。
+    #
+    # ⚠️ 默认关。录一趟约 1,250 行，不能常开。
+    recording = bool(capture_rows) or os.environ.get(ENV_CAPTURE_ROWS) == "1"
+    if recording:
+        say("本趟录逐屏原始行（诊断）：名次 / 坐标 / 分数 / 空值都进日志")
+    # ⚠⚠ **开工记录：语料的完整性检查靠它认「这一批是哪一趟、什么配置、哪个版本」。**
+    #
+    # 版本标识用 `SCORE_RULE_VERSION` + 包版本，**不用 git sha** —— 运行机上不一定
+    # 拿得到（那里可能根本没有 git），而判据版本指纹本来就是为了回答这个问题建的。
+    record_log(
+        "采集开工",
+        {
+            "rule_version": SCORE_RULE_VERSION,
+            "package_version": evo_helper_version,
+            "recording": recording,
+            "bot_limit": bot_limit,
+            "bot_scrolls": bot_scrolls,
+            "blind_rows": blind_rows,
+            "blind_rows_source": blind_rows_source,
+        },
+    )
 
     account = BlindSpinAccount()
     if blind_rows is None:
@@ -1634,6 +1801,195 @@ def scan(
     screens: list[list[RankingTarget]] = []
     outcome = 0
     progress = ScanProgress()
+
+    def process_screen(rows: list[RankingRow], *, screen_seq: int) -> bool:
+        """判一屏、落库、更新锚点与自愈阀、记账。交回「本批采够了吗」。
+
+        ⚠️ **这一段原先只写在滚动循环里，首屏走的是另一条路。** 于是首屏不打
+        「采集一屏」日志、没有 `dry`、没有重叠判断，**也不进自愈阀的计数** ——
+        它可以把坏点写进曲线历史而永远不被计为一次失败。而 `bot_limit` 在首屏
+        就采够时 `range(1, 0)` 为空，那一趟连一条逐屏日志都不会有。
+
+        抽出来是为了让首屏能走同一条路（`screen_seq=0`）。
+        ⚠️ **自愈阀那一段用 `screen_seq > 0` 闸着**：先只搬代码，首屏进不进阀
+        是下一步单独的决定（账在 `docs/军力榜补数/方案.md` 的 6.1）。
+        """
+        nonlocal score_anchor, blind_score_screens, dry, previous_coordinates
+        nonlocal screens_without_overlap, last_reset_screen, reset_count
+        outcome = judge_rows(
+            rows,
+            observed_at=datetime.now(UTC),
+            anchor=score_anchor,
+            history=score_history,
+        )
+        fresh, reached = collect(outcome.targets)
+        score_anchor = next_score_anchor(rows, anchor=score_anchor)
+        # 三个候选条件同屏并行算，各自记失败；**都不影响真阀**。
+        # 账在 `shadow_blind` 那段注释上。
+        fresh_valued = sum(1 for target in fresh if target.military_score is not None)
+        success = {
+            "old": fresh_valued > 0,
+            "verdict": outcome.verdict_trusted > 0,
+            "history": outcome.history_appended > 0,
+        }
+        # ⚠️ **这一屏的计数要在阀之前就算好。** 阀是看「连续两屏」才响的，
+        # 而其中一屏就是当前这一屏 —— 算在阀后面的话，重置日志里记的会是
+        # 前两屏，恰好漏掉触发它的那一屏。
+        stats = {
+            "screen_seq": screen_seq,
+            "verdict_trusted": outcome.verdict_trusted,
+            "history_appended": outcome.history_appended,
+            "history_new_ranks": outcome.history_new_ranks,
+            "bot_measured": outcome.bot_measured,
+            "fresh_valued": fresh_valued,
+        }
+        shadow_reset_here = []
+        for name, ok in success.items():
+            if ok:
+                shadow_blind[name] = 0
+                continue
+            shadow_blind[name] += 1
+            if shadow_blind[name] >= SCORE_ANCHOR_RESET_SCREENS:
+                shadow_resets[name] += 1
+                shadow_blind[name] = 0
+                shadow_reset_here.append(name)
+        if screen_seq > 0:
+            if any(target.military_score is not None for target in fresh):
+                blind_score_screens = 0
+            else:
+                blind_score_screens += 1
+                if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
+                    say(
+                        f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
+                        f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
+                        f"锚点和历史一起撤掉重新起头"
+                    )
+                    record_log(
+                        "军力锚点重置",
+                        {
+                            "screens": blind_score_screens,
+                            "anchor": score_anchor,
+                            "history": len(score_history),
+                            "screen_seq": screen_seq,
+                            "unread_waiting": len(unread),
+                            # 连续那两屏各自的计数 —— 阀就是看这两屏才响的。
+                            "screens_detail": recent_stats[-1:] + [stats],
+                        },
+                    )
+                    score_anchor = None
+                    # ⚠⚠ **曲线的历史也得一起撤。**
+                    #
+                    # 这道阀当年只有锚点要救，而曲线（#272 之后）是**同一个吸收态的第二个
+                    # 入口**，还是个优先级更高的入口：有参照时只听曲线的，所以单撤锚点
+                    # **一点用都没有**。
+                    #
+                    # 2026-09-03 生产实况（#275 上线后第一趟，20:28–20:30）：这句
+                    # 「撤掉锚点重新起头」**响了 8 次**，而屏幕照旧一屏一屏全丢，
+                    # 参照一路跑到 -48,203。那一趟 302 个被丢行里 101 行出自这一段。
+                    #
+                    # 成因：两个**相邻**的错读被采信进了历史，而 Theil–Sen 只抗得住少数
+                    # 坏点 —— 4 个点的窗口里坏 2 个就到了一半，斜率中位数当场跑飞。
+                    # 而跑飞之后每屏全丢、一个新点也进不了历史，于是它自己维持着自己。
+                    #
+                    # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
+                    # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
+                    score_history.clear()
+                    last_reset_screen = screen_seq
+                    reset_count += 1
+                    blind_score_screens = 0
+        # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
+        # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
+        # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
+        # 而 bot 段有四千多个。
+        #
+        # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
+        # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
+        # ⚠️ **`dry` 和自愈阀一样是「决策」机制**（够 `DRY_SCREENS` 就收工），
+        # 所以同样闸在 `screen_seq > 0` 里。首屏这一步只加**记账**（日志、
+        # 重叠判断、计数）；它要不要参与这两个决策，是下一步单独的事。
+        if screen_seq > 0:
+            dry = 0 if fresh else dry + 1
+        screens.append(fresh)
+        # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
+        # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
+        # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
+        # 这里只观测不拦（名字也会读错，一次没对上就中断整趟不值），
+        # 拦不拦等推进量提上去再定。
+        #
+        # ⚠️ **只说「可能」，也不说「漏了几行」。** 跳过去的行没被读过，
+        # 「几行」这个数在原理上就无从得知——原先那道名次判据敢报「漏掉
+        # 8922 名」（整趟只走了 570 名），正因为它是从两个带噪声的名次
+        # 减出来的。整段账在 `screens_overlap` 上。
+        seen_here = coordinates_of(rows)
+        overlap = screens_overlap(previous_coordinates, seen_here)
+        if overlap is False:
+            screens_without_overlap += 1
+            say("  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）")
+        # ⚠️ **不许写 `or previous_coordinates`。** 这一屏坐标全读不出时，
+        # 保留上一屏的集合会让下一屏拿「隔两屏」的坐标去比——而隔两屏本来
+        # 就不该有共同坐标（一次拖动推约 8 行，两次就推出一整屏），于是
+        # 每一次读废都要连带造出一条**假警报**。而假警报比不报更坏：
+        # 它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
+        # 读不出就该是空集，让下一次比较答「不知道」。
+        previous_coordinates = seen_here
+        # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
+        #
+        # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
+        # 在日志里长得一模一样。2026-08-23 那个漏采一半的缺陷就是这么埋住的：
+        # 生产日志里「12, 8, 6 → 0, 0, 0」被当成「榜单真人与 bot 交错」，
+        # 而真相是那三屏各有 10–12 个 bot、一个都没读出来。要分开这两件事
+        # 当时得临时写只读探针——那正是「出事时能只靠库里日志定位」不成立的样子。
+        say(
+            f"  采集第{screen_seq:>3}滚 读出 {len(rows):>2} 行 本屏 bot {len(fresh)} 连续空屏 {dry}"
+        )
+        record_log(
+            "采集一屏",
+            {
+                "scroll": screen_seq,
+                "rows_read": len(rows),
+                "bots_fresh": len(fresh),
+                "dry_screens": dry,
+                # `True` 重叠上了 / `False` 一个坐标都没对上 /
+                # `None` 有一屏坐标全读不出，答「不知道」。
+                # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
+                # （连名字都读不出的）在日志里长得像「重叠断了」。
+                "overlap_intact": overlap,
+                # 下面这一批都是 Phase 0 只观测的计数；`say` 一个字没动
+                # —— 特征化基准只录 `say`，这条界线正是它能一直用下去的原因。
+                # 四个来源分开记的理由整段在 `ScreenOutcome` 上。
+                "verdict_trusted": outcome.verdict_trusted,
+                "verdict_positive": outcome.verdict_positive,
+                "history_appended": outcome.history_appended,
+                "history_new_ranks": outcome.history_new_ranks,
+                "bot_measured": outcome.bot_measured,
+                "fresh_valued": fresh_valued,
+                "success_old": success["old"],
+                "success_verdict": success["verdict"],
+                "success_history": success["history"],
+                # 哪几个候选条件会在这一屏触发一次「假想重置」。空列表 = 谁都不会。
+                "shadow_reset": shadow_reset_here,
+                # 开关打开时才带原始行。payload 是 `Text` 无长度限制，而写入路径四层
+                # 吞异常、在后台线程做、队列满只丢最旧 —— 录语料不可能把扫描搞挂。
+                **({"rows_raw": [_row_record(row) for row in rows]} if recording else {}),
+                **(
+                    {
+                        "prior_states": {
+                            str(coordinate): state
+                            for coordinate, state in (
+                                prior_states[-1] if prior_states else {}
+                            ).items()
+                        }
+                    }
+                    if recording
+                    else {}
+                ),
+            },
+        )
+        # 这一屏的计数存起来，下一屏重置时要连着两屏一起记。
+        recent_stats.append(stats)
+        del recent_stats[:-2]
+        return reached
+
     try:
         # -- 第一段：翻真人段，只问「到 bot 区了没有」 ----------------------
         #
@@ -1681,141 +2037,33 @@ def scan(
         if outcome == 0:
             progress.stage = ScanStage.COLLECTING
             rows = read_rows()
-            first, reached_limit = collect(
-                targets_from_rows(
-                    rows,
-                    observed_at=datetime.now(UTC),
-                    anchor=score_anchor,
-                    history=score_history,
-                )
-            )
-            score_anchor = next_score_anchor(rows, anchor=score_anchor)
-            screens.append(first)
+            # ⚠️ **首屏走同一条路（`screen_seq=0`）。** 它原先在循环外另写一份，
+            # 于是不打「采集一屏」日志、没有重叠判断、也不进任何计数 ——
+            # 而 `bot_limit` 在首屏就采够时 `range(1, 0)` 为空，那一趟连一条逐屏日志都没有。
+            #
+            # ⚠️ `dry` 要在调用之前绑上：`process_screen` 会读它（尽管首屏不更新它）。
+            reached_limit = process_screen(rows, screen_seq=0)
             if reached_limit:
                 say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
-            dry = 0
-            previous_coordinates = coordinates_of(rows)
             for extra in range(1, 0 if reached_limit else bot_scrolls + 1):
                 progress.collect_scrolls = extra
                 step = nav.scroll_once()
                 if step.outcome is ScrollOutcome.OFF_PAGE:
                     say(f"采集第 {extra} 滚之后离页（多半断线）；丢掉最后一屏")
+                    # ⚠⚠ **离页那一屏也要记一条，否则屏序会断。**
+                    # `break` 在算日志之前，所以这一屏原先一条逐屏记录都没有 ——
+                    # 而语料的完整性检查要求屏序连续不重复。
+                    record_log(
+                        "采集一屏",
+                        {
+                            "scroll": extra,
+                            "rows_read": 0,
+                            "ended_because": "off_page",
+                        },
+                    )
                     outcome = EXIT_RANKING_INCOMPLETE
                     break
-                rows = list(step.rows)
-                fresh, reached_limit = collect(
-                    targets_from_rows(
-                        rows,
-                        observed_at=datetime.now(UTC),
-                        anchor=score_anchor,
-                        history=score_history,
-                    )
-                )
-                score_anchor = next_score_anchor(rows, anchor=score_anchor)
-                # ⚠️ **自愈阀：连着几屏整屏被判掉，就把锚点撤掉重新起头。**
-                #
-                # 锚点错了的后果是不对称的：它会把**后面每一屏**的好读数都判成
-                # 「破坏降序」，而整屏被判掉又让锚点「沿用」下去——一个错值就能
-                # 让整趟余下的军力值全空，且每屏只打一句「丢掉这几行」，没有累计信号。
-                # （2026-08-23 实测过一种入口：第一屏中位数为 0，见
-                # `domain.ranking.trusted_scores`；那条已经堵了，但堵的是入口，
-                # 不是这个形状本身。）
-                #
-                # 撤掉锚点的代价只是「下一屏按自己的中位数起头」，而收益是把一次
-                # 永久性静默失败压成两屏的颠簸。
-                if any(target.military_score is not None for target in fresh):
-                    blind_score_screens = 0
-                else:
-                    blind_score_screens += 1
-                    if blind_score_screens >= SCORE_ANCHOR_RESET_SCREENS:
-                        say(
-                            f"⚠️ 连着 {blind_score_screens} 屏一个军力值都没采信"
-                            f"（锚点 {score_anchor}、曲线历史 {len(score_history)} 点）："
-                            f"锚点和历史一起撤掉重新起头"
-                        )
-                        record_log(
-                            "军力锚点重置",
-                            {
-                                "screens": blind_score_screens,
-                                "anchor": score_anchor,
-                                "history": len(score_history),
-                            },
-                        )
-                        score_anchor = None
-                        # ⚠⚠ **曲线的历史也得一起撤。**
-                        #
-                        # 这道阀当年只有锚点要救，而曲线（#272 之后）是**同一个吸收态的第二个
-                        # 入口**，还是个优先级更高的入口：有参照时只听曲线的，所以单撤锚点
-                        # **一点用都没有**。
-                        #
-                        # 2026-09-03 生产实况（#275 上线后第一趟，20:28–20:30）：这句
-                        # 「撤掉锚点重新起头」**响了 8 次**，而屏幕照旧一屏一屏全丢，
-                        # 参照一路跑到 -48,203。那一趟 302 个被丢行里 101 行出自这一段。
-                        #
-                        # 成因：两个**相邻**的错读被采信进了历史，而 Theil–Sen 只抗得住少数
-                        # 坏点 —— 4 个点的窗口里坏 2 个就到了一半，斜率中位数当场跑飞。
-                        # 而跑飞之后每屏全丢、一个新点也进不了历史，于是它自己维持着自己。
-                        #
-                        # 撤历史的代价和撤锚点一模一样：下一屏没曲线可问（凑不够 4 个点），
-                        # 按自己的区间和中位数起头；采信出来的点又把历史重新堆起来。
-                        score_history.clear()
-                        blind_score_screens = 0
-                # ⚠️ **别在 bot 区的边界上提前收工。** 2026-08-15 实机：刚翻到
-                # bot 区时那几屏大半还是真人，本来就没几个新 bot，而
-                # `SCROLL_STALL_CONFIRMATIONS`(3) 当场就触发了——一趟只写了 2 条，
-                # 而 bot 段有四千多个。
-                #
-                # bot 段里每屏期望 8 个新的（实测），所以连着 `DRY_SCREENS` 屏
-                # 一个都没有才算真的到头。跑不满就由 `bot_scrolls` 预算兜底。
-                dry = 0 if fresh else dry + 1
-                screens.append(fresh)
-                # ⚠️ **重叠断了必须留下痕迹。** 见 `domain.ranking.screens_overlap`：
-                # 跳过去的那几行压根没被读过，所以「采到的 bot 数」看起来完全正常
-                # ——和 2026-08-23 修掉的那个整屏漏采是同一类静默失败。
-                # 这里只观测不拦（名字也会读错，一次没对上就中断整趟不值），
-                # 拦不拦等推进量提上去再定。
-                #
-                # ⚠️ **只说「可能」，也不说「漏了几行」。** 跳过去的行没被读过，
-                # 「几行」这个数在原理上就无从得知——原先那道名次判据敢报「漏掉
-                # 8922 名」（整趟只走了 570 名），正因为它是从两个带噪声的名次
-                # 减出来的。整段账在 `screens_overlap` 上。
-                seen_here = coordinates_of(rows)
-                overlap = screens_overlap(previous_coordinates, seen_here)
-                if overlap is False:
-                    screens_without_overlap += 1
-                    say("  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）")
-                # ⚠️ **不许写 `or previous_coordinates`。** 这一屏坐标全读不出时，
-                # 保留上一屏的集合会让下一屏拿「隔两屏」的坐标去比——而隔两屏本来
-                # 就不该有共同坐标（一次拖动推约 8 行，两次就推出一整屏），于是
-                # 每一次读废都要连带造出一条**假警报**。而假警报比不报更坏：
-                # 它把这条判据教成「经常喊狼来了」，真断的那次就没人看了。
-                # 读不出就该是空集，让下一次比较答「不知道」。
-                previous_coordinates = seen_here
-                # ⚠️ **「读出几行」必须和「本屏 bot 几个」一起记。**
-                #
-                # 原先只记后者，于是「这一屏没有新 bot」和「这一屏整个没读出来」
-                # 在日志里长得一模一样。2026-08-23 那个漏采一半的缺陷就是这么埋住的：
-                # 生产日志里「12, 8, 6 → 0, 0, 0」被当成「榜单真人与 bot 交错」，
-                # 而真相是那三屏各有 10–12 个 bot、一个都没读出来。要分开这两件事
-                # 当时得临时写只读探针——那正是「出事时能只靠库里日志定位」不成立的样子。
-                say(
-                    f"  采集第{extra:>3}滚 读出 {len(rows):>2} 行 "
-                    f"本屏 bot {len(fresh)} 连续空屏 {dry}"
-                )
-                record_log(
-                    "采集一屏",
-                    {
-                        "scroll": extra,
-                        "rows_read": len(rows),
-                        "bots_fresh": len(fresh),
-                        "dry_screens": dry,
-                        # `True` 重叠上了 / `False` 一个坐标都没对上 /
-                        # `None` 有一屏坐标全读不出，答「不知道」。
-                        # ⚠️ `None` 不许落成 `False`：那会让最可疑的那几屏
-                        # （连名字都读不出的）在日志里长得像「重叠断了」。
-                        "overlap_intact": overlap,
-                    },
-                )
+                reached_limit = process_screen(list(step.rows), screen_seq=extra)
                 if reached_limit:
                     say(f"已采够军力攻击批次 {bot_limit} 个 bot；交给攻击任务")
                     break
@@ -1827,7 +2075,7 @@ def scan(
         # ⚠️ **补数放在这里，不放 `finally`。** 被 Ctrl+C / 调度器抢占打断时曲线只盖到
         # 一半，那时补出来的是半条曲线上的外推值——而收尾那句话必须照打（它在
         # `finally` 里），两件事的要求正好相反。补不成没有代价：那些行本来就空着。
-        _backfill_from_the_curve(repository, unread, history=score_history)
+        backfill = _backfill_from_the_curve(repository, unread, history=score_history)
     finally:
         if not nav.close():
             say("排行榜已关闭，但导航条还原未确认")
@@ -1845,6 +2093,31 @@ def scan(
             completion_message(
                 progress, written=written, suspect=written - len(kept), outcome=outcome
             )
+        )
+        # ⚠⚠ **整趟的汇总：最后一次重置在第几屏、收尾历史多少点、补数三个数。**
+        #
+        # 「重置共几次」不够用：收尾补数用的是**最后**那一次重置之后攒的历史。
+        # 一趟里 7 次前段误重置 + 1 次临近收尾的真重置，误触发率 87.5%，
+        # 但修掉前七次之后最后那一次照样清空全部历史 —— 补数照样很差。
+        #
+        # 影子重置总数也在这里，好直接对比三种条件在这一趟上各会响几次。
+        record_log(
+            "采集收尾汇总",
+            {
+                "screens_collected": progress.collect_scrolls + 1,
+                "reset_count": reset_count,
+                "last_reset_screen": last_reset_screen,
+                "history_at_end": len(score_history),
+                "backfill_holes": backfill.holes,
+                "backfill_reachable": backfill.reachable,
+                "backfill_written": backfill.written,
+                "shadow_resets": dict(shadow_resets),
+                # 结束原因：完成 / 达到上限 / 离页 / 异常；以及收尾补数到底跑没跑。
+                # 两样都是完整性检查要看的 —— 缺结束记录的批次要标为不完整。
+                "ended_because": ("off_page" if outcome == EXIT_RANKING_INCOMPLETE else "complete"),
+                "backfill_ran": backfill.holes > 0 or backfill.written > 0,
+                "recording": recording,
+            },
         )
         # ⚠️ **没接上的屏单独报一行，不塞进 `completion_message`。**
         # 那句话是「这一趟干了多少」，这句是「这一趟有几屏没接上」——后者是异常
@@ -1959,6 +2232,14 @@ def build_parser() -> argparse.ArgumentParser:
             "只在没给 --blind-rows 时才生效"
         ),
     )
+    parser.add_argument(
+        "--capture-rows",
+        action="store_true",
+        help=(
+            "【诊断用】把逐屏原始行（名次/坐标/分数/空值）录进日志，供离线回放。"
+            "调度器那一路走一次性请求（环境变量），这个参数是给手工直跑的"
+        ),
+    )
     for name in ("rank", "name", "score"):
         parser.add_argument(
             f"--{name}-column", nargs=2, type=int, metavar=("LEFT", "RIGHT"), default=None
@@ -2011,6 +2292,7 @@ def main(argv: list[str] | None = None) -> int:
             blind_rows=blind_rows,
             blind_rows_source=blind_rows_source,
             blind_scrolls=BLIND_SCROLLS if args.blind_scrolls is None else args.blind_scrolls,
+            capture_rows=args.capture_rows or None,
         )
     )
 
@@ -2155,6 +2437,8 @@ __all__ = [
     "sample_overlap",
     "scroll_through_humans",
     "spin_blind_rows",
+    "ScreenOutcome",
+    "judge_rows",
     "targets_from_rows",
     "take_batch_targets",
     "track_progress",
