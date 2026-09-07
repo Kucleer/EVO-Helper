@@ -74,6 +74,16 @@ class _Repository:
         """攻击配置页那一行。`scan_hours=None` = 页面上留空。"""
         return SimpleNamespace(report_scan_hours=self.scan_hours)
 
+    def rematch_unlinked_reports(self, **_fields: Any) -> int:
+        """进信箱之前那趟库内补认领，默认「没有可补的」。
+
+        ⚠️ **这个替身不能少。** 少了它，`backfill_reports` 会走进
+        `rematch_unlinked_before_mail` 的兜底分支（那条路吞异常），于是这一整个
+        文件都在悄悄测一条降级路径而照样全绿。接线本身另有专文：
+        `test_rematch_before_mail_scan.py`。
+        """
+        return 0
+
 
 def _row(index: int, kind: ReportKind = ReportKind.PIRATE, *, at: datetime = NOON) -> MailRow:
     return MailRow(
