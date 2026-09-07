@@ -821,8 +821,15 @@ class SlowDragDriver:
             origin_x + x, origin_y + y, random.uniform(0.2, 0.4)
         )
 
-    def wheel_notch(self) -> None:
-        """往下滚**一格**。盲滚段唯一的动作原语。
+    def wheel_notch(self, *, up: bool = False) -> None:
+        """滚**一格**。`up=True` 往上，默认往下。滚动段唯一的动作原语。
+
+        ⚠️ **只有「一格」这一种粒度，方向不改变这一点。** 允许传格数的话，实现里
+        迟早把 N 格合成一个大事件发出去，而那会被游戏**静默封顶**（实测 800 格只走
+        14px）。格数与间隔的密度由调用方的循环控制。
+
+        ⚠️ **方向只在这一个地方分叉**，`WHEEL_DELTA` 的符号不许再有第二处 ——
+        写成两个方法（`wheel_notch` / `wheel_notch_up`）的话，两处迟早各自漂。
 
         ⚠️ **`pyautogui.scroll(n)` 在 Windows 上把 `n` 原样当 `dwData` 传给
         `mouse_event`，不乘 120。** 所以这里发的是 `-WHEEL_DELTA`(-120) 而不是
@@ -862,7 +869,7 @@ class SlowDragDriver:
         previous = pyautogui.PAUSE
         try:
             pyautogui.PAUSE = 0
-            pyautogui.scroll(-WHEEL_DELTA)
+            pyautogui.scroll(WHEEL_DELTA if up else -WHEEL_DELTA)
         finally:
             pyautogui.PAUSE = previous
 
