@@ -376,6 +376,18 @@ class AttackDispatchRow(Base):
 
 class BattleReportRow(Base):
     __tablename__ = "battle_reports"
+    __table_args__ = (
+        # 去重探针（`repository.has_report_at`）**每封邮件问一次**，而这张表上
+        # 原先只有主键和 `dispatch_id` 那两个索引 —— 那一问是整表扫，而这张表
+        # 只会长。
+        #
+        # 为什么是单列而不是「坐标 + 报告时刻」那条复合索引：报告时刻在这张表里
+        # 近乎唯一，按它收窄之后剩下的是个位数行，再补上三个坐标列买不到什么。
+        # 而单列这一条还顺手服务了另外两类查询 —— 未认领战报按它倒序取
+        # （`repository._unlinked_report_rows`）、数据概览按它取时间窗
+        # （`storage.overview`），复合索引对那两类一点用都没有。
+        Index("ix_battle_reports_reported_at_utc", "reported_at_utc"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     reported_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)

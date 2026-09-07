@@ -1,4 +1,4 @@
-"""撤掉「盲拖屏数」那一列的迁移。**当前的 head。**
+"""撤掉「盲拖屏数」那一列的迁移。
 
 本地测试用 `Base.metadata.create_all` 建表，所以模型和迁移可以静默分叉：一路全绿，
 只有真实的库会在启动时炸。这里两边对着比一遍——**删列这一类尤其要比**：模型上把
@@ -48,19 +48,22 @@ def _columns(database_url: str) -> set[str]:
     return {column["name"] for column in inspect(create_engine(database_url)).get_columns(TABLE)}
 
 
-def test_this_revision_is_the_single_head() -> None:
-    """链上只有一个 head，而且就是这一条。
+def test_this_revision_is_on_a_single_headed_chain() -> None:
+    """链上只有一个 head，而这一条在链上。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前一个字
     都看不出来。
 
-    ⚠️ 「head 就是我」这句话只有**最新那一条**该说；等下一条迁移接上来，这里要跟着
-    退回成「我在链上」（同 `test_bot_target_unreadable_migration.py` 里那一段）。
+    ⚠️ 这条**不再断言「head 就是我」**：后面又接了新的迁移（`d3b9f27c4a81`，
+    给 `battle_reports.reported_at_utc` 加索引），「谁是 head」这句话只该由**最新
+    那一条**的用例来说，否则每加一条迁移都要回来改一次这里，而改多了就没人再当真
+    （同 `test_bot_target_unreadable_migration.py` 里那一段的理由）。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {revision.revision for revision in script.walk_revisions()}
     assert script.get_revision(REVISION).down_revision == DOWN_REVISION
 
 
