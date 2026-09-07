@@ -638,7 +638,7 @@ def test_an_empty_box_parses_to_no_cooldown_at_all(  # type: ignore[no-untyped-d
     """空框 / 空串 / 显式 null 都是「没配」，**不是某个默认值**。
 
     ⚠️ 给它写一个代码默认值就分不开「没配」和「恰好配成当前默认」，而这两件事在
-    默认值将来被改动时的处置完全相反。理由照抄 `military_attack_config.blind_scrolls`。
+    默认值将来被改动时的处置完全相反。理由照抄 `military_attack_config.blind_scroll_rows`。
     """
     enable(repository, MissionKind.RANKING, params_json=raw)
     row = task(repository, MissionKind.RANKING)

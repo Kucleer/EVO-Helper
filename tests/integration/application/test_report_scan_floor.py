@@ -127,12 +127,12 @@ def test_the_value_survives_a_round_trip_through_the_global_attack_config(
     repository: SqlAlchemyRepository,
 ) -> None:
     """存在既有的全局攻击配置表里，和档位、盲拖屏数同一行、同一次原子替换。"""
-    repository.replace_military_attack_tiers("[]", blind_scrolls=12, report_scan_hours=3)
+    repository.replace_military_attack_tiers("[]", blind_scroll_rows=712, report_scan_hours=3)
 
     row = repository.military_attack_config()
 
     assert row.report_scan_hours == 3
-    assert row.blind_scrolls == 12, "整份替换不能把同一行上的另一项冲掉"
+    assert row.blind_scroll_rows == 712, "整份替换不能把同一行上的另一项冲掉"
 
 
 def test_a_fresh_row_starts_out_blank_so_upgrades_change_nothing(

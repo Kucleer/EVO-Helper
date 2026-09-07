@@ -1,9 +1,13 @@
 """军力榜的「盲滚行数」：攻击配置页上可配，**留空 = 按实测自动标定**。
 
 口径 2026-08-22 从「屏」换成「行」：盲滚段不再慢拖，改成连拨滚轮，而滚轮没有
-「屏」这个概念，拨的是格。行是唯一同时量得住慢拖和滚轮的单位。屏口径那一份
-用例（`test_ranking_blind_scrolls.py`）留着钉回滚杠杆——那一列和页面上那个框都
-还在，只是不再上命令行。
+「屏」这个概念，拨的是格。行是唯一同时量得住慢拖和滚轮的单位。
+
+⚠️ 屏口径那一份（`military_attack_config.blind_scrolls`、攻击配置页上那个框、
+`validate_blind_scrolls` / `_blind_scrolls` 那一整套）**2026-09-07 全撤了**：
+那个框存得进、读不出——`ranking_command` 的参数表里没有它，`_blind_scrolls()`
+也没有调用点。慢拖那条老路仍然在，只从命令行进（`--blind-scrolls N`），
+所以这份用例现在是盲滚配置的**唯一**一份。
 
 这份用例钉的是**四件互相制衡**的事：
 
@@ -398,15 +402,19 @@ def test_a_value_past_the_supposed_bot_start_is_still_accepted(
     assert scheduler.validate_blind_scroll_rows(raw) == raw
 
 
-def test_the_screen_era_validator_still_accepts_values(scheduler: MissionScheduler) -> None:
-    """屏口径那把尺子还是活的：那一列和页面上那个框留着当**回滚杠杆**。
+def test_the_screen_era_knob_is_gone_for_good(scheduler: MissionScheduler) -> None:
+    """⚠️⚠️ **屏口径那一套不许再长回来。**
 
-    ⚠️ 但它写进去的值**不再上命令行**——那一条由
-    `test_ranking_blind_scrolls.py` 钉着。两件事分开测，是因为「校验还收得住」
-    和「取值还生效」在回滚期间恰好是一真一假。
+    它当过一年半的「一键回滚杠杆」，而杠杆的另一半（库列 → 命令行）从来没接上：
+    `ranking_command` 的参数表里没有 `blind_scrolls`，`_blind_scrolls()` 也没有
+    调用点。于是页面上那个框存得进、读得回、看着像生效了，实机行为一个字不变——
+    而人会去拨它的时刻，恰好是滚轮这条路已经出事的时刻（2026-09-07 真发生了一次）。
+
+    这条用例钉的是**别再把它加回来**：要恢复慢拖就敲
+    `python -m evo_helper.tools.ranking_scan --blind-scrolls N`，那条路一个字都没删。
     """
-    assert scheduler.validate_blind_scrolls(40) == 40
-    assert scheduler.validate_blind_scrolls("") is None
+    for gone in ("validate_blind_scrolls", "_blind_scrolls", "_blind_scroll_decision"):
+        assert not hasattr(scheduler, gone), f"{gone} 又回来了；回滚请走命令行"
 
 
 # -- 判定本身要在日志里说得出来 ------------------------------------------------

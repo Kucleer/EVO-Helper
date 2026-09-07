@@ -431,7 +431,6 @@ class AttackPlanetView:
 class MilitaryAttackConfigView:
     tiers: tuple[dict[str, Any], ...]
     #: 军力榜盲拖屏数；`None` = 页面上留空 = 按实测自动标定。
-    blind_scrolls: int | None = None
     #: 军力榜盲滚行数（滚轮口径）；`None` = 页面上留空 = 跟着代码默认值走
     #: （见 `game.ranking_ui.BLIND_SCROLL_ROWS`）。0 是合法取值，意思是「一格都不拨」。
     blind_scroll_rows: int | None = None

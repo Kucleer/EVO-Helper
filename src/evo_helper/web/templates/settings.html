@@ -88,8 +88,7 @@
     <strong>填大填小由你定</strong>，这里不拦、也不标红。盲滚少走的行由检测段接手，而检测段每屏都要做一次整列 OCR，
     比多拨几格贵得多——所以宁可多滚。反过来，滚过头会<strong>跳过榜单靠前的一段</strong>，那里面的 bot 就整段没采到，
     而漏采是<strong>静默的</strong>：不报错、不少日志，只是采回来的数少一截。
-    参考：屏口径下已记录的观测下界是 {{ blind_scrolls_max }} 屏，按 {{ rows_per_scroll }} 行/屏折合约 {{ blind_scroll_rows_reference }} 行——
-    那只是<strong>观测值</strong>，不是上限。
+    参考：已记录的观测下界约 {{ blind_scroll_rows_reference }} 行——那只是<strong>观测值</strong>，不是上限。
   </p>
   <div class="filter-bar" style="margin-top:10px">
     <input id="blind-scroll-rows" type="number" min="0" step="1"
@@ -97,31 +96,6 @@
     <button class="btn primary small" type="button" id="btn-save-blind-rows">保存盲滚行数</button>
   </div>
   <p id="blind-rows-seconds" class="overview-note"></p>
-</section>
-
-<section class="panel" aria-labelledby="blind-head">
-  <h2 id="blind-head">军力榜盲拖屏数（回滚用，当前不生效）</h2>
-  <p class="muted">
-    ⚠️ <strong>这个框现在完全不上命令行，填什么都不影响实机。</strong>
-    2026-08-22 盲滚段从慢拖改成了滚轮，口径也从「屏」换成了「行」——真正决定盲滚多远的只有上面那个<strong>盲滚行数</strong>
-    （包括它留空时的自动标定）。这一格连同库里那一列一起留着，是为了滚轮出问题时能退回慢拖；
-    <strong>但那个回滚要改代码</strong>（把调度器那两处换回屏口径），不是把上面那个框清空就行。
-  </p>
-  <p class="muted">
-    填法与原先一样：<strong>留空 = 按实测自动标定</strong>，取最近 {{ blind_scroll_samples }} 次「翻了 N 屏到达 bot 区」的<strong>最小值</strong>再减 {{ blind_scroll_margin }} 屏余量；
-    历史不足 {{ blind_scroll_samples }} 次时用默认的 {{ blind_scrolls_default }} 屏。<strong>填了数就锁死</strong>，不再自动调。
-  </p>
-  <p class="muted">
-    ⚠️ 回滚之后这个数填大了会<strong>跳过榜单靠前的一段</strong>，那里面的 bot 就整段没采到，而漏采是<strong>静默的</strong>——
-    不报错、不少日志，只是采回来的数少一截，页面上完全看不出来。填小了只是多花几屏检测（一屏约 0.3 秒），代价小得多。
-    参考：已记录的最小实测屏数减余量是 {{ blind_scrolls_max }} 屏——那只是<strong>观测值</strong>，不是上限；
-    榜会随玩家增加变长，实测值也在涨，所以这里<strong>不拦</strong>更大的值，由你判断。
-  </p>
-  <div class="filter-bar" style="margin-top:10px">
-    <input id="blind-scrolls" type="number" min="0" step="1"
-           placeholder="留空 = 自动标定" aria-label="军力榜盲拖屏数">
-    <button class="btn primary small" type="button" id="btn-save-blind">保存盲拖屏数</button>
-  </div>
 </section>
 
 <section class="panel" aria-labelledby="knob-head">
@@ -316,7 +290,6 @@
 (() => {
   const tiers = document.getElementById('tier-list');
   const planets = document.getElementById('planet-list');
-  const blindScrolls = document.getElementById('blind-scrolls');
   const blindScrollRows = document.getElementById('blind-scroll-rows');
   const blindRowsSeconds = document.getElementById('blind-rows-seconds');
   const reportScanHours = document.getElementById('report-scan-hours');
@@ -416,7 +389,6 @@
         for (const tier of config.tiers) addTier(tier);
         // `?? ''` 而不是 `|| ''`：0 是合法取值（「一屏都别盲拖」），
         // `||` 会把它显示成空框，也就是显示成「自动标定」。
-        blindScrolls.value = config.blind_scrolls ?? '';
         // 同理，盲滚行数也是 `??`：0 是合法取值（「一格都不拨」），
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
         blindScrollRows.value = config.blind_scroll_rows ?? '';
@@ -445,12 +417,6 @@
       tierPayload.push({ min_score: min, preset });
     }
     tierPayload.sort((left, right) => right.min_score - left.min_score);
-    const raw = blindScrolls.value.trim();
-    let scrolls = null;
-    if (raw !== '') {
-      scrolls = Number(raw);
-      if (!Number.isInteger(scrolls) || scrolls < 0) throw new Error('盲拖屏数要填非负整数；要自动标定就把它留空');
-    }
     const rawRows = blindScrollRows.value.trim();
     let rows = null;
     if (rawRows !== '') {
@@ -482,7 +448,6 @@
     }
     const payload = {
       tiers: tierPayload,
-      blind_scrolls: scrolls,
       blind_scroll_rows: rows,
       report_scan_hours: hours,
       score_max_age_hours: maxAge,
@@ -508,7 +473,6 @@
 
   document.getElementById('btn-add-tier').onclick = () => addTier();
   document.getElementById('btn-save-tiers').onclick = saveConfig;
-  document.getElementById('btn-save-blind').onclick = saveConfig;
   document.getElementById('btn-save-blind-rows').onclick = saveConfig;
   blindScrollRows.oninput = showBlindRowsSeconds;
   document.getElementById('btn-save-window').onclick = saveConfig;

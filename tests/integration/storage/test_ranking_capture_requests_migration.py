@@ -1,4 +1,4 @@
-"""一次性逐屏语料采样请求那张表的迁移。**当前的 head。**
+"""一次性逐屏语料采样请求那张表的迁移。
 
 本地测试用 `Base.metadata.create_all` 建表，所以模型和迁移可以静默分叉：一路全绿，
 只有真实的库会在启动时炸。这里两边对着比一遍。
@@ -47,19 +47,22 @@ def _columns(database_url: str) -> dict[str, dict[str, object]]:
     }
 
 
-def test_this_revision_is_the_single_head() -> None:
-    """链上只有一个 head，而且就是这一条。
+def test_this_revision_is_on_a_single_headed_chain() -> None:
+    """链上只有一个 head，而这一条在链上。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前一个字
     都看不出来。
 
-    ⚠️ 「head 就是我」这句话只有**最新那一条**该说；等下一条迁移接上来，这里要跟着
-    退回成「我在链上」（同 `test_bot_target_unreadable_migration.py` 里那一段）。
+    ⚠️ 这条**不再断言「head 就是我」**：后面又接了新的迁移（`c7d92f4a1b60`，
+    撤掉 `blind_scrolls` 那一列），「谁是 head」这句话只该由**最新那一条**的用例来
+    说，否则每加一条迁移都要回来改一次这里，而改多了就没人再当真
+    （同 `test_bot_target_unreadable_migration.py` 里那一段的理由）。
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    assert len(script.get_heads()) == 1
+    assert REVISION in {revision.revision for revision in script.walk_revisions()}
     assert script.get_revision(REVISION).down_revision == DOWN_REVISION
 
 
@@ -123,12 +126,17 @@ def test_a_pending_request_is_claimed_exactly_once(database_url: str) -> None:
 
 
 def test_downgrade_removes_the_table(database_url: str) -> None:
-    """回退把表整个删掉，不留残迹。"""
+    """回退把表整个删掉，不留残迹。
+
+    ⚠️ **回退目标写成 `DOWN_REVISION` 而不是 `-1`。** 这一条已经不是 head 了，
+    `-1` 从 head 往回只走一步，落在本条**之后**那一条上——表还在，用例红，而红的
+    原因看起来像是本条迁移的 downgrade 漏了东西。
+    """
     config = _config(database_url)
     command.upgrade(config, "head")
     assert TABLE in inspect(create_engine(database_url)).get_table_names()
 
-    command.downgrade(config, "-1")
+    command.downgrade(config, DOWN_REVISION)
 
     assert TABLE not in inspect(create_engine(database_url)).get_table_names()
 
@@ -137,7 +145,7 @@ def test_upgrade_is_replayable_after_a_downgrade(database_url: str) -> None:
     """回退再升一次要能跑通 —— 索引名重复是这类迁移最常见的绊脚石。"""
     config = _config(database_url)
     command.upgrade(config, "head")
-    command.downgrade(config, "-1")
+    command.downgrade(config, DOWN_REVISION)
     command.upgrade(config, "head")
 
     assert TABLE in inspect(create_engine(database_url)).get_table_names()

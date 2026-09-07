@@ -61,7 +61,6 @@ from evo_helper.game.ranking_ui import (
     BLIND_SCROLL_MARGIN_ROWS,
     BLIND_SCROLL_ROWS,
     BLIND_SCROLL_SAMPLES,
-    BLIND_SCROLLS,
     BLIND_SCROLLS_MAX,
     GLIDE_SETTLE_S,
     ROWS_PER_NOTCH,
@@ -792,8 +791,6 @@ def create_app(
             # 唯一依据。
             context={
                 "active": "settings",
-                "blind_scrolls_default": BLIND_SCROLLS,
-                "blind_scrolls_max": BLIND_SCROLLS_MAX,
                 "blind_scroll_samples": BLIND_SCROLL_SAMPLES,
                 "blind_scroll_margin": BLIND_SCROLL_MARGIN,
                 # 盲滚那一节要的四个标定常量。页面拿它们做「行 → 秒」换算，
@@ -1365,7 +1362,6 @@ def _attack_planet_out(view: AttackPlanetView) -> AttackPlanetOut:
 def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttackConfigOut:
     return MilitaryAttackConfigOut(
         tiers=[MilitaryTierIn(**tier) for tier in view.tiers],
-        blind_scrolls=view.blind_scrolls,
         blind_scroll_rows=view.blind_scroll_rows,
         report_scan_hours=view.report_scan_hours,
         unknown_line_hold_minutes=view.unknown_line_hold_minutes,
@@ -1439,7 +1435,6 @@ def register_mission_routes(app: FastAPI) -> None:
         return _military_attack_config_out(
             console.replace_military_attack_tiers(
                 tuple(item.model_dump() for item in payload.tiers),
-                blind_scrolls=payload.blind_scrolls,
                 blind_scroll_rows=payload.blind_scroll_rows,
                 report_scan_hours=payload.report_scan_hours,
                 unknown_line_hold_minutes=payload.unknown_line_hold_minutes,
