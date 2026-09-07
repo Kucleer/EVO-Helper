@@ -227,6 +227,40 @@ def _trace(
     return _Trace(written=written, said=said, logged=logged)
 
 
+def _human_rows(*, first_rank: int, count: int = 3) -> list[RankingRow]:
+    """一屏**真人**行：`coordinate=None`，所以 bot 过滤会整批剔掉。
+
+    ⚠️ **判据看的是坐标，不是名字。** `domain.ranking.is_bot_entry` 要「名字反解得出
+    坐标 + 军力不为 0」——真人的名字反解不出坐标，所以这里必须给 `None`。
+    给个坐标就等于伪造了一屏 bot，而这个场景要的恰恰是相反的那一半。
+
+    名字照实机那几屏的样子写（2026-09-07 08:07 那趟名字列读到的是
+    `Kucleer XiaoFan result EXSTRIM Playerl423929772`）。
+    """
+    return [
+        RankingRow(
+            rank=first_rank + index,
+            name=f"Player{first_rank + index}",
+            score=10_000.0 - index * 10,
+            coordinate=None,
+        )
+        for index in range(count)
+    ]
+
+
+#: 检测段宣布「到了 bot 区」，可整趟**一个 bot 行都没读到**。
+#:
+#: ⚠️⚠ **这是 2026-09-07 早上那 6 趟空跑的最小复现。** bot 区检测会误报
+#: （明明还在真人段就说「到了」），而实测样本原先就在那一刻发出去 ——
+#: 于是一趟采到 0 条的跑法留下一条偏小的实测，下一趟按它滚得更少、又误报、
+#: 数更小。**自我强化且不自愈**：当天 7 趟里 6 趟一条都没采到，
+#: 一直到有人手工把盲滚行数填死才停下。
+SCENARIO_NO_BOTS = (
+    _human_rows(first_rank=580),
+    _human_rows(first_rank=583),
+    _human_rows(first_rank=586),
+)
+
 #: 六屏。**第 3、4 屏故意重复前两屏的坐标** —— 见模块头「场景是挑过的」那一段。
 SCENARIO = (
     _rows([10_600.0, 10_590.0, 10_580.0], system=137, first_rank=850),

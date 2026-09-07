@@ -279,6 +279,9 @@ BASELINE_WRITTEN: list[str] = [
 ]
 
 BASELINE_SAID: list[str] = [
+    # ⚠️ 检测段只报进度；样本那一句推迟到**第一次真读到 bot 行**才发（见
+    # `tools.ranking_scan` 里 `pending_bot_area`）。两句的先后就是这次改动本身。
+    "检测段判定已进 bot 区（本趟走了 800 行），开始细读",
     "翻了 800 行到达 bot 区",
     "  采集第  0滚 读出  3 行 本屏 bot 3 连续空屏 0",
     "  ⚠️ 与上一屏没有一个共同坐标：重叠可能断了（中间的行没被读过）",
@@ -303,6 +306,9 @@ BASELINE_LIMIT_WRITTEN: list[str] = [
 ]
 
 BASELINE_LIMIT_SAID: list[str] = [
+    # ⚠️ 检测段只报进度；样本那一句推迟到**第一次真读到 bot 行**才发（见
+    # `tools.ranking_scan` 里 `pending_bot_area`）。两句的先后就是这次改动本身。
+    "检测段判定已进 bot 区（本趟走了 800 行），开始细读",
     "翻了 800 行到达 bot 区",
     "  采集第  0滚 读出  3 行 本屏 bot 3 连续空屏 0",
     "已采够军力攻击批次 3 个 bot；交给攻击任务",

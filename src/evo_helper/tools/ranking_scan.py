@@ -990,10 +990,17 @@ def take_batch_targets(
 def report_bot_area_reached(rows: int, *, blind_rows: int) -> None:
     """记下这一趟实测走了多少**行**才到 bot 区，并在余量被吃掉时喊一声。
 
+    ⚠️⚠ **调用时机：第一次真读到 bot 行的那一屏，不是检测段刚结束那一刻。**
+    检测段的「到了 bot 区」会误报（明明还在真人段），而误报的代价是一条偏小的
+    实测进了标定、下一趟滚得更少、又误报 —— 自我强化且不自愈。理由整段写在
+    `scan()` 里 `pending_bot_area` 那个变量上。**别把这个调用挪回检测段。**
+
     ⚠️ **两件事刻意绑在同一个出口上。** 那句话是自动标定唯一的**样本**
     （`domain.ranking.bot_area_rows` 从 `system_log` 里反解它），而告警是这份
     样本唯一能暴露「盲滚是不是已经滚过头」的时刻。摆成两个各自独立的调用点，
-    删掉其中任何一个都不会有东西报错。
+    删掉其中任何一个都不会有东西报错。告警和样本同进同退也是有意的：数不作数，
+    据它算出来的告警也不作数（2026-09-07 08:07 那条就误导了一次 —— 它让人去查
+    配置页上的盲滚行数，而那个数是标定自己算错的）。
 
     ⚠️ **告警补的是自动标定唯一的盲点。** 标定看不出自己滚过头了：滚过头的表现是
     「第一屏检测就看到 bot」，而那和「刚好停在 bot 起点上」在数据上一模一样——
@@ -1749,6 +1756,23 @@ def scan(
     # `process_screen` 拿 `nonlocal` 读它，而 mypy 要求绑定出现在嵌套函数
     # **之前**（运行时不在乎文本顺序，但 CI 那道门在乎）。
     dry = 0
+    # ⚠️⚠ **实测样本要等「真看见 bot 行」才发得出去。**
+    #
+    # `report_bot_area_reached` 那句话是自动标定**唯一**的样本来源，而它原先打在
+    # 检测段刚结束、采集段还没跑的那一刻 —— 那时候还不知道这一趟会不会采到东西。
+    # bot 区检测会误报（明明还在真人段就说「到了」），于是一趟采到 0 条的跑法照样
+    # 留下一条偏小的实测，下一趟按它滚得更少、又误报、数更小。
+    # **它自己滚雪球，而且永远转不回来** —— 2026-09-07 早上 6 趟空跑就卡在这个圈里。
+    #
+    # 所以改成：检测段只报进度，样本推迟到**第一次真读到 bot 行**的那一屏再发。
+    # 这一刻才有资格说「到了 bot 区」。余量告警跟着一起走 —— 它算的是同一个数，
+    # 数不作数，告警也不作数（08:07 那条就误导了一次：它让人去查配置页上的盲滚
+    # 行数，而那个数是标定自己算错的）。
+    #
+    # ⚠️ **刻意不认机器名。** 用户口径（2026-09-07）：「谁拉代码谁就是实体机，
+    # 未来也可能有新的」。按 host 筛只是把问题挪走：备份机上的调试跑一样会误报，
+    # 而实机自己误报时照样没人挡。判据只有一条 —— 这一趟到底有没有见到 bot。
+    pending_bot_area: tuple[int, int] | None = None
     # ⚠️ **提到 `try` 之前。** 汇总那一条在 `finally` 里，而补数在 `try` 里 ——
     # 被 Ctrl+C / 调度器抢占打断时补数根本没跑到，而汇总照打。定义在 `try` 里
     # 的话，`finally` 会撞 `NameError`，把一次干净的中断变成一条堆栈。
@@ -1829,6 +1853,7 @@ def scan(
         """
         nonlocal score_anchor, blind_score_screens, dry, previous_coordinates
         nonlocal screens_without_overlap, last_reset_screen, reset_count
+        nonlocal pending_bot_area
         outcome = judge_rows(
             rows,
             observed_at=datetime.now(UTC),
@@ -1836,6 +1861,16 @@ def scan(
             history=score_history,
         )
         fresh, reached = collect(outcome.targets)
+        # ⚠️⚠ **这一屏读到了 bot 行 —— 现在才有资格说「到了 bot 区」。**
+        #
+        # `outcome.targets` 是 bot 过滤**之后**的那一批，所以它非空就等于这一屏
+        # 真读到了 bot。用它而不是 `fresh`：`fresh` 在去重之后，一屏全是已见过的
+        # 坐标时会为空，而那种屏照样证明了「我在 bot 区」。
+        # 也不用 `written`：拉黑的坐标写不进库，可那不代表没见到 bot。
+        if pending_bot_area is not None and outcome.targets:
+            rows_to_bots, blind_used = pending_bot_area
+            pending_bot_area = None
+            report_bot_area_reached(rows_to_bots, blind_rows=blind_used)
         score_anchor = next_score_anchor(rows, anchor=score_anchor)
         # 三个候选条件同屏并行算，各自记失败；**都不影响真阀**。
         # 账在 `shadow_blind` 那段注释上。
@@ -2048,9 +2083,18 @@ def scan(
         )
         outcome = exit_code_for_stretch(stretch)
         if stretch.reached_bots:
-            # ⚠️ 这一句不只是给人看的：它是**自动标定唯一的实测样本来源**，
-            # 而同一个出口还负责在余量被吃掉时报警。别把它拆回一句 `say`。
-            report_bot_area_reached(stretch.rows, blind_rows=blind_phase_rows)
+            # ⚠️⚠ **这里只报进度，不发样本。**
+            #
+            # `report_bot_area_reached` 那句话是自动标定唯一的样本来源，而这一刻
+            # 「到了 bot 区」还只是**检测段的判断** —— 它会误报，而误报的代价是
+            # 一条偏小的实测进了标定、下一趟滚得更少、又误报（理由整段写在
+            # `pending_bot_area` 上）。所以先攒着，等采集段真读到 bot 行再发。
+            #
+            # ⚠️ 这条进度句**必须避开 `翻了 ` 这个前缀** —— 标定就是按那个前缀
+            # 从 `system_log` 里取样的（`domain.ranking.BOT_AREA_REACHED_PREFIX`）。
+            # 措辞一撞，推迟就白做了。
+            say(f"检测段判定已进 bot 区（本趟走了 {stretch.rows} 行），开始细读")
+            pending_bot_area = (stretch.rows, blind_phase_rows)
         if account.rows_requested:
             # ⚠️ **落在这里而不是拨完那一刻**，因为 `rows_to_bot_area` 要等检测段
             # 跑完才知道，而那个数与「每格实测几行」放在同一条里才对得上账。
