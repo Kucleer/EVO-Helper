@@ -414,7 +414,50 @@ MAIL_BACK_WAIT_S = 2.0
 #: 而且保证一定会停。
 #:
 #: ⚠️ **「拖不动了」比的是时间列，不是行身份**，理由见 `mail_times_settled`。
+#: ⚠️ **这个数已经不是「拖几次」的上限了**，见下面那三个 `MAIL_TO_TOP_*`。
+#: 2026-09-07 回顶从慢拖换成连拨滚轮，单位从「次」变成「轮」，
+#: 而一轮走的距离是一次慢拖的六十多倍 —— 照抄 40 会让最坏情形反而更慢。
 MAIL_SCROLL_TO_TOP_MAX_DRAGS = 40
+
+#: 回顶一轮往上连拨几格。**标定常量，不是运维旋钮。**
+#:
+#: 2026-09-07 实机量的（探针只滚不点、不写库）：**一格约 1.5 行**
+#: （往下拨 2 格移了 3 行、4 格移了 6 行也就是整屏）。邮件一屏 6 行。
+#: 所以 200 格 ≈ 300 行。
+#:
+#: 为什么要这么大：**实机上信箱确实很深**。同一天量到的证据 ——
+#: 拖满 40 次（≈186 行）放弃时，末屏第 0 行的时刻**落后那一趟 483–1109 分钟**
+#: （8–18 小时）；而在顶部时第 0 行该是几分钟前的邮件。
+#: 也就是说 186 行远远不够，而这正是 17.3% 的进信箱「从一个不知道在哪的位置
+#: 开始往下翻」的原因。
+#:
+#: ⚠️ **往上过冲没有代价** —— 列表到顶就被夹住，物理上不可能滚过头。
+#: ⚠️ 而且**夹住那一屏正好落在标定网格上**：同一次实测里，往上拨 400 格之后
+#: 连续两屏的时间列**逐位相同 6/6**，且第 0 行是 10 分钟前的邮件（真顶部）。
+#: 离网格的代价是**读空**（拨 8 格那一屏 6 行里 5 行读不出），
+#: 所以「拨到夹住」不只是快，它还是唯一保证读得准的位置。
+MAIL_TO_TOP_NOTCHES = 200
+
+#: 回顶最多拨几轮。**刻意比 `MAIL_SCROLL_TO_TOP_MAX_DRAGS`(40) 小得多。**
+#:
+#: 一轮 ≈ 300 行，8 轮 ≈ 2400 行；而一次慢拖只有 4.6 行，40 次才 186 行。
+#: 单位换了，上限必须跟着换：照抄 40 的话最坏情形是
+#: 40 × (3.2s 拨 + 1.2s 沉降 + 约 2s 读) ≈ 7 分钟，**比换之前的 232 秒更慢**。
+#:
+#: 8 轮的最坏情形约 51 秒，而常态是 2–3 轮（第 1 轮拨到夹住、第 2 轮确认）。
+#:
+#: ⚠️ 走满仍然**不许说「已经在顶部」** —— 那一句的口径见
+#: `_say_scroll_to_top_gave_up`，2026-08-18 那次它说过谎。
+MAIL_TO_TOP_MAX_ROUNDS = 8
+
+#: 连拨时两格之间的间隔。游戏做的是**速度惯性**滚动，间隔太大攒不起动量
+#: （`scan_coordinates.LiveDriver.wheel_notch` 上记着实测：`PAUSE` 没归零时
+#: 被撑成 117ms/格，80 格只走 2 行）。与军力榜盲滚、行星列表回顶同源。
+MAIL_WHEEL_GAP_S = 0.016
+
+#: 拨完等滑行停下再读屏。**读早了读到的是拨之前那一屏** —— 那会与上一屏
+#: 逐位相同，于是 `mail_times_settled` 把「还没走动」误判成「到顶了」。
+MAIL_SPIN_SETTLE_S = 1.2
 
 #: 面板标题（那块金属牌上的大字），用来认出「现在是哪个面板」。
 #: 邮件列表是「邮箱」，报告详情页是「消息」——两者都是大字，读得很干净。
@@ -460,6 +503,12 @@ MAIL_BACK_ATTEMPTS = 2
 #: 详情页里把内容拖到底用的起止点（917 空间）。必须慢拖，见 `slow_drag`。
 PANEL_DRAG_FROM_Y = 700
 PANEL_DRAG_TO_Y = 300
+
+#: 回顶连拨滚轮之前指针落在哪。**跟着上面那两个走，不写死** ——
+#: 面板的位置随画面走，写死的 y 迟早落到面板外面，而落错了就是白拨
+#: （滚轮事件发给指针当下所在的那个控件）。x 与 `slow_drag` 的默认值同源。
+MAIL_PANEL_HOVER_X = 960
+MAIL_PANEL_HOVER_Y = (PANEL_DRAG_FROM_Y + PANEL_DRAG_TO_Y) // 2
 
 #: 读「单位」/「损失单位」那两行之前，详情页要往下拖几次（见 `PirateLoop._bottom_screens`）。
 #: 到底会夹住，多拖一次无害；少拖一次就是静默留空。
@@ -875,6 +924,26 @@ def mail_times_settled(
         1 for before, after in zip(previous, current, strict=True) if before and before == after
     )
     return same * 2 > len(current)
+
+
+def _times_matching_in_place(
+    previous: Sequence[str | None] | None, current: Sequence[str | None]
+) -> int | None:
+    """相邻两屏**逐位相同**的行数。`previous` 为空时交回 `None`（还没得比）。
+
+    ⚠️ 这不是判据，只是把判据算的那个数拎出来**好落进日志**。
+    判据本身是 `domain.mail_scan.mail_times_settled`（严格多数相同才算没动，
+    读空不算到顶），一个字都没动。
+
+    为什么要它：走满上限时只记末屏**解释不了判据为什么失败**。
+    「到没到顶判不出来」不等于「实际没到顶」，而「6 行时间都读出来」也不等于
+    「读对了」—— 读错同样会让逐位比较永远不相同。有了这个数才分得开
+    「列表还很深」（每轮都在动、相同行数一直是 0）和「同一个位置两次读出不同
+    内容」（列表没动，相同行数却上不去）。
+    """
+    if previous is None:
+        return None
+    return sum(1 for a, b in zip(previous, current, strict=False) if a and b and a == b)
 
 
 def _first_row_time(rows: Sequence[MailRow]) -> str:
@@ -2336,17 +2405,56 @@ class PirateLoop:
         """
         previous: list[str | None] | None = None
         rows: list[MailRow] = []
-        for drag in range(MAIL_SCROLL_TO_TOP_MAX_DRAGS):
+        # ⚠️ 逐轮留痕：走满上限时把这一份交给 `_say_scroll_to_top_gave_up`。
+        #
+        # 原先只记末屏，而末屏**解释不了判据为什么失败** —— 「到没到顶判不出来」
+        # 不等于「实际没到顶」，「6 行时间都读出来」也不等于「读对了」。
+        # 逐轮的时间列 + 相邻两屏逐位相同的行数才分得开「列表还很深」和
+        # 「同一个位置两次读出不同内容」。
+        rounds: list[dict[str, Any]] = []
+        for spin in range(MAIL_TO_TOP_MAX_ROUNDS):
             rows = self._mail_list_rows()
             times = [row.raw_time_text for row in rows]
+            matched = _times_matching_in_place(previous, times)
+            rounds.append(
+                {
+                    "round": spin,
+                    "row_times": list(times),
+                    "readable_times": sum(1 for value in times if value),
+                    "matched_in_place": matched,
+                }
+            )
             if mail_times_settled(previous, times):
-                say(f"  列表往上拖了 {drag} 次到顶；第 0 行是 {_first_row_time(rows)} 的邮件")
+                say(f"  列表往上拨了 {spin} 轮到顶；第 0 行是 {_first_row_time(rows)} 的邮件")
                 return
             previous = times
-            slow_drag(self._driver, PANEL_DRAG_TO_Y, PANEL_DRAG_FROM_Y)
-        self._say_scroll_to_top_gave_up(rows)
+            self._spin_mail_list_back()
+        self._say_scroll_to_top_gave_up(rows, rounds=rounds)
 
-    def _say_scroll_to_top_gave_up(self, rows: Sequence[MailRow]) -> None:
+    def _spin_mail_list_back(self) -> None:
+        """把指针落进邮件列表，往上连拨 `MAIL_TO_TOP_NOTCHES` 格。
+
+        ⚠️ **落点必须在拨之前**：滚轮事件发给指针当下所在的那个控件，
+        而 `wheel_notch` 自己不移动鼠标（它要塞进一个 16ms 的循环里，
+        抢前台或重新定位都放不进去）。落点取面板拖动几何的中点，
+        跟着 `PANEL_DRAG_*` 走而不写死。
+
+        ⚠️ **一格一个事件，不合并。** N 格合成一个大事件会被游戏静默封顶
+        （实测 800 格只走 14px）；密度由这里的循环控制。
+
+        ⚠️ **拨完等沉降再让调用方读屏。** 读早了读到的是拨之前那一屏，
+        那会与上一屏逐位相同，于是判据把「还没走动」误判成「到顶了」。
+        """
+        driver = SlowDragDriver(self._driver)
+        driver.hover(MAIL_PANEL_HOVER_X, MAIL_PANEL_HOVER_Y)
+        for _ in range(MAIL_TO_TOP_NOTCHES):
+            driver.wheel_notch(up=True)
+            driver.wait(MAIL_WHEEL_GAP_S)
+        driver.wait(MAIL_SPIN_SETTLE_S)
+
+    def _say_scroll_to_top_gave_up(
+        self, rows: Sequence[MailRow], *, rounds: Sequence[dict[str, Any]] | None = None
+    ) -> None:
         """走满上限时**如实**描述，并把证据落库。
 
         ⚠️ 原先这里打的是「这一趟看到的**不是信箱最新的几封**」，而 2026-08-18
@@ -2361,11 +2469,25 @@ class PirateLoop:
         本地 `var/logs` 取不到（CLAUDE.md「排障看库里的日志表」）。
         `payload_json` 带上那一屏的时间列，下次再出这一句时能直接看出来
         「是列表真的深，还是时间也读不出来了」——这正是原先分不出的那两种。
+
+        ## 2026-09-07：末屏不够，逐轮才够
+
+        拿库里 147 条这样的记录重看过一遍：放弃时**末屏第 0 行的时刻落后那一趟
+        483–1109 分钟（8–18 小时）**，而在顶部时第 0 行该是几分钟前的邮件 ——
+        所以主因是「列表确实比拖得到的还深」。同一天多次放弃的末屏几乎两两不同
+        （19 次 19 种），也印证它一直在动。
+
+        ⚠️ **但末屏只能证到这一步。** 「判不出到顶」不等于「实际没到顶」，
+        「6 行时间都读出来」也不等于「读对了」——读错同样会让逐位比较永远不相同
+        （实测 142 次里有 20 次读出的行数不足 6）。所以现在把**逐轮**的时间列
+        和**相邻两屏逐位相同的行数**一起落库：前者说列表在不在动，
+        后者说判据差多少才成立。
         """
         times = [row.raw_time_text for row in rows]
         readable = sum(1 for value in times if value)
         say(
-            f"  往上拖满 {MAIL_SCROLL_TO_TOP_MAX_DRAGS} 次，两屏之间的时间列一直在变；"
+            f"  往上拨满 {MAIL_TO_TOP_MAX_ROUNDS} 轮（每轮 {MAIL_TO_TOP_NOTCHES} 格），"
+            f"两屏之间的时间列一直在变；"
             f"最后一屏第 0 行是 {_first_row_time(rows)} 的邮件，"
             f"{len(times)} 行里读出时间的有 {readable} 行。"
             "到没到顶判不出来，这一趟就从这里往下翻"
@@ -2373,12 +2495,17 @@ class PirateLoop:
         record_system_log(
             "WARNING",
             "tools.pirate_loop",
-            "拖回信箱顶部走满上限，到没到顶判不出来",
+            "拨回信箱顶部走满上限，到没到顶判不出来",
             payload={
-                "max_drags": MAIL_SCROLL_TO_TOP_MAX_DRAGS,
+                "max_rounds": MAIL_TO_TOP_MAX_ROUNDS,
+                "notches_per_round": MAIL_TO_TOP_NOTCHES,
                 "first_row_time": rows[0].raw_time_text if rows else None,
                 "row_times": list(times),
                 "readable_times": readable,
+                # ⚠️ 这一份是这次加的：末屏解释不了判据为什么失败，逐轮才行。
+                # 每一项带 `row_times` 与 `matched_in_place`（相邻两屏逐位相同的
+                # 行数）——前者说列表在不在动，后者说判据差多少才成立。
+                "rounds": [dict(entry) for entry in (rounds or ())],
                 "criterion": "mail_times_settled：逐位比时间列，严格多数相同才算没动",
             },
         )

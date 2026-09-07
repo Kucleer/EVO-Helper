@@ -52,7 +52,8 @@ import pytest
 
 from evo_helper.tools import pirate_loop
 from evo_helper.tools.pirate_loop import (
-    MAIL_SCROLL_TO_TOP_MAX_DRAGS,
+    MAIL_TO_TOP_MAX_ROUNDS,
+    MAIL_TO_TOP_NOTCHES,
     RECONCILE_MAX_PAGES,
     LoopOptions,
     MailRow,
@@ -89,13 +90,20 @@ NOISY_SUBJECTS = [
 
 
 class _List:
-    """一个记得自己滚到哪的假邮件列表。往上拖会夹在第 0 行。"""
+    """一个记得自己滚到哪的假邮件列表。往上拨会夹在第 0 行。
 
-    def __init__(self, *, start: int, rows_per_drag: int = 5, noisy_subjects: bool = False) -> None:
+    `rows_per_round` 是**一轮连拨**走多少行。默认 300 就是实机的量级
+    （2026-09-07 实测一格约 1.5 行 × 一轮 200 格），也就是**一轮必然夹住**；
+    要验「判据是内容不是次数」的那几条把它调小。
+    """
+
+    def __init__(
+        self, *, start: int, rows_per_round: int = 300, noisy_subjects: bool = False
+    ) -> None:
         self.offset = start
-        self._step = rows_per_drag
+        self._step = rows_per_round
         self._noisy = noisy_subjects
-        self.drags = 0
+        self.rounds = 0
         self.reads = 0
 
     def read(self) -> list[MailRow]:
@@ -105,9 +113,39 @@ class _List:
         self.reads += 1
         return _rows(self.offset, subject=subject)
 
-    def drag_up(self) -> None:
-        self.drags += 1
+    def spin_up(self) -> None:
+        self.rounds += 1
         self.offset = max(0, self.offset - self._step)
+
+
+class _FakeInput:
+    """假的 `SlowDragDriver`：只认落点、滚轮、等待，一步真实操作都不做。
+
+    ⚠️ **按「轮」结算而不是按「格」**：攒够 `MAIL_TO_TOP_NOTCHES` 格才让列表动
+    一次。逐格模拟会建出一个实机上不存在的中间态（一格 1.5 行 × 200 格远超
+    任何一屏），那种模型下任何实现都能一轮到顶，用例就废了。
+    """
+
+    def __init__(self, listing: _List) -> None:
+        self._listing = listing
+        self.hovers: list[tuple[int, int]] = []
+        self.notches: list[bool] = []
+
+    def hover(self, x: int, y: int) -> None:
+        self.hovers.append((x, y))
+
+    def wheel_notch(self, *, up: bool = False) -> None:
+        self.notches.append(up)
+        if len(self.notches) % MAIL_TO_TOP_NOTCHES:
+            return
+        # 一轮拨完。往上才回顶；往下（忘了传 up=True）会越走越深。
+        if up:
+            self._listing.spin_up()
+        else:
+            self._listing.offset += self._listing._step
+
+    def wait(self, seconds: float) -> None:
+        del seconds
 
 
 @pytest.fixture(autouse=True)
@@ -119,12 +157,19 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _wire(monkeypatch: pytest.MonkeyPatch, listing: _List) -> Any:
-    """一个只装了「读一屏 + 往上拖」的 `PirateLoop`。慢拖换成假列表的滚动。"""
-    monkeypatch.setattr(pirate_loop, "slow_drag", lambda *args, **kwargs: listing.drag_up())
+    """一个只装了「读一屏 + 往上连拨」的 `PirateLoop`。
+
+    ⚠️ 2026-09-07 之前这里打桩的是 `slow_drag`；回顶换成连拨滚轮之后，
+    动作走 `SlowDragDriver`（那一层管着 `PAUSE` 与「一格一个事件」），
+    所以打桩点跟着换。`_input` 挂到 loop 上，好让用例读得到落点与格数。
+    """
+    fake = _FakeInput(listing)
+    monkeypatch.setattr(pirate_loop, "SlowDragDriver", lambda _driver: fake)
     loop = PirateLoop.__new__(PirateLoop)
     loop._options = LoopOptions(systems=(), scout=True, attack=True)
     loop._driver = object()
     loop._mail_list_rows = listing.read  # type: ignore[assignment, method-assign]
+    loop._fake_input = fake  # type: ignore[attr-defined]
     return loop
 
 
@@ -162,24 +207,28 @@ def test_b_it_never_takes_a_shortcut_and_always_verifies_by_dragging(
 
     loop._scroll_mail_list_to_top()
 
-    # 已经在顶上：也要拖一次亲眼确认它不动，但**只拖一次**——上限是兜底，不是节奏。
-    assert listing.drags == 1
+    # 已经在顶上：也要拨一轮亲眼确认它不动，但**只拨一轮**——上限是兜底，不是节奏。
+    assert listing.rounds == 1
     assert listing.offset == 0
 
 
 def test_the_stop_is_the_rows_not_the_count(monkeypatch: pytest.MonkeyPatch) -> None:
     """一次拖动能走几行**没有标定过**，所以停止条件只能是「还是那几行」。
 
-    这里把步距调成 1 行——写死次数的那版会停在第 97 行，而按判据停的这版
-    照样回到第 0 行，只是多拖了几次。
+    这里把一轮的步距调成 1 行——写死轮数的那版会停在半路，而按判据停的这版
+    照样回到第 0 行，只是多拨了几轮。
+
+    ⚠️ 起点用 5 而不是 20：一轮上限是 `MAIL_TO_TOP_MAX_ROUNDS`(8)，而实机上
+    一轮走约 300 行，所以「一轮只走 1 行」这种极端步距下起点必须留在上限之内，
+    否则这条验的就变成上限而不是判据了（上限有它自己那条用例）。
     """
-    listing = _List(start=20, rows_per_drag=1)
+    listing = _List(start=5, rows_per_round=1)
     loop = _wire(monkeypatch, listing)
 
     loop._scroll_mail_list_to_top()
 
     assert listing.offset == 0
-    assert listing.drags == 21  # 20 次把它拖上去，第 21 次确认拖不动了
+    assert listing.rounds == 6  # 5 轮把它拨上去，第 6 轮确认拨不动了
 
 
 def test_e_subject_noise_no_longer_defeats_the_stop_condition(
@@ -196,7 +245,7 @@ def test_e_subject_noise_no_longer_defeats_the_stop_condition(
 
     loop._scroll_mail_list_to_top()
 
-    assert listing.drags == 1
+    assert listing.rounds == 1
 
 
 def test_e_one_garbled_time_cell_does_not_restart_the_dragging(
@@ -228,13 +277,13 @@ def test_e_one_garbled_time_cell_does_not_restart_the_dragging(
 
     loop._scroll_mail_list_to_top()
 
-    assert listing.drags == 1
+    assert listing.rounds == 1
 
 
 def test_d_giving_up_describes_the_evidence_instead_of_claiming_it_is_not_the_top(
     monkeypatch: pytest.MonkeyPatch, _capture: list[str]
 ) -> None:
-    """走满上限时**只说能证明的**：拖了几次、第 0 行是什么时候的、判据是什么。
+    """走满上限时**只说能证明的**：拨了几轮、第 0 行是什么时候的、判据是什么。
 
     ⚠️ 原先打的是「这一趟看到的**不是信箱最新的几封**」。2026-08-18 走满上限的
     那 17 趟里，用户当场核对过：**进邮箱本来就在顶部**，看到的正是最新的几封。
@@ -263,13 +312,15 @@ def test_d_giving_up_describes_the_evidence_instead_of_claiming_it_is_not_the_to
 
     loop._scroll_mail_list_to_top()
 
-    # ⚠️ 上界写成字面量，**不写 `MAIL_SCROLL_TO_TOP_MAX_DRAGS`**：拿被守的常量
-    # 当自己的尺子，把上限改成 400（一趟 20 分钟）这条也照样绿。60 次 ≈ 280 行、
-    # 约三分钟，是「还能忍」的那一档。
-    assert 0 < listing.drags <= 60
-    # 而下界也要有：拖不到一趟对账往下沉的那么多行，等于没修
-    # （`RECONCILE_MAX_PAGES` = 8 屏，每屏一次拖动）。
-    assert MAIL_SCROLL_TO_TOP_MAX_DRAGS > RECONCILE_MAX_PAGES * 2
+    # ⚠️ 上界写成字面量，**不写 `MAIL_TO_TOP_MAX_ROUNDS`**：拿被守的常量
+    # 当自己的尺子，把上限改成 400 这条也照样绿。一轮约 3.2 秒拨 + 1.2 秒沉降
+    # + 一次面板 OCR，所以 12 轮 ≈ 一分钟，是「还能忍」的那一档。
+    assert 0 < listing.rounds <= 12
+    # 而下界也要有：一轮拨不过一趟对账往下沉的那么多行，等于没修
+    # （`RECONCILE_MAX_PAGES` = 8 屏 × 6 行 = 48 行）。
+    # ⚠️ 这里比的是**行**不是次数：单位从「一次拖 4.6 行」换成
+    # 「一轮 200 格 × 约 1.5 行」之后，拿次数比会得出相反的结论。
+    assert MAIL_TO_TOP_NOTCHES * 1.5 > RECONCILE_MAX_PAGES * 6
 
     spoken = "\n".join(_capture)
     # 不许再声称「看到的不是最新的几封」——它没有任何证据支持这句。
@@ -284,10 +335,57 @@ def test_d_giving_up_describes_the_evidence_instead_of_claiming_it_is_not_the_to
     assert [level for level, _message, _payload in records] == ["WARNING"]
     _level, message, payload = records[0]
     assert "不是" not in message
-    assert payload["max_drags"] == MAIL_SCROLL_TO_TOP_MAX_DRAGS
+    assert payload["max_rounds"] == MAIL_TO_TOP_MAX_ROUNDS
+    assert payload["notches_per_round"] == MAIL_TO_TOP_NOTCHES
     assert payload["first_row_time"] == last_seen
     assert payload["readable_times"] == 6
     assert len(payload["row_times"]) == 6
+
+    # ⚠️⚠️ **逐轮的现场也要落库。** 只记末屏解释不了判据为什么失败：
+    # 「判不出到顶」不等于「实际没到顶」，「6 行时间都读出来」也不等于「读对了」。
+    # 每一轮带 `row_times`（列表在不在动）和 `matched_in_place`
+    # （相邻两屏逐位相同的行数，也就是判据差多少才成立）。
+    assert len(payload["rounds"]) == MAIL_TO_TOP_MAX_ROUNDS
+    assert payload["rounds"][0]["matched_in_place"] is None, "第一轮没得比"
+    assert all(entry["matched_in_place"] == 0 for entry in payload["rounds"][1:]), (
+        "这一列每轮都在动，逐位相同的行数应当一直是 0"
+    )
+    assert all(len(entry["row_times"]) == 6 for entry in payload["rounds"])
+
+
+def test_one_round_is_many_single_notches_upward(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️⚠️ **一轮 = `MAIL_TO_TOP_NOTCHES` 个「一格」事件，方向朝上，落点在前。**
+
+    三件事各自都会静默失效，所以三件都钉住：
+
+    1. **格数**。合并成一个大事件会被游戏**静默封顶**（实测 800 格只走 14px），
+       所以驱动面上只有「一格」这一种粒度，密度由这一层的循环控制。
+    2. **方向**。`wheel_notch` 的默认方向是**往下**（军力榜盲滚是往下走的）。
+       回顶忘了传 `up=True` 的实现会**越走越深** —— 而信箱本来就深 8–18 小时，
+       症状是「拨满上限还没到顶」，和不修一模一样。
+    3. **落点在拨之前**。滚轮事件发给指针当下所在的控件，落点晚一步就是白拨，
+       而白拨不报错。
+
+    ⚠️ 落点还必须**跟着面板拖动几何走**，不写死：面板位置随画面走。
+    """
+    listing = _List(start=1_000)
+    loop = _wire(monkeypatch, listing)
+
+    loop._scroll_mail_list_to_top()
+
+    fake = loop._fake_input
+    assert fake.notches, "一格都没拨"
+    assert len(fake.notches) % MAIL_TO_TOP_NOTCHES == 0
+    assert all(fake.notches), "回顶必须每一格都往上拨；往下拨会越走越深"
+    assert fake.hovers, "拨之前没有落点"
+    assert fake.hovers[0] == (
+        pirate_loop.MAIL_PANEL_HOVER_X,
+        pirate_loop.MAIL_PANEL_HOVER_Y,
+    )
+    assert (
+        pirate_loop.MAIL_PANEL_HOVER_Y
+        == (pirate_loop.PANEL_DRAG_FROM_Y + pirate_loop.PANEL_DRAG_TO_Y) // 2
+    ), "落点写死了；面板一挪就落到外面去"
 
 
 def test_c_an_unreadable_screen_is_not_mistaken_for_the_top(
