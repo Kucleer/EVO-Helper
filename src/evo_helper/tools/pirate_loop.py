@@ -135,6 +135,7 @@ from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
+    SlowDragDriver,
     crop_png_base64,
     ensure_window_or_restart,
     make_ocr,
@@ -4882,6 +4883,10 @@ class _PlanetListDriver:
 
     def __init__(self, driver: LiveDriver) -> None:
         self._driver = driver
+        # 滚轮与落点走 `SlowDragDriver`：那一层管着 `PAUSE` 的存取与「一格一个
+        # 事件」，而这两条都不该在这里再写一遍。持有一个而不是每次新建 ——
+        # 它是无状态包装，但连拨一轮要调它 40 次。
+        self._input = SlowDragDriver(driver)
 
     def click(self, x: int, y: int, *, label: str = "") -> None:
         self._driver.click(x, y, label=label)
@@ -4892,6 +4897,18 @@ class _PlanetListDriver:
 
     def wait(self, seconds: float) -> None:
         self._driver.wait(seconds)
+
+    def hover(self, x: int, y: int) -> None:
+        """转交 `SlowDragDriver.hover`：把指针挪过去，**不按下**。
+
+        ⚠️ 连拨滚轮之前必须先落点 —— 滚轮事件发给指针当下所在的那个控件，
+        而 `wheel_notch` 自己不移动鼠标（理由在它的 docstring 上）。
+        """
+        self._input.hover(x, y)
+
+    def wheel_notch(self, *, up: bool = False) -> None:
+        """转交 `SlowDragDriver.wheel_notch`。回顶那一段用 `up=True`。"""
+        self._input.wheel_notch(up=up)
 
 
 class _PresetPickerDriver:

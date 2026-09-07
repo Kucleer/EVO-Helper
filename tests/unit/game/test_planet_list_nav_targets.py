@@ -27,12 +27,26 @@ class _Driver:
 
     def __init__(self) -> None:
         self.clicks: list[tuple[int, int, str]] = []
+        self.hovers: list[tuple[int, int]] = []
+        self.notches: list[bool] = []
 
     def click(self, x: int, y: int, *, label: str = "") -> None:
         self.clicks.append((x, y, label))
 
     def drag(self, from_x: int, from_y: int, to_x: int, to_y: int, *, label: str = "") -> None:
         return None
+
+    def hover(self, x: int, y: int) -> None:
+        """回顶那一段连拨滚轮之前的落点。这几条用例只关心点击，落点记下不校验。
+
+        ⚠️ 2026-09-07 之前这个桩不需要它：那时回顶是慢拖，而慢拖遇到只读出
+        一行的屏会因为「没有安全的按下点」提前退出。滚轮不需要按下点，
+        所以这条路现在真的会走到。
+        """
+        self.hovers.append((x, y))
+
+    def wheel_notch(self, *, up: bool = False) -> None:
+        self.notches.append(up)
 
     def wait(self, seconds: float) -> None:
         return None
