@@ -16,6 +16,10 @@
 from __future__ import annotations
 
 from evo_helper.domain.models import Coordinate
+from evo_helper.game.pirate_ui import (
+    PLANET_LIST_TO_TOP_MAX_DRAGS,
+    PLANET_LIST_TO_TOP_NOTCHES,
+)
 from evo_helper.game.planet_list import PlanetSwitcher, SwitchResult, coordinate_words
 
 HOME = Coordinate(2, 137, 18)
@@ -46,6 +50,10 @@ GOTO_ROW_3 = (1166, 710)
 EXPAND_ROW_1 = (1166, 320)
 
 
+#: 一轮连拨几格 —— **从实现里取**，别在测试里再写一遍那个数字。
+_NOTCHES_PER_ROUND = PLANET_LIST_TO_TOP_NOTCHES
+
+
 class _List:
     """一列**上下都能滚**的行星清单。`screens` 从上到下排开，两端夹住。
 
@@ -71,6 +79,40 @@ class _List:
     def scroll_back(self) -> None:
         self.at = max(0, self.at - 1)
 
+    def scroll_to_top(self) -> None:
+        """一轮连拨能走的距离远超清单全长 ⇒ 直接夹在顶端。
+
+        ⚠️ 这不是「假驱动图省事」，而是照实测建的模型：2026-09-07 量到一格约
+        125px、行星列表全长 920px，而一轮是 40 格（≈5000px）。逐格模拟反而会
+        建出一个实机上不存在的中间态。
+        """
+        self.at = 0
+
+    def scroll_to_bottom(self) -> None:
+        self.at = len(self.screens) - 1
+
+
+class _RestlessList(_List):
+    """**每次读都换一批坐标**，位置在哪都一样 —— 判据永远判不出「到顶」。
+
+    ⚠️ 2026-09-07 换成连拨之后，「清单太长、上界不够」这种情形**不再存在**：
+    一轮 40 格远超任何现实清单的长度，必然夹在端点。所以原先那个「60 屏、
+    每屏不同」的模型在新实现下一轮就到顶了，拿它验上界会变成空断言。
+
+    真实机上「判不出到顶」的成因是**同一个位置两次读出不同内容**（邮件那条
+    链路 2026-09-01…09-06 天天如此：时间列 6 行全读出来了，逐位比较却始终
+    不相同）。这个假清单建的就是那个形状。
+    """
+
+    def read(self) -> list[tuple[int, str]]:
+        self.reads += 1
+        step = self.reads
+        return [
+            (190, f"[5:{step}:1]"),
+            (420, f"[5:{step + 1}:1]"),
+            (650, f"[5:{step + 2}:1]"),
+        ]
+
 
 class _FlakyList(_List):
     """指定次数把已有行读成空，模拟列表刚展开时的单帧 OCR 失手。"""
@@ -92,6 +134,15 @@ class _Driver:
         self._planets = planets
         self.clicks: list[tuple[int, int, str]] = []
         self.drags: list[tuple[int, int, int, str]] = []
+        self.hovers: list[tuple[int, int]] = []
+        #: 每一轮连拨记一条：`(格数, 方向是不是往上)`。
+        #:
+        #: ⚠️ **按「轮」记而不是按「格」记**：一轮 40 格是密度的事（游戏对单个大
+        #: 事件会静默封顶，所以只能一格一个事件），而用例关心的是「回顶拨了几轮」。
+        #: 逐格记的话每条用例都要除以 40，而那个 40 一改所有用例跟着red。
+        self.spins: list[tuple[int, bool]] = []
+        self._pending_notches = 0
+        self._pending_up = False
 
     def click(self, x: int, y: int, *, label: str = "") -> None:
         self.clicks.append((x, y, label))
@@ -127,8 +178,36 @@ class _Driver:
         """往下翻找目标的那几下。"""
         return [drag for drag in self.drags if drag[2] < drag[1]]
 
+    def hover(self, x: int, y: int) -> None:
+        self.hovers.append((x, y))
+
+    def wheel_notch(self, *, up: bool = False) -> None:
+        """攒格数；`wait(沉降)` 那一下才把这一轮结算进 `spins` 并真的滚动。
+
+        ⚠️ **一轮只让列表动一次**，而不是每格动一次：实机上 40 格是攒动量，
+        列表走的距离由整轮决定（实测一格约 125px，一轮 40 格远超列表全长，
+        于是必然夹在端点）。逐格滚动的假驱动会让「拨一轮 = 走 40 屏」，
+        那种模型下任何实现都能一轮到顶，用例就废了。
+        """
+        self._pending_notches += 1
+        self._pending_up = up
+
     def wait(self, seconds: float) -> None:
         del seconds
+        if not self._pending_notches:
+            return
+        notches, up = self._pending_notches, self._pending_up
+        self._pending_notches = 0
+        # 间隔那几下 `wait` 也会走到这里，所以只有攒够一轮才结算。
+        if notches < _NOTCHES_PER_ROUND:
+            self._pending_notches = notches
+            return
+        self.spins.append((notches, up))
+        # 一轮拨得远超列表全长 ⇒ 直接夹在端点。
+        if up:
+            self._planets.scroll_to_top()
+        else:
+            self._planets.scroll_to_bottom()
 
     @property
     def points(self) -> list[tuple[int, int]]:
@@ -184,6 +263,26 @@ def _switcher(
         say=said.append if said is not None else (lambda _message: None),
         record_evidence=lambda message, payload: recorded.append((message, payload)),
         dry_run=dry_run,
+    )
+    return switcher, driver, planets
+
+
+def _switcher_with(
+    planets: _List,
+    *,
+    origin_reads: str = "2:137:18",
+    evidence: list[tuple[str, dict[str, object]]] | None = None,
+    said: list[str] | None = None,
+) -> tuple[PlanetSwitcher, _Driver, _List]:
+    """给一个**现成的**假清单实例。`_switcher` 只收屏幕列表，接不了自定义读数行为。"""
+    driver = _Driver(planets)
+    recorded = evidence if evidence is not None else []
+    switcher = PlanetSwitcher(
+        driver=driver,  # type: ignore[arg-type]
+        read_rows=planets.read,
+        read_origin=lambda: origin_reads,
+        say=said.append if said is not None else (lambda _message: None),
+        record_evidence=lambda message, payload: recorded.append((message, payload)),
     )
     return switcher, driver, planets
 
@@ -260,10 +359,17 @@ class TestClickingOnlyTheGoToColumn:
         assert planets.reads >= 2, "点之前必须再读一次这一屏"
 
     def test_a_row_that_moved_between_the_two_reads_is_not_clicked(self) -> None:
-        """复核读到的 y 变了 = 列表还在动。这时点下去点的是「刚才那个位置」。"""
+        """复核读到的 y 变了 = 列表还在动。这时点下去点的是「刚才那个位置」。
+
+        ⚠️ **前两份答案是给回顶用的**：两屏一样，`reached_top` 才认「到顶了」，
+        回顶那一段才交出控制权。原先只给两份就够，是因为慢拖有「一行读不出就
+        没有按下点」那道闸会把回顶提前结束 —— 换成连拨之后没有按下点，
+        回顶会一直拨到判据成立或走满上限。**这条用例要验的是复核那一步，
+        不该顺带依赖回顶怎么退出。**
+        """
         planets = _List([BASELINE])
         driver = _Driver(planets)
-        answers = [BASELINE, [(310, "[2:137:18]")], BASELINE, [(310, "[2:137:18]")]]
+        answers = [BASELINE, BASELINE, BASELINE, [(310, "[2:137:18]")]]
 
         def read() -> list[tuple[int, str]]:
             return answers.pop(0) if answers else []
@@ -566,12 +672,18 @@ class TestDraggingThroughTheList:
 
         assert [(x, from_y) for x, from_y, _to, _label in driver.forward_drags] == [(961, 760)]
 
-    def test_the_drag_back_to_the_top_presses_on_this_screens_rows_too(self) -> None:
-        """回顶那一下的起止点同样只能来自当前这一屏：按下 `rows[0]`、松手 `rows[-1]`。
+    def test_the_spin_back_to_the_top_hovers_on_this_screens_first_row(self) -> None:
+        """回顶那一轮的**落点**同样只能来自当前这一屏：悬停在 `rows[0]` 上。
 
         这一屏的行在 300/530/760，都不在基准图那三个高度上——实现要是写死了
-        190/420/650 里的任何一个，这条就红。写死的代价与往下翻那一下完全一样：
-        横向中点只在星球名那一行是空白，往下 60px 就是图标上排。
+        190/420/650 里的任何一个，这条就红。
+
+        ⚠️ **落点写死的代价和原先按下点写死一样大，只是形状不同**：滚轮事件发给
+        指针**当下所在的那个控件**，落到面板外面就是白拨 —— 而白拨不报错，
+        症状只是「拨满上限还没到顶」。
+
+        （2026-09-07 之前这一段是慢拖，断言的是按下 `rows[0]`、松手 `rows[-1]`；
+        换成连拨之后没有按下点了，只剩落点。）
         """
         screens = [
             [(300, "[2:137:18]"), (530, "[9:250:8]"), (760, "[4:96:7]")],
@@ -581,7 +693,8 @@ class TestDraggingThroughTheList:
 
         switcher.switch_to(MISSING)
 
-        assert [(x, a, b) for x, a, b, _label in driver.back_drags] == [(961, 300, 760)]
+        assert driver.hovers[0] == (961, 300)
+        assert driver.back_drags == [], "回顶不该再有慢拖"
 
     def test_two_identical_screens_end_the_search_without_a_click(self) -> None:
         """「这一屏读到的和上一屏一样」= 到底了。仍没找到就什么都不点。"""
@@ -653,33 +766,70 @@ class TestGettingBackToTheTopBeforeSearching:
         assert switcher.switch_to(BOTTOM_PLANET) is SwitchResult.SWITCHED
         assert driver.in_panel == [GOTO_ROW_3]
 
-    def test_the_drags_back_stop_as_soon_as_the_list_stops_moving(self) -> None:
-        """停止判据是「拖了一下坐标还是那几个」，不是「拖够几次」。
+    def test_the_spins_back_stop_as_soon_as_the_list_stops_moving(self) -> None:
+        """停止判据是「拨了一轮坐标还是那几个」，不是「拨够几轮」。
 
-        从最后一屏回到第一屏要 3 下，再多 1 下确认拖不动了——**一共 4 下**。
-        写死次数的实现（比如照信箱那次的老样子拖 3 下）会少一下或多好几下，
-        而多拖一下就是一秒多，少拖一下就是这次的缺陷复发。
+        **一共 2 轮**：第 1 轮把列表拨到夹在顶部，第 2 轮确认拨不动了。
+        原先慢拖要 4 下（从第 4 屏回第 1 屏 3 下 + 1 下确认），因为一下只走一屏；
+        一轮连拨（40 格 ≈ 5000px）远超清单全长，所以「走过去」那几下并成了一轮。
+        **这就是这次改动省下的东西**，而判据一个字没动。
+
+        写死轮数的实现会少一轮或多好几轮 —— 多一轮是一秒八，少一轮就是
+        「其实没到顶却当成到了」。
         """
         switcher, driver, _planets = _switcher(SIX_PLANETS, starts_at=3, origin_reads="4:277:15")
 
         switcher.switch_to(TOP_PLANET)
 
-        assert len(driver.back_drags) == 4
+        assert [up for _notches, up in driver.spins] == [True, True]
+        assert driver.back_drags == [], "回顶不该再有慢拖"
+
+    def test_one_round_is_many_single_notches_upward(self) -> None:
+        """⚠️⚠️ **一轮 = `PLANET_LIST_TO_TOP_NOTCHES` 个「一格」事件，方向朝上。**
+
+        三件事各自都会静默失效，所以三件都钉住：
+
+        1. **格数**。合并成一个大事件会被游戏**静默封顶**（实测 800 格只走 14px），
+           所以驱动面上只有「一格」这一种粒度，密度由这一层的循环控制。
+        2. **方向**。`LiveDriver.wheel_notch` 的默认方向是**往下**
+           （盲滚段是往下走的）。回顶忘了传 `up=True` 的实现会一路滚到**底部**，
+           而底部同样会被夹住 ⇒ 两屏内容相同 ⇒ `reached_top` 误判「到顶了」，
+           之后在清单末尾找上面的目标，**找不到**。这一条红了就是那个缺陷。
+        3. **落点在拨之前**。滚轮事件发给指针当下所在的控件，落点晚一步就是白拨。
+        """
+        planets = _List(SIX_PLANETS, starts_at=3)
+        driver = _Driver(planets)
+        switcher = PlanetSwitcher(
+            driver=driver,  # type: ignore[arg-type]
+            read_rows=planets.read,
+            read_origin=lambda: "4:277:15",
+            say=lambda _message: None,
+        )
+
+        switcher.switch_to(TOP_PLANET)
+
+        assert driver.spins, "回顶一轮都没拨"
+        notches, up = driver.spins[0]
+        assert notches == PLANET_LIST_TO_TOP_NOTCHES
+        assert up is True, "回顶必须往上拨；往下拨会被底部夹住而误判到顶"
+        assert driver.hovers, "拨之前没有落点"
 
     def test_a_list_that_never_settles_still_stops(self) -> None:
         """⚠️ **上界不许缺。** 每一屏都不一样时也得停下来。
 
-        这一列每拖一下都换一批坐标（实机上「拖不动了」判不出来就是这个样子），
-        没有上界的实现会在这里永远拖下去，把整个攻击进程挂在开工阶段。
+        这一列**每读一次就换一批坐标**（实机上「到没到顶判不出来」就是这个样子：
+        邮件那条链路 2026-09-01…09-06 天天如此），没有上界的实现会在这里
+        永远拨下去，把整个攻击进程挂在开工阶段。
+
+        ⚠️ 原先这里用的是「60 屏、每屏不同」的清单 —— 换成连拨之后那个模型
+        **一轮就到顶**（一轮远超清单全长），拿它验上界会变成空断言。
+        成因换成「读数不稳」才继续验得住。
         """
-        never_settles = [
-            [(190, f"[5:{step + 1}:1]"), (420, f"[5:{step + 2}:1]"), (650, f"[5:{step + 3}:1]")]
-            for step in range(60)
-        ]
-        switcher, driver, _planets = _switcher(never_settles, starts_at=59)
+        switcher, driver, _planets = _switcher_with(_RestlessList([BASELINE]))
 
         assert switcher.switch_to(MISSING) is SwitchResult.NOT_FOUND
-        assert len(driver.back_drags) <= 6, "回顶必须有上界"
+        assert len(driver.spins) <= PLANET_LIST_TO_TOP_MAX_DRAGS, "回顶必须有上界"
+        assert driver.spins, "上界不该把回顶变成一轮都不拨"
 
     def test_walking_into_the_bound_says_so_instead_of_claiming_the_top(self) -> None:
         """⚠️ **走满上限时不许说「已经在顶部」。**
@@ -693,12 +843,8 @@ class TestGettingBackToTheTopBeforeSearching:
         """
         said: list[str] = []
         evidence: list[tuple[str, dict[str, object]]] = []
-        never_settles = [
-            [(190, f"[5:{step + 1}:1]"), (420, f"[5:{step + 2}:1]"), (650, f"[5:{step + 3}:1]")]
-            for step in range(60)
-        ]
-        switcher, _driver, _planets = _switcher(
-            never_settles, starts_at=59, said=said, evidence=evidence
+        switcher, _driver, _planets = _switcher_with(
+            _RestlessList([BASELINE]), said=said, evidence=evidence
         )
 
         switcher.switch_to(MISSING)
@@ -707,7 +853,8 @@ class TestGettingBackToTheTopBeforeSearching:
         assert "到没到顶判不出来" in spoken
         assert "到顶" not in spoken.replace("到没到顶判不出来", "")
         assert len(evidence) == 1
-        assert evidence[0][1]["max_drags"] == 6
+        assert evidence[0][1]["max_rounds"] == PLANET_LIST_TO_TOP_MAX_DRAGS
+        assert evidence[0][1]["notches_per_round"] == PLANET_LIST_TO_TOP_NOTCHES
 
     def test_two_rows_are_needed_to_press_and_release_on(self) -> None:
         """一屏只认出一行时**一下都不拖**：按下和松手都必须落在识别出来的名字行上。
