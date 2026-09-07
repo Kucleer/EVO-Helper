@@ -114,6 +114,16 @@ class _Repository:
         self.records.append({"target_kind": target_kind, **fields})
         return None
 
+    def rematch_unlinked_reports(self, **_fields: Any) -> int:
+        """进信箱之前那趟库内补认领，默认「没有可补的」。
+
+        ⚠️ **这个替身不能少。** 少了它，`reconcile_today` 会走进
+        `rematch_unlinked_before_mail` 的兜底分支（那条路吞异常，见它的
+        docstring），于是这一整个文件都在悄悄测一条降级路径而照样全绿。
+        接线本身另有专文：`test_rematch_before_mail_scan.py`。
+        """
+        return 0
+
 
 class _Keeper:
     """`SessionKeeper` 的替身：只记「关窗重开被叫过几次」，并按剧本给结局。

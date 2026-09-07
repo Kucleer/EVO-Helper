@@ -114,6 +114,19 @@ def summary_lines(kind: str, tally: BackfillTally, *, exhaustive: bool) -> list[
         f"  单子上到点没战报的派遣：开工 {tally.due_before} 发 → 收工 {tally.due_after} 发"
         f"（认领上 {tally.claimed} 发）",
     ]
+    # 进信箱之前那趟库内补认领单独报一行，**不许并进上面那句「认领上 N 发」**：
+    # 它一封邮件都没开，混进去就等于把库内补上的那几份记成信箱的功劳。耗时也报，
+    # 用户口径（2026-09-07）「将实际耗时计入汇总即可」。
+    if tally.rematch.failed is None:
+        lines.append(
+            f"  进信箱前库内补认领：补上 {tally.rematch.matched} 份，"
+            f"用了 {tally.rematch.seconds:.1f}s"
+        )
+    else:
+        lines.append(
+            f"  ⚠️ 进信箱前库内补认领没跑成（{tally.rematch.failed}）；"
+            "库里没认领的那些还躺着，这一趟只补了信箱那一侧"
+        )
     if tally.scan.cut_short:
         lines.append(
             f"  ⚠️ 这一趟没走完：{tally.scan.cut_short}。"
