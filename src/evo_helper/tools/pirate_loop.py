@@ -145,6 +145,7 @@ from evo_helper.tools.scan_coordinates import (
     say,
     thumbnail_base64,
     wait_for_login_if_unrecognised,
+    warn,
 )
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
@@ -1008,6 +1009,26 @@ class MailScan:
     cut_short: str | None = None
 
 
+@dataclass(frozen=True)
+class UnlinkedRematch:
+    """进信箱之前那趟**库内**补认领的账：补上几份、花了多久、有没有跑成。
+
+    耗时是这里非留不可的东西。用户口径（2026-09-07）：「它内部会逐份查询候选，
+    并非单次 SQL，将实际耗时计入汇总即可」。一趟信箱的开销里多出来的这一段，
+    只有被记在账上才看得出它什么时候开始变贵——而它慢下来的样子是「每趟信箱
+    前面多等几十秒」，不报出来只会被当成信箱本身变慢。
+
+    ⚠️ `failed` 非空与 `matched == 0` 是**两件事**：前者是安全网自己坏了
+    （库里那些没认领的还躺着），后者是「查过了，没有可补的」。混成一个 0，
+    安全网失效那一刻在日志里就是无声的。
+    """
+
+    matched: int = 0
+    seconds: float = 0.0
+    #: 跑不成时的异常文本；正常收工是 None。
+    failed: str | None = None
+
+
 @dataclass
 class BackfillTally:
     """一次战报补录的摘要。退出前打成一行人话，见 `tools.backfill_reports`。"""
@@ -1022,6 +1043,11 @@ class BackfillTally:
     #: 这一趟开工/收工时，单子上「到点还没战报」的派遣各有几发。
     due_before: int = 0
     due_after: int = 0
+    #: 进信箱**之前**那次库内补认领的账，见 `rematch_unlinked_before_mail`。
+    #:
+    #: ⚠️ 与上面那个 `rematched` 不是一回事：那个是开封路径上撞见「库里已有」
+    #: 时顺手补的（`rematch_note`），这个一封邮件都没开、也在这一趟之前就跑完了。
+    rematch: UnlinkedRematch = field(default_factory=UnlinkedRematch)
 
     @property
     def claimed(self) -> int:
@@ -3285,8 +3311,19 @@ class PirateLoop:
         窗口尺寸。
         """
         moment = now or datetime.now(UTC)
+        # 这一档也进信箱（控制台点「开始」走的就是它），所以补认领也接在这里；
+        # 侦察那两条入口（`collect_scout_reports` / `backfill_scout_reports`）
+        # 不接——它们读的是侦察报告、写的是 `_store_scout_reading`，和
+        # `battle_reports.dispatch_id` 上的认领没有一行交集，接上去就是每趟白跑。
+        #
+        # ⚠️ **排在算 `due_before` 之前。** `claimed` 是拿单子的落差算出来的
+        # （见 `BackfillTally.claimed`）；补认领销掉的那几发要是落在落差里面，
+        # 这一趟信箱就会白拿一份不属于它的功劳，而那个数正是用来回答
+        # 「刚才那趟补录到底有没有用」的。
+        repository, _run_id = self._ensure_run()
+        rematch = rematch_unlinked_before_mail(repository, what="补录")
         due_before = self._due_dispatches(moment)
-        tally = BackfillTally(due_before=len(due_before))
+        tally = BackfillTally(due_before=len(due_before), rematch=rematch)
         windows = ExpectedReportWindows.from_dispatches(due_before)
         time_hits = 0
         opened_blind = 0
@@ -3360,6 +3397,11 @@ class PirateLoop:
                 "opened_blind": opened_blind,
                 "skipped_by_time": skipped_by_time,
                 "claimed": tally.claimed,
+                # 进信箱之前那趟库内补认领：份数与耗时都进这条汇总，
+                # 慢下来那一刻只有这里看得见（见 `UnlinkedRematch`）。
+                "unlinked_rematched": tally.rematch.matched,
+                "unlinked_rematch_ms": round(tally.rematch.seconds * 1000),
+                "unlinked_rematch_failed": tally.rematch.failed,
                 "still_missing": still_missing,
             },
         )
@@ -3480,6 +3522,13 @@ class PirateLoop:
         用户口径（2026-08-11）：「任务启动先去读战报……读完后，需要更新海盗攻击 /
         bot 攻击的数量，因为我可能暂停任务重启启动。」
 
+        ## 进信箱之前先补一次认领
+
+        第一件事是 `rematch_unlinked_before_mail`——只查库、不读页面，把库里那些
+        「在库里却没认领上派遣」的战报按现在的判据再算一次。接在这一趟最前面是
+        因为它的刷新周期必须是「每一趟真进信箱」而不是「用户重启控制台」，
+        整段理由（连同为什么它的异常在这里被吞掉）写在那个函数上。
+
         ## 一趟信箱办两件事
 
         进出信箱要复位画面、切地表、开面板、切「报告」标签、慢拖回顶，一趟约 20 秒；
@@ -3543,6 +3592,16 @@ class PirateLoop:
         now = datetime.now(UTC)
         day_start = quota_day_start_utc(now)
         say(f"开工：读回{self.REPORT_LABEL}，并数一遍 UTC {day_start:%Y-%m-%d} 打了几发")
+        # **接在这里，而不是接在 `run()` 或 `_reconcile_if_due()` 上。** 判据是
+        # 「这一趟到底进不进信箱」：`reconcile_today` 只在冷却放行时才被调到
+        # （`_reconcile_if_due`），而被冷却跳过的那些趟根本不翻信箱——2026-09-07
+        # 那 66 趟就是。给它们也跑一趟库内扫，等于把这条最频繁的路径每次都加上
+        # 一段没人会用到的查询。
+        #
+        # ⚠️ **也必须排在下面那句问单子之前。** 补认领会把几发派遣从「到点还没
+        # 战报」里销掉，而「库里有 N 发到点还没战报」是排障的人拿去对信箱的那个
+        # 数；先问单子再补认领，打出来的 N 就永远比真相大。
+        rematch = rematch_unlinked_before_mail(repository, what="开工对账")
         # **先问库要单子，再进信箱。** 这一句就是「由库驱动」那条口径的落点：
         # 带着「哪几发理论上已经该有战报了」去找，而不是翻到什么算什么。
         outstanding = self._due_dispatches(now)
@@ -3587,6 +3646,15 @@ class PirateLoop:
         )
         note = "翻到底了" if tally.complete else "没翻到底，这是「至少」"
         say(f"  今天已有 {tally.observed} 份（{note}）")
+        # 收尾这几行才是**人真的会回头看的那份账**：上面那句 `[耗时]` 打在整趟
+        # 最前面，到这里已经被几十行翻页与开封日志顶掉了。所以补认领的两个数在
+        # 这里再报一次——用户口径（2026-09-07）「将实际耗时计入汇总即可」。
+        if rematch.failed is None:
+            say(f"  进信箱前补认领 {rematch.matched} 份，用了 {rematch.seconds:.1f}s")
+        else:
+            # 跑不成不等于「没有可补的」：库里那些没认领的行还躺着，而下一步
+            # 的跳过开封会让它们再也没有别的机会。这一句必须和「补上 0 份」分得开。
+            say(f"  ⚠️ 进信箱前补认领没跑成（{rematch.failed}）；库里没认领的那些还躺着")
         # 当天状态已经固化进 `daily_reconciliations`，重启之后一行就能读回
         # （用户口径 2026-08-11：「每天的海盗次数（状态）也可以存库，快速回读」）。
         if status is not None:
@@ -4791,6 +4859,70 @@ def _expected_note(dispatches: Sequence[Any]) -> str:
     if not expected or len(known) != len(expected):
         return "其中有发没读到飞行时间，说不出最晚该在什么时候"
     return f"最晚一发的期望战报时刻 {max(known):%Y-%m-%d %H:%M:%S} UTC"
+
+
+def rematch_unlinked_before_mail(repository: Any, *, what: str) -> UnlinkedRematch:
+    """**每一趟真进信箱之前**，把库里还没认领上派遣的战报按现在的判据再算一次。
+
+    只查库、不读页面（`repository.rematch_unlinked_reports`）：它遍历
+    `dispatch_id IS NULL` 的那些行，拿行上自带的目标与时刻走
+    `_link_dispatch` 的唯一候选规则，一封邮件都不开。
+
+    ## 为什么刷新周期必须是「每一趟」而不是「重启」
+
+    这一趟原先只在用户点「开始」时跑一次
+    （`application.mission_scheduler.start`），也就是说补认领的刷新周期是
+    「用户重启控制台」。
+
+    紧接着要做的一件事是：开封之前按「这个时刻库里有没有战报」把已入库的邮件
+    跳过去。跳过之后，一份「在库里但没认领」的报告就**再也不会被重新开封**，
+    于是也再没有机会在开封路径上补认领（`rematch_note` 那条路）——那正是
+    2026-08-11 踩过的坑，来龙去脉记在 `repository.rematch_report_at`：报告确实
+    在库里，四发派遣却永远停在「待战报」。所以这道安全网得跟着每一趟对账走。
+
+    ## 为什么这里吞异常，而 `mission_scheduler` 那个调用点不吞
+
+    那个调用点在用户点「开始」的路上：抛出来当场有人看见、当场能重试，而且
+    那一刻整轮任务还什么都没做。这里的处境相反——它排在整趟对账的最前面，
+    抛出来会把「读战报」这条链路整趟带走，等于把
+    `domain.reconcile_cooldown` 模块头记的那次断流故障换个成因再造一遍。
+    **补认领是安全网，不是主线：它坏了只该少补几份，不该让战报读不回来。**
+
+    所以坏了要说得出口：走 `warn` 并把异常落进 payload。安静地退化成「一直
+    补上 0 份」是这条路最坏的失效形态，而它长得和「本来就没有可补的」一样。
+
+    **不限流。** 一趟信箱最多走一次，而对账那一侧还有 15 分钟冷却兜着
+    （`domain.reconcile_cooldown`），不是每 tick 都可能触发的那一类；耗时这件事
+    恰恰只有每趟都记才看得出趋势。
+    """
+    started = time.monotonic()
+    try:
+        matched = int(repository.rematch_unlinked_reports())
+    except Exception as error:  # noqa: BLE001 - 见 docstring：安全网不许拖累主路径
+        elapsed = time.monotonic() - started
+        warn(f"  进信箱前补认领没跑成（{error}）；照常翻信箱，用了 {elapsed:.1f}s")
+        record_system_log(
+            "WARNING",
+            "tools.report_ingest",
+            f"进信箱前补认领没跑成（{what}）：{error}",
+            payload={
+                "stage": what,
+                "elapsed_ms": round(elapsed * 1000),
+                "error": str(error),
+            },
+        )
+        return UnlinkedRematch(seconds=elapsed, failed=str(error))
+    elapsed = time.monotonic() - started
+    # 用 `.1f` 而不是 `StepTimer` 那行惯用的 `.0f`：这一趟正常时不到一秒，取整
+    # 会把它一律显示成 0s，而「它什么时候变慢」正是记它的唯一理由。
+    say(f"  [耗时] 进信箱前补认领 共 {elapsed:.1f}s（补上 {matched} 份）")
+    record_system_log(
+        "INFO",
+        "tools.report_ingest",
+        f"进信箱前补认领：补上 {matched} 份，用了 {elapsed:.1f}s（{what}）",
+        payload={"stage": what, "matched": matched, "elapsed_ms": round(elapsed * 1000)},
+    )
+    return UnlinkedRematch(matched=matched, seconds=elapsed)
 
 
 def rematch_note(repository: Any, target: Coordinate, reported_at: datetime) -> str:
