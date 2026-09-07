@@ -916,32 +916,24 @@ class MilitaryAttackConfigRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     tiers_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
-    #: 军力榜采集开榜后先「盲拖」几屏（`game.ranking_ui.BLIND_SCROLLS`）。
-    #:
-    #: **可空，空 = 用代码里的默认值 40**，与加这一列之前的行为完全一致。
-    #: 不给它写 `default=40`：那样「没配」和「配了 40」就分不开了，日后调默认值
-    #: 时所有老行都会被钉死在 40 上，而它们表达的其实是「跟着默认走」。
-    #:
-    #: 放在这张全局表而不是 `mission_tasks.params_json`：用户口径（2026-08-17）
-    #: 是「盲拖数量需在攻击配置页可配置」，而这一页存的就是全局的那几项。
-    blind_scrolls: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     #: 军力榜开榜后先用滚轮盲滚多少**行**（`game.ranking_ui.BLIND_SCROLL_ROWS` = 700
     #: 是留空时的默认值）。口径是「行」而不是「屏」：滚轮那一段量得到的是行。
     #:
-    #: **可空、不给 server_default**：NULL = 「跟着代码里的默认值走」。先例是上面那一列
-    #: `blind_scrolls`——给了默认值就分不开「没配」和「恰好配成当前默认」，日后调默认值
-    #: 时所有老行都会被钉死在旧数上，而它们表达的其实是「跟着默认走」。
+    #: **可空、不给 server_default**：NULL = 「跟着实测自动标定走」（样本不够时才落到
+    #: 代码默认值）。给了 server_default 就分不开「没配」和「恰好配成当前默认」，
+    #: 日后调默认值时所有老行都会被钉死在旧数上，而它们表达的其实是「跟着默认走」。
     #:
     #: ⚠️ **本列置空 ≠ 退回慢拖。** 置空只是「跟着代码默认值 700 走」，走的仍是滚轮。
     #: 两种说法一度并存在设计文档里（「留空 = 700 行」与「置空即退回慢拖」），
     #: 而它们在配置层不可能同时成立——留空只能有一个含义。**取前者**：
     #: 与本表其余可空旋钮的惯例一致，NULL 一律是「跟着代码默认走」。
     #:
-    #: ⚠️ **上面那一列 `blind_scrolls`（屏）仍刻意保留不删**，但它是**代码级**回滚的
-    #: 落脚点，不是配置级的：把 `domain.missions.ranking_command` 的参数换回
-    #: `--blind-scrolls`、两处调用点换回 `_blind_scrolls()`，就退回慢拖那条路，
-    #: 而那一列和页面上那个框还在，不必再来一条迁移。顺手把它删掉，
-    #: 回滚就变成「改代码 + 加迁移 + 重新发版」。
+    #: ⚠️ **退回慢拖那条老路只从命令行进**：
+    #: `python -m evo_helper.tools.ranking_scan --blind-scrolls N`。
+    #: 原先屏口径那一列（`blind_scrolls`）和攻击配置页上那个「盲拖屏数」框
+    #: **2026-09-07 一起撤了**：那个框存得进、读不出 —— `ranking_command` 的参数表里
+    #: 从来没有它，`_blind_scrolls()` 也从来没有调用点。它本想当「不改代码就能回滚」
+    #: 的杠杆，实际是一根看着上了膛的空枪，而人会去拨它的时刻恰好是已经出事的时刻。
     blind_scroll_rows: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     #: 对账那一趟翻信箱最多往回读几个**小时**
     #: （`tools.pirate_loop.PirateLoop.backfill_reports` 的 routine 那一档）。

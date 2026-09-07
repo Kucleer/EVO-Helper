@@ -920,9 +920,11 @@ def bot_rows(rows: Iterable[RankingRow]) -> list[RankingRow]:
 # 「屏」只是慢拖的副产品（1 屏 ≈ 8.3 行），而盲滚段改用滚轮之后连「屏」这个概念都
 # 没有了；名次天然就是行，所以标定、余量、日志正文一律用行，屏退化成显示单位。
 #
-# 屏那一套（`bot_area_reached_message` / `bot_area_scrolls` /
-# `calibrated_blind_scrolls`）**留着但已被取代**：库里存着一整年屏版样本，
-# 读得出来才谈得上过渡。新代码一律用下面的行版。
+# 屏那一套里还留着 `bot_area_reached_message` / `bot_area_scrolls`：库里存着一整年
+# 屏版样本，读得出来才谈得上过渡。新代码一律用下面的行版。
+# ⚠️ `calibrated_blind_scrolls` 2026-09-07 删了 —— 它唯一的调用点在调度器里，
+# 而那一整套（连攻击配置页上的「盲拖屏数」框和库里那一列）一起撤了：那个框
+# 存得进、读不出。慢拖那条老路仍然在，只从命令行进（`--blind-scrolls N`）。
 #
 # 下面这段推理是屏版时期写的，**换成行之后每一条都仍然成立**（只是数乘了 8.3），
 # 所以原样搬过来：
@@ -1021,42 +1023,13 @@ def bot_area_rows(message: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
-def calibrated_blind_scrolls(
-    measurements: Sequence[int], *, sample_size: int, margin: int
-) -> int | None:
-    """按最近 `sample_size` 次实测定盲拖屏数：`min(样本) - margin`。
-
-    ⚠️ **已被 `calibrated_blind_rows` 取代（口径改行，2026-08-22），
-    等调用点切完再删。** 判据本身一条没变，只是单位从屏换成行。
-
-    `measurements` 按**新到旧**排列，多给的会被截掉——只看最近那一段是因为这个
-    数随玩家增长往上漂，陈年样本只会把盲拖压得越来越保守（安全但白花检测）。
-
-    **样本不够就返回 `None`**，意思是「这次不给答案，用写死的默认值」。返回
-    `None` 而不是自己回落成某个数字：默认值只有 `game.ranking_ui.BLIND_SCROLLS`
-    一处，在这里再写一遍，日后调默认值就会漏掉这一处。
-
-    `margin` 是余量，不是保险丝上的裕度而是**判据的一部分**：实测噪声跨度
-    6 屏（72–78），余量必须大于它，否则算出来的盲拖会落进噪声区间里。
-
-    结果钳到 0：样本比余量还小（榜单极短）时，答案是「一屏都别盲拖」，
-    而不是一个负数。
-    """
-    if sample_size < 1:
-        raise ValueError("sample_size 必须至少为 1")
-    recent = list(measurements)[:sample_size]
-    if len(recent) < sample_size:
-        return None
-    return max(0, min(recent) - margin)
-
-
 def calibrated_blind_rows(
     measurements: Sequence[int], *, sample_size: int, margin: int
 ) -> int | None:
     """按最近 `sample_size` 次实测定盲滚**行数**：`min(样本) - margin`。
 
-    与 `calibrated_blind_scrolls` 同形——下面每条理由都是从那边搬过来的，
-    换成行之后一条都没失效（只是数乘了约 8.3）。
+    下面每条理由都是从屏版那一份（`calibrated_blind_scrolls`，2026-09-07 已删）
+    搬过来的，换成行之后一条都没失效（只是数乘了约 8.3）。
 
     `measurements` 按**新到旧**排列，多给的会被截掉。**只看最近那一段**是因为
     这个数随玩家增长往上漂，陈年样本只会把盲滚压得越来越保守：安全，但少走的
@@ -1105,7 +1078,6 @@ __all__ = [
     "bot_area_scrolls",
     "bot_rows",
     "calibrated_blind_rows",
-    "calibrated_blind_scrolls",
     "coordinate_of",
     "SCORE_CLIFF_FACTOR",
     "descending_breaks",

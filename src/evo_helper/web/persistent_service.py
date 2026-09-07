@@ -1535,7 +1535,6 @@ class MissionConsoleService:
         self,
         tiers: tuple[dict[str, Any], ...],
         *,
-        blind_scrolls: object = None,
         blind_scroll_rows: object = None,
         report_scan_hours: object = None,
         unknown_line_hold_minutes: object = None,
@@ -1560,7 +1559,6 @@ class MissionConsoleService:
         normalized = [dict(tier) for tier in tiers]
         try:
             self._scheduler.validate_military_tiers(normalized)
-            scrolls = self._scheduler.validate_blind_scrolls(blind_scrolls)
             rows = self._scheduler.validate_blind_scroll_rows(blind_scroll_rows)
             hours = self._scheduler.validate_report_scan_hours(report_scan_hours)
             hold = self._scheduler.validate_unknown_line_hold_minutes(unknown_line_hold_minutes)
@@ -1584,7 +1582,6 @@ class MissionConsoleService:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
             json.dumps(normalized, ensure_ascii=False),
-            blind_scrolls=scrolls,
             blind_scroll_rows=rows,
             report_scan_hours=hours,
             unknown_line_hold_minutes=hold,
@@ -2578,7 +2575,6 @@ def _config_view(
     """
     return MilitaryAttackConfigView(
         tiers,
-        blind_scrolls=row.blind_scrolls,
         blind_scroll_rows=row.blind_scroll_rows,
         report_scan_hours=row.report_scan_hours,
         unknown_line_hold_minutes=row.unknown_line_hold_minutes,

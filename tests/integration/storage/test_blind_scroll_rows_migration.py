@@ -13,7 +13,10 @@
 
 1. **可空、无 `server_default`**——NULL = 「跟着代码里的默认值
    `game.ranking_ui.BLIND_SCROLL_ROWS`(700) 走」。
-2. **`blind_scrolls`（屏）没被这条迁移带走**——它是这次改动的一键回滚。
+2. **`blind_scrolls`（屏）没被这条迁移带走**——当时它是这次改动的一键回滚。
+   ⚠️ 那一列 2026-09-07 由 `c7d92f4a1b60` 撤掉了（那根杠杆的另一半从来没接上），
+   所以下面那条用例现在断言的是「升到 head 之后它不在了」，而本条迁移**自己**那一步
+   仍然一个字都不碰它。
 """
 
 from __future__ import annotations
@@ -107,15 +110,20 @@ def test_the_existing_row_comes_out_null(database_url: str) -> None:
     assert all(value is None for value in stored)
 
 
-def test_the_screens_column_survives_as_the_rollback_lever(database_url: str) -> None:
-    """`blind_scrolls`（屏）**刻意保留不删**，这条用例就是那句话的钉子。
+def test_the_screens_column_is_gone_by_head(database_url: str) -> None:
+    """⚠️ **口径变了**：`blind_scrolls`（屏）原先是「刻意保留不删的一键回滚杠杆」，
+    2026-09-07 被 `c7d92f4a1b60` 撤掉了。
 
-    它是这次改动的一键回滚：`blind_scroll_rows` 置空即退回慢拖那条路，不需要改
-    代码、不需要再来一条迁移。顺手把它删掉，回滚就变成「改代码 + 重新发版」。
+    那根杠杆的另一半（库列 → 命令行）从来没接上：`ranking_command` 的参数表里没有
+    它，`_blind_scrolls()` 也没有调用点。所以它是一个存得进、读不出的框。
+    慢拖那条老路仍然在，只从命令行进（`--blind-scrolls N`）。
+
+    ⚠️ 这里断言的是**升到 head 之后**没有那一列 —— 本条迁移自己那一步不碰它
+    （下面 `test_downgrade_removes_only_the_new_column` 钉的是那一点）。
     """
     command.upgrade(_config(database_url), "head")
 
-    assert SCROLLS in _columns(database_url, CONFIG)
+    assert SCROLLS not in _columns(database_url, CONFIG)
 
 
 def test_downgrade_removes_only_the_new_column(database_url: str) -> None:

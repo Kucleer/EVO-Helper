@@ -47,7 +47,6 @@ def set_score_window(
         return
     repository.replace_military_attack_tiers(
         row.tiers_json,
-        blind_scrolls=row.blind_scrolls,
         blind_scroll_rows=row.blind_scroll_rows,
         report_scan_hours=row.report_scan_hours,
         unknown_line_hold_minutes=row.unknown_line_hold_minutes,

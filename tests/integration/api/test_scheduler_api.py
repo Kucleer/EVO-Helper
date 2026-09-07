@@ -1690,7 +1690,7 @@ def test_the_report_scan_floor_round_trips_through_the_attack_config(console: Co
         "/api/attack-config",
         json={
             "tiers": [{"min_score": 0, "preset": "AAA"}],
-            "blind_scrolls": 30,
+            "blind_scroll_rows": 730,
             "report_scan_hours": 2,
         },
     )
@@ -1704,7 +1704,7 @@ def test_the_report_scan_floor_round_trips_through_the_attack_config(console: Co
 
     assert saved.status_code == 200, saved.text
     assert read_back.json()["report_scan_hours"] == 2
-    assert read_back.json()["blind_scrolls"] == 30
+    assert read_back.json()["blind_scroll_rows"] == 730
     assert read_back.json()["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
     # 两道关各管一段：数字但不合理的由调度器那把尺子拒（400，带中文原因），
     # 压根不是整数的在 pydantic 那层就进不来（422）。
@@ -1826,8 +1826,8 @@ def test_the_blind_scroll_rows_round_trip_through_the_attack_config(console: Con
         "/api/attack-config",
         json={
             "tiers": [{"min_score": 0, "preset": "AAA"}],
-            "blind_scrolls": 30,
             "blind_scroll_rows": 700,
+            "report_scan_hours": 2,
         },
     )
     read_back = console.client.get("/api/attack-config").json()
@@ -1836,9 +1836,9 @@ def test_the_blind_scroll_rows_round_trip_through_the_attack_config(console: Con
     assert zero_read["blind_scroll_rows"] == 0, "0 被读成了留空"
     assert saved.status_code == 200, saved.text
     assert read_back["blind_scroll_rows"] == 700
-    # 屏口径那一列刻意保留（它是回滚杠杆的用户入口），所以这一次 PUT 同时送
-    # 两项，钉住「送了行数没把屏数冲掉」。
-    assert read_back["blind_scrolls"] == 30
+    # 同一次 PUT 送两项，钉住「送了行数没把邻居冲掉」。原先这里送的是屏口径那一列
+    # （回滚杠杆的用户入口），那一列 2026-09-07 撤了，换成翻信箱时长同样成立。
+    assert read_back["report_scan_hours"] == 2
     assert read_back["tiers"] == [{"min_score": 0.0, "preset": "AAA"}]
 
 
@@ -1908,9 +1908,9 @@ def test_a_blind_scroll_rows_that_is_not_an_integer_is_refused(
 #: `domain.target_order` 模块头第 3 步）。留在这张表里的话，这条用例会为一个
 #: 已经不存在的字段红掉，而红的原因看起来像是管线漏了一边。
 _ALL_KNOBS = {
-    "blind_scrolls": 30,
-    # 盲滚行数（滚轮口径）。和上面那个屏数（慢拖口径）**同时存在**：置空它就退回
-    # 慢拖，是这次改动的一键回滚，所以两列必须各自存得住。
+    # 盲滚行数（滚轮口径）。⚠️ 屏口径那一列 `blind_scrolls` 2026-09-07 从这张表里
+    # 删掉了（`c7d92f4a1b60`）——那个框存得进、读不出，回滚改走命令行
+    # `--blind-scrolls N`。删旋钮要连着从这里删一行，见上面那段。
     "blind_scroll_rows": 700,
     "report_scan_hours": 2,
     "unknown_line_hold_minutes": 45,
@@ -1968,7 +1968,8 @@ def test_the_settings_page_renders_every_knob(console: Console) -> None:
     assert response.status_code == 200, response.text
     body = response.text
     for knob_id in (
-        "blind-scrolls",
+        # ⚠️ `blind-scrolls`（盲拖屏数）2026-09-07 从这一页撤了：那个框存得进、读不出。
+        # 删旋钮要连着从这份清单里删一行，否则这条会为一个不该存在的框红。
         "blind-scroll-rows",
         "report-scan-hours",
         "line-hold",
@@ -2004,9 +2005,11 @@ def test_the_settings_page_renders_every_knob(console: Console) -> None:
     assert "1.08 行/格" in body, "每格行数没从常量传进模板"
     assert "惯性滑行约 2.5 秒" in body, "滑行等待没从常量传进模板"
     assert 'id="blind-rows-seconds"' in body, "行↔秒换算那一行没有显示位"
-    # 两个框并排放着，页面必须说清哪一个当真：屏数那一格现在完全不生效，
-    # 不写明白的话用户会以为自己填的屏数还管事，而实机走的是行数那一路。
-    assert "完全不上命令行" in body, "没说清屏数那个框已经不生效"
+    # ⚠️ 原先这里钉的是「页面得说清屏数那个框不生效」。2026-09-07 换了做法：
+    # 那个框整个撤了。**一行「当前不生效」的说明挡不住人去拨它** —— 而人会去拨它的
+    # 时刻，恰好是滚轮这条路已经出事的时刻。现在钉的是它真的不在页面上。
+    assert 'id="blind-scrolls"' not in body, "盲拖屏数那个框又回来了；回滚请走命令行"
+    assert "盲拖屏数" not in body, "撤掉的框不该在页面上留下入口文案"
     # ⚠️ 读回必须是 `??` 而不是 `||`：0 是合法取值（「一格都不拨」），`||` 会把它
     # 显示成空框，也就是显示成「用默认值」——用户下一次保存就把 0 改掉了，而他
     # 从头到尾没看见自己填的那个 0。这一条是白盒断言，因为这一页没有 JS 测试台，
