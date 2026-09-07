@@ -68,7 +68,10 @@ from evo_helper.game.pirate_ui import (
     PLANET_LIST_MAX_DRAGS,
     PLANET_LIST_MIN_DRAG_PX,
     PLANET_LIST_OPEN_WAIT_S,
+    PLANET_LIST_SPIN_SETTLE_S,
     PLANET_LIST_TO_TOP_MAX_DRAGS,
+    PLANET_LIST_TO_TOP_NOTCHES,
+    PLANET_LIST_WHEEL_GAP_S,
     PLANET_SWITCH_WAIT_S,
 )
 
@@ -139,6 +142,23 @@ class PlanetListDriver(Protocol):
     def drag_vertical(self, x: int, from_y: int, to_y: int, *, label: str = ...) -> None: ...
 
     def wait(self, seconds: float) -> None: ...
+
+    def hover(self, x: int, y: int) -> None:
+        """把指针挪到某处，**不按下**。连拨滚轮之前用它落点。
+
+        ⚠️ **滚轮事件落在指针当下所在的控件上**，而 `wheel_notch` 自己不移动鼠标
+        （它要塞进一个 16ms 的循环里，抢前台或重新定位都放不进去）。
+        所以落点是**上一个动作**的责任 —— 回顶那一段由 `_spin_back_once` 负责。
+        """
+        ...
+
+    def wheel_notch(self, *, up: bool = False) -> None:
+        """滚**一格**。`up=True` 往上。
+
+        ⚠️ **只有「一格」这一种粒度。** 允许传格数的话，实现里迟早把 N 格合成一个
+        大事件发出去，而那会被游戏静默封顶（实测 800 格只走 14px）。
+        """
+        ...
 
 
 @dataclass(frozen=True)
@@ -308,78 +328,105 @@ class PlanetSwitcher:
         return self._locate(target)
 
     def _scroll_to_top(self) -> None:
-        """把列表拖回顶部：**拖到拖不动为止**，不是拖固定次数。
+        """把列表拨回顶部：**拨到拨不动为止**，不是拨固定轮数。
 
-        判据是 `domain.planet_switch.reached_top`（往回拖了一下，这一屏的坐标序列
+        判据是 `domain.planet_switch.reached_top`（往回拨了一轮，这一屏的坐标序列
         和上一屏一样）。这一条从信箱那条链路上学了两件事，都写在 `reached_top` 里：
         比的必须是**读出来的内容**，而**整屏读空不算到顶**。
 
         上界 `PLANET_LIST_TO_TOP_MAX_DRAGS` 只是兜底，保证一定会停。走满上限时
         **不许说「已经在顶部」**——那时到没到顶就是不知道，照 CLAUDE.md 那条
-        「日志说假话比不说更糟」，只说拖了几次、最后一屏读到了什么。
+        「日志说假话比不说更糟」，只说拨了几轮、最后一屏读到了什么。
 
-        读不出行时**一下都不拖**：按下点必须落在这一屏识别出来的星球名那一行上
-        （`domain.planet_switch.PlanetRow`），认不出行就没有安全的按下点。
-        这时安静退出，后面 `_locate` 会照原样走到「读不出」那条路。
+        ## 2026-09-07：这一段从慢拖换成了连拨滚轮
+
+        原先每一轮是一次分步慢拖（往下拖 `rows[0]` → `rows[-1]`），实测约 5 秒；
+        现在是一轮 `PLANET_LIST_TO_TOP_NOTCHES` 格滚轮，约 1.8 秒（拨 0.6s +
+        沉降 1.2s）。判据、上界、以及「走满不许说到顶」三条**一个字都没动**。
+
+        ⚠️ **为什么这一处可以用滚轮，而向下找目标那一段（`_drag_once`）不行**：
+        `game.human_input.drag` 上记着实测（2026-08-22）——滚轮 19–23 行/秒、
+        慢拖 1.73 行/秒，但滚轮有速度惯性，会把列表停在**非整行位置**，而
+        `vision` 是逐行裁剪的。回顶这一处两条特殊性都成立：
+
+        1. **往上过冲物理上不可能** —— 列表到顶就被夹住。
+        2. **夹住那一屏正好落在标定网格上**（2026-09-07 实测：夹住之后行 y 精确
+           回到 190/420/650，连拨两轮读数逐位一致，与刚开面板时相同）。
+           而离网格的代价是**读错字** —— 同一次实测里 `[1:55:6]` 被读成
+           `[1:55:56]`、`[8:117:6]` 被读成 `[8:17:65]`。**读错比读不出更坏**，
+           因为它会静默地把坐标认成另一个。
+
+        所以「拨到夹住」不只是快，它还是这条链路上唯一保证读得准的位置。
+
+        读不出行时**一轮都不拨**：这一条**理由变了但结论没变**。原先是因为
+        慢拖的按下点必须落在识别出来的星球名那一行上，认不出行就没有安全的按下点；
+        滚轮不需要按下点，但读空时我们**判不出自己有没有在往前走**，而万一面板
+        根本没打开，盲拨就是往未知窗口里灌几百个滚轮事件。所以照旧安静退出，
+        后面 `_locate` 会走到「读不出」那条路。
         """
         previous: Sequence[PlanetRow] | None = None
-        for drag in range(PLANET_LIST_TO_TOP_MAX_DRAGS):
+        for spin in range(PLANET_LIST_TO_TOP_MAX_DRAGS):
             rows = rows_from_words(self._read_rows_confirming())
             self.top_screens.append([row.text for row in rows])
             if reached_top(previous, rows):
-                self.say(f"  列表往回拖了 {drag} 次到顶；顶上是 {self.top_screens[-1]}")
+                self.say(f"  列表往回拨了 {spin} 轮到顶；顶上是 {self.top_screens[-1]}")
                 return
             previous = rows
-            if not self._drag_back_once(rows):
-                self.say(f"  没有可以按下的星球名行（这一屏读到 {self.top_screens[-1]}）；不往回拖")
+            if not rows:
+                self.say(f"  这一屏一行星球名都读不出（读到 {self.top_screens[-1]}）；不往回拨")
                 return
+            self._spin_back_once(rows)
         self._say_scroll_to_top_gave_up()
 
     def _say_scroll_to_top_gave_up(self) -> None:
         """走满上限时**如实**描述，并把证据留下。
 
         照信箱那条链路 `_say_scroll_to_top_gave_up` 的教训写：只说能证明的三样
-        ——拖了多少次、最后一屏读到了什么、判据为什么没停下来。**到没到顶不知道
+        ——拨了多少轮、最后一屏读到了什么、判据为什么没停下来。**到没到顶不知道
         就说不知道**，绝不写成「已经在顶部」。
 
         这一句同时是「该不该把上界做成可配置」的凭据：库里出现它，才说明
         `PLANET_LIST_TO_TOP_MAX_DRAGS` 真的不够用了。
         """
         self.say(
-            f"  往回拖满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 次，两屏之间的坐标一直在变；"
+            f"  往回拨满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 轮，两屏之间的坐标一直在变；"
             f"最后一屏读到 {self.top_screens[-1] if self.top_screens else []}。"
             "到没到顶判不出来，这一趟就从这里往下翻"
         )
         self.record_evidence(
-            f"行星列表往回拖满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 次仍没停下来；到没到顶判不出来",
+            f"行星列表往回拨满 {PLANET_LIST_TO_TOP_MAX_DRAGS} 轮仍没停下来；到没到顶判不出来",
             {
-                "max_drags": PLANET_LIST_TO_TOP_MAX_DRAGS,
+                "max_rounds": PLANET_LIST_TO_TOP_MAX_DRAGS,
+                "notches_per_round": PLANET_LIST_TO_TOP_NOTCHES,
                 "top_screens": [list(screen) for screen in self.top_screens],
                 "criterion": "reached_top：逐屏比坐标序列，读空不算到顶",
             },
         )
 
-    def _drag_back_once(self, rows: Sequence[PlanetRow]) -> bool:
-        """按住**这一屏最上面那一行的名字高度**往下拖，露出上面的行；拖不动返回 False。
+    def _spin_back_once(self, rows: Sequence[PlanetRow]) -> None:
+        """把指针落进列表，往上连拨 `PLANET_LIST_TO_TOP_NOTCHES` 格。
 
-        起止点都取自当前这一屏识别出来的名字行：按下在 `rows[0]`、松手在 `rows[-1]`。
-        `_drag_once` 往下翻时用的是同一套几何，只是方向相反——两端都落在星球名
-        那一行上，也就是用户点过头的那个「横向中点是空白」的高度
-        （`game.pirate_ui.PLANET_LIST_DRAG_X` 的注释）。
+        ⚠️ **落点取自这一屏识别出来的第一行，不写死绝对 y。** 同原先慢拖那一套
+        （`_drag_once` 的注释）：面板的位置随画面走，写死的 y 迟早落到面板外面，
+        而滚轮事件是发给**指针当下所在的那个控件**的 —— 落错了就是白拨。
 
-        ⚠️ **不写死绝对 y。** 同 `_drag_once`：横向中点只在星球名那一行是空白，
-        往下 60px 就是图标上排，同一个 x 上坐着「部署」；而按下再拖起来，
-        行程太短的话游戏可能当成点击。行程不够 `PLANET_LIST_MIN_DRAG_PX` 就不拖。
+        ⚠️ **一格一个事件，不合并。** `wheel_notch` 上记着理由：N 格合成一个大
+        事件会被游戏静默封顶（实测 800 格只走 14px）。密度由这里的循环控制，
+        间隔 `PLANET_LIST_WHEEL_GAP_S` 与军力榜盲滚同源 —— 游戏做的是速度惯性
+        滚动，间隔太大攒不起动量。⚠️ 间隔走 `driver.wait` 而不是 `time.sleep`：
+        同 `ranking_nav.spin_blind`，那让「每格 16ms」在单测里数得出来。
+
+        ⚠️ **拨完必须等沉降再让调用方读屏。** 读早了读到的是拨之前那一屏，
+        那会与上一屏逐位相同，于是 `reached_top` 把「还没走动」误判成「到顶了」。
+
+        不返回「拨动了没有」：滚轮没有慢拖那个「行程不够就当点击」的失败模式，
+        拨不动的唯一原因就是已经夹在顶部 —— 而那正是判据下一轮要认的事。
         """
-        if len(rows) < 2:
-            return False
-        anchor = rows[0].name_row_y
-        release = rows[-1].name_row_y
-        if release - anchor < PLANET_LIST_MIN_DRAG_PX:
-            return False
-        self.driver.drag_vertical(PLANET_LIST_DRAG_X, anchor, release, label="行星列表回顶")
-        self.driver.wait(PLANET_LIST_DRAG_WAIT_S)
-        return True
+        self.driver.hover(PLANET_LIST_DRAG_X, rows[0].name_row_y)
+        for _ in range(PLANET_LIST_TO_TOP_NOTCHES):
+            self.driver.wheel_notch(up=True)
+            self.driver.wait(PLANET_LIST_WHEEL_GAP_S)
+        self.driver.wait(PLANET_LIST_SPIN_SETTLE_S)
 
     def _read_nothing_at_all(self) -> bool:
         """逐屏一行都没认出来吗？——这才是「疑似有浮层盖住」的证据。
