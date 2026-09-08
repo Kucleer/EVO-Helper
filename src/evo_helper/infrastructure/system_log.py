@@ -76,6 +76,17 @@ ENV_MISSION_KIND = "EVO_HELPER_LOG_MISSION_KIND"
 #: 两条路在扫描器内部汇成同一个变量。
 ENV_CAPTURE_ROWS = "EVO_HELPER_RANKING_CAPTURE_ROWS"
 
+#: 这一趟要不要把信箱列表页每行的**颜色读数 + 原分辨率裁片**录进日志（标定用，默认关）。
+#:
+#: 未读/已读的颜色阈值已于 2026-09-08 标定（`vision.mail_unread.CALIBRATION`），
+#: 但**实拍图一律不进 Git**，所以每次游戏版面变了都得在实机上重采一遍。
+#: 开这个标记跑一趟，标定语料就有了；捞出来的办法在 `tools.mail_unread_probe`。
+#:
+#: ⚠️ 默认关，理由同 `ENV_CAPTURE_ROWS`：一趟六行裁片，常开会把日志表写成语料库。
+#: 走环境变量而不是命令行，也是同一条：调度器的 `command` 在 `run_id` 生成之前
+#: 就建好了，而这批语料必须认得出「是哪一趟采的」。
+ENV_MAIL_UNREAD_PROBE = "EVO_HELPER_MAIL_UNREAD_PROBE"
+
 _HOST = socket.gethostname()[:64]
 
 
@@ -586,6 +597,7 @@ __all__ = [
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_CAPACITY",
     "ENV_CAPTURE_ROWS",
+    "ENV_MAIL_UNREAD_PROBE",
     "ENV_MISSION_KIND",
     "ENV_RUN_ID",
     "ENV_TASK_ID",

@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -128,7 +129,11 @@ from evo_helper.game.system_navigator import (
     reads_like_a_dropped_digit,
     value_box_crops,
 )
-from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
+from evo_helper.infrastructure.system_log import (
+    ENV_MAIL_UNREAD_PROBE,
+    record_knob_override,
+    record_system_log,
+)
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
 from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
@@ -150,6 +155,12 @@ from evo_helper.tools.scan_coordinates import (
 
 # `vision.parsers` 只依赖标准库与 domain，没有 Pillow / pytesseract，
 # 所以可以在模块顶层导入；真正带可选依赖的 `vision.optional.*` 仍旧惰性导入。
+# `vision.mail_unread` 同理：纯 dataclass 与算术，一个像素都不碰。
+from evo_helper.vision.mail_unread import (
+    CALIBRATION,
+    MAIL_UNREAD_PROBE_MESSAGE,
+    classify_unread,
+)
 from evo_helper.vision.parsers import (
     GAME_DISPLAY_ZONE,
     REPORT_TIME_RE,
@@ -370,6 +381,61 @@ MAIL_SCAN_PAGES = 4
 #: 报告（海盗一系 4 发侦察、bot 一轮 6 发探路）。
 MAIL_MAX_OPENS = 8
 
+#: **未读**邮件另有的一笔开封预算，独立于 `MAIL_MAX_OPENS` 之外。
+#:
+#: 未读 ⇒ 我们还没开过它 ⇒ 库里不可能有它的战报。这类邮件**必开**：漏掉一封不是
+#: 「这一趟慢了」——它会一直排在别人后面，直到掉出扫描下限
+#: （`_routine_scan_floor`，默认 6 小时）；那之后**日常那趟永远翻不到它**，
+#: 只剩人手动 `--exhaustive` 能救。所以它不许和「主题看着对得上但可能已经读过」
+#: 的那 8 封抢预算。
+#:
+#: ⚠️ **别把这条写成「下一趟它已经是已读、会被 #288 那道时刻闸跳掉」**（我第一版
+#: 就写错了）：`_already_in_library` 比的是「库里该秒份数 ≥ 同屏该秒行数」，
+#: 而这一封根本没入库 ⇒ `0 >= 1` 不成立 ⇒ 它照开。真正把它埋掉的是扫描下限。
+#:
+#: ⚠️ **但必须封上界。** 「必开」若真的无上界，一组标偏的颜色阈值（把已读判成未读）
+#: 会让每屏六行全进这条路：4 屏 × 6 行 × ≈20 秒 ≈ 8 分钟，而日志上看着一切正常。
+#:
+#: ## 为什么是一个上限，而不是「从顶往下开、开到第一行已读为止」
+#:
+#: 用户口径（2026-09-08）：「注意 正常情况下 是连续的未读批量 而不是现在读的
+#: 稀稀拉拉」——**正常版面是顶部一段连续的未读**。既然连续，「开到第一行已读
+#: 为止」看着自带界，比一个写死的 12 更贴事实。**审过之后没有采用**，三条理由：
+#:
+#: 1. **它是停止条件，不是预算。** 这个上限存在的唯一理由是「一组标偏的阈值把
+#:    已读判成未读」，而那种失效恰好让「第一行已读」**永远不出现** —— 停止条件
+#:    在它最该起作用的那一刻正好失效。上限必须**在标定错的时候仍然成立**，
+#:    所以它不能建在「颜色读得对」这个前提上。
+#: 2. **它读偏的方向是贵的那一侧。** 一行读偏（或者一封别类型的已读邮件插在
+#:    中间）就把整段未读堵在第 0 行，而漏开一封未读的代价是「再也读不回来」
+#:    ——正是这道闸要修的那件事。上限读偏只多花时间。
+#: 3. **「连续」这条事实已经用在该用的地方了。** 页尾那个 `more_unread_possible`
+#:    （这一屏有未读就再翻一屏、第一屏没未读就收工）就是**屏粒度**的「开到第一
+#:    行已读为止」。它落在**继续翻**那一侧，猜错只多花翻一屏的两秒；把同一条
+#:    事实搬到「停止开封」那一侧，猜错就丢战报。
+#:
+#: 于是这条口径在这里只改一件事：**它把 12 从推理变成了有出处的数。**
+#: 12 = 两屏的行数（一屏 `MAIL_SCAN_ROWS` 行）。取两屏而不是一屏，是因为连续的
+#: 那一段正好被屏幕下边缘切开时一屏装不下。
+#:
+#: ## 这个洞有多大（生产库实测，2026-09-08）
+#:
+#: 当天 3 趟进信箱（#288 之后有日志的那 3 趟）跳过 2 / 12 / 1 封，而**「真开」
+#: 的封数正好都是 8 = `MAIL_MAX_OPENS`，3/3 趟撞上限**。同时信箱深处（约
+#: 24 / 30 / 36 / 72 行）躺着 4 封未读的攻击报告，时刻 09:54:02 / 09:53:47 /
+#: 08:44:07 / 05:45:04，按 ±5 秒查 `battle_reports` **4 封全缺**，躺了
+#: 8.5–16.7 小时。当天到点无战报 **19 / 213 发（8.9%）**。
+#:
+#: ⚠️ **那 4 封是历史空洞，日常这一趟救不了它们**（早就掉出扫描下限了，
+#: 见 `_routine_scan_floor`）。存量归补录那条路，见 `BACKFILL_UNREAD_MAX_OPENS`。
+#:
+#: ⚠️ **这是运维旋钮，不是标定常量**（判据见记忆里那条「主动考虑可配置」）：
+#: 活动期间信箱一次堆几十封未读时用户会想调大它。现在它是 `_scan_mail_rows` 的
+#: **参数**，默认这个数；补录那条路自己传大值。**还欠一个配置页旋钮**：挪上去
+#: 要给攻击配置表加一列（`storage.models` 那张表 + 一次迁移），这一版刻意不碰
+#: 库结构，所以先记在这里，连同那句要写给用户的话：「调大 = 少丢战报、多花时间」。
+MAIL_UNREAD_MAX_OPENS = 12
+
 #: 补录侦察报告（`backfill_scout_reports`）时的两个上限。
 #:
 #: 与活链路那两个（`MAIL_SCAN_PAGES` / `MAIL_MAX_OPENS`）分开写死，不是复用后调参：
@@ -380,6 +446,23 @@ MAIL_MAX_OPENS = 8
 #: 最坏约 15 分钟，是「人盯着跑一次」能接受的量级，同时保证它一定会停。
 BACKFILL_SCAN_PAGES = 12
 BACKFILL_MAX_OPENS = 60
+
+#: **`--exhaustive` 那一档**未读的开封预算。日常那趟仍旧用 `MAIL_UNREAD_MAX_OPENS`。
+#:
+#: 这一格是为了让「散落在深处的历史未读归补录管」这句话**真的成立**。那些洞
+#: （2026-09-08 实测 4 封，24–72 行深、8.5–16.7 小时没人开过）早就掉出了日常那趟
+#: 的扫描下限；而补录虽然有 60 封的预算，未读那一档原先仍旧封在 12 上 —— 撞了 12
+#: 之后剩下的未读**退回常规预算排队**，于是又要过 `should_open` 那道时刻窗口闸，
+#: 而历史空洞的时刻恰恰早就不在任何窗口里了。它们因此两条路都到不了。
+#:
+#: ⚠️ **只给 `exhaustive`，不给控制台「开始」那一档。** 「开始」每按一次都跑一趟
+#: （而且按记忆里那条约定，读完战报才放行任务），把它的最坏时长翻一倍是不能接受的。
+#:
+#: 取 `BACKFILL_MAX_OPENS` 同一个数，最坏时长仍然有界：两笔预算加起来也开不过
+#: **看得到的行数**（12 屏 × 6 行 = 72 行），72 × ≈20 秒 ≈ 24 分钟 —— 与这个入口
+#: 原本 15 分钟的量级同档，而且只有「整个信箱都是未读」时才摸得到，
+#: 那种情形下这 72 封正是人手动跑补录想开的东西。
+BACKFILL_UNREAD_MAX_OPENS = BACKFILL_MAX_OPENS
 
 #: 开工对账时最多往下翻几屏。**一封都不打开。**
 #:
@@ -723,6 +806,19 @@ class MailRow:
     raw_time_text: str | None
     reported_at_utc: datetime | None
     kind: ReportKind
+    #: 这一行是未读（True）、已读（False），还是**读不出**（None）。
+    #:
+    #: 用户口径（2026-09-08）：「邮箱中未读邮件（前 4 个），字体颜色是与已读邮件
+    #: 不一致的，你在开未读邮件时，需要把这些内容都阅读了。」
+    #:
+    #: ⚠️ **默认 `None`，而 `None` 的语义是「按改动之前的行为办」**，不是「已读」。
+    #: 判成已读的代价比判成未读高得多（那一封会一直排队到掉出扫描下限，
+    #: 见 `MAIL_UNREAD_MAX_OPENS`），所以「读不出」绝不能往那一侧倒。
+    #:
+    #: 颜色阈值已于 2026-09-08 在实机实拍上标定（`vision.mail_unread.CALIBRATION`），
+    #: 所以这一格在实机上开始给出真答案；`None` 仍旧是常见结局（时刻带定位不到、
+    #: 占比落在两档之间的空档里），而**下游对 `None` 的处置一个字都不许改**。
+    unread: bool | None = None
 
     @property
     def identity(self) -> str | None:
@@ -862,8 +958,11 @@ class ExpectedReportWindows:
         return any(lower <= reported_at_utc <= upper for lower, upper in self.intervals)
 
 
-def mail_row_from_text(index: int, text: str) -> MailRow:
+def mail_row_from_text(index: int, text: str, *, unread: bool | None = None) -> MailRow:
     """把一行邮件的 OCR 文字读成 `MailRow`。
+
+    `unread` 是**另一路观测**（颜色，不是文字）读出来的，所以它是参数而不是在这里
+    算出来的：这个函数只拿得到文字。读不出就留 `None`，见 `MailRow.unread`。
 
     主题**不取第 0 行**：`--psm 6` 在这块 ROI 上不保证行序，而时间那一行的形状
     （`DD/MM/YYYY HH:MM:SS`）是唯一确定的。所以先把时间行认出来剔掉，
@@ -882,6 +981,7 @@ def mail_row_from_text(index: int, text: str) -> MailRow:
             parse_report_timestamp(match.group(0), GAME_DISPLAY_ZONE) if match is not None else None
         ),
         kind=classify_report_subject(subject),
+        unread=unread,
     )
 
 
@@ -947,6 +1047,50 @@ def _times_matching_in_place(
     return sum(1 for a, b in zip(previous, current, strict=False) if a and b and a == b)
 
 
+def say_mail_unread_tally(scan: MailScan) -> None:
+    """把未读色这道闸这一趟的账说出来。**没未读也说，没标定也说。**
+
+    ⚠️ **这道闸最可能的失效形态是「一直判不出」**，而那和「今天信箱里没有未读」
+    在别的日志上长得一模一样。所以三个数每趟都报，`skipped_known` 那句
+    （「一封都没跳也报一次」）是现成的先例。
+
+    没标定时另说一句：那一句是**这一趟跑的是哪个版本**的凭据。#266 一行新日志都
+    没留，于是用户问「生产跑的哪个版本」答不上来——那次的教训写在记忆里
+    （`evidence-must-be-full-resolution` 的「留一个只有新代码写得出的键」）。
+    """
+    if CALIBRATION is None:
+        say(f"  未读色：还没标定，这一趟 {scan.observed} 行全按「读不出」处理（判据没通电）")
+        return
+    say(
+        f"  未读色：判成未读 {scan.unread_seen} 行、读不出 {scan.unread_unknown} 行"
+        f"（共看了 {scan.observed} 行）；因未读越过上限与早停开了 {scan.unread_opened} 封"
+    )
+    if scan.unread_over_budget:
+        warn(
+            f"  这一趟有 {scan.unread_over_budget} 行未读撞上未读开封上限"
+            f"（{scan.unread_budget}）、退回常规预算排队；可能漏了未读邮件"
+        )
+
+
+def mail_unread_payload(scan: MailScan) -> dict[str, Any]:
+    """未读色那几个数的结构化版，拌进调用方自己那条日志的 `payload_json`。
+
+    `unread_calibrated` 是**只有新代码写得出的键**：库里凭它就分得出「这一趟跑的
+    是带未读色的版本、只是还没标定」和「跑的是旧版本」。
+    """
+    return {
+        "unread_calibrated": CALIBRATION is not None,
+        # 标定的出处也进日志：换了游戏版面之后「生产上跑的是哪一组数」
+        # 只有这里查得到（库里查不到代码分支）。
+        "unread_measured_on": None if CALIBRATION is None else CALIBRATION.measured_on,
+        "unread_seen": scan.unread_seen,
+        "unread_opened": scan.unread_opened,
+        "unread_unknown": scan.unread_unknown,
+        "unread_over_budget": scan.unread_over_budget,
+        "unread_budget": scan.unread_budget,
+    }
+
+
 def _first_row_time(rows: Sequence[MailRow]) -> str:
     """第 0 行那封邮件的时间，专供日志。读不出/整屏空时说清是哪一种。
 
@@ -1002,6 +1146,36 @@ class MailScan:
     skipped_known: int = 0
     #: 在列表页实际看过几行（含主题不符与被时刻闸门筛掉的行）。
     observed: int = 0
+    #: 颜色判成**未读**的行数（`MailRow.unread is True`）。
+    unread_seen: int = 0
+    #: 因为未读而开的封数——也就是**越过 `MAIL_MAX_OPENS` 或早停**开出来的那些。
+    #:
+    #: ⚠️ 和 `opened` 分开记，理由同 `skipped_known`：两个数回答的是不同的问题。
+    #: `opened` 是花掉的常规预算，这一格是「要是没有未读色，这几封本来会被漏掉」。
+    unread_opened: int = 0
+    #: 颜色**读不出**的行数（`MailRow.unread is None`）。
+    #:
+    #: ⚠️⚠️ **这一格是这道闸的体检指标。** 阈值没标定时它必然等于 `observed`；
+    #: 标定落地（2026-09-08）之后它**必须掉下来**，居高不下就说明那组数在实机上
+    #: 不成立（换了游戏版面、换了分辨率、或者取样的自对齐失手了），
+    #: 而**那和「今天信箱里没有未读」在别的日志上长得一模一样**。
+    #: 分不出「定位失败」还是「落在空档」时，看 `_say_mail_unread_unlocated`
+    #: 那条 WARNING 在不在。
+    unread_unknown: int = 0
+    #: 判成未读、但未读预算（`MAIL_UNREAD_MAX_OPENS`）已经用满的行数。
+    #:
+    #: 这些行**退回去和别人抢常规预算**（不是直接丢掉），所以它不等于「漏了几封」；
+    #: 但它不为 0 就意味着这一趟**可能**漏了未读邮件，摘要必须说出来。
+    #: 它同时是「颜色阈值标偏了」最先冒头的地方：正常一趟的未读只有几封，
+    #: 撞上这个上限本身就不正常。
+    unread_over_budget: int = 0
+    #: 这一趟未读那一档的预算是多少（日常那趟 `MAIL_UNREAD_MAX_OPENS`、
+    #: `--exhaustive` 补录 `BACKFILL_UNREAD_MAX_OPENS`）。
+    #:
+    #: ⚠️ **记下来是为了让告警说的那个数是真的。** 上限成了 `_scan_mail_rows` 的
+    #: 参数之后，打日志的地方再去读模块常量就会在补录那条路上报出一个假数字，
+    #: 而「撞了哪个上限」正是那句告警唯一要回答的事（记忆里「引用数字前先查出处」）。
+    unread_budget: int = MAIL_UNREAD_MAX_OPENS
     #: 这一趟**没能好好走完**的理由；正常收工时是 None。
     #:
     #: ⚠️ 摘要必须把它说出来。实机 2026-08-13 20:35：一趟给了 30 屏预算的补录在
@@ -1220,6 +1394,14 @@ class PirateLoop:
     #: 无关。没做成可配置——同 `MAX_COORD_DUMPS`。
     MAX_MAIL_DUMPS: int = 3
 
+    #: 标定探针一个进程最多录这么多屏（见 `_record_mail_unread_probe`）。
+    #:
+    #: **按屏封顶而不是按形态**（和 `MAX_NAV_VALUE_CROPS` 相反）：那边要攒的是
+    #: 「会读错的字形」，稀有度就是价值；这边要的是「同一屏上未读行与已读行**并排**
+    #: 的样子」，任意一屏都答得了，多录只是重复。6 屏够覆盖几趟不同的信箱状态
+    #: （全已读的那一屏也是证据：它给出已读那一侧的分布）。
+    MAX_MAIL_UNREAD_PROBES: int = 6
+
     #: 导航栏回读对不上时，最多往 `system_log` 里塞这么多张**整帧**缩略图（见
     #: `_record_navigation_bar_mismatch`）。**文字每次都记，只有图封顶。**
     #:
@@ -1292,6 +1474,10 @@ class PirateLoop:
         self._session_keeper: Any = session_keeper
         self._coord_dumps = 0
         self._mail_dumps = 0
+        #: 标定探针已经录了几屏，以及「颜色量不出来」这句话说过没有。
+        #: 两个都用 `getattr` 兜底读，因为老测试拿 `__new__` 造实例、不走这里。
+        self._mail_unread_probes = 0
+        self._mail_unread_broken = False
         self._origin_dumps = 0
         self._nav_readback_dumps = 0
         #: 已经存过裁片的读数形态。见 `MAX_NAV_VALUE_CROPS`：按形态去重，不按次数。
@@ -2366,11 +2552,156 @@ class PirateLoop:
 
         代价是一次截图加六次窄 ROI OCR，比开一封（≈8 秒）便宜整整一个量级——
         这就是「先筛后开」成立的全部理由。
+
+        ⚠️ **文字与颜色必须取自同一个 `ReportScreens` 实例**，也就是同一帧。
+        各问一次会得出两份都对、却对不上的读数：「第 2 行是未读」被安到另一屏的
+        第 2 行上，而那一屏的第 2 行是另一封邮件（`_report_screens` 头上「每次
+        重新建」那条注释防的正是这件事，只是方向相反）。
         """
-        return [
-            mail_row_from_text(index, text)
-            for index, text in enumerate(self._report_screens().mail_rows())
+        screens = self._report_screens()
+        texts = list(screens.mail_rows())
+        unread = self._mail_row_unread(screens, len(texts))
+        rows = [
+            mail_row_from_text(index, text, unread=flag)
+            for index, (text, flag) in enumerate(zip(texts, unread, strict=True))
         ]
+        self._record_mail_unread_probe(screens, rows)
+        return rows
+
+    def _mail_row_unread(self, screens: Any, count: int) -> list[bool | None]:
+        """这一屏每一行是未读 / 已读 / 读不出。**任何一点不顺都交回一屏 `None`。**
+
+        `None` 在策略层的意思是「按改动之前的行为办」（见 `MailRow.unread`），
+        所以这里退化得越干脆越好：
+
+        - 取图那一侧**没有这个能力**（轻量测试桩、`tools.ingest_report` 那个
+          只实现文字的 `ReportScreens`）—— 用 `getattr` 探，而**不是**往
+          `ReportScreens` 协议上加方法：加了就得改每一个实现，而它们一个都不需要
+          这个信号。
+        - 量出来了但**没有标定**（`vision.mail_unread.CALIBRATION is None`）——
+          一律 `None`。（2026-09-08 起生产上是标定过的，但这条路不许因此拆掉：
+          换了游戏版面就要把 `CALIBRATION` 撤回 `None` 重采。）
+        - 某一行的**时刻带定位不到**（自对齐失败，`mail_row_colors` 交回 `None`）
+          —— 只有那一行是 `None`，别的行照判。**这条也要留痕**，见
+          `_say_mail_unread_unlocated`：它是取样这一侧唯一的失效形态，
+          而它在别的日志上和「今天没有未读」长得一模一样。
+        - 量的过程**抛了**（Pillow 版本、ROI 落到画面外）—— 吞掉、留一条日志。
+          ⚠️ 这条吞是有代价的，所以它必须留痕：一趟信箱二十秒起，不能让一个
+          刚上线的可选信号把它弄死；但「静默失效」正是这道闸最可能的死法。
+        """
+        blank: list[bool | None] = [None] * count
+        measure = getattr(screens, "mail_row_colors", None)
+        if not callable(measure):
+            return blank
+        try:
+            colors = tuple(measure())
+        except Exception as error:  # noqa: BLE001 - 可选信号不许弄死整趟信箱
+            self._say_mail_unread_broken(error)
+            return blank
+        unlocated = sum(1 for color in colors[:count] if color is None)
+        if unlocated:
+            self._say_mail_unread_unlocated(unlocated, count)
+        return [
+            classify_unread(colors[index]) if index < len(colors) else None
+            for index in range(count)
+        ]
+
+    def _say_mail_unread_unlocated(self, unlocated: int, count: int) -> None:
+        """有行定位不到时刻带时说一次。**一个进程只说一次**，同 `_say_mail_unread_broken`。
+
+        为什么值得单独一条：`MailScan.unread_unknown` 只数「判不出」，分不出这一行
+        是**定位失败**（取样这一侧坏了，一屏可能整屏归零）还是**占比落在空档里**
+        （标定这一侧的正常结局）。两者的处置完全不同——前者要去看版面几何
+        （`_mail_time_bands` 那一组常量），后者要去重采重标。而实拍四屏 24 行
+        **定位成功率是 24/24**，所以这条日志一出现就意味着版面变了。
+        """
+        if getattr(self, "_mail_unread_unlocated_said", False):
+            return
+        self._mail_unread_unlocated_said = True
+        say(f"  列表页有 {unlocated}/{count} 行定位不到时刻带；那几行的未读色判不出")
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            "列表页未读色定位不到时刻带",
+            payload={"unlocated": unlocated, "rows": count},
+        )
+
+    def _say_mail_unread_broken(self, error: Exception) -> None:
+        """颜色量不出来时说一次。**一个进程只说一次**，否则每屏一条把日志淹掉。"""
+        if getattr(self, "_mail_unread_broken", False):
+            return
+        self._mail_unread_broken = True
+        say(f"  列表页颜色量不出来（{error}）；未读判据这一趟起全部退回按时刻处理")
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            "列表页未读色量不出来",
+            payload={"error": repr(error)},
+        )
+
+    def _record_mail_unread_probe(self, screens: Any, rows: Sequence[MailRow]) -> None:
+        """标定探针：把这一屏每行的**原分辨率裁片 + 颜色读数**记进 `system_log`。
+
+        ⚠️ **默认关，靠环境变量开**（`ENV_MAIL_UNREAD_PROBE`）。理由与
+        `ENV_CAPTURE_ROWS`（军力榜逐屏原始行）一字不差：默认开会把日志表写成语料库，
+        而调度器起 runner 时的 `command` 在 `run_id` 生成之前就建好了，所以标记必须
+        走环境变量才能和那一趟的 `run_id` 绑在一起。
+
+        ## 为什么落库而不落 `var/logs/`
+
+        实机跑在另一台机器上，本地 `var/logs` 跨机取不到——这条是本仓的硬约定
+        （`infrastructure.system_log` 与那几条 `record_system_log` 注释）。
+        捞出来的办法在 `tools.mail_unread_probe`，它和 `tools.nav_value_corpus`
+        是同一条路子（只读 SELECT → 落 PNG → 生成标定草稿）。
+
+        ## 为什么存裁片而不是整帧缩略图
+
+        这里事后要从图上读出的是**颜色**，而 1920 → 480 的整帧缩略图会把半透明
+        面板上的黄字和白字混成同一团灰。整条教训在
+        `tools.scan_coordinates.crop_png_base64`：那一次是数不出屏上有几位数字，
+        换成颜色一样读不出来。裁片比 ROI 大一圈，见 `mail_row_crops`。
+        """
+        if os.environ.get(ENV_MAIL_UNREAD_PROBE) != "1":
+            return
+        if getattr(self, "_mail_unread_probes", 0) >= self.MAX_MAIL_UNREAD_PROBES:
+            return
+        measure = getattr(screens, "mail_row_colors", None)
+        crop = getattr(screens, "mail_row_crops", None)
+        if not callable(measure) or not callable(crop):
+            return
+        try:
+            colors = tuple(measure())
+            crops = [crop_png_base64(image) for image in crop()]
+        except Exception:  # noqa: BLE001 - 同 `_value_box_evidence`：证据不许弄死链路
+            return
+        self._mail_unread_probes = getattr(self, "_mail_unread_probes", 0) + 1
+        record_system_log(
+            "INFO",
+            "tools.pirate_loop",
+            MAIL_UNREAD_PROBE_MESSAGE,
+            payload={
+                "calibrated": CALIBRATION is not None,
+                "rows": [
+                    {
+                        "index": row.index,
+                        "subject": row.subject,
+                        "raw_time_text": row.raw_time_text,
+                        "kind": row.kind.name,
+                        "unread": row.unread,
+                        # ⚠️ **定位不到时刻带的行也要进来，只是没有读数。**
+                        # 少写一条会让 `rows` 和 `mail_row_png_base64` 错位，
+                        # 而那两个列表是靠**下标**对起来的（`rows_from_logs`）——
+                        # 错位之后标签 `--unread 8891:2` 会点到另一行的裁片上。
+                        "located": color is not None,
+                        "pixels": 0 if color is None else color.pixels,
+                        "warmth_buckets": [] if color is None else list(color.warmth_buckets),
+                        "mean_luminance": 0 if color is None else color.mean_luminance,
+                    }
+                    for row, color in zip(rows, colors, strict=False)
+                ],
+                "mail_row_png_base64": crops,
+            },
+        )
 
     def _enter_mailbox(self) -> None:
         """关浮层 → 切地表 → 开信箱 → 拖回顶部。两条链路进信箱的唯一姿势。
@@ -2551,6 +2882,7 @@ class PirateLoop:
         not_before: datetime | None = None,
         max_pages: int = MAIL_SCAN_PAGES,
         max_opens: int = MAIL_MAX_OPENS,
+        max_unread_opens: int = MAIL_UNREAD_MAX_OPENS,
         observe: Callable[[MailRow], None] | None = None,
         should_open: Callable[[MailRow], bool] | None = None,
         skip_known: bool = False,
@@ -2564,6 +2896,26 @@ class PirateLoop:
         `visit(row, page)` 返回 True 表示「要的都收齐了」，这一趟就此收工。
         `not_before` 是「要找的报告最早可能是什么时候」：列表按时间倒序，翻到比它
         更早的那一行，往下就全是旧报告，可以立刻收工。
+
+        ## 未读那一档：**第三笔预算**
+
+        列表页上未读邮件的字体颜色与已读不同（用户口径 2026-09-08）。未读 ⇒ 按定义
+        我们还没开过它 ⇒ 库里不可能有它的战报 ⇒ **必开**：它越过 `max_opens`、
+        越过早停、越过 `skip_known` 与 `should_open` 那两道时刻闸，只受
+        `max_unread_opens` 和主题闸（`may_be`）约束。
+
+        取舍不对称，这是它必开的全部理由：漏开一封已读邮件 = 多花八秒；漏开一封
+        **未读**邮件 = 它会一直排在别人后面，直到掉出扫描下限（默认 6 小时），
+        那之后日常这趟**永远翻不到它**（整段与那个「我第一版写错了」的因果链
+        写在 `MAIL_UNREAD_MAX_OPENS` 上）。
+
+        ⚠️ **`row.unread is None` 时这一整档完全不存在**，行为与改动之前逐字节相同。
+        `None` 是「读不出」，不是「已读」——颜色量不出来、时刻带定位不到、占比落在
+        空档里，以及万一哪天 `CALIBRATION` 又回到 `None`，走的都是这一条。
+
+        `max_unread_opens` 默认是日常那趟的 `MAIL_UNREAD_MAX_OPENS`；`--exhaustive`
+        补录传 `BACKFILL_UNREAD_MAX_OPENS`，理由（存量历史空洞两条路都到不了）
+        写在那个常量上。
 
         `observe(row)` 是**看每一行（不开封）**的旁路，开工对账用它数今天已经有
         多少份战报（见 `reconcile_today`）。它和开封是两笔独立的预算，这一点是
@@ -2610,10 +2962,13 @@ class PirateLoop:
         #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
         #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
         seen: set[str] = set()
-        scan = MailScan()
+        scan = MailScan(unread_budget=max_unread_opens)
         opened = 0
+        #: 未读那一档花掉的开封数。**和 `opened` 分开**，见 `MAIL_UNREAD_MAX_OPENS`。
+        unread_opened = 0
         collected = False
         budget_noted = False
+        unread_budget_noted = False
         done = False
         reentries = 0
         #: 上一屏的时间列。判「拖到底了」只能靠它，见下面 `fresh` 为空那一段。
@@ -2681,8 +3036,15 @@ class PirateLoop:
                 continue
             last_times = times
             seen.update(identity for row in fresh if (identity := row.identity) is not None)
+            #: 这一屏有没有未读行。见页尾那道「收齐了还翻不翻」的判据。
+            page_had_unread = False
             for row in fresh:
                 scan.observed += 1
+                if row.unread is True:
+                    scan.unread_seen += 1
+                    page_had_unread = True
+                elif row.unread is None:
+                    scan.unread_unknown += 1
                 if observe is not None:
                     observe(row)
                 if row.is_older_than(not_before):
@@ -2692,20 +3054,43 @@ class PirateLoop:
                     )
                     done = True
                     break
-                if collected:
+                # ⚠️⚠️ **未读那一档在这里分岔**：未读 ⇒ 我们还没开过它 ⇒ 库里不可能
+                # 有它的战报 ⇒ **必开**，越过开封上限与早停。整段取舍在
+                # `MAIL_UNREAD_MAX_OPENS` 与 `MailRow.unread`；`unread is None`
+                # （读不出：定位不到、落在空档、或者哪天又撤回未标定）走的是下面
+                # 原样不动的那条路。
+                forced = row.unread is True
+                if forced and unread_opened >= max_unread_opens:
+                    # 未读预算也满了。**退回去和别人抢常规预算**，不是直接丢掉——
+                    # 常规那条路上还有主题闸和时刻闸，它们对未读行同样是对的判断，
+                    # 只是不再享受「必开」。这一格不为 0 本身就是告警，见
+                    # `MailScan.unread_over_budget`。
+                    scan.unread_over_budget += 1
+                    forced = False
+                    if not unread_budget_noted:
+                        unread_budget_noted = True
+                        say(
+                            f"  未读邮件已经开了 {unread_opened} 封，到未读上限"
+                            f"（{max_unread_opens}）；剩下的未读退回常规预算里排队"
+                        )
+                if collected and not forced:
                     continue
-                if opened >= max_opens:
+                if not forced and opened >= max_opens:
                     if not budget_noted:
                         budget_noted = True
                         say(f"  这一趟已经开了 {opened} 封，到上限；剩下的留给下一趟")
                     continue
+                # ⚠️ **主题闸对未读行照样生效。** 「必开」的范围是**这一趟在找的那几类**
+                # 邮件，不是信箱里所有未读——一封未读的侦察报告不该由收攻击战报的
+                # 那一趟去开（下一趟收侦察报告时它仍然是未读，照样开得到）。
+                # 这也是「必开」有界的第二道保障：一整屏活动通知不会进来。
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
                     continue
                 # ⚠️ **排在主题闸之后、时刻窗口闸之前。** 主题闸在前是因为它不查库；
                 # 而这一道在时刻窗口闸之前，是因为「库里已经有了」比「时刻落不落在
                 # 待补窗口内」更强 —— 已经有的那一封，无论落不落在窗口里都不必开。
-                if skip_known and self._already_in_library(row, times):
+                if not forced and skip_known and self._already_in_library(row, times):
                     scan.skipped_known += 1
                     say(f"  第 {row.index} 行（{row.raw_time_text}）的战报库里已经有了；不打开")
                     # ⚠️⚠️ **早停仍然走 `_stop_after_known()` 本身。**
@@ -2721,22 +3106,43 @@ class PirateLoop:
                     if self._stop_after_known():
                         collected = True
                     continue
-                if should_open is not None and not should_open(row):
+                # ⚠️ **未读行不过这道时刻闸。** 它是拿「待补派遣的预计抵达时刻」
+                # 去猜「这一封值不值得开」，而未读是**直接读到**「这一封还没读过」——
+                # 一个推测不该否掉一个观测。（`_already_in_library` 那道同理，
+                # 上面那一行的 `not forced` 就是这条。）
+                if not forced and should_open is not None and not should_open(row):
                     say(f"  第 {row.index} 行时刻不在待补战报的预计窗口内；不打开")
                     continue
-                opened += 1
-                scan.opened = opened
+                if forced:
+                    unread_opened += 1
+                    scan.unread_opened = unread_opened
+                else:
+                    opened += 1
+                    scan.opened = opened
                 # ⚠️ **开封的那些行原先一个字都不打印**，只有被跳过的行有日志——
                 # 正好是不需要的那一半。2026-08-13 复盘时，「那 59 封开的到底是
                 # 什么」在证据上是个黑洞：日志里 239 条主题全是跳过的行，
                 # 而「VS 块读不出来」那 53 次连主题都没留下。
                 when = row.raw_time_text or "时间读不出"
-                say(f"  第 {row.index} 行开封（{when} {row.subject!r}）")
+                mark = "；未读，越过开封上限与早停" if forced else ""
+                say(f"  第 {row.index} 行开封（{when} {row.subject!r}）{mark}")
                 if self._open_mail_row(row, visit):
                     collected = True
             # 不再开封之后还翻不翻，取决于**有没有人在数数**：
             # 数数要的是「今天一共几份」，那个数不能被开封预算截断。
-            if collected and observe is None:
+            #
+            # ⚠️ **第三种要接着翻的情形：这一屏有未读、而未读预算还没用满。**
+            # 未读在时间倒序的列表里是**连续的一段**（用户口径 2026-09-08：
+            # 「正常情况下 是连续的未读批量」），而这一段正好被屏幕下边缘切开时，
+            # 「收齐了就收工」会把下一屏那几封未读留在信箱里——而它们下一趟仍旧要
+            # 和别人抢那 8 封预算，一直排到掉出扫描下限为止。
+            # 下一屏没有未读时这个条件立刻不成立，所以它不是「无限往下翻」。
+            #
+            # 这里是「连续」那条事实**唯一**该承重的地方：猜错只多翻一屏（两秒）。
+            # 把它搬到「停止开封」那一侧（开到第一行已读为止）猜错就丢战报，
+            # 整段取舍在 `MAIL_UNREAD_MAX_OPENS`。
+            more_unread_possible = page_had_unread and unread_opened < max_unread_opens
+            if collected and observe is None and not more_unread_possible:
                 done = True
             if not done and page + 1 < max_pages:
                 slow_drag(self._driver, PANEL_DRAG_FROM_Y, PANEL_DRAG_TO_Y)
@@ -3445,10 +3851,18 @@ class PirateLoop:
             not_before=floor,
             max_pages=max_pages,
             max_opens=max_opens,
+            # ⚠️ **只有 `exhaustive` 那一档放大未读预算。** 存量的历史空洞
+            # （散落在深处、时刻早就不在任何 `should_open` 窗口里的那些未读）
+            # 只有这条路够得到；而控制台「开始」走的是默认那一档，它每按一次都跑，
+            # 不能把最坏时长翻一倍。整段在 `BACKFILL_UNREAD_MAX_OPENS`。
+            max_unread_opens=(BACKFILL_UNREAD_MAX_OPENS if exhaustive else MAIL_UNREAD_MAX_OPENS),
             should_open=should_open if due_before else None,
         )
         due_after = self._due_dispatches(datetime.now(UTC))
         tally.due_after = len(due_after)
+        # 补录也是一趟信箱，未读色那道闸在这条路上同样生效（`_scan_mail_rows` 里），
+        # 所以它的体检数也要说出来 —— 「一直判不出」在这条路上和日常那条一样看不见。
+        say_mail_unread_tally(tally.scan)
         still_missing = [
             {
                 "target": str(dispatch.target),
@@ -3478,6 +3892,10 @@ class PirateLoop:
                 "unlinked_rematch_ms": round(tally.rematch.seconds * 1000),
                 "unlinked_rematch_failed": tally.rematch.failed,
                 "still_missing": still_missing,
+                # 未读那一档在 `_scan_mail_rows` 里，所以补录这条路也吃得到它
+                # （控制台点「开始」走的就是这条）。数进同一条汇总，别另开一条：
+                # 补录一趟只打一条日志，多开一条会让两条的时刻对不上。
+                **mail_unread_payload(tally.scan),
             },
         )
         return tally
@@ -3778,6 +4196,7 @@ class PirateLoop:
             f"  开封前按时刻跳过 {scan.skipped_known} 封（库里已经有了）；"
             f"这一趟真开了 {scan.opened} 封"
         )
+        say_mail_unread_tally(scan)
         record_system_log(
             "INFO",
             "tools.pirate_loop",
@@ -3787,6 +4206,7 @@ class PirateLoop:
                 "opened": scan.opened,
                 "pages": scan.pages,
                 "observed": scan.observed,
+                **mail_unread_payload(scan),
             },
         )
         return tally

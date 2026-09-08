@@ -17,6 +17,11 @@ from io import BytesIO
 from typing import Any, Protocol
 
 from evo_helper.vision.fleet_counts import COUNT_RECIPES
+from evo_helper.vision.mail_unread import (
+    WARMTH_BUCKET_WIDTH,
+    WARMTH_BUCKETS,
+    MailRowColor,
+)
 from evo_helper.vision.parsers import REPORT_TIME_RE, normalise_report_time
 from evo_helper.vision.report_layout import (
     OCR_PSM_COLUMN,
@@ -85,6 +90,58 @@ NAME_PASS_UPSCALES: tuple[int, ...] = (FLEET_NAME_UPSCALE, 4, 2)
 
 #: 战报存档图的 WEBP 质量。理由见 `ImageReportScreens.report_panel_image`。
 REPORT_PANEL_WEBP_QUALITY = 90
+
+#: 邮件行裁片比读数 ROI 各边多留这么多像素。理由见 `ImageReportScreens.mail_row_crops`。
+#: **这不是偏好项**：留少了事后分不出「本来就是白的」和「框把颜色切掉了」。
+MAIL_ROW_EVIDENCE_PAD = 8
+
+#: 未读色量在**自对齐的标题带**上，不是整行。下面这一组常量全部量于
+#: 2026-09-08 的四屏信箱列表页实拍（标定视口 879 空间，27 行），**不是调出来的**。
+#:
+#: 为什么不量整行：黄字「攻击报告」只有约 **434** 个墨迹像素，而整行 ROI
+#: （`ReportLayout.mail_row`）是 **44,200** 像素 —— 一个 R−B ≈ +220 的强信号
+#: 被稀释到 1%。同一批样本上三种取法的实测对比：
+#:
+#: ====================  ==========  ==========  ==========  ======
+#: ROI 做法              面积        未读最小    已读最大    比值
+#: ====================  ==========  ==========  ==========  ======
+#: 整行                  44,200 px   0.0153      0.0092      1.7×
+#: 标题带，按名义行顶     1,296 px   0.0000      0.0000      分不开
+#: **标题带，自对齐**     1,296 px   **0.2137**  **0.0054**  **40×**
+#: ====================  ==========  ==========  ==========  ======
+#:
+#: 「按名义行顶」那一档为什么归零，见 `_mail_time_bands` 的 docstring。
+
+#: 时刻格所在的列（x）。**每一行都有时刻**，而且是高对比白字 —— 整屏最好定位的
+#: 东西，所以自对齐拿它当锚点。
+MAIL_TIME_COLUMN = (1060, 1200)
+
+#: 时刻格「算不算白字墨迹」的灰度门槛，以及一行里至少要有几个这样的像素。
+#:
+#: ⚠️ 这个门槛**只用来定位行**，不参与「暖不暖」的判断：暖色直方图仍旧统计
+#: 标题带里**全部**像素（`_band_color`）。两件事分开的理由在
+#: `vision.mail_unread` 的模块头 —— 挑墨迹要一个亮度门槛，而拿它去筛暖色
+#: 就等于把标定的自由度提前焊死。定位是另一回事：定位错了整行都不算。
+MAIL_TIME_INK_THRESHOLD = 200
+MAIL_TIME_MIN_INK_PIXELS = 4
+
+#: 一段墨迹至少这么高才算一条时刻带。时刻字高实测十来像素，而面板描边只有两三像素。
+MAIL_TIME_MIN_BAND_HEIGHT = 6
+
+#: 标题带：横向范围，以及相对**时刻带顶**的纵向偏移与高度。
+#:
+#: ⚠️ **x 不许往左到 792。** `x 792..812` 是信封图标上那个**红色角标**，它也是暖色，
+#: 而且**每一行都有** —— 收进来会把已读那一侧整体抬起来，空档当场没了。
+MAIL_TITLE_COLUMN = (818, 890)
+MAIL_TITLE_BAND_DY = -26
+MAIL_TITLE_BAND_HEIGHT = 18
+
+#: 扫时刻带时，在列表区上下各多扫这么多行。
+#:
+#: 多扫是为了**看见列表区之外那半行**、好把它整条丢掉：滚过之后列表顶上常挂着
+#: 上一行的下半截，它的时刻带完整地落在列表区上方。只扫列表区的话，那半行的
+#: 时刻带会被扫描边界切成一条「顶端 = 列表顶」的假带，反而顶到第 0 行上。
+MAIL_TIME_SCAN_MARGIN = 30
 
 #: 「获得资源」那 12 格**不走 tesseract**，走 `vision.resource_digits` 的字模匹配。
 #:
@@ -170,6 +227,170 @@ class ImageReportScreens:
             self._read(self._layout.mail_row(index), OCR_PSM_COLUMN)
             for index in range(self._layout.mail_visible_rows)
         ]
+
+    def mail_row_colors(self) -> tuple[MailRowColor | None, ...]:
+        """每一行标题带的颜色读数，供「未读 / 已读」判据用。见 `vision.mail_unread`。
+
+        一行一个读数，**下标就是 `mail_rows()` 的下标**（点击坐标也按它算）。
+        **和 `mail_rows()` 读的是同一帧**——它们必须是，否则「第 2 行是未读」会被
+        安到另一屏的第 2 行上（`_report_screens` 头上「每次重新建」那条注释防的正是
+        这件事，只是方向相反）。同一个实例保证了这一点。
+
+        ⚠️ **定位不到时刻带的行交回 `None`（判不出），绝不回落到名义行顶。**
+        回落等于在离网格的那几屏上给出一个确定的错答案（实测归零，两侧分不开），
+        而 `None` 在策略层的意思是「按改动之前的行为办」。整段在 `_mail_time_bands`。
+
+        代价：一次灰度遍历（定位）加每行两次全通道遍历（`ImageChops` 与
+        `convert("L")` 都在 C 层跑），而标题带只有 72×18——**比一次窄 ROI 的 OCR
+        还便宜**，而它省下的是一封 ≈20 秒的开封。所以不做「按需才测」的懒加载：
+        那样会引入「这一屏测过没有」的状态，而这个类的全部约定就是「一个实例只读一屏」。
+        """
+        bands = self._mail_time_bands()
+        return tuple(
+            self._title_color(bands.get(index)) for index in range(self._layout.mail_visible_rows)
+        )
+
+    def _mail_time_bands(self) -> dict[int, int]:
+        """每一名义行**自己那条时刻带的顶端**；定位不到的行不在字典里。
+
+        ## ⚠️ 为什么颜色不能按名义行顶取
+
+        滚轮滚过之后列表**离网格**：名义行顶和真实行内容错开十几到几十像素
+        （四屏实测偏移 +11 / +23 / +38 / +82）。标题带只有 18 像素高，错开
+        十几像素就整条落到行距的空白上——实测**对齐那一屏取到 0.233、离网格的
+        两屏取到 0.000**，于是「未读最小占比」被拉到 0，两侧再也分不开。
+
+        ⚠️ **`mail_rows()` 的 OCR 之所以不受这件事影响，是因为它的 ROI 有 85px
+        高，装得下这点漂移。颜色判据没有这份余量**——18px 的带子容不下 82px 的
+        漂移。这就是同一屏上文字读得好、颜色读不出的全部原因。
+
+        ## 锚点取时刻格
+
+        每一行都有时刻，白字高对比（`MAIL_TIME_COLUMN`），是整屏最好定位的东西；
+        标题带随即取「时刻带顶 − 26」（`MAIL_TITLE_BAND_DY`，四屏 27 行一致）。
+
+        ## 带子怎么归到行上
+
+        判据是**时刻带的顶端落在哪一名义行的纵向范围里**，而不是「标题带落在哪里」：
+        对齐那一屏第 0 行的标题带是 203..221，比名义行顶（205）还高 2 像素，
+        按标题带归位会把一行真未读整条丢掉。
+
+        这条归位同时办了两件必须办的事：
+
+        1. **把列表区之外的半行整条丢掉。** 实拍 `sample-mailunread-03` 顶上那条
+           时刻带在 y=203，它属于已经滚出列表的上一行；照它算出来的标题带是
+           177..195，已经出了列表区，量到 **0.0054** —— 那是全部已读样本里唯一的
+           非零值（捞到的是页签上的橙色角标）。它的顶端落在第 0 行之上，所以不归任何行。
+        2. **让颜色和 OCR 落在同一行上。** 归位用的是名义行的范围，而 OCR 读的
+           就是那个范围，所以两边挑中的是同一行。
+
+        一行匹配到两条带（不该发生，除非扫到了列表之外的亮东西）时**交回「定位不到」**：
+        两条带里挑一条就是在猜，而猜错的方向是「给出一个确定的错答案」。
+
+        ⚠️ **残余风险，写明不藏**：离网格很深时（实测 +82），一行的名义 ROI 里
+        装着的是它自己的标题、却可能是**上一行**的时刻文字（那一行的时刻带贴着
+        ROI 下沿被切掉）。那是名义行 ROI 本身的老毛病（点击坐标也按名义行算），
+        不是这里引入的；日常那趟每次进信箱都先拖回顶部正是为了压住它。
+        """
+        grey = self._image.convert("L")
+        pixels = grey.load()
+        layout = self._layout
+        last = layout.mail_row(layout.mail_visible_rows - 1)
+        scan_top = max(0, layout.mail_first_row.top - MAIL_TIME_SCAN_MARGIN)
+        scan_bottom = min(self._image.height, last.bottom + MAIL_TIME_SCAN_MARGIN)
+        left, right = MAIL_TIME_COLUMN
+        tops: list[int] = []
+        band: list[int] | None = None
+        for y in range(scan_top, scan_bottom):
+            inked = sum(1 for x in range(left, right) if pixels[x, y] >= MAIL_TIME_INK_THRESHOLD)
+            if inked >= MAIL_TIME_MIN_INK_PIXELS:
+                band = [y, y] if band is None else [band[0], y]
+                continue
+            if band is not None:
+                if band[1] - band[0] >= MAIL_TIME_MIN_BAND_HEIGHT:
+                    tops.append(band[0])
+                band = None
+        if band is not None and band[1] - band[0] >= MAIL_TIME_MIN_BAND_HEIGHT:
+            tops.append(band[0])
+
+        located: dict[int, int] = {}
+        for index in range(layout.mail_visible_rows):
+            row = layout.mail_row(index)
+            # 上界取闭区间：名义行距（86）比行高（85）大一像素，开区间会漏掉
+            # 正好落在那道缝上的带子。相邻行的范围仍然不重叠。
+            inside = [top for top in tops if row.top <= top <= row.bottom]
+            if len(inside) == 1:
+                located[index] = inside[0]
+        return located
+
+    def _title_color(self, time_band_top: int | None) -> MailRowColor | None:
+        """一条时刻带对应的标题带颜色。带子没定位到、或标题带出画就交回 `None`。"""
+        if time_band_top is None:
+            return None
+        top = time_band_top + MAIL_TITLE_BAND_DY
+        bottom = top + MAIL_TITLE_BAND_HEIGHT
+        if top < 0 or bottom > self._image.height:
+            return None
+        left, right = MAIL_TITLE_COLUMN
+        return self._band_color(Region(left, top, right, bottom))
+
+    def mail_row_crops(self, pad: int = MAIL_ROW_EVIDENCE_PAD) -> tuple[Any, ...]:
+        """每一行的**原分辨率**裁片，只给标定探针与诊断证据用（不喂 OCR）。
+
+        裁的是**整个名义行再各边加一圈**，而不是读数用的那条 18px 标题带：
+        读数带是自对齐算出来的，而「自对齐算错了没有」正是事后最要查的一件事——
+        只存那条带子，等于把要复核的东西提前裁掉了。整行裁片里既有标题也有时刻格，
+        照 `_mail_time_bands` 的做法能整条复算一遍。
+
+        ⚠️ **比读数用的 ROI 大一圈**（`pad`）：贴着 ROI 裁的话，事后分不出
+        「这一行本来就是白的」和「框把带颜色的那一截切掉了」。整条教训在
+        `tools.scan_coordinates.crop_png_base64` 与 `pirate_loop._value_box_evidence`
+        上——那一次是缩略图糊掉了字，这里换成框切掉了色，失效方式一样。
+
+        裁片**不做任何预处理**（不缩放、不转灰、不二值化）：标定要调的正是
+        「暖到哪一档算暖」，先处理一道等于把那个自由度提前焊死。
+        """
+        width, height = self._image.width, self._image.height
+        crops: list[Any] = []
+        for index in range(self._layout.mail_visible_rows):
+            left, top, right, bottom = self._layout.mail_row(index).as_box()
+            box = (
+                max(0, left - pad),
+                max(0, top - pad),
+                min(width, right + pad),
+                min(height, bottom + pad),
+            )
+            crops.append(self._image.crop(box).convert("RGB"))
+        return tuple(crops)
+
+    def _band_color(self, region: Region) -> MailRowColor:
+        """一条带子的暖色直方图与平均亮度。**带内全部像素，不先挑墨迹。**
+
+        挑墨迹要一个亮度门槛，而那个门槛和颜色阈值一样没标定过；用它就等于
+        在测量这一步先做一次未标定的判断。理由整段在 `vision.mail_unread` 的模块头。
+        （定位那一步用的 `MAIL_TIME_INK_THRESHOLD` 不算：它决定的是「量哪一块」，
+        不是「这一块暖不暖」。）
+
+        暖色用 `R − B` 而不是转 HSV 取色相：`ImageChops.subtract` 天然在 0 处截断
+        （白字与偏蓝的面板底色因此落在最低那一桶），而这个量在本仓已经标定过一次
+        ——胜负横幅就是量在 R−B 上的（`OUTCOME_INK_THRESHOLD`：横幅峰值 155/192，
+        幽灵文字与面板背景不超过 10）。同一块面板、同一套配色，换个量没有好处。
+        """
+        from PIL import ImageChops
+
+        crop = self._image.crop(region.as_box()).convert("RGB")
+        pixels = crop.width * crop.height
+        if pixels <= 0:  # pragma: no cover - ROI 落在画面外时才可能
+            return MailRowColor(pixels=0, warmth_buckets=(0,) * WARMTH_BUCKETS, mean_luminance=0)
+        red, _green, blue = crop.split()
+        warmth = ImageChops.subtract(red, blue).histogram()
+        buckets = tuple(
+            sum(warmth[index * WARMTH_BUCKET_WIDTH : (index + 1) * WARMTH_BUCKET_WIDTH])
+            for index in range(WARMTH_BUCKETS)
+        )
+        grey = crop.convert("L").histogram()
+        mean = round(sum(value * count for value, count in enumerate(grey)) / pixels)
+        return MailRowColor(pixels=pixels, warmth_buckets=buckets, mean_luminance=mean)
 
     def report_header(self) -> str:
         """页眉文本。时间那一行读不到时，用窄 ROI 单独补一次。
