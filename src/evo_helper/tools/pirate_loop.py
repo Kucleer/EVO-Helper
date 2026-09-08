@@ -994,6 +994,12 @@ class MailScan:
     pages: int = 0
     #: 真的打开过几封。
     opened: int = 0
+    #: 因为「库里已经有了」而**没打开**的封数（`skip_known` 那道闸）。
+    #:
+    #: ⚠️ 单独一格，不并进 `opened` —— 它们是两件事：`opened` 是花掉的开封预算
+    #: （`MAIL_MAX_OPENS`），而这一格是**省下来的**。混成一个数就看不出这道闸
+    #: 有没有在工作，而「一直是 0」正是它最可能的失效形态（判据永远不成立）。
+    skipped_known: int = 0
     #: 在列表页实际看过几行（含主题不符与被时刻闸门筛掉的行）。
     observed: int = 0
     #: 这一趟**没能好好走完**的理由；正常收工时是 None。
@@ -2547,6 +2553,7 @@ class PirateLoop:
         max_opens: int = MAIL_MAX_OPENS,
         observe: Callable[[MailRow], None] | None = None,
         should_open: Callable[[MailRow], bool] | None = None,
+        skip_known: bool = False,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
@@ -2694,6 +2701,25 @@ class PirateLoop:
                     continue
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
+                    continue
+                # ⚠️ **排在主题闸之后、时刻窗口闸之前。** 主题闸在前是因为它不查库；
+                # 而这一道在时刻窗口闸之前，是因为「库里已经有了」比「时刻落不落在
+                # 待补窗口内」更强 —— 已经有的那一封，无论落不落在窗口里都不必开。
+                if skip_known and self._already_in_library(row, times):
+                    scan.skipped_known += 1
+                    say(f"  第 {row.index} 行（{row.raw_time_text}）的战报库里已经有了；不打开")
+                    # ⚠️⚠️ **早停仍然走 `_stop_after_known()` 本身。**
+                    #
+                    # 这一封被识别为「库里已有」，和把它开出来读到 KNOWN 是同一件事，
+                    # 所以后续该不该收工必须问同一个判据 —— 它每封重查待补清单、
+                    # 清单空了才停。理由整段在 `_ingest_report_row` 上：报告在库里
+                    # **却没接到该接的那一发派遣**时，「库里已有 ⇒ 往下都读过了」
+                    # 这个假定会把那几发永久钉在「待战报」（2026-08-11 那四发）。
+                    #
+                    # 不许在这里改写条件，也不许省掉这一问 —— 省掉的后果是
+                    # 从「早停」退化成「翻满上限」，把省下的时间又花回翻页上。
+                    if self._stop_after_known():
+                        collected = True
                     continue
                 if should_open is not None and not should_open(row):
                     say(f"  第 {row.index} 行时刻不在待补战报的预计窗口内；不打开")
@@ -3176,6 +3202,55 @@ class PirateLoop:
         if self._ingest_report(row, page) is not ReportIngest.KNOWN:
             return False
         return self._stop_after_known()
+
+    def _already_in_library(self, row: MailRow, times: Sequence[str | None]) -> bool:
+        """这一封的战报库里是不是**肯定**已经有了 —— 有就不必点开。
+
+        每趟进信箱都把每封战报点开、读完、解析完，才发现「库里已有，不重复入库」。
+        实测每两封就有一封是这样白开的（2026-09-07 全天 513 封里 253 封；
+        2026-09-08 换完回顶之后 39 封里 19 封 —— 比例没变，它是另一条链路），
+        一封约 20 秒。而**列表页那一列在开封之前就把时刻读出来了**。
+
+        ⚠️ 顺带抢回的是**开封预算**：`MAIL_MAX_OPENS` = 8，而新版本每趟都撞
+        「开了 8 封到上限」。那 8 封里有 4 封花在已经读过的邮件上，
+        真正要读的那几封被挤到下一趟 —— 所以这道闸不只是省时间。
+
+        ## 判据：比「这一屏同一秒有几行」，不是「库里有没有」
+
+        ⚠️⚠️ **「有就跳」会把同秒的第二封永久丢掉。** 2026-08-25 20:18:44 那一秒
+        有两份战报（`2:490:16` 与 `1:439:11`，两个不同目标），同一趟里隔 25 秒
+        先后入库。第二封被评估时库里已经有一份 —— 「有就跳」会让它这一趟跳过、
+        下一趟同样跳过，那一发派遣**永远**停在「待战报」。
+
+        而「比待补派遣数」的保守版也救不了它：那一刻该秒已有 1 份、待补 1 发，
+        `1 >= 1` 成立，照跳（第一轮 review 指出，2026-08-26 的日志实证）。
+
+        所以比的是**信箱这一屏同一秒有几行**：库里的份数够不够盖住眼前这几行。
+        列表 2 行同秒、库里 1 份 → `1 < 2` → 照开，第二封不丢。
+
+        ⚠️ **残余缺口，写明不藏**：同秒两行被**翻页切开**时，两屏各看到 1 行、
+        库里 1 份，第二行仍会被跳。历史上同秒只出现过 1 对（2963 份 / 32 天
+        → 0.034%），再乘一个翻页概率。**用户已明确接受这个残余风险**
+        （口径 2026-09-07：「我不想为了一个非常冗余的问题，增加系统复杂度」）。
+
+        ## 只对攻击战报生效
+
+        同一趟还扫安全告警（`PLANET_SCOUTED`）与保护期返航（`PROTECTION_BOUNCE`）。
+        它们跟战报的时刻撞车时不能被顺带跳掉 —— 那会丢保护期记录或告警。
+        查过历史：这两类**一封都没入库过**（`planet_scout_alerts` 0 行、
+        「撞保护期」这四个字在全部日志里没出现过），所以不做分流、只加这一个
+        `is` 判断，**未知类型一律落在「照开」那一侧**。
+        """
+        if row.kind is not self.RECONCILE_KIND:
+            return False
+        moment = row.reported_at_utc
+        if moment is None:
+            # 时刻读不出：照开。这条不是保守，是判据的一部分 ——
+            # 时间那一格实拍上 93.5% 读得出，读不出的那几行正是最该看一眼的。
+            return False
+        repository, _run_id = self._ensure_run()
+        on_screen = sum(1 for value in times if value == row.raw_time_text)
+        return repository.count_reports_at(moment) >= max(on_screen, 1)
 
     def _stop_after_known(self) -> bool:
         """撞见一封「库里已有」之后，还要不要接着开封。
@@ -3682,13 +3757,37 @@ class PirateLoop:
             # into a run of eight redundant detail reads.
             return self._ingest_report_row(row, page)
 
-        self._scan_mail_rows(
+        scan = self._scan_mail_rows(
             wanted=(self.RECONCILE_KIND, *NON_REPORT_MAIL_KINDS),
             label=f"{self.REPORT_LABEL}、安全告警或保护期返航",
             visit=visit,
             not_before=self._report_floor(day_start, now=now),
             max_pages=RECONCILE_MAX_PAGES,
             observe=tally,
+            # ⚠️ **只有这一条日常链路开跳过。** 补录那一档（`backfill_reports`）
+            # 刻意不开：那个入口存在的理由正是要够到被各种闸筛掉的邮件
+            # （`exhaustive` 那一档连早停都不走）。在它上面开跳过，
+            # 等于把「人手动来救」这条最后的路也堵掉。方案 §3.7 前提④。
+            skip_known=True,
+        )
+        # ⚠️ **这道闸最可能的失效形态是「一直跳过 0 封」** —— 判据永远不成立，
+        # 而那和「没装这道闸」在日志上一模一样。所以有跳过就报，没跳过也报一次
+        # 「一封都没跳」，让「它到底在不在工作」这件事一眼可查。
+        # 数进 `scan.skipped_known`，与花掉的开封预算（`opened`）分开记。
+        say(
+            f"  开封前按时刻跳过 {scan.skipped_known} 封（库里已经有了）；"
+            f"这一趟真开了 {scan.opened} 封"
+        )
+        record_system_log(
+            "INFO",
+            "tools.pirate_loop",
+            "开封前按时刻跳过已入库的邮件",
+            payload={
+                "skipped_known": scan.skipped_known,
+                "opened": scan.opened,
+                "pages": scan.pages,
+                "observed": scan.observed,
+            },
         )
         return tally
 

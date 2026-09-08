@@ -2893,6 +2893,42 @@ class SqlAlchemyRepository:
                 or 0
             ) > 0
 
+    def count_reports_at(self, reported_at_utc: datetime) -> int:
+        """这个**报告时刻**库里已经有几份战报。**只读，一个字节都不写。**
+
+        与 `has_report_at` 分开，因为它们回答的是两个不同的问题：
+        那一个要目标坐标（入库去重、保护期返航都拿得到坐标），而这一个
+        **只有时刻** —— 邮件列表页上读得出时刻，读不出目标是谁。
+
+        ## 用在哪：开封之前决定要不要点开这一封
+
+        活链路每趟进信箱都把每封战报点开、读完、解析完，才发现「库里已有」——
+        实测每两封就有一封是这样白开的（2026-09-07 全天 513 封里 253 封，
+        2026-09-08 新版本 39 封里 19 封），一封约 20 秒。
+        而列表页那一列**开封之前就把时刻读出来了**，所以这个数够拦住它们。
+
+        ⚠️⚠️ **交回的是「几份」而不是「有没有」，因为判据要拿它和
+        「这一屏同一秒有几行」比。** 光看「有没有」会把同秒的第二封**永久**跳过：
+        2026-08-25 20:18:44 那一秒有两份战报（`2:490:16` 与 `1:439:11`，
+        两个不同目标），同一趟里隔 25 秒先后入库。第二封被评估时库里已经有一份，
+        「有就跳」会让它这一趟跳过、下一趟同样跳过 —— 那一发派遣永远停在
+        「待战报」。整段账在 `docs/任务耗时优化/方案.md` §3.5。
+
+        ⚠️ 走 `reported_at_utc` 上那条索引（`d3b9f27c4a81`）。**这条查询每封邮件
+        跑一次**，没有索引就是每封一次全表扫，省下的开封时间会被查库吃回去 ——
+        而且分不清是哪一边。所以那条迁移是这一步的前置，先发的。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            return (
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.BattleReportRow)
+                    .where(orm.BattleReportRow.reported_at_utc == reported_at_utc)
+                )
+                or 0
+            )
+
     def set_resume_at(self, run_id: UUID, resume_at_utc: datetime | None) -> None:
         with self._session_factory() as session:
             row = session.get(orm.RunInstance, run_id)

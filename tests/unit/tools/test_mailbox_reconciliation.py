@@ -124,6 +124,18 @@ class _Repository:
         """
         return 0
 
+    def count_reports_at(self, _reported_at_utc: Any) -> int:
+        """开封前那道「库里已经有几份」的探针，默认「库里一份都没有」。
+
+        ⚠️ **这个替身也不能少，而且默认值必须是 0。** 少了它整个文件报
+        `AttributeError`（那还算好，一眼能看见）；默认给非 0 才是真陷阱 ——
+        这一整个文件的用例都在验「开封与早停」，而非 0 会让每一封都被跳过，
+        于是它们全在测一条什么都不开的路径。
+
+        要验跳过本身的用例另有专文：`test_skip_known_mail.py`。
+        """
+        return 0
+
 
 class _Keeper:
     """`SessionKeeper` 的替身：只记「关窗重开被叫过几次」，并按剧本给结局。
