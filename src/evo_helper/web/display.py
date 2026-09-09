@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 
 from evo_helper.application.backfill import BACKFILL_KINDS, BackfillPhase
 from evo_helper.domain.fleet_preset import title_signature
 from evo_helper.domain.records import TARGET_KIND_LABELS, BattleResourceEntry
 from evo_helper.domain.scheduler import TaskStatus
+from evo_helper.infrastructure.system_log import SCREENSHOT_PAYLOAD_KEYS, screenshot_base64
 
 #: 三条任务链路在界面上的名字。
 #:
@@ -444,7 +447,10 @@ def resource_precision_hint(entry: BattleResourceEntry) -> str:
 #: 它撑到几十屏、横向滚动条永远拉不到头（实机 2026-08-17 用户报的就是这个），
 #: 而那串字符对读日志的人**没有任何用处**——有用的是那张图本身。
 #: 所以从正文里摘出来，另行渲染成图。
-_IMAGE_PAYLOAD_KEYS = ("thumbnail_png_base64",)
+#:
+#: 键名本身住在 `infrastructure.system_log`：查询层也要认它（按「有没有图」决定
+#: 取不取那几万字符），两处各写一份的话改一处就等于让另一处看不见图。
+_IMAGE_PAYLOAD_KEYS = SCREENSHOT_PAYLOAD_KEYS
 
 
 def payload_text(payload_json: str | None) -> str:
@@ -468,17 +474,29 @@ def payload_text(payload_json: str | None) -> str:
 
 
 def payload_image(payload_json: str | None) -> str:
-    """`payload_json` 里那张 base64 图，可以直接当 `src` 用；没有就返回空串。"""
-    if not payload_json or payload_json == "{}":
-        return ""
+    """`payload_json` 里那张 base64 图，可以直接当 `src` 用；没有就返回空串。
+
+    ⚠️ **系统日志列表页已经不用它了。** 一张图内联进 DOM 是 8 万到 16 万字符，
+    默认那一页动辄 0.5 MB、每页 1000 行时 1.6 MB（生产库实测 2026-09-09），而
+    `loading="lazy"` 对 `data:` URI 一点用都没有——字节已经在 HTML 里了。列表页
+    改成只标一个链接，图走 `GET /system-log/{id}/image`。
+    这个函数留着：接口那一路仍原样返回整段 payload，而「图能不能取到」这件事
+    有它自己的用例钉着。
+    """
+    raw = screenshot_base64(payload_json)
+    return f"data:image/png;base64,{raw}" if raw else ""
+
+
+def payload_image_bytes(payload_json: str | None) -> bytes | None:
+    """`payload_json` 里那张图解码成 PNG 字节；没有或解不开就返回 `None`。
+
+    解不开也返回 `None` 而不是抛：这一路是排障页面上的一个链接，
+    「点开是 404」比「点开把控制台整页打成 500」好认得多。
+    """
+    raw = screenshot_base64(payload_json)
+    if not raw:
+        return None
     try:
-        data = json.loads(payload_json)
-    except (TypeError, ValueError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    for key in _IMAGE_PAYLOAD_KEYS:
-        raw = data.get(key)
-        if isinstance(raw, str) and raw:
-            return f"data:image/png;base64,{raw}"
-    return ""
+        return base64.b64decode(raw, validate=True)
+    except (ValueError, binascii.Error):
+        return None

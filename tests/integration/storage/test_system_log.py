@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -16,7 +17,11 @@ from evo_helper.domain.scheduler import MissionKind
 from evo_helper.infrastructure.system_log import SystemLogRecord, SystemLogSink
 from evo_helper.infrastructure.system_log_db import database_sink, purge_system_log
 from evo_helper.storage.repository import SqlAlchemyRepository
-from evo_helper.storage.system_log import SystemLogRepository
+from evo_helper.storage.system_log import (
+    FACET_CACHE_TTL_S,
+    PAYLOAD_INLINE_LIMIT,
+    SystemLogRepository,
+)
 
 BASE = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
 
@@ -176,6 +181,128 @@ def test_the_limit_is_clamped_rather_than_refused(logs: SystemLogRepository) -> 
     assert logs.query(limit=10**6).limit == 1000
     assert logs.query(limit=0).limit == 1
     assert logs.query(offset=-5).offset == 0
+
+
+# -- 现场图与大 payload ------------------------------------------------------
+
+
+def _screenshot_payload(chars: int = 120_000) -> str:
+    """一条带现场图的 payload，量级同实机那批（8 万到 16 万字符）。"""
+    return json.dumps({"note": "画面认不出", "thumbnail_png_base64": "A" * chars})
+
+
+def test_the_list_page_does_not_carry_the_screenshot_bytes(logs: SystemLogRepository) -> None:
+    """⚠️ 本组核心判据：**超限的 payload 一个字节都不许随这一页搬回来。**
+
+    判据落在「那一大串字符在不在取回来的行里」，不是「有没有调某个函数」。
+    量级不是省几毫秒：生产库上一页 200 行全落在带图的行上时，全量是 27 MB /
+    3.9 秒，只带长度是 0.11 秒（实测 2026-09-09）。
+    """
+    logs.append([record(minute=0, payload_json=_screenshot_payload())])
+
+    row = logs.query(payload_inline_limit=PAYLOAD_INLINE_LIMIT).rows[0]
+
+    assert "A" * 40 not in row.payload_json
+    assert row.payload_json == "", "这一次没取 ≠ 库里没有"
+    assert row.payload_bytes > 120_000, "省掉的是多大一段，页面要说得出"
+    assert row.payload_withheld
+    assert row.has_screenshot, "不搬那几万字符，不等于不知道有图"
+
+
+def test_without_a_limit_the_whole_payload_still_comes_back(logs: SystemLogRepository) -> None:
+    """⚠️ `payload_json` 是排障的命根子。`GET /api/system-log` 走的就是这条，
+    不传上限就必须是整段，含那张图。"""
+    payload = _screenshot_payload()
+    logs.append([record(minute=0, payload_json=payload)])
+
+    row = logs.query().rows[0]
+
+    assert row.payload_json == payload
+    assert not row.payload_withheld
+    assert row.has_screenshot
+
+
+def test_an_ordinary_payload_still_travels_with_the_page(logs: SystemLogRepository) -> None:
+    """让路的是库里 0.5% 的大行，剩下 99.5% 不许跟着多一次点击。"""
+    logs.append([record(minute=0, payload_json='{"coordinate": "2:137:1"}')])
+
+    row = logs.query(payload_inline_limit=PAYLOAD_INLINE_LIMIT).rows[0]
+
+    assert row.payload_json == '{"coordinate": "2:137:1"}'
+    assert not row.payload_withheld
+    assert not row.has_screenshot
+
+
+def test_an_empty_screenshot_key_does_not_count_as_a_screenshot(
+    logs: SystemLogRepository,
+) -> None:
+    """抓不到画面时 `tools.screen_diagnostics` 写进去的是空串。
+
+    页面上一个点开是 404 的「现场图」比不显示更糟，所以取回了 payload 就按内容
+    确切地判，不看那个键在不在。
+    """
+    logs.append([record(minute=0, payload_json=json.dumps({"thumbnail_png_base64": ""}))])
+
+    assert not logs.query(payload_inline_limit=PAYLOAD_INLINE_LIMIT).rows[0].has_screenshot
+
+
+def test_one_row_can_still_be_fetched_whole_by_id(logs: SystemLogRepository) -> None:
+    """列表页不搬图之后，「点开再取」必须走得通——否则省下的字节就是丢掉的证据。"""
+    payload = _screenshot_payload()
+    logs.append([record(minute=0, payload_json=payload)])
+    entry_id = logs.query().rows[0].id
+
+    fetched = logs.entry(entry_id)
+
+    assert fetched is not None
+    assert fetched.payload_json == payload
+    assert logs.entry(entry_id + 10_000) is None, "认不出的 id 是「没有」，不是报错"
+
+
+# -- 筛选下拉框的候选值 ------------------------------------------------------
+
+
+def test_a_machine_that_starts_logging_shows_up_in_the_dropdown_at_once(
+    logs: SystemLogRepository,
+) -> None:
+    """⚠️ **少一个 host 就等于一台机器的日志「查不到了」。**
+
+    两个 `distinct` 现在带缓存（原先各自全表扫一遍，占服务端每页 360 ms 里的
+    276 ms）。这一条钉的是缓存**已经热**之后新来一台机器的情形：它写下的第一条
+    就是最新的那一行，所以当场就得在框里。
+    """
+    logs.append([record(minute=0, host="console-pc")])
+    assert logs.query().hosts == ("console-pc",), "先把缓存烧热"
+
+    logs.append([record(minute=1, host="live-pc", source="tools.pirate_loop")])
+
+    page = logs.query()
+    assert page.hosts == ("console-pc", "live-pc")
+    assert page.sources == ("tools.bot_loop", "tools.pirate_loop")
+    assert logs.query(host="live-pc").hosts == ("console-pc", "live-pc"), (
+        "候选值是全局事实，不跟着当前筛选缩水"
+    )
+
+
+def test_the_dropdown_catches_up_when_the_new_rows_are_off_this_page(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """写日志的机器在**另一台**上，本进程作废不了缓存——所以缓存必须会过期。
+
+    这里刻意让新机器那一行落在当前筛选之外（按 level 筛掉了），「并上这一页」
+    救不了，只有过期重取能救。
+    """
+    now = [1000.0]
+    logs = SystemLogRepository(session_factory, clock=lambda: now[0])
+    logs.append([record(minute=0, host="console-pc", level="ERROR")])
+    assert logs.query(level="ERROR").hosts == ("console-pc",)
+
+    # 另一台机器、另一个进程：换一个仓储实例写，本实例的缓存不知情。
+    SystemLogRepository(session_factory).append([record(minute=1, host="live-pc")])
+
+    assert logs.query(level="ERROR").hosts == ("console-pc",), "还没到期，照旧"
+    now[0] += FACET_CACHE_TTL_S
+    assert logs.query(level="ERROR").hosts == ("console-pc", "live-pc")
 
 
 # -- 保留策略 ----------------------------------------------------------------

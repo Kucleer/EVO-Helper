@@ -8,9 +8,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
-from evo_helper.web.display import payload_image, payload_text
+from evo_helper.web.display import payload_image, payload_image_bytes, payload_text
 
 
 def test_the_base64_image_never_reaches_the_text_column() -> None:
@@ -33,6 +34,27 @@ def test_the_image_is_handed_over_as_something_a_browser_can_show() -> None:
     payload = json.dumps({"thumbnail_png_base64": "iVBORw0KGgo"})
 
     assert payload_image(payload) == "data:image/png;base64,iVBORw0KGgo"
+
+
+def test_the_image_decodes_back_to_the_bytes_that_went_in() -> None:
+    """`GET /system-log/{id}/image` 返回的必须是原图，不是缩过一道的。
+
+    列表页现在只标一个链接（内联进 DOM 是 8 万到 16 万字符），所以这一路是
+    「图取得到」的唯一保证。
+    """
+    raw = b"\x89PNG\r\n\x1a\n" + b"pixels" * 500
+    payload = json.dumps({"thumbnail_png_base64": base64.b64encode(raw).decode("ascii")})
+
+    assert payload_image_bytes(payload) == raw
+
+
+def test_an_unreadable_image_is_none_rather_than_an_exception() -> None:
+    """⚠️ 解不开就当没有：这一路是排障页面上的一个链接，
+    「点开是 404」比「点开把整页控制台打成 500」好认得多。"""
+    assert payload_image_bytes(json.dumps({"thumbnail_png_base64": "不是 base64!!"})) is None
+    assert payload_image_bytes("{不是 json") is None
+    assert payload_image_bytes("{}") is None
+    assert payload_image_bytes(None) is None
 
 
 def test_a_payload_without_a_picture_offers_none() -> None:
