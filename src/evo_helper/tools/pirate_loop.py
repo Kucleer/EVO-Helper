@@ -3564,7 +3564,53 @@ class PirateLoop:
         if row.kind is ReportKind.PROTECTION_BOUNCE:
             self._ingest_protection_bounce(row, page)
             return True
+        if self._detail_says_protection_bounce(page):
+            # ⚠️ **列表行认不出这一种**，所以必须在详情页上再判一次。见下面那个方法。
+            say(f"  第 {row.index} 行列表上看着是战报，详情页是保护期返航")
+            self._ingest_protection_bounce(row, page)
+            return True
         return False
+
+    def _detail_says_protection_bounce(self, page: Any) -> bool:
+        """详情页正文是不是那句「X 处于保护状态，我方舰队已返航」。
+
+        ## ⚠️ 为什么非在这里判一次不可（2026-09-09 实拍推翻了原来的假设）
+
+        原先只按 `row.kind` 分流，而 `row.kind` 来自**列表行**的文字。
+        `classify_report_subject` 判这一种要求整句话都在（坐标 + 「处于保护状态」
+        + 「已返航」，`PROTECTION_BOUNCE_RE`），它的注释里写着依据是
+        「列表行上的文字是正文预览」——**那句话是错的**。
+
+        2026-09-09 实机采到的那一封（`[4:277:14]`、邮件时刻 12:27:13）：
+
+            列表行     攻击报告 / System / 09/09/2026 12:27:13     ← 没有正文预览
+            详情页     标题栏「消息」；主题: 攻击报告
+                       正文  [4:277:14]（bot_4_277_14's Planet）处于保护状态，我方舰队已返航。
+
+        ⇒ **它的主题和普通战报一字不差**，于是列表行被判成 `ATTACK`、
+        进战报解析、没有 VS 块、读不出、静默丢掉，而那一发派遣永远挂在
+        「到点还没战报」上。生产库实测：近 12 天 **153 发**这样挂着，
+        它们让 `_stop_after_known()` 几乎从不触发（6 小时窗口里平均挂 3.59 发、
+        单子为空只占 19.8%），每趟信箱因此开满上限。
+
+        ## 探测放宽、读取仍严
+
+        这里只问「像不像」：读到**至少一个**坐标就算。真正的读取仍走
+        `read_protection_bounce`，它对 >1 个坐标是**拒收**的（怕把保护期记到
+        别人头上）。两件事分开，是为了不让「拒收一封」变成「整类认不出」。
+
+        ⚠️ **读不出正文一律返回 False**，让它照旧走战报那条路 —— 那条路读不出会
+        留现场图，而在这里悄悄吞掉才是最坏的：下一趟它还在信箱里，而我们不知道为什么。
+        """
+        from evo_helper.vision.parsers import find_protection_bounce_targets
+
+        try:
+            body = page.security_message()
+        except Exception:  # noqa: BLE001 - 详情页没铺开/没这一块，交给战报那条路去报
+            return False
+        if not isinstance(body, str) or not body.strip():
+            return False
+        return bool(find_protection_bounce_targets(body))
 
     def _ingest_planet_scout_alert(self, row: MailRow, page: Any) -> None:
         """Persist and notify a foreign-reconnaissance mail exactly once.
