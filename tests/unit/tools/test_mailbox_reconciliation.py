@@ -32,6 +32,7 @@ from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
 from evo_helper.tools import pirate_loop
 from evo_helper.tools.bot_loop import BotLoop
 from evo_helper.tools.pirate_loop import (
+    MAIL_MAX_KNOWN_RUN,
     MAIL_MAX_OPENS,
     RECONCILE_MAX_PAGES,
     LoopOptions,
@@ -426,6 +427,16 @@ def test_a_pending_dispatch_keeps_the_opening_going_past_a_known_report(
     它下面，那几个目标永远停在「待战报」。
 
     ⚠️ 早停本身**不删**（用户明确要的）——它只是要先问过那张单子。
+
+    ## ⚠️ 为什么这里不再是「四封全开」
+
+    2026-09-09 加了第二道停止条件：常规闸**连着** `MAIL_MAX_KNOWN_RUN` 封开出来
+    都是「库里已有」就不再开封（整段在那个常量与 `KnownRunGate` 上；这条修复要防
+    的那件事**一个字没让**）。四封全是「已有」，所以它在第 N 封上接手。
+
+    这一条要钉的仍旧是原来那件事，只是换了个说法：**不许在第一封「已有」就收工**。
+    「连续」版遇到一封真入库就把计数清零，所以 2026-08-11 那四发照旧救得回来 ——
+    专文在 `test_consecutive_known_mail.py`。
     """
     loop, _repository, opened = _loop(
         [
@@ -438,7 +449,8 @@ def test_a_pending_dispatch_keeps_the_opening_going_past_a_known_report(
 
     _reconcile(loop, monkeypatch)
 
-    assert opened == [0, 1, 2, 3], "单子上还有一发没找到，不该在第一封「已有」就收工"
+    assert opened == list(range(MAIL_MAX_KNOWN_RUN)), "不该在第一封「已有」就收工"
+    assert len(opened) > 1, "单子上还有一发没找到，一封「已有」不足以让这一趟收工"
 
 
 def test_the_worklist_line_says_when_the_latest_report_is_due(

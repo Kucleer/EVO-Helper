@@ -436,6 +436,58 @@ MAIL_MAX_OPENS = 8
 #: 库结构，所以先记在这里，连同那句要写给用户的话：「调大 = 少丢战报、多花时间」。
 MAIL_UNREAD_MAX_OPENS = 12
 
+#: 常规闸**连着**开出多少封「库里已有」就不再开封（这一趟的保险值 N）。
+#:
+#: ## 在省什么（生产实测 2026-09-09）
+#:
+#: 新窗口 33 趟开封 278 封、入库 113 封，平均 **104.8 秒才入库一封新战报**。
+#: 拆开看：未读强开 120 封只白开 1 封（0.8%），而**常规闸 162 封一封新的都没有**
+#: （白开率 100%），折算约 2 小时/天。
+#:
+#: 根因不在这 162 封本身，而在早停从来不触发：`_stop_after_known()` 要「待认领
+#: 单子空了」才肯停，可近 12 天有 153 发派遣到点没战报，`MAX_REPORT_AGE`（6 小时）
+#: 的老化窗口里平均挂着 3.59 发 —— 单子为空的时刻只占 **19.8%**。于是每趟都把
+#: `MAIL_MAX_OPENS` 开满（日志里「接着往下开」那一句出现 221 次）。
+#:
+#: ## ⚠️⚠️ 为什么是「连续」而不是「有一封就停」
+#:
+#: 「库里已有 ⇒ 往下都读过了」这个推论有一颗记录在案的雷（整段在
+#: `_ingest_report_row`）：2026-08-11 那四发 —— 报告确实在库里、**却没接到该接的
+#: 那一发派遣**，于是每趟都在第一封就收工，那四发被永久钉在「待战报」。
+#:
+#: 「连续」版**遇到一次真入库就归零**，所以它自己能翻案：只要下面还躺着一封没入库
+#: 的战报，开到它的那一趟计数就清了、接着往下开。「有就停」没有这个出口 ——
+#: 这是这道闸敢和 `_stop_after_known()` 并存的全部理由，也是这个常量不许被读成
+#: 「白开阈值」的原因：它数的是**连续段**，不是总数。
+#:
+#: ## 取 2 的依据：拿历史日志回放过
+#:
+#: | 保险值 | 新窗口漏掉入库 | 旧窗口漏掉入库（= 未读判据失效时的样子） |
+#: |---|---|---|
+#: | 0 | 1 | 1197（全丢） |
+#: | 1 | 0 | 123（10.3%） |
+#: | **2** | **0** | 35（2.9%） |
+#: | 3 | 0 | 25（2.1%） |
+#: | 5 | 0 | 13（1.1%） |
+#:
+#: 新口径下 0 漏、省掉 120/288 封开封；而万一未读判据失效，2 比 1 安全得多
+#: （漏 2.9% 而不是 10.3%）。
+#:
+#: ⚠️ **上表同时说明「正确取值取决于未读判据的健康度」**，也就是说它是**运维旋钮
+#: 不是标定常量**（记忆里那条「主动考虑可配置」）。**还欠一个配置页旋钮**：挪到
+#: 攻击配置页要给那张表加一列（`storage.models` + 一次迁移），而这一版刻意不碰库
+#: 结构，所以先做成模块常量 + `_scan_mail_rows` 的关键字参数，与
+#: `MAIL_UNREAD_MAX_OPENS` 同形。要写给用户的那句话是：「调小 = 省时间，
+#: 但未读判据一失效就多丢战报；调大 = 反之」。
+MAIL_MAX_KNOWN_RUN = 2
+
+#: 「未读判据看着已经死了」连着几趟才打告警。见 `unread_gate_looks_silent`。
+#:
+#: 单趟 `unread_seen == 0` 完全可能是真的（刚把一批未读开完、信箱确实清了），
+#: 所以要连着两趟。两趟之后再等下去没有意义：这道闸的安全性整个建立在未读判据
+#: 还活着上，而它悄悄失效的样子在别的账上和「今天没有未读」一模一样。
+UNREAD_SILENT_ROUNDS = 2
+
 #: 补录侦察报告（`backfill_scout_reports`）时的两个上限。
 #:
 #: 与活链路那两个（`MAIL_SCAN_PAGES` / `MAIL_MAX_OPENS`）分开写死，不是复用后调参：
@@ -1091,6 +1143,66 @@ def mail_unread_payload(scan: MailScan) -> dict[str, Any]:
     }
 
 
+def say_mail_blank_tally(scan: MailScan) -> None:
+    """连续白开那道闸这一趟的账。**每趟至少一句，没触发也说。**
+
+    ⚠️ **这道闸最可能的失效形态是「一直不触发」**，而那和「今天没有白开」在日志上
+    一模一样（`skipped_known` 那句「一封都没跳也报一次」是现成的先例）。所以没停
+    的时候也要把白开数与**最长连续段**说出来：连续段一直贴着 0，说明信箱里真的
+    没有白开；一直停在保险值下面一封，说明白开是散着来的、这道闸只是没轮到。
+    """
+    if scan.blank_run_limit is None:
+        say("  连续白开：这一趟没接这道闸（补录与侦察那几条路不接）")
+        return
+    if scan.blank_run_stopped:
+        say(
+            f"  连续白开：连着 {scan.blank_run_max} 封开出来都是库里已有"
+            f"（保险值 {scan.blank_run_limit}）；这一趟到此不再开封"
+        )
+        return
+    say(
+        f"  连续白开：这一趟白开 {scan.blank_opens} 封、最长连着 {scan.blank_run_max} 封"
+        f"（保险值 {scan.blank_run_limit}）；没到保险值，没停开封"
+    )
+
+
+def mail_blank_payload(scan: MailScan) -> dict[str, Any]:
+    """连续白开那几个数的结构化版，拌进调用方自己那条日志的 `payload_json`。
+
+    `blank_run_limit` 是**只有新代码写得出的键**：库里凭它就分得出「这一趟跑的是
+    带这道闸的版本、只是没触发」和「跑的是旧版本」（记忆里 #266 那条教训）。
+    """
+    return {
+        "blank_run_limit": scan.blank_run_limit,
+        "blank_opens": scan.blank_opens,
+        "blank_run_max": scan.blank_run_max,
+        "blank_run_stopped": scan.blank_run_stopped,
+    }
+
+
+def unread_gate_looks_silent(scan: MailScan, *, outstanding: int) -> bool:
+    """这一趟看着像「未读判据已经失效」。**判据单独一个函数，好钉也好读。**
+
+    连续白开那道闸的安全性**整个建立在未读判据还活着上**：未读必开，所以真正没
+    读过的那些邮件不会被连续白开截掉。游戏改版或阈值漂移会让它悄悄判成「全是
+    已读」，而那时保险值 2 会让入库掉约 3%（回放表在 `MAIL_MAX_KNOWN_RUN`）。
+
+    两个条件缺一不可：
+
+    - `unread_seen == 0`：新窗口 34 趟里它**一次都没有是 0**，所以 0 本身就是异常
+      信号；
+    - **单子非空**：排掉「信箱真的一封新邮件都没有」那种正常情形 —— 没人在等战报
+      的时候一封未读都读不到，再正常不过。
+
+    没标定（`CALIBRATION is None`）时一律不算：那时 `unread_seen` 按定义恒为 0，
+    而这件事 `say_mail_unread_tally` 每趟都明说「判据没通电」，再报一条 WARNING
+    只会把真正的失效淹掉。
+    """
+    if CALIBRATION is None:
+        return False
+    return scan.unread_seen == 0 and outstanding > 0
+
+
 def _first_row_time(rows: Sequence[MailRow]) -> str:
     """第 0 行那封邮件的时间，专供日志。读不出/整屏空时说清是哪一种。
 
@@ -1176,6 +1288,21 @@ class MailScan:
     #: 参数之后，打日志的地方再去读模块常量就会在补录那条路上报出一个假数字，
     #: 而「撞了哪个上限」正是那句告警唯一要回答的事（记忆里「引用数字前先查出处」）。
     unread_budget: int = MAIL_UNREAD_MAX_OPENS
+    #: 常规闸开出来是「库里已有」的封数，也就是**白开**。
+    #:
+    #: ⚠️ **只数常规闸那一档。** 未读强开的白开率实测 0.8%，混进来会把这个体检
+    #: 指标稀释掉——而这一格正是用来回答「那道闸到底还有没有活可干」的。
+    blank_opens: int = 0
+    #: 这一趟**最长的一段连续白开**。
+    #:
+    #: ⚠️ **没触发时它才是有用的那个数。** 「这道闸一直没触发」和「今天本来就没有
+    #: 白开」在别的账上分不出来，而这两件事的处置完全相反（前者要查判据，后者
+    #: 什么都不用做）。有了它，「差一封就触发」和「一封白开都没有」一眼可分。
+    blank_run_max: int = 0
+    #: 这一趟连续白开的保险值。**`None` = 这条路没接这道闸**（补录与侦察那三条）。
+    blank_run_limit: int | None = None
+    #: 这道闸有没有真的拦下开封。
+    blank_run_stopped: bool = False
     #: 这一趟**没能好好走完**的理由；正常收工时是 None。
     #:
     #: ⚠️ 摘要必须把它说出来。实机 2026-08-13 20:35：一趟给了 30 屏预算的补录在
@@ -1187,6 +1314,68 @@ class MailScan:
     #: 「翻了 3 屏」本身没撒谎，但只有知道预算是 30 屏的人才看得出不对劲，
     #: 而看摘要的人恰恰是不看命令行的那个人。
     cut_short: str | None = None
+
+
+@dataclass
+class KnownRunGate:
+    """「连着 N 封开出来都是库里已有就停止开封」这道闸的计数器。
+
+    ⚠️ **它是一条额外的停止条件，不替换 `_stop_after_known()`**，两条谁先成立谁
+    生效。取值与省下来的时间整段在 `MAIL_MAX_KNOWN_RUN`。
+
+    ⚠️⚠️ **归零那一步（`after_open` 里 `blank` 为假的那一支）是这道闸的安全底线。**
+    「库里已有 ⇒ 往下都读过了」这个推论会在「报告在库里、却没接到该接的那一发
+    派遣」时把几发派遣永久钉死（2026-08-11 那四发，整段在 `_ingest_report_row`）。
+    连续版遇到一封真入库就把计数清了，所以它自己能翻案；「有一封白开就停」不能，
+    那正是它没有被采用的原因。
+
+    ## 为什么要分成 `note()` 与 `after_open()` 两步
+
+    白开这个信号**只有 `visit` 看得见**（`_scan_mail_rows` 拿到的只是 `visit` 的
+    bool 返回值，`ReportIngest.KNOWN` 到不了那一层），而「还开不开」只有
+    `_scan_mail_rows` 决定得了。两边共用同一个对象，于是 `visit` 的协议一个字
+    没改 —— 不接这道闸的那几个调用方（补录、补录侦察、收侦察报告）行为逐字节不变。
+    """
+
+    #: 保险值 N。见 `MAIL_MAX_KNOWN_RUN`。
+    limit: int = MAIL_MAX_KNOWN_RUN
+    #: 当前连着白开了几封。
+    run: int = 0
+    #: 这一趟一共白开几封（只数常规闸开出来的）。
+    blank_opens: int = 0
+    #: 这一趟最长的一段连续白开。见 `MailScan.blank_run_max`。
+    longest_run: int = 0
+    #: 这道闸这一趟到底有没有拦下开封。
+    tripped: bool = False
+    #: 刚开的那一封是不是白开。`note()` 写，`after_open()` 读完就清。
+    blank: bool = False
+
+    def note(self, outcome: ReportIngest) -> None:
+        """`visit` 每读完一封就交一次账。"""
+        self.blank = outcome is ReportIngest.KNOWN
+
+    def after_open(self) -> bool:
+        """常规闸开完一封之后问一句：还开不开。**未读强开那一档不问这里。**
+
+        未读的白开率实测 0.8%，本来就不该被截断；而它「必开」的理由
+        （`MAIL_UNREAD_MAX_OPENS`）也不允许被一个按已读推出来的计数否掉。
+
+        ⚠️ **详情页没铺开、或者这一封被分流去当安全告警读了，都落在「不是白开」
+        那一侧**（`blank` 默认为假，那两条路根本不调 `note()`）。那一侧是安全的：
+        它只会让计数归零、多开几封。
+        """
+        blank = self.blank
+        self.blank = False
+        if not blank:
+            self.run = 0
+            return False
+        self.blank_opens += 1
+        self.run += 1
+        self.longest_run = max(self.longest_run, self.run)
+        if self.run < self.limit:
+            return False
+        self.tripped = True
+        return True
 
 
 @dataclass(frozen=True)
@@ -1450,6 +1639,17 @@ class PirateLoop:
 
     #: 上面那一档在日志里怎么念。只影响措辞，不影响判据。
     REPORT_LABEL: str = "海盗攻击报告"
+
+    #: 「未读判据看着已经死了」已经连着几趟了。见 `_note_unread_silence`。
+    #:
+    #: ⚠️ **写在类上而不是 `__init__` 里**：这一层到处是 `PirateLoop.__new__` 造
+    #: 出来的替身（测试与子类），`__init__` 里的赋值它们一个都拿不到，于是这个数
+    #: 会变成 `AttributeError` 或者一个每趟都新建的 0。
+    #:
+    #: 进程内计数，重启即清零 —— 代价是重启之后要多花一趟才报得出来，而一趟信箱
+    #: 只有几分钟、进程重启是天级的事。**但每一趟都把这个数写进 `payload_json`**，
+    #: 所以就算告警那一句没赶上，库里那几行也能把连续段还原出来。
+    _unread_silent_rounds: int = 0
 
     def __init__(
         self,
@@ -2886,6 +3086,7 @@ class PirateLoop:
         observe: Callable[[MailRow], None] | None = None,
         should_open: Callable[[MailRow], bool] | None = None,
         skip_known: bool = False,
+        known_run: KnownRunGate | None = None,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
@@ -2916,6 +3117,20 @@ class PirateLoop:
         `max_unread_opens` 默认是日常那趟的 `MAIL_UNREAD_MAX_OPENS`；`--exhaustive`
         补录传 `BACKFILL_UNREAD_MAX_OPENS`，理由（存量历史空洞两条路都到不了）
         写在那个常量上。
+
+        ## 连续白开那道闸：一条**额外**的停止条件
+
+        接上 `known_run` 之后，常规闸**连着开出 N 封「库里已有」就不再开封**
+        （N = `KnownRunGate.limit`）。它与 `_stop_after_known()` **并存，谁先成立
+        谁生效**：那一条要「待认领单子空了」才肯停，而单子为空的时刻只占 19.8%，
+        于是早停几乎从不触发、每趟把 `max_opens` 开满（实测 162 封常规开封里一封
+        新的都没有）。为什么必须是「连续」而不是「有一封就停」，整段在
+        `MAIL_MAX_KNOWN_RUN` 与 `KnownRunGate`。
+
+        ⚠️ **未读强开那一档不受它约束**，连续计数也只数常规闸开出来的：未读的白开率
+        实测 0.8%，理由同它越过其它每一道闸。
+
+        ⚠️ **不传 `known_run` 的调用方行为逐字节不变。**
 
         `observe(row)` 是**看每一行（不开封）**的旁路，开工对账用它数今天已经有
         多少份战报（见 `reconcile_today`）。它和开封是两笔独立的预算，这一点是
@@ -3128,6 +3343,15 @@ class PirateLoop:
                 say(f"  第 {row.index} 行开封（{when} {row.subject!r}）{mark}")
                 if self._open_mail_row(row, visit):
                     collected = True
+                # ⚠️ **额外的一条停止条件，和上面 `_stop_after_known()` 那条并存。**
+                # 谁先成立谁生效；`collected` 是同一个出口，所以「停开封不停数数」
+                # 那条不变式也照旧（`observe` 还要接着往下翻）。
+                if not forced and known_run is not None and known_run.after_open():
+                    say(
+                        f"  连着 {known_run.run} 封开出来都是库里已有"
+                        f"（保险值 {known_run.limit}）；这一趟不再开封"
+                    )
+                    collected = True
             # 不再开封之后还翻不翻，取决于**有没有人在数数**：
             # 数数要的是「今天一共几份」，那个数不能被开封预算截断。
             #
@@ -3152,6 +3376,13 @@ class PirateLoop:
             # 下面还有没看过的邮件。这同样不是「好好走完」，摘要要说出来。
             if not done:
                 scan.cut_short = f"翻满了 {max_pages} 屏的上限，信箱还没到底"
+        if known_run is not None:
+            # 抄进账单**在这里而不是边走边抄**：上面有五条 break，漏一条就会让
+            # 「没触发」和「触发了但没记上」在日志里长得一样。
+            scan.blank_run_limit = known_run.limit
+            scan.blank_opens = known_run.blank_opens
+            scan.blank_run_max = known_run.longest_run
+            scan.blank_run_stopped = known_run.tripped
         self._close_mail()
         return scan
 
@@ -3578,7 +3809,9 @@ class PirateLoop:
         if saved:
             say(f"  战报截图已入库（{panel.width}×{panel.height}，{len(panel.image_bytes)} 字节）")
 
-    def _ingest_report_row(self, row: MailRow, page: Any) -> bool:
+    def _ingest_report_row(
+        self, row: MailRow, page: Any, *, known_run: KnownRunGate | None = None
+    ) -> bool:
         """开工那一趟里开的每一封都走这里。返回「不必再开封了」。
 
         **读到库里已有的那一份就不再开封**（用户口径 2026-08-11）。信箱按时间
@@ -3604,8 +3837,17 @@ class PirateLoop:
 
         ⚠️ **只停开封，不停这一趟。** 数数还要接着往下翻（见 `_scan_mail_rows` 的
         `observe`）：库里已有多少份和信箱里今天有多少份是两件事，而配额要的是后者。
+
+        ## `known_run`：把「这一封是白开」这个信号交出去
+
+        `_scan_mail_rows` 拿到的只是这个方法的 bool 返回值，`ReportIngest.KNOWN`
+        到不了那一层，而连续白开那道闸恰恰要数它。所以这里多一步交账 ——
+        **返回值一个字没改**，不传 `known_run` 的调用方行为逐字节不变。
         """
-        if self._ingest_report(row, page) is not ReportIngest.KNOWN:
+        outcome = self._ingest_report(row, page)
+        if known_run is not None:
+            known_run.note(outcome)
+        if outcome is not ReportIngest.KNOWN:
             return False
         return self._stop_after_known()
 
@@ -4166,6 +4408,11 @@ class PirateLoop:
         一个没人能解释的值，而它正是「今日 X/32」显示的东西。
         """
         tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
+        # ⚠️ **只有这一条日常链路接连续白开那道闸。** 补录那两个入口不接，理由和
+        # 下面 `skip_known` 那段一字不差：那个入口存在的意义就是够到被各种闸筛掉
+        # 的邮件（`exhaustive` 那一档连早停都不走）。而这 104.8 秒/封的账也是在
+        # 这条路上量出来的 —— 它每一轮都跑，补录一次开机只跑一趟。
+        known_run = KnownRunGate()
 
         def visit(row: MailRow, page: Any) -> bool:
             if self._ingest_non_report_mail(row, page):
@@ -4173,7 +4420,7 @@ class PirateLoop:
             # Keep the existing early-stop invariant for already persisted
             # battle reports: alert handling must not turn every task start
             # into a run of eight redundant detail reads.
-            return self._ingest_report_row(row, page)
+            return self._ingest_report_row(row, page, known_run=known_run)
 
         scan = self._scan_mail_rows(
             wanted=(self.RECONCILE_KIND, *NON_REPORT_MAIL_KINDS),
@@ -4182,6 +4429,7 @@ class PirateLoop:
             not_before=self._report_floor(day_start, now=now),
             max_pages=RECONCILE_MAX_PAGES,
             observe=tally,
+            known_run=known_run,
             # ⚠️ **只有这一条日常链路开跳过。** 补录那一档（`backfill_reports`）
             # 刻意不开：那个入口存在的理由正是要够到被各种闸筛掉的邮件
             # （`exhaustive` 那一档连早停都不走）。在它上面开跳过，
@@ -4197,6 +4445,11 @@ class PirateLoop:
             f"这一趟真开了 {scan.opened} 封"
         )
         say_mail_unread_tally(scan)
+        say_mail_blank_tally(scan)
+        # **问的是翻完之后的单子**：这一趟入库掉的那几发已经销了，剩下的才是
+        # 「本来该有战报可读、却什么都没读到」的证据 —— 而那正是失效探测要的。
+        outstanding = len(self._due_dispatches(datetime.now(UTC)))
+        silent_rounds = self._note_unread_silence(scan, outstanding=outstanding)
         record_system_log(
             "INFO",
             "tools.pirate_loop",
@@ -4206,10 +4459,50 @@ class PirateLoop:
                 "opened": scan.opened,
                 "pages": scan.pages,
                 "observed": scan.observed,
+                # 失效探测的连续段每趟都记：告警那一句只在够数那几趟出现，
+                # 而「它是从哪一趟开始哑的」只有这个数答得上来。
+                "unread_silent_rounds": silent_rounds,
+                "outstanding_after": outstanding,
                 **mail_unread_payload(scan),
+                **mail_blank_payload(scan),
             },
         )
         return tally
+
+    def _note_unread_silence(self, scan: MailScan, *, outstanding: int) -> int:
+        """未读判据的失效探测：连着 `UNREAD_SILENT_ROUNDS` 趟就打一条 WARNING。
+
+        返回**到这一趟为止连着几趟**（0 = 这一趟看着正常），由调用方写进
+        `payload_json`。判据本身在 `unread_gate_looks_silent`。
+
+        ## ⚠️ 报警之后**不退回旧行为**，三条理由
+
+        1. **探测本身是推断，它自己会误报。** 判据只有「一封未读都没判出来」加
+           「单子非空」，而一发早就丢了的派遣能在单子上挂满 6 小时
+           （`MAX_REPORT_AGE`），配上一段信箱真的没有新邮件的时间就够触发。
+           让一个会误报的推断去改行为，误报的代价从「多一行 WARNING」变成
+           「每趟多开满一轮、多花约两分钟」—— 那正好把这道闸省下来的时间还回去。
+        2. **故障期的表现会变成另一套，回放就掺了两种口径。** 保险值 2 是拿历史
+           日志回放定出来的（表在 `MAIL_MAX_KNOWN_RUN`）；行为一分叉，下一次要
+           重定这个数时，样本里就混着「按新闸跑的」和「自动退回旧闸跑的」两段。
+        3. **真失效时的代价有界，而且已经量化过**：漏 2.9%，且下一封真入库就归零
+           （`KnownRunGate` 那条自我翻案的路）。告警落库之后人有的是办法收手 ——
+           眼下是改 `MAIL_MAX_KNOWN_RUN` 重启，配置项上了之后是在页面上调大它。
+
+        换句话说：**这一条只负责让失效被看见**，处置留给人。
+        """
+        if not unread_gate_looks_silent(scan, outstanding=outstanding):
+            self._unread_silent_rounds = 0
+            return 0
+        self._unread_silent_rounds += 1
+        rounds = self._unread_silent_rounds
+        if rounds >= UNREAD_SILENT_ROUNDS:
+            warn(
+                f"  ⚠️ 连着 {rounds} 趟一封未读都没判出来，而单子上还有 {outstanding} 发"
+                f"到点没战报；未读判据可能已经失效，而连续白开那道闸"
+                f"（保险值 {scan.blank_run_limit}）正是靠它兜底的"
+            )
+        return rounds
 
     def _retry_mailbox_after_restart(
         self,
