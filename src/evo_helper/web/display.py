@@ -473,6 +473,44 @@ def payload_text(payload_json: str | None) -> str:
     return json.dumps(kept, ensure_ascii=False)
 
 
+#: `payload_json` 里声明图片编码的那个键，以及允许出现的取值。
+#:
+#: ⚠️ **白名单不是洁癖。** `payload_json` 是**数据**（runner 写的、行里存的），
+#: 把它的字符串直接拼进 `Content-Type` 或 `data:` URI 等于让一行日志决定响应头。
+#: 认不出的取值一律回落到 png，而不是原样透传。
+_IMAGE_FORMAT_KEY = "thumbnail_image_format"
+_ALLOWED_IMAGE_FORMATS = frozenset({"png", "webp"})
+
+#: 没有 `_IMAGE_FORMAT_KEY` 的那些行按 png 认。
+#:
+#: ⚠️ **这不是兜底，是历史事实**：2026-09-09 之前写下的 846 行装的确实是 PNG，
+#: 而那时还没有这个键。改成别的默认值就等于把那 846 行读成打不开的图。
+#: 同 `battle_report_screenshots.image_format` 那一列的理由——「将来换编码时
+#: 旧行仍能正确回放；接口靠它填 `Content-Type`，猜错就是浏览器直接下载而不显示」。
+_DEFAULT_IMAGE_FORMAT = "png"
+
+
+def screenshot_format(payload_json: str | None) -> str:
+    """那张图的编码，`png` / `webp` 之一。读不出、认不出一律按 png。"""
+    if not payload_json or payload_json == "{}":
+        return _DEFAULT_IMAGE_FORMAT
+    try:
+        data = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return _DEFAULT_IMAGE_FORMAT
+    if not isinstance(data, dict):
+        return _DEFAULT_IMAGE_FORMAT
+    shown = data.get(_IMAGE_FORMAT_KEY)
+    if isinstance(shown, str) and shown.lower() in _ALLOWED_IMAGE_FORMATS:
+        return shown.lower()
+    return _DEFAULT_IMAGE_FORMAT
+
+
+def screenshot_media_type(payload_json: str | None) -> str:
+    """那张图的 `Content-Type`。直接给接口填响应头用。"""
+    return f"image/{screenshot_format(payload_json)}"
+
+
 def payload_image(payload_json: str | None) -> str:
     """`payload_json` 里那张 base64 图，可以直接当 `src` 用；没有就返回空串。
 
@@ -484,11 +522,16 @@ def payload_image(payload_json: str | None) -> str:
     有它自己的用例钉着。
     """
     raw = screenshot_base64(payload_json)
-    return f"data:image/png;base64,{raw}" if raw else ""
+    if not raw:
+        return ""
+    return f"data:{screenshot_media_type(payload_json)};base64,{raw}"
 
 
 def payload_image_bytes(payload_json: str | None) -> bytes | None:
-    """`payload_json` 里那张图解码成 PNG 字节；没有或解不开就返回 `None`。
+    """`payload_json` 里那张图解码成原始字节；没有或解不开就返回 `None`。
+
+    ⚠️ **返回的字节不一定是 PNG** —— 2026-09-09 起新写的是 webp。
+    调用方要填 `Content-Type` 就用 `screenshot_media_type`，别假定 png。
 
     解不开也返回 `None` 而不是抛：这一路是排障页面上的一个链接，
     「点开是 404」比「点开把控制台整页打成 500」好认得多。

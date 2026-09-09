@@ -243,3 +243,67 @@ def test_the_attack_log_page_is_untouched(client) -> None:  # type: ignore[no-un
     assert response.status_code == 200
     assert "攻击日志" in response.text
     assert "简报认不出，安全地不派" not in response.text
+
+
+#: 一条**声明了 webp** 的现场图行。用真 webp 魔数（`RIFF....WEBP`），
+#: 好让「返回的字节没被换过」这件事也验得出来。
+WEBP_BYTES = b"RIFF\x00\x00\x00\x00WEBP" + b"vp8!" * 8_000
+WEBP_PAYLOAD = json.dumps(
+    {
+        "note": "导航栏回读对不上出发星球",
+        "thumbnail_png_base64": base64.b64encode(WEBP_BYTES).decode("ascii"),
+        "thumbnail_image_format": "webp",
+    },
+    ensure_ascii=False,
+)
+
+
+def _webp_client(tmp_path):  # type: ignore[no-untyped-def]
+    """只装一条 webp 现场图行的客户端。
+
+    ⚠️ **不并进 `_seed`**：本文件里好几条用例断言「共 4 条」和「最新那一条是哪句」，
+    往那批种子里加一行会把它们一起弄红，而那些断言管的是另一件事。
+    """
+    engine = create_database_engine(scratch_database_url(tmp_path, "webp-log.db"))
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    SystemLogRepository(session_factory).append(
+        [
+            SystemLogRecord(
+                logged_at_utc=BASE_TIME,
+                host="live-pc",
+                source="tools.pirate_loop",
+                level="WARNING",
+                mission_kind="bot",
+                message="导航栏回读对不上出发星球",
+                payload_json=WEBP_PAYLOAD,
+                pid=4321,
+                run_id=None,
+            )
+        ]
+    )
+    app = create_persistent_app(session_factory, local_token="test-token")
+    client = TestClient(app)
+    client.headers.update({"X-Evo-Helper-Token": "test-token"})
+    return client
+
+
+def test_a_webp_screenshot_is_served_as_webp(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **`Content-Type` 必须按 payload 里声明的编码填，不许写死。**
+
+    2026-09-09 起新写的缩略图是 webp。写死 `image/png` 的后果**不是显示得难看，
+    是浏览器直接下载而不显示** —— 同 `battle_report_screenshots.image_format`
+    单独设一列的那条理由。
+
+    ⚠️ 这一条是**专门为了钉住接线**加的：本文件原有的那条图用例走的是
+    「缺格式键（= png）」那一档，所以把 `media_type` 写回死的 `image/png`
+    它照样全绿 —— 变异验证当场暴露了这个缺口。
+    """
+    client = _webp_client(tmp_path)
+    entry_id = int(client.get("/api/system-log").json()["rows"][0]["id"])
+
+    response = client.get(f"/system-log/{entry_id}/image")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/webp"
+    assert response.content == WEBP_BYTES, "字节要原样交回，不许转码"
