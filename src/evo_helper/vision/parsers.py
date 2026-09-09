@@ -327,9 +327,18 @@ def classify_report_subject(subject: str) -> ReportKind:
     """Classify a mail subject. Order matters: pirate is checked before attack."""
     text = subject.strip()
     if PROTECTION_BOUNCE_RE.search(text):
-        # ⚠️ **排在所有关键词之前。** 列表行上的文字是正文预览，那句话里既有坐标
-        # 又可能夹着别的字；先判这一条，才不会被后面的子串判定抢走。子串判定
-        # （`"攻击报告" in text`）本来就宽，而这一条要求整句话都在。
+        # ⚠️ **排在所有关键词之前**：这一条要求整句话都在，而后面的子串判定
+        # （`"攻击报告" in text`）本来就宽，先判宽的会把它抢走。
+        #
+        # ⚠️⚠️ **但别指望它在邮件列表行上命中。** 原先这里写着依据是
+        # 「列表行上的文字是正文预览」——2026-09-09 实拍推翻了：列表行上只有
+        # **主题**（「攻击报告」）和发件人，**没有正文预览**，所以保护期返航那种
+        # 邮件在列表行上和普通战报一字不差。列表行那一侧的兜底在
+        # `tools.pirate_loop.PirateLoop._detail_says_protection_bounce`
+        # （开封之后拿正文再判一次），整段经过写在那个方法上。
+        #
+        # 这一条留着仍然有用：**详情页的正文**走的就是它，
+        # 而 `find_protection_bounce_targets` 与它是同一份模式。
         return ReportKind.PROTECTION_BOUNCE
     if "你的行星被侦察" in text:
         return ReportKind.PLANET_SCOUTED

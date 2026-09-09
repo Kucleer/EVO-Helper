@@ -245,7 +245,18 @@ def test_the_mailbox_scan_routes_this_kind_to_its_own_reader(collector: Any) -> 
 
 
 def test_a_real_battle_report_row_is_left_to_the_report_reader(collector: Any) -> None:
-    """反过来也要守：攻击战报**不许**被这条分流截走。"""
+    """反过来也要守：攻击战报**不许**被这条分流截走。
+
+    ## ⚠️ 夹具改过（2026-09-09）：原来这里传的是 `_Mail()`
+
+    `_Mail()` 的 `security_message()` 交的是 `BODY` —— **也就是保护期返航那句话**。
+    于是这条用例原先断言的其实是「列表行说是战报、正文说是返航 ⇒ 留给战报解析」，
+    而那正是生产上丢掉 153 发派遣的那个行为
+    （详见 `test_protection_bounce_detection.py` 的模块说明）。
+
+    它的**意图**没问题（真战报不许被截走），错的是夹具：一封真战报的正文里
+    不会有那句话。所以这里换成真战报的正文，意图一个字没让。
+    """
     repository = _Repository(_closed(uuid4()))
     attack_row = MailRow(
         index=0,
@@ -254,8 +265,9 @@ def test_a_real_battle_report_row_is_left_to_the_report_reader(collector: Any) -
         reported_at_utc=MAIL_AT,
         kind=ReportKind.ATTACK,
     )
+    real_report = _Mail("VS\n我方 400 − 0\n敌方 6290 − 6290\n战斗详情")
 
-    assert _loop(repository)._ingest_non_report_mail(attack_row, _Mail()) is False
+    assert _loop(repository)._ingest_non_report_mail(attack_row, real_report) is False
     assert repository.calls == []
 
 
