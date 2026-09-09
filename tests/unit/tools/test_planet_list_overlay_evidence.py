@@ -33,7 +33,7 @@ def recorded(monkeypatch) -> list[dict[str, Any]]:
             {"level": level, "source": source, "message": message, **kwargs}
         ),
     )
-    monkeypatch.setattr(pirate_loop, "_last_overlay_evidence_at", None)
+    pirate_loop._last_evidence_frame_at.clear()
     return rows
 
 
@@ -65,7 +65,7 @@ def test_only_the_picture_is_rate_limited(recorded) -> None:
     文字每次都写：这一支每出现一次就等于一轮没派，那是必须数得清的。
     图限流：画面卡在一个关不掉的面板上时，不限流就是每轮往库里塞一张。
     """
-    clock = iter([0.0, 1.0, pirate_loop.OVERLAY_EVIDENCE_INTERVAL_S + 1.0])
+    clock = iter([0.0, 1.0, pirate_loop.EVIDENCE_FRAME_INTERVAL_S + 1.0])
     for _ in range(3):
         pirate_loop.record_planet_list_overlay_retry(
             "读空", {"recovered": False}, capture=_frame, now=lambda: next(clock)
@@ -77,6 +77,28 @@ def test_only_the_picture_is_rate_limited(recorded) -> None:
         False,
         True,
     ]
+    # 被掐掉的那一条要留痕，不然它和「当时截不到图」在库里长得一模一样。
+    assert pirate_loop.EVIDENCE_THROTTLED_KEY in recorded[1]["payload"]
+    assert pirate_loop.EVIDENCE_THROTTLED_KEY not in recorded[0]["payload"]
+
+
+def test_each_kind_of_scene_gets_its_own_valve(recorded) -> None:
+    """⚠️ **按类分开限流。** 全局一个阀门会让最吵的那一类把最值钱的那一类挤掉。
+
+    生产 2026-09-09：「导航栏回读对不上」633 条、「画面认不出」156 条。共用阀门
+    的话后者基本抢不到名额，而它恰恰是「判据把活儿挡掉的那一刻」最值钱的一类。
+    """
+    frozen = {"planet_list_overlay": 0.0, "nav_readback": 1.0}
+    for kind, moment in frozen.items():
+        payload: dict[str, Any] = {}
+        assert pirate_loop._allow_evidence_frame(payload, kind, now=lambda m=moment: m), (
+            f"{kind} 第一张必须放行——它自己那一路还没存过图"
+        )
+        assert pirate_loop.EVIDENCE_THROTTLED_KEY not in payload
+
+    blocked: dict[str, Any] = {}
+    assert not pirate_loop._allow_evidence_frame(blocked, "planet_list_overlay", now=lambda: 2.0)
+    assert "planet_list_overlay" in blocked[pirate_loop.EVIDENCE_THROTTLED_KEY]
 
 
 def test_a_driver_without_a_screenshot_still_leaves_the_text(recorded) -> None:
