@@ -776,9 +776,7 @@ dialog::backdrop { background: rgba(4, 8, 13, 0.7); }
    ⚠️ **但「怎么展开」两页各走各的。** `.log-line` 那套 `tr:hover` 换行展开
    **只剩系统日志在用**；攻击日志改成了点开弹窗（往下看 `.outcome-*`），因为
    `tr:hover` 展开会把一行撑到十几行高（用户 2026-08-19 报）。
-   两页症状看着一样，要的东西不一样：系统日志那一列里是 `payload_json` 加一张
-   base64 缩略图，而缩略图**本来就靠 hover 放大**（`.log-shot`）——把它挪进要
-   点一下才出来的弹窗，最该扫一眼的那张图反而多了一次点击。
+   系统日志这一列里是 `payload_json` 的文字，`tr:hover` 展开它正合适。
    所以这里刻意留两套，不要「统一」掉。 */
 .log-body { max-width: var(--log-body-cap, 46vw); }
 .log-line {
@@ -792,16 +790,19 @@ tr:hover .log-line {
   overflow: visible;
   word-break: break-word;
 }
-/* 出事那一刻的画面。缩略图本身就是 480px 宽，这里再缩一道，hover 放大。 */
-.log-shot {
-  display: block;
-  margin-top: 6px;
-  width: 120px;
-  border-radius: 4px;
-  opacity: 0.75;
-  transition: width 0.15s ease, opacity 0.15s ease;
+/* 「现场图」「payload N KB」这两个点开再取的链接。
+   ⚠️ 原先这里是 `.log-shot`——把缩略图内联进 DOM、hover 放大。删掉的理由不是
+   样式偏好：一张图的 base64 有 8 万到 16 万字符，默认那一页 0.5 MB HTML、每页
+   1000 行时 1.6 MB，而这一页还挂着 15 秒自动刷新（实测 2026-09-09）。
+   现在字节一个都不进列表页，图走 `GET /system-log/{id}/image`。 */
+.log-links {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 12px;
 }
-tr:hover .log-shot { width: 480px; opacity: 1; }
+/* 不跟着 `.log-line` 一起截断：这两个链接是整格里唯一要点得到的东西。 */
+.log-links a { white-space: nowrap; }
 
 /* 攻击日志那张表的收窄，两条一起才够。
    ⚠️ **下面这些数不是偏好项，是按版面量出来的标定量**——它们由这一页的列数、

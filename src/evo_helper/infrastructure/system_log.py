@@ -495,6 +495,40 @@ def encode_payload(payload: Mapping[str, Any] | None) -> str:
         return json.dumps({"payload_repr": repr(payload)}, ensure_ascii=False)
 
 
+#: `payload_json` 里这些键装的是一张 PNG 的 base64，**不是文字**。
+#:
+#: ⚠️ 键名放在这里而不是只放在 `web.display`：认这张图的不止显示层。查询层要按
+#: 「这一条有没有现场图」决定取不取那几万字符（见 `storage.system_log.query` 的
+#: `payload_inline_limit`），而两处各写一份键名，改一处就等于让另一处静悄悄
+#: 看不见图。日志格式的事实归产生它的这一层。
+SCREENSHOT_PAYLOAD_KEYS = ("thumbnail_png_base64",)
+
+
+def screenshot_base64(payload_json: str | None) -> str:
+    """`payload_json` 里那张现场图的 base64；没有就返回空串。
+
+    解析不出来一律当「没有图」——**但正文那一路不能这么处理**（见
+    `web.display.payload_text`：写坏了的 payload 要原样显示出来）。这里只回答
+    「有没有图」，而认不出格式的东西当图渲染只会得到一个碎图标。
+
+    键在但值是空串也算没有：`tools.screen_diagnostics` 抓不到画面时正是这么写的
+    （`thumbnail_png_base64: ""`），而页面上一个点不开的「现场图」链接比不显示更糟。
+    """
+    if not payload_json or payload_json == "{}":
+        return ""
+    try:
+        data = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in SCREENSHOT_PAYLOAD_KEYS:
+        raw = data.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return ""
+
+
 def _normalise_level(level: str) -> str:
     upper = level.upper()[:8]
     return upper if upper in LEVELS else "INFO"
@@ -603,6 +637,7 @@ __all__ = [
     "ENV_TASK_ID",
     "LEVELS",
     "LogWriter",
+    "SCREENSHOT_PAYLOAD_KEYS",
     "SinkStats",
     "SystemLogContext",
     "SystemLogHandler",
@@ -619,5 +654,6 @@ __all__ = [
     "record_knob_override",
     "record_system_log",
     "reset_knob_override_memo",
+    "screenshot_base64",
     "shutdown_system_log_sink",
 ]

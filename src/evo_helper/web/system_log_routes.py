@@ -16,8 +16,8 @@ from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -25,9 +25,11 @@ from evo_helper.infrastructure.system_log import LEVELS
 from evo_helper.storage.system_log import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    PAYLOAD_INLINE_LIMIT,
     SystemLogPage,
     SystemLogRepository,
 )
+from evo_helper.web.display import payload_image_bytes
 
 #: 页面上的任务链路下拉。与 `mission_kind` 列存的取值一套。
 MISSION_KINDS = ("pirate", "bot", "scan", "ranking")
@@ -115,6 +117,7 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
         q: str | None,
         offset: int,
         limit: int,
+        payload_inline_limit: int | None = None,
     ) -> SystemLogPage:
         return repository.query(
             level=_blank(level),
@@ -127,6 +130,7 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
             keyword=_blank(q),
             offset=offset,
             limit=limit,
+            payload_inline_limit=payload_inline_limit,
         )
 
     @router.get("/api/system-log")
@@ -196,6 +200,12 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
             q=q,
             offset=offset,
             limit=limit,
+            # ⚠️ 页面这一路**刻意不搬那张现场图**。一张图内联进 DOM 是 8 万到
+            # 16 万字符，默认页 0.5 MB、每页 1000 行时 1.6 MB，而一页正好落在
+            # 带图的行上时服务端要 3.9 秒、搬 27 MB（生产库实测 2026-09-09）。
+            # 超限的行只带回长度与「有没有图」，图和正文各自点开再取。
+            # `GET /api/system-log` 不传这个上限——那一路仍是全量。
+            payload_inline_limit=PAYLOAD_INLINE_LIMIT,
         )
 
         def page_url(new_offset: int) -> str:
@@ -236,6 +246,50 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
                 "prev_url": page_url(max(offset - limit, 0)) if offset > 0 else None,
                 "next_url": page_url(offset + limit) if page.has_more else None,
             },
+        )
+
+    #: 列表页不再内联图之后，这两条就是「取得到」的唯一保证。
+    #:
+    #: ⚠️ **它们不是锦上添花。** 这个仓的硬要求是「出事时能只靠库里日志定位」，
+    #: 而列表页现在只标一个链接——链接点不开就等于证据丢了。所以这两条各有
+    #: 自己的用例钉着（`tests/integration/api/test_system_log_api.py`）。
+    #:
+    #: 缓存开得长：一行日志入库之后**再也不会变**，而缩略图正是要反复点开看的。
+    _IMMUTABLE = "private, max-age=86400, immutable"
+
+    @router.get("/system-log/{entry_id}/image", include_in_schema=False)
+    async def system_log_image(entry_id: int) -> Response:
+        """那一行的现场图，原样返回 PNG。"""
+        entry = repository.entry(entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"没有 id={entry_id} 这条日志")
+        image = payload_image_bytes(entry.payload_json)
+        if image is None:
+            raise HTTPException(status_code=404, detail=f"id={entry_id} 这条日志里没有现场图")
+        return Response(
+            content=image,
+            media_type="image/png",
+            headers={"Cache-Control": _IMMUTABLE},
+        )
+
+    @router.get(
+        "/system-log/{entry_id}/payload",
+        response_class=PlainTextResponse,
+        include_in_schema=False,
+    )
+    async def system_log_payload(entry_id: int) -> PlainTextResponse:
+        """那一行的整段 `payload_json`，**原样**（含图那几万字符）。
+
+        原样而不是「美化过的 JSON」：写坏了的 payload 正是最需要看到原文的那一种，
+        而 `json.dumps(json.loads(...))` 会在它认不出来的那一刻整段丢掉。
+        """
+        entry = repository.entry(entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"没有 id={entry_id} 这条日志")
+        return PlainTextResponse(
+            content=entry.payload_json,
+            media_type="text/plain; charset=utf-8",
+            headers={"Cache-Control": _IMMUTABLE},
         )
 
     app.include_router(router)
