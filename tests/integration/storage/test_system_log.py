@@ -259,6 +259,24 @@ def test_one_row_can_still_be_fetched_whole_by_id(logs: SystemLogRepository) -> 
     assert logs.entry(entry_id + 10_000) is None, "认不出的 id 是「没有」，不是报错"
 
 
+def test_capping_the_payload_does_not_disturb_the_order_or_the_paging(
+    logs: SystemLogRepository,
+) -> None:
+    """这一页的 `id` 先由子查询定下来，再去投影 payload 那几列（否则 `length()`
+    会对扫过的每一行求值，深翻页时是 10 万次）。子查询套 `JOIN` 之后**顺序要靠
+    外层那个 `ORDER BY` 重新钉**，漏了它翻页就会重复或漏行。
+    """
+    logs.append([record(minute=index, message=f"第 {index} 句") for index in range(6)])
+
+    walked = []
+    for offset in (0, 2, 4):
+        page = logs.query(offset=offset, limit=2, payload_inline_limit=PAYLOAD_INLINE_LIMIT)
+        assert page.offset == offset
+        walked.extend(row.message for row in page.rows)
+
+    assert walked == [f"第 {index} 句" for index in (5, 4, 3, 2, 1, 0)]
+
+
 # -- 筛选下拉框的候选值 ------------------------------------------------------
 
 

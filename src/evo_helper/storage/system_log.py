@@ -198,6 +198,20 @@ class SystemLogRepository:
             for clause in clauses:
                 statement = statement.where(clause)
             total = int(session.scalar(select(func.count()).select_from(statement.subquery())) or 0)
+            # ⚠️ **先用一个子查询把这一页的 `id` 定下来，再去投影那几列。**
+            # 直接把 `length()` / `LIKE` 写进带 `OFFSET` 的那条 SELECT 的话，
+            # PostgreSQL 会**对扫过的每一行**求值，而不是只对活下来的 200 行：
+            # offset=100000 时那是 10 万次，实测 403 ms（换成下面这种写法 52 ms，
+            # 生产库 2026-09-09）。裸列没这个问题，所以原先看不出来——
+            # 表达式列是这一版新加的。
+            page_ids = (
+                statement.order_by(
+                    orm.SystemLogRow.logged_at_utc.desc(), orm.SystemLogRow.id.desc()
+                )
+                .offset(offset)
+                .limit(limit)
+                .subquery("page_ids")
+            )
             page = select(
                 orm.SystemLogRow.id,
                 orm.SystemLogRow.logged_at_utc,
@@ -212,13 +226,9 @@ class SystemLogRepository:
                 payload_column.label("payload_json"),
                 payload_length.label("payload_bytes"),
                 _mentions_screenshot().label("mentions_screenshot"),
-            )
-            for clause in clauses:
-                page = page.where(clause)
+            ).join(page_ids, orm.SystemLogRow.id == page_ids.c.id)
             rows = session.execute(
                 page.order_by(orm.SystemLogRow.logged_at_utc.desc(), orm.SystemLogRow.id.desc())
-                .offset(offset)
-                .limit(limit)
             ).all()
             entries = tuple(_entry(row) for row in rows)
             hosts, sources = self._facets(session, entries)
