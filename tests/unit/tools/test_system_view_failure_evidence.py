@@ -239,6 +239,27 @@ def test_the_frames_are_capped_but_the_text_is_not(looper) -> None:  # type: ign
     assert len(framed) == 1
 
 
+def test_only_the_whole_frame_thumbnail_is_rate_limited(looper) -> None:  # type: ignore[no-untyped-def]
+    """⚠️ **限流只掐整帧缩略图，裁片和文字都不掐。**
+
+    裁片是这条告警的答案本身（标签到底长什么样，几 KB），缩略图只回答「当时屏上
+    大致是什么」——同一分钟里第二张答的是同一句话，而它一张就是几十 KB。
+    """
+    loop, recorder, module = looper
+    loop._driver = _Driver(Image.new("RGB", (1920, 917), (9, 12, 20)))
+    loop.MAX_VIEW_FAILURE_FRAMES = 99  # 把封顶让开，这条只量限流
+
+    for _ in range(3):
+        _run(loop, module, [""] * 8)
+
+    recorded = [p for p in recorder.payloads if "label_reads" in p]
+    assert len(recorded) == 6, "文字一条都不许省"
+    assert len([p for p in recorded if "label_row_png_base64" in p]) == 6, "裁片不限流"
+    assert len([p for p in recorded if p.get("thumbnail_png_base64")]) == 1, "缩略图只留第一张"
+    throttled = [p for p in recorded if module.EVIDENCE_THROTTLED_KEY in p]
+    assert len(throttled) == 5, "被掐掉的那几条要留痕"
+
+
 def test_a_driver_that_cannot_screenshot_still_records_the_readings(looper) -> None:  # type: ignore[no-untyped-def]
     """⚠️ 截不了图时，读数照记。
 

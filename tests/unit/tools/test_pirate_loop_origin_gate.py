@@ -671,7 +671,9 @@ def _mismatch_payload(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> dict[st
         ),
     )
     monkeypatch.setattr(module, "crop_png_base64", lambda crop: f"PNG<{crop.box}>")
-    monkeypatch.setattr(module, "thumbnail_base64", lambda frame: "THUMB")
+    monkeypatch.setattr(
+        module, "thumbnail_evidence", lambda frame: {"thumbnail_png_base64": "THUMB"}
+    )
     loop = _loop(monkeypatch, **kwargs)
     with pytest.raises(OriginDrifted):
         loop.attack(TARGET, preset="AAA")
@@ -731,7 +733,9 @@ def test_the_text_and_the_picture_come_from_one_frame(
     """
     loop = _loop(monkeypatch, origin_readings=[""], dialog=UNKNOWN_DIALOG)
     monkeypatch.setattr(module, "crop_png_base64", lambda crop: "PNG")
-    monkeypatch.setattr(module, "thumbnail_base64", lambda frame: "THUMB")
+    monkeypatch.setattr(
+        module, "thumbnail_evidence", lambda frame: {"thumbnail_png_base64": "THUMB"}
+    )
 
     with pytest.raises(OriginDrifted):
         loop.attack(TARGET, preset="AAA")

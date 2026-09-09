@@ -29,7 +29,7 @@ from evo_helper.storage.system_log import (
     SystemLogPage,
     SystemLogRepository,
 )
-from evo_helper.web.display import payload_image_bytes
+from evo_helper.web.display import payload_image_bytes, screenshot_media_type
 
 #: 页面上的任务链路下拉。与 `mission_kind` 列存的取值一套。
 MISSION_KINDS = ("pirate", "bot", "scan", "ranking")
@@ -259,7 +259,14 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
 
     @router.get("/system-log/{entry_id}/image", include_in_schema=False)
     async def system_log_image(entry_id: int) -> Response:
-        """那一行的现场图，原样返回 PNG。"""
+        """那一行的现场图，原样返回字节。
+
+        ⚠️ **`Content-Type` 必须按 payload 里声明的编码填，不许写死。**
+        2026-09-09 起新写的缩略图是 webp，而库里 846 行老的是 png
+        （那时还没有 `thumbnail_image_format` 这个键，所以缺键按 png 认）。
+        猜错的后果不是显示得难看，是**浏览器直接下载而不显示**——
+        同 `battle_report_screenshots.image_format` 单独设一列的那条理由。
+        """
         entry = repository.entry(entry_id)
         if entry is None:
             raise HTTPException(status_code=404, detail=f"没有 id={entry_id} 这条日志")
@@ -268,7 +275,7 @@ def register_system_log_routes(app: FastAPI, session_factory: sessionmaker[Sessi
             raise HTTPException(status_code=404, detail=f"id={entry_id} 这条日志里没有现场图")
         return Response(
             content=image,
-            media_type="image/png",
+            media_type=screenshot_media_type(entry.payload_json),
             headers={"Cache-Control": _IMMUTABLE},
         )
 

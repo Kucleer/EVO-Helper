@@ -148,7 +148,7 @@ from evo_helper.tools.scan_coordinates import (
     origin,
     run_with_foreground_guard,
     say,
-    thumbnail_base64,
+    thumbnail_evidence,
     wait_for_login_if_unrecognised,
     warn,
 )
@@ -1486,13 +1486,54 @@ class Outcome:
     failed: str | None = None
 
 
-#: 「行星列表读空 → 关浮层重读」这一支隔多久才肯再往库里塞一张图。
+#: 同一类现场隔多久才肯再往 `system_log` 塞一张缩略图。
 #: 理由与 `scan_coordinates.UNRECOGNISED_EVIDENCE_INTERVAL_S` 一模一样：
 #: **限流不是省空间，是防刷爆**。文字那一条每次都写，图才限流。
-OVERLAY_EVIDENCE_INTERVAL_S = 120.0
+#:
+#: 取 120s 也照那条先例：卡死的时候同一句话能在两分钟内打二十几条
+#: （2026-08-17 实机），而这个窗口让那一串里只留下第一张。
+#: ⚠️ 它掐不掉「几十分钟一条」的慢滴漏——2026-09-09 量过，生产库 14 天里 852 张
+#: 只有 46 张落在同类的 120s 内。**体积那件事归 webp 管**（`thumbnail_base64`），
+#: 这个窗口管的是「一分钟塞进几十张一模一样的图」。
+EVIDENCE_FRAME_INTERVAL_S = 120.0
 
-#: 上一次往 `system_log` 塞图的时刻（`time.monotonic`）。进程级，重启即清零。
-_last_overlay_evidence_at: float | None = None
+#: 每一类现场上次真的存下图的时刻（`time.monotonic`）。进程级，重启即清零——
+#: 这正好，每一轮 runner 都值得留一张。
+#:
+#: ⚠️ **按类分开，不是全局一个阀门。** 全局共用会让「导航栏回读对不上」那 633 条
+#: 把「画面认不出」的图挤掉，而后者只有 156 条、恰恰是最值钱的那一类
+#: （2026-08-17 整晚空转，日志只有一句 `unrecognised screen`、没说看到了什么，
+#: 故障因此拖了两天）。
+#:
+#: ⚠️ 状态挂在模块上而不是实例上：这一层到处是 `__new__` 造出来的替身，而
+#: `MAX_NAV_READBACK_FRAMES` 那些**按实例**封顶的名额每轮都跟着新实例复位——
+#: 生产库那 633 条就是这么攒起来的（一轮 2 张 × 十几天）。
+_last_evidence_frame_at: dict[str, float] = {}
+
+#: 图被限流掉时留在 payload 里的键。**只有它能回答「本该有图、被掐了几次」**——
+#: 掐掉之后 payload 里若什么痕迹都不留，这条记录和「当时截不到图」长得一模一样。
+EVIDENCE_THROTTLED_KEY = "evidence_frame_throttled"
+
+
+def _allow_evidence_frame(
+    payload: dict[str, Any], kind: str, *, now: Callable[[], float] = time.monotonic
+) -> bool:
+    """这一类现场现在还能不能再存一张缩略图；不能就在 `payload` 上留痕。
+
+    ⚠️ **限流只掐图，不掐日志。** 判据把活儿挡掉的那一刻必须在库里数得清，
+    而那是文字回答的；图回答的是「当时看到了什么」，少一张不影响计数。
+    `record_planet_list_overlay_retry` 上方那条降级（截不到图也照写文字）
+    说的是同一件事。
+    """
+    moment = now()
+    last = _last_evidence_frame_at.get(kind)
+    if last is not None and moment - last < EVIDENCE_FRAME_INTERVAL_S:
+        payload[EVIDENCE_THROTTLED_KEY] = (
+            f"{kind}：{EVIDENCE_FRAME_INTERVAL_S:.0f}s 内已存过一张现场图，这条只留文字"
+        )
+        return False
+    _last_evidence_frame_at[kind] = moment
+    return True
 
 
 def record_planet_list_overlay_retry(
@@ -1520,16 +1561,9 @@ def record_planet_list_overlay_retry(
     文字每次都记（这一支本来就少见，而它每出现一次就等于一轮没派）；
     **图限流**，免得画面卡在浮层上时每轮都写一张进库。
     """
-    global _last_overlay_evidence_at
     body: dict[str, Any] = dict(payload)
-    moment = now()
-    fresh = (
-        _last_overlay_evidence_at is None
-        or moment - _last_overlay_evidence_at >= OVERLAY_EVIDENCE_INTERVAL_S
-    )
-    if fresh and capture is not None:
-        _last_overlay_evidence_at = moment
-        body["thumbnail_png_base64"] = thumbnail_base64(capture())
+    if capture is not None and _allow_evidence_frame(body, "planet_list_overlay", now=now):
+        body.update(thumbnail_evidence(capture()))
     record_system_log("WARNING", "tools.pirate_loop", message, payload=body)
 
 
@@ -1597,6 +1631,9 @@ class PirateLoop:
     #: 一轮最多触发一次（切出发星球一轮只切一次），所以留 2 是给「同一进程里跑好
     #: 几轮」留的余量。分类同 `MAX_COORD_DUMPS`：**低优先级旋钮，没做成可配置**——
     #: 它只影响排障时手上有几张图，不影响任何判据。
+    #:
+    #: ⚠️ **这道闸只管一轮之内**：名额挂在实例上，每轮新实例一造就复位。跨轮那
+    #: 一半归 `EVIDENCE_FRAME_INTERVAL_S`——少了它，这个 2 在十几天里放过了 633 张。
     MAX_NAV_READBACK_FRAMES: int = 2
 
     #: 值框裁片最多存这么多**种**读数形态。⚠️ **按形态封顶，不是按次数。**
@@ -2538,6 +2575,7 @@ class PirateLoop:
         shown: Coordinate | None,
         raw: str,
         dialog: dict[str, Any] | None = None,
+        now: Callable[[], float] = time.monotonic,
     ) -> None:
         """把这次核不过写进 `system_log`——落库不落文件。
 
@@ -2545,8 +2583,11 @@ class PirateLoop:
         （`record_planet_list_overlay_retry` 的注释里记着同一件事），所以缩略图
         跟着 payload 一起进库。
 
-        **不限流。** 这一支每轮最多走一次（走到就停轮），不是「每 tick 都可能触发」
-        的那一类；限流反而会把仅有的那一条证据吞掉。
+        **文字不限流，图按类限流。** 这一支每轮最多走一次（走到就停轮），所以
+        文字每次都写。图这一半原先跟着「每轮最多一次」一起放行了，而那句话只
+        管得住一轮之内：生产库 14 天攒下 40 条、3.8 MB，全是这么来的。
+        ⚠️ 被掐掉的那一条**文字照写**，payload 里留 `EVIDENCE_THROTTLED_KEY`
+        说明图去哪了——不然它和「当时截不到图」在库里分不开。
 
         ## `dialog_checked` 是版本指纹
 
@@ -2568,8 +2609,8 @@ class PirateLoop:
             "target_kind": self.TARGET_KIND,
             **(dialog or {"dialog_checked": False}),
         }
-        if callable(capture):
-            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
+        if callable(capture) and _allow_evidence_frame(payload, "origin_mismatch", now=now):
+            payload.update(thumbnail_evidence(capture()))
         record_system_log(
             "WARNING",
             "tools.pirate_loop",
@@ -5012,7 +5053,12 @@ class PirateLoop:
         return _WatchedLabels(read=read, seen=seen)
 
     def _record_system_view_failure(
-        self, what_failed: str, seen: Sequence[str], *, stage: str
+        self,
+        what_failed: str,
+        seen: Sequence[str],
+        *,
+        stage: str,
+        now: Callable[[], float] = time.monotonic,
     ) -> None:
         """切不回恒星系视图时，把**标签读成了什么**连同标签行的原分辨率裁片落库。
 
@@ -5058,8 +5104,12 @@ class PirateLoop:
         if callable(capture) and self._view_failure_dumps < self.MAX_VIEW_FAILURE_FRAMES:
             self._view_failure_dumps += 1
             frame = capture()
+            # ⚠️ **只有整帧缩略图限流，裁片不限。** 裁片是这条日志的答案本身
+            # （标签到底长什么样，几 KB），缩略图只回答「当时屏上大致是什么」，
+            # 同一分钟里第二张答的是同一句话。
             payload["label_row_png_base64"] = crop_png_base64(frame.crop(NAV_LABEL_ROI))
-            payload["thumbnail_png_base64"] = thumbnail_base64(frame)
+            if _allow_evidence_frame(payload, "system_view_failure", now=now):
+                payload.update(thumbnail_evidence(frame))
         record_system_log(
             "WARNING", "tools.pirate_loop", "切不回恒星系视图：标签读数留痕", payload=payload
         )
@@ -5352,7 +5402,13 @@ class PirateLoop:
             values=(values[0], values[1], values[2]), reads=reads, frame=frame, digits=counted
         )
 
-    def _record_navigation_bar_mismatch(self, origin: Coordinate, reading: NavBarReading) -> None:
+    def _record_navigation_bar_mismatch(
+        self,
+        origin: Coordinate,
+        reading: NavBarReading,
+        *,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
         """回读对不上时把证据落库：三个框 × 每套配方的原始读数，外加封顶的一帧。
 
         ⚠️ **这条是补上来的，因为缺了它这个缺陷藏了整整一段时间。** 上线以来
@@ -5365,9 +5421,11 @@ class PirateLoop:
         存的 PNG 在本机的 `var/logs` 里根本取不到——这条教训写在
         `record_planet_list_overlay_retry` 上方。
 
-        **文字每轮都记，图封顶。** 这一支一轮最多触发一次（切星球一轮只切一次），
-        不必像 `record_unrecognised_screen` 那样按时间限流；但图要封顶，理由和
-        `MAX_COORD_DUMPS` 一样：几张几乎一样的图对定位没有增量。
+        **文字每轮都记，图既封顶又限流。** 「一轮最多一次」原先被当成不必按时间
+        限流的理由，可那句话只管一轮之内：名额跟着新实例复位，十几天下来就是
+        633 条、91 MB——`system_log` 全部 payload 的八成。所以两道一起上，
+        封顶管一轮之内（同 `MAX_COORD_DUMPS`：几张几乎一样的图没有增量），
+        `EVIDENCE_FRAME_INTERVAL_S` 管跨轮。
         """
         payload: dict[str, Any] = {
             "expected": str(origin),
@@ -5405,9 +5463,15 @@ class PirateLoop:
         if reading.frame is not None:
             payload.update(self._value_box_evidence(reading.frame, reading))
         capture = getattr(getattr(self, "_driver", None), "capture", None)
-        if callable(capture) and self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES:
+        if (
+            callable(capture)
+            and self._nav_readback_dumps < self.MAX_NAV_READBACK_FRAMES
+            # ⚠️ 名额是**按实例**的，每轮跟着新实例复位——生产库靠它攒出了 633 条、
+            # 91 MB（占 `system_log` 全部 payload 的八成）。跨轮那一半归限流管。
+            and _allow_evidence_frame(payload, "nav_readback", now=now)
+        ):
             self._nav_readback_dumps += 1
-            payload["thumbnail_png_base64"] = thumbnail_base64(capture())
+            payload.update(thumbnail_evidence(capture()))
         record_system_log(
             "WARNING", "tools.pirate_loop", "导航栏回读对不上出发星球", payload=payload
         )

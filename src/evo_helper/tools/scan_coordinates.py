@@ -1017,9 +1017,28 @@ OBSERVE_FRAME_GAP_S = 0.9
 UNRECOGNISED_EVIDENCE_INTERVAL_S = 120.0
 
 #: 缩略图宽度。480 px 够看清「这是哪一屏、导航条在不在、浮层盖住了没有」，
-#: 一张 PNG 几十 KB，base64 之后仍在 `payload_json` 扛得住的量级。
+#: base64 之后仍在 `payload_json` 扛得住的量级。
 #: 原图 1920 宽存进库一张就近 2 MB，不合适。
 EVIDENCE_THUMBNAIL_WIDTH = 480
+
+#: 缩略图的编码。同 `battle_report_screenshots`：PNG 转 webp 能省一大截。
+#:
+#: ⚠️ **这个值必须跟着图一起落进 payload**（`thumbnail_evidence`）。库里已经有
+#: 846 条是 PNG 时代写下的、payload 里没有这个键——读取侧「没这个键就按 PNG 认」
+#: 才能让那些老图继续打得开。理由与 `battle_report_screenshots.image_format`
+#: 一字不差：接口靠它填 `Content-Type`，猜错就是浏览器直接下载而不显示。
+EVIDENCE_THUMBNAIL_FORMAT = "webp"
+
+#: 缩略图的 webp 质量。**比战报截图那条路的 q90 低，是因为用途不同**：
+#: 这张图答的是「当时屏上大致是什么」，`crop_png_base64` 才管「这几个字长什么样」，
+#: 所以这里不需要读字，只需要认出是哪一屏、导航条在不在、浮层盖住了没有。
+#:
+#: 取 60 的判据（2026-09-09 拿生产库 40 张真实缩略图实测，480×229）：
+#: PNG 平均 84.5 KB、q90 12.8 KB、q80 7.4 KB、**q60 4.9 KB**（PNG 的 5.8%）、
+#: q50 4.4 KB、q40 3.8 KB。q60 往下每降一档只多省 0.5–1 KB，收益已经平掉；
+#: 而肉眼比对同一帧时，q60 上面板轮廓、导航条、行星都还认得出，q40 已经开始糊成
+#: 一片。所以停在这一档：再往下省不到东西，只会赌上「这张图还能不能用」。
+EVIDENCE_THUMBNAIL_QUALITY = 60
 
 #: 上一次记证据的时刻（`time.monotonic`）。进程级，重启即清零——这正好，
 #: 每一轮 runner 都值得留一张。
@@ -1027,7 +1046,13 @@ _last_evidence_at: float | None = None
 
 
 def thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
-    """整帧缩到 `width` 宽的 PNG，base64。失败返回空串——证据不许把链路弄死。"""
+    """整帧缩到 `width` 宽，base64。失败返回空串——证据不许把链路弄死。
+
+    编码是 `EVIDENCE_THUMBNAIL_FORMAT`（webp），不再是 PNG：同一批实拍图 PNG 平均
+    84.5 KB、webp q60 平均 4.9 KB，而 `system_log` 里 89.7% 的 payload 体积就是
+    这些图撑起来的。⚠️ 调用方要用 `thumbnail_evidence` 而不是直接用这个函数，
+    否则 payload 里只有图、没有编码，将来换编码时这一批又会变成打不开的。
+    """
     import base64
     import io
 
@@ -1037,10 +1062,33 @@ def thumbnail_base64(image: Any, width: int = EVIDENCE_THUMBNAIL_WIDTH) -> str:
             height = max(1, round(image.height * width / image.width))
             scaled = image.resize((width, height))
         buffer = io.BytesIO()
-        scaled.convert("RGB").save(buffer, format="PNG")
+        scaled.convert("RGB").save(
+            buffer, format=EVIDENCE_THUMBNAIL_FORMAT.upper(), quality=EVIDENCE_THUMBNAIL_QUALITY
+        )
         return base64.b64encode(buffer.getvalue()).decode("ascii")
     except Exception:  # noqa: BLE001 - 见 docstring：诊断路径不许抛
         return ""
+
+
+def thumbnail_evidence(image: Any) -> dict[str, str]:
+    """缩略图连**它的编码**一起，按 `payload_json` 的键交出来。
+
+    ⚠️ 键名仍叫 `thumbnail_png_base64`（现在装的是 webp），是**故意不改的**：
+    这个名字已经写在 163k 行历史数据里，还同时被查询层（`storage.system_log`
+    按「有没有图」决定取不取那几万字符）和显示层认着。改名等于让老行整批
+    看不见图，而它换不来任何东西——格式那件事由 `thumbnail_image_format` 回答。
+
+    截不到图时只留空值键、不带编码：`web.display` 那一路把「键在、值空」当没有图
+    （`tools.screen_diagnostics` 抓不到画面时正是这么写的），而一个点不开的
+    「现场图」链接比不显示更糟。
+    """
+    raw = thumbnail_base64(image)
+    if not raw:
+        return {"thumbnail_png_base64": ""}
+    return {
+        "thumbnail_png_base64": raw,
+        "thumbnail_image_format": EVIDENCE_THUMBNAIL_FORMAT,
+    }
 
 
 def crop_png_base64(image: Any) -> str:
@@ -1105,7 +1153,7 @@ def record_unrecognised_screen(
             "capture_size": list(size) if size else None,
             "nav_text": nav_text,
             "entry_title_text": entry_text,
-            "thumbnail_png_base64": thumbnail_base64(image),
+            **thumbnail_evidence(image),
         },
     )
     return True

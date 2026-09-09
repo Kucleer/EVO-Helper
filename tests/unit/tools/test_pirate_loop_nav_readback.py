@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -340,7 +341,9 @@ class TestTheEvidenceThatGoesIntoTheDatabase:
                 (level, message, dict(payload or {}))
             ),
         )
-        monkeypatch.setattr(module, "thumbnail_base64", lambda _image: "PNG")
+        monkeypatch.setattr(
+            module, "thumbnail_evidence", lambda _image: {"thumbnail_png_base64": "PNG"}
+        )
         return records
 
     def test_a_mismatch_records_every_recipe_read_for_every_box(
@@ -388,12 +391,46 @@ class TestTheEvidenceThatGoesIntoTheDatabase:
 
         rounds = loop.MAX_NAV_READBACK_FRAMES + 2
         for _ in range(rounds):
+            # 每一轮之间隔了两分多钟（实机上轮与轮就是这个量级）。把限流那一半推开，
+            # 这条用例才是在量**封顶**；不推的话第二轮起就被限流掐掉，两道闸分不开。
+            module._last_evidence_frame_at["nav_readback"] = (
+                time.monotonic() - module.EVIDENCE_FRAME_INTERVAL_S - 1.0
+            )
             loop._current_planet = None
             loop._adopt_navigation_bar(ORIGIN)
 
         assert len(records) == rounds, "文字不许限流"
         framed = [payload for _l, _m, payload in records if "thumbnail_png_base64" in payload]
         assert len(framed) == loop.MAX_NAV_READBACK_FRAMES
+
+    def test_rounds_in_quick_succession_only_leave_one_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **封顶只管一轮之内，跨轮那一半归限流。**
+
+        名额挂在实例上，每轮新实例一造就复位——生产库靠这个缺口在 14 天里攒下
+        633 条带图记录、91 MB，占 `system_log` 全部 payload 的八成。这里让好几轮
+        紧挨着跑（同一进程、同一实例，时间没走），图只许留下第一张。
+
+        ⚠️ **文字一条都不许少**：判据把活儿挡掉的那一刻必须数得清，而那是文字
+        回答的。被掐掉的那几条要留痕，不然它们和「当时截不到图」分不开。
+        """
+        records = self._records(monkeypatch)
+        loop, _driver, _said = _loop(monkeypatch, reads=("4", "77", "15"))
+        loop.MAX_NAV_READBACK_FRAMES = 99  # 把封顶让开，这条只量限流
+
+        for _ in range(4):
+            loop._current_planet = None
+            loop._adopt_navigation_bar(ORIGIN)
+
+        assert len(records) == 4, "文字不许限流"
+        framed = [payload for _l, _m, payload in records if payload.get("thumbnail_png_base64")]
+        assert len(framed) == 1, "同一类现场 120 秒内只留一张"
+        throttled = [
+            payload for _l, _m, payload in records if module.EVIDENCE_THROTTLED_KEY in payload
+        ]
+        assert len(throttled) == 3, "被掐掉的那几条要在 payload 里留痕"
+        assert "nav_readback" in throttled[0][module.EVIDENCE_THROTTLED_KEY]
 
 
 def _synthetic_frame(digits: tuple[int, int, int]) -> Any:
