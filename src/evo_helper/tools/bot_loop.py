@@ -145,6 +145,8 @@ class BotOptions:
     #: 本进程最多真正派出多少发。调度器按当前出发星球的空闲航线数传入，避免
     #: 盲目点到游戏的「航线已满」弹窗；手工运行不传则不设上限。
     max_dispatches: int | None = None
+    #: 待执行的回收目标（坐标列表）。回收先于攻击执行，按顺序做到名额用完。
+    recycle: tuple[Coordinate, ...] = ()
 
 
 class BotLoop(PirateLoop):
@@ -537,6 +539,15 @@ class BotLoop(PirateLoop):
         **仍旧一趟只推进一态**——每个目标在这个循环里只走一个分支。
         """
         dispatched = 0
+        # ⚠️ **回收先于攻击执行**：回收的目标是已知的、不用挑，而攻击那一组还要
+        # 过保护期等闸门；先做确定的那件，失败也不影响后面。
+        for coordinate in self._bot.recycle:
+            if self._bot.max_dispatches is not None and dispatched >= self._bot.max_dispatches:
+                say(f"  已派出 {dispatched} 发，达到本轮预算；剩余回收作业留待下一轮")
+                break
+            say(f"回收目标 {coordinate}")
+            if self._recycle_once(coordinate):
+                dispatched += 1
         for coordinate in self._bot.targets:
             if self._bot.max_dispatches is not None and dispatched >= self._bot.max_dispatches:
                 say(f"  已派出 {dispatched} 发，达到本轮空闲航线预算；其余目标留待返航后继续")
@@ -549,6 +560,38 @@ class BotLoop(PirateLoop):
             elif phase is BotPhase.AWAITING_ATTACK_REPORT:
                 self._say_still_waiting(coordinate)
             # `DONE` 无事可做。
+
+    def _recycle_once(self, coordinate: Coordinate) -> bool:
+        """派一发回收。六步链路（`流程图.md` §3）：
+
+            导航到坐标（星球已由 ensure_origin_planet 切好）
+              → 面板上有没有「回收」按钮？   没有 → 记 state=无残骸，acc 不回退
+              → 点「回收」（⚠️ 按标签文字定位）
+                → 残骸框（⚠️ 三格数字**不读**）→ 绿✓
+                  → 派遣页（⚠️ 舰队自动配好，不用挑预设）→ 逐发核起点 → 终点三框回读 → 点勾
+                    → 弹窗？  有 → 见 PR-A 的六格表
+                    → 无 ⇒ **已派出**（R21），记一发派遣、占线
+                      → 简报页：读飞行时间（同攻击）+ 读任务类型（⚠️ 只告警不拦，R24）
+                        → 点「出发！」
+                          → ⚠️ **到此为止，不追结果**（R16）
+
+        ⚠️ **回收按钮必须按标签文字定位，不写死坐标** —— R24 之后这是唯一的防线：
+        简报页类型只告警不拦，定位错了没有第二道闸。
+        """
+        check = self._goto_checked(coordinate)
+        if check is not TargetCheck.CONFIRMED:
+            self._note_check_failure(coordinate, check)
+            return False
+        # TODO(E3): 实现完整的六步链路（回收按钮定位、残骸框、派遣页、简报页）
+        # 当前先返回 False，表示「还没实现」，不误记为已派出。
+        say(f"  {coordinate} 回收链路尚未实装；跳过")
+        record_system_log(
+            "WARNING",
+            "tools.bot_loop",
+            f"{coordinate} 回收链路尚未实装，跳过这一发",
+            payload={"target": str(coordinate), "reason": "not_implemented"},
+        )
+        return False
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
         """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
@@ -687,7 +730,20 @@ def main(argv: list[str] | None = None) -> int:
     # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
     install_runner_system_log()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        type=parse_target_assignment,
+        default=[],
+        help="攻击目标（g:s:p 或 g:s:p=预设名）。纯回收轮可以不给",
+    )
+    parser.add_argument(
+        "--recycle",
+        nargs="+",
+        type=parse_origin,
+        default=[],
+        help="待执行的回收目标坐标（g:s:p）。回收先于攻击执行",
+    )
     parser.add_argument(
         "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打，每个目标一发"
     )
@@ -717,6 +773,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.max_dispatches is not None and args.max_dispatches < 1:
         parser.error("--max-dispatches 必须至少为 1")
+    if not args.targets and not args.recycle:
+        parser.error("--targets 和 --recycle 至少要给一个")
 
     import ctypes
 
@@ -730,13 +788,15 @@ def main(argv: list[str] | None = None) -> int:
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
         force_reconcile=args.reconcile,
         max_dispatches=args.max_dispatches,
+        recycle=tuple(args.recycle),
     )
     mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(
         f"{target}={(options.presets or {}).get(target, BOT_ATTACK_PRESET)}"
         for target in options.targets
     )
-    say(f"模式：{mode}；目标 {listed}")
+    recycle_listed = ", ".join(str(c) for c in options.recycle)
+    say(f"模式：{mode}；目标 {listed}" + (f"；回收 {recycle_listed}" if recycle_listed else ""))
 
     def go() -> int:
         driver = LiveDriver(allow_actions=args.attack)

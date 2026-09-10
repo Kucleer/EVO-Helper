@@ -1573,6 +1573,11 @@ class MissionScheduler:
             # 没有一样是共用的。搅在一起的代价是其中一条的判据松一点，另一条
             # 跟着松——而它们各自放错人的后果完全不同。
             self._resume_tasks_after_a_backoff(self._clock())
+            # 回收决策扫描：对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
+            # ⚠️ **排在 `_step` 循环之前** —— `_step` 一个 tick 会转好几圈，
+            # 挂在它后面会扫好几遍；挂在这一排里恰好每 tick 一次，而且
+            # 起轮之前作业已经在库里了。
+            self._scan_recycle_decisions()
             # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
             # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
             for _ in range(len(MissionKind)):
@@ -2080,6 +2085,91 @@ class MissionScheduler:
                 },
                 now=now,
             )
+
+    # -- 回收决策扫描 -----------------------------------------------------------
+
+    def _scan_recycle_decisions(self) -> None:
+        """对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
+
+        每 tick 调一次（`tick()` 里排在 `_step` 循环之前）。
+
+        ⚠️ **扫描条件两个，缺一不可**：
+        - `mission_kind = ATTACK` 且 `target_kind = bot`（海盗不回收，R13）
+        - 那条线已释放（`_still_holding_a_line` 为假），`hold` 必填
+
+        ⚠️ **`target_kind` 不在派遣行上，必须 JOIN 意图表**（仓库方法里已处理）。
+
+        ⚠️ **整数十分位，绝不用浮点**（`domain.recycle_rhythm`）。
+        """
+        rate = self._repository.recycle_rate_tenths()
+        if rate <= 0:
+            return
+        now = self._clock()
+        hold = self._unknown_line_hold()
+        # 首次启用的历史边界：只对「开启之后才释放的」计数。
+        # 开启时刻从最近一条决策行推；没有决策行时用 now（首次扫描只看当下）。
+        acc, last_decided = self._repository.recycle_acc_state()
+        since = last_decided or (now - timedelta(hours=1))
+        candidates = self._repository.released_bot_attack_dispatches_without_decision(
+            now_utc=now, hold=hold, since=since
+        )
+        from evo_helper.domain.recycle_rhythm import step_acc
+
+        for item in candidates:
+            source_dispatch_id = item["dispatch_id"]
+            target = item["target"]
+            origin = item["origin"]
+            result = step_acc(acc, rate)
+            decision_id = self._repository.save_recycle_decision(
+                source_dispatch_id=source_dispatch_id,
+                run_id=None,  # 滑块路径没有入口 A 的 run_id
+                target=target,
+                origin=origin,
+                decided_at_utc=now,
+                rate_tenths=rate,
+                acc_before=result.acc_before,
+                acc_after=result.acc_after,
+                selected=result.selected,
+                source="slider",
+            )
+            if decision_id is None:
+                continue  # 幂等：已决策过
+            acc = result.acc_after
+            if result.selected:
+                self._repository.save_recycle_job(
+                    decision_id=decision_id,
+                    target=target,
+                    origin=origin,
+                    created_at_utc=now,
+                )
+                record_system_log(
+                    "INFO",
+                    "application.mission_scheduler",
+                    f"回收决策：{target} 选中（acc {result.acc_before}→{result.acc_after}，"
+                    f"档位 {rate/10:.1f}），已生成待执行作业",
+                    payload={
+                        "target": str(target),
+                        "origin": str(origin),
+                        "source_dispatch_id": str(source_dispatch_id),
+                        "rate_tenths": rate,
+                        "acc_before": result.acc_before,
+                        "acc_after": result.acc_after,
+                    },
+                )
+            else:
+                record_system_log(
+                    "DEBUG",
+                    "application.mission_scheduler",
+                    f"回收决策：{target} 未选中（acc {result.acc_before}→{result.acc_after}，"
+                    f"档位 {rate/10:.1f}）",
+                    payload={
+                        "target": str(target),
+                        "source_dispatch_id": str(source_dispatch_id),
+                        "rate_tenths": rate,
+                        "acc_before": result.acc_before,
+                        "acc_after": result.acc_after,
+                    },
+                )
 
     # -- 自动停用 ------------------------------------------------------------
 
