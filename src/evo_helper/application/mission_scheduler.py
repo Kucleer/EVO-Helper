@@ -1586,6 +1586,10 @@ class MissionScheduler:
             # 没有一样是共用的。搅在一起的代价是其中一条的判据松一点，另一条
             # 跟着松——而它们各自放错人的后果完全不同。
             self._resume_tasks_after_a_backoff(self._clock())
+            # 回收作业清理：扫全表 pending，标掉过期和跨周的。
+            # ⚠️ **不带 limit** —— 带了的话第 11 条往后的旧作业永远进不了盲区，
+            # R23「作业不跨周」对它们不生效。
+            self._repository.cleanup_stale_recycle_jobs(now_utc=self._clock())
             # 回收决策扫描：对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
             # ⚠️ **排在 `_step` 循环之前** —— `_step` 一个 tick 会转好几圈，
             # 挂在它后面会扫好几遍；挂在这一排里恰好每 tick 一次，而且
@@ -3654,9 +3658,8 @@ class MissionScheduler:
         # 也查一下有没有只有作业、没有攻击目标的出发点
         # （从任务配置里取所有启用的出发点）
         config_origins = self._enabled_origins(row)
-        now = self._clock()
         for origin in origins | config_origins:
-            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10, now_utc=now)
+            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10)
             if jobs:
                 recycle_by_origin[origin] = jobs
         if not assignments and not recycle_by_origin:

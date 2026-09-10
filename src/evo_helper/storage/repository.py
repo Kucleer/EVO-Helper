@@ -3992,24 +3992,16 @@ class SqlAlchemyRepository:
             return int(row.id)
 
     def pending_recycle_jobs(
-        self, *, origin: Coordinate, limit: int = 10, now_utc: datetime
+        self, *, origin: Coordinate, limit: int = 10
     ) -> list[dict[str, Any]]:
         """某颗出发星球的待执行回收作业，**新的先**。
 
         残骸越新越可能还在；旧的自然过期。
 
-        ⚠️ **三档生命周期在这里统一处理**（调度接线.md §3.5）：
-        - **被新一发取代**：`save_recycle_job` 里已处理（每个坐标最多一条待执行）
-        - **时间上限**：超过 `recycle_job_max_age_hours` 的标 `expired`
-        - **跨周作废**：R23，执行前查 `same_cycle(created_at, now)`，不同周标 `cross_cycle`
-
-        ⚠️ 三档都要**记原因落 `system_log`**，⚠️ **不上页面**（R17）。
-        ⚠️ **`acc` 本身不跨周清零** —— R23 说的是「作业」不跨周，不是计数器。
+        ⚠️ **只查、不改状态。** 清理（过期/跨周）在 `cleanup_stale_recycle_jobs` 里，
+        挂在 tick 上每 tick 跑一次。拆开的原因：清理带 `limit` 的话，第 11 条往后的
+        旧作业永远不会被读到，R23「作业不跨周」对它们不生效。
         """
-        from evo_helper.domain.rules import same_cycle
-        from evo_helper.infrastructure.system_log import record_system_log
-
-        max_age = self.recycle_job_max_age_hours()
         with self._session_factory() as session:
             rows = session.scalars(
                 select(orm.RecycleJobRow)
@@ -4022,12 +4014,40 @@ class SqlAlchemyRepository:
                 .order_by(orm.RecycleJobRow.created_at_utc.desc())
                 .limit(limit)
             ).all()
-            result: list[dict[str, Any]] = []
+            return [
+                {
+                    "id": int(r.id),
+                    "target": Coordinate(r.target_galaxy, r.target_system, r.target_position),
+                    "origin": Coordinate(r.origin_galaxy, r.origin_system, r.origin_position),
+                    "created_at_utc": r.created_at_utc,
+                }
+                for r in rows
+            ]
+
+    def cleanup_stale_recycle_jobs(self, *, now_utc: datetime) -> int:
+        """扫全表 `state='pending'`，标掉过期和跨周的。返回处理了几条。
+
+        ⚠️ **不带 `limit`** —— 带了的话第 11 条往后的旧作业永远进不了盲区，
+        R23「作业不跨周」对它们不生效。这是 `pending_recycle_jobs` 拆出去的原因。
+
+        ⚠️ 三档都要**记原因落 `system_log`**，⚠️ **不上页面**（R17）。
+        ⚠️ **`acc` 本身不跨周清零** —— R23 说的是「作业」不跨周，不是计数器。
+        """
+        from evo_helper.domain.rules import same_cycle
+        from evo_helper.infrastructure.system_log import record_system_log
+
+        max_age = self.recycle_job_max_age_hours()
+        handled = 0
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.RecycleJobRow).where(orm.RecycleJobRow.state == "pending")
+            ).all()
             for r in rows:
                 target = Coordinate(r.target_galaxy, r.target_system, r.target_position)
                 # 跨周作废（R23）
                 if not same_cycle(r.created_at_utc, now_utc):
                     r.state = "cross_cycle"
+                    handled += 1
                     record_system_log(
                         "INFO",
                         "storage.repository",
@@ -4045,6 +4065,7 @@ class SqlAlchemyRepository:
                 age = now_utc - r.created_at_utc
                 if max_age is not None and age > timedelta(hours=max_age):
                     r.state = "expired"
+                    handled += 1
                     record_system_log(
                         "INFO",
                         "storage.repository",
@@ -4058,17 +4079,8 @@ class SqlAlchemyRepository:
                             "max_age_hours": max_age,
                         },
                     )
-                    continue
-                result.append(
-                    {
-                        "id": int(r.id),
-                        "target": target,
-                        "origin": Coordinate(r.origin_galaxy, r.origin_system, r.origin_position),
-                        "created_at_utc": r.created_at_utc,
-                    }
-                )
             session.commit()
-            return result
+        return handled
 
     def recycle_job_max_age_hours(self) -> int | None:
         """回收作业的时间上限（小时）。空 = 24 小时。"""
