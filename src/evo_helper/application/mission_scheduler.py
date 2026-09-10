@@ -1586,6 +1586,10 @@ class MissionScheduler:
             # 没有一样是共用的。搅在一起的代价是其中一条的判据松一点，另一条
             # 跟着松——而它们各自放错人的后果完全不同。
             self._resume_tasks_after_a_backoff(self._clock())
+            # 回收作业清理：扫全表 pending，标掉过期和跨周的。
+            # ⚠️ **不带 limit** —— 带了的话第 11 条往后的旧作业永远进不了盲区，
+            # R23「作业不跨周」对它们不生效。
+            self._repository.cleanup_stale_recycle_jobs(now_utc=self._clock())
             # 回收决策扫描：对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
             # ⚠️ **排在 `_step` 循环之前** —— `_step` 一个 tick 会转好几圈，
             # 挂在它后面会扫好几遍；挂在这一排里恰好每 tick 一次，而且
@@ -2119,12 +2123,17 @@ class MissionScheduler:
             return
         now = self._clock()
         hold = self._unknown_line_hold()
-        # 首次启用的历史边界：只对「开启之后才释放的」计数。
-        # 开启时刻从最近一条决策行推；没有决策行时用 now（首次扫描只看当下）。
-        acc, last_decided = self._repository.recycle_acc_state()
-        since = last_decided or (now - timedelta(hours=1))
+        # ⚠️ **历史边界用固定的启用时刻，不是 `last_decided`。**
+        # 用 `last_decided` 会产生棘轮效应：一发攻击约 1 小时后才释放，
+        # 而那时 `since` 已被后来的决策推到它的派遣时刻之后 ⇒ 它永远出局。
+        # 生产实测：22 发攻击只产生 1 条决策（Bug 1）。
+        enabled_at = self._repository.recycle_enabled_at_utc()
+        if enabled_at is None:
+            # 还没启用过（rate_tenths 是直接改库设的），不扫历史
+            return
+        acc, _last_decided = self._repository.recycle_acc_state()
         candidates = self._repository.released_bot_attack_dispatches_without_decision(
-            now_utc=now, hold=hold, since=since
+            now_utc=now, hold=hold, since=enabled_at
         )
         from evo_helper.domain.recycle_rhythm import step_acc
 
@@ -3654,9 +3663,8 @@ class MissionScheduler:
         # 也查一下有没有只有作业、没有攻击目标的出发点
         # （从任务配置里取所有启用的出发点）
         config_origins = self._enabled_origins(row)
-        now = self._clock()
         for origin in origins | config_origins:
-            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10, now_utc=now)
+            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10)
             if jobs:
                 recycle_by_origin[origin] = jobs
         if not assignments and not recycle_by_origin:

@@ -29,6 +29,9 @@
            这个问题的答案就在这一列里。 #}
         <th scope="col">挂机</th>
         <th scope="col">利用率</th>
+        {# 残骸：趟数 + 占线时长。⚠️ 实收恒为「未知」（回收邮件 hold）。 #}
+        <th scope="col">残骸趟数</th>
+        <th scope="col">残骸占线</th>
       </tr>
     </thead>
     <tbody>
@@ -66,9 +69,13 @@
               {% else %}title="分母 = 周期总时长 × {{ row.lines }} 条航线（那几轮开始时记下的真值）"{% endif %}>
             {% if row.utilisation is none %}—{% else %}{{ '≤ ' if not row.lines_exact }}{{ '%.0f'|format(row.utilisation * 100) }}%{% endif %}
           </td>
+          {# 残骸趟数。⚠️ 实收恒为「未知」（回收邮件 hold），不在这张表里显示。 #}
+          <td>{{ row.recycle_dispatches }}</td>
+          {# 残骸占线小时。⚠️ 这是唯一能证明「回收真的在占资源」的量。 #}
+          <td>{% if row.recycle_occupied_hours > 0 %}{{ '%.1f'|format(row.recycle_occupied_hours) }}h{% else %}—{% endif %}</td>
         </tr>
       {% else %}
-        <tr><td colspan="9" class="muted">这一档没有数据</td></tr>
+        <tr><td colspan="11" class="muted">这一档没有数据</td></tr>
       {% endfor %}
     </tbody>
   </table>

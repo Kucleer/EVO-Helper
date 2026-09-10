@@ -99,6 +99,8 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "recycle_decisions.decided_at_utc",
         "recycle_jobs.created_at_utc",
         "recycle_jobs.executed_at_utc",
+        # a7c3e5d9f2b1（回收启用时刻）加的。
+        "military_attack_config.recycle_enabled_at_utc",
     }
 )
 
@@ -151,6 +153,8 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "recycle_decisions.decided_at_utc",
         "recycle_jobs.created_at_utc",
         "recycle_jobs.executed_at_utc",
+        # a7c3e5d9f2b1（回收启用时刻）加的。
+        "military_attack_config.recycle_enabled_at_utc",
     }
 )
 
