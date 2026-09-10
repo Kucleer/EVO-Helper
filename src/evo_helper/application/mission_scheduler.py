@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
+
 from evo_helper.application.ai_targeting import AiShadowObserver
 from evo_helper.application.backfill import (
     BACKFILL_KINDS,
@@ -1571,6 +1573,11 @@ class MissionScheduler:
             # 没有一样是共用的。搅在一起的代价是其中一条的判据松一点，另一条
             # 跟着松——而它们各自放错人的后果完全不同。
             self._resume_tasks_after_a_backoff(self._clock())
+            # 回收决策扫描：对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
+            # ⚠️ **排在 `_step` 循环之前** —— `_step` 一个 tick 会转好几圈，
+            # 挂在它后面会扫好几遍；挂在这一排里恰好每 tick 一次，而且
+            # 起轮之前作业已经在库里了。
+            self._scan_recycle_decisions()
             # 一个任务因参数不合格被就地停用后要能立刻让位给下一个，否则这一秒
             # 谁都不跑。上限取任务条数：每转一圈至少停用一个，不可能无限转。
             for _ in range(len(MissionKind)):
@@ -2078,6 +2085,91 @@ class MissionScheduler:
                 },
                 now=now,
             )
+
+    # -- 回收决策扫描 -----------------------------------------------------------
+
+    def _scan_recycle_decisions(self) -> None:
+        """对「已释放、且还没决策过」的 bot 攻击派遣做 acc 决策。
+
+        每 tick 调一次（`tick()` 里排在 `_step` 循环之前）。
+
+        ⚠️ **扫描条件两个，缺一不可**：
+        - `mission_kind = ATTACK` 且 `target_kind = bot`（海盗不回收，R13）
+        - 那条线已释放（`_still_holding_a_line` 为假），`hold` 必填
+
+        ⚠️ **`target_kind` 不在派遣行上，必须 JOIN 意图表**（仓库方法里已处理）。
+
+        ⚠️ **整数十分位，绝不用浮点**（`domain.recycle_rhythm`）。
+        """
+        rate = self._repository.recycle_rate_tenths()
+        if rate <= 0:
+            return
+        now = self._clock()
+        hold = self._unknown_line_hold()
+        # 首次启用的历史边界：只对「开启之后才释放的」计数。
+        # 开启时刻从最近一条决策行推；没有决策行时用 now（首次扫描只看当下）。
+        acc, last_decided = self._repository.recycle_acc_state()
+        since = last_decided or (now - timedelta(hours=1))
+        candidates = self._repository.released_bot_attack_dispatches_without_decision(
+            now_utc=now, hold=hold, since=since
+        )
+        from evo_helper.domain.recycle_rhythm import step_acc
+
+        for item in candidates:
+            source_dispatch_id = item["dispatch_id"]
+            target = item["target"]
+            origin = item["origin"]
+            result = step_acc(acc, rate)
+            decision_id = self._repository.save_recycle_decision(
+                source_dispatch_id=source_dispatch_id,
+                run_id=None,  # 滑块路径没有入口 A 的 run_id
+                target=target,
+                origin=origin,
+                decided_at_utc=now,
+                rate_tenths=rate,
+                acc_before=result.acc_before,
+                acc_after=result.acc_after,
+                selected=result.selected,
+                source="slider",
+            )
+            if decision_id is None:
+                continue  # 幂等：已决策过
+            acc = result.acc_after
+            if result.selected:
+                self._repository.save_recycle_job(
+                    decision_id=decision_id,
+                    target=target,
+                    origin=origin,
+                    created_at_utc=now,
+                )
+                record_system_log(
+                    "INFO",
+                    "application.mission_scheduler",
+                    f"回收决策：{target} 选中（acc {result.acc_before}→{result.acc_after}，"
+                    f"档位 {rate / 10:.1f}），已生成待执行作业",
+                    payload={
+                        "target": str(target),
+                        "origin": str(origin),
+                        "source_dispatch_id": str(source_dispatch_id),
+                        "rate_tenths": rate,
+                        "acc_before": result.acc_before,
+                        "acc_after": result.acc_after,
+                    },
+                )
+            else:
+                record_system_log(
+                    "DEBUG",
+                    "application.mission_scheduler",
+                    f"回收决策：{target} 未选中（acc {result.acc_before}→{result.acc_after}，"
+                    f"档位 {rate / 10:.1f}）",
+                    payload={
+                        "target": str(target),
+                        "source_dispatch_id": str(source_dispatch_id),
+                        "rate_tenths": rate,
+                        "acc_before": result.acc_before,
+                        "acc_after": result.acc_after,
+                    },
+                )
 
     # -- 自动停用 ------------------------------------------------------------
 
@@ -3534,42 +3626,60 @@ class MissionScheduler:
         都派不出去」，而多出发点场景里「这一颗此刻满了」是**正常的间歇**。
         2026-08-18 01:00 那一小时把它当成配置错误处理，代价是自动停用 447 次、
         自动恢复 447 次、bot 链路空转一小时。所以这里一律 `MissionIdle`。
+
+        ⚠️ **起轮判据：攻击目标和待执行作业「都」为空才 `MissionIdle`。**
+        纯回收轮（攻击目标空、作业非空）必须起得来——r=1 时单航线星球攻击一释放，
+        下一轮本来就该是纯回收轮。
         """
         assignments = self._military_assignments(row)
-        if not assignments:
-            raise MissionIdle("本轮没有可派遣的军力攻击目标")
-        origin = self._origin_taking_its_turn(assignments)
+        # 收集所有出发点的待执行回收作业
+        recycle_by_origin: dict[Coordinate, list[dict[str, Any]]] = {}
+        if assignments:
+            origins = {item.origin for item in assignments}
+        else:
+            origins = set()
+        # 也查一下有没有只有作业、没有攻击目标的出发点
+        # （从任务配置里取所有启用的出发点）
+        config_origins = self._enabled_origins(row)
+        for origin in origins | config_origins:
+            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10)
+            if jobs:
+                recycle_by_origin[origin] = jobs
+        if not assignments and not recycle_by_origin:
+            raise MissionIdle("本轮没有可派遣的军力攻击目标，也没有待执行的回收作业")
+        # 轮换候选：分到目标的星球 ∪ 有待执行作业的星球
+        all_origins = {item.origin for item in assignments} | set(recycle_by_origin)
+        origin = self._origin_taking_its_turn_from(all_origins)
         group = [item for item in assignments if item.origin == origin]
-        # ⚠️ **`budget` 只数正选，备胎一个都不算。**
-        #
-        # 备胎是 2026-08-24 加的（`MILITARY_SPARE_FACTOR`）：分配阶段按
-        # 「航线数 × 2」放行，多出来的那些标了 `reserve=True`，用来顶替撞上保护期
-        # 的目标。它们**绝不能让这一轮多派几发**——而 `max_dispatches` 有默认值
-        # `None`，那条路上 budget 会退回 `len(group)`，若拿整组去数就等于翻倍。
-        #
-        # 正选的个数已经被这颗星球的两道闸预算卡过一次了
-        # （`_military_assignments` 把预算喂给了 `assign_by_capacity_and_value`），
-        # 所以这里不必、也不该再去查一次库：再查一次就是第二把尺子。
+        jobs = recycle_by_origin.get(origin, [])
+        # ⚠️ **作业先占名额，攻击目标只拿剩下的。** `--max-dispatches` 仍是总数。
         primaries = [item for item in group if not item.reserve]
-        budget = min(
-            max_dispatches if max_dispatches is not None else len(primaries), len(primaries)
-        )
-        if budget < 1:
-            # 结构上到不了（`facts.free_lines` 是各出发点里最能派的那一个，
-            # 而这颗星球恰恰是分到了目标的那些之一）。留着它是为了让「万一走到了」
-            # 也走 `MissionIdle` 那条路——不停用、不记失败、下一 tick 重算。
+        total_budget = max_dispatches if max_dispatches is not None else len(primaries) + len(jobs)
+        recycle_count = min(len(jobs), total_budget)
+        attack_budget = max(0, total_budget - recycle_count)
+        attack_budget = min(attack_budget, len(primaries))
+        recycle_targets = [job["target"] for job in jobs[:recycle_count]]
+        attack_targets = [item.coordinate for item in group] if attack_budget >= 1 else []
+        if not recycle_targets and attack_budget < 1:
             raise MissionIdle(f"出发点 {origin} 此刻没有可用航线")
-        # ⚠️ **坐标交整组（含备胎），派出数交 `budget`（只含正选）。**
-        # runner 按这个次序往下试，撞上保护期弹窗就跳过那一个、拿下一个顶上
-        # （`pirate_loop._handle_dialog`），直到派满 `max_dispatches` 发。
-        # 交整组是「这一轮的攻击必须发出去」唯一的兑现方式：只交正选的话，
-        # 一个被保护的目标就白白吃掉一条航线。
         return bot_command(
-            [item.coordinate for item in group],
+            attack_targets,
             origin=origin,
-            presets={item.coordinate: item.preset for item in group},
-            max_dispatches=budget,
+            presets={item.coordinate: item.preset for item in group} if attack_targets else None,
+            max_dispatches=total_budget if (recycle_targets or attack_targets) else None,
+            recycle=recycle_targets,
         )
+
+    def _enabled_origins(self, row: orm.MissionTaskRow) -> set[Coordinate]:
+        """任务配置里所有启用的出发点。"""
+        with self._repository._session_factory() as session:  # noqa: SLF001
+            rows = session.scalars(
+                select(orm.MissionTaskOriginRow).where(
+                    orm.MissionTaskOriginRow.task_id == row.id,
+                    orm.MissionTaskOriginRow.enabled.is_(True),
+                )
+            ).all()
+            return {Coordinate(r.galaxy, r.system, r.position) for r in rows}
 
     def _origin_taking_its_turn(self, assignments: Sequence[AssignedTarget]) -> Coordinate:
         """这一轮跑哪颗星球：**分到了目标的那些里，上次出兵最久远的那颗。**
@@ -3598,6 +3708,10 @@ class MissionScheduler:
         只为让结果确定——否则同一份事实能选出两颗不同的星球。
         """
         candidates = sorted({item.origin for item in assignments})
+        return self._origin_taking_its_turn_from(set(candidates))
+
+    def _origin_taking_its_turn_from(self, candidates: set[Coordinate]) -> Coordinate:
+        """从给定候选里挑上次出兵最久远的那颗。"""
         return min(
             candidates,
             key=lambda origin: (

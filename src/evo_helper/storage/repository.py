@@ -3134,6 +3134,7 @@ class SqlAlchemyRepository:
         window_floor: int | None = None,
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
+        recycle_rate_tenths: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
@@ -3158,6 +3159,7 @@ class SqlAlchemyRepository:
             row.window_floor = window_floor
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
+            row.recycle_rate_tenths = recycle_rate_tenths
             session.commit()
             session.refresh(row)
             return row
@@ -3850,6 +3852,270 @@ class SqlAlchemyRepository:
                 for galaxy, system, position, seen_at in rows:
                     result[Coordinate(galaxy, system, position)] = seen_at
         return result
+
+    # -- 残骸回收 ---------------------------------------------------------------
+
+    def recycle_rate_tenths(self) -> int:
+        """回收节奏（整数十分位 0–10）。空/读不出 = 0（关）。"""
+        try:
+            row = self.military_attack_config()
+        except ValueError:
+            return 0
+        value = row.recycle_rate_tenths
+        if value is None:
+            return 0
+        return max(0, min(10, int(value)))
+
+    def set_recycle_rate_tenths(self, rate_tenths: int) -> None:
+        """写回收节奏。落库前夹到 0–10。"""
+        clamped = max(0, min(10, int(rate_tenths)))
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                row = orm.MilitaryAttackConfigRow(id=1)
+                session.add(row)
+            row.recycle_rate_tenths = clamped
+            session.commit()
+
+    def recycle_acc_state(self) -> tuple[int, datetime | None]:
+        """全局 acc 当前值 + 最近一次决策时刻。
+
+        acc 从最近一条决策行的 `acc_after` 读；没有决策行时是 (0, None)。
+        ⚠️ **必须落库** —— 放进程内存的话一次重启就清零，比例会被系统性拉低。
+        """
+        with self._session_factory() as session:
+            row = session.scalars(
+                select(orm.RecycleDecisionRow)
+                .order_by(orm.RecycleDecisionRow.decided_at_utc.desc())
+                .limit(1)
+            ).first()
+            if row is None:
+                return 0, None
+            return int(row.acc_after), row.decided_at_utc
+
+    def save_recycle_decision(
+        self,
+        *,
+        source_dispatch_id: UUID | None,
+        run_id: UUID | None,
+        target: Coordinate,
+        origin: Coordinate,
+        decided_at_utc: datetime,
+        rate_tenths: int,
+        acc_before: int,
+        acc_after: int,
+        selected: bool,
+        source: str = "slider",
+    ) -> int | None:
+        """落一条决策。撞幂等键时静默跳过、返回 None。
+
+        ⚠️ **计数与决策必须同一个事务落库** —— 否则「加了 acc 但没记决策」和
+        「记了决策但没加 acc」都会出现，而两者事后分不开。
+        """
+        with self._session_factory() as session:
+            # 幂等：滑块路径按 source_dispatch_id，入口 A 按 (run_id, target)
+            if source_dispatch_id is not None:
+                existing = session.scalars(
+                    select(orm.RecycleDecisionRow.id).where(
+                        orm.RecycleDecisionRow.source_dispatch_id == source_dispatch_id
+                    )
+                ).first()
+                if existing is not None:
+                    return None
+            elif run_id is not None:
+                existing = session.scalars(
+                    select(orm.RecycleDecisionRow.id).where(
+                        orm.RecycleDecisionRow.run_id == run_id,
+                        orm.RecycleDecisionRow.target_galaxy == target.galaxy,
+                        orm.RecycleDecisionRow.target_system == target.system,
+                        orm.RecycleDecisionRow.target_position == target.position,
+                    )
+                ).first()
+                if existing is not None:
+                    return None
+            row = orm.RecycleDecisionRow(
+                source_dispatch_id=source_dispatch_id,
+                run_id=run_id,
+                target_galaxy=target.galaxy,
+                target_system=target.system,
+                target_position=target.position,
+                origin_galaxy=origin.galaxy,
+                origin_system=origin.system,
+                origin_position=origin.position,
+                decided_at_utc=decided_at_utc,
+                rate_tenths=rate_tenths,
+                acc_before=acc_before,
+                acc_after=acc_after,
+                selected=selected,
+                source=source,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return int(row.id)
+
+    def save_recycle_job(
+        self,
+        *,
+        decision_id: int,
+        target: Coordinate,
+        origin: Coordinate,
+        created_at_utc: datetime,
+    ) -> int:
+        """为选中的决策生成一条待执行作业。同一坐标已有待执行的先标 superseded。"""
+        with self._session_factory() as session:
+            # 被新一发取代：每个坐标最多一条待执行
+            pending = session.scalars(
+                select(orm.RecycleJobRow).where(
+                    orm.RecycleJobRow.target_galaxy == target.galaxy,
+                    orm.RecycleJobRow.target_system == target.system,
+                    orm.RecycleJobRow.target_position == target.position,
+                    orm.RecycleJobRow.state == "pending",
+                )
+            ).all()
+            for old in pending:
+                old.state = "superseded"
+            row = orm.RecycleJobRow(
+                decision_id=decision_id,
+                target_galaxy=target.galaxy,
+                target_system=target.system,
+                target_position=target.position,
+                origin_galaxy=origin.galaxy,
+                origin_system=origin.system,
+                origin_position=origin.position,
+                created_at_utc=created_at_utc,
+                state="pending",
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return int(row.id)
+
+    def pending_recycle_jobs(self, *, origin: Coordinate, limit: int = 10) -> list[dict[str, Any]]:
+        """某颗出发星球的待执行回收作业，**新的先**。
+
+        残骸越新越可能还在；旧的自然过期。
+        """
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.state == "pending",
+                    orm.RecycleJobRow.origin_galaxy == origin.galaxy,
+                    orm.RecycleJobRow.origin_system == origin.system,
+                    orm.RecycleJobRow.origin_position == origin.position,
+                )
+                .order_by(orm.RecycleJobRow.created_at_utc.desc())
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    "id": int(r.id),
+                    "target": Coordinate(r.target_galaxy, r.target_system, r.target_position),
+                    "origin": Coordinate(r.origin_galaxy, r.origin_system, r.origin_position),
+                    "created_at_utc": r.created_at_utc,
+                }
+                for r in rows
+            ]
+
+    def mark_recycle_job(
+        self,
+        job_id: int,
+        *,
+        state: str,
+        executed_at_utc: datetime | None = None,
+        dispatch_id: UUID | None = None,
+    ) -> None:
+        """更新作业状态。未派出的原因只落 system_log，不上页面。"""
+        with self._session_factory() as session:
+            row = session.get(orm.RecycleJobRow, job_id)
+            if row is None:
+                return
+            row.state = state
+            if executed_at_utc is not None:
+                row.executed_at_utc = executed_at_utc
+            if dispatch_id is not None:
+                row.dispatch_id = dispatch_id
+            session.commit()
+
+    def count_protection_exclusions_since(self, since: datetime) -> int:
+        """本周期新写入了几条 8 小时保护期排除。
+
+        ⚠️ **数据来源是 `system_log`，不是 `bot_targets.protection_seen_at_utc`** ——
+        后者是覆盖的，同一坐标一周撞三次只算一次，数出来必然偏小。
+        `_note_protection_period` 每次撞上都写一条 system_log（两个分支都写）。
+
+        ⚠️ **两条过滤条件，缺一个基线就是错的**（第八轮评审 §3）：
+        - 只数 `recorded = true`：false 那一档根本没落库、没排除任何目标
+        - 只数 `evidence = "dialog"`：别把邮件侧认出的保护返航混进来
+        """
+        import json
+
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(orm.SystemLogRow.payload_json).where(
+                    orm.SystemLogRow.source == "tools.pirate_loop",
+                    orm.SystemLogRow.logged_at_utc >= since,
+                    orm.SystemLogRow.message.like("%在保护期内%"),
+                )
+            ).all()
+            count = 0
+            for payload_json in rows:
+                try:
+                    payload = json.loads(payload_json or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if payload.get("recorded") is True and payload.get("evidence") == "dialog":
+                    count += 1
+            return count
+
+    def released_bot_attack_dispatches_without_decision(
+        self, *, now_utc: datetime, hold: timedelta, since: datetime
+    ) -> list[dict[str, Any]]:
+        """已释放、且还没有决策行的 bot 攻击派遣。
+
+        ⚠️ `target_kind` 不在派遣行上，必须 JOIN 意图表。
+        ⚠️ `hold` 必填 —— `_still_holding_a_line` 没有默认值。
+        ⚠️ 只看 `mission_kind = ATTACK` 且 `target_kind = bot`（海盗不回收，R13）。
+        """
+        decided = select(orm.RecycleDecisionRow.source_dispatch_id).where(
+            orm.RecycleDecisionRow.source_dispatch_id.is_not(None)
+        )
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    orm.AttackDispatchRow.id,
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackIntentRow.target_galaxy,
+                    orm.AttackIntentRow.target_system,
+                    orm.AttackIntentRow.target_position,
+                    orm.AttackIntentRow.origin_galaxy,
+                    orm.AttackIntentRow.origin_system,
+                    orm.AttackIntentRow.origin_position,
+                )
+                .join(
+                    orm.AttackIntentRow,
+                    orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                )
+                .where(
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK,
+                    orm.AttackIntentRow.target_kind == "bot",
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dispatched_at_utc >= since,
+                    orm.AttackDispatchRow.id.not_in(decided),
+                    ~_still_holding_a_line(now_utc, hold),
+                )
+                .order_by(orm.AttackDispatchRow.dispatched_at_utc)
+            ).all()
+            return [
+                {
+                    "dispatch_id": dispatch_id,
+                    "dispatched_at_utc": dispatched_at,
+                    "target": Coordinate(tg, ts, tp),
+                    "origin": Coordinate(og, os_, op_),
+                }
+                for dispatch_id, dispatched_at, tg, ts, tp, og, os_, op_ in rows
+            ]
 
 
 def _mission_task(session: Session, task_id: int) -> orm.MissionTaskRow:

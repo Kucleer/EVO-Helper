@@ -207,6 +207,7 @@ def bot_command(
     origin: Coordinate,
     presets: Mapping[Coordinate, str] | None = None,
     max_dispatches: int | None = None,
+    recycle: Sequence[Coordinate] | None = None,
 ) -> list[str]:
     """bot 攻击命令行。
 
@@ -222,8 +223,13 @@ def bot_command(
 
     `--origin` 同 `pirate_command`：这一轮的出发星球，显式传，不许让 runner 自己
     去猜。多个 bot 任务的区别就在这一个参数上——猜错了两个任务的账会记到一起。
+
+    ⚠️ **`targets` 可以为空，前提是 `recycle` 非空**（纯回收轮）。两个都空才是
+    真的没事干，那时才抛 `MissionParamError`。原先无条件抛会让纯回收轮变成
+    「bot 任务被停用到手点恢复」。
     """
-    if not targets:
+    recycle = tuple(recycle or ())
+    if not targets and not recycle:
         raise MissionParamError("该范围内没有已记录的 bot；先跑扫描")
     # 同坐标把预设写进 argv，使命令台账能如实回放每一发用了哪个标题。
     # 区域攻击不传映射，runner 仍使用既有 BBB，避免被军力逻辑影响。
@@ -233,10 +239,15 @@ def bot_command(
         else f"{item.galaxy}:{item.system}:{item.position}"
         for item in targets
     ]
-    command = [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--targets", *listed] + [
-        "--origin",
-        str(origin),
-    ]
+    command = [_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop"]
+    if listed:
+        command += ["--targets", *listed]
+    if recycle:
+        command += [
+            "--recycle",
+            *[f"{item.galaxy}:{item.system}:{item.position}" for item in recycle],
+        ]
+    command += ["--origin", str(origin)]
     if max_dispatches is not None:
         if max_dispatches < 1:
             raise NoFreeLineError("空闲航线不足，暂不启动 bot 攻击")

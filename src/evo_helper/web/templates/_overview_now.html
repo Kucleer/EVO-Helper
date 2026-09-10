@@ -61,6 +61,42 @@
     </div>
   {% endif %}
 
+  {#
+    回收节奏卡（概览面板.md §3/§4/§6）。
+    ⚠️ 三个数分开显示，不拿比例判故障 —— acc 不回退时正常运行下就该对不上。
+    ⚠️ 「残骸实收」恒为「未知」—— 回收邮件 hold，这一版读不到实收。
+    ⚠️ 「未派出」不拆原因 —— 原因只落 system_log。
+  #}
+  <div class="tile overview-card">
+    <div class="label">回收节奏</div>
+    {% if now.recycle.enabled %}
+      <div class="value tone-accent">
+        {{ '%.1f' % now.recycle.rate }}
+        <span class="overview-unit">
+          {% if now.recycle.acc is not none %}· acc {{ '%.1f' % now.recycle.acc }}{% endif %}
+        </span>
+      </div>
+      <div class="overview-kv"><span>应尝试</span><b>{{ now.recycle.should_try }}</b></div>
+      <div class="overview-kv"><span>已派出</span><b>{{ now.recycle.dispatched }}</b></div>
+      <div class="overview-kv"><span>未派出</span><b>{{ now.recycle.not_dispatched }}</b></div>
+      <div class="overview-kv"><span>残骸实收</span><b class="muted">未知</b></div>
+      {% if now.recycle.protection_exclusions %}
+        <div class="overview-note">
+          保护期排除 <b>{{ now.recycle.protection_exclusions }}</b> 条
+          <span class="muted">（探针：异常上涨说明两条链路串了）</span>
+        </div>
+      {% endif %}
+    {% else %}
+      <div class="value muted">已关闭</div>
+      <div class="overview-note muted">滑块默认 0，打开后每 10 发攻击按比例安排回收</div>
+      {% if now.recycle.protection_exclusions %}
+        <div class="overview-note">
+          保护期排除 <b>{{ now.recycle.protection_exclusions }}</b> 条
+        </div>
+      {% endif %}
+    {% endif %}
+  </div>
+
   {% for line in now.lines %}
     <div class="tile overview-card">
       <div class="label">航线 · {{ line.origin }} <span class="muted">配置 {{ line.configured_lines }} 条</span></div>

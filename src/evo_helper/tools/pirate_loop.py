@@ -2073,7 +2073,7 @@ class PirateLoop:
             evidence["dialog_evidence_error"] = str(error)
         return evidence
 
-    def _handle_dialog(self, coordinate: Coordinate) -> bool:
+    def _handle_dialog(self, coordinate: Coordinate, *, purpose: pirate_ui.DispatchPurpose) -> bool:
         """认出弹窗就关掉它，并决定这一轮还能不能继续。
 
         返回 True 表示「没有弹窗，照常往下走」；False 表示「这个目标跳过」。
@@ -2082,18 +2082,49 @@ class PirateLoop:
         ⚠️ 三个弹窗**分两类，处理方式相反**。把「没有可执行的任务」也当成停轮，
         一个被别人打过、正在保护期里的目标就能让整轮空转，而它后面可能还排着
         一堆能打的。
+
+        ⚠️ `purpose` 是**必填关键字参数**——同一句中文在攻击和回收上意思不同，
+        从弹窗上永远分不出来，只能由调用方说自己在派什么。
         """
         message = self._dialog()
         if message is None:
             return True
         self._driver.click(*pirate_ui.DIALOG_CONFIRM, label="关闭弹窗")
         self._driver.wait(DISPATCH_WAIT_S)
-        # ⚠️ **类别按弹窗类型认，不按那句中文认**（`pirate_ui.DialogKind`）。
+        # ⚠️ **处置按 (弹窗 × 意图) 查表认，不按那句中文认**（`pirate_ui.dialog_action`）。
         # 同 `mission_scheduler._launch` 里那条「类别按异常类型认」。这几句中文是
-        # 从屏幕上 OCR 出来再贴回词表的，字面本来就会抖；而两类做反的代价极不对称。
-        if pirate_ui.dialog_kind(message) is pirate_ui.DialogKind.PROTECTED:
+        # 从屏幕上 OCR 出来再贴回词表的，字面本来就会抖；而「跳过这个目标」与
+        # 「停下整轮」做反的代价极不对称。
+        action = pirate_ui.dialog_action(message, purpose=purpose)
+        if action is pirate_ui.DialogAction.SKIP_PROTECTED:
             self._note_protection_period(coordinate)
             say(f"  {coordinate} 在保护期内（{message}）；跳过这个目标")
+            self._outcome.refused.append((coordinate, message))
+            return False
+        if action is pirate_ui.DialogAction.SKIP_NO_DEBRIS:
+            # 回收撞「没有可执行的任务」= 这颗没有残骸。**绝不写保护期排除。**
+            say(f"  {coordinate} 没有残骸（{message}）；跳过这次回收")
+            self._outcome.refused.append((coordinate, message))
+            return False
+        if action is pirate_ui.DialogAction.SKIP_NO_RECYCLERS:
+            # ⚠️ 本不该发生（回收船是数量级多一位的存在，用户口径 2026-09-10）。
+            # 真走到了，最可能的解释不是「船不够」，而是：
+            #   · 我们根本不在回收的派遣页上（走错屏了）
+            #   · purpose 说了谎 —— 想派回收却点到了攻击图标
+            #   · 游戏版面变了，这句话现在是别的意思
+            # 处置是跳过（不误伤攻击），但**日志级别按异常写**。
+            say(f"  {coordinate} 回收船不够（{message}）；跳过这次回收，攻击照跑")
+            record_system_log(
+                "WARNING",
+                "tools.pirate_loop",
+                f"{coordinate} 回收撞「{message}」——本不该发生，多半是走错屏或 purpose 说谎",
+                payload={
+                    "target": str(coordinate),
+                    "purpose": purpose.value,
+                    "dialog": message,
+                    "action": action.value,
+                },
+            )
             self._outcome.refused.append((coordinate, message))
             return False
         raise RoundExhausted(message)
@@ -2429,7 +2460,9 @@ class PirateLoop:
             payload=payload,
         )
 
-    def _require_origin_before_dispatch(self, coordinate: Coordinate) -> bool:
+    def _require_origin_before_dispatch(
+        self, coordinate: Coordinate, *, purpose: pirate_ui.DispatchPurpose
+    ) -> bool:
         """**每一发派遣之前**回读派遣面板的「起点」，与这一轮记账用的出发星比对。
 
         交 `True` 照常往下派；交 `False` 表示「这个目标跳过，这一轮继续」
@@ -2530,7 +2563,7 @@ class PirateLoop:
         # 认出资源耗尽那几种时它自己抛 `RoundExhausted`，照旧停轮。
         dialog: dict[str, Any] = {"dialog_checked": False}
         if shown is None:
-            if not self._handle_dialog(coordinate):
+            if not self._handle_dialog(coordinate, purpose=purpose):
                 return False
             # 走到这儿 = 问过了、认不出。**这一档就是 2026-08-27 那个循环卡住的地方**，
             # 而它此前在日志上和「屏上什么都没有」长得一模一样。把那一格拍下来。
@@ -2627,7 +2660,9 @@ class PirateLoop:
             payload=payload,
         )
 
-    def _launch(self, coordinate: Coordinate, mission: str) -> bool:
+    def _launch(
+        self, coordinate: Coordinate, mission: str, *, purpose: pirate_ui.DispatchPurpose
+    ) -> bool:
         """简报页核对任务类型，通过才点「出发！」。"""
         shown = self._briefing_mission()
         if shown != mission:
@@ -2643,7 +2678,7 @@ class PirateLoop:
         # 「同时派遣的舰队数量已达上限。」，而这一发根本没飞。不检查的话调用方会
         # 记下一条**根本不存在的派遣**：调度器据此以为一条航线被占着，等一份永远
         # 不会来的战报，要到 `MAX_REPORT_AGE`（6 小时）才被判缺失清掉。
-        return self._handle_dialog(coordinate)
+        return self._handle_dialog(coordinate, purpose=purpose)
 
     def scout(self, coordinate: Coordinate) -> bool:
         """派一发侦察。派遣面板的终点是自动预填的，侦察也不需要选预设。
@@ -2657,11 +2692,12 @@ class PirateLoop:
         意图与派遣的先后和 `attack()` 一个语义：意图在点「出发！」之前写，
         派遣在之后写，两者之差就是「想派但被闸门拦下了」。
         """
+        purpose = pirate_ui.DispatchPurpose.SCOUT
         self._driver.click(*pirate_ui.SCOUT_BUTTON, label="侦察")
         self._driver.wait(DISPATCH_WAIT_S)
         # 面板刚铺开、还没点绿✓，起点那一行就在眼前：**每一发都核一次脚底下的星球**。
         # 侦察也要核——它一样占航线、一样按出发坐标记账，从错的星球飞出去同样是假账。
-        if not self._require_origin_before_dispatch(coordinate):
+        if not self._require_origin_before_dispatch(coordinate, purpose=purpose):
             # 交 False = 屏上是保护期弹窗，这个目标跳过、这一轮继续。弹窗已经点掉了，
             # 但派遣列表还开着，和下面「弹窗挡下」那一支一样要自己退出来。
             self._leave_dispatch_list()
@@ -2670,7 +2706,7 @@ class PirateLoop:
         self._driver.wait(BRIEFING_WAIT_S)
         # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
         # 这里弹的是那种单按钮弹窗。**先认再走**，而且要在记意图之前。
-        if not self._handle_dialog(coordinate):
+        if not self._handle_dialog(coordinate, purpose=purpose):
             self._leave_dispatch_list()
             return False
         intent_id = self._record_intent(coordinate, preset=SCOUT_PRESET_NAME)
@@ -2685,7 +2721,7 @@ class PirateLoop:
         # 一遍，于是**每发侦察多花约 6 秒、一轮 4 发就是 24 秒**。那是 ROI 没对上的
         # 症状，不是别的毛病——第一次实机发现侦察变慢，先去核这个 ROI。
         flight = self._read_flight_time(coordinate, mission_kind=MISSION_KIND_SCOUT)
-        if not self._launch(coordinate, "侦察"):
+        if not self._launch(coordinate, "侦察", purpose=purpose):
             self._leave_dispatch_list()
             return False
         self._record_dispatch(intent_id, flight, mission_kind=MISSION_KIND_SCOUT)
@@ -2705,6 +2741,7 @@ class PirateLoop:
         游戏里维护的，助手去核对既多余、也会把「用户改了预设」误判成故障。
         """
         wanted = preset or self._options.preset
+        purpose = pirate_ui.DispatchPurpose.ATTACK
         timer = StepTimer(f"{coordinate} 攻击")
         self._driver.click(*self.ATTACK_BUTTON, label="攻击")
         self._driver.wait(DISPATCH_WAIT_S)
@@ -2712,7 +2749,7 @@ class PirateLoop:
         # ⚠️ **必须排在展开预设条之前。** `PRESET_TOGGLE` 就坐在起点那一行的右端，
         # 条一展开，「预设 N/10」那一栏整个把起点盖住（实拍 `var/logs/atk-2-presets.png`），
         # 那时再读只会读到预设名。顺带还省下一次翻预设条：核不过的那一发本来就不派。
-        if not self._require_origin_before_dispatch(coordinate):
+        if not self._require_origin_before_dispatch(coordinate, purpose=purpose):
             timer.lap("核起点")
             timer.say_total("保护期弹窗挡下")
             self._leave_dispatch_list()
@@ -2748,7 +2785,7 @@ class PirateLoop:
         self._driver.wait(BRIEFING_WAIT_S)
         # 绿✓ 之后出来的未必是简报页：目标在保护期、或者一条战舰都选不出来时，
         # 这里弹的是那种单按钮弹窗。**先认再走**，而且要在记意图之前。
-        if not self._handle_dialog(coordinate):
+        if not self._handle_dialog(coordinate, purpose=purpose):
             timer.say_total("弹窗挡下")
             self._leave_dispatch_list()
             return False
@@ -2758,7 +2795,7 @@ class PirateLoop:
         # 看起来只是「一直在等」。
         flight = self._read_flight_time(coordinate)
         timer.lap("简报")
-        if not self._launch(coordinate, "攻击"):
+        if not self._launch(coordinate, "攻击", purpose=purpose):
             timer.say_total("点不出「出发」")
             self._leave_dispatch_list()
             return False

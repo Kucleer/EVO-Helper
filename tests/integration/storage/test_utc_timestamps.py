@@ -95,6 +95,10 @@ EXPECTED_TIMESTAMP_COLUMNS = frozenset(
         "target_revisits.executed_at_utc",
         "target_revisits.requested_at_utc",
         "ui_observations.observed_at_utc",
+        # e5a8c3d2f1b4（残骸回收闭环）建的两张表。
+        "recycle_decisions.decided_at_utc",
+        "recycle_jobs.created_at_utc",
+        "recycle_jobs.executed_at_utc",
     }
 )
 
@@ -143,6 +147,10 @@ POST_TIMESTAMP_MIGRATION_COLUMNS = frozenset(
         "ranking_capture_requests.consumed_at_utc",
         # f2c04b8ae153（退避到期自动恢复）加的，那条迁移里也写着 `timezone=True`。
         "mission_tasks.retry_after_utc",
+        # e5a8c3d2f1b4（残骸回收闭环）建的两张表。
+        "recycle_decisions.decided_at_utc",
+        "recycle_jobs.created_at_utc",
+        "recycle_jobs.executed_at_utc",
     }
 )
 

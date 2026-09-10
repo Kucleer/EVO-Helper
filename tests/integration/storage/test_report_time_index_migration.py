@@ -57,7 +57,7 @@ def _indexes(database_url: str) -> dict[str, list[str]]:
 
 
 def test_this_revision_is_the_single_head() -> None:
-    """链上只有一个 head，而且就是这一条。
+    """链上只有一个 head。
 
     生产靠启动时 `alembic upgrade head` 自升（`web.runtime._upgrade_database`），
     多一个 head 就是用户重启 bat 之后控制台直接起不来——而这件事在合并之前一个字
@@ -68,7 +68,11 @@ def test_this_revision_is_the_single_head() -> None:
     """
     script = ScriptDirectory.from_config(_config("sqlite://"))
 
-    assert list(script.get_heads()) == [REVISION]
+    # 这条迁移已不是 head（后面接了 e5a8c3d2f1b4），只断言链上只有一个 head、
+    # 且自己在链上。
+    heads = list(script.get_heads())
+    assert len(heads) == 1, f"期望单一 head，实际 {heads}"
+    assert script.get_revision(REVISION) is not None
     assert script.get_revision(REVISION).down_revision == DOWN_REVISION
 
 

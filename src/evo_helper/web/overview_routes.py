@@ -322,6 +322,34 @@ class PeriodRow:
 
 
 @dataclass(frozen=True, slots=True)
+class RecycleCard:
+    """回收节奏的此刻状态（概览面板.md §3/§4/§6）。
+
+    ⚠️ **三个数分开显示，不许拿「已派出 ÷ 攻击数」和滑块比对判故障** ——
+    `acc` 不回退时正常运行下这两个数就该对不上。
+    ⚠️ **「未派出」不拆原因**（用户口径 2026-09-10）：原因只落 system_log。
+    ⚠️ **「残骸实收」恒为「未知」** —— 回收邮件 hold，这一版读不到实收。
+    """
+
+    #: 当前档位（0.0–1.0）。0 = 关。
+    rate: float
+    #: acc 当前值（0–9 的整数，显示为 0.0–0.9）。None = 还没有决策行。
+    acc: float | None
+    #: 应尝试（本周期决策里 selected=true 的条数）。
+    should_try: int
+    #: 已派出（本周期 recycle_jobs 里 state=dispatched 的条数）。
+    dispatched: int
+    #: 未派出（本周期选中但没派出去的条数）。
+    not_dispatched: int
+    #: 保护期排除条数（本周期新写入的 8 小时排除，从 system_log 数）。
+    protection_exclusions: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.rate > 0
+
+
+@dataclass(frozen=True, slots=True)
 class NowView:
     now_utc: datetime
     scheduler: SchedulerCard
@@ -342,6 +370,8 @@ class NowView:
     pool_unscored: int
     galaxies: tuple[GalaxyFreshness, ...]
     today: TodayCard
+    #: 回收节奏的此刻状态（概览面板.md §3/§4/§6）。
+    recycle: RecycleCard
     #: 这一趟有没有查失败。失败时页面上给一条红条，而不是把 0 当成事实摆出来。
     failed: bool = False
 
@@ -587,7 +617,84 @@ def build_now_view(
         score_max_age_hours=round(max_age.total_seconds() / 3600, 1),
         galaxies=_galaxy_freshness(fresh),
         today=_today_card(repository, now_utc=now_utc, today_start=today_start, hold=hold),
+        recycle=_recycle_card(repository, now_utc=now_utc, today_start=today_start),
     )
+
+
+def _recycle_card(
+    repository: OverviewRepository, *, now_utc: datetime, today_start: datetime
+) -> RecycleCard:
+    """组装回收节奏的此刻状态。
+
+    ⚠️ **三个数分开显示**，不拿比例判故障（概览面板.md §3）。
+    ⚠️ **保护期排除条数从 system_log 数**，不从 `bot_targets.protection_seen_at_utc`
+    ——那一列是覆盖的，同一坐标一周撞三次只算一次。
+    """
+    from evo_helper.storage.repository import SqlAlchemyRepository
+
+    # OverviewRepository 没有 recycle 方法，直接用底层 session_factory
+    # 构造一个 SqlAlchemyRepository 来读回收状态
+    session_factory = repository._session_factory  # noqa: SLF001
+    repo = SqlAlchemyRepository(session_factory)
+    rate_tenths = repo.recycle_rate_tenths()
+    acc, _last = repo.recycle_acc_state()
+    # 本周期的决策与作业统计
+    should_try, dispatched, not_dispatched = _recycle_stats(session_factory, today_start)
+    protection_exclusions = repo.count_protection_exclusions_since(today_start)
+    return RecycleCard(
+        rate=rate_tenths / 10.0,
+        acc=acc / 10.0 if acc is not None else None,
+        should_try=should_try,
+        dispatched=dispatched,
+        not_dispatched=not_dispatched,
+        protection_exclusions=protection_exclusions,
+    )
+
+
+def _recycle_stats(session_factory: sessionmaker[Session], since: datetime) -> tuple[int, int, int]:
+    """本周期回收统计：(应尝试, 已派出, 未派出)。
+
+    ⚠️ **页面上不拆「未派出」的原因**（用户口径 2026-09-10）。
+    """
+    from sqlalchemy import func, select
+
+    from evo_helper.storage import models as orm
+
+    with session_factory() as session:
+        should_try = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleDecisionRow)
+                .where(
+                    orm.RecycleDecisionRow.decided_at_utc >= since,
+                    orm.RecycleDecisionRow.selected.is_(True),
+                )
+            )
+            or 0
+        )
+        dispatched = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.created_at_utc >= since,
+                    orm.RecycleJobRow.state == "dispatched",
+                )
+            )
+            or 0
+        )
+        not_dispatched = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.created_at_utc >= since,
+                    orm.RecycleJobRow.state.not_in(("dispatched", "pending")),
+                )
+            )
+            or 0
+        )
+    return int(should_try), int(dispatched), int(not_dispatched)
 
 
 def _line_card(usage: OriginLineUsage) -> LineCard:
@@ -1047,6 +1154,14 @@ def _empty_now_view(now: datetime) -> NowView:
             uptime_partial=False,
             score_age_median=None,
             score_age_max=None,
+        ),
+        recycle=RecycleCard(
+            rate=0.0,
+            acc=None,
+            should_try=0,
+            dispatched=0,
+            not_dispatched=0,
+            protection_exclusions=0,
         ),
         failed=True,
     )
