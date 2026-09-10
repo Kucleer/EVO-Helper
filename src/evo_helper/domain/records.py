@@ -32,6 +32,11 @@ TARGET_KIND_LABELS = {TARGET_KIND_BOT: "bot", TARGET_KIND_PIRATE: "海盗"}
 #: 同样是字符串常量而不是枚举，理由与 `TARGET_KIND_*` 一致：原样进库、原样出接口。
 MISSION_KIND_ATTACK = "ATTACK"
 MISSION_KIND_SCOUT = "SCOUT"
+#: 残骸回收。⚠️ **必须和攻击分开记**，否则回收会喂自己：
+#: 回收决策扫的是「`mission_kind = ATTACK` 且 `target_kind = bot` 且航线已释放」，
+#: 回收若记成 ATTACK，它自己一释放就又生成一条回收作业 —— **自我放大，攻击永远轮不上**。
+#: 2026-09-11 03:1x 实机撞到过：4 发回收全被记成 ATTACK。
+MISSION_KIND_RECYCLE = "RECYCLE"
 
 
 @dataclass(frozen=True)

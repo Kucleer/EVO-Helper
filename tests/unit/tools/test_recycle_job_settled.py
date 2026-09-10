@@ -108,3 +108,23 @@ def test_every_recycle_outcome_settles_the_job_source_level() -> None:
     assert 'self._finish_recycle_job(coordinate, "dispatched")' in source, (
         "派出成功之后没有结作业 —— 那一条会被下一轮当成待办再派一次"
     )
+
+
+def test_recycle_dispatch_is_not_recorded_as_an_attack() -> None:
+    """⚠️⚠️ **源码级断言：回收派遣必须显式传 `mission_kind=RECYCLE`。**
+
+    `_record_dispatch` 的默认值是 `MISSION_KIND_ATTACK`，漏传**不会报错**，
+    只会把回收记成攻击 —— 而回收决策扫的正是
+    「`mission_kind = ATTACK` 且 `target_kind = bot` 且航线已释放」。
+
+    ⇒ **回收会喂自己**：每一发回收一释放就又生成一条回收作业，自我放大，
+    攻击永远轮不上。2026-09-11 03:1x 实机撞到过，4 发回收全被记成 ATTACK。
+    """
+    import inspect
+
+    from evo_helper.tools import bot_loop as module
+
+    source = inspect.getsource(module.BotLoop._recycle_once)
+    assert "mission_kind=MISSION_KIND_RECYCLE" in source, (
+        "回收派遣没显式传 mission_kind —— 默认值是 ATTACK，会让回收喂自己"
+    )
