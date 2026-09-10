@@ -1926,6 +1926,7 @@ _ALL_KNOBS = {
     "window_floor": 40,
     "account_line_limit": 6,
     "auto_toggle_log_seconds": 90,
+    "recycle_rate_tenths": 6,
 }
 
 

@@ -343,6 +343,11 @@ class MilitaryAttackConfigOut(BaseModel):
     #: 自动停用/自动恢复的日志限流窗口（秒）。**`None` = 留空 = 默认 120。**
     #: `0` 是合法取值，意思是「每一次跃迁都记」，不是「关掉日志」。
     auto_toggle_log_seconds: int | None = None
+    #: 回收节奏（整数十分位 0–10）。**`None` = 留空 = 关（0）。**
+    #:
+    #: ⚠️ **落库是整数十分位，页面显示 0.0–1.0。** 浮点误差累加会让 `r=0.1`
+    #: 前十发一次都不收（实测复现过），所以计数一律用整数。
+    recycle_rate_tenths: int | None = Field(default=None, ge=0, le=10)
 
 
 class CurrentMissionOut(BaseModel):

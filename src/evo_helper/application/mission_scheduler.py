@@ -1164,6 +1164,19 @@ class MissionScheduler:
         """校验攻击配置页上那个「自动停用/恢复日志的限流窗口」。留空返回 `None`。"""
         return _auto_toggle_log_seconds(value)
 
+    def validate_recycle_rate_tenths(self, value: object) -> int | None:
+        """校验回收节奏（整数十分位 0–10）。留空返回 `None`（关）。
+
+        ⚠️ **落库是整数十分位，页面显示 0.0–1.0。** 浮点误差累加会让 `r=0.1`
+        前十发一次都不收（实测复现过），所以计数一律用整数。
+        """
+        tenths = _optional_int(value, label="回收节奏（十分位）")
+        if tenths is None:
+            return None
+        if tenths < 0 or tenths > 10:
+            raise MissionParamError("回收节奏必须在 0–10 之间（整数十分位）；0 = 关")
+        return tenths
+
     def account_line_limit(self) -> int | None:
         """全账号此刻认的航线上限，**没配就是 `None`**。页面显示那句提示时读它。
 
