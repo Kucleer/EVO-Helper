@@ -1147,6 +1147,14 @@ class MilitaryAttackConfigRow(Base):
     #: 可空、不给 `server_default`：NULL = 关（同本表其余旋钮）。
     recycle_rate_tenths: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    #: 回收作业的时间上限（小时）。**空 = 24 小时。**
+    #:
+    #: 过期的代价只是时间：到了没按钮就不派——不占线、不占名额。
+    #: 旋钮而非标定常量：调大更宽松（残骸可能还在），调小更激进（旧作业早点清掉）。
+    recycle_job_max_age_hours: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
 
 class AiTargetDecisionRow(Base):
     """AI 选靶（影子）的每一轮记录：算法选了谁、AI 选了谁、以及两者的对账。

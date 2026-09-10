@@ -3654,8 +3654,9 @@ class MissionScheduler:
         # 也查一下有没有只有作业、没有攻击目标的出发点
         # （从任务配置里取所有启用的出发点）
         config_origins = self._enabled_origins(row)
+        now = self._clock()
         for origin in origins | config_origins:
-            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10)
+            jobs = self._repository.pending_recycle_jobs(origin=origin, limit=10, now_utc=now)
             if jobs:
                 recycle_by_origin[origin] = jobs
         if not assignments and not recycle_by_origin:
