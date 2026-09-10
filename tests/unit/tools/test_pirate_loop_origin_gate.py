@@ -600,7 +600,7 @@ def test_the_round_memory_survives_a_protection_dialog(
 def test_an_exhausted_dialog_still_stops_the_round(monkeypatch: pytest.MonkeyPatch) -> None:
     """⚠️ 另一半：「未选择任何战舰」是资源耗尽，**照旧停轮**。
 
-    两类弹窗处理方式相反（`pirate_ui.DialogKind`）。把这一档也放成「跳过这个
+    两类弹窗处理方式相反（`pirate_ui.dialog_action`）。把这一档也放成「跳过这个
     目标」，一轮会拿着一支派不出去的舰队把余下每个目标都空跑一遍。
 
     ⚠️ 停的形式是 `RoundExhausted` 而**不是** `OriginDrifted`：起点根本没漂，

@@ -1138,6 +1138,15 @@ class MilitaryAttackConfigRow(Base):
     #: 0 或负数表示**不清理**（口径同 `system_log_retention_days`）。默认 90 天。
     ai_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    #: 回收节奏：每 10 发攻击释放后安排几次回收。**整数十分位 0–10，空 = 0（关）。**
+    #:
+    #: 用户口径（2026-09-10）：滑块 0.0–1.0、步进 0.1；落库存整数十分位
+    #: `R = 滑块 × 10`，`acc` 存 0–9 的整数，阈值 10。⚠️ **绝不用浮点**——
+    #: 浮点误差累加会让 `r=0.1` 前十发一次都不收（实测复现过）。
+    #:
+    #: 可空、不给 `server_default`：NULL = 关（同本表其余旋钮）。
+    recycle_rate_tenths: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
 
 class AiTargetDecisionRow(Base):
     """AI 选靶（影子）的每一轮记录：算法选了谁、AI 选了谁、以及两者的对账。
@@ -1381,3 +1390,93 @@ class SystemLogRow(Base):
     message: Mapped[str] = mapped_column(Text)
     #: 坐标、预设名、耗时、异常栈之类的结构化附加信息。
     payload_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+
+
+class RecycleDecisionRow(Base):
+    """回收节奏的每一次决策：一发攻击的航线释放 → acc 累加 → 选没选中。
+
+    ⚠️ **这张表只追加，落定之后不许 UPDATE。** 它是滑块唯一能被事后验证的证据。
+    状态变化全落在 `recycle_jobs` 上。
+
+    ⚠️ **`source_dispatch_id` 是幂等锚**（唯一键）：「航线空出来」是每次查询现算的
+    状态、不是事件，没有这个键的话进程重启后同一发会被再数一次。
+    """
+
+    __tablename__ = "recycle_decisions"
+    __table_args__ = (
+        UniqueConstraint("source_dispatch_id", name="uq_recycle_decision_source"),
+        # 入口 A（攻击被拒就地改回收）的幂等锚：没有 dispatch_id，用 (run_id, 坐标)。
+        UniqueConstraint(
+            "run_id",
+            "target_galaxy",
+            "target_system",
+            "target_position",
+            name="uq_recycle_decision_run_target",
+        ),
+        Index("ix_recycle_decision_decided_at", "decided_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    #: 来源攻击的 dispatch_id。**滑块路径的唯一幂等键。**
+    #: 入口 A（攻击被拒）没有 dispatch_id，为 NULL，靠 (run_id, 坐标) 去重。
+    source_dispatch_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("attack_dispatches.id"), nullable=True
+    )
+    #: ⚠️ **是 `EVO_HELPER_LOG_RUN_ID` 那个 run_id，不是 `_ensure_run()` 那个。**
+    #: 手工直跑没有那个环境变量 ⇒ run_id 为 NULL ⇒ 入口 A 不做。
+    #: ⚠️ **别挂外键** —— `mission_runs` 那一行在 supervisor.start() 之后才写。
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    target_galaxy: Mapped[int] = mapped_column(Integer)
+    target_system: Mapped[int] = mapped_column(Integer)
+    target_position: Mapped[int] = mapped_column(Integer)
+    origin_galaxy: Mapped[int] = mapped_column(Integer)
+    origin_system: Mapped[int] = mapped_column(Integer)
+    origin_position: Mapped[int] = mapped_column(Integer)
+    decided_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: 当时的档位 R（整数十分位 0–10）。
+    rate_tenths: Mapped[int] = mapped_column(Integer)
+    #: acc 前 / 后。⚠️ **整数，绝不用浮点。**
+    acc_before: Mapped[int] = mapped_column(Integer)
+    acc_after: Mapped[int] = mapped_column(Integer)
+    selected: Mapped[bool] = mapped_column(Boolean)
+    #: `slider`（滑块路径）或 `on_refuse`（攻击被拒就地改回收）。
+    source: Mapped[str] = mapped_column(String(16), default="slider", server_default="slider")
+
+
+class RecycleJobRow(Base):
+    """只有选中的决策才有：一条待执行的回收作业。
+
+    状态机：待执行 → 已派 / 无残骸 / 被弹窗拒 / 过期 / 被取代 / 跨周作废。
+    ⚠️ 未派出的原因**只落 `system_log`，不上页面**（用户口径 2026-09-10）。
+    """
+
+    __tablename__ = "recycle_jobs"
+    __table_args__ = (
+        # 每个坐标最多一条待执行作业（被新一发取代时旧的先标掉）。
+        Index("ix_recycle_job_pending_target", "target_galaxy", "target_system", "target_position"),
+        Index("ix_recycle_job_created_at", "created_at_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    decision_id: Mapped[int] = mapped_column(
+        ForeignKey("recycle_decisions.id"), unique=True, index=True
+    )
+    target_galaxy: Mapped[int] = mapped_column(Integer)
+    target_system: Mapped[int] = mapped_column(Integer)
+    target_position: Mapped[int] = mapped_column(Integer)
+    origin_galaxy: Mapped[int] = mapped_column(Integer)
+    origin_system: Mapped[int] = mapped_column(Integer)
+    origin_position: Mapped[int] = mapped_column(Integer)
+    created_at_utc: Mapped[datetime] = mapped_column(UTCDateTime)
+    #: `pending` / `dispatched` / `no_debris` / `dialog_rejected` / `expired` /
+    #: `superseded` / `cross_cycle`。
+    state: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending")
+    executed_at_utc: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    #: 派出的那一发 dispatch_id（可空：没派出去就没有）。
+    dispatch_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("attack_dispatches.id"), nullable=True
+    )

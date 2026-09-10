@@ -95,6 +95,8 @@ from evo_helper.domain.target_order import DEFAULT_UNREADABLE_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.tools.pirate_loop import (
+    BRIEFING_WAIT_S,
+    DISPATCH_WAIT_S,
     LoopOptions,
     PirateLoop,
     ReportIngest,
@@ -145,6 +147,8 @@ class BotOptions:
     #: 本进程最多真正派出多少发。调度器按当前出发星球的空闲航线数传入，避免
     #: 盲目点到游戏的「航线已满」弹窗；手工运行不传则不设上限。
     max_dispatches: int | None = None
+    #: 待执行的回收目标（坐标列表）。回收先于攻击执行，按顺序做到名额用完。
+    recycle: tuple[Coordinate, ...] = ()
 
 
 class BotLoop(PirateLoop):
@@ -537,6 +541,15 @@ class BotLoop(PirateLoop):
         **仍旧一趟只推进一态**——每个目标在这个循环里只走一个分支。
         """
         dispatched = 0
+        # ⚠️ **回收先于攻击执行**：回收的目标是已知的、不用挑，而攻击那一组还要
+        # 过保护期等闸门；先做确定的那件，失败也不影响后面。
+        for coordinate in self._bot.recycle:
+            if self._bot.max_dispatches is not None and dispatched >= self._bot.max_dispatches:
+                say(f"  已派出 {dispatched} 发，达到本轮预算；剩余回收作业留待下一轮")
+                break
+            say(f"回收目标 {coordinate}")
+            if self._recycle_once(coordinate):
+                dispatched += 1
         for coordinate in self._bot.targets:
             if self._bot.max_dispatches is not None and dispatched >= self._bot.max_dispatches:
                 say(f"  已派出 {dispatched} 发，达到本轮空闲航线预算；其余目标留待返航后继续")
@@ -549,6 +562,133 @@ class BotLoop(PirateLoop):
             elif phase is BotPhase.AWAITING_ATTACK_REPORT:
                 self._say_still_waiting(coordinate)
             # `DONE` 无事可做。
+
+    def _recycle_once(self, coordinate: Coordinate) -> bool:
+        """派一发回收。六步链路（`流程图.md` §3 + `回收残骸/待办.md`）：
+
+            导航到坐标（星球已由 ensure_origin_planet 切好）
+              → 面板上有没有「回收」按钮？   没有 → 记 state=无残骸，acc 不回退
+              → 点「回收」（⚠️ 按标签文字定位）
+                → 残骸框（⚠️ 三格数字**不读**）→ 绿✓
+                  → 派遣页（⚠️ 舰队自动配好，不用挑预设）→ 逐发核起点 → 终点三框回读 → 点勾
+                    → 弹窗？  有 → 见 PR-A 的六格表
+                    → 无 ⇒ **已派出**（R21），记一发派遣、占线
+                      → 简报页：读飞行时间（同攻击）+ 读任务类型（⚠️ 只告警不拦，R24）
+                        → 点「出发！」
+                          → ⚠️ **到此为止，不追结果**（R16）
+
+        ⚠️ **回收按钮必须按标签文字定位，不写死坐标** —— 图标集是动态的
+        （残骸没了「回收」就消失，后面整体左移一格）。实拍：22:05 第 4 格是回收，
+        22:28 同一 x 是邮件。盲点会开出发私信窗口。
+        """
+        check = self._goto_checked(coordinate)
+        if check is not TargetCheck.CONFIRMED:
+            self._note_check_failure(coordinate, check)
+            return False
+
+        # 第 2 步：找「回收」按钮（按标签文字定位）
+        recycle_x = self._find_recycle_button()
+        if recycle_x is None:
+            say(f"  {coordinate} 面板上没有「回收」按钮；这颗没有残骸")
+            record_system_log(
+                "INFO",
+                "tools.bot_loop",
+                f"{coordinate} 面板上没有「回收」按钮，跳过这次回收",
+                payload={"target": str(coordinate), "reason": "no_recycle_button"},
+            )
+            return False
+
+        # 点「回收」
+        label_y = pirate_ui.BOT_ATTACK_BUTTON[1] + pirate_ui.BOT_PANEL_LABEL_Y_OFFSET
+        self._driver.click(recycle_x, label_y - 15, label="回收")  # 点图标而非标签
+        self._driver.wait(DISPATCH_WAIT_S)
+
+        # 第 3 步：残骸框 → 绿✓（三格数字不读）
+        title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
+        if pirate_ui.RECYCLE_DIALOG_TITLE not in title:
+            say(f"  {coordinate} 残骸框没弹出来（读到 {title!r}）；跳过")
+            return False
+        self._driver.click(*pirate_ui.RECYCLE_DIALOG_CONFIRM, label="残骸框绿✓")
+        self._driver.wait(DISPATCH_WAIT_S)
+
+        # 第 4 步：派遣页 —— 舰队已自动配好，不用挑预设
+        # 逐发核起点（复用攻击链路那道闸门）
+        purpose = pirate_ui.DispatchPurpose.RECYCLE
+        if not self._require_origin_before_dispatch(coordinate, purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 终点三框回读（可选：回收的终点是自动填的，核一下更稳）
+        # 第 5 步：点绿✓
+        self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
+        self._driver.wait(BRIEFING_WAIT_S)
+
+        # 弹窗？（PR-A 六格表）
+        if not self._handle_dialog(coordinate, purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 记意图（⚠️ 必须写 attack_intents，否则 count_inflight 少数一条 ⇒ 超派）
+        # 回收没有预设，用占位值
+        intent_id = self._record_intent(coordinate, preset="回收")
+
+        # 第 6 步：简报页 —— 读任务类型（只告警不拦，R24）+ 读飞行时间
+        shown_mission = self._briefing_mission()
+        if shown_mission != "回收":
+            # ⚠️ R24：算派出去，占航线。只记 WARNING，照点出发。
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 简报页任务类型是 {shown_mission or '（读不出）'}，不是回收；"
+                f"照点出发（R24）",
+                payload={
+                    "target": str(coordinate),
+                    "expected": "回收",
+                    "shown": shown_mission,
+                },
+            )
+        flight = self._read_flight_time(coordinate)
+
+        # 点「出发！」
+        if not self._launch(coordinate, "回收", purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 记派遣
+        self._record_dispatch(intent_id, flight)
+        say(f"  已派出回收 → {coordinate}")
+        self._leave_dispatch_list()
+        return True
+
+    def _find_recycle_button(self) -> int | None:
+        """读面板标签行，找「回收」按钮的 x 坐标。找不到返回 None。
+
+        ⚠️ **不许写死坐标** —— 图标集是动态的。实拍：22:05 第 4 格是回收，
+        22:28 同一 x 是邮件。盲点会开出发私信窗口。
+
+        做法：读标签行 → 逐格贴 `PANEL_ACTION_LABELS` → 找「回收」那一格。
+        贴不出来就当作「这颗没有回收可做」。
+        """
+        raw = self._read(pirate_ui.BOT_PANEL_LABELS_ROI)
+        if not raw:
+            return None
+        # 标签行是一行文字，按空格/标点切分后逐个贴
+        import re
+
+        parts = re.split(r"[\s/·|]+", raw)
+        label_x_start = pirate_ui.BOT_PANEL_LABELS_ROI[0]
+        label_x_end = pirate_ui.BOT_PANEL_LABELS_ROI[2]
+        total_width = label_x_end - label_x_start
+        n = max(len(parts), 1)
+        step = total_width / n
+        for i, part in enumerate(parts):
+            snapped = pirate_ui.snap_panel_label(part.strip())
+            if snapped == "回收":
+                x = int(label_x_start + step * i + step / 2)
+                say(f"  找到「回收」按钮：标签 {part!r} → x={x}")
+                return x
+        say(f"  标签行读到 {raw!r}，没有贴出「回收」")
+        return None
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
         """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
@@ -687,7 +827,20 @@ def main(argv: list[str] | None = None) -> int:
     # 日志出口。装不上就是空操作，`say()` 照常打到控制台。
     install_runner_system_log()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--targets", nargs="+", type=parse_target_assignment, required=True)
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        type=parse_target_assignment,
+        default=[],
+        help="攻击目标（g:s:p 或 g:s:p=预设名）。纯回收轮可以不给",
+    )
+    parser.add_argument(
+        "--recycle",
+        nargs="+",
+        type=parse_origin,
+        default=[],
+        help="待执行的回收目标坐标（g:s:p）。回收先于攻击执行",
+    )
     parser.add_argument(
         "--attack", action="store_true", help=f"真的用预设 {BOT_ATTACK_PRESET} 打，每个目标一发"
     )
@@ -717,6 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.max_dispatches is not None and args.max_dispatches < 1:
         parser.error("--max-dispatches 必须至少为 1")
+    if not args.targets and not args.recycle:
+        parser.error("--targets 和 --recycle 至少要给一个")
 
     import ctypes
 
@@ -730,13 +885,15 @@ def main(argv: list[str] | None = None) -> int:
         presets={item[0]: item[1] for item in args.targets if item[1] is not None} or None,
         force_reconcile=args.reconcile,
         max_dispatches=args.max_dispatches,
+        recycle=tuple(args.recycle),
     )
     mode = "真打" if args.attack else "只认目标"
     listed = ", ".join(
         f"{target}={(options.presets or {}).get(target, BOT_ATTACK_PRESET)}"
         for target in options.targets
     )
-    say(f"模式：{mode}；目标 {listed}")
+    recycle_listed = ", ".join(str(c) for c in options.recycle)
+    say(f"模式：{mode}；目标 {listed}" + (f"；回收 {recycle_listed}" if recycle_listed else ""))
 
     def go() -> int:
         driver = LiveDriver(allow_actions=args.attack)
