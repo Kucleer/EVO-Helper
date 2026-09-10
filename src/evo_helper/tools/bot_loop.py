@@ -609,7 +609,7 @@ class BotLoop(PirateLoop):
 
         # 第 3 步：残骸框 → 绿✓（三格数字不读）
         title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
-        if pirate_ui.RECYCLE_DIALOG_TITLE not in title:
+        if not pirate_ui.looks_like_recycle_dialog(title):
             say(f"  {coordinate} 残骸框没弹出来（读到 {title!r}）；跳过")
             # ⚠️ **兜底那一支要先关窗口再返回。** 点错按钮可能打开了别的窗口
             # （实拍：盲点会开出发私信窗口），不关掉的话下一步操作叠在它上面。
