@@ -87,6 +87,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, DispatchFact, phase_of
 from evo_helper.domain.models import Coordinate
@@ -111,10 +112,12 @@ from evo_helper.tools.pirate_loop import (
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
+    crop_png_base64,
     ensure_window_or_restart,
     make_console_encoding_safe,
     make_ocr,
     make_session_keeper,
+    origin,
     run_with_foreground_guard,
     say,
 )
@@ -596,6 +599,7 @@ class BotLoop(PirateLoop):
                 f"{coordinate} 面板上没有「回收」按钮，跳过这次回收",
                 payload={"target": str(coordinate), "reason": "no_recycle_button"},
             )
+            self._finish_recycle_job(coordinate, "no_debris")
             return False
 
         # 点「回收」
@@ -618,6 +622,9 @@ class BotLoop(PirateLoop):
             )
             self._reset_to_known_screen()
             self._navigator.invalidate()
+            # ⚠️ 不叫 no_debris —— 那是「去了、看清了、真没有」。这一档是**画面异常**，
+            # 两者的善后完全不同（同「实收为零 vs 解析失败」那条口径）。
+            self._finish_recycle_job(coordinate, "screen_error")
             return False
         self._driver.click(*pirate_ui.RECYCLE_DIALOG_CONFIRM, label="残骸框绿✓")
         self._driver.wait(DISPATCH_WAIT_S)
@@ -627,6 +634,7 @@ class BotLoop(PirateLoop):
         purpose = pirate_ui.DispatchPurpose.RECYCLE
         if not self._require_origin_before_dispatch(coordinate, purpose=purpose):
             self._leave_dispatch_list()
+            self._finish_recycle_job(coordinate, "origin_mismatch")
             return False
 
         # 终点三框回读（可选：回收的终点是自动填的，核一下更稳）
@@ -637,6 +645,7 @@ class BotLoop(PirateLoop):
         # 弹窗？（PR-A 六格表）
         if not self._handle_dialog(coordinate, purpose=purpose):
             self._leave_dispatch_list()
+            self._finish_recycle_job(coordinate, "dialog_rejected")
             return False
 
         # 记意图（⚠️ 必须写 attack_intents，否则 count_inflight 少数一条 ⇒ 超派）
@@ -665,13 +674,50 @@ class BotLoop(PirateLoop):
         # 点「出发！」
         if not self._launch(coordinate, "回收", purpose=purpose):
             self._leave_dispatch_list()
+            self._finish_recycle_job(coordinate, "launch_failed")
             return False
 
         # 记派遣
         self._record_dispatch(intent_id, flight)
+        self._finish_recycle_job(coordinate, "dispatched")
         say(f"  已派出回收 → {coordinate}")
         self._leave_dispatch_list()
         return True
+
+    def _finish_recycle_job(
+        self, coordinate: Coordinate, state: str, *, dispatch_id: UUID | None = None
+    ) -> None:
+        """把这一坐标的待执行作业结掉。⚠️ **不结的后果**见仓储那个方法的 docstring：
+        作业永远 `pending`，调度器每轮都当成待办再派一遍，攻击的名额被占死。
+
+        取不到仓储（轻量驱动、用例桩）就只记日志，**不抛** —— 记账不许把链路弄死。
+        """
+        try:
+            repository, _run_id = self._ensure_run()
+            job_id = repository.finish_recycle_job_for_target(
+                target=coordinate,
+                origin=self._options.origin or origin(),
+                state=state,
+                executed_at_utc=datetime.now(UTC),
+                dispatch_id=dispatch_id,
+            )
+        except Exception as error:  # noqa: BLE001 - 见 docstring：记账不许抛
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 回收作业结不掉（{state}）：{error}",
+                payload={"target": str(coordinate), "state": state},
+            )
+            return
+        if job_id is None:
+            say(f"  {coordinate} 没有待执行的回收作业可结（state={state}）")
+            return
+        record_system_log(
+            "INFO",
+            "tools.bot_loop",
+            f"回收作业 {coordinate} 结为「{state}」（job {job_id}）",
+            payload={"target": str(coordinate), "state": state, "job_id": job_id},
+        )
 
     def _find_recycle_button(self) -> int | None:
         """读面板标签行，找「回收」按钮的 x 坐标。找不到返回 None。
@@ -701,7 +747,59 @@ class BotLoop(PirateLoop):
                 say(f"  找到「回收」按钮：标签 {part!r} → x={x}")
                 return x
         say(f"  标签行读到 {raw!r}，没有贴出「回收」")
+        self._record_panel_label_evidence(raw)
         return None
+
+    #: 面板标签取证的裁片范围。⚠️ **故意比读字的 `BOT_PANEL_LABELS_ROI` 大一大圈**：
+    #: 只裁那 25px 高的条，回答得了「这几个字长什么样」，回答不了
+    #: 「标签行到底在不在这个 y 上」——而现在卡住的正是后一个问题
+    #: （实测读到 '以而 TARR ia Leh HX'，像是读到了别的行）。
+    #: 从图标排上方一直裁到下方，才看得出真正的标签行落在哪。
+    PANEL_EVIDENCE_ROI = (760, 360, 1300, 500)
+
+    #: 同 `record_unrecognised_screen` 的先例：取证要限流，否则一轮几十张。
+    PANEL_EVIDENCE_INTERVAL_S = 120.0
+    _last_panel_evidence_at: float | None = None
+
+    def _record_panel_label_evidence(self, raw: str) -> None:
+        """贴不出「回收」时，把**同一帧**的 OCR 原文 + 原分辨率裁片写进 `system_log`。
+
+        ⚠️ **只记结论不记证据等于没记**（`record_unrecognised_screen` 那条教训）。
+        这条路现在一张图都不留，于是「这颗真没残骸」和「标签行 ROI 落偏了」
+        在日志上长得一模一样 —— 而两者的善后完全相反。
+
+        ⚠️ **必须原分辨率**：480 宽缩略图上这行小字就是一团糊斑
+        （`crop_png_base64` 与 `_dialog_evidence` 的注释里各写过一次）。
+
+        取不到帧就只交文字，**不抛** —— 取证不许把链路弄死。
+        """
+        import time
+
+        moment = time.monotonic()
+        last = type(self)._last_panel_evidence_at
+        if last is not None and moment - last < self.PANEL_EVIDENCE_INTERVAL_S:
+            return
+        type(self)._last_panel_evidence_at = moment
+
+        payload: dict[str, Any] = {
+            "labels_roi": list(pirate_ui.BOT_PANEL_LABELS_ROI),
+            "labels_raw_text": raw,
+            "attack_button": list(pirate_ui.BOT_ATTACK_BUTTON),
+            "label_y_offset": pirate_ui.BOT_PANEL_LABEL_Y_OFFSET,
+            "evidence_roi": list(self.PANEL_EVIDENCE_ROI),
+        }
+        try:
+            frame, _read = self._frame_reader()
+            payload["capture_size"] = list(getattr(frame, "size", ()) or ())
+            payload["panel_png_base64"] = crop_png_base64(frame.crop(self.PANEL_EVIDENCE_ROI))
+        except Exception as error:  # noqa: BLE001 - 见 docstring：取证不许抛
+            payload["evidence_error"] = str(error)
+        record_system_log(
+            "WARNING",
+            "tools.bot_loop",
+            f"面板标签行贴不出「回收」：读到 {raw!r}（ROI {pirate_ui.BOT_PANEL_LABELS_ROI}）",
+            payload=payload,
+        )
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
         """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
