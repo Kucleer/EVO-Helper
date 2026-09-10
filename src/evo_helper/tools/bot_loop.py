@@ -607,6 +607,17 @@ class BotLoop(PirateLoop):
         title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
         if pirate_ui.RECYCLE_DIALOG_TITLE not in title:
             say(f"  {coordinate} 残骸框没弹出来（读到 {title!r}）；跳过")
+            # ⚠️ **兜底那一支要先关窗口再返回。** 点错按钮可能打开了别的窗口
+            # （实拍：盲点会开出发私信窗口），不关掉的话下一步操作叠在它上面。
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 点回收后残骸框没弹出来（读到 {title!r}），"
+                f"可能点错了按钮；已复位画面",
+                payload={"target": str(coordinate), "dialog_title": title},
+            )
+            self._reset_to_known_screen()
+            self._navigator.invalidate()
             return False
         self._driver.click(*pirate_ui.RECYCLE_DIALOG_CONFIRM, label="残骸框绿✓")
         self._driver.wait(DISPATCH_WAIT_S)
