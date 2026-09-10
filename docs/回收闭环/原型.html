@@ -123,6 +123,31 @@
   tr.key td { background: var(--raised); font-weight: 600; font-size: 15px; border-bottom: 1px solid var(--line); }
   tr.key td:first-child { box-shadow: inset 3px 0 0 var(--knob); }
 
+  /* 排序列要一眼看出来——这一版的主线就是「按累计战损排」，
+     不标出来的话读者还会以为排序键是右边那个换算值。 */
+  th.sortcol { color: var(--knob); border-bottom-color: var(--knob); }
+  td.sortcol { background: var(--raised); font-weight: 600; }
+  /* 降级列：在场，但明确不参与判据。 */
+  th.aside, td.aside { color: var(--ink-faint); }
+
+  /* 状态标：逐趟明细那张表里，状态必须能分辨，不能只靠一句中文糊过去。
+     边框用 currentColor，深浅两套主题各自跟着字色走。 */
+  .st {
+    display: inline-block; font-family: var(--mono); font-size: 11.5px;
+    border: 1px solid currentColor; border-radius: 3px;
+    padding: 0 5px; white-space: nowrap; line-height: 1.7;
+  }
+  .st-idle { color: var(--ink-faint); }
+  .st-fly  { color: var(--knob); }
+  .st-ok   { color: var(--scan); }
+  .st-wait { color: var(--atk); }
+  .st-bad  { color: var(--warn); }
+  .sample {
+    display: inline-block; margin: 18px 0 0; padding: 2px 9px;
+    font-family: var(--mono); font-size: 12px; color: var(--atk);
+    border: 1px dashed var(--atk); border-radius: 4px;
+  }
+
   .knob-tag {
     display: inline-block; font-family: var(--mono); font-size: 12px;
     color: var(--knob); background: var(--knob-wash);
@@ -236,24 +261,31 @@
 <body>
 <div class="wrap">
 <header>
-  <p class="eyebrow">EVO-Helper · 残骸回收 · 原型 v1</p>
+  <p class="eyebrow">EVO-Helper · 残骸回收 · 原型 v2</p>
   <h1>残骸回收：概览与配置</h1>
   <p class="lede">
     这一页是拿来 review 的原型，不是一个在跑的功能。
     十步闭环里只有前两步是自动发生的，残骸那一列一个数都还没有，
-    而换算系数 k 只有一个样本、那次读数还已被证伪。三件事页面上都照实画出来。
+    07 那张逐趟明细里全是示例行。这几件事页面上都照实画出来（清单见 08）。
+  </p>
+  <p class="lede" style="margin-top:12px; font-size:15px">
+    <strong>v2 的主要改动：把换算系数 k 从主线上撤下来。</strong>
+    统一的正数 k 是个标量倍乘，<code>k × Σ战损</code> 和 <code>Σ战损</code> 排出来的顺序完全一样，
+    所以目标池<strong>直接按累计战损排</strong>，k 只留作量级换算、放在末列。
+    k 的标定<strong>不是这个功能的前置条件</strong>，页面上也不为它做人工确认界面。
   </p>
 </header>
 
 <h2><span class="n">01</span>闭环长什么样，以及缺哪几步</h2>
 <p>
   ①② 是攻击链已经在做的，游戏侧自动产生残骸。
-  从 ③ 起一步都不存在。<strong>关键是 ⑨→⑩ 那条回边</strong>——
-  没有它，③ 的预估永远停在同一个常数上，派出去了也不知道收回多少。
+  从 ③ 起一步都不存在。<strong>关键是 ⑨ 读回实收</strong>——
+  没有它，派出去多少、收回多少永远对不上账，07 那张逐趟明细也就填不满。
+  （⑩ 存档同时把 k 从 1 个样本变成一个分布，但那是<strong>附带产物</strong>，不是这条链跑起来的前提。）
 </p>
 
 <figure class="scroller">
-  <svg viewBox="0 0 1000 600" role="img" aria-label="残骸回收十步闭环示意图。攻击打掉舰队与残骸生成两步已自动发生，用实线框表示。其余八步用虚线框表示尚未实现：按累计战损预估、水位线闸、派出回收、记账、舰队返航、回收邮件、读回实收、存档三元组，最后回到预估形成闭环。">
+  <svg viewBox="0 0 1000 600" role="img" aria-label="残骸回收十步闭环示意图。攻击打掉舰队与残骸生成两步已自动发生，用实线框表示。其余八步用虚线框表示尚未实现：按累计战损排序选靶、水位线闸、派出回收、记账、舰队返航、回收邮件、读回实收、存档三元组，最后回填账本形成闭环。">
     <defs>
       <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
         <polygon points="0,0 10,4 0,8" fill="currentColor"></polygon>
@@ -280,15 +312,15 @@
 
       <text x="750" y="26" font-size="12" font-weight="600" fill="var(--warn)" font-family="IBM Plex Mono, monospace" letter-spacing="0.08em">③–⑩ 一步都没有</text>
 
-      <text x="237" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">拿预估过闸</text>
+      <text x="237" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">拿候选过闸</text>
       <text x="477" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">放行</text>
       <text x="717" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">已派出</text>
 
       <rect x="30" y="188" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
-      <text x="46" y="212" font-size="13.5" font-weight="600">③ 预估</text>
+      <text x="46" y="212" font-size="13.5" font-weight="600">③ 排序选靶</text>
       <text x="164" y="205" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
-      <text x="46" y="231" font-size="11.5" fill="var(--ink-muted)">按累计战损</text>
-      <text x="46" y="250" font-size="11.5" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">残骸 ≈ 战损 × k</text>
+      <text x="46" y="231" font-size="11.5" fill="var(--ink-muted)">直接按累计战损排</text>
+      <text x="46" y="250" font-size="11.5" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">× k 只换量纲，不改序</text>
 
       <rect x="270" y="188" width="175" height="74" rx="6" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.6" stroke-dasharray="5 3"></rect>
       <text x="286" y="212" font-size="13.5" font-weight="600" fill="var(--knob)">④ 水位线闸</text>
@@ -299,25 +331,25 @@
       <rect x="510" y="188" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
       <text x="526" y="212" font-size="13.5" font-weight="600">⑤ 派出回收</text>
       <text x="644" y="205" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
-      <text x="526" y="231" font-size="11.5" fill="var(--ink-muted)">六步链路，「出发」是</text>
-      <text x="526" y="250" font-size="11.5" fill="var(--ink-muted)">唯一真派出的那一下</text>
+      <text x="526" y="231" font-size="11.5" fill="var(--ink-muted)">闸门在简报页：读到任务</text>
+      <text x="526" y="250" font-size="11.5" fill="var(--ink-muted)">= 「回收」才点出发</text>
 
       <rect x="750" y="188" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
       <text x="766" y="212" font-size="13.5" font-weight="600">⑥ 记账</text>
       <text x="884" y="205" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
       <text x="766" y="231" font-size="11.5" fill="var(--ink-muted)">占一条线，记一笔</text>
-      <text x="766" y="250" font-size="11.5" fill="var(--ink-muted)">预估待收</text>
+      <text x="766" y="250" font-size="11.5" fill="var(--ink-muted)">在途待收</text>
 
       <path d="M 925 225 L 962 225 L 962 417 L 928 417" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#ar)"></path>
       <text x="948" y="316" text-anchor="end" font-size="10.5" fill="var(--ink-muted)">在途飞行</text>
 
       <path d="M 117 380 L 117 266" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#ar)"></path>
-      <text x="130" y="316" font-size="11" fill="var(--warn)" font-weight="600">存档供校准</text>
+      <text x="130" y="316" font-size="11" fill="var(--warn)" font-weight="600">实收回填账本</text>
       <text x="130" y="333" font-size="11" fill="var(--ink-muted)">闭环就合在这一条边上</text>
 
       <text x="717" y="370" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">回港生成邮件</text>
       <text x="477" y="370" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">读出实收资源</text>
-      <text x="237" y="370" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">实收 ÷ 战损</text>
+      <text x="237" y="370" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">凑齐三元组</text>
 
       <rect x="750" y="380" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
       <text x="766" y="404" font-size="13.5" font-weight="600">⑦ 舰队返航</text>
@@ -335,23 +367,23 @@
       <text x="286" y="404" font-size="13.5" font-weight="600">⑨ 读回实收</text>
       <text x="404" y="397" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
       <text x="286" y="423" font-size="11.5" fill="var(--ink-muted)">金属 / 晶体 / 气体</text>
-      <text x="286" y="442" font-size="11.5" fill="var(--ink-faint)">这是 k 的唯一数据源</text>
+      <text x="286" y="442" font-size="11.5" fill="var(--warn)">解析失败 ≠ 实收为零</text>
 
       <rect x="30" y="380" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
       <text x="46" y="404" font-size="13.5" font-weight="600">⑩ 存档三元组</text>
       <text x="164" y="397" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
-      <text x="46" y="423" font-size="11.5" fill="var(--ink-muted)">实收 ÷ 战损 → 新 k</text>
-      <text x="46" y="442" font-size="11.5" fill="var(--ink-faint)">落库、展示、人确认才生效</text>
+      <text x="46" y="423" font-size="11.5" fill="var(--ink-muted)">(换算值, 面板读数, 实收)</text>
+      <text x="46" y="442" font-size="11.5" fill="var(--ink-faint)">落库存档；k 只做量级参考</text>
 
       <line x1="30" y1="492" x2="970" y2="492" stroke="var(--line)" stroke-width="1"></line>
       <text x="30" y="518" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">实线框 = 现在自动发生的两步　　虚线框 = 还不存在的八步　　「未实现」标记逐格标出</text>
-      <text x="30" y="538" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">紫框 = 用户可调的旋钮（水位线）　　本页所有「残骸」数据为空，正是因为 ③–⑩ 一步都没接上</text>
-      <text x="30" y="565" font-size="11.5" fill="var(--warn)" font-weight="600">⑨ 缺失 ⇒ 整条链是开环的：派出去了，不知道收回多少，也就永远不知道该不该继续派。</text>
+      <text x="30" y="538" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">紫框 = 用户可调的旋钮（水位线）　　本页所有「残骸」实测数据为空，正是因为 ③–⑩ 一步都没接上</text>
+      <text x="30" y="565" font-size="11.5" fill="var(--warn)" font-weight="600">⑨ 缺失 ⇒ 整条链是开环的：派出去了，不知道收回多少，账就永远对不上。</text>
     </g>
   </svg>
   <figcaption>
     十步闭环。<strong>只有 ①② 是实线</strong>——它们由攻击链带出来，不需要新代码。
-    ③–⑩ 全是虚线，每格右上角标了「未实现」。回边 ⑩→③ 是这个功能能不能自我校正的全部依据。
+    ③–⑩ 全是虚线，每格右上角标了「未实现」。回边 ⑩→③ 是这个功能能不能把账对上的全部依据。
   </figcaption>
 </figure>
 
@@ -417,9 +449,40 @@
     <tr><td>趟数</td><td class="num">213</td><td class="empty">—</td></tr>
     <tr><td>收益（金属 + 晶体 + 气体）</td><td class="num">305M</td><td class="empty">—</td></tr>
     <tr class="key"><td>每线小时收益</td><td class="num">1.17M</td><td class="empty">—</td></tr>
-    <tr><td>覆盖率<span class="sub">已读回 / 已派出</span></td><td class="num">92.6%</td><td class="empty">—</td></tr>
+    <tr>
+      <td>报告覆盖率<span class="sub">已读回 ÷ 已派出</span></td>
+      <td class="num">94.2%<span class="sub">已读回 210 / 已派出 223</span></td>
+      <td class="empty">—<span class="sub">已读回 0 / 已派出 0</span></td>
+    </tr>
+    <tr>
+      <td>保护期排除条数<span class="sub">本周期新写入的 8 小时排除</span></td>
+      <td class="empty">—<span class="sub">攻击链没有按周期单列过</span></td>
+      <td class="empty">—<span class="sub">回收一发都没派，探针还没读数</span></td>
+    </tr>
+    <tr>
+      <td>残骸被拒比例<span class="sub">派出前弹「没有可执行的任务」的占比</span></td>
+      <td class="empty">不适用</td>
+      <td class="empty">—<span class="sub">分母为 0（0 / 0）</span></td>
+    </tr>
   </tbody>
 </table>
+</div>
+<p>
+  <strong>覆盖率两个数都要给。</strong>一个百分比看不出分母有多小——
+  「10 发读回 9 发」和「223 发读回 210 发」都是九成上下，但可信度差得远。
+  攻击那一格是 <strong>2026-09-08 全天（UTC+8）直接计数</strong>：
+  已派出 223、已读回 210、覆盖率 94.2%（<code>attack_dispatches</code> 左连
+  <code>battle_reports.dispatch_id</code>）。⚠️ 这个数会随补录**往上走**——
+  今天没读回的，明天补回来就算进去了，所以同一天的数过几天再看会变大。
+</p>
+<div class="note">
+  <p><strong>为什么要单列「保护期排除条数」。</strong>
+  撞保护期（攻击被拒）和残骸被拒（没残骸），游戏弹的是<strong>同一句「没有可执行的任务」</strong>。
+  照搬攻击那条分支的后果是：<strong>一颗完全打得了的 bot 被排出攻击候选池 8 小时，
+  而页面上和日志上都看不出异常。</strong>
+  这个计数是那个坑<strong>唯一的探针</strong>——它要是在回收开跑之后突然抬头，就说明两条链路串了。</p>
+  <p><strong>「残骸被拒比例」量的是另一件事</strong>：派出前就被游戏挡回来的占比。
+  它高，说明选靶用的累计战损跟「现场还有没有残骸」对不上（残骸会衰减、也会被别人捡走）。</p>
 </div>
 <p>
   「每线小时」这一行加重，只因为它是攻击与残骸<strong>唯一能直接并排比的量纲</strong>。
@@ -427,7 +490,8 @@
 </p>
 <p>
   残骸那一列现在<strong>全是「—」</strong>，因为一发都还没派出去——这正是要展示的状态，不填假数。
-  等有数了，样本低于门槛时标「不可信」，判据<strong>复用现有的 <code>LOW_RECOVERY_THRESHOLD</code></strong>，不另造门槛。
+  等有数了，<strong>报告覆盖率低于门槛</strong>时整列标「不可信」，
+  判据<strong>复用现有的 <code>LOW_RECOVERY_THRESHOLD</code></strong>，不另造门槛。
 </p>
 <div class="note">
   <p><strong>撞名提醒。</strong>页面上已有的「回收率」指的是<strong>战报</strong>回收率。
@@ -480,57 +544,166 @@
 <table>
   <thead>
     <tr>
-      <th>坐标</th><th>打过几次</th><th>累计战损<span class="sub">单位</span></th>
-      <th>按 k 换算<span class="sub">战损 × k，非收益预测</span></th><th>距上次攻击</th><th>从哪颗星出发</th>
+      <th>坐标</th><th>打过几次</th>
+      <th class="sortcol">累计战损 ↓<span class="sub">单位 · 这一列就是排序键</span></th>
+      <th>距上次攻击</th><th>从哪颗星出发</th>
+      <th class="aside">按 k 换算<span class="sub">仅供量级参考，不参与排序</span></th>
     </tr>
   </thead>
   <tbody>
-    <tr><td class="num">1:497:17</td><td class="num">4</td><td class="num">19,940</td><td class="num">27.1M</td><td class="empty">—</td><td class="num">1:55:6</td></tr>
-    <tr><td class="num">5:267:17</td><td class="num">4</td><td class="num">19,870</td><td class="num">27.0M</td><td class="empty">—</td><td class="num">5:261:8</td></tr>
-    <tr><td class="num">1:66:15</td><td class="num">4</td><td class="num">19,140</td><td class="num">26.0M</td><td class="empty">—</td><td class="num">1:55:6</td></tr>
-    <tr><td class="num">5:319:10</td><td class="num">4</td><td class="num">18,290</td><td class="num">24.8M</td><td class="empty">—</td><td class="num">5:261:8</td></tr>
-    <tr><td class="num">4:277:14</td><td class="num">3</td><td class="num">14,960</td><td class="num">20.3M</td><td class="empty">—</td><td class="num">4:277:15</td></tr>
-    <tr><td class="num">1:152:20</td><td class="num">4</td><td class="num">14,850</td><td class="num">20.2M</td><td class="empty">—</td><td class="num">1:55:6</td></tr>
-    <tr><td class="num">5:290:8</td><td class="num">4</td><td class="num">13,904</td><td class="num">18.9M</td><td class="empty">—</td><td class="num">5:261:8</td></tr>
+    <tr><td class="num">1:497:17</td><td class="num">4</td><td class="num sortcol">19,940</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">27.1M</td></tr>
+    <tr><td class="num">5:267:17</td><td class="num">4</td><td class="num sortcol">19,870</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">27.0M</td></tr>
+    <tr><td class="num">1:66:15</td><td class="num">4</td><td class="num sortcol">19,140</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">26.0M</td></tr>
+    <tr><td class="num">5:319:10</td><td class="num">4</td><td class="num sortcol">18,290</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">24.8M</td></tr>
+    <tr><td class="num">4:277:14</td><td class="num">3</td><td class="num sortcol">14,960</td><td class="empty">—</td><td class="num">4:277:15</td><td class="num aside">20.3M</td></tr>
+    <tr><td class="num">1:152:20</td><td class="num">4</td><td class="num sortcol">14,850</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">20.2M</td></tr>
+    <tr><td class="num">5:290:8</td><td class="num">4</td><td class="num sortcol">13,904</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">18.9M</td></tr>
   </tbody>
 </table>
 </div>
 <p>
-  <code>按 k 换算 = 累计战损 × k</code>，<code>k = 1,357 资源/单位</code>。
-  ⚠️ 这一列<strong>只是把「单位数」换算成「资源数」，不是收益预测</strong>。
-  「距上次攻击」写成「—」是因为那一列我没有实测值，编一个会看起来像真的。
-  表里只有这 7 个坐标，同理：再往下补就得编坐标。
+  <strong>排序键就是「累计战损」本身</strong>（紫色那一列），不再是换算之后的资源数。
+  末列 <code>按 k 换算 = 累计战损 × k</code>（<code>k = 1,357 资源/单位</code>）只是把「单位数」
+  换成一个便于口头描述的量级，<strong>删掉它，上面 7 行的先后顺序一个字都不会变</strong>。
 </p>
 <p>
+  「距上次攻击」写成「—」是因为那一列我没有实测值，编一个会看起来像真的。
+  表里只有这 7 个坐标，同理：再往下补就得编坐标。
   <code>4:277:14</code> 是<strong>唯一实际读到过残骸的那颗</strong>（残骸框读到 20.3M，累计战损 14,960 单位）——
-  k 就是这么来的，所以它那一行的「预估」和「实测」当然对得上，这不构成验证。
+  k 就是这么来的，所以它那一行的两个数当然对得上，这不构成验证。
 </p>
 
 <div class="note loud">
-  <p class="hd">⚠️ 整张表的绝对值都不可信</p>
+  <p class="hd">⚠️ 末列的绝对值不可信 —— 但它不在关键路径上</p>
   <p>
-    <strong>k = 1,357 来自 n = 1 的一次观测，而那次读数本身已被证伪</strong>——
-    确认之后游戏弹了「没有可执行的任务」，20 分钟后回收按钮就消失了。
-    换句话说，唯一一次读到的残骸数，和游戏自己的判断是矛盾的。
+    <strong>k 只影响量级换算，不影响排序。</strong>
+    统一的正数 k 是个标量倍乘：<code>k × Σ战损</code> 和 <code>Σ战损</code> 排出来的顺序<strong>完全一样</strong>。
+    所以 <strong>k 的标定不是这个功能的前置条件</strong>，也不需要一个「人工确认 k」的界面——
+    这一版把原来那套确认机制整个撤掉了。
   </p>
   <p>
-    <strong>这张表只用来说明「排序长什么样」</strong>，不要拿任何一格的数字做决定。
-    （用户口径 2026-09-09：「只要记录数据就可以了，考虑收益不在你的范围内」——
-    所以这一页不做收益结论，只负责把数记下来、摆出来。）
+    绝对值仍然不可信，理由照旧：<strong>k = 1,357 来自 n = 1 的一次观测，而那次读数本身已被证伪</strong>——
+    确认之后游戏弹了「没有可执行的任务」，20 分钟后回收按钮就消失了。
     还有一条会让 k 系统性走偏的机制：<code>defender_losses</code> 是<strong>单位数不是造价</strong>，
     同样打掉 3,000 单位，全是轻型机和全是无畏舰能差一个量级。
   </p>
   <p>
-    ⚠️ <strong>在实机读回更多样本之前，凡是用 k 换算出来的数都只能当量级参考。</strong>
-    下一步就是去实机读十几处残骸框，把 k 从一个点变成一个分布。
+    ⇒ <strong>凡是用 k 换算出来的数只能当量级参考，别拿它跟攻击那边的收益并排比。</strong>
+    （用户口径 2026-09-09：「只要记录数据就可以了，考虑收益不在你的范围内」——
+    这一页不做收益结论，只负责把数记下来、摆出来。）
+    实机读十几处残骸框、把 k 从一个点变成一个分布，仍然值得做，
+    但它是<strong>能并行的支线</strong>，不挡邮件那一半，也不挡第一发派遣。
   </p>
 </div>
 
-<h2><span class="n">07</span>这一页刻意没有粉饰的三件事</h2>
+<h2><span class="n">07</span>逐趟明细：面板读数 → 派遣 → 邮件实收</h2>
+<p>
+  闭环的落点在这张表上。一行一趟，把<strong>同一趟</strong>的三次读数摆在一行里：
+  开面板时看到的残骸框、派出去的那一下、以及回收邮件里真正到账的三种资源。
+  <strong>对不上的时候，得能一眼看出是在哪一步断的。</strong>
+</p>
+<p class="sample">⚠️ 整张表是示例数据，非实测 —— 一发都还没派过，真实的这张表现在是空的</p>
+<div class="scroller">
+<table>
+  <thead>
+    <tr>
+      <th>时刻<span class="sub">UTC+0</span></th>
+      <th>坐标</th>
+      <th>面板读数<span class="sub">残骸框 金 / 晶 / 气</span></th>
+      <th>派遣状态</th>
+      <th>预期返回</th>
+      <th>邮件实收<span class="sub">金 / 晶 / 气</span></th>
+      <th>解析状态</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="num">09-08 23:02</td><td class="num">5:267:17</td>
+      <td class="num">9.2M / 5.6M / 2.8M</td>
+      <td><span class="st st-fly">已派出</span></td>
+      <td class="num">09-09 00:37</td>
+      <td class="empty">—</td>
+      <td><span class="st st-idle">待返回</span><span class="sub">还没回来，正常</span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 22:14</td><td class="num">1:497:17</td>
+      <td class="num">8.4M / 5.1M / 2.6M</td>
+      <td><span class="st st-idle">没派</span></td>
+      <td class="empty">—</td>
+      <td class="empty">—</td>
+      <td><span class="st st-idle">不适用</span><span class="sub">纯观察记录：只开面板读了个数，没点出发</span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 21:40</td><td class="num">8:117:6</td>
+      <td class="empty">读不到<span class="sub">面板上没有残骸框</span></td>
+      <td><span class="st st-idle">没派</span></td>
+      <td class="empty">—</td>
+      <td class="empty">—</td>
+      <td><span class="st st-wait">被拒</span><span class="sub">弹「没有可执行的任务」；计入「残骸被拒比例」，⚠️ <strong>不许</strong>写保护期排除</span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 20:05</td><td class="num">1:66:15</td>
+      <td class="num">7.8M / 4.7M / 2.4M</td>
+      <td><span class="st st-ok">已返回</span></td>
+      <td class="num">09-08 21:33</td>
+      <td class="empty">—</td>
+      <td><span class="st st-wait">未匹配到邮件</span><span class="sub">舰队回来了，按坐标 + 预期到达时刻没认领到；可能邮件还没生成，也可能认领条件写错了</span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 18:20</td><td class="num">5:319:10</td>
+      <td class="num">6.1M / 3.7M / 1.9M</td>
+      <td><span class="st st-ok">已返回</span></td>
+      <td class="num">09-08 19:44</td>
+      <td class="num">0 / 0 / 0</td>
+      <td><span class="st st-ok">已解析</span><span class="sub">邮件在，三格都读出来了，就是零 —— 这是一条<strong>有效数据</strong></span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 16:52</td><td class="num">1:152:20</td>
+      <td class="num">5.4M / 3.3M / 1.7M</td>
+      <td><span class="st st-ok">已返回</span></td>
+      <td class="num">09-08 18:10</td>
+      <td class="empty">读不出</td>
+      <td><span class="st st-bad">解析失败</span><span class="sub">邮件找到了，三格没解析出来 —— ⚠️ 跟上一行的「零」<strong>是两回事</strong>，不许合并成一档</span></td>
+    </tr>
+    <tr>
+      <td class="num">09-08 14:30</td><td class="num">5:290:8</td>
+      <td class="num">4.9M / 3.0M / 1.5M</td>
+      <td><span class="st st-ok">已返回</span></td>
+      <td class="num">09-08 15:58</td>
+      <td class="num">4.6M / 2.8M / 1.4M</td>
+      <td><span class="st st-ok">已解析</span><span class="sub">顺利的那一条，全页只有这一行是顺的</span></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <p><strong>「实收为零」和「解析失败」必须分成两档。</strong>
+  合成一档的话，<code>0</code> 会被当成一次真实的空手而归喂进统计，
+  <strong>解析器坏掉会伪装成「残骸都没了」</strong>，而且越坏越像是这个功能不划算。
+  上面两行的区别就是这个：一行是<strong>三格都读出来了、值是 0</strong>，
+  另一行是<strong>三格根本没读出来</strong>。</p>
+</div>
+
+<h3>派遣状态只有三档：没派 / 已派出 / 已返回</h3>
+<p>
+  <strong>没有「派了但不知道成没成」这一档。</strong>
+  用户口径（2026-09-09）：<strong>「派遣回收不会失败，前提是你确认的是派遣回收。」</strong>
+</p>
+<p>
+  ⇒ <strong>闸门在简报页</strong>：点「出发」之前先读简报页上的任务类型，
+  <strong>读到「回收」才点，读不出就不点</strong>。
+  所以这一列不需要「重试」，也不需要「派遣失败」——
+  真出问题的地方在<strong>点之前</strong>（被拒 / 读不出任务类型），不在点之后。
+  被拒的那一趟见上表第三行：它落在「没派」，不占航线，也不该产生任何保护期排除。
+</p>
+
+<h2><span class="n">08</span>这一页刻意没有粉饰的四件事</h2>
 <ul>
   <li><strong>残骸那一列全是空的</strong>——功能一发都没派过，04 那张表的「—」是真实状态，不是加载中。</li>
-  <li><strong>闭环里八步不存在</strong>——01 图上逐格标了「未实现」，缺的不是收尾工作，缺的是 ⑨ 那条回边。</li>
-  <li><strong>换算系数 k 只有一个样本，而且那次读数已被证伪</strong>——06 的警告块是这一页最该先读的一段。</li>
+  <li><strong>07 那张逐趟明细整张是编的</strong>——它画的是「表长什么样、能表达哪几种状态」，不是「已经收了多少」。真实的这张表现在一行都没有。</li>
+  <li><strong>闭环里八步不存在</strong>——01 图上逐格标了「未实现」，缺的不是收尾工作，缺的是 ⑨ 读回实收。</li>
+  <li><strong>换算系数 k 只有一个样本，而且那次读数已被证伪</strong>——但这一版已经把它挪出关键路径：它只出现在目标池的末列，删掉不影响排序，也不影响任何判据。</li>
 </ul>
 <p>
   这个原型是<strong>给 review 用的决策材料</strong>，不是一个已经在跑的功能的仪表盘。
