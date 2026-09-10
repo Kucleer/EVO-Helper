@@ -2146,7 +2146,7 @@ class MissionScheduler:
                     "INFO",
                     "application.mission_scheduler",
                     f"回收决策：{target} 选中（acc {result.acc_before}→{result.acc_after}，"
-                    f"档位 {rate/10:.1f}），已生成待执行作业",
+                    f"档位 {rate / 10:.1f}），已生成待执行作业",
                     payload={
                         "target": str(target),
                         "origin": str(origin),
@@ -2161,7 +2161,7 @@ class MissionScheduler:
                     "DEBUG",
                     "application.mission_scheduler",
                     f"回收决策：{target} 未选中（acc {result.acc_before}→{result.acc_after}，"
-                    f"档位 {rate/10:.1f}）",
+                    f"档位 {rate / 10:.1f}）",
                     payload={
                         "target": str(target),
                         "source_dispatch_id": str(source_dispatch_id),

@@ -651,9 +651,7 @@ def _recycle_card(
     )
 
 
-def _recycle_stats(
-    session_factory: sessionmaker[Session], since: datetime
-) -> tuple[int, int, int]:
+def _recycle_stats(session_factory: sessionmaker[Session], since: datetime) -> tuple[int, int, int]:
     """本周期回收统计：(应尝试, 已派出, 未派出)。
 
     ⚠️ **页面上不拆「未派出」的原因**（用户口径 2026-09-10）。
@@ -663,24 +661,39 @@ def _recycle_stats(
     from evo_helper.storage import models as orm
 
     with session_factory() as session:
-        should_try = session.scalar(
-            select(func.count()).select_from(orm.RecycleDecisionRow).where(
-                orm.RecycleDecisionRow.decided_at_utc >= since,
-                orm.RecycleDecisionRow.selected.is_(True),
+        should_try = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleDecisionRow)
+                .where(
+                    orm.RecycleDecisionRow.decided_at_utc >= since,
+                    orm.RecycleDecisionRow.selected.is_(True),
+                )
             )
-        ) or 0
-        dispatched = session.scalar(
-            select(func.count()).select_from(orm.RecycleJobRow).where(
-                orm.RecycleJobRow.created_at_utc >= since,
-                orm.RecycleJobRow.state == "dispatched",
+            or 0
+        )
+        dispatched = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.created_at_utc >= since,
+                    orm.RecycleJobRow.state == "dispatched",
+                )
             )
-        ) or 0
-        not_dispatched = session.scalar(
-            select(func.count()).select_from(orm.RecycleJobRow).where(
-                orm.RecycleJobRow.created_at_utc >= since,
-                orm.RecycleJobRow.state.not_in(("dispatched", "pending")),
+            or 0
+        )
+        not_dispatched = (
+            session.scalar(
+                select(func.count())
+                .select_from(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.created_at_utc >= since,
+                    orm.RecycleJobRow.state.not_in(("dispatched", "pending")),
+                )
             )
-        ) or 0
+            or 0
+        )
     return int(should_try), int(dispatched), int(not_dispatched)
 
 

@@ -4019,7 +4019,11 @@ class SqlAlchemyRepository:
             ]
 
     def mark_recycle_job(
-        self, job_id: int, *, state: str, executed_at_utc: datetime | None = None,
+        self,
+        job_id: int,
+        *,
+        state: str,
+        executed_at_utc: datetime | None = None,
         dispatch_id: UUID | None = None,
     ) -> None:
         """更新作业状态。未派出的原因只落 system_log，不上页面。"""
