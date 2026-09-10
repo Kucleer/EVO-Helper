@@ -78,6 +78,18 @@ BOT_PANEL_LABELS_ROI = (780, 430, 1280, 455)
 BOT_PANEL_CELL_PITCH = 96
 BOT_PANEL_FIRST_CELL_X = 821
 
+#: 第一排图标在纵向上的亮区（实拍量得）。⚠️ **点图标必须落在这一段里。**
+#:
+#: 2026-09-11 实拍三张、四格全一致：图标亮区 y 362…416、中心 y≈389，
+#: 而标签文字在 y 429…440 —— **中间 417…428 是空隙**。
+#: `BOT_ATTACK_BUTTON` 的 y=398 正在图标里，这也是攻击那条链路一直点得中的原因。
+#:
+#: ⚠️ 回收原来点 `label_y - 15 = 420`，**落在这条空隙里**：整夜 7 成 6 败，
+#: 失败那些读到的 `'UF HK'` / `'UF A'` 是残骸框根本没开、ROI 读到了底层面板。
+#: 同一排的按钮没有理由用两个不同的 y —— 这正是本文件开头
+#: `(1032, 540)` 那条注释记下的同一类错误。
+BOT_PANEL_ICON_Y_RANGE = (362, 416)
+
 #: 单格标签的裁剪半宽与纵向范围（相对整屏）。窄一点，免得吃进隔壁那格。
 BOT_PANEL_LABEL_HALF_WIDTH = 36
 BOT_PANEL_LABEL_Y_RANGE = (426, 446)
@@ -723,6 +735,7 @@ __all__ = [
     "ATTACK_PRESET_COUNTS",
     "ATTACK_PRESET_NAME",
     "BOT_ATTACK_BUTTON",
+    "BOT_PANEL_ICON_Y_RANGE",
     "BRIEFING_LAUNCH_BUTTON",
     "BRIEFING_MISSION_ROI",
     "DISPATCH_CONFIRM",
