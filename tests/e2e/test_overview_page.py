@@ -819,6 +819,8 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
         "收割者碎片",
         "挂机",
         "利用率",
+        "残骸趟数",
+        "残骸占线",
     ]
     # 并排，不是分在两张表里。
     assert columns.index("读回战报") < columns.index("合金碎片")
@@ -1218,7 +1220,7 @@ def test_the_utilisation_denominator_is_the_whole_period_not_the_run_time(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-19 今天")[-1] == "2%"
+    assert _period_cells(html, "08-19 今天")[-3] == "2%"
 
 
 def test_a_period_whose_line_count_was_recorded_is_not_marked_as_a_bound(
@@ -1273,7 +1275,7 @@ def test_a_period_without_a_recorded_line_count_falls_back_to_the_peak_and_says_
     html = client.get("/overview").text
     cells = _period_cells(html, "08-19 今天")
 
-    assert cells[-1] == "≤ 10%"
+    assert cells[-3] == "≤ 10%"
     # 方向必须写在页面上，不只是写在注释里。
     assert "利用率因此偏高" in html
 
@@ -1296,7 +1298,7 @@ def test_a_period_estimated_from_the_peak_never_exceeds_one_hundred_percent(
             factory, run_id, dispatched_at_utc=NOW - timedelta(hours=5) + timedelta(minutes=minutes)
         )
 
-    percent = _period_cells(client.get("/overview").text, "08-19 今天")[-1]
+    percent = _period_cells(client.get("/overview").text, "08-19 今天")[-3]
 
     assert percent.startswith("≤ ")
     assert int(percent.removeprefix("≤ ").removesuffix("%")) <= 100
@@ -1345,7 +1347,7 @@ def test_a_period_without_any_heartbeat_says_no_data_instead_of_zero(
     html = client.get("/overview").text
 
     # 挂机那一格在利用率左边。
-    assert _period_cells(html, "08-19 今天")[-2] == "—"
+    assert _period_cells(html, "08-19 今天")[-4] == "—"
     assert "—" in _utilisation_card(html)
 
 
@@ -1371,7 +1373,7 @@ def test_the_uptime_column_reports_the_hours_the_scheduler_was_up(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-19 今天")[-2] == "3.5h"
+    assert _period_cells(html, "08-19 今天")[-4] == "3.5h"
     assert "3.5 小时" in _utilisation_card(html)
 
 
@@ -1392,7 +1394,7 @@ def test_a_killed_process_does_not_keep_the_uptime_growing(
     _uptime(repository, start=day + timedelta(hours=1), last_beat=day + timedelta(hours=2))
     _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=2))
 
-    assert _period_cells(client.get("/overview").text, "08-19 今天")[-2] == "1.0h"
+    assert _period_cells(client.get("/overview").text, "08-19 今天")[-4] == "1.0h"
 
 
 def test_a_day_before_the_first_beat_still_says_no_data(
@@ -1416,5 +1418,5 @@ def test_a_day_before_the_first_beat_still_says_no_data(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-18")[-2] == "—"
-    assert _period_cells(html, "08-19 今天")[-2] == "≥ 1.0h"
+    assert _period_cells(html, "08-18")[-4] == "—"
+    assert _period_cells(html, "08-19 今天")[-4] == "≥ 1.0h"

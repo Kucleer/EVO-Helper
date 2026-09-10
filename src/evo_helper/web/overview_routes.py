@@ -308,6 +308,10 @@ class PeriodRow:
     uptime_hours: float | None
     uptime_partial: bool
     is_total: bool
+    #: 回收趟数（recycle_jobs 里 state=dispatched 的）。
+    recycle_dispatches: int = 0
+    #: 回收占线小时（来自 line_free_at_utc）。⚠️ 这是唯一能证明「回收真的在占资源」的量。
+    recycle_occupied_hours: float = 0.0
 
     @property
     def empty(self) -> bool:
@@ -1077,6 +1081,7 @@ def build_period_rows(
             now_utc=now_utc,
             observed_since=observed_since,
         )
+        recycle_dispatches, recycle_hours = repository.recycle_period_stats(start=start, end=end)
         rows.append(
             PeriodRow(
                 label=period_label(start, granularity, now=now_utc),
@@ -1090,6 +1095,8 @@ def build_period_rows(
                 uptime_hours=capacity.uptime_hours,
                 uptime_partial=capacity.uptime_partial,
                 is_total=granularity is Granularity.TOTAL,
+                recycle_dispatches=recycle_dispatches,
+                recycle_occupied_hours=recycle_hours,
             )
         )
     return trim_empty_tail(rows, lambda row: row.empty)

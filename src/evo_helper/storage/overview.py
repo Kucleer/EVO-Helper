@@ -365,6 +365,44 @@ class OverviewRepository:
             coordinates=coordinates,
         )
 
+    def recycle_period_stats(self, *, start: datetime, end: datetime) -> tuple[int, float]:
+        """一个周期里的回收统计：(趟数, 占线小时)。
+
+        ⚠️ **「残骸实收」恒为「未知」** —— 回收邮件 hold，这一版读不到实收。
+        ⚠️ **「占线时长」是记得住的** —— 它来自 `line_free_at_utc`，和实收无关。
+        这是这一版唯一能证明「回收真的在占资源」的量。
+        """
+        with self._session_factory() as session:
+            # 趟数：recycle_jobs 里 state=dispatched 的
+            dispatched = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(orm.RecycleJobRow)
+                    .where(
+                        orm.RecycleJobRow.state == "dispatched",
+                        orm.RecycleJobRow.executed_at_utc >= start,
+                        orm.RecycleJobRow.executed_at_utc < end,
+                    )
+                )
+                or 0
+            )
+            # 占线小时：从 attack_dispatches 里 mission_kind=RECYCLE 的行算
+            # line_free_at_utc - dispatched_at_utc
+            rows = session.execute(
+                select(
+                    orm.AttackDispatchRow.dispatched_at_utc,
+                    orm.AttackDispatchRow.line_free_at_utc,
+                ).where(
+                    orm.AttackDispatchRow.mission_kind == "RECYCLE",
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.dispatched_at_utc >= start,
+                    orm.AttackDispatchRow.dispatched_at_utc < end,
+                    orm.AttackDispatchRow.line_free_at_utc.is_not(None),
+                )
+            ).all()
+            occupied_seconds = sum((free - dispatched).total_seconds() for dispatched, free in rows)
+        return dispatched, occupied_seconds / 3600
+
     def resource_totals(self, *, start: datetime, end: datetime) -> tuple[ResourceTotal, ...]:
         """一个周期里 12 格各收了多少。**按战报时刻切，只覆盖已读回的战报。**
 
