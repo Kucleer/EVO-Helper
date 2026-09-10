@@ -984,6 +984,20 @@ DISCONNECT_TEXT_ROI = (780, 440, 1140, 500)
 DISCONNECT_BUTTON = (960, 583)
 DISCONNECT_UPSCALE = 3
 
+#: ⚠️⚠️ **弹窗盖住时，掉线那句话渲染在另一个位置。**
+#:
+#: 2026-09-11 01:45 实机：残骸框开着的时候连接断了，
+#: 「连接已断开，正在重新连接…」被画进了**那个框里面**（y≈563），
+#: 而 `DISCONNECT_TEXT_ROI` 的下边界是 500 —— **一个字都读不到**。
+#:
+#: 后果不是「少认一次」，是**整夜停摆**：会话守护看不见掉线，不会关窗重开；
+#: 而每一轮都死在「切出发星球前回不到星球地表」，谁也没升级这件事。
+#: 实测 **42/45 轮**这样空转了 80 分钟，一发攻击、一发回收都没有。
+#:
+#: ⇒ 两个位置都要读。这一块是实拍量出来的（`upscale` 3–5 都读得出
+#: 「连接已断开，正在重新连接…」）。
+DISCONNECT_TEXT_ROI_OVERLAID = (820, 550, 1100, 578)
+
 #: 服务器维护公告：标题横栏与「知道了」按钮。实机 2026-08-15 03:30 量的
 #: （`var/logs/rankv/B0-dialog.png`）。
 #:
@@ -1218,6 +1232,18 @@ def make_session_keeper(
         state = classify_screen(text)
         if state in (ScreenState.DISCONNECTED, ScreenState.DEAD_SESSION):
             return state
+
+        # ⚠️ 弹窗盖住时那句话在另一个位置（见 `DISCONNECT_TEXT_ROI_OVERLAID`）。
+        overlaid = ocr(
+            image.crop(DISCONNECT_TEXT_ROI_OVERLAID), digits=False, upscale=DISCONNECT_UPSCALE
+        )
+        state = classify_screen(overlaid)
+        if state in (ScreenState.DISCONNECTED, ScreenState.DEAD_SESSION):
+            # ⚠️ **一律按「只能关窗重开」处理，哪怕文案是可恢复那一种。**
+            # 上面盖着一个我们认不出的弹窗，`DISCONNECT_BUTTON` 那个位置坐着的
+            # 是别人家的按钮（实机那次是残骸框的绿✓/红✗）——照着点等于乱点。
+            # 关窗重开是这一档唯一站得住的善后。
+            return ScreenState.DEAD_SESSION
         return None
 
     def maintenance_notice(image: Any) -> ScreenState | None:

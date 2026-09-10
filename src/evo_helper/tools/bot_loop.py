@@ -91,7 +91,7 @@ from uuid import UUID
 
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, DispatchFact, phase_of
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.records import TARGET_KIND_BOT
+from evo_helper.domain.records import MISSION_KIND_RECYCLE, TARGET_KIND_BOT
 from evo_helper.domain.target_order import DEFAULT_UNREADABLE_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
@@ -608,7 +608,7 @@ class BotLoop(PirateLoop):
         self._driver.wait(DISPATCH_WAIT_S)
 
         # 第 3 步：残骸框 → 绿✓（三格数字不读）
-        title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
+        title = self._wait_for_recycle_dialog()
         if not pirate_ui.looks_like_recycle_dialog(title):
             say(f"  {coordinate} 残骸框没弹出来（读到 {title!r}）；跳过")
             # ⚠️ **兜底那一支要先关窗口再返回。** 点错按钮可能打开了别的窗口
@@ -677,8 +677,9 @@ class BotLoop(PirateLoop):
             self._finish_recycle_job(coordinate, "launch_failed")
             return False
 
-        # 记派遣
-        self._record_dispatch(intent_id, flight)
+        # 记派遣。⚠️ **必须显式传 RECYCLE** —— `_record_dispatch` 的默认值是 ATTACK，
+        # 漏传的后果不是「标错一个字段」，是**回收喂自己**（见 `MISSION_KIND_RECYCLE`）。
+        self._record_dispatch(intent_id, flight, mission_kind=MISSION_KIND_RECYCLE)
         self._finish_recycle_job(coordinate, "dispatched")
         say(f"  已派出回收 → {coordinate}")
         self._leave_dispatch_list()
@@ -718,6 +719,28 @@ class BotLoop(PirateLoop):
             f"回收作业 {coordinate} 结为「{state}」（job {job_id}）",
             payload={"target": str(coordinate), "state": state, "job_id": job_id},
         )
+
+    #: 残骸框弹出来要多久。⚠️ 点完立刻读会读到动画中途的半张图：
+    #: 2026-09-11 03:19 实测读到 `'UF HK'`，而同一个框两分钟后截图是清清楚楚的
+    #: 「回收残骸」+ 三格资源 —— **判成「点错了按钮」纯属读早了**。
+    RECYCLE_DIALOG_TRIES = 4
+    RECYCLE_DIALOG_GAP_S = 0.8
+
+    def _wait_for_recycle_dialog(self) -> str:
+        """等残骸框画完，返回最后一次读到的标题。
+
+        ⚠️ **重试而不是把等待时间调长**：框弹出的快慢跟网络与机器都有关，
+        一个写死的 `sleep` 要么白等、要么还是不够。读到就走，是这两者里唯一
+        既快又稳的写法（同 `ORIGIN_SETTLE_TRIES` 的先例）。
+        """
+        title = ""
+        for attempt in range(self.RECYCLE_DIALOG_TRIES):
+            title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
+            if pirate_ui.looks_like_recycle_dialog(title):
+                return title
+            if attempt + 1 < self.RECYCLE_DIALOG_TRIES:
+                self._driver.wait(self.RECYCLE_DIALOG_GAP_S)
+        return title
 
     def _find_recycle_button(self) -> int | None:
         """读面板标签，找「回收」那一格的 x。找不到返回 None。
