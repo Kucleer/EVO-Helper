@@ -31,7 +31,7 @@ from evo_helper.domain.scout_verdict import (
     PIRATE_TRIGGER_SHIPS,
     triggers_attack,
 )
-from evo_helper.domain.text import snap_to_vocabulary
+from evo_helper.domain.text import edit_distance, snap_to_vocabulary
 from evo_helper.game.overlay import OVERLAY_CLOSE_BUTTON
 
 #: 行星面板上「敌对海盗」的标题与坐标行。两者都读到才算认出是海盗位。
@@ -311,6 +311,35 @@ DIALOG_CONFIRM = (959, 583)
 RECYCLE_DIALOG_CONFIRM = (862, 583)
 RECYCLE_DIALOG_TITLE_ROI = (900, 350, 1020, 380)
 RECYCLE_DIALOG_TITLE = "回收残骸"
+
+
+def looks_like_recycle_dialog(raw: str, *, max_distance: int = 2) -> bool:
+    """残骸框的标题读到了没有。⚠️ **按编辑距离判，不许用精确子串**。
+
+    2026-09-11 01:34 实测：框**确实弹出来了**，OCR 读到的是 `'回收残仍'` ——
+    「骸」被读成「仍」。而 v1 的判据是 `RECYCLE_DIALOG_TITLE not in title`，
+    **一个字读错就否定整屏**：那一趟被判成「点错了按钮」，复位画面、
+    作业结成 `screen_error`，而**实际上一切正常，只差按一下绿✓**。
+
+    ⚠️ 这条路是回收链上唯一的「确认点对了」的闸门，
+    所以它宁可**松一格**也不该因为一个字的抖动把好屏判死 ——
+    真点错时开出来的是发私信窗口，标题差着十万八千里，两个字的容差挡得住。
+
+    ⚠️ 与 `snap_panel_label` 那条阈值教训**不冲突**：那里的问题是词表全是两字词、
+    放宽到 2 会让每个输入命中全部六项。这里的词表**只有一项**，不存在歧义。
+    """
+    text = "".join(raw.split())
+    if not text:
+        return False
+    if RECYCLE_DIALOG_TITLE in text:
+        return True
+    # OCR 可能带上邻近像素，按标题长度开窗逐段比，任一段够近就算认出。
+    width = len(RECYCLE_DIALOG_TITLE)
+    for start in range(max(1, len(text) - width + 1)):
+        if edit_distance(text[start : start + width], RECYCLE_DIALOG_TITLE) <= max_distance:
+            return True
+    return False
+
 
 #: 「没有可执行的任务。」——目标处于**8 小时保护期**（被攻击过之后）。
 #:
