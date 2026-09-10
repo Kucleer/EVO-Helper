@@ -4123,6 +4123,50 @@ class SqlAlchemyRepository:
                 row.dispatch_id = dispatch_id
             session.commit()
 
+    def finish_recycle_job_for_target(
+        self,
+        *,
+        target: Coordinate,
+        origin: Coordinate,
+        state: str,
+        executed_at_utc: datetime,
+        dispatch_id: UUID | None = None,
+    ) -> int | None:
+        """把这颗星球上这个坐标的**待执行**作业结掉，返回被结掉的 job_id。
+
+        ⚠️ **运行器手里没有 job_id** —— `--recycle` 只带坐标（和 `--targets` 同形）。
+        所以按 `(出发星球, 目标坐标, state='pending')` 反查，这一组按设计**最多一条**
+        （`save_recycle_job` 里同坐标已有待执行的先标 `superseded`）。
+
+        ⚠️ **不结掉的后果是实的**：作业永远留在 `pending`，调度器每一轮都把它
+        当成待办派一遍 —— 2026-09-10 23:14–23:39 实测，同一批坐标循环重试了
+        四轮，而**攻击因为名额被作业占满彻底停了**。
+        """
+        with self._session_factory() as session:
+            row = session.scalars(
+                select(orm.RecycleJobRow)
+                .where(
+                    orm.RecycleJobRow.state == "pending",
+                    orm.RecycleJobRow.target_galaxy == target.galaxy,
+                    orm.RecycleJobRow.target_system == target.system,
+                    orm.RecycleJobRow.target_position == target.position,
+                    orm.RecycleJobRow.origin_galaxy == origin.galaxy,
+                    orm.RecycleJobRow.origin_system == origin.system,
+                    orm.RecycleJobRow.origin_position == origin.position,
+                )
+                .order_by(orm.RecycleJobRow.created_at_utc.desc())
+                .limit(1)
+            ).first()
+            if row is None:
+                return None
+            row.state = state
+            row.executed_at_utc = executed_at_utc
+            if dispatch_id is not None:
+                row.dispatch_id = dispatch_id
+            job_id = row.id
+            session.commit()
+            return job_id
+
     def count_protection_exclusions_since(self, since: datetime) -> int:
         """本周期新写入了几条 8 小时保护期排除。
 
