@@ -5,43 +5,41 @@ type: Changed
 date: 2026-09-10
 ---
 
-**弹窗分流改造：purpose 贯穿，九格表替代 DialogKind。**
+**残骸回收闭环：弹窗分流 + 模型/迁移 + acc + 调度接线 + 执行骨架。**
 
-同一句中文「没有可执行的任务」在攻击上是保护期、在回收上是没残骸。
-原 `DialogKind` 把「游戏说了什么」和「我们该做什么」混在一起，第二种含义放不进去。
+## 分层
 
-## 改了什么
+| 层 | 内容 | 状态 |
+|---|---|---|
+| PR-A | 弹窗分流：purpose 贯穿，九格表替代 DialogKind | ✅ |
+| PR-B | 保护期排除计数（system_log，recorded+dialog 过滤） | ✅ |
+| PR-C | 预算扣减（调度器侧：作业先占名额） | ✅ |
+| PR-D | 调度接线（四层：起轮判据/轮换/预算/空目标） | ✅ |
+| E1 | 配置项 + 两张表（recycle_decisions / recycle_jobs） | ✅ |
+| E2 | 决策扫描（tick 里 acc 累加 + 生成作业） | ✅ |
+| E3 | bot_loop --recycle 执行链路 | ⚠️ 骨架 |
+| E4 | 概览页三个数 + 保护期排除计数 | 待做 |
 
-- `pirate_ui.py`: `DialogMessage` / `DispatchPurpose` / `DialogAction` 三 enum + 九格封闭表 + `dialog_action()`
-- `pirate_loop.py`: `_handle_dialog` 及 4 个调用点全部显式传 `purpose`（必填无默认值）
-- 行为不变：现有攻击/侦察仍走 SKIP_PROTECTED / STOP_ROUND
-- 回收三格先摆好：SKIP_NO_DEBRIS 不写保护期排除，SKIP_NO_RECYCLERS 不停整轮且按 WARNING 落库
+## 关键设计
 
-## 九格表
+- **整数十分位误差累加**（绝不用浮点）：R=6 × 10 发 = 正好 6 次
+- **purpose 必填无默认值**，4 个调用点全部显式传
+- **(NO_MISSION, RECYCLE) 不写保护期排除**
+- **(NO_SHIPS, RECYCLE) 不停整轮**，WARNING 落库
+- **回收先于攻击执行**，预算按实际派遣扣
+- **空 targets 允许**（纯回收轮）
 
-| 弹窗 × 意图 | 处置 |
-|---|---|
-| (NO_MISSION, ATTACK/SCOUT) | SKIP_PROTECTED |
-| (NO_MISSION, RECYCLE) | SKIP_NO_DEBRIS ⚠️ 绝不写保护期排除 |
-| (NO_SHIPS, ATTACK/SCOUT) | STOP_ROUND |
-| (NO_SHIPS, RECYCLE) | SKIP_NO_RECYCLERS ⚠️ 不停整轮，WARNING 落库 |
-| (LINES_FULL, *) | STOP_ROUND |
+## 迁移
 
-## 四个地雷，逐条防住
+`e5a8c3d2f1b4`：`recycle_rate_tenths` 配置列 + `recycle_decisions` + `recycle_jobs`。
+⚠️ SQLite batch mode；推前需拿远端 `evo_helper_test` 单独验。
 
-1. `purpose` 必填无默认值、4 个调用点全部显式传 —— 漏传会静默拿到攻击那一档
-2. `(NO_MISSION, RECYCLE)` 不调 `_note_protection_period` —— 防止打得了的 bot 被排出 8 小时
-3. `(NO_SHIPS, RECYCLE)` 是 SKIP_NO_RECYCLERS 不是 STOP_ROUND —— 两拨船独立
-4. SCOUT 三格显式写死 —— 九格表封闭
+## 默认关
 
-## 变异验证
+滑块默认 0（NULL=关），上线当天不会有任何回收发生。
 
-- `(NO_MISSION, RECYCLE)` → `SKIP_PROTECTED` ⇒ 两条用例红
-- `(NO_SHIPS, RECYCLE)` → `STOP_ROUND` ⇒ 一条用例红
-- 源码级断言：`_note_protection_period` 只在 SKIP_PROTECTED 分支；每个调用点都传 purpose
-
-- Configuration: 无新增配置项。
-- Database: 无迁移。
-- Verification: `pytest tests/unit/tools/ -q`（766 passed）/ `ruff check` / `mypy` 全绿。
-- Safety: **攻击/侦察侧行为一个字没变**；回收三格只摆着，接线在后续 PR。
-- Rollback: revert 本 PR 即可。
+- Configuration: `recycle_rate_tenths`（0–10 整数十分位，NULL=关）
+- Database: 迁移 `e5a8c3d2f1b4`
+- Verification: `pytest tests/unit/tools/ -q`（822 passed）/ `ruff check` / `mypy` 全绿
+- Safety: **攻击/侦察侧行为一个字没变**；滑块默认 0
+- Rollback: 滑块置 0 即可停用；revert 本 PR 回到改造前
