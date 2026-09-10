@@ -3991,11 +3991,25 @@ class SqlAlchemyRepository:
             session.refresh(row)
             return int(row.id)
 
-    def pending_recycle_jobs(self, *, origin: Coordinate, limit: int = 10) -> list[dict[str, Any]]:
+    def pending_recycle_jobs(
+        self, *, origin: Coordinate, limit: int = 10, now_utc: datetime
+    ) -> list[dict[str, Any]]:
         """某颗出发星球的待执行回收作业，**新的先**。
 
         残骸越新越可能还在；旧的自然过期。
+
+        ⚠️ **三档生命周期在这里统一处理**（调度接线.md §3.5）：
+        - **被新一发取代**：`save_recycle_job` 里已处理（每个坐标最多一条待执行）
+        - **时间上限**：超过 `recycle_job_max_age_hours` 的标 `expired`
+        - **跨周作废**：R23，执行前查 `same_cycle(created_at, now)`，不同周标 `cross_cycle`
+
+        ⚠️ 三档都要**记原因落 `system_log`**，⚠️ **不上页面**（R17）。
+        ⚠️ **`acc` 本身不跨周清零** —— R23 说的是「作业」不跨周，不是计数器。
         """
+        from evo_helper.domain.rules import same_cycle
+        from evo_helper.infrastructure.system_log import record_system_log
+
+        max_age = self.recycle_job_max_age_hours()
         with self._session_factory() as session:
             rows = session.scalars(
                 select(orm.RecycleJobRow)
@@ -4008,15 +4022,61 @@ class SqlAlchemyRepository:
                 .order_by(orm.RecycleJobRow.created_at_utc.desc())
                 .limit(limit)
             ).all()
-            return [
-                {
-                    "id": int(r.id),
-                    "target": Coordinate(r.target_galaxy, r.target_system, r.target_position),
-                    "origin": Coordinate(r.origin_galaxy, r.origin_system, r.origin_position),
-                    "created_at_utc": r.created_at_utc,
-                }
-                for r in rows
-            ]
+            result: list[dict[str, Any]] = []
+            for r in rows:
+                target = Coordinate(r.target_galaxy, r.target_system, r.target_position)
+                # 跨周作废（R23）
+                if not same_cycle(r.created_at_utc, now_utc):
+                    r.state = "cross_cycle"
+                    record_system_log(
+                        "INFO",
+                        "storage.repository",
+                        f"回收作业 {target} 跨周作废"
+                        f"（生成于 {r.created_at_utc:%Y-%m-%d %H:%M} UTC）",
+                        payload={
+                            "job_id": int(r.id),
+                            "target": str(target),
+                            "reason": "cross_cycle",
+                            "created_at_utc": r.created_at_utc.isoformat(),
+                        },
+                    )
+                    continue
+                # 时间上限
+                age = now_utc - r.created_at_utc
+                if max_age is not None and age > timedelta(hours=max_age):
+                    r.state = "expired"
+                    record_system_log(
+                        "INFO",
+                        "storage.repository",
+                        f"回收作业 {target} 过期（生成于 {r.created_at_utc:%H:%M} UTC，"
+                        f"上限 {max_age} 小时）",
+                        payload={
+                            "job_id": int(r.id),
+                            "target": str(target),
+                            "reason": "expired",
+                            "age_hours": age.total_seconds() / 3600,
+                            "max_age_hours": max_age,
+                        },
+                    )
+                    continue
+                result.append(
+                    {
+                        "id": int(r.id),
+                        "target": target,
+                        "origin": Coordinate(r.origin_galaxy, r.origin_system, r.origin_position),
+                        "created_at_utc": r.created_at_utc,
+                    }
+                )
+            session.commit()
+            return result
+
+    def recycle_job_max_age_hours(self) -> int | None:
+        """回收作业的时间上限（小时）。空 = 24 小时。"""
+        try:
+            row = self.military_attack_config()
+        except ValueError:
+            return None
+        return row.recycle_job_max_age_hours
 
     def mark_recycle_job(
         self,

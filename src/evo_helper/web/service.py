@@ -460,6 +460,9 @@ class MilitaryAttackConfigView:
     account_line_limit: int | None = None
     #: 自动停用/恢复日志的限流窗口（秒）；`None` = 留空 = 默认 120。
     auto_toggle_log_seconds: int | None = None
+    #: 回收节奏（整数十分位 0–10）；`None` = 留空 = 关（0）。
+    #: ⚠️ 页面上显示 0.0–1.0，落库存整数十分位，绝不用浮点。
+    recycle_rate_tenths: int | None = None
 
 
 @dataclass(frozen=True)

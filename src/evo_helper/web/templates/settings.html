@@ -240,6 +240,19 @@
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
+    <label for="recycle-rate">回收节奏（0.0–1.0，步进 0.1，默认 0 = 关）</label>
+    <input id="recycle-rate" type="range" min="0" max="10" step="1" value="0"
+           aria-label="回收节奏" style="width:200px;vertical-align:middle">
+    <span id="recycle-rate-display" class="muted" style="margin-left:8px">0.0（关）</span>
+  </div>
+  <p class="muted">
+    每 10 发攻击的航线释放后，按这个比例安排回收。拉到 <strong>1.0</strong> 就是「攻击-回收-攻击-回收」，
+    拉到 <strong>0</strong> 就是一发都不回收。<br>
+    ⚠️ <strong>落库是整数十分位</strong>（0–10），页面显示 0.0–1.0。浮点误差累加会让 0.1 前十发一次都不收。<br>
+    ⚠️ <strong>回收和攻击共用同一条航线</strong>——拉高滑块会让一部分攻击被回收换掉。
+  </p>
+
+  <div class="filter-bar" style="margin-top:10px">
     <button class="btn primary small" type="button" id="btn-save-knobs">保存调度节奏</button>
   </div>
 </section>
@@ -318,6 +331,15 @@
     { element: document.getElementById('account-line-limit'), key: 'account_line_limit', label: '全账号航线上限' },
     { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '调度器重复日志窗口' },
   ];
+  // 回收节奏滑块：range 0–10，显示 0.0–1.0，落库整数十分位
+  const recycleRate = document.getElementById('recycle-rate');
+  const recycleRateDisplay = document.getElementById('recycle-rate-display');
+  function updateRecycleDisplay() {
+    const tenths = Number(recycleRate.value);
+    const display = (tenths / 10).toFixed(1);
+    recycleRateDisplay.textContent = tenths === 0 ? '0.0（关）' : display;
+  }
+  recycleRate.addEventListener('input', updateRecycleDisplay);
   const errorBox = document.getElementById('settings-error');
   const coordinatePayload = (text) => {
     const parts = text.trim().split(':').map(Number);
@@ -401,6 +423,8 @@
         // 同上，一律 `??`：0 是合法取值（翻信箱冷却填 0 = 每轮都翻），
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
         for (const knob of knobs) knob.element.value = config[knob.key] ?? '';
+        recycleRate.value = config.recycle_rate_tenths ?? 0;
+        updateRecycleDisplay();
         renderPlanets(list);
       })
       .catch(fail);
@@ -452,6 +476,7 @@
       report_scan_hours: hours,
       score_max_age_hours: maxAge,
       window_floor: floor,
+      recycle_rate_tenths: Number(recycleRate.value),
     };
     for (const knob of knobs) {
       const text = knob.element.value.trim();
