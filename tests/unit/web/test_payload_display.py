@@ -8,9 +8,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
-from evo_helper.web.display import payload_image, payload_text
+from evo_helper.web.display import (
+    payload_image,
+    payload_image_bytes,
+    payload_text,
+    screenshot_format,
+    screenshot_media_type,
+)
 
 
 def test_the_base64_image_never_reaches_the_text_column() -> None:
@@ -33,6 +40,27 @@ def test_the_image_is_handed_over_as_something_a_browser_can_show() -> None:
     payload = json.dumps({"thumbnail_png_base64": "iVBORw0KGgo"})
 
     assert payload_image(payload) == "data:image/png;base64,iVBORw0KGgo"
+
+
+def test_the_image_decodes_back_to_the_bytes_that_went_in() -> None:
+    """`GET /system-log/{id}/image` 返回的必须是原图，不是缩过一道的。
+
+    列表页现在只标一个链接（内联进 DOM 是 8 万到 16 万字符），所以这一路是
+    「图取得到」的唯一保证。
+    """
+    raw = b"\x89PNG\r\n\x1a\n" + b"pixels" * 500
+    payload = json.dumps({"thumbnail_png_base64": base64.b64encode(raw).decode("ascii")})
+
+    assert payload_image_bytes(payload) == raw
+
+
+def test_an_unreadable_image_is_none_rather_than_an_exception() -> None:
+    """⚠️ 解不开就当没有：这一路是排障页面上的一个链接，
+    「点开是 404」比「点开把整页控制台打成 500」好认得多。"""
+    assert payload_image_bytes(json.dumps({"thumbnail_png_base64": "不是 base64!!"})) is None
+    assert payload_image_bytes("{不是 json") is None
+    assert payload_image_bytes("{}") is None
+    assert payload_image_bytes(None) is None
 
 
 def test_a_payload_without_a_picture_offers_none() -> None:
@@ -64,3 +92,58 @@ def test_an_empty_payload_takes_up_no_room() -> None:
 def test_chinese_survives_the_round_trip() -> None:
     """正文里的中文不能变成 `\\uXXXX`——那是给人读的，不是给机器读的。"""
     assert "认不出" in payload_text(json.dumps({"note": "画面认不出"}, ensure_ascii=False))
+
+
+def test_a_row_without_a_format_key_is_read_as_png() -> None:
+    """⚠️ **这不是兜底，是历史事实。**
+
+    2026-09-09 之前写下的 846 行装的确实是 PNG，而那时还没有
+    `thumbnail_image_format` 这个键。改成别的默认值，就等于把那 846 行
+    读成打不开的图。
+    """
+    payload = json.dumps({"thumbnail_png_base64": "AAAA"})
+
+    assert screenshot_format(payload) == "png"
+    assert screenshot_media_type(payload) == "image/png"
+
+
+def test_a_webp_row_says_webp() -> None:
+    """2026-09-09 起新写的是 webp，`Content-Type` 要跟着走。"""
+    payload = json.dumps({"thumbnail_png_base64": "AAAA", "thumbnail_image_format": "webp"})
+
+    assert screenshot_format(payload) == "webp"
+    assert screenshot_media_type(payload) == "image/webp"
+    assert payload_image(payload).startswith("data:image/webp;base64,")
+
+
+def test_a_format_nobody_recognises_falls_back_to_png() -> None:
+    """⚠️ **白名单不是洁癖。**
+
+    `payload_json` 是**数据**（runner 写的、行里存的）。把它的字符串直接拼进
+    `Content-Type` 或 `data:` URI，等于让一行日志决定响应头。
+    认不出的一律回落，不原样透传。
+    """
+    for bogus in ("svg+xml", "html", "../../etc/passwd", "png; charset=x", ""):
+        payload = json.dumps({"thumbnail_image_format": bogus})
+        assert screenshot_format(payload) == "png", bogus
+        assert screenshot_media_type(payload) == "image/png", bogus
+
+
+def test_a_format_key_that_is_not_a_string_falls_back_to_png() -> None:
+    """写坏的诊断数据不许把这一路打成 500。"""
+    for bogus in (1, None, ["webp"], {"webp": True}):
+        payload = json.dumps({"thumbnail_image_format": bogus})
+        assert screenshot_media_type(payload) == "image/png", repr(bogus)
+
+
+def test_the_format_is_case_insensitive() -> None:
+    """`WEBP` 也认——大小写不该决定图能不能显示。"""
+    payload = json.dumps({"thumbnail_image_format": "WEBP"})
+
+    assert screenshot_media_type(payload) == "image/webp"
+
+
+def test_unreadable_payload_still_answers_png() -> None:
+    """整段解不开时也要给一个能用的答案，别抛。"""
+    for broken in (None, "", "{}", "not json at all", "[1, 2, 3]"):
+        assert screenshot_media_type(broken) == "image/png", repr(broken)

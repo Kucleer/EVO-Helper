@@ -148,11 +148,30 @@
             {% if detail %}
               <div class="log-line muted" style="font-size:12px">{{ detail }}</div>
             {% endif %}
-            {% set shot = payload_image(row.payload_json) %}
-            {% if shot %}
-              {# 那张 base64 缩略图是**证据本身**，以文字显示对谁都没用。
-                 缩成一小张，hover 放大——查「画面认不出」时它比任何文字都直接。 #}
-              <img class="log-shot" src="{{ shot }}" alt="出事那一刻的画面" loading="lazy">
+            {#
+              ⚠️ **这张图现在是链接，不再内联。** 原先是 `<img src="data:image/png;base64,…">`，
+              一张就是 8 万到 16 万字符：默认那一页 0.5 MB HTML，每页 1000 行时
+              1.6 MB（生产库实测 2026-09-09），而这一页还挂着 15 秒自动刷新。
+              `loading="lazy"` 在这里**一点用都没有**——字节已经在 HTML 里了，
+              lazy 只推迟网络请求。
+
+              代价是「扫一眼那张图」多了一次点击（这正是 2026-08-17 当初留 hover
+              放大而不用弹窗的理由）。接受它，因为那次要挡的是「把整页宽度撑爆」，
+              而现在要挡的是整页的字节数——两件事的量级差了三个数量级。
+              图本身一张没少：走 `GET /system-log/{id}/image`。
+
+              `payload` 那一条同理：超过 `PAYLOAD_INLINE_LIMIT` 的行（库里 0.5%，
+              占 payload 总体积 89.8%）不随这一页搬回来，点开取原文。
+            #}
+            {% if row.has_screenshot or row.payload_withheld %}
+              <div class="log-links">
+                {% if row.has_screenshot %}
+                  <a href="/system-log/{{ row.id }}/image" target="_blank" rel="noopener">现场图</a>
+                {% endif %}
+                {% if row.payload_withheld %}
+                  <a href="/system-log/{{ row.id }}/payload" target="_blank" rel="noopener">payload {{ (row.payload_bytes / 1024) | round | int }} KB</a>
+                {% endif %}
+              </div>
             {% endif %}
           </td>
         </tr>
