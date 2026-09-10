@@ -4006,9 +4006,7 @@ class SqlAlchemyRepository:
             session.refresh(row)
             return int(row.id)
 
-    def pending_recycle_jobs(
-        self, *, origin: Coordinate, limit: int = 10
-    ) -> list[dict[str, Any]]:
+    def pending_recycle_jobs(self, *, origin: Coordinate, limit: int = 10) -> list[dict[str, Any]]:
         """某颗出发星球的待执行回收作业，**新的先**。
 
         残骸越新越可能还在；旧的自然过期。
