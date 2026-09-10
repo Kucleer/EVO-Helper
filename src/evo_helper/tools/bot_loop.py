@@ -603,8 +603,10 @@ class BotLoop(PirateLoop):
             return False
 
         # 点「回收」
-        label_y = pirate_ui.BOT_ATTACK_BUTTON[1] + pirate_ui.BOT_PANEL_LABEL_Y_OFFSET
-        self._driver.click(recycle_x, label_y - 15, label="回收")  # 点图标而非标签
+        # ⚠️ y 用攻击按钮那一行的既有值 —— **同一排图标，没有理由用两个 y**。
+        # 原来写的 `label_y - 15 = 420` 落在图标（362…416）和标签（429…440）
+        # 之间的**空隙**里，实测整夜 7 成 6 败。x 仍然由读标签决定。
+        self._driver.click(recycle_x, pirate_ui.BOT_ATTACK_BUTTON[1], label="回收")
         self._driver.wait(DISPATCH_WAIT_S)
 
         # 第 3 步：残骸框 → 绿✓（三格数字不读）
