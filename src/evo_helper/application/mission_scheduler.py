@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
+
 from evo_helper.application.ai_targeting import AiShadowObserver
 from evo_helper.application.backfill import (
     BACKFILL_KINDS,

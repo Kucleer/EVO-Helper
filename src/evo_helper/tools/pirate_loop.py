@@ -2107,9 +2107,24 @@ class PirateLoop:
             self._outcome.refused.append((coordinate, message))
             return False
         if action is pirate_ui.DialogAction.SKIP_NO_RECYCLERS:
-            # ⚠️ 本不该发生（回收船是数量级多一位的存在）。多半是走错屏或
-            # purpose 说了谎。处置是跳过（不误伤攻击），但日志按异常写。
+            # ⚠️ 本不该发生（回收船是数量级多一位的存在，用户口径 2026-09-10）。
+            # 真走到了，最可能的解释不是「船不够」，而是：
+            #   · 我们根本不在回收的派遣页上（走错屏了）
+            #   · purpose 说了谎 —— 想派回收却点到了攻击图标
+            #   · 游戏版面变了，这句话现在是别的意思
+            # 处置是跳过（不误伤攻击），但**日志级别按异常写**。
             say(f"  {coordinate} 回收船不够（{message}）；跳过这次回收，攻击照跑")
+            record_system_log(
+                "WARNING",
+                "tools.pirate_loop",
+                f"{coordinate} 回收撞「{message}」——本不该发生，多半是走错屏或 purpose 说谎",
+                payload={
+                    "target": str(coordinate),
+                    "purpose": purpose.value,
+                    "dialog": message,
+                    "action": action.value,
+                },
+            )
             self._outcome.refused.append((coordinate, message))
             return False
         raise RoundExhausted(message)
