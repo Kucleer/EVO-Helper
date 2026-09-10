@@ -53,21 +53,24 @@ def upgrade() -> None:
             type_=sa.DateTime(timezone=True),
             existing_nullable=True,
         )
-    # ⚠️ 已有行按 +08 → UTC 修正（PostgreSQL 专用；SQLite 上是 no-op）
+    # ⚠️ 已有行按 +08 → UTC 修正（**只在 PostgreSQL 上跑**）
     # 原来写进去的 aware UTC 被按会话时区 +08 转成墙钟再丢掉时区，
     # 所以读出来要减 8 小时才是真正的 UTC。
-    op.execute(
-        "UPDATE recycle_decisions SET decided_at_utc = decided_at_utc - INTERVAL '8 hours' "
-        "WHERE decided_at_utc IS NOT NULL"
-    )
-    op.execute(
-        "UPDATE recycle_jobs SET created_at_utc = created_at_utc - INTERVAL '8 hours' "
-        "WHERE created_at_utc IS NOT NULL"
-    )
-    op.execute(
-        "UPDATE recycle_jobs SET executed_at_utc = executed_at_utc - INTERVAL '8 hours' "
-        "WHERE executed_at_utc IS NOT NULL"
-    )
+    # SQLite 上 INTERVAL 语法不存在，而且本地测试库里没有存量数据，跳过。
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute(
+            "UPDATE recycle_decisions SET decided_at_utc = decided_at_utc - INTERVAL '8 hours' "
+            "WHERE decided_at_utc IS NOT NULL"
+        )
+        op.execute(
+            "UPDATE recycle_jobs SET created_at_utc = created_at_utc - INTERVAL '8 hours' "
+            "WHERE created_at_utc IS NOT NULL"
+        )
+        op.execute(
+            "UPDATE recycle_jobs SET executed_at_utc = executed_at_utc - INTERVAL '8 hours' "
+            "WHERE executed_at_utc IS NOT NULL"
+        )
 
 
 def downgrade() -> None:
