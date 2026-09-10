@@ -322,6 +322,24 @@ DIALOG_CONFIRM = (959, 583)
 #: 而这一版用不上。
 RECYCLE_DIALOG_CONFIRM = (862, 583)
 RECYCLE_DIALOG_TITLE_ROI = (900, 350, 1020, 380)
+
+#: 读残骸框标题的配方。⚠️ **必须二值化。**
+#:
+#: 2026-09-11 06:45 实拍那张取证图上逐个配方跑过（`#314` 存的原分辨率裁片）：
+#:
+#:     upscale=3（`_read` 的默认）      → 'UF A'      ← 日志里那串，精确复现
+#:     upscale=4                        → 'UF'
+#:     upscale=5 / 6                    → 'DUI' / 'EIU'
+#:     upscale=4, threshold=120         → '回收残徽'  ✅
+#:     upscale=4, threshold=150         → '回收残航'  ✅
+#:
+#: ⚠️ **光加 upscale 没用，越放大越糟。** 标题是浅色字压在蓝色渐变上，
+#: 不二值化就读不出来 —— 同 `make_ocr` 里 START 那条（「半透明的大字压在星空上」）。
+#:
+#: ⚠️ 二值化之后读出来仍然会错一个字（「骸」→「徽」/「航」），
+#: 靠 `looks_like_recycle_dialog` 的模糊匹配兜住 —— 那正是 `#311` 加它的理由。
+RECYCLE_DIALOG_TITLE_UPSCALE = 4
+RECYCLE_DIALOG_TITLE_THRESHOLD = 120
 RECYCLE_DIALOG_TITLE = "回收残骸"
 
 
