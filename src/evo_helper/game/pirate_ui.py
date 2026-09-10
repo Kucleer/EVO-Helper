@@ -54,6 +54,21 @@ ATTACK_BUTTON = (1032, 540)
 #: 没有真正派出过一发。
 BOT_ATTACK_BUTTON = (821, 398)
 
+#: 有主面板图标排下方的标签行。图标 y≈398，标签 y≈435（图标下方 37px）。
+#:
+#: ⚠️ **面板纵向位置浮动**（坐标行 y≈277 / y≈240），但图标排位置相对稳定。
+#: 标签行 ROI 的 y 从图标 y 推：`BOT_ATTACK_BUTTON[1] + 37`。
+#:
+#: ⚠️ **「回收」按钮禁止写死坐标** —— 图标集是动态的（残骸没了「回收」就消失，
+#: 后面整体左移一格）。实拍：22:05 第 4 格是回收，22:28 同一 x 是邮件。
+#: 盲点会开出发私信窗口。必须读标签文字定位。
+BOT_PANEL_LABEL_Y_OFFSET = 37
+#: 标签行横向范围：覆盖「攻击 / 侦察 / 扫描 / 回收 / 邮件 / 书签」六格。
+BOT_PANEL_LABELS_ROI = (780, 430, 1280, 455)
+
+#: 有主面板上可能出现的动作标签，封闭集合。
+PANEL_ACTION_LABELS = ("攻击", "侦察", "扫描", "回收", "邮件", "书签")
+
 #: 派遣面板：关闭、确认目标（绿 ✓）、预设条展开/收起。
 DISPATCH_CLOSE = (750, 71)
 DISPATCH_CONFIRM = (1156, 763)
@@ -266,6 +281,17 @@ DIALOG_TEXT_ROI = (830, 455, 1090, 483)
 #: 这些单按钮弹窗共用同一套框。位置可以写死，**但点不点由那行字决定**：
 #: 认出是哪一个弹窗之前不要点，认不出就停。
 DIALOG_CONFIRM = (959, 583)
+
+# -- 「回收残骸」框（实拍 sample-recycle-dialog-220553.png，2026-09-08）---------
+#
+#: 标题「回收残骸」约 (958, 364)；三格资源 y 468..481；绿✓ (862, 583)。
+#:
+#: ⚠️ **三格数字不读**（用户 hold 2026-09-10）——只要认出框出现了、点绿✓。
+#: 数值是缩写（11.2M / 8M / 1.1M），字高只有 14px，读它要走字模匹配那条路，
+#: 而这一版用不上。
+RECYCLE_DIALOG_CONFIRM = (862, 583)
+RECYCLE_DIALOG_TITLE_ROI = (900, 350, 1020, 380)
+RECYCLE_DIALOG_TITLE = "回收残骸"
 
 #: 「没有可执行的任务。」——目标处于**8 小时保护期**（被攻击过之后）。
 #:
@@ -618,6 +644,16 @@ def snap_mission(raw: str, *, max_distance: int = 1) -> str | None:
 def briefing_says_attack(raw: str) -> bool:
     """派攻击之前的最后一道闸门。贴不出来一律当作「不是攻击」。"""
     return snap_mission(raw) == "攻击"
+
+
+def snap_panel_label(raw: str, *, max_distance: int = 2) -> str | None:
+    """把面板标签行 OCR 出来的文字贴回封闭集合；贴不上或有歧义就返回 None。
+
+    同 `snap_mission` 的先例：按编辑距离贴 + **要求唯一命中**。
+    ⚠️ `max_distance=2` 比 `snap_mission` 的 1 宽一档：面板标签字更小、
+    OCR 抖动更大（「回收」被读成过「回叙」）。
+    """
+    return snap_to_vocabulary(raw, PANEL_ACTION_LABELS, max_distance=max_distance)
 
 
 __all__ = [

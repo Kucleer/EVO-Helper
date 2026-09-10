@@ -95,6 +95,8 @@ from evo_helper.domain.target_order import DEFAULT_UNREADABLE_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
 from evo_helper.tools.pirate_loop import (
+    BRIEFING_WAIT_S,
+    DISPATCH_WAIT_S,
     LoopOptions,
     PirateLoop,
     ReportIngest,
@@ -562,7 +564,7 @@ class BotLoop(PirateLoop):
             # `DONE` 无事可做。
 
     def _recycle_once(self, coordinate: Coordinate) -> bool:
-        """派一发回收。六步链路（`流程图.md` §3）：
+        """派一发回收。六步链路（`流程图.md` §3 + `回收残骸/待办.md`）：
 
             导航到坐标（星球已由 ensure_origin_planet 切好）
               → 面板上有没有「回收」按钮？   没有 → 记 state=无残骸，acc 不回退
@@ -575,23 +577,118 @@ class BotLoop(PirateLoop):
                         → 点「出发！」
                           → ⚠️ **到此为止，不追结果**（R16）
 
-        ⚠️ **回收按钮必须按标签文字定位，不写死坐标** —— R24 之后这是唯一的防线：
-        简报页类型只告警不拦，定位错了没有第二道闸。
+        ⚠️ **回收按钮必须按标签文字定位，不写死坐标** —— 图标集是动态的
+        （残骸没了「回收」就消失，后面整体左移一格）。实拍：22:05 第 4 格是回收，
+        22:28 同一 x 是邮件。盲点会开出发私信窗口。
         """
         check = self._goto_checked(coordinate)
         if check is not TargetCheck.CONFIRMED:
             self._note_check_failure(coordinate, check)
             return False
-        # TODO(E3): 实现完整的六步链路（回收按钮定位、残骸框、派遣页、简报页）
-        # 当前先返回 False，表示「还没实现」，不误记为已派出。
-        say(f"  {coordinate} 回收链路尚未实装；跳过")
-        record_system_log(
-            "WARNING",
-            "tools.bot_loop",
-            f"{coordinate} 回收链路尚未实装，跳过这一发",
-            payload={"target": str(coordinate), "reason": "not_implemented"},
-        )
-        return False
+
+        # 第 2 步：找「回收」按钮（按标签文字定位）
+        recycle_x = self._find_recycle_button()
+        if recycle_x is None:
+            say(f"  {coordinate} 面板上没有「回收」按钮；这颗没有残骸")
+            record_system_log(
+                "INFO",
+                "tools.bot_loop",
+                f"{coordinate} 面板上没有「回收」按钮，跳过这次回收",
+                payload={"target": str(coordinate), "reason": "no_recycle_button"},
+            )
+            return False
+
+        # 点「回收」
+        label_y = pirate_ui.BOT_ATTACK_BUTTON[1] + pirate_ui.BOT_PANEL_LABEL_Y_OFFSET
+        self._driver.click(recycle_x, label_y - 15, label="回收")  # 点图标而非标签
+        self._driver.wait(DISPATCH_WAIT_S)
+
+        # 第 3 步：残骸框 → 绿✓（三格数字不读）
+        title = self._read(pirate_ui.RECYCLE_DIALOG_TITLE_ROI)
+        if pirate_ui.RECYCLE_DIALOG_TITLE not in title:
+            say(f"  {coordinate} 残骸框没弹出来（读到 {title!r}）；跳过")
+            return False
+        self._driver.click(*pirate_ui.RECYCLE_DIALOG_CONFIRM, label="残骸框绿✓")
+        self._driver.wait(DISPATCH_WAIT_S)
+
+        # 第 4 步：派遣页 —— 舰队已自动配好，不用挑预设
+        # 逐发核起点（复用攻击链路那道闸门）
+        purpose = pirate_ui.DispatchPurpose.RECYCLE
+        if not self._require_origin_before_dispatch(coordinate, purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 终点三框回读（可选：回收的终点是自动填的，核一下更稳）
+        # 第 5 步：点绿✓
+        self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
+        self._driver.wait(BRIEFING_WAIT_S)
+
+        # 弹窗？（PR-A 六格表）
+        if not self._handle_dialog(coordinate, purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 记意图（⚠️ 必须写 attack_intents，否则 count_inflight 少数一条 ⇒ 超派）
+        # 回收没有预设，用占位值
+        intent_id = self._record_intent(coordinate, preset="回收")
+
+        # 第 6 步：简报页 —— 读任务类型（只告警不拦，R24）+ 读飞行时间
+        shown_mission = self._briefing_mission()
+        if shown_mission != "回收":
+            # ⚠️ R24：算派出去，占航线。只记 WARNING，照点出发。
+            record_system_log(
+                "WARNING",
+                "tools.bot_loop",
+                f"{coordinate} 简报页任务类型是 {shown_mission or '（读不出）'}，不是回收；"
+                f"照点出发（R24）",
+                payload={
+                    "target": str(coordinate),
+                    "expected": "回收",
+                    "shown": shown_mission,
+                },
+            )
+        flight = self._read_flight_time(coordinate)
+
+        # 点「出发！」
+        if not self._launch(coordinate, "回收", purpose=purpose):
+            self._leave_dispatch_list()
+            return False
+
+        # 记派遣
+        self._record_dispatch(intent_id, flight)
+        say(f"  已派出回收 → {coordinate}")
+        self._leave_dispatch_list()
+        return True
+
+    def _find_recycle_button(self) -> int | None:
+        """读面板标签行，找「回收」按钮的 x 坐标。找不到返回 None。
+
+        ⚠️ **不许写死坐标** —— 图标集是动态的。实拍：22:05 第 4 格是回收，
+        22:28 同一 x 是邮件。盲点会开出发私信窗口。
+
+        做法：读标签行 → 逐格贴 `PANEL_ACTION_LABELS` → 找「回收」那一格。
+        贴不出来就当作「这颗没有回收可做」。
+        """
+        raw = self._read(pirate_ui.BOT_PANEL_LABELS_ROI)
+        if not raw:
+            return None
+        # 标签行是一行文字，按空格/标点切分后逐个贴
+        import re
+
+        parts = re.split(r"[\s/·|]+", raw)
+        label_x_start = pirate_ui.BOT_PANEL_LABELS_ROI[0]
+        label_x_end = pirate_ui.BOT_PANEL_LABELS_ROI[2]
+        total_width = label_x_end - label_x_start
+        n = max(len(parts), 1)
+        step = total_width / n
+        for i, part in enumerate(parts):
+            snapped = pirate_ui.snap_panel_label(part.strip())
+            if snapped == "回收":
+                x = int(label_x_start + step * i + step / 2)
+                say(f"  找到「回收」按钮：标签 {part!r} → x={x}")
+                return x
+        say(f"  标签行读到 {raw!r}，没有贴出「回收」")
+        return None
 
     def _say_still_waiting(self, coordinate: Coordinate) -> None:
         """还在等战报的目标，日志上要分清三件事，一件都不许含糊。
