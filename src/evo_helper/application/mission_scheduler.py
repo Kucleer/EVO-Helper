@@ -3708,7 +3708,7 @@ class MissionScheduler:
         只为让结果确定——否则同一份事实能选出两颗不同的星球。
         """
         candidates = sorted({item.origin for item in assignments})
-        return self._origin_taking_its_turn_from(candidates)
+        return self._origin_taking_its_turn_from(set(candidates))
 
     def _origin_taking_its_turn_from(self, candidates: set[Coordinate]) -> Coordinate:
         """从给定候选里挑上次出兵最久远的那颗。"""
