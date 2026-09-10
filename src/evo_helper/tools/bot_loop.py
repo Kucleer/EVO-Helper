@@ -720,41 +720,52 @@ class BotLoop(PirateLoop):
         )
 
     def _find_recycle_button(self) -> int | None:
-        """读面板标签行，找「回收」按钮的 x 坐标。找不到返回 None。
+        """读面板标签，找「回收」那一格的 x。找不到返回 None。
 
-        ⚠️ **不许写死坐标** —— 图标集是动态的。实拍：22:05 第 4 格是回收，
-        22:28 同一 x 是邮件。盲点会开出发私信窗口。
+        ⚠️ **不许按位置认按钮** —— 图标集是动态的：残骸没了「回收」就消失、
+        后面整体左移一格（实拍 22:05 第 4 格是回收，22:28 同一个 x 是邮件）。
+        照旧坐标盲点开出来的是**给 bot 发私信的窗口**，只差一步就发出去了。
+        所以哪一格是回收**只能由读标签决定**。
 
-        做法：读标签行 → 逐格贴 `PANEL_ACTION_LABELS` → 找「回收」那一格。
-        贴不出来就当作「这颗没有回收可做」。
+        ## ⚠️ 逐格读，不要整条一起 OCR
+
+        v1 把整条标签行（500px 宽）交给 tesseract，再按空格切、按词数等分推 x。
+        **实测那样读出来是垃圾**：`'以而  TARR  ia  te} eX'` —— 一个标签都贴不出，
+        于是每一颗星球都被判成「没有回收按钮 ⇒ 这颗没残骸」，回收一发都派不出去。
+
+        同一帧、同一套 OCR，**逐格读**（每格约 72px 宽）出来是干干净净的
+        `'攻击' '侦察' '扫描' '回收'`（2026-09-10 实拍验证过）。
+
+        ⇒ 按 `BOT_PANEL_FIRST_CELL_X + k × BOT_PANEL_CELL_PITCH` 逐格裁、逐格贴。
+        格距是**版面常量**，只回答「下一格在哪」；「这格是不是回收」仍然靠读字。
         """
-        raw = self._read(pirate_ui.BOT_PANEL_LABELS_ROI)
-        if not raw:
-            return None
-        # 标签行是一行文字，按空格/标点切分后逐个贴
-        import re
-
-        parts = re.split(r"[\s/·|]+", raw)
-        label_x_start = pirate_ui.BOT_PANEL_LABELS_ROI[0]
-        label_x_end = pirate_ui.BOT_PANEL_LABELS_ROI[2]
-        total_width = label_x_end - label_x_start
-        n = max(len(parts), 1)
-        step = total_width / n
-        for i, part in enumerate(parts):
-            snapped = pirate_ui.snap_panel_label(part.strip())
-            if snapped == "回收":
-                x = int(label_x_start + step * i + step / 2)
-                say(f"  找到「回收」按钮：标签 {part!r} → x={x}")
-                return x
-        say(f"  标签行读到 {raw!r}，没有贴出「回收」")
-        self._record_panel_label_evidence(raw)
+        frame, read = self._frame_reader()
+        seen: list[str] = []
+        for index in range(pirate_ui.BOT_PANEL_MAX_CELLS):
+            centre = pirate_ui.BOT_PANEL_FIRST_CELL_X + index * pirate_ui.BOT_PANEL_CELL_PITCH
+            half = pirate_ui.BOT_PANEL_LABEL_HALF_WIDTH
+            top, bottom = pirate_ui.BOT_PANEL_LABEL_Y_RANGE
+            try:
+                raw = read((centre - half, top, centre + half, bottom), digits=False, upscale=4)
+            except Exception as error:  # noqa: BLE001 - 读不出这一格不该弄死整条
+                say(f"  第 {index} 格读屏失败：{error}")
+                break
+            text = str(raw).strip()
+            seen.append(text)
+            if not text:
+                # 空格子 = 这一排到头了。⚠️ 不是「没有回收」的结论，继续往下也没意义。
+                break
+            if pirate_ui.snap_panel_label(text) == "回收":
+                say(f"  找到「回收」按钮：第 {index} 格读到 {text!r} → x={centre}")
+                return centre
+        say(f"  面板标签逐格读到 {seen}，没有「回收」")
+        self._record_panel_label_evidence(" | ".join(seen))
         return None
 
-    #: 面板标签取证的裁片范围。⚠️ **故意比读字的 `BOT_PANEL_LABELS_ROI` 大一大圈**：
-    #: 只裁那 25px 高的条，回答得了「这几个字长什么样」，回答不了
-    #: 「标签行到底在不在这个 y 上」——而现在卡住的正是后一个问题
-    #: （实测读到 '以而 TARR ia Leh HX'，像是读到了别的行）。
-    #: 从图标排上方一直裁到下方，才看得出真正的标签行落在哪。
+    #: 面板标签取证的裁片范围。⚠️ **故意比逐格读字的框大一大圈**：只裁那几格，
+    #: 回答得了「这几个字长什么样」，回答不了「标签行到底在不在这个 y 上」。
+    #: 从图标排上方一直裁到下方，才看得出真正的标签行落在哪 —— 2026-09-10
+    #: 就是靠这张图才发现「ROI 是对的、坏的是整行 OCR 和贴词阈值」。
     PANEL_EVIDENCE_ROI = (760, 360, 1300, 500)
 
     #: 同 `record_unrecognised_screen` 的先例：取证要限流，否则一轮几十张。
@@ -765,11 +776,10 @@ class BotLoop(PirateLoop):
         """贴不出「回收」时，把**同一帧**的 OCR 原文 + 原分辨率裁片写进 `system_log`。
 
         ⚠️ **只记结论不记证据等于没记**（`record_unrecognised_screen` 那条教训）。
-        这条路现在一张图都不留，于是「这颗真没残骸」和「标签行 ROI 落偏了」
-        在日志上长得一模一样 —— 而两者的善后完全相反。
+        没有这张图，「这颗真没残骸」和「标签读不出来」在日志上长得一模一样，
+        而两者的善后完全相反。
 
-        ⚠️ **必须原分辨率**：480 宽缩略图上这行小字就是一团糊斑
-        （`crop_png_base64` 与 `_dialog_evidence` 的注释里各写过一次）。
+        ⚠️ **必须原分辨率**：480 宽缩略图上这行小字就是一团糊斑。
 
         取不到帧就只交文字，**不抛** —— 取证不许把链路弄死。
         """
@@ -782,10 +792,10 @@ class BotLoop(PirateLoop):
         type(self)._last_panel_evidence_at = moment
 
         payload: dict[str, Any] = {
-            "labels_roi": list(pirate_ui.BOT_PANEL_LABELS_ROI),
             "labels_raw_text": raw,
-            "attack_button": list(pirate_ui.BOT_ATTACK_BUTTON),
-            "label_y_offset": pirate_ui.BOT_PANEL_LABEL_Y_OFFSET,
+            "first_cell_x": pirate_ui.BOT_PANEL_FIRST_CELL_X,
+            "cell_pitch": pirate_ui.BOT_PANEL_CELL_PITCH,
+            "label_y_range": list(pirate_ui.BOT_PANEL_LABEL_Y_RANGE),
             "evidence_roi": list(self.PANEL_EVIDENCE_ROI),
         }
         try:
@@ -797,7 +807,7 @@ class BotLoop(PirateLoop):
         record_system_log(
             "WARNING",
             "tools.bot_loop",
-            f"面板标签行贴不出「回收」：读到 {raw!r}（ROI {pirate_ui.BOT_PANEL_LABELS_ROI}）",
+            f"面板标签贴不出「回收」：逐格读到 {raw!r}",
             payload=payload,
         )
 
