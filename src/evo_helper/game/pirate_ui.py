@@ -338,7 +338,8 @@ RECYCLE_DIALOG_TITLE_ROI = (900, 350, 1020, 380)
 #:
 #: ⚠️ 二值化之后读出来仍然会错一个字（「骸」→「徽」/「航」），
 #: 靠 `looks_like_recycle_dialog` 的模糊匹配兜住 —— 那正是 `#311` 加它的理由。
-RECYCLE_DIALOG_TITLE_RECIPE = {"upscale": 4, "threshold": 120}
+RECYCLE_DIALOG_TITLE_UPSCALE = 4
+RECYCLE_DIALOG_TITLE_THRESHOLD = 120
 RECYCLE_DIALOG_TITLE = "回收残骸"
 
 

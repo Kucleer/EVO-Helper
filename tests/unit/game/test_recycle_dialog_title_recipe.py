@@ -35,15 +35,15 @@ def test_the_recipe_binarises() -> None:
     静默失败，然后以「框没弹出来、可能点错了按钮」的面目出现在日志里，
     把排障引向点击和 ROI（我就是这么被引偏的）。
     """
-    recipe = pirate_ui.RECYCLE_DIALOG_TITLE_RECIPE
-    assert recipe.get("threshold") is not None, (
-        "标题配方没有 threshold —— 不二值化读出来是 'UF A'，而且不报错"
+    assert pirate_ui.RECYCLE_DIALOG_TITLE_THRESHOLD is not None
+    assert 0 < pirate_ui.RECYCLE_DIALOG_TITLE_THRESHOLD < 255, (
+        "标题必须二值化 —— 不二值化读出来是 'UF A'，而且不报错"
     )
 
 
 def test_the_recipe_upscales_beyond_the_default() -> None:
     """`_read` 的默认 upscale 是 3，实测 3 读不出来；配方要显式抬高。"""
-    assert pirate_ui.RECYCLE_DIALOG_TITLE_RECIPE.get("upscale", 0) >= 4
+    assert pirate_ui.RECYCLE_DIALOG_TITLE_UPSCALE >= 4
 
 
 def test_the_dialog_title_read_uses_the_recipe() -> None:
@@ -54,7 +54,7 @@ def test_the_dialog_title_read_uses_the_recipe() -> None:
     from evo_helper.tools.bot_loop import BotLoop
 
     source = inspect.getsource(BotLoop._wait_for_recycle_dialog)
-    assert "RECYCLE_DIALOG_TITLE_RECIPE" in source, (
+    assert "RECYCLE_DIALOG_TITLE_THRESHOLD" in source, (
         "读标题没带配方 —— 会退回 upscale=3 无阈值，也就是 'UF A'"
     )
 

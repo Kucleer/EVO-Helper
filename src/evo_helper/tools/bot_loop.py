@@ -741,7 +741,9 @@ class BotLoop(PirateLoop):
         for attempt in range(self.RECYCLE_DIALOG_TRIES):
             title = self._read(
                 pirate_ui.RECYCLE_DIALOG_TITLE_ROI,
-                **pirate_ui.RECYCLE_DIALOG_TITLE_RECIPE,  # ⚠️ 不二值化读出来是 'UF A'
+                upscale=pirate_ui.RECYCLE_DIALOG_TITLE_UPSCALE,
+                # ⚠️ 不二值化读出来是 'UF A'，而且不报错
+                threshold=pirate_ui.RECYCLE_DIALOG_TITLE_THRESHOLD,
             )
             if pirate_ui.looks_like_recycle_dialog(title):
                 return title
