@@ -123,12 +123,6 @@
   tr.key td { background: var(--raised); font-weight: 600; font-size: 15px; border-bottom: 1px solid var(--line); }
   tr.key td:first-child { box-shadow: inset 3px 0 0 var(--knob); }
 
-  /* 排序列要一眼看出来——这一版的主线就是「按累计战损排」，
-     不标出来的话读者还会以为排序键是右边那个换算值。 */
-  th.sortcol { color: var(--knob); border-bottom-color: var(--knob); }
-  td.sortcol { background: var(--raised); font-weight: 600; }
-  /* 降级列：在场，但明确不参与判据。 */
-  th.aside, td.aside { color: var(--ink-faint); }
 
   /* 状态标：逐趟明细那张表里，状态必须能分辨，不能只靠一句中文糊过去。
      边框用 currentColor，深浅两套主题各自跟着字色走。 */
@@ -188,9 +182,9 @@
   li { margin: 6px 0; }
   li::marker { color: var(--ink-faint); }
 
-  /* —— 航线格子 + 水位线 —— */
-  /* 固定 512px 不许压缩：水位线是按 44+8 的格距算出来的绝对位置，
-     格子一被 flex 压窄，竖线就指到别的格上去了。窄屏改成横向滚动。 */
+  /* —— 航线格子 —— */
+  /* 固定 512px 不许压缩；窄屏改成横向滚动。
+     ⚠️ 格子上不画任何闸门标示（用户 2026-09-10：「不需要标示」）。 */
   .lane-stage { position: relative; padding: 30px 0 4px; width: 512px; }
   .lanes { display: flex; gap: 8px; }
   .lane {
@@ -204,14 +198,6 @@
   .lane .mark { font-size: 14px; line-height: 1; }
   .lane .idx { font-size: 11px; }
   .lane.busy { background: var(--knob-wash); border-color: var(--knob); color: var(--knob); font-weight: 600; }
-  .waterline {
-    position: absolute; top: 24px; bottom: 0; width: 0;
-    border-left: 2px dashed var(--warn); transition: left 90ms linear;
-  }
-  .waterline .flag {
-    position: absolute; top: -21px; left: 4px; white-space: nowrap;
-    font-family: var(--mono); font-size: 11px; color: var(--warn); font-weight: 500;
-  }
   .lane-legend { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); margin: 10px 0 0; }
   .verdict { font-family: var(--mono); font-size: 14.5px; margin: 14px 0 4px; }
   .verdict .pass { color: var(--scan); font-weight: 600; }
@@ -263,16 +249,18 @@
 <header>
   <p class="eyebrow">EVO-Helper · 残骸回收 · 原型 v2</p>
   <h1>残骸回收：概览与配置</h1>
+  <p class="sample">v2 · 2026-09-10 · 已按<strong>回收节奏滑块</strong>重写；水位线、每轮上限、出发星球勾选、按累计战损排序的目标池<strong>全部作废</strong></p>
   <p class="lede">
     这一页是拿来 review 的原型，不是一个在跑的功能。
-    十步闭环里只有前两步是自动发生的，残骸那一列一个数都还没有，
-    07 那张逐趟明细里全是示例行。这几件事页面上都照实画出来（清单见 08）。
+    闭环里只有前两步是自动发生的，残骸那一列一个数都还没有，
+    06 那张逐趟明细里全是示例行。这几件事页面上都照实画出来（清单见 07）。
   </p>
   <p class="lede" style="margin-top:12px; font-size:15px">
-    <strong>v2 的主要改动：把换算系数 k 从主线上撤下来。</strong>
-    统一的正数 k 是个标量倍乘，<code>k × Σ战损</code> 和 <code>Σ战损</code> 排出来的顺序完全一样，
-    所以目标池<strong>直接按累计战损排</strong>，k 只留作量级换算、放在末列。
-    k 的标定<strong>不是这个功能的前置条件</strong>，页面上也不为它做人工确认界面。
+    <strong>v2 的主要改动：不再挑目标，也不再看战报。</strong>
+    用户口径 2026-09-10：<strong>「派不派和战报没关系，不要进行耦合」</strong>。
+    ⇒ 回收的目标就是<strong>刚打过的那一颗</strong>，不用排序、不用挑；
+    「有没有残骸」由<strong>面板上那个回收按钮</strong>回答，那本来就是唯一可信的判据。
+    ⇒ 原先按累计战损排序的目标池、以及换算系数 k，<strong>整节删掉</strong>。
   </p>
 </header>
 
@@ -285,7 +273,7 @@
 </p>
 
 <figure class="scroller">
-  <svg viewBox="0 0 1000 600" role="img" aria-label="残骸回收十步闭环示意图。攻击打掉舰队与残骸生成两步已自动发生，用实线框表示。其余八步用虚线框表示尚未实现：按累计战损排序选靶、水位线闸、派出回收、记账、舰队返航、回收邮件、读回实收、存档三元组，最后回填账本形成闭环。">
+  <svg viewBox="0 0 1000 600" role="img" aria-label="残骸回收十步闭环示意图。攻击打掉舰队与残骸生成两步已自动发生，用实线框表示。其余八步用虚线框表示尚未实现：按航线释放计数、节奏闸、派出回收、记账、舰队返航、回收邮件、读回实收、存档三元组，最后回填账本形成闭环。">
     <defs>
       <marker id="ar" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto-start-reverse">
         <polygon points="0,0 10,4 0,8" fill="currentColor"></polygon>
@@ -308,24 +296,24 @@
       <text x="286" y="82" font-size="11.5" fill="var(--ink-muted)">游戏侧自动，留在原地</text>
 
       <path d="M 357 102 L 357 150 L 117 150 L 117 186" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#ar)"></path>
-      <text x="250" y="142" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">累计战损入账</text>
+      <text x="250" y="142" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">航线释放</text>
 
       <text x="750" y="26" font-size="12" font-weight="600" fill="var(--warn)" font-family="IBM Plex Mono, monospace" letter-spacing="0.08em">③–⑩ 一步都没有</text>
 
-      <text x="237" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">拿候选过闸</text>
+      <text x="237" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">喂给计数器</text>
       <text x="477" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">放行</text>
       <text x="717" y="180" text-anchor="middle" font-size="10.5" fill="var(--ink-muted)">已派出</text>
 
       <rect x="30" y="188" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
-      <text x="46" y="212" font-size="13.5" font-weight="600">③ 排序选靶</text>
+      <text x="46" y="212" font-size="13.5" font-weight="600">③ 航线释放</text>
       <text x="164" y="205" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
-      <text x="46" y="231" font-size="11.5" fill="var(--ink-muted)">直接按累计战损排</text>
-      <text x="46" y="250" font-size="11.5" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">× k 只换量纲，不改序</text>
+      <text x="46" y="231" font-size="11.5" fill="var(--ink-muted)">目标 = 刚打过那颗</text>
+      <text x="46" y="250" font-size="11.5" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">不挑、不排序</text>
 
       <rect x="270" y="188" width="175" height="74" rx="6" fill="var(--knob-wash)" stroke="var(--knob)" stroke-width="1.6" stroke-dasharray="5 3"></rect>
-      <text x="286" y="212" font-size="13.5" font-weight="600" fill="var(--knob)">④ 水位线闸</text>
+      <text x="286" y="212" font-size="13.5" font-weight="600" fill="var(--knob)">④ 节奏计数器</text>
       <text x="404" y="205" font-size="9.5" fill="var(--warn)" font-family="IBM Plex Mono, monospace">未实现</text>
-      <text x="286" y="231" font-size="11.5" fill="var(--ink-muted)">占用 &lt; 水位线</text>
+      <text x="286" y="231" font-size="11.5" fill="var(--ink-muted)">acc += R，满 10 就派</text>
       <text x="286" y="250" font-size="11.5" fill="var(--ink-muted)">且起飞星球有空线</text>
 
       <rect x="510" y="188" width="175" height="74" rx="6" fill="var(--panel)" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
@@ -377,7 +365,7 @@
 
       <line x1="30" y1="492" x2="970" y2="492" stroke="var(--line)" stroke-width="1"></line>
       <text x="30" y="518" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">实线框 = 现在自动发生的两步　　虚线框 = 还不存在的八步　　「未实现」标记逐格标出</text>
-      <text x="30" y="538" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">紫框 = 用户可调的旋钮（水位线）　　本页所有「残骸」实测数据为空，正是因为 ③–⑩ 一步都没接上</text>
+      <text x="30" y="538" font-size="11" fill="var(--ink-faint)" font-family="IBM Plex Mono, monospace">紫框 = 用户可调的旋钮（回收节奏 0–1）　　本页所有「残骸」实测数据为空，正是因为 ③–⑩ 一步都没接上</text>
       <text x="30" y="565" font-size="11.5" fill="var(--warn)" font-weight="600">⑨ 缺失 ⇒ 整条链是开环的：派出去了，不知道收回多少，账就永远对不上。</text>
     </g>
   </svg>
@@ -387,55 +375,62 @@
   </figcaption>
 </figure>
 
-<h2><span class="n">02</span>此刻状态：水位线画进航线格子</h2>
+<h2><span class="n">02</span>此刻状态：航线格子 + 回收节奏</h2>
 <p>
-  格子按<strong>配置的线数</strong>画（10 条），不按占用数——线数变了格子才变，
-  这样水位线的位置才有固定的参照。竖线是水位线，示例值 8。
+  格子按<strong>配置的线数</strong>画（10 条），不按占用数。
+  ⚠️ <strong>格子上不画任何闸门标示</strong> —— 用户口径 2026-09-10：「不需要标示」。
+  回收节奏管的不是「占用到几条就停」，而是<strong>每 10 次航线释放里安排几次回收</strong>。
 </p>
 
 <div class="card">
   <div class="scroller">
     <div class="lane-stage">
       <div class="lanes" id="lanes"></div>
-      <div class="waterline" id="waterline"><span class="flag" id="wl-flag">水位线 8</span></div>
     </div>
   </div>
-  <p class="lane-legend">■ 占用中　·  空闲　┊ 水位线</p>
+  <p class="lane-legend">■ 占用中　·  空闲</p>
   <p class="verdict" id="verdict"></p>
-  <p class="ratio" id="ratio"></p>
 
   <div class="slider-row">
-    <label for="wl">拖一下看闸门怎么变 · 残骸航线水位线</label>
-    <input type="range" id="wl" min="0" max="10" step="1" value="8">
-    <span class="val" id="wl-val">8</span>
-    <button type="button" id="wl-reset">恢复默认 0（关）</button>
+    <label for="rate">拖一下看节奏怎么排 · 回收节奏</label>
+    <input type="range" id="rate" min="0" max="10" step="1" value="6">
+    <span class="val" id="rate-val">0.6</span>
+    <button type="button" id="rate-reset">恢复默认 0（关）</button>
   </div>
+
+  <p class="ratio">接下来 10 次航线释放会怎么排（<code>acc</code> 是误差累加器，满 10 就派一次并减 10）：</p>
+  <div class="scroller"><table id="seq"></table></div>
+
   <p class="ratio" style="margin-top:12px">
     这个滑块和下面 <a href="#cfg">05 配置区</a>里的是<strong>同一个旋钮</strong>，两处联动。
-    页面载入时停在示例值 8，<strong>而实际默认是 0（关）</strong>。
+    页面载入时停在示例值 0.6，<strong>而实际默认是 0（关）</strong>。
   </p>
 </div>
 
-<h2><span class="n">03</span>水位线各档能跑多久（实测）</h2>
+<h2><span class="n">03</span>为什么必须用整数十分位</h2>
+<p>
+  滑块步进是 0.1，<strong>落库存整数</strong>：<code>R = 滑块 × 10</code>（0–10），
+  <code>acc</code> 存 0–9，阈值 10。用浮点会算错，而且<strong>不收敛</strong>。
+</p>
 <div class="measured">
 <div class="scroller">
 <table>
   <thead>
-    <tr><th>水位线</th><th>允许回收的时间占比</th><th>扣掉 runner 停机的 11.6% 之后</th><th>大致什么时候会跑</th></tr>
+    <tr><th>档位</th><th>浮点版前 10 发命中</th><th>应该</th><th>浮点版跑 100 发</th></tr>
   </thead>
   <tbody>
-    <tr><td class="num">0</td><td class="num">0%</td><td class="num">0%</td><td>关（默认）</td></tr>
-    <tr><td class="num">7</td><td class="num">24.8%</td><td class="num">≈13%</td><td>只在最闲的那几个钟头（22 点前后）</td></tr>
-    <tr><td class="num">8</td><td class="num">38.2%</td><td class="num">≈27%</td><td>夜里为主</td></tr>
-    <tr><td class="num">9</td><td class="num">54.5%</td><td class="num">≈43%</td><td>夜里 + 白天的低谷</td></tr>
-    <tr><td class="num">10</td><td class="num">76.5%</td><td class="num">≈65%</td><td>只要有一条线是空的就派</td></tr>
+    <tr><td class="num">0.1</td><td class="num" style="color:var(--warn);font-weight:600">0</td><td class="num">1</td><td class="num">—</td></tr>
+    <tr><td class="num">0.3</td><td class="num" style="color:var(--warn);font-weight:600">2</td><td class="num">3</td><td class="num">—</td></tr>
+    <tr><td class="num">0.6</td><td class="num" style="color:var(--warn);font-weight:600">5</td><td class="num">6</td><td class="num" style="color:var(--warn);font-weight:600">59</td></tr>
+    <tr><td class="num">0.7</td><td class="num" style="color:var(--warn);font-weight:600">6</td><td class="num">7</td><td class="num">—</td></tr>
   </tbody>
 </table>
 </div>
 <p style="padding-bottom:10px">
-  <strong>实测注</strong>：近 7 天平均占用 <strong>7.2 / 10</strong>；
-  白天（08–17 点）7.9–8.6 条，夜里（21–01 点）3.6–6.7 条。
-  1–6 档表里没有——近 7 天占用几乎没低到那儿去过，所以它们跟 0 一样等于关，但<strong>没有实测支撑</strong>，页面上不给数。
+  <strong>每一档都少一次。</strong> 原因：<code>0.2 + 0.6 + 0.6 − 1 = 0.39999…</code>，
+  再 <code>+ 0.6 = 0.99999…</code>，过不了 1。
+  ⚠️ <code>acc</code> 要<strong>落库、跨重启累积</strong>，浮点误差只会越滚越大 ——
+  拉到 0.1 的人会看见「前十发一次都不收」，直接判定功能坏了。
 </p>
 </div>
 
@@ -452,7 +447,7 @@
     <tr>
       <td>报告覆盖率<span class="sub">已读回 ÷ 已派出</span></td>
       <td class="num">94.2%<span class="sub">已读回 210 / 已派出 223</span></td>
-      <td class="empty">—<span class="sub">已读回 0 / 已派出 0</span></td>
+      <td class="empty">不适用<span class="sub">⚠️ 用户口径 2026-09-10：派出即终态，<strong>这一版不追踪回收结果</strong></span></td>
     </tr>
     <tr>
       <td>保护期排除条数<span class="sub">本周期新写入的 8 小时排除</span></td>
@@ -460,7 +455,7 @@
       <td class="empty">—<span class="sub">回收一发都没派，探针还没读数</span></td>
     </tr>
     <tr>
-      <td>残骸被拒比例<span class="sub">派出前弹「没有可执行的任务」的占比</span></td>
+      <td>未派出<span class="sub">选中了、但最后没派出去的次数</span></td>
       <td class="empty">不适用</td>
       <td class="empty">—<span class="sub">分母为 0（0 / 0）</span></td>
     </tr>
@@ -481,8 +476,10 @@
   照搬攻击那条分支的后果是：<strong>一颗完全打得了的 bot 被排出攻击候选池 8 小时，
   而页面上和日志上都看不出异常。</strong>
   这个计数是那个坑<strong>唯一的探针</strong>——它要是在回收开跑之后突然抬头，就说明两条链路串了。</p>
-  <p><strong>「残骸被拒比例」量的是另一件事</strong>：派出前就被游戏挡回来的占比。
-  它高，说明选靶用的累计战损跟「现场还有没有残骸」对不上（残骸会衰减、也会被别人捡走）。</p>
+  <p><strong>⚠️ 「未派出」只给一个数，不在页面上拆原因。</strong>
+  用户口径 2026-09-10：「不需要跳过原因，可以记录日志，前台不需要，写未派出就可以了」。
+  ⇒ 到底是<strong>去了没残骸 / 过期没去 / 被新一发取代 / 跨周作废</strong>，
+  一律落 <code>system_log</code>，页面只显示总数。</p>
 </div>
 <p>
   「每线小时」这一行加重，只因为它是攻击与残骸<strong>唯一能直接并排比的量纲</strong>。
@@ -498,109 +495,36 @@
   残骸这条链一律叫「残骸」，两个词在同一页里不许混用。</p>
 </div>
 
-<h2 id="cfg"><span class="n">05</span>残骸配置（三个控件，全部默认关）</h2>
+<h2 id="cfg"><span class="n">05</span>残骸配置（<strong>只有一个控件</strong>，默认关）</h2>
 
 <div class="card">
-  <h3>残骸航线水位线 <span class="off-tag">默认 0（关）</span></h3>
-  <p style="margin-top:4px">账号级的政策闸：<strong>此刻总占用 &lt; 水位线</strong>才放行。填 0 等于整条链停用，也是一键回滚的方式。</p>
+  <h3>回收节奏 <span class="off-tag">默认 0（关）</span></h3>
+  <p style="margin-top:4px">
+    <strong>0–1，步进 0.1，全局</strong>。拉到 <code>1</code> 就是「攻击-回收-攻击-回收」，
+    <strong>攻击和回收共用同一条航线</strong>；拉到 <code>0</code> 整条链停用，也是一键回滚的方式。
+  </p>
   <div class="slider-row">
-    <input type="range" id="wl2" min="0" max="10" step="1" value="8">
-    <span class="val" id="wl2-val">8</span>
-    <span class="ratio" id="wl2-hint"></span>
+    <input type="range" id="rate2" min="0" max="10" step="1" value="6">
+    <span class="val" id="rate2-val">0.6</span>
+    <span class="ratio" id="rate2-hint"></span>
   </div>
 
-  <h3 style="margin-top:34px">每轮残骸上限 <span class="off-tag">默认 1</span></h3>
-  <p style="margin-top:4px">刹车，不是最优值。一轮最多派几发回收，防止水位线一放开就整批涌出去。</p>
-  <div class="slider-row">
-    <input type="number" id="cap" min="0" max="10" step="1" value="1">
-    <span class="ratio">发 / 轮</span>
-  </div>
-
-  <h3 style="margin-top:34px">允许回收的出发星球 <span class="off-tag">默认全不勾</span></h3>
-  <p style="margin-top:4px">每颗星球后面是它<strong>自己</strong>的航线数。</p>
-  <div class="planets">
-    <label class="planet"><input type="checkbox"><span class="coord">1:55:6</span><span class="lanes-of">2 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">2:391:16</span><span class="lanes-of">1 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">4:277:15</span><span class="lanes-of">1 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">5:261:8</span><span class="lanes-of">1 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">7:228:15</span><span class="lanes-of">2 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">8:117:6</span><span class="lanes-of">1 线</span></label>
-    <label class="planet"><input type="checkbox"><span class="coord">9:250:8</span><span class="lanes-of">2 线</span></label>
-  </div>
   <div class="note" style="margin-bottom:0">
-    <p><strong>两层闸，都要过。</strong>
-    能不能派，<strong>物理上取决于那颗星球自己有没有空线</strong>——
-    2:391:16 只有 1 条线，那条线在飞，勾了也派不出去。
-    水位线是<strong>账号级的政策闸</strong>，管的是「整体还剩多少余量」。
-    水位线放行、星球没空线 ⇒ 不派；星球有空线、水位线不放行 ⇒ 也不派。</p>
+    <p><strong>⚠️ 原先那三个控件全部作废。</strong>
+    「残骸航线水位线」被这个滑块替换；「每轮残骸上限」和「允许回收的出发星球」
+    在第二轮 review 后撤销 —— 用户口径：<strong>「是全局的设置，所有的星球都遵守这个配置」</strong>。</p>
+    <p><strong>物理闸仍然在那儿，只是不再是一个旋钮。</strong>
+    能不能派，取决于<strong>那颗星球自己有没有空线</strong> ——
+    2:391:16 只有 1 条线，那条线在飞就派不出去。
+    ⚠️ 判据一律复用 <code>_still_holding_a_line</code>，页面不另造。</p>
   </div>
 </div>
 
-<h2><span class="n">06</span>残骸目标池（按累计战损排序）</h2>
-<p style="font-family:var(--mono); font-size:13px; color:var(--warn); font-weight:600">
-  ⚠️ 只有「打过几次」和「累计战损」来自库里（实测）；编造的示例值一律写成「—」
-</p>
-<div class="scroller">
-<table>
-  <thead>
-    <tr>
-      <th>坐标</th><th>打过几次</th>
-      <th class="sortcol">累计战损 ↓<span class="sub">单位 · 这一列就是排序键</span></th>
-      <th>距上次攻击</th><th>从哪颗星出发</th>
-      <th class="aside">按 k 换算<span class="sub">仅供量级参考，不参与排序</span></th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td class="num">1:497:17</td><td class="num">4</td><td class="num sortcol">19,940</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">27.1M</td></tr>
-    <tr><td class="num">5:267:17</td><td class="num">4</td><td class="num sortcol">19,870</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">27.0M</td></tr>
-    <tr><td class="num">1:66:15</td><td class="num">4</td><td class="num sortcol">19,140</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">26.0M</td></tr>
-    <tr><td class="num">5:319:10</td><td class="num">4</td><td class="num sortcol">18,290</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">24.8M</td></tr>
-    <tr><td class="num">4:277:14</td><td class="num">3</td><td class="num sortcol">14,960</td><td class="empty">—</td><td class="num">4:277:15</td><td class="num aside">20.3M</td></tr>
-    <tr><td class="num">1:152:20</td><td class="num">4</td><td class="num sortcol">14,850</td><td class="empty">—</td><td class="num">1:55:6</td><td class="num aside">20.2M</td></tr>
-    <tr><td class="num">5:290:8</td><td class="num">4</td><td class="num sortcol">13,904</td><td class="empty">—</td><td class="num">5:261:8</td><td class="num aside">18.9M</td></tr>
-  </tbody>
-</table>
-</div>
+<h2><span class="n">06</span>逐趟明细：决策 → 观察 → 派遣</h2>
 <p>
-  <strong>排序键就是「累计战损」本身</strong>（紫色那一列），不再是换算之后的资源数。
-  末列 <code>按 k 换算 = 累计战损 × k</code>（<code>k = 1,357 资源/单位</code>）只是把「单位数」
-  换成一个便于口头描述的量级，<strong>删掉它，上面 7 行的先后顺序一个字都不会变</strong>。
-</p>
-<p>
-  「距上次攻击」写成「—」是因为那一列我没有实测值，编一个会看起来像真的。
-  表里只有这 7 个坐标，同理：再往下补就得编坐标。
-  <code>4:277:14</code> 是<strong>唯一实际读到过残骸的那颗</strong>（残骸框读到 20.3M，累计战损 14,960 单位）——
-  k 就是这么来的，所以它那一行的两个数当然对得上，这不构成验证。
-</p>
-
-<div class="note loud">
-  <p class="hd">⚠️ 末列的绝对值不可信 —— 但它不在关键路径上</p>
-  <p>
-    <strong>k 只影响量级换算，不影响排序。</strong>
-    统一的正数 k 是个标量倍乘：<code>k × Σ战损</code> 和 <code>Σ战损</code> 排出来的顺序<strong>完全一样</strong>。
-    所以 <strong>k 的标定不是这个功能的前置条件</strong>，也不需要一个「人工确认 k」的界面——
-    这一版把原来那套确认机制整个撤掉了。
-  </p>
-  <p>
-    绝对值仍然不可信，理由照旧：<strong>k = 1,357 来自 n = 1 的一次观测，而那次读数本身已被证伪</strong>——
-    确认之后游戏弹了「没有可执行的任务」，20 分钟后回收按钮就消失了。
-    还有一条会让 k 系统性走偏的机制：<code>defender_losses</code> 是<strong>单位数不是造价</strong>，
-    同样打掉 3,000 单位，全是轻型机和全是无畏舰能差一个量级。
-  </p>
-  <p>
-    ⇒ <strong>凡是用 k 换算出来的数只能当量级参考，别拿它跟攻击那边的收益并排比。</strong>
-    （用户口径 2026-09-09：「只要记录数据就可以了，考虑收益不在你的范围内」——
-    这一页不做收益结论，只负责把数记下来、摆出来。）
-    实机读十几处残骸框、把 k 从一个点变成一个分布，仍然值得做，
-    但它是<strong>能并行的支线</strong>，不挡邮件那一半，也不挡第一发派遣。
-  </p>
-</div>
-
-<h2><span class="n">07</span>逐趟明细：面板读数 → 派遣 → 邮件实收</h2>
-<p>
-  闭环的落点在这张表上。一行一趟，把<strong>同一趟</strong>的三次读数摆在一行里：
-  开面板时看到的残骸框、派出去的那一下、以及回收邮件里真正到账的三种资源。
-  <strong>对不上的时候，得能一眼看出是在哪一步断的。</strong>
+  一行一次<strong>决策</strong>（每次攻击的航线释放都有一行，选中与否都记）。
+  ⚠️ <strong>到「派出去了」为止</strong> —— 用户口径 2026-09-10：
+  「收走就被收走，暂时不追踪数据」，所以<strong>这张表没有实收列，也没有返航列</strong>。
 </p>
 <p class="sample">⚠️ 整张表是示例数据，非实测 —— 一发都还没派过，真实的这张表现在是空的</p>
 <div class="scroller">
@@ -609,156 +533,177 @@
     <tr>
       <th>时刻<span class="sub">UTC+0</span></th>
       <th>坐标</th>
-      <th>面板读数<span class="sub">残骸框 金 / 晶 / 气</span></th>
-      <th>派遣状态</th>
-      <th>预期返回</th>
-      <th>邮件实收<span class="sub">金 / 晶 / 气</span></th>
-      <th>解析状态</th>
+      <th>当时档位<span class="sub">R / 10</span></th>
+      <th><code>acc</code><span class="sub">加之前 → 加之后</span></th>
+      <th>选中？</th>
+      <th>面板上有回收按钮？</th>
+      <th>结果</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td class="num">09-08 23:02</td><td class="num">5:267:17</td>
-      <td class="num">9.2M / 5.6M / 2.8M</td>
-      <td><span class="st st-fly">已派出</span></td>
-      <td class="num">09-09 00:37</td>
-      <td class="empty">—</td>
-      <td><span class="st st-idle">待返回</span><span class="sub">还没回来，正常</span></td>
+      <td class="num">0.6</td><td class="num">6 → 12</td>
+      <td><span class="st st-ok">选中</span></td>
+      <td class="num">有</td>
+      <td><span class="st st-fly">已派出</span><span class="sub">占那颗星球一条线</span></td>
     </tr>
     <tr>
       <td class="num">09-08 22:14</td><td class="num">1:497:17</td>
-      <td class="num">8.4M / 5.1M / 2.6M</td>
-      <td><span class="st st-idle">没派</span></td>
-      <td class="empty">—</td>
-      <td class="empty">—</td>
-      <td><span class="st st-idle">不适用</span><span class="sub">纯观察记录：只开面板读了个数，没点出发</span></td>
+      <td class="num">0.6</td><td class="num">0 → 6</td>
+      <td><span class="st st-idle">未选中</span></td>
+      <td class="empty">—<span class="sub">没去看</span></td>
+      <td><span class="st st-idle">未派出</span><span class="sub">节奏没轮到，这条线改派攻击</span></td>
     </tr>
     <tr>
       <td class="num">09-08 21:40</td><td class="num">8:117:6</td>
-      <td class="empty">读不到<span class="sub">面板上没有残骸框</span></td>
-      <td><span class="st st-idle">没派</span></td>
-      <td class="empty">—</td>
-      <td class="empty">—</td>
-      <td><span class="st st-wait">被拒</span><span class="sub">弹「没有可执行的任务」；计入「残骸被拒比例」，⚠️ <strong>不许</strong>写保护期排除</span></td>
+      <td class="num">0.6</td><td class="num">4 → 10</td>
+      <td><span class="st st-ok">选中</span></td>
+      <td class="num" style="color:var(--warn);font-weight:600">没有</td>
+      <td><span class="st st-idle">未派出</span><span class="sub">⚠️ 这颗<strong>没残骸</strong>；<strong>不许</strong>写保护期排除，<code>acc</code> <strong>不回退</strong></span></td>
     </tr>
     <tr>
       <td class="num">09-08 20:05</td><td class="num">1:66:15</td>
-      <td class="num">7.8M / 4.7M / 2.4M</td>
-      <td><span class="st st-ok">已返回</span></td>
-      <td class="num">09-08 21:33</td>
+      <td class="num">0.6</td><td class="num">2 → 8</td>
+      <td><span class="st st-idle">未选中</span></td>
       <td class="empty">—</td>
-      <td><span class="st st-wait">未匹配到邮件</span><span class="sub">舰队回来了，按坐标 + 预期到达时刻没认领到；可能邮件还没生成，也可能认领条件写错了</span></td>
+      <td><span class="st st-idle">未派出</span></td>
     </tr>
     <tr>
       <td class="num">09-08 18:20</td><td class="num">5:319:10</td>
-      <td class="num">6.1M / 3.7M / 1.9M</td>
-      <td><span class="st st-ok">已返回</span></td>
-      <td class="num">09-08 19:44</td>
-      <td class="num">0 / 0 / 0</td>
-      <td><span class="st st-ok">已解析</span><span class="sub">邮件在，三格都读出来了，就是零 —— 这是一条<strong>有效数据</strong></span></td>
+      <td class="num">0.6</td><td class="num">6 → 12</td>
+      <td><span class="st st-ok">选中</span></td>
+      <td class="empty">—<span class="sub">没轮到那颗星球</span></td>
+      <td><span class="st st-wait">未派出</span><span class="sub">作业过期 / 被新一发取代 / 跨周作废 —— ⚠️ <strong>原因只落日志，页面不拆</strong></span></td>
     </tr>
     <tr>
       <td class="num">09-08 16:52</td><td class="num">1:152:20</td>
-      <td class="num">5.4M / 3.3M / 1.7M</td>
-      <td><span class="st st-ok">已返回</span></td>
-      <td class="num">09-08 18:10</td>
-      <td class="empty">读不出</td>
-      <td><span class="st st-bad">解析失败</span><span class="sub">邮件找到了，三格没解析出来 —— ⚠️ 跟上一行的「零」<strong>是两回事</strong>，不许合并成一档</span></td>
-    </tr>
-    <tr>
-      <td class="num">09-08 14:30</td><td class="num">5:290:8</td>
-      <td class="num">4.9M / 3.0M / 1.5M</td>
-      <td><span class="st st-ok">已返回</span></td>
-      <td class="num">09-08 15:58</td>
-      <td class="num">4.6M / 2.8M / 1.4M</td>
-      <td><span class="st st-ok">已解析</span><span class="sub">顺利的那一条，全页只有这一行是顺的</span></td>
+      <td class="num">0.6</td><td class="num">4 → 10</td>
+      <td><span class="st st-ok">选中</span></td>
+      <td class="num">有</td>
+      <td><span class="st st-bad">未派出</span><span class="sub">⚠️ 点勾之后弹「没有可执行的任务」 ⇒ 这颗<strong>没残骸</strong>；<strong>不许</strong>写保护期排除</span></td>
     </tr>
   </tbody>
 </table>
 </div>
 
 <div class="note">
-  <p><strong>「实收为零」和「解析失败」必须分成两档。</strong>
-  合成一档的话，<code>0</code> 会被当成一次真实的空手而归喂进统计，
-  <strong>解析器坏掉会伪装成「残骸都没了」</strong>，而且越坏越像是这个功能不划算。
-  上面两行的区别就是这个：一行是<strong>三格都读出来了、值是 0</strong>，
-  另一行是<strong>三格根本没读出来</strong>。</p>
+  <p><strong>「未选中」和「选中了但没派出」是两回事。</strong>
+  前者是节奏本来就没轮到（<strong>正常</strong>），后者是安排了却没落地。
+  ⚠️ 只有后者值得看 —— 而它<strong>又分两层</strong>：
+  <strong>去了</strong>（没残骸 / 简报读不出）和<strong>压根没去</strong>（过期 / 被取代 / 跨周）。
+  页面只给一个「未派出」总数，<strong>两层的区分在日志里</strong>。</p>
 </div>
 
-<h3>派遣状态只有三档：没派 / 已派出 / 已返回</h3>
+<h3>派遣状态只有三档：未选中 / 未派出 / 已派出</h3>
 <p>
   <strong>没有「派了但不知道成没成」这一档。</strong>
   用户口径（2026-09-09）：<strong>「派遣回收不会失败，前提是你确认的是派遣回收。」</strong>
 </p>
 <p>
-  ⇒ <strong>闸门在简报页</strong>：点「出发」之前先读简报页上的任务类型，
-  <strong>读到「回收」才点，读不出就不点</strong>。
-  所以这一列不需要「重试」，也不需要「派遣失败」——
-  真出问题的地方在<strong>点之前</strong>（被拒 / 读不出任务类型），不在点之后。
-  被拒的那一趟见上表第三行：它落在「没派」，不占航线，也不该产生任何保护期排除。
+  用户口径（2026-09-10）：<strong>「到派遣页点勾，就视为已经发出了回收，后续你不需要考虑。
+  你的流程是没办法把回收误派成攻击的。」</strong>
+</p>
+<p>
+  ⇒ <strong>闸门是「这条链路从『回收』那个按钮进来」</strong>，不是简报页上的类型文字 ——
+  回收自始至终不与攻击合流：没有预设可选，舰队是游戏按残骸量自动配的。
+  所以这一列不需要「重试」，也不需要「派遣失败」。
+</p>
+<p>
+  ⚠️ <strong>这条保证的前提是按标签文字定位</strong>：写死坐标点到隔壁，
+  入口就不再是「回收」那个按钮了 —— 而闸门撤掉之后<strong>没有第二道防线</strong>。
+</p>
+<p>
+  简报页（<strong>各任务类型通用的那一屏</strong>）和「出发！」<strong>照走</strong>。
+  「点勾就算已发出」说的是<strong>记账口径</strong>，不是链路到此为止 ——
+  <strong>记一发派遣是在真的点了「出发！」之后</strong>。
+</p>
+<p>
+  ⚠️ 那一屏上的<strong>任务类型照读</strong>：它不再是闸门，但和飞行时间是
+  <strong>同一次解析拿到的</strong>，不读等于把到手的字段扔掉。
+  ⚠️ 它是<strong>纯告警探针，不改变行为</strong>（用户 2026-09-10：「算派出去，占航线」）——
+  读到别的类型也照点出发、照记一发派遣，只是<strong>日志级别按 WARNING 写</strong>。
+  「别的类型」和「读不出」在日志上要分得开，处置相同。
+</p>
+<p>
+  ⚠️ 也<strong>没有「已返回」这一档了</strong>：这一版派出即终态（R16）。
+  航线什么时候释放照旧由 <code>_still_holding_a_line</code> 回答，那是记账，不是这张表的列。
 </p>
 
-<h2><span class="n">08</span>这一页刻意没有粉饰的四件事</h2>
+<h2><span class="n">07</span>这一页刻意没有粉饰的五件事</h2>
 <ul>
-  <li><strong>残骸那一列全是空的</strong>——功能一发都没派过，04 那张表的「—」是真实状态，不是加载中。</li>
-  <li><strong>07 那张逐趟明细整张是编的</strong>——它画的是「表长什么样、能表达哪几种状态」，不是「已经收了多少」。真实的这张表现在一行都没有。</li>
-  <li><strong>闭环里八步不存在</strong>——01 图上逐格标了「未实现」，缺的不是收尾工作，缺的是 ⑨ 读回实收。</li>
-  <li><strong>换算系数 k 只有一个样本，而且那次读数已被证伪</strong>——但这一版已经把它挪出关键路径：它只出现在目标池的末列，删掉不影响排序，也不影响任何判据。</li>
+  <li><strong>残骸那一列全是空的</strong> —— 功能一发都没派过，04 那张表的「—」是真实状态，不是加载中。</li>
+  <li><strong>06 那张逐趟明细整张是编的</strong> —— 它画的是「表长什么样、能表达哪几种状态」，不是「已经收了多少」。</li>
+  <li><strong>⚠️ 这一版收不到「实收多少」</strong> —— 回收邮件和残骸框数字都被用户 hold 了，
+      派出即终态。<strong>所以它不能叫「实收闭环完成」</strong>，数据链在「派出去了」那一步就断了。</li>
+  <li><strong>⚠️ 「未派出」在页面上是一个数，不是一张原因表</strong> ——
+      到底为什么没派，只有日志答得出。这是用户 2026-09-10 定的。</li>
+  <li><strong>回收整条链一行代码都还不存在</strong> —— 01 图上逐格标了「未实现」。</li>
 </ul>
 <p>
   这个原型是<strong>给 review 用的决策材料</strong>，不是一个已经在跑的功能的仪表盘。
   页面上凡是能拖能勾的，都只改本页显示，不连任何后端。
 </p>
 
-</div>
 <script>
-  // 三个数写死在这里而不是从表里读：表是给人看的排版，解析它会把展示和判据绑死。
+  // 两个数写死在这里而不是从表里读：表是给人看的排版，解析它会把展示和判据绑死。
   var LANES_CONFIGURED = 10;   // 配置的航线数——格子按它画
   var LANES_BUSY = 6;          // 此刻占用
-  var RATIO = {
-    0:  ["0%", "0%"],
-    7:  ["24.8%", "≈13%"],
-    8:  ["38.2%", "≈27%"],
-    9:  ["54.5%", "≈43%"],
-    10: ["76.5%", "≈65%"]
-  };
-
-  var CELL = 44, GAP = 8;
 
   var lanesEl = document.getElementById("lanes");
   for (var i = 1; i <= LANES_CONFIGURED; i++) {
     var busy = i <= LANES_BUSY;
     var d = document.createElement("div");
     d.className = "lane" + (busy ? " busy" : "");
-    d.innerHTML = '<span class="mark">' + (busy ? "■" : "·") + '</span><span class="idx">' + i + "</span>";
-    d.title = "第 " + i + " 条线 · " + (busy ? "占用中" : "空闲");
+    d.innerHTML = '<span class="mark">' + (busy ? "\u25a0" : "\u00b7") + '</span><span class="idx">' + i + "</span>";
+    d.title = "\u7b2c " + i + " \u6761\u7ebf \u00b7 " + (busy ? "\u5360\u7528\u4e2d" : "\u7a7a\u95f2");
     lanesEl.appendChild(d);
   }
 
-  var wl = document.getElementById("wl");
-  var wl2 = document.getElementById("wl2");
-  var line = document.getElementById("waterline");
+  var a = document.getElementById("rate");
+  var b = document.getElementById("rate2");
 
-  function render(v) {
-    // 水位线画在第 v 个格子的右边缘：v=0 贴左边，v=10 贴右边。
-    var left = v * (CELL + GAP) - GAP / 2;
-    line.style.left = Math.max(-2, Math.min(LANES_CONFIGURED * (CELL + GAP) - GAP, left)) + "px";
-    document.getElementById("wl-flag").textContent = "水位线 " + v;
-    document.getElementById("wl-val").textContent = v;
-    document.getElementById("wl2-val").textContent = v;
+  // 整数十分位：R 是 0-10，acc 是 0-9，阈值 10。**页面上也不许用浮点**——
+  // 原型里偷用浮点，实现的人照着抄，就把那个不收敛的 bug 带进去了。
+  function plan(R) {
+    var acc = 0, rows = [];
+    for (var k = 0; k < 10; k++) {
+      var before = acc;
+      acc += R;
+      var hit = acc >= 10;
+      if (hit) { acc -= 10; }
+      rows.push({ n: k + 1, before: before, after: before + R, hit: hit });
+    }
+    return rows;
+  }
 
-    var pass = LANES_BUSY < v;
+  function render(R) {
+    var shown = (R / 10).toFixed(1);
+    document.getElementById("rate-val").textContent = shown;
+    document.getElementById("rate2-val").textContent = shown;
+
     document.getElementById("verdict").innerHTML =
-      "残骸水位线 " + v + " · 此刻占用 " + LANES_BUSY + " · " +
-      (pass ? '<span class="pass">放行</span>' : '<span class="block">不放行</span>');
+      "\u56de\u6536\u8282\u594f <b>" + shown + "</b> \u00b7 \u6bcf 10 \u6b21\u822a\u7ebf\u91ca\u653e\u5b89\u6392 <b>" + R +
+      "</b> \u6b21\u56de\u6536 \u00b7 \u6b64\u523b\u5360\u7528 " + LANES_BUSY + " / " + LANES_CONFIGURED;
 
-    var r = RATIO[v];
-    var txt = r
-      ? "这一档允许回收的时间占比 <b>" + r[0] + "</b>，扣掉 runner 停机的 11.6% 之后 <b>" + r[1] + "</b>。"
-      : "这一档<b>没有实测</b>——近 7 天占用几乎没低到 " + v + " 以下，实际等于关。";
-    document.getElementById("ratio").innerHTML = txt;
-    document.getElementById("wl2-hint").innerHTML =
-      r ? ("允许回收的时间占比 <b>" + r[0] + "</b>") : "无实测档位";
+    document.getElementById("rate2-hint").innerHTML =
+      R === 0 ? "\u5173\uff08\u4e0d\u6d3e\u56de\u6536\uff09"
+              : (R === 10 ? "\u6bcf\u4e00\u53d1\u90fd\u56de\u6536" : "10 \u53d1\u91cc <b>" + R + "</b> \u53d1");
+
+    var rows = plan(R);
+    var head = "<thead><tr><th>\u7b2c\u51e0\u53d1</th>";
+    var accs = "<tbody><tr><td><code>acc</code> \u52a0\u5b8c</td>";
+    var acts = "<tr><td>\u8fd9\u4e00\u53d1</td>";
+    for (var j = 0; j < rows.length; j++) {
+      var r = rows[j];
+      head += "<th class=\"num\">" + r.n + "</th>";
+      accs += '<td class="num">' + r.after + (r.hit ? " \u2713" : "") + "</td>";
+      acts += r.hit
+        ? '<td class="num"><span class="st st-ok">\u56de\u6536</span></td>'
+        : '<td class="num"><span class="st st-idle">\u653b\u51fb</span></td>';
+    }
+    document.getElementById("seq").innerHTML =
+      head + "</tr></thead>" + accs + "</tr>" + acts + "</tr></tbody>";
   }
 
   function bind(src, other) {
@@ -767,15 +712,15 @@
       render(Number(src.value));
     });
   }
-  bind(wl, wl2);
-  bind(wl2, wl);
+  bind(a, b);
+  bind(b, a);
 
-  document.getElementById("wl-reset").addEventListener("click", function () {
-    wl.value = wl2.value = 0;
+  document.getElementById("rate-reset").addEventListener("click", function () {
+    a.value = b.value = 0;
     render(0);
   });
 
-  render(Number(wl.value));
+  render(Number(a.value));
 </script>
 </body>
 </html>
