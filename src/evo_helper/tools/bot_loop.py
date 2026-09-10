@@ -620,6 +620,8 @@ class BotLoop(PirateLoop):
                 f"可能点错了按钮；已复位画面",
                 payload={"target": str(coordinate), "dialog_title": title},
             )
+            # ⚠️ 取证必须赶在复位之前——复位之后那一帧就没了。
+            self._record_recycle_dialog_evidence(title)
             self._reset_to_known_screen()
             self._navigator.invalidate()
             # ⚠️ 不叫 no_debris —— 那是「去了、看清了、真没有」。这一档是**画面异常**，
@@ -795,6 +797,13 @@ class BotLoop(PirateLoop):
     PANEL_EVIDENCE_INTERVAL_S = 120.0
     _last_panel_evidence_at: float | None = None
 
+    #: 残骸框没弹出来时的取证范围。**故意比 `RECYCLE_DIALOG_TITLE_ROI`
+    #: (900,350,1020,380) 大一大圈**：要判的是「框到底在不在、标题画在哪」，
+    #: 只裁读字那一小块的话，框整个没画出来和标题挪了位置看起来一模一样。
+    #: 下边界取到 640，把 583 那行（绿✓ / 红✗）也框进来。
+    RECYCLE_DIALOG_EVIDENCE_ROI = (700, 300, 1250, 640)
+    _last_dialog_evidence_at: float | None = None
+
     def _record_panel_label_evidence(self, raw: str) -> None:
         """贴不出「回收」时，把**同一帧**的 OCR 原文 + 原分辨率裁片写进 `system_log`。
 
@@ -831,6 +840,50 @@ class BotLoop(PirateLoop):
             "WARNING",
             "tools.bot_loop",
             f"面板标签贴不出「回收」：逐格读到 {raw!r}",
+            payload=payload,
+        )
+
+    def _record_recycle_dialog_evidence(self, title: str) -> None:
+        """残骸框没弹出来时，把**同一帧**的标题 OCR 原文 + 原分辨率裁片写进 `system_log`。
+
+        ⚠️ **必须在 `_reset_to_known_screen()` 之前调。** 复位之后那一帧就没了，
+        留下来的图是复位后的画面，什么也证明不了。
+
+        ⚠️ 这条支线光有字符串**判不出是哪种毛病**：实拍读到过 `'UF HK'`——
+        拉丁乱码离「回收残骸」要多远有多远，`looks_like_recycle_dialog` 的
+        模糊匹配再放宽也够不着。到底是框还没画完、ROI 落偏了、还是点开了
+        别的窗口，三者的善后完全不同，而**日志上长得一模一样**
+        （同「没有回收按钮」那条在 `#309` 之前的处境）。
+
+        取不到帧就只交文字，**不抛** —— 取证不许把链路弄死。
+        """
+        import time
+
+        moment = time.monotonic()
+        last = type(self)._last_dialog_evidence_at
+        if last is not None and moment - last < self.PANEL_EVIDENCE_INTERVAL_S:
+            return
+        type(self)._last_dialog_evidence_at = moment
+
+        payload: dict[str, Any] = {
+            "dialog_title_raw": title,
+            "title_roi": list(pirate_ui.RECYCLE_DIALOG_TITLE_ROI),
+            "evidence_roi": list(self.RECYCLE_DIALOG_EVIDENCE_ROI),
+            "dialog_tries": self.RECYCLE_DIALOG_TRIES,
+            "dialog_gap_s": self.RECYCLE_DIALOG_GAP_S,
+        }
+        try:
+            frame, _read = self._frame_reader()
+            payload["capture_size"] = list(getattr(frame, "size", ()) or ())
+            payload["dialog_png_base64"] = crop_png_base64(
+                frame.crop(self.RECYCLE_DIALOG_EVIDENCE_ROI)
+            )
+        except Exception as error:  # noqa: BLE001 - 见 docstring：取证不许抛
+            payload["evidence_error"] = str(error)
+        record_system_log(
+            "WARNING",
+            "tools.bot_loop",
+            f"残骸框取证：标题读到 {title!r}",
             payload=payload,
         )
 
