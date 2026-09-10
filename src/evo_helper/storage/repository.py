@@ -3867,15 +3867,30 @@ class SqlAlchemyRepository:
         return max(0, min(10, int(value)))
 
     def set_recycle_rate_tenths(self, rate_tenths: int) -> None:
-        """写回收节奏。落库前夹到 0–10。"""
+        """写回收节奏。落库前夹到 0–10。
+
+        ⚠️ **滑块从 0 变非 0 时写一次 `recycle_enabled_at_utc`**，之后再调档位不更新。
+        那个时刻是决策扫描的固定下界（Bug 1 修复：用 `last_decided` 会产生棘轮效应）。
+        """
         clamped = max(0, min(10, int(rate_tenths)))
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
             if row is None:
                 row = orm.MilitaryAttackConfigRow(id=1)
                 session.add(row)
+            # 从 0 变非 0：记下启用时刻（只写一次）
+            if clamped > 0 and (row.recycle_rate_tenths or 0) == 0:
+                row.recycle_enabled_at_utc = datetime.now(UTC)
             row.recycle_rate_tenths = clamped
             session.commit()
+
+    def recycle_enabled_at_utc(self) -> datetime | None:
+        """回收节奏的启用时刻。决策扫描的固定下界。"""
+        try:
+            row = self.military_attack_config()
+        except ValueError:
+            return None
+        return row.recycle_enabled_at_utc
 
     def recycle_acc_state(self) -> tuple[int, datetime | None]:
         """全局 acc 当前值 + 最近一次决策时刻。

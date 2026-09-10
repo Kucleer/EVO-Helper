@@ -1155,6 +1155,17 @@ class MilitaryAttackConfigRow(Base):
         Integer, nullable=True, default=None
     )
 
+    #: 回收节奏**启用时刻**（滑块从 0 调到非 0 的那一刻写一次）。
+    #:
+    #: ⚠️ **这是决策扫描的固定下界**，不是 `last_decided`。用 `last_decided` 会
+    #: 产生棘轮效应：一发攻击约 1 小时后才释放，而那时 `since` 已被后来的决策
+    #: 推到它的派遣时刻之后 ⇒ 它永远出局。生产实测：22 发攻击只产生 1 条决策。
+    #:
+    #: ⚠️ 只在滑块从 0 变非 0 时写一次；之后再调档位不更新。
+    recycle_enabled_at_utc: Mapped[datetime | None] = mapped_column(
+        UTCDateTime, nullable=True, default=None
+    )
+
 
 class AiTargetDecisionRow(Base):
     """AI 选靶（影子）的每一轮记录：算法选了谁、AI 选了谁、以及两者的对账。

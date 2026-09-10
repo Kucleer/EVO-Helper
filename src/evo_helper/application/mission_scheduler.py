@@ -2123,12 +2123,17 @@ class MissionScheduler:
             return
         now = self._clock()
         hold = self._unknown_line_hold()
-        # 首次启用的历史边界：只对「开启之后才释放的」计数。
-        # 开启时刻从最近一条决策行推；没有决策行时用 now（首次扫描只看当下）。
-        acc, last_decided = self._repository.recycle_acc_state()
-        since = last_decided or (now - timedelta(hours=1))
+        # ⚠️ **历史边界用固定的启用时刻，不是 `last_decided`。**
+        # 用 `last_decided` 会产生棘轮效应：一发攻击约 1 小时后才释放，
+        # 而那时 `since` 已被后来的决策推到它的派遣时刻之后 ⇒ 它永远出局。
+        # 生产实测：22 发攻击只产生 1 条决策（Bug 1）。
+        enabled_at = self._repository.recycle_enabled_at_utc()
+        if enabled_at is None:
+            # 还没启用过（rate_tenths 是直接改库设的），不扫历史
+            return
+        acc, _last_decided = self._repository.recycle_acc_state()
         candidates = self._repository.released_bot_attack_dispatches_without_decision(
-            now_utc=now, hold=hold, since=since
+            now_utc=now, hold=hold, since=enabled_at
         )
         from evo_helper.domain.recycle_rhythm import step_acc
 
