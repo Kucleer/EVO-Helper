@@ -299,41 +299,97 @@ DIALOG_LINES_FULL = "同时派遣的舰队数量已达上限"
 DIALOG_MESSAGES = (DIALOG_NO_SHIPS, DIALOG_LINES_FULL, DIALOG_NO_MISSION)
 
 
-class DialogKind(Enum):
-    """单按钮弹窗的**处理类别**。三个弹窗，两类，处理方式相反。
+class DialogMessage(Enum):
+    """**观测**：游戏说了什么。不含任何处置含义。
 
     ⚠️ **下游判据一律认这个枚举，不认那句中文。** 仓库里已有同形的规矩
     （`application.mission_scheduler._launch`：「类别按**异常类型**认，不按那句
     中文认」）。理由在这里更硬一点：这几句中文是**从屏幕上 OCR 出来再贴回词表**
     的，字面本来就可能抖（实机把「派遣」读成过「派遗」）；而且「跳过这个目标」
-    与「停下整轮」做反的代价极不对称。谁要新写一个 `== DIALOG_NO_MISSION`，
-    就等于把这条判据的正确性重新押在一句可能变的文案上。
+    与「停下整轮」做反的代价极不对称。
     """
 
-    #: 「没有可执行的任务。」——目标在保护期里。**只跳过这一个目标**，整轮继续。
-    PROTECTED = "protected"
-    #: 「未选择任何战舰」「同时派遣的舰队数量已达上限。」——资源耗尽。
-    #: **停下整轮**等舰队返航，跳到下一个目标也一样派不出去。
-    EXHAUSTED = "exhausted"
+    #: 「没有可执行的任务。」
+    NO_MISSION = "no_mission"
+    #: 「未选择任何战舰」
+    NO_SHIPS = "no_ships"
+    #: 「同时派遣的舰队数量已达上限。」
+    LINES_FULL = "lines_full"
 
 
-#: 文案 → 类别。词表是封闭的，所以这张表也是封闭的：新增弹窗必须同时给它定类别，
-#: 否则 `dialog_kind` 会 `KeyError`——**那正是想要的**。漏掉一个新弹窗的默认行为
-#: 若是「当成没弹窗放行」，症状是 runner 对着一个它没看懂的屏继续点下去。
-_DIALOG_KINDS: dict[str, DialogKind] = {
-    DIALOG_NO_MISSION: DialogKind.PROTECTED,
-    DIALOG_NO_SHIPS: DialogKind.EXHAUSTED,
-    DIALOG_LINES_FULL: DialogKind.EXHAUSTED,
+class DispatchPurpose(Enum):
+    """**意图**：这一次点击是为了派什么。由调用方给，不从屏幕上猜。
+
+    ⚠️ `purpose` 必须从顶层操作贯穿到底，每一层都是**必填关键字参数、不设默认值**。
+    给默认值等于让漏传的那一层悄悄拿到攻击那一档的处置——回收撞「没有可执行的
+    任务」时会被误记成保护期，把一颗打得了的 bot 排出候选池 8 小时，而页面和
+    日志都看不出异常。
+
+    ⚠️ 不用 `vision.parsers.MissionType`：两者语义不同——`MissionType` 是
+    「**简报上写着**什么任务」（观测），`DispatchPurpose` 是「**我们打算**派什么」
+    （意图）。弹窗分流靠的是后者。
+    """
+
+    #: 攻击
+    ATTACK = "attack"
+    #: 侦察
+    SCOUT = "scout"
+    #: 回收（残骸）
+    RECYCLE = "recycle"
+
+
+class DialogAction(Enum):
+    """**处置**：我们该做什么。由 `(DialogMessage, DispatchPurpose)` 查表得到。"""
+
+    #: 记 8 小时排除 + 跳过这个目标（保护期）
+    SKIP_PROTECTED = "skip_protected"
+    #: 只记一条观察，**绝不写排除**（回收撞「没残骸」）
+    SKIP_NO_DEBRIS = "skip_no_debris"
+    #: 本不该发生：跳过这次回收，**攻击照跑**，并告警（回收船不够）
+    SKIP_NO_RECYCLERS = "skip_no_recyclers"
+    #: 资源耗尽，停下整轮
+    STOP_ROUND = "stop_round"
+
+
+#:
+#: 封闭表：新增一种弹窗或一种任务类型，漏一格就 `KeyError`——**那正是想要的**。
+#: 漏掉的默认行为若是「当成没弹窗放行」，症状是 runner 对着一个它没看懂的屏
+#: 继续点下去。
+#:
+#: ⚠️ `(NO_MISSION, RECYCLE)` 绝不能调 `_note_protection_period`——后果是一颗
+#: 打得了的 bot 被排出候选池 8 小时，页面和日志都看不出异常。
+#: ⚠️ `(NO_SHIPS, RECYCLE)` 是 `SKIP_NO_RECYCLERS` 不是 `STOP_ROUND`——回收和
+#: 攻击是两拨船，照抄会让「回收船不够」把这一轮的攻击也停掉。
+_ACTIONS: dict[tuple[DialogMessage, DispatchPurpose], DialogAction] = {
+    (DialogMessage.NO_MISSION, DispatchPurpose.ATTACK): DialogAction.SKIP_PROTECTED,
+    (DialogMessage.NO_MISSION, DispatchPurpose.SCOUT): DialogAction.SKIP_PROTECTED,
+    (DialogMessage.NO_MISSION, DispatchPurpose.RECYCLE): DialogAction.SKIP_NO_DEBRIS,
+    (DialogMessage.NO_SHIPS, DispatchPurpose.ATTACK): DialogAction.STOP_ROUND,
+    (DialogMessage.NO_SHIPS, DispatchPurpose.SCOUT): DialogAction.STOP_ROUND,
+    (DialogMessage.NO_SHIPS, DispatchPurpose.RECYCLE): DialogAction.SKIP_NO_RECYCLERS,
+    (DialogMessage.LINES_FULL, DispatchPurpose.ATTACK): DialogAction.STOP_ROUND,
+    (DialogMessage.LINES_FULL, DispatchPurpose.SCOUT): DialogAction.STOP_ROUND,
+    (DialogMessage.LINES_FULL, DispatchPurpose.RECYCLE): DialogAction.STOP_ROUND,
+}
+
+#: 文案 → 观测。
+_DIALOG_MESSAGES: dict[str, DialogMessage] = {
+    DIALOG_NO_MISSION: DialogMessage.NO_MISSION,
+    DIALOG_NO_SHIPS: DialogMessage.NO_SHIPS,
+    DIALOG_LINES_FULL: DialogMessage.LINES_FULL,
 }
 
 
-def dialog_kind(message: str) -> DialogKind:
-    """已经贴回词表的弹窗文案属于哪一类。
+def dialog_action(message: str, *, purpose: DispatchPurpose) -> DialogAction:
+    """已经贴回词表的弹窗文案 × 这次派遣意图 → 该怎么处置。
 
     参数只接受 `snap_dialog` 的输出（词表里的原文），**不接受屏幕原文**：
     贴词表这件事只做一次，做两次就有两份判据。
+
+    ⚠️ `purpose` 是**必填关键字参数，没有默认值**。给默认值等于让漏传的调用方
+    悄悄拿到攻击那一档的处置（同 `_still_holding_a_line` 的 `hold` 那条先例）。
     """
-    return _DIALOG_KINDS[message]
+    return _ACTIONS[(_DIALOG_MESSAGES[message], purpose)]
 
 
 def snap_dialog(raw: str, *, max_distance: int = 3) -> str | None:

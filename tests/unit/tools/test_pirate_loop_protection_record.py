@@ -3,9 +3,9 @@
 判据不是「有没有打日志」，而是**出事时能不能只靠库里的日志定位**。所以这一条
 钉的是内容而不是条数：哪个坐标、排除到什么时候、依据是什么，一样都不能少。
 
-⚠️ **类别按弹窗类型认，不按那句中文认**（`pirate_ui.DialogKind`）。这几句中文是
-从屏幕上 OCR 出来再贴回词表的，字面本来就会抖（实机把「派遣」读成过「派遗」），
-而「跳过这个目标」和「停下整轮」做反的代价极不对称。
+⚠️ **处置按 (弹窗 × 意图) 查表认，不按那句中文认**（`pirate_ui.dialog_action`）。
+这几句中文是从屏幕上 OCR 出来再贴回词表的，字面本来就会抖（实机把「派遣」
+读成过「派遗」），而「跳过这个目标」和「停下整轮」做反的代价极不对称。
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from evo_helper.game import pirate_ui
 from evo_helper.tools.pirate_loop import Outcome, PirateLoop
 
 TARGET = Coordinate(4, 393, 10)
+ATTACK = pirate_ui.DispatchPurpose.ATTACK
+RECYCLE = pirate_ui.DispatchPurpose.RECYCLE
 
 
 class _Driver:
@@ -92,7 +94,7 @@ def test_hitting_the_dialog_records_the_protection_period(monkeypatch: pytest.Mo
     repository = _Repository()
     loop = _loop(repository)
 
-    assert loop._handle_dialog(TARGET) is False, "保护期只跳过这一个目标，不停整轮"
+    assert loop._handle_dialog(TARGET, purpose=ATTACK) is False, "保护期只跳过这一个目标，不停整轮"
 
     assert [coordinate for coordinate, _seen in repository.noted] == [TARGET]
     seen_at = repository.noted[0][1]
@@ -116,9 +118,26 @@ def test_the_other_two_dialogs_never_touch_the_protection_column(
     loop._read = lambda *_a, **_k: message  # type: ignore[assignment]
 
     with pytest.raises(RoundExhausted):
-        loop._handle_dialog(TARGET)
+        loop._handle_dialog(TARGET, purpose=ATTACK)
 
     assert repository.noted == []
+
+
+def test_recycle_hitting_no_mission_never_touches_the_protection_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ 回收撞「没有可执行的任务」= 没有残骸，**一个字都不许往保护期那一列写**。
+
+    写了的话，一颗完全打得了的 bot 会被排出候选池 8 小时，而页面和日志
+    都看不出异常。这是 PR-A 最关键的变异点。
+    """
+    _logs(monkeypatch)
+    repository = _Repository()
+    loop = _loop(repository)
+
+    assert loop._handle_dialog(TARGET, purpose=RECYCLE) is False
+
+    assert repository.noted == [], "回收撞没残骸时绝不许写保护期排除"
 
 
 # -- 日志 ----------------------------------------------------------------------
@@ -136,7 +155,7 @@ def test_the_log_line_says_which_target_until_when_and_why(
     repository = _Repository()
     loop = _loop(repository)
 
-    loop._handle_dialog(TARGET)
+    loop._handle_dialog(TARGET, purpose=ATTACK)
 
     assert len(captured) == 1, "每个目标每次撞上写一条，不限流也不重复"
     level, message, payload = captured[0]
@@ -160,7 +179,7 @@ def test_a_configured_window_shows_up_in_the_log_line(monkeypatch: pytest.Monkey
     captured = _logs(monkeypatch)
     loop = _loop(_Repository(hours=2))
 
-    loop._handle_dialog(TARGET)
+    loop._handle_dialog(TARGET, purpose=ATTACK)
 
     _level, _message, payload = captured[0]
     seen_at = datetime.fromisoformat(payload["seen_at_utc"])
@@ -178,7 +197,7 @@ def test_a_failed_record_is_reported_not_swallowed(monkeypatch: pytest.MonkeyPat
     captured = _logs(monkeypatch)
     loop = _loop(_Repository(has_row=False))
 
-    loop._handle_dialog(TARGET)
+    loop._handle_dialog(TARGET, purpose=ATTACK)
 
     level, message, payload = captured[0]
     assert level == "WARNING"
@@ -197,7 +216,7 @@ def test_an_unreadable_knob_falls_back_to_the_default(monkeypatch: pytest.Monkey
     repository.military_attack_config = _boom  # type: ignore[method-assign]
     loop = _loop(repository)
 
-    loop._handle_dialog(TARGET)
+    loop._handle_dialog(TARGET, purpose=ATTACK)
 
     _level, _message, payload = captured[0]
     assert payload["exclusion_hours"] == 8
@@ -208,25 +227,52 @@ def _boom() -> _Config:
     raise RuntimeError("库连不上")
 
 
-# -- 判据认的是类型，不是那句中文 ----------------------------------------------
+# -- 判据认的是 (消息 × 意图)，不是那句中文 ------------------------------------
 
 
-def test_the_branch_is_keyed_on_the_dialog_kind() -> None:
-    """三个弹窗，两类。词表是封闭的，这张分类表也必须是封闭的。
+def test_the_branch_is_keyed_on_message_and_purpose() -> None:
+    """三个弹窗 × 三种意图，封闭表九格。漏一格就 `KeyError`——**那正是想要的**。
 
-    ⚠️ 新增弹窗却不给它定类别时 `dialog_kind` 直接 `KeyError`——**那正是想要的**。
+    ⚠️ 新增弹窗或意图却不给它定处置时直接 `KeyError`。
     「认不出就当没弹窗放行」的默认行为会让 runner 对着一个它没看懂的屏继续点。
     """
-    assert pirate_ui.dialog_kind(pirate_ui.DIALOG_NO_MISSION) is pirate_ui.DialogKind.PROTECTED
-    assert pirate_ui.dialog_kind(pirate_ui.DIALOG_NO_SHIPS) is pirate_ui.DialogKind.EXHAUSTED
-    assert pirate_ui.dialog_kind(pirate_ui.DIALOG_LINES_FULL) is pirate_ui.DialogKind.EXHAUSTED
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_NO_MISSION, purpose=ATTACK)
+        is pirate_ui.DialogAction.SKIP_PROTECTED
+    )
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_NO_MISSION, purpose=RECYCLE)
+        is pirate_ui.DialogAction.SKIP_NO_DEBRIS
+    )
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_NO_SHIPS, purpose=ATTACK)
+        is pirate_ui.DialogAction.STOP_ROUND
+    )
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_NO_SHIPS, purpose=RECYCLE)
+        is pirate_ui.DialogAction.SKIP_NO_RECYCLERS
+    )
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_LINES_FULL, purpose=ATTACK)
+        is pirate_ui.DialogAction.STOP_ROUND
+    )
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_LINES_FULL, purpose=RECYCLE)
+        is pirate_ui.DialogAction.STOP_ROUND
+    )
+    # 侦察与攻击同处置
+    scout = pirate_ui.DispatchPurpose.SCOUT
+    assert (
+        pirate_ui.dialog_action(pirate_ui.DIALOG_NO_MISSION, purpose=scout)
+        is pirate_ui.DialogAction.SKIP_PROTECTED
+    )
     assert set(pirate_ui.DIALOG_MESSAGES) == {
         pirate_ui.DIALOG_NO_MISSION,
         pirate_ui.DIALOG_NO_SHIPS,
         pirate_ui.DIALOG_LINES_FULL,
     }
     with pytest.raises(KeyError):
-        pirate_ui.dialog_kind("服务器维护中")
+        pirate_ui.dialog_action("服务器维护中", purpose=ATTACK)
 
 
 def test_a_misread_dialog_still_records_the_protection_period(
@@ -236,14 +282,14 @@ def test_a_misread_dialog_still_records_the_protection_period(
 
     实机把「派遣」读成过「派遗」。判据若是那句中文的字面比较，差一个字就漏——
     而漏掉的后果是这个目标下一轮又被挑中，症状和这次修的缺陷一模一样。
-    `snap_dialog` 先把文案贴回词表，之后一律按 `DialogKind` 分流。
+    `snap_dialog` 先把文案贴回词表，之后一律按 `(消息 × 意图)` 分流。
     """
     _logs(monkeypatch)
     repository = _Repository()
     loop = _loop(repository)
     loop._read = lambda *_a, **_k: "没有可执行的仼务。"  # type: ignore[assignment]
 
-    assert loop._handle_dialog(TARGET) is False
+    assert loop._handle_dialog(TARGET, purpose=ATTACK) is False
     assert [coordinate for coordinate, _seen in repository.noted] == [TARGET]
 
 
@@ -258,7 +304,7 @@ def test_the_current_time_is_read_once_per_hit(monkeypatch: pytest.MonkeyPatch) 
     loop = _loop(repository)
 
     before = datetime.now(UTC)
-    loop._handle_dialog(TARGET)
+    loop._handle_dialog(TARGET, purpose=ATTACK)
     after = datetime.now(UTC)
 
     _level, _message, payload = captured[0]
