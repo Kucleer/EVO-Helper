@@ -112,6 +112,7 @@ def _report(
     resources: tuple[tuple[int, int], ...] = (),
     approximate: bool = False,
     uncertainty: int = 0,
+    outcome: str | None = None,
 ) -> None:
     report_id = uuid4()
     with session_factory() as session:
@@ -126,6 +127,7 @@ def _report(
                 defender_target_system=140,
                 defender_target_position=9,
                 dispatch_id=dispatch_id,
+                outcome=outcome,
             )
         )
         session.flush()
@@ -442,3 +444,31 @@ def test_an_occupancy_is_clamped_to_now(
     segments = origins.origin_occupancies(start=DAY, end=NOW, hold=HOLD, now_utc=NOW)
 
     assert segments[ALPHA][0].end == NOW
+
+
+def test_a_protection_bounce_is_not_counted_as_a_report_here_either(
+    origins: OriginEfficiencyRepository, session_factory: sessionmaker[Session], run_id: UUID
+) -> None:
+    """⚠️ 撞保护期那一行不算战报（用户口径 2026-09-11）。
+
+    这张表**另有一条查询**，周期表那一条改了它不会跟着改——两处口径分叉的话，
+    同一天的战报回收率在两个页面上会是两个数。
+
+    ⚠️ 这里的 `reports` 数的是「这一发有没有战报」（按派出日归属），
+    和周期表按 `reported_at_utc` 切不是一回事；但「撞保护期不算」这一条两边一致。
+    """
+    moment = DAY + timedelta(hours=1)
+    real = _dispatch(session_factory, run_id, origin=ALPHA, dispatched_at_utc=moment)
+    bounced = _dispatch(session_factory, run_id, origin=ALPHA, dispatched_at_utc=moment)
+    _report(session_factory, reported_at_utc=moment + timedelta(minutes=40), dispatch_id=real)
+    _report(
+        session_factory,
+        reported_at_utc=moment + timedelta(minutes=40),
+        dispatch_id=bounced,
+        outcome="PROTECTED",
+    )
+
+    day = _by_origin(origins)[ALPHA]
+
+    assert day.attacks == 2
+    assert day.reports == 1, "撞保护期被算成读回战报了"

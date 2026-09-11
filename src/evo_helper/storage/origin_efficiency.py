@@ -32,9 +32,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Integer, cast, func, select
+from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.origin_efficiency import OriginDay
 from evo_helper.domain.overview import RARE_SLOTS, Occupancy, occupancy_end
@@ -172,7 +173,19 @@ class OriginEfficiencyRepository:
                 orm.AttackIntentRow.origin_position,
                 func.count().filter(kind == MISSION_KIND_ATTACK).label("attacks"),
                 func.count().filter(kind == MISSION_KIND_RECYCLE).label("recycles"),
-                func.count().filter(orm.BattleReportRow.id.is_not(None)).label("reports"),
+                # ⚠️ 撞保护期那一行不算战报（用户口径 2026-09-11）：它是合成出来
+                # 给那一发结账用的，里面一格资源都没有。同 `period_counts`。
+                func.count()
+                .filter(
+                    orm.BattleReportRow.id.is_not(None),
+                    # ⚠️ IS NULL 那一支不能省，理由同 `period_counts`：
+                    # 裸的 `!=` 会把没写结局的战报一起滤掉（NULL 不是 TRUE）。
+                    or_(
+                        orm.BattleReportRow.outcome.is_(None),
+                        orm.BattleReportRow.outcome != OUTCOME_PROTECTED,
+                    ),
+                )
+                .label("reports"),
                 func.min(orm.AttackDispatchRow.dispatched_at_utc).label("first"),
                 func.max(orm.AttackDispatchRow.dispatched_at_utc).label("last"),
             )
