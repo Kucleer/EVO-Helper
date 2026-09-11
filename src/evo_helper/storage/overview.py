@@ -27,6 +27,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import Occupancy, occupancy_end
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.uptime import UptimeSegment
 from evo_helper.storage import models as orm
 from evo_helper.storage.repository import (
@@ -57,6 +58,15 @@ class OriginLineUsage:
     #: `UNKNOWN_LINE_HOLD` 占着航线的那批；混在一起，页面就说不出「为什么明明
     #: 没派几发却没航线了」（需求文档 2.1）。
     unknown_duration: int
+    #: 上面 `holding` 里属于**残骸回收**的那些（`mission_kind = RECYCLE`）。
+    #:
+    #: ⚠️ **`holding` / `unknown_duration` 仍然是合计**，这两个是它们的子集，
+    #: 不是另起一套。别处（「N 条是时长未知」那句提示、`LineTotals`、
+    #: `overflow_lines`）读的都是合计，改语义会连带出错。
+    recycle_holding: int
+    #: 再往下切一刀：回收里航线钟为 NULL 的那些。
+    #: 页面要画的是 `类型 × 钟` 四档，两个维度得交叉才拆得开。
+    recycle_unknown: int
     #: 已知最早会空出来的那条航线，什么时候空。
     #:
     #: ⚠️ **只看还没到点的那些**（`line_free_at_utc > now`）。原型第一版写的是
@@ -90,7 +100,15 @@ class UnreadReports:
 class PeriodCounts:
     """一个周期里的计数类指标。资源另走 `resource_totals`。"""
 
+    #: 攻击 + 回收。⚠️ **不含侦察。** 侦察最后一次派遣是 2026-08-23，早已停用；
+    #: 把它算进「派遣」会让这一列和下面 `attacks + recycles` 对不上账，
+    #: 而页面上这三个数是挨着显示的。
     dispatches: int
+    #: `mission_kind = ATTACK` 的那些。
+    attacks: int
+    #: `mission_kind = RECYCLE` 的那些。回收**永远不产生战报**，所以它绝不能
+    #: 进 `recovery_rate` 的分母（见那个函数的注释）。
+    recycles: int
     reports: int
     protection_hits: int
     coordinates: int
@@ -162,27 +180,34 @@ class OverviewRepository:
                 configured_lines=lines,
                 holding=held,
                 unknown_duration=unknown,
+                recycle_holding=rec,
+                recycle_unknown=rec_unknown,
                 next_free_at_utc=self._repository.next_line_free_at(now_utc=now_utc, origin=origin),
             )
-            for (origin, lines), (held, unknown) in zip(origins, counts, strict=True)
+            for (origin, lines), (held, unknown, rec, rec_unknown) in zip(
+                origins, counts, strict=True
+            )
         )
 
     @staticmethod
     def _counts_for(
         session: Session, origin: Coordinate, *, holding: ColumnElement[bool]
-    ) -> tuple[int, int]:
-        """「占着几条」与「其中几条时长未知」。
+    ) -> tuple[int, int, int, int]:
+        """「占着几条」「其中几条时长未知」「其中几条是回收」「回收里几条时长未知」。
 
-        一趟查询取齐而不是查两遍：它们必须来自同一个 `now`，分两次查会让
-        「占着 3 条、其中 4 条时长未知」这种自相矛盾在边界上真的发生。
+        ⚠️ **一趟查询取齐这四个，不许分开查。** 它们必须来自同一个 `now`：
+        分两次查会让「占着 3 条、其中 4 条时长未知」这种自相矛盾在边界上真的发生，
+        加了回收维度之后更糟——「回收占 2 条，而总共只占 1 条」同样会画出来。
         """
+        is_recycle = orm.AttackDispatchRow.mission_kind == MISSION_KIND_RECYCLE
+        no_clock = orm.AttackDispatchRow.line_free_at_utc.is_(None)
         row = session.execute(
             select(
                 func.count().label("holding"),
                 # 「时长未知」= 还占着 **且** 航线钟为 NULL。
-                func.count()
-                .filter(orm.AttackDispatchRow.line_free_at_utc.is_(None))
-                .label("unknown"),
+                func.count().filter(no_clock).label("unknown"),
+                func.count().filter(is_recycle).label("recycle"),
+                func.count().filter(and_(is_recycle, no_clock)).label("recycle_unknown"),
             )
             .select_from(orm.AttackDispatchRow)
             .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
@@ -192,7 +217,12 @@ class OverviewRepository:
                 holding,
             )
         ).one()
-        return int(row.holding or 0), int(row.unknown or 0)
+        return (
+            int(row.holding or 0),
+            int(row.unknown or 0),
+            int(row.recycle or 0),
+            int(row.recycle_unknown or 0),
+        )
 
     def unread_reports(self, *, now_utc: datetime, day_start_utc: datetime) -> UnreadReports:
         """当天（UTC+0）派出去、还没回读战报的那些，切成三档。
@@ -304,21 +334,30 @@ class OverviewRepository:
         """一个周期里的计数类指标。**半开区间 `[start, end)`。**
 
         战报按 `reported_at_utc` 切，派遣按 `dispatched_at_utc` 切——两者是两个
-        不同的时刻。拿同一列切会让「回收率」变成一个自己跟自己比的数。
+        不同的时刻。拿同一列切会让「战报回收率」变成一个自己跟自己比的数。
+
+        ⚠️ **攻击与回收分开数，`dispatches` 是这两个之和。** 页面上三个数挨着
+        显示，任何一个用了别的口径（比如把侦察也算进 `dispatches`）都会当场
+        对不上账。侦察最后一次派遣是 2026-08-23，这里**明确不算**。
         """
+        kind = orm.AttackDispatchRow.mission_kind
+        in_window = (
+            orm.AttackDispatchRow.accepted.is_(True),
+            orm.AttackDispatchRow.dispatched_at_utc >= start,
+            orm.AttackDispatchRow.dispatched_at_utc < end,
+        )
         with self._session_factory() as session:
-            dispatches = int(
-                session.scalar(
-                    select(func.count())
-                    .select_from(orm.AttackDispatchRow)
-                    .where(
-                        orm.AttackDispatchRow.accepted.is_(True),
-                        orm.AttackDispatchRow.dispatched_at_utc >= start,
-                        orm.AttackDispatchRow.dispatched_at_utc < end,
-                    )
+            kinds = session.execute(
+                select(
+                    func.count().filter(kind == MISSION_KIND_ATTACK).label("attacks"),
+                    func.count().filter(kind == MISSION_KIND_RECYCLE).label("recycles"),
                 )
-                or 0
-            )
+                .select_from(orm.AttackDispatchRow)
+                .where(*in_window)
+            ).one()
+            attacks = int(kinds.attacks or 0)
+            recycles = int(kinds.recycles or 0)
+            dispatches = attacks + recycles
             reports = int(
                 session.scalar(
                     select(func.count())
@@ -360,48 +399,12 @@ class OverviewRepository:
             )
         return PeriodCounts(
             dispatches=dispatches,
+            attacks=attacks,
+            recycles=recycles,
             reports=reports,
             protection_hits=protection,
             coordinates=coordinates,
         )
-
-    def recycle_period_stats(self, *, start: datetime, end: datetime) -> tuple[int, float]:
-        """一个周期里的回收统计：(趟数, 占线小时)。
-
-        ⚠️ **「残骸实收」恒为「未知」** —— 回收邮件 hold，这一版读不到实收。
-        ⚠️ **「占线时长」是记得住的** —— 它来自 `line_free_at_utc`，和实收无关。
-        这是这一版唯一能证明「回收真的在占资源」的量。
-        """
-        with self._session_factory() as session:
-            # 趟数：recycle_jobs 里 state=dispatched 的
-            dispatched = int(
-                session.scalar(
-                    select(func.count())
-                    .select_from(orm.RecycleJobRow)
-                    .where(
-                        orm.RecycleJobRow.state == "dispatched",
-                        orm.RecycleJobRow.executed_at_utc >= start,
-                        orm.RecycleJobRow.executed_at_utc < end,
-                    )
-                )
-                or 0
-            )
-            # 占线小时：从 attack_dispatches 里 mission_kind=RECYCLE 的行算
-            # line_free_at_utc - dispatched_at_utc
-            rows = session.execute(
-                select(
-                    orm.AttackDispatchRow.dispatched_at_utc,
-                    orm.AttackDispatchRow.line_free_at_utc,
-                ).where(
-                    orm.AttackDispatchRow.mission_kind == "RECYCLE",
-                    orm.AttackDispatchRow.accepted.is_(True),
-                    orm.AttackDispatchRow.dispatched_at_utc >= start,
-                    orm.AttackDispatchRow.dispatched_at_utc < end,
-                    orm.AttackDispatchRow.line_free_at_utc.is_not(None),
-                )
-            ).all()
-            occupied_seconds = sum((free - dispatched).total_seconds() for dispatched, free in rows)
-        return dispatched, occupied_seconds / 3600
 
     def resource_totals(self, *, start: datetime, end: datetime) -> tuple[ResourceTotal, ...]:
         """一个周期里 12 格各收了多少。**按战报时刻切，只覆盖已读回的战报。**

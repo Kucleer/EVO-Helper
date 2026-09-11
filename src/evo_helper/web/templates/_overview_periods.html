@@ -19,8 +19,15 @@
     <thead>
       <tr>
         <th scope="col">周期</th>
+        {# 派遣 = 攻击 + 回收。⚠️ **不含侦察**（最后一次派遣 2026-08-23，已停用）：
+           它和右边两列必须加得起来，页面上三个数是挨着的。 #}
         <th scope="col">派遣</th>
-        <th scope="col">读回战报</th>
+        <th scope="col">攻击</th>
+        <th scope="col">攻击战报</th>
+        {# ⚠️ 「战报回收率」分母是**攻击**不是派遣：回收永远不产生战报，
+           算进分母只会把这个率稀释成一个假的「战报丢了」。 #}
+        <th scope="col">战报回收率</th>
+        <th scope="col">回收</th>
         <th scope="col">回收率</th>
         {% for cell in (rows[0].rare if rows else []) %}
           <th scope="col">{{ cell.label }}</th>
@@ -29,9 +36,6 @@
            这个问题的答案就在这一列里。 #}
         <th scope="col">挂机</th>
         <th scope="col">利用率</th>
-        {# 残骸：趟数 + 占线时长。⚠️ 实收恒为「未知」（回收邮件 hold）。 #}
-        <th scope="col">残骸趟数</th>
-        <th scope="col">残骸占线</th>
       </tr>
     </thead>
     <tbody>
@@ -39,9 +43,27 @@
         <tr {% if row.is_total %}class="overview-total"{% endif %}>
           <th scope="row">{{ row.label }}</th>
           <td>{{ row.dispatches }}</td>
+          <td>{{ row.attacks }}</td>
           <td>{{ row.reports }}</td>
           <td class="{% if row.recovery is none %}muted{% elif row.recovery >= 0.75 %}tone-ok{% elif row.recovery >= 0.3 %}tone-warn{% else %}tone-danger{% endif %}">
             {% if row.recovery is none %}—{% else %}{{ '%.0f'|format(row.recovery * 100) }}%{% endif %}
+          </td>
+          {#
+            回收两列。⚠️ **「—」只给残骸回收上线之前的那些段**
+            （`RECYCLE_STATS_START_UTC`，UTC 2026-09-10）。
+
+            ⚠️⚠️ 上线**之后**的零必须写 `0`，不许写「—」。写「—」会把
+            「回收链路挂了」显示成「没数据」，正好把故障藏起来——
+            同左边挂机那一列「0 的意思是那段没开机，而我们并不知道」的道理，
+            方向相反：那里 0 是假话，这里「—」才是假话。
+          #}
+          <td class="{% if row.recycle_before_start %}muted{% elif row.recycles %}tone-recycle{% endif %}"
+              {% if row.recycle_before_start %}title="这一段还在残骸回收上线之前（UTC 2026-09-10）。写「—」而不是 0：0 的意思是那段时间一趟没回收，而那时这个功能还不存在"{% endif %}>
+            {% if row.recycle_before_start %}—{% else %}{{ row.recycles }}{% endif %}
+          </td>
+          <td class="{% if row.recycle_before_start or row.recycle_rate is none %}muted{% elif row.recycle_rate %}tone-recycle{% endif %}"
+              {% if not row.recycle_before_start and row.recycle_rate is not none %}title="回收 ÷ 攻击。分母是攻击不是派遣——派遣里含着回收，拿它当分母的话档位 r=1.0 也只能到 50%"{% endif %}>
+            {% if row.recycle_before_start or row.recycle_rate is none %}—{% else %}{{ '%.0f'|format(row.recycle_rate * 100) }}%{% endif %}
           </td>
           {% for cell in row.rare %}
             <td>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
@@ -69,13 +91,10 @@
               {% else %}title="分母 = 周期总时长 × {{ row.lines }} 条航线（那几轮开始时记下的真值）"{% endif %}>
             {% if row.utilisation is none %}—{% else %}{{ '≤ ' if not row.lines_exact }}{{ '%.0f'|format(row.utilisation * 100) }}%{% endif %}
           </td>
-          {# 残骸趟数。⚠️ 实收恒为「未知」（回收邮件 hold），不在这张表里显示。 #}
-          <td>{{ row.recycle_dispatches }}</td>
-          {# 残骸占线小时。⚠️ 这是唯一能证明「回收真的在占资源」的量。 #}
-          <td>{% if row.recycle_occupied_hours > 0 %}{{ '%.1f'|format(row.recycle_occupied_hours) }}h{% else %}—{% endif %}</td>
         </tr>
       {% else %}
-        <tr><td colspan="11" class="muted">这一档没有数据</td></tr>
+        {# ⚠️ 这个数是写死的，加减列必须同步改：周期 + 派遣 + 攻击 + 攻击战报 + 战报回收率 + 回收 + 回收率（7） + 稀有三样（len(RARE_SLOTS) = 3）+ 挂机 + 利用率（2）= 12。 #}
+        <tr><td colspan="12" class="muted">这一档没有数据</td></tr>
       {% endfor %}
     </tbody>
   </table>

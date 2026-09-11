@@ -78,6 +78,7 @@ from datetime import UTC, datetime, timedelta
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import (
     MAX_DAY_ROWS,
+    RECYCLE_STATS_START_UTC,
     RESOURCE_STATS_START_UTC,
     LineCount,
     LineSource,
@@ -85,6 +86,7 @@ from evo_helper.domain.overview import (
     day_start,
     max_concurrent_lines,
     recovery_rate,
+    recycle_rate,
 )
 
 #: 回收率低于这个水平时，这一行的效率数标成**不可信**。
@@ -127,10 +129,19 @@ class OriginDay:
     """
 
     origin: Coordinate
-    #: 当天从这颗星球派出去、被游戏接受的发数。
+    #: 当天从这颗星球派出去、被游戏接受的发数 = `attacks + recycles`。
+    #: ⚠️ **不含侦察**（最后一次派遣 2026-08-23，已停用）：页面上这三个数挨着显示，
+    #: 任何一个用了别的口径都会当场对不上账。
     dispatches: int
+    #: 上面那些里 `mission_kind = ATTACK` 的。
+    attacks: int
+    #: 上面那些里 `mission_kind = RECYCLE` 的。
+    recycles: int
     #: 上面那些发次里，**已经读回战报**的有几发。⚠️ 不是「当天读回的战报数」——
-    #: 后者会把昨天派出的战报算进来，让回收率变成一个自己跟自己比的数。
+    #: 后者会把昨天派出的战报算进来，让战报回收率变成一个自己跟自己比的数。
+    #:
+    #: ⚠️ 回收发次**永远不会有战报**，所以它们只能进分子的「没有」那一侧；
+    #: 分母必须是 `attacks`，不是 `dispatches`（见 `_recovery`）。
     reports: int
     #: 稀有三样的合计（`domain.overview.RARE_SLOTS`），来自上面那些已读回的战报。
     rare_amount: int
@@ -161,8 +172,16 @@ class OriginEfficiency:
     per_line: float | None
     #: 稀有三样 ÷ 航线数 ÷ 在岗小时。两个分母任一不可用时为 None。
     per_line_hour: float | None
-    #: 读回战报数 ÷ 派出数。派出数为 0 时为 None（**不是 0%**）。
+    #: 攻击战报数 ÷ **攻击数**。攻击数为 0 时为 None（**不是 0%**）。
+    #:
+    #: ⚠️ 分母 2026-09-11 从「派出数」换成了「攻击数」：回收永远不产生战报，
+    #: 留在分母里只会把这个率稀释成一个假的「战报丢了」。
     recovery: float | None
+    #: 回收 ÷ 攻击。攻击数为 0 时为 None。
+    recycle_rate: float | None
+    #: 这一天在残骸回收上线**之前**——回收那两列写「—」，不是 0。
+    #: ⚠️ 上线之后的零必须写 0，否则「回收挂了」会显示成「没数据」。
+    recycle_before_start: bool
     #: 回收率低到足以让排序翻转（见 `LOW_RECOVERY_THRESHOLD`）。
     untrustworthy: bool
 
@@ -453,6 +472,9 @@ def build_rows(
                 per_line=per_line(fact.rare_amount, line_count.lines),
                 per_line_hour=per_line_hour(fact.rare_amount, line_count.lines, on_duty),
                 recovery=recovery,
+                recycle_rate=_recycle_rate(fact),
+                # ⚠️ 判的是这一天的**右界**：跨上线那一天回收已经在跑了。
+                recycle_before_start=day_end_utc <= RECYCLE_STATS_START_UTC,
                 untrustworthy=is_untrustworthy(recovery),
             )
         )
@@ -460,18 +482,26 @@ def build_rows(
 
 
 def _recovery(fact: OriginDay) -> float | None:
-    """回收率。判据 import `domain.overview.recovery_rate`，**不在这里另写一遍**。
+    """战报回收率。判据 import `domain.overview.recovery_rate`，**不在这里另写一遍**。
 
-    那个函数钉着一条这一段同样需要的规矩：比率永远是「分子之和 ÷ 分母之和」，
-    而且分母为 0 时给 None（一发没派时「回收率 0%」是句假话）。
+    那个函数钉着两条这一段同样需要的规矩：比率永远是「分子之和 ÷ 分母之和」；
+    分母为 0 时给 None（一发没打时「回收率 0%」是句假话）。
+    **分母是攻击不是派出**也在那边钉着。
     """
-    return recovery_rate(fact.reports, fact.dispatches)
+    return recovery_rate(fact.reports, fact.attacks)
+
+
+def _recycle_rate(fact: OriginDay) -> float | None:
+    """回收率。同样 import 过来，不在这里另写。"""
+    return recycle_rate(fact.recycles, fact.attacks)
 
 
 def _empty_day(origin: Coordinate) -> OriginDay:
     return OriginDay(
         origin=origin,
         dispatches=0,
+        attacks=0,
+        recycles=0,
         reports=0,
         rare_amount=0,
         rare_approximate=False,

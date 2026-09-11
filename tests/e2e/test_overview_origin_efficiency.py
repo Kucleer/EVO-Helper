@@ -412,10 +412,15 @@ def test_the_recovery_column_sits_next_to_the_efficiency_columns(
     factory: sessionmaker[Session],
     run_id: UUID,
 ) -> None:
-    """⚠️ **回收率必须并列在表里，不能做成小字。**
+    """⚠️ **战报回收率必须并列在表里，不能做成小字。**
 
-    分子只数已读回的战报，所以回收率就是分子的覆盖率；少了这一列，用户看历史
+    分子只数已读回的战报，所以这个率就是分子的覆盖率；少了这一列，用户看历史
     某一天会得出「那天效率崩了」这个错结论（实测 08-17 是 39 发读回 13 发）。
+
+    ⚠️ 2026-09-11 拆列：「读回战报」→「攻击战报」、「回收率」→「战报回收率」，
+    新增「攻击」「回收」「回收率」。**分母同时从「派出」换成了「攻击」** ——
+    这张表比周期表更要紧，因为 `is_untrustworthy` 拿这个率**翻转排序**：
+    回收派得多的星球本来会被排进「不可信」。
     """
     _configure(repository)
     _earn(factory, run_id, origin=EARLY, at=DAY + timedelta(hours=1), rare=1_000)
@@ -427,7 +432,10 @@ def test_the_recovery_column_sits_next_to_the_efficiency_columns(
     assert _headers(html) == [
         "出发星球",
         "派出",
-        "读回战报",
+        "攻击",
+        "攻击战报",
+        "战报回收率",
+        "回收",
         "回收率",
         "稀有三样",
         "航线",
@@ -435,7 +443,7 @@ def test_the_recovery_column_sits_next_to_the_efficiency_columns(
         "每线",
         "每线小时",
     ]
-    # 2 发派出、1 发读回 = 50%。
+    # 2 发攻击、1 发读回 = 50%。
     assert "50%" in _cells(html, EARLY)
 
 

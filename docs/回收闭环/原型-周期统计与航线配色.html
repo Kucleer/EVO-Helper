@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>周期统计改版 · 航线配色</title>
+<style>
+  /* ⚠️ token 直接抄自 web/static/console.css:8-40，不是另配的一套。
+     这个原型的作用是让你在真实配色里判断，所以不能用别的色。 */
+  :root {
+    --bg: #0d1117;
+    --bg-panel: #151b24;
+    --bg-panel-raised: #1b232e;
+    --border: #263140;
+    --border-strong: #35435a;
+    --text: #e4eaf2;
+    --text-muted: #8b97a8;
+    --text-faint: #5f6b7c;
+    --accent: #35c8e0;
+    --accent-strong: #4fdcf2;
+    --accent-dim: #16323b;
+    --accent-edge: #1c6c74;
+    --ok: #4ec98a;
+    --warn: #e0b341;
+    --danger: #e5675f;
+    --rare: #b79cf0;
+
+    /* ★ 新增（已定）：回收 = 靛蓝 */
+    --recycle: #7c9bec;
+    --recycle-dim: #1a2340;
+    --recycle-edge: #33477e;
+
+    --sans: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 var(--sans); }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 20px 80px; }
+
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .3px; }
+  .sub { color: var(--text-muted); font-size: 12.5px; margin-bottom: 26px; }
+  h2 {
+    font-size: 15px; margin: 40px 0 6px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  h2 .tag {
+    font-size: 10.5px; font-weight: 500; letter-spacing: .6px;
+    padding: 2px 7px; border-radius: 3px; border: 1px solid #24503c; color: var(--ok);
+  }
+  h2 .tag.ask { color: var(--warn); border-color: #52431d; }
+  h3 { font-size: 13px; margin: 26px 0 10px; color: var(--text-muted); font-weight: 600; }
+  p { margin: 10px 0; }
+  .note { color: var(--text-muted); font-size: 12.5px; }
+  .warnline { color: var(--warn); }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+
+  .tile { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+
+  /* ---- 航线卡 ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(238px, 1fr)); gap: 12px; }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card-title { font-size: 12.5px; color: var(--text-muted); }
+  .card-cfg { font-size: 11.5px; color: var(--text-faint); }
+  .card-val { font-size: 26px; font-weight: 600; margin: 6px 0 0; }
+  .card-val .unit { font-size: 12px; color: var(--text-muted); font-weight: 400; margin-left: 4px; }
+  .overview-slots { display: flex; gap: 5px; margin: 10px 0 2px; }
+  .overview-slots i {
+    flex: 1; height: 24px; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-style: normal; overflow: hidden; white-space: nowrap;
+  }
+  /* 四档 + 空 */
+  .slot-fly     { background: var(--accent-dim);  color: var(--accent);  border: 1px solid var(--accent-edge); }
+  .slot-flyunk  { background: var(--accent-dim);  color: var(--accent);  border: 1px dashed var(--warn); }
+  .slot-rec     { background: var(--recycle-dim); color: var(--recycle); border: 1px solid var(--recycle-edge); }
+  .slot-recunk  { background: var(--recycle-dim); color: var(--recycle); border: 1px dashed var(--warn); }
+  .slot-free    { border: 1px dashed var(--border-strong); color: var(--text-faint); }
+  .overview-slots.dense i { font-size: 9px; }
+  .card-note { font-size: 11px; color: var(--text-faint); margin-top: 6px; }
+  .card-note b { color: var(--text-muted); font-weight: 500; }
+
+  /* 合计卡里的拆分条 */
+  .split { display: flex; gap: 6px; margin: 10px 0 2px; height: 8px; border-radius: 4px; overflow: hidden; }
+  .split span { display: block; height: 100%; border-radius: 4px; }
+  .split .s-atk { background: var(--accent); }
+  .split .s-rec { background: var(--recycle); }
+  .split .s-free { background: var(--border-strong); }
+  .breakdown { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; }
+  .breakdown i { font-style: normal; display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); }
+  .breakdown b { font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; }
+
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-faint); margin-top: 12px; }
+  .legend i { font-style: normal; display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ---- 表 ---- */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 1020px; }
+  th, td { padding: 9px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  th { font-size: 11.5px; font-weight: 600; color: var(--text-muted); border-bottom: 1px solid var(--border-strong); }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:hover { background: #1a212b; }
+  td.muted { color: var(--text-faint); }
+  .tone-ok { color: var(--ok); }
+  .tone-warn { color: var(--warn); }
+  .tone-rare { color: var(--rare); }
+  .tone-rec { color: var(--recycle); }
+  .newcol { background: rgba(124,155,236,.06); }
+  th.newcol { color: var(--recycle); }
+  .col-sep { border-left: 1px solid var(--border-strong); }
+  .gone { text-decoration: line-through; color: var(--text-faint); }
+
+  .formula {
+    font-family: var(--mono); font-size: 12px; background: var(--bg-panel-raised);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+    margin: 8px 0; color: var(--text); overflow-x: auto; white-space: pre;
+  }
+  ul.plain { padding-left: 20px; }
+  ul.plain li { margin: 8px 0; }
+  .decided { display: grid; grid-template-columns: 150px 1fr; gap: 8px 16px; font-size: 12.5px; margin: 12px 0; }
+  .decided dt { color: var(--recycle); font-weight: 600; }
+  .decided dd { margin: 0; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>周期统计改版 · 航线格子分色 <span style="font-size:13px;color:var(--text-faint);font-weight:400">v2</span></h1>
+  <div class="sub">
+    配色 token 取自 <code>web/static/console.css:8-40</code>。表里计数列为 <b>2026-09-11 09:40 生产库实测</b>；资源 / 挂机 / 利用率取自 09:30 那张截图。
+  </div>
+
+  <!-- ============ 已定 ============ -->
+  <h2>已定的口径 <span class="tag">6 条</span></h2>
+  <dl class="decided">
+    <dt>派遣</dt><dd>= 攻击 + 回收（侦察最后一次派遣是 08-23，早已不用）</dd>
+    <dt>战报回收率</dt><dd>分母是<b>攻击</b>，不是派遣</dd>
+    <dt>回收率</dt><dd>= 回收 ÷ 攻击</dd>
+    <dt>回收配色</dt><dd>靛蓝 <code>#7c9bec</code>；格子文案用<b>「攻击 / 回收」</b></dd>
+    <dt>时长未知</dt><dd>四档（类型 × 钟）</dd>
+    <dt>残骸两列</dt><dd>趟数、占线<b>都删</b></dd>
+  </dl>
+
+  <!-- ============ 航线 ============ -->
+  <h2>一、航线格子 <span class="tag">已定</span></h2>
+
+  <p class="note">
+    四档：颜色带「是什么任务」，虚线琥珀边带「航线钟为 NULL、不知道何时空出」。
+    <code>console.css</code> 开头那条硬规矩（<b>色永远不是唯一载体</b>）靠文案满足 —— 攻击 / 回收两个字直接写在格子里。
+  </p>
+
+  <div class="legend">
+    <i><span class="dot" style="background:var(--accent-dim);border:1px solid var(--accent-edge)"></span> 攻击 · 钟已知</i>
+    <i><span class="dot" style="background:var(--accent-dim);border:1px dashed var(--warn)"></span> 攻击 · 钟未知</i>
+    <i><span class="dot" style="background:var(--recycle-dim);border:1px solid var(--recycle-edge)"></span> 回收 · 钟已知</i>
+    <i><span class="dot" style="background:var(--recycle-dim);border:1px dashed var(--warn)"></span> 回收 · 钟未知</i>
+    <i><span class="dot" style="border:1px dashed var(--border-strong)"></span> 空</i>
+  </div>
+
+  <h3>四档长这样</h3>
+  <div class="cards">
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 7:228:15</span><span class="card-cfg">配置 4 条</span></div>
+      <div class="card-val">4<span class="unit">/ 4 条占用（满）</span></div>
+      <div class="overview-slots">
+        <i class="slot-fly">攻击</i><i class="slot-flyunk">攻击?</i><i class="slot-rec">回收</i><i class="slot-recunk">回收?</i>
+      </div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:47:39</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 1:55:6</span><span class="card-cfg">配置 4 条</span></div>
+      <div class="card-val">2<span class="unit">/ 4 条占用</span></div>
+      <div class="overview-slots">
+        <i class="slot-fly">攻击</i><i class="slot-rec">回收</i><i class="slot-free">空</i><i class="slot-free">空</i>
+      </div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:58:31</b></div>
+    </div>
+  </div>
+
+  <h3>现在实际的一屏（单卡最多 2 格）</h3>
+  <p class="note">7 颗星球、合计 10 条，09:40 那一刻全满。此刻实际有 5 发回收在飞。</p>
+  <div class="cards">
+
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线合计</span><span class="card-cfg">共 7 颗星球</span></div>
+      <div class="card-val">10<span class="unit">/ 10 条占用（全满）</span></div>
+      <div class="split">
+        <span class="s-atk" style="flex:5"></span><span class="s-rec" style="flex:5"></span>
+      </div>
+      <div class="breakdown">
+        <i><span class="dot" style="background:var(--accent)"></span> 攻击 <b style="color:var(--accent)">5</b></i>
+        <i><span class="dot" style="background:var(--recycle)"></span> 回收 <b style="color:var(--recycle)">5</b></i>
+        <i><span class="dot" style="background:var(--border-strong)"></span> 空 <b>0</b></i>
+      </div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:41:27</b></div>
+    </div>
+
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 1:55:6</span><span class="card-cfg">配置 2 条</span></div>
+      <div class="card-val">2<span class="unit">/ 2 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-fly">攻击</i><i class="slot-rec">回收</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:58:31</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 2:391:16</span><span class="card-cfg">配置 1 条</span></div>
+      <div class="card-val">1<span class="unit">/ 1 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-fly">攻击</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:47:38</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 4:277:15</span><span class="card-cfg">配置 1 条</span></div>
+      <div class="card-val">1<span class="unit">/ 1 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-rec">回收</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:41:27</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 5:261:8</span><span class="card-cfg">配置 1 条</span></div>
+      <div class="card-val">1<span class="unit">/ 1 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-fly">攻击</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 10:22:21</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 7:228:15</span><span class="card-cfg">配置 2 条</span></div>
+      <div class="card-val">2<span class="unit">/ 2 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-fly">攻击</i><i class="slot-rec">回收</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:47:39</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 8:117:6</span><span class="card-cfg">配置 1 条</span></div>
+      <div class="card-val">1<span class="unit">/ 1 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-rec">回收</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 10:08:25</b></div>
+    </div>
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 9:250:8</span><span class="card-cfg">配置 2 条</span></div>
+      <div class="card-val">2<span class="unit">/ 2 条占用（满）</span></div>
+      <div class="overview-slots"><i class="slot-fly">攻击</i><i class="slot-rec">回收</i></div>
+      <div class="card-note">最早空出 <b>2026-09-11 09:48:34</b></div>
+    </div>
+  </div>
+
+  <h3>合计卡：怎么算</h3>
+  <p class="warnline note">
+    ⚠️ <b>必须从上面那几张卡加出来，不能另走一趟查询。</b>
+    现有注释写得很清楚：读这一页的人正是拿「合计」和「明细」判此刻还能不能派，
+    一个和明细矛盾的合计比不显示合计更糟。<code>LineTotals.of(cards)</code> 的入参就是模板遍历的那个元组，新增的攻击/回收计数照样从里面 <code>sum()</code>。
+  </p>
+  <p class="note">
+    合计卡<b>仍然不画格子</b>（那是刻意的），改成一条占比条 + 一行拆分数字。
+    「空」那一档在全满时是 0，条形里就不占宽度。
+  </p>
+
+  <h3>一个边界情况（现在碰不到，但要留规则）</h3>
+  <p class="note">
+    单颗星球现在最多配 <b>2 条</b>（1:55:6 / 7:228:15 / 9:250:8），所以「攻击?」三个字宽度绰绰有余。
+    某天某颗星球配到 <b>6 条以上</b>时格子会挤 —— 加一条降级：<code>configured_lines &gt; 4</code> 时给
+    <code>.overview-slots</code> 挂 <code>.dense</code>，文案缩成「攻 / 回」，完整说明留在 <code>aria-label</code> 和 <code>title</code> 里。
+  </p>
+  <div class="cards" style="max-width:520px">
+    <div class="tile">
+      <div class="card-head"><span class="card-title">航线 · 假设某颗</span><span class="card-cfg">配置 8 条</span></div>
+      <div class="card-val">6<span class="unit">/ 8 条占用</span></div>
+      <div class="overview-slots dense">
+        <i class="slot-fly">攻</i><i class="slot-fly">攻</i><i class="slot-flyunk">攻?</i><i class="slot-rec">回</i>
+        <i class="slot-rec">回</i><i class="slot-recunk">回?</i><i class="slot-free">空</i><i class="slot-free">空</i>
+      </div>
+      <div class="card-note">最早空出 <b>—</b></div>
+    </div>
+  </div>
+
+  <!-- ============ 周期统计 ============ -->
+  <h2>二、周期统计 <span class="tag">已定</span></h2>
+
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>周期</th>
+          <th>派遣</th>
+          <th class="newcol">攻击</th>
+          <th class="newcol">攻击战报</th>
+          <th class="newcol">战报回收率</th>
+          <th class="newcol">回收</th>
+          <th class="newcol">回收率</th>
+          <th class="col-sep">合金碎片</th>
+          <th>泰坦立方</th>
+          <th>收割者碎片</th>
+          <th class="col-sep">挂机</th>
+          <th>利用率</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>09-11 今天</td><td>14</td>
+          <td class="newcol">9</td><td class="newcol">5</td><td class="newcol tone-warn">56%</td>
+          <td class="newcol tone-rec">5</td><td class="newcol tone-rec">56%</td>
+          <td class="col-sep tone-rare">约 11,400</td><td class="tone-rare">331</td><td class="tone-rare">56</td>
+          <td class="col-sep">1.5h</td><td class="tone-ok">93%</td>
+        </tr>
+        <tr>
+          <td>09-10</td><td>190</td>
+          <td class="newcol">169</td><td class="newcol">164</td><td class="newcol tone-ok">97%</td>
+          <td class="newcol tone-rec">21</td><td class="newcol tone-rec">12%</td>
+          <td class="col-sep tone-rare">约 377,963</td><td class="tone-rare">17,519</td><td class="tone-rare">2,300</td>
+          <td class="col-sep">21.5h</td><td>72%</td>
+        </tr>
+        <tr>
+          <td>09-09</td><td>184</td>
+          <td class="newcol">184</td><td class="newcol">186</td><td class="newcol tone-warn">101%</td>
+          <td class="newcol muted">—</td><td class="newcol muted">—</td>
+          <td class="col-sep tone-rare">约 512,524</td><td class="tone-rare">28,358</td><td class="tone-rare">3,523</td>
+          <td class="col-sep">20.5h</td><td>71%</td>
+        </tr>
+        <tr>
+          <td>09-08</td><td>232</td>
+          <td class="newcol">232</td><td class="newcol">219</td><td class="newcol tone-ok">94%</td>
+          <td class="newcol muted">—</td><td class="newcol muted">—</td>
+          <td class="col-sep tone-rare">约 695,500</td><td class="tone-rare">36,542</td><td class="tone-rare">4,555</td>
+          <td class="col-sep">21.8h</td><td>73%</td>
+        </tr>
+        <tr>
+          <td>09-07</td><td>215</td>
+          <td class="newcol">215</td><td class="newcol">190</td><td class="newcol tone-ok">88%</td>
+          <td class="newcol muted">—</td><td class="newcol muted">—</td>
+          <td class="col-sep tone-rare">约 975,700</td><td class="tone-rare">37,517</td><td class="tone-rare">5,438</td>
+          <td class="col-sep">20.9h</td><td>52%</td>
+        </tr>
+        <tr>
+          <td>09-06</td><td>76</td>
+          <td class="newcol">76</td><td class="newcol">73</td><td class="newcol tone-ok">96%</td>
+          <td class="newcol muted">—</td><td class="newcol muted">—</td>
+          <td class="col-sep tone-rare">约 53,644</td><td class="tone-rare">2,278</td><td class="tone-rare">257</td>
+          <td class="col-sep">9.0h</td><td class="tone-warn">33%</td>
+        </tr>
+        <tr>
+          <td>09-05</td><td>207</td>
+          <td class="newcol">207</td><td class="newcol">193</td><td class="newcol tone-ok">93%</td>
+          <td class="newcol muted">—</td><td class="newcol muted">—</td>
+          <td class="col-sep tone-rare">约 170,159</td><td class="tone-rare">5,909</td><td class="tone-rare">710</td>
+          <td class="col-sep">24.0h</td><td class="tone-ok">81%</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note" style="margin-top:12px">
+    浅蓝底 5 列是新的。<span class="gone">残骸趟数</span> <span class="gone">残骸占线</span> 两列已删。
+  </p>
+
+  <h3>公式</h3>
+  <div class="formula">派遣       = count(attack_dispatches) where accepted and mission_kind in ('ATTACK','RECYCLE')
+攻击       = 同上，mission_kind = 'ATTACK'
+回收       = 同上，mission_kind = 'RECYCLE'
+攻击战报   = count(battle_reports) where reported_at_utc ∈ [start, end)     ← 口径未变
+战报回收率 = 攻击战报 ÷ 攻击
+回收率     = 回收     ÷ 攻击
+
+挂机 / 利用率  —— 原样不动</div>
+
+  <h3>两条实现注意</h3>
+  <ul class="plain note">
+    <li>
+      <span class="warnline">⚠️ <b>「—」只给功能还不存在的日子。</b></span>
+      加 <code>RECYCLE_STATS_START_UTC = 2026-09-10</code>（照 <code>RESOURCE_STATS_START_UTC</code> 的先例）。
+      <b>09-10 起，真的零回收必须显示 0</b> —— 显示「—」会把「回收挂了」伪装成「没数据」。
+    </li>
+    <li>
+      <code>colspan="11"</code> 在 <code>_overview_periods.html:78</code> 是<b>写死的</b>。
+      列数 11 → 12（+攻击 +回收 +回收率 −残骸趟数 −残骸占线），必须同步改。
+    </li>
+    <li>
+      <code>PeriodRow.empty</code> 只看 dispatches / reports / rare 三样。现在回收进了 <code>dispatches</code>，
+      「只有回收、没有攻击和战报」的末尾行不会再被误砍 —— 这条顺带修好了。
+    </li>
+  </ul>
+
+  <!-- ============ 改动面 ============ -->
+  <h2>三、改动面 <span class="tag ask">确认后开工</span></h2>
+  <div class="formula">storage/overview.py    _counts_for()        按 mission_kind 分组（钟未知那档要和类型交叉）
+                       period_counts()      拆成 attacks / recycles
+                       recycle_period_stats()  ← 整个删掉（两列都没了）
+domain/overview.py     SLOT_* 常量 +2       攻击未知 / 回收 / 回收未知；line_slots() 排序重定
+                       recovery_rate()      分母换成攻击
+                       RECYCLE_STATS_START_UTC = 2026-09-10
+web/overview_routes.py OriginLineUsage      +回收计数、+回收·钟未知计数
+                       LineCard / LineTotals  合计从 cards 加，不另查
+                       PeriodRow            +attacks +recycles +recycle_rate，−残骸两列
+templates/_overview_now.html      slot 文案 map +2；合计卡加占比条与拆分行
+templates/_overview_periods.html  表头与单元格；colspan 11 → 12
+static/console.css     --recycle / --recycle-dim / --recycle-edge
+                       .slot-flyunk / .slot-rec / .slot-recunk / .overview-slots.dense</div>
+
+  <p class="note" style="margin-top:22px; padding-top:14px; border-top:1px solid var(--border)">
+    确认这版就开工。
+  </p>
+
+</div>
+</body>
+</html>

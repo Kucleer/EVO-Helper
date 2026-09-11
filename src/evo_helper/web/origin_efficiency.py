@@ -74,9 +74,17 @@ class OriginRow:
     in_config: bool
     #: 当前配置里是不是启用状态。**停用的照样出现在表里**：它当天真打出去过。
     enabled: bool
+    #: 派出 = 攻击 + 回收（**不含侦察**，最后一次派遣 2026-08-23）。
     dispatches: int
+    attacks: int
+    recycles: int
     reports: int
+    #: 攻击战报 ÷ **攻击**。⚠️ 分母不是派出：回收永远不产生战报。
     recovery: float | None
+    #: 回收 ÷ 攻击。
+    recycle_rate: float | None
+    #: 这一天在残骸回收上线之前 ⇒ 回收两列写「—」。上线之后的零要写 0。
+    recycle_before_start: bool
     #: 稀有三样合计在页面上的写法（近似值带「约」）。
     rare_text: str
     rare_hint: str
@@ -237,8 +245,12 @@ def _row(item: OriginEfficiency) -> OriginRow:
         in_config=item.in_config,
         enabled=item.enabled,
         dispatches=item.day.dispatches,
+        attacks=item.day.attacks,
+        recycles=item.day.recycles,
         reports=item.day.reports,
         recovery=item.recovery,
+        recycle_rate=item.recycle_rate,
+        recycle_before_start=item.recycle_before_start,
         rare_text=resource_amount_text(entry),
         rare_hint=resource_precision_hint(entry),
         rare_amount=item.day.rare_amount,

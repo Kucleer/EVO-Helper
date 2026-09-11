@@ -50,13 +50,19 @@ def _day(
     *,
     dispatches: int = 10,
     reports: int = 10,
+    recycles: int = 0,
     rare_amount: int = 0,
     first: datetime | None = None,
     last: datetime | None = None,
 ) -> OriginDay:
+    """⚠️ `dispatches` 是**合计**（攻击 + 回收）——和生产侧同口径，
+    所以攻击数由这里相减推出，不让用例各写各的。
+    """
     return OriginDay(
         origin=origin,
         dispatches=dispatches,
+        attacks=max(dispatches - recycles, 0),
+        recycles=recycles,
         reports=reports,
         rare_amount=rare_amount,
         rare_approximate=False,

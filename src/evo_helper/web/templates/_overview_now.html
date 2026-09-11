@@ -51,6 +51,32 @@
       <div class="value {% if now.line_totals.all_full %}tone-warn{% else %}tone-accent{% endif %}">
         {{ now.line_totals.holding }}<span class="overview-unit">/ {{ now.line_totals.configured_lines }} 条占用{% if now.line_totals.all_full %}（全满）{% endif %}</span>
       </div>
+      {#
+        占比条 + 拆分行（用户口径 2026-09-11：合计卡也要显示回收）。
+
+        ⚠️ **数字从卡片加出来**（`LineTotals.of`），不另走一趟查询——另查一份
+        就会和下面那几张卡的格子对不上，而读这一页的人正是拿这两处判
+        「此刻还能不能派」。合计卡**仍然不画格子**（理由见上）：这是一条比例带，
+        说的是「这 10 条里攻击几条回收几条」，不是「这里有 10 条可互相顶替的航线」。
+      #}
+      {% if now.line_totals.holding %}
+        <div class="line-split" role="img"
+             aria-label="占用 {{ now.line_totals.holding }} 条：攻击 {{ now.line_totals.attack_holding }} 条、回收 {{ now.line_totals.recycle_holding }} 条">
+          {% if now.line_totals.attack_holding %}
+            <span class="split-atk" style="flex: {{ now.line_totals.attack_holding }}"></span>
+          {% endif %}
+          {% if now.line_totals.recycle_holding %}
+            <span class="split-rec" style="flex: {{ now.line_totals.recycle_holding }}"></span>
+          {% endif %}
+          {% set free = now.line_totals.configured_lines - now.line_totals.holding %}
+          {% if free > 0 %}<span class="split-free" style="flex: {{ free }}"></span>{% endif %}
+        </div>
+        <div class="line-breakdown">
+          <i><span class="swatch swatch-atk"></span>攻击 <b class="tone-accent">{{ now.line_totals.attack_holding }}</b></i>
+          <i><span class="swatch swatch-rec"></span>回收 <b class="tone-recycle">{{ now.line_totals.recycle_holding }}</b></i>
+          <i><span class="swatch swatch-free"></span>空 <b>{{ [now.line_totals.configured_lines - now.line_totals.holding, 0]|max }}</b></i>
+        </div>
+      {% endif %}
       <div class="overview-note">最早空出
         {% if now.line_totals.next_free_at_utc %}
           <b class="tone-accent">{{ local_time(now.line_totals.next_free_at_utc) }}</b>
@@ -103,11 +129,30 @@
       <div class="value {% if line.full %}tone-warn{% else %}tone-accent{% endif %}">
         {{ line.holding }}<span class="overview-unit">/ {{ line.configured_lines }} 条占用{% if line.full %}（满）{% endif %}</span>
       </div>
-      {# ⚠️ 格子数恒等于「配置的航线数」，不按占用数画（需求文档 8.3）。 #}
-      <div class="overview-slots" role="img"
-           aria-label="{{ line.configured_lines }} 条航线，占用 {{ line.holding }} 条">
-        {% for slot in line.slots %}<i class="slot-{{ slot }}">{{
-          {'fly': '飞', 'unk': '?', 'free': '空'}[slot] }}</i>{% endfor %}
+      {#
+        ⚠️ 格子数恒等于「配置的航线数」，不按占用数画（需求文档 8.3）。
+
+        ⚠️ 四档 = 任务类型 × 航线钟。**新增 slot code 必须同时加进下面这个 map**，
+        漏一个 Jinja 直接 KeyError（这是它比 `|default` 好的地方：当场炸，
+        而不是在页面上悄悄画成别的东西）。
+
+        `configured_lines > 6` 时缩字（`.dense`）：格子是等分的，配得多了
+        「攻击?」三个字会挤出去。阈值取 6 是量出来的——卡宽约 238px，
+        6 格时每格还有约 30px，刚好放得下；8 格只剩 22px 就不行了。
+        缩字之后完整说明留在 `aria-label` 与每格的 `title` 里，信息不丢。
+      #}
+      <div class="overview-slots{% if line.configured_lines > 6 %} dense{% endif %}" role="img"
+           aria-label="{{ line.configured_lines }} 条航线，占用 {{ line.holding }} 条（攻击 {{ line.attack_holding }} · 回收 {{ line.recycle_holding }}）">
+        {% for slot in line.slots %}<i class="slot-{{ slot }}" title="{{
+          {'fly': '攻击，飞行时间已知',
+           'flyunk': '攻击，飞行时间没读出来，按兜底时长占着',
+           'rec': '残骸回收，飞行时间已知',
+           'recunk': '残骸回收，飞行时间没读出来，按兜底时长占着',
+           'free': '空闲'}[slot] }}">{{
+          {'fly': '攻击', 'flyunk': '攻击?', 'rec': '回收', 'recunk': '回收?', 'free': '空'}[slot]
+          if line.configured_lines <= 6 else
+          {'fly': '攻', 'flyunk': '攻?', 'rec': '回', 'recunk': '回?', 'free': '空'}[slot]
+        }}</i>{% endfor %}
       </div>
       {% if line.overflow %}
         <div class="overview-note tone-warn">超出配置 {{ line.overflow }} 条——航线是跨任务共享的，海盗与 bot 抢同一批</div>

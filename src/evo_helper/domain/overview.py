@@ -59,6 +59,15 @@ COUNT_STATS_START_UTC = datetime(2026, 8, 17, tzinfo=UTC)
 #: 资源明细统计的起点（UTC）。**和上面那个不是同一天，也不许合并。**
 RESOURCE_STATS_START_UTC = datetime(2026, 8, 18, tzinfo=UTC)
 
+#: 残骸回收统计的起点（UTC）。第一发真正派出去的回收在 2026-09-11 03:15（UTC+8），
+#: 落在 UTC 的 09-10 这一天。
+#:
+#: ⚠️ **这条线只用来区分「那时还没这功能」和「那天真的一发没回收」。**
+#: 早于它显示「—」；**到了这天以后，零就要显示 0，不许显示「—」**。
+#: 否则哪天回收链路挂了，页面会说「没数据」而不是「零」——正好把故障藏起来。
+#: 同 `uptime_hours` 那一列「0 的意思是那段没开机，而我们并不知道」的道理。
+RECYCLE_STATS_START_UTC = datetime(2026, 9, 10, tzinfo=UTC)
+
 #: 首屏那三样。用户口径：「最关注合金碎片/泰坦立方/收割者碎片，其他可以忽略
 #: 不计」。**存的是槽位不是名字**——名字由 `battle_resources.SLOT_LABELS` 翻译，
 #: 改名不用动这里，同样也不许把名字抄进来（理由见那个模块）。
@@ -210,20 +219,42 @@ def resource_window(start: datetime, end: datetime) -> tuple[datetime, datetime]
     return clipped, end
 
 
-def recovery_rate(reports: int, dispatches: int) -> float | None:
-    """战报回收率。派遣数为 0 时返回 None（**不是 0%**）。
+def recovery_rate(reports: int, attacks: int) -> float | None:
+    """战报回收率 = 攻击战报 ÷ **攻击**。攻击数为 0 时返回 None（**不是 0%**）。
+
+    ⚠️ **分母是攻击，不是派遣。** 回收**永远不会产生战报**，把它算进分母只会
+    把这个率稀释：2026-09-11 那天 9 发攻击读回 5 份，真值 56%；连回收一起当
+    分母就成了 5 ÷ 14 = 36%，看着像丢了战报，其实一份没丢。
+    这也正是「假欠战报」那个 bug 的同一个根子（`pending_reports_for_kind`
+    只认 `mission_kind='ATTACK'`，见 `docs/回收闭环/实机验证-2026-09-10夜.md` §4）。
 
     ⚠️ **比率永远是「分子之和 ÷ 分母之和」，不是把每天的百分比平均一遍。**
     天数不齐、量级不齐时那两个算法给的数不一样，而后者是错的：08-19 只派了 8 发
     却 100% 回收，08-16 派了 39 发一份没回收——平均下来 50%，而真实的周回收率是
     8 ÷ 47 = 17%。这条在 `docs/数据概览-方案.md` 第三节写着「要有用例钉住」。
 
-    分母为 0 时返回 None 而不是 0：那一天一发没派，「回收率 0%」是句假话
+    分母为 0 时返回 None 而不是 0：那一天一发没打，「回收率 0%」是句假话
     （页面上显示成「—」）。
     """
-    if dispatches <= 0:
+    if attacks <= 0:
         return None
-    return reports / dispatches
+    return reports / attacks
+
+
+def recycle_rate(recycles: int, attacks: int) -> float | None:
+    """回收率 = 回收 ÷ 攻击。攻击数为 0 时返回 None。
+
+    ⚠️ **分母是攻击而不是派遣**，理由和 `recovery_rate` 同源：派遣里就含着回收，
+    拿它当分母等于「回收 ÷（攻击 + 回收）」，回收越多这个数越往 100% 压不上去，
+    读不出「打一发能收几趟」这件事。档位 r=1.0 的理想值是 1.0，拿派遣当分母
+    永远只能到 0.5——那个上限是算法造出来的，不是业务的。
+
+    ⚠️ 它可以 **>100%**，不许截断：同一颗星球一周能被打两次，
+    而残骸决策是按航线释放触发的，一轮攻击可能喂出不止一趟回收。
+    """
+    if attacks <= 0:
+        return None
+    return recycles / attacks
 
 
 def utilisation(occupied_seconds: float, available_seconds: float) -> float | None:
@@ -429,13 +460,27 @@ def trim_empty_tail[T](rows: list[T], is_empty: Callable[[T], bool]) -> list[T]:
     return trimmed
 
 
-#: 航线格子的三种样子。`fly` 在飞、`unk` 时长未知（按 `hold` 兜底占着）、`free` 空。
+#: 航线格子的五种样子：**任务类型 × 航线钟**，再加一个空。
+#:
+#: ⚠️ **两个维度各用一种视觉通道**（`console.css` 那条「色永远不是唯一载体」）：
+#: 类型靠颜色 + 格子里的字（攻击 / 回收），钟未知靠琥珀虚线边 + 一个问号。
+#: 混成一档的话，「那条读不出飞行时间的是攻击还是回收」就看不见了——
+#: 而排障时想知道的正是这个。
 SLOT_FLYING = "fly"
-SLOT_UNKNOWN = "unk"
+SLOT_FLYING_UNKNOWN = "flyunk"
+SLOT_RECYCLE = "rec"
+SLOT_RECYCLE_UNKNOWN = "recunk"
 SLOT_FREE = "free"
 
 
-def line_slots(*, configured_lines: int, holding: int, unknown_duration: int) -> tuple[str, ...]:
+def line_slots(
+    *,
+    configured_lines: int,
+    holding: int,
+    unknown_duration: int,
+    recycle_holding: int,
+    recycle_unknown: int,
+) -> tuple[str, ...]:
     """一颗星球的航线格子。**格子数恒等于 `configured_lines`。**
 
     ⚠️ **按配置的航线数画，不按占用数画**（需求文档 8.3）。原型第一版按
@@ -443,11 +488,37 @@ def line_slots(*, configured_lines: int, holding: int, unknown_duration: int) ->
     表达的是「这颗星球有 7 条航线」，而它只有 4 条。配几条就画几格，
     占多少点亮多少；占用超了另说（见 `overflow_lines`），不许靠加格子表达。
 
-    次序是「在飞 → 时长未知 → 空」：时长未知那一档挨着空格子，一眼看得出
-    「满了，但其中几条是因为读不出飞行时间才占着的」。
+    次序是「攻击 → 回收 → 攻击·钟未知 → 回收·钟未知 → 空」：
+    **两档「钟未知」挨着空格子**，一眼看得出「满了，但其中几条是因为读不出
+    飞行时间才占着的」——这是原来「在飞 → 时长未知 → 空」那条次序的本意，
+    加了类型维度之后照旧成立。
+
+    ⚠️ **`recycle_holding` / `recycle_unknown` 没有默认值，故意的。**
+    `_record_dispatch` 的 `mission_kind` 当初就是栽在默认值上：漏传不报错，
+    只是把回收记成攻击（见 `#312`）。这里漏传的后果同形——页面把回收画成攻击，
+    跑起来一切正常，只有肉眼对不上账。所以宁可让调用方多写两个词。
+
+    ⚠️ **非回收一律画成「攻击」。** 侦察（`MISSION_KIND_SCOUT`）最后一次派遣是
+    2026-08-23，早已停用；真要重新启用，得在这里再分一档，不能让它顶着「攻击」
+    的皮混进来。
+
+    入参是**合计口径**（`holding` / `unknown_duration` 含所有类型），四档由这里
+    相减推出来——库那边只多查两个数，不用把四个计数都算好再传。
     """
-    flying = max(holding - unknown_duration, 0)
-    cells = [SLOT_FLYING] * flying + [SLOT_UNKNOWN] * max(unknown_duration, 0)
+    recycle_all = max(recycle_holding, 0)
+    recycle_unk = min(max(recycle_unknown, 0), recycle_all)
+    recycle_known = recycle_all - recycle_unk
+
+    attack_all = max(holding - recycle_all, 0)
+    attack_unk = min(max(unknown_duration - recycle_unk, 0), attack_all)
+    attack_known = attack_all - attack_unk
+
+    cells = (
+        [SLOT_FLYING] * attack_known
+        + [SLOT_RECYCLE] * recycle_known
+        + [SLOT_FLYING_UNKNOWN] * attack_unk
+        + [SLOT_RECYCLE_UNKNOWN] * recycle_unk
+    )
     if len(cells) < configured_lines:
         cells.extend([SLOT_FREE] * (configured_lines - len(cells)))
     return tuple(cells[:configured_lines])
@@ -518,10 +589,13 @@ __all__ = [
     "MAX_MONTH_ROWS",
     "MAX_WEEK_ROWS",
     "RARE_SLOTS",
+    "RECYCLE_STATS_START_UTC",
     "RESOURCE_STATS_START_UTC",
     "SLOT_FREE",
     "SLOT_FLYING",
-    "SLOT_UNKNOWN",
+    "SLOT_FLYING_UNKNOWN",
+    "SLOT_RECYCLE",
+    "SLOT_RECYCLE_UNKNOWN",
     "Granularity",
     "LineCount",
     "LineSource",
@@ -542,6 +616,7 @@ __all__ = [
     "period_start",
     "period_starts",
     "recovery_rate",
+    "recycle_rate",
     "resource_window",
     "row_limit",
     "trim_empty_tail",
