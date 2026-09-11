@@ -25,6 +25,7 @@ from sqlalchemy import Integer, and_, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import Occupancy, occupancy_end
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
@@ -390,6 +391,22 @@ class OverviewRepository:
                     .where(
                         orm.BattleReportRow.reported_at_utc >= start,
                         orm.BattleReportRow.reported_at_utc < end,
+                        # ⚠️ **撞保护期那一行不算战报**（用户口径 2026-09-11）。
+                        # 它是 `to_protection_bounce_report` 合成出来的，
+                        # 用途是**给那一发结账**（让它从「到点未读」里消失），
+                        # 不是真读回了一份战报——里面一格资源都没有。
+                        #
+                        # ⚠️ 「结账」和「读回战报」是两件事，这里只砍后者：
+                        # `unread_reports` / `pending_reports_for_kind` 那一侧照旧认它，
+                        # 否则撞保护期的那一发会退回去变成假欠账。
+                        # ⚠️⚠️ **必须带上 IS NULL 那一支。** 写成裸的
+                        # `outcome != 'PROTECTED'` 时，`outcome IS NULL` 的行求值是
+                        # **NULL 不是 TRUE**，于是所有没写结局的战报被一起滤掉——
+                        # 生产上这一列会整列归零，而且不报错。用例当场抓到过。
+                        or_(
+                            orm.BattleReportRow.outcome.is_(None),
+                            orm.BattleReportRow.outcome != OUTCOME_PROTECTED,
+                        ),
                     )
                 )
                 or 0

@@ -116,6 +116,7 @@ def _report(
     resources: tuple[tuple[int, int], ...] = (),
     approximate: bool = False,
     uncertainty: int = 0,
+    outcome: str | None = None,
 ) -> None:
     report_id = uuid4()
     with session_factory() as session:
@@ -130,6 +131,7 @@ def _report(
                 defender_target_system=130,
                 defender_target_position=4,
                 dispatch_id=dispatch_id,
+                outcome=outcome,
             )
         )
         # 同 `_dispatch`：两张表之间没有 ORM 关系，不先落盘就会撞外键。
@@ -877,3 +879,50 @@ def test_a_recycle_still_in_the_air_is_not_counted_as_flying_either(
     assert unread.unknown_eta == 0
     assert unread.dispatched_today == 3
     assert unread.recycles_today == 2
+
+
+def test_a_protection_bounce_settles_the_dispatch_without_counting_as_a_report(
+    overview: OverviewRepository, session_factory: sessionmaker[Session], run_id: UUID
+) -> None:
+    """⚠️⚠️ **「结账」和「读回战报」是两件事，这一条把它们钉开。**
+
+    撞保护期那一行是 `to_protection_bounce_report` **合成**出来的，
+    用途只有一个：让那一发从「到点未读」里消失。它里面一格资源都没有，
+    所以**不算读回了一份战报**（用户口径 2026-09-11）。
+
+    两边都要断言，少一边就会往相反方向滑：
+
+    - 只砍战报数不管结账 ⇒ 撞保护期的那一发退回去变成**假欠账**
+      （和回收那个 bug 一模一样，见 `#320`）
+    - 只结账不砍战报数 ⇒ 战报回收率被撑高，而那一天其实一份资源都没收到
+    """
+    moment = NOW - timedelta(hours=2)
+    real = _dispatch(
+        session_factory,
+        run_id,
+        dispatched_at_utc=moment,
+        expected_report_at_utc=moment + timedelta(minutes=40),
+    )
+    bounced = _dispatch(
+        session_factory,
+        run_id,
+        dispatched_at_utc=moment,
+        expected_report_at_utc=moment + timedelta(minutes=40),
+    )
+    _report(session_factory, reported_at_utc=moment + timedelta(minutes=45), dispatch_id=real)
+    _report(
+        session_factory,
+        reported_at_utc=moment + timedelta(minutes=45),
+        dispatch_id=bounced,
+        outcome="PROTECTED",
+    )
+
+    counts = overview.period_counts(start=day_start(NOW), end=NOW)
+    unread = overview.unread_reports(now_utc=NOW, day_start_utc=day_start(NOW))
+
+    # 战报只数真的那一份。
+    assert counts.reports == 1, "撞保护期被算成读回战报了"
+    assert counts.attacks == 2
+    # ⚠️ 但两发都结清了——撞保护期那一发**不许**退回成「到点未读」。
+    assert unread.unread == 0, "撞保护期的那一发退回成假欠账了"
+    assert unread.dispatched_today == 2
