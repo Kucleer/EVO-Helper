@@ -252,3 +252,22 @@ def test_the_recycle_colour_is_not_one_of_the_status_colours() -> None:
     assert recycle.group(1).lower() not in {value.lower() for value in taken.values()}, (
         f"回收用了一个已经有别的含义的颜色：{taken}"
     )
+
+
+def test_the_recycle_rate_over_one_hundred_is_explained_not_clamped() -> None:
+    """⚠️ >100% 是**跨日错位**，不是超量回收。
+
+    一发攻击和它喂出的回收之间隔着半小时到两小时（航线先释放、决策才触发），
+    跨过 UTC 零点（= 本地 08:00）的那一发**攻击记昨天、回收记今天**。
+
+    实测 2026-09-11：`9:250:8` 攻击 4 / 回收 5 = 125%，而那第 5 趟的源头攻击
+    在本地 07:43——算昨天。同一天全局是 29 : 29 = 100%，一趟没多。
+
+    这一条钉两件事：**不许截断**，以及**页面上得有话解释**——
+    不写清楚的话下一个人会去查一个不存在的「重复派遣」bug（我就查过）。
+    """
+    assert recycle_rate(5, 4) == pytest.approx(1.25)
+
+    for name in ("_overview_periods.html", "_overview_origins.html"):
+        tip = (TEMPLATES / name).read_text(encoding="utf-8")
+        assert "超过 100% 不是超量回收" in tip, f"{name} 没有解释 >100% 是怎么来的"
