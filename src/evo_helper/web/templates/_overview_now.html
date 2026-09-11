@@ -136,10 +136,12 @@
         漏一个 Jinja 直接 KeyError（这是它比 `|default` 好的地方：当场炸，
         而不是在页面上悄悄画成别的东西）。
 
-        `configured_lines > 4` 时缩字（`.dense`）：格子是等分的，配得多了
-        「攻击?」三个字会挤出去。完整说明留在 `aria-label` 与 `title` 里。
+        `configured_lines > 6` 时缩字（`.dense`）：格子是等分的，配得多了
+        「攻击?」三个字会挤出去。阈值取 6 是量出来的——卡宽约 238px，
+        6 格时每格还有约 30px，刚好放得下；8 格只剩 22px 就不行了。
+        缩字之后完整说明留在 `aria-label` 与每格的 `title` 里，信息不丢。
       #}
-      <div class="overview-slots{% if line.configured_lines > 4 %} dense{% endif %}" role="img"
+      <div class="overview-slots{% if line.configured_lines > 6 %} dense{% endif %}" role="img"
            aria-label="{{ line.configured_lines }} 条航线，占用 {{ line.holding }} 条（攻击 {{ line.attack_holding }} · 回收 {{ line.recycle_holding }}）">
         {% for slot in line.slots %}<i class="slot-{{ slot }}" title="{{
           {'fly': '攻击，飞行时间已知',
@@ -148,7 +150,7 @@
            'recunk': '残骸回收，飞行时间没读出来，按兜底时长占着',
            'free': '空闲'}[slot] }}">{{
           {'fly': '攻击', 'flyunk': '攻击?', 'rec': '回收', 'recunk': '回收?', 'free': '空'}[slot]
-          if line.configured_lines <= 4 else
+          if line.configured_lines <= 6 else
           {'fly': '攻', 'flyunk': '攻?', 'rec': '回', 'recunk': '回?', 'free': '空'}[slot]
         }}</i>{% endfor %}
       </div>

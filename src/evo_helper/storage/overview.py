@@ -351,7 +351,9 @@ class OverviewRepository:
                 select(
                     func.count().filter(kind == MISSION_KIND_ATTACK).label("attacks"),
                     func.count().filter(kind == MISSION_KIND_RECYCLE).label("recycles"),
-                ).select_from(orm.AttackDispatchRow).where(*in_window)
+                )
+                .select_from(orm.AttackDispatchRow)
+                .where(*in_window)
             ).one()
             attacks = int(kinds.attacks or 0)
             recycles = int(kinds.recycles or 0)

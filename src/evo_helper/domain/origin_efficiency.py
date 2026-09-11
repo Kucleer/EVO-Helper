@@ -78,13 +78,13 @@ from datetime import UTC, datetime, timedelta
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import (
     MAX_DAY_ROWS,
+    RECYCLE_STATS_START_UTC,
     RESOURCE_STATS_START_UTC,
     LineCount,
     LineSource,
     Occupancy,
     day_start,
     max_concurrent_lines,
-    RECYCLE_STATS_START_UTC,
     recovery_rate,
     recycle_rate,
 )

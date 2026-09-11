@@ -274,10 +274,37 @@ def _uptime(repository: SqlAlchemyRepository, *, start: datetime, last_beat: dat
 
 
 def _period_cells(html: str, label: str) -> list[str]:
-    """周期统计表里那一行的各个格子（不含最左边的周期名）。"""
+    """周期统计表里那一行的各个格子（不含最左边的周期名）。
+
+    ⚠️ 按下标取格子的用例，加减列时会**整批错位而不报错**——它们只会说
+    「期望 3 得到 4」，看不出是列变了。新用例请用 `_period_column`。
+    """
     row = re.search(rf"<tr[^>]*>\s*<th scope=\"row\">{re.escape(label)}</th>(.*?)</tr>", html, re.S)
     assert row is not None, f"周期统计表里没有 {label} 这一行"
     return re.findall(r"<td[^>]*>\s*([^<]*?)\s*</td>", row.group(1))
+
+
+def _period_headers(html: str) -> list[str]:
+    """周期统计表的表头文字，按出现顺序。稀有三样那几列各是自己的名字。"""
+    head = re.search(r"周期统计.*?<thead>(.*?)</thead>", html, re.S)
+    assert head is not None, "页面上没有周期统计表的表头"
+    return [
+        re.sub(r"<[^>]+>", "", cell).strip()
+        for cell in re.findall(r"<th scope=\"col\"[^>]*>(.*?)</th>", head.group(1), re.S)
+    ]
+
+
+def _period_column(html: str, label: str, column: str) -> str:
+    """周期统计表里「某一行 × 某一列」那一格。**按列名取，不按下标。**
+
+    ⚠️ 这一页的列会变（2026-09-11 一次加了 3 列删了 2 列）。按下标写的用例
+    在那种改动下会整批错位，而错位的报错长得和「算错了」一模一样，
+    每一条都要人去翻表头才知道是哪种。按名字取就当场说「没有这一列」。
+    """
+    headers = _period_headers(html)
+    assert column in headers, f"周期统计表里没有「{column}」这一列；现有：{headers}"
+    # 表头第一列是「周期」，而格子列表不含它。
+    return _period_cells(html, label)[headers.index(column) - 1]
 
 
 def _utilisation_card(html: str) -> str:
@@ -293,10 +320,15 @@ def _totals_card(html: str) -> str:
 
 
 def _slot_classes(html: str) -> list[list[str]]:
-    """每一张航线卡片上的格子，按出现顺序。"""
+    """每一张航线卡片上的格子，按出现顺序。
+
+    ⚠️ 取块的正则要容得下 `overview-slots` 后面再挂别的 class（现在有个
+    `dense`）。写成 `class="overview-slots"` 那种紧贴收尾的，加一个修饰类
+    就会让这张卡**整块取不到**——而用例只会说「少了一张卡」，不会说「正则太严」。
+    """
     return [
         re.findall(r'class="slot-(\w+)"', block)
-        for block in re.findall(r'<div class="overview-slots".*?</div>', html, re.S)
+        for block in re.findall(r'<div class="overview-slots[^"]*".*?</div>', html, re.S)
     ]
 
 
@@ -415,11 +447,11 @@ def test_the_page_follows_the_configured_unknown_line_hold(
     """
     _dispatch(factory, run_id, origin=HOME, dispatched_at_utc=NOW - timedelta(minutes=60))
 
-    assert _slot_classes(client.get("/overview").text)[0].count("unk") == 1
+    assert _slot_classes(client.get("/overview").text)[0].count("flyunk") == 1
 
     repository.replace_military_attack_tiers("[]", unknown_line_hold_minutes=45)
 
-    assert _slot_classes(client.get("/overview").text)[0].count("unk") == 0
+    assert _slot_classes(client.get("/overview").text)[0].count("flyunk") == 0
 
 
 def test_the_unknown_duration_lines_are_shown_apart_from_the_flying_ones(
@@ -442,7 +474,7 @@ def test_the_unknown_duration_lines_are_shown_apart_from_the_flying_ones(
     html = client.get("/overview").text
     second_grid = _slot_classes(html)[1]
 
-    assert second_grid == ["fly", "unk", "unk", "free"]
+    assert second_grid == ["fly", "flyunk", "flyunk", "free"]
     assert "2 条是「时长未知」" in html
 
 
@@ -799,32 +831,39 @@ def test_the_totals_say_full_only_when_every_planet_is_full(
 def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
     client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
 ) -> None:
-    """⚠️ **「读回战报数」与「回收率」必须和资源列并排**（需求文档 8.4）。
+    """⚠️ **战报那几列必须和资源列并排**（需求文档 8.4）。
 
     资源列只统计已读回的战报，而战报是滞后读回来的——同一天的数会一直涨
     （实测 08-18 隔 11 小时从 67,594 变成 166,194）。少了这两列，用户明天再看
     同一天的数会以为出了 bug。
+
+    ⚠️ 列名 2026-09-11 改过一轮：「读回战报」→「攻击战报」、
+    「回收率」→「战报回收率」（那个词被残骸回收抢了），并新增「攻击」
+    「回收」「回收率」三列、删掉「残骸趟数」「残骸占线」。
     """
     html = client.get("/overview").text
-    header = html[html.index("<thead>") : html.index("</thead>")]
-    columns = re.findall(r'<th scope="col">([^<]+)</th>', header)
+    columns = _period_headers(html)
 
     assert columns == [
         "周期",
         "派遣",
-        "读回战报",
+        "攻击",
+        "攻击战报",
+        "战报回收率",
+        "回收",
         "回收率",
         "合金碎片",
         "泰坦立方",
         "收割者碎片",
         "挂机",
         "利用率",
-        "残骸趟数",
-        "残骸占线",
     ]
     # 并排，不是分在两张表里。
-    assert columns.index("读回战报") < columns.index("合金碎片")
-    assert columns.index("回收率") < columns.index("合金碎片")
+    assert columns.index("攻击战报") < columns.index("合金碎片")
+    assert columns.index("战报回收率") < columns.index("合金碎片")
+    # ⚠️ 派遣 = 攻击 + 回收，三个数要挨着，读的人才看得出它们是一组。
+    assert columns.index("派遣") + 1 == columns.index("攻击")
+    assert columns.index("回收") + 1 == columns.index("回收率")
     # ⚠️ 「挂机」必须紧挨着「利用率」：分母换成「周期总时长 × 线数」之后，
     # 「为什么低」这个问题的答案就在挂机那一列里。分开摆等于把一对数拆散。
     assert columns.index("挂机") == columns.index("利用率") - 1
@@ -833,7 +872,7 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
 def test_the_period_table_reports_the_measured_numbers(
     client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
 ) -> None:
-    """今天派 4 发、读回 3 份、收了 27,500 合金碎片。"""
+    """今天派 4 发（都是攻击）、读回 3 份、收了 27,500 合金碎片。"""
     for _ in range(4):
         _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=1))
     for amount in (20_000, 7_000, 500):
@@ -842,14 +881,18 @@ def test_the_period_table_reports_the_measured_numbers(
         )
 
     html = client.get("/overview").text
-    row = re.search(r"<tr[^>]*>\s*<th scope=\"row\">08-19 今天</th>(.*?)</tr>", html, re.S)
-    assert row is not None
-    cells = re.findall(r"<td[^>]*>\s*([^<]*?)\s*</td>", row.group(1))
 
-    assert cells[0] == "4"
-    assert cells[1] == "3"
-    assert cells[2] == "75%"
-    assert cells[3] == "27,500"
+    assert _period_column(html, "08-19 今天", "派遣") == "4"
+    assert _period_column(html, "08-19 今天", "攻击") == "4"
+    assert _period_column(html, "08-19 今天", "攻击战报") == "3"
+    assert _period_column(html, "08-19 今天", "战报回收率") == "75%"
+    assert _period_column(html, "08-19 今天", "合金碎片") == "27,500"
+    # ⚠️ 这一页的夹具时钟是 2026-08-19（`NOW`），**早于**残骸回收上线
+    # （UTC 2026-09-10），所以这里「—」才是对的。
+    # 「上线之后的零必须写 0」那一侧由
+    # `tests/unit/web/test_overview_recycle_columns.py` 钉着——
+    # 它连模板里不许写成 `{% if not row.recycles %}` 都一并断言了。
+    assert _period_column(html, "08-19 今天", "回收") == "—"
 
 
 def test_a_day_before_the_resource_start_still_reports_its_dispatches(
@@ -867,13 +910,12 @@ def test_a_day_before_the_resource_start_still_reports_its_dispatches(
     _report(factory, reported_at_utc=datetime(2026, 8, 13, 13, tzinfo=UTC))
 
     html = client.get("/overview").text
-    row = re.search(r"<tr[^>]*>\s*<th scope=\"row\">08-13</th>(.*?)</tr>", html, re.S)
-    assert row is not None
-    cells = re.findall(r"<td[^>]*>\s*([^<]*?)\s*</td>", row.group(1))
 
-    assert cells[0] == "3"
-    assert cells[1] == "1"
-    assert cells[3] == "0"
+    assert _period_column(html, "08-13", "派遣") == "3"
+    assert _period_column(html, "08-13", "攻击战报") == "1"
+    assert _period_column(html, "08-13", "合金碎片") == "0"
+    # ⚠️ 08-13 在残骸回收上线（UTC 2026-09-10）之前 ⇒ 这里才该写「—」。
+    assert _period_column(html, "08-13", "回收") == "—"
 
 
 # -- 第九节：未读战报只算当天 ----------------------------------------------------
@@ -1220,7 +1262,7 @@ def test_the_utilisation_denominator_is_the_whole_period_not_the_run_time(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-19 今天")[-3] == "2%"
+    assert _period_column(html, "08-19 今天", "利用率") == "2%"
 
 
 def test_a_period_whose_line_count_was_recorded_is_not_marked_as_a_bound(
@@ -1244,9 +1286,11 @@ def test_a_period_whose_line_count_was_recorded_is_not_marked_as_a_bound(
         line_free_at_utc=NOW - timedelta(hours=1),
     )
 
-    cells = _period_cells(client.get("/overview").text, "08-19 今天")
+    html = client.get("/overview").text
 
-    assert "≤" not in cells[-1]
+    # ⚠️ 原来这里取的是 `cells[-1]`，而那时最后一列已经是「残骸占线」了——
+    # 断言恒真，这条用例被静默削弱过一轮。按列名取就不会再发生。
+    assert "≤" not in _period_column(html, "08-19 今天", "利用率")
 
 
 def test_a_period_without_a_recorded_line_count_falls_back_to_the_peak_and_says_so(
@@ -1273,9 +1317,8 @@ def test_a_period_without_a_recorded_line_count_falls_back_to_the_peak_and_says_
         )
 
     html = client.get("/overview").text
-    cells = _period_cells(html, "08-19 今天")
 
-    assert cells[-3] == "≤ 10%"
+    assert _period_column(html, "08-19 今天", "利用率") == "≤ 10%"
     # 方向必须写在页面上，不只是写在注释里。
     assert "利用率因此偏高" in html
 
@@ -1298,7 +1341,7 @@ def test_a_period_estimated_from_the_peak_never_exceeds_one_hundred_percent(
             factory, run_id, dispatched_at_utc=NOW - timedelta(hours=5) + timedelta(minutes=minutes)
         )
 
-    percent = _period_cells(client.get("/overview").text, "08-19 今天")[-3]
+    percent = _period_column(client.get("/overview").text, "08-19 今天", "利用率")
 
     assert percent.startswith("≤ ")
     assert int(percent.removeprefix("≤ ").removesuffix("%")) <= 100
@@ -1347,7 +1390,7 @@ def test_a_period_without_any_heartbeat_says_no_data_instead_of_zero(
     html = client.get("/overview").text
 
     # 挂机那一格在利用率左边。
-    assert _period_cells(html, "08-19 今天")[-4] == "—"
+    assert _period_column(html, "08-19 今天", "挂机") == "—"
     assert "—" in _utilisation_card(html)
 
 
@@ -1373,7 +1416,7 @@ def test_the_uptime_column_reports_the_hours_the_scheduler_was_up(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-19 今天")[-4] == "3.5h"
+    assert _period_column(html, "08-19 今天", "挂机") == "3.5h"
     assert "3.5 小时" in _utilisation_card(html)
 
 
@@ -1394,7 +1437,7 @@ def test_a_killed_process_does_not_keep_the_uptime_growing(
     _uptime(repository, start=day + timedelta(hours=1), last_beat=day + timedelta(hours=2))
     _dispatch(factory, run_id, dispatched_at_utc=NOW - timedelta(hours=2))
 
-    assert _period_cells(client.get("/overview").text, "08-19 今天")[-4] == "1.0h"
+    assert _period_column(client.get("/overview").text, "08-19 今天", "挂机") == "1.0h"
 
 
 def test_a_day_before_the_first_beat_still_says_no_data(
@@ -1418,5 +1461,5 @@ def test_a_day_before_the_first_beat_still_says_no_data(
 
     html = client.get("/overview").text
 
-    assert _period_cells(html, "08-18")[-4] == "—"
-    assert _period_cells(html, "08-19 今天")[-4] == "≥ 1.0h"
+    assert _period_column(html, "08-18", "挂机") == "—"
+    assert _period_column(html, "08-19 今天", "挂机") == "≥ 1.0h"

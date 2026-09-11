@@ -36,9 +36,9 @@ from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.origin_efficiency import OriginDay
 from evo_helper.domain.overview import RARE_SLOTS, Occupancy, occupancy_end
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.storage import models as orm
 
 

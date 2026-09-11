@@ -19,8 +19,6 @@ from evo_helper.domain.overview import (
     SLOT_FLYING,
     SLOT_FLYING_UNKNOWN,
     SLOT_FREE,
-    SLOT_RECYCLE,
-    SLOT_RECYCLE_UNKNOWN,
     Granularity,
     LineSource,
     Occupancy,
