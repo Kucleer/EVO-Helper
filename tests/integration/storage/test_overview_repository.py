@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import day_start
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.models import (
     AttackDispatchRow,
@@ -64,6 +65,7 @@ def _dispatch(
     line_hold_until_utc: datetime | None = None,
     expected_report_at_utc: datetime | None = None,
     score_at_utc: datetime | None = None,
+    mission_kind: str = MISSION_KIND_ATTACK,
 ) -> UUID:
     intent_id = uuid4()
     dispatch_id = uuid4()
@@ -99,6 +101,7 @@ def _dispatch(
                 line_released_at_utc=line_released_at_utc,
                 line_hold_until_utc=line_hold_until_utc,
                 expected_report_at_utc=expected_report_at_utc,
+                mission_kind=mission_kind,
             )
         )
         session.commit()
@@ -802,3 +805,75 @@ def test_the_first_beat_ever_is_what_tells_no_data_from_zero(
     repository.open_uptime_segment(now_utc=NOW - timedelta(hours=1))
 
     assert overview.first_uptime_beat() == first
+
+
+def test_a_recycle_never_counts_as_an_unread_report(
+    overview: OverviewRepository, session_factory: sessionmaker[Session], run_id: UUID
+) -> None:
+    """⚠️⚠️ **回收永远不会产生战报，所以它一发都不许进「到点未读」。**
+
+    混进来的话每一发回收到点之后都会变成一发「未读」，而这个数一红，
+    读的人第一反应是「战报链路挂了」。
+
+    实测 2026-09-11 12:30 的生产库就是这个形状：
+
+        ATTACK   派出 20 → 到点未读  7 · 有战报 12
+        RECYCLE  派出 18 → 到点未读 16 · 有战报  0    ← 全是假的
+        页面显示 23 发到点未读，其中 16 发是假的（七成）
+
+    ⚠️ 但 `dispatched_today` **仍然是合计** —— 那一格回答的是
+    「今天一共派出去多少」，改成只数攻击就没地方看这个数了。
+    """
+    moment = NOW - timedelta(hours=2)
+    for _ in range(2):
+        _dispatch(
+            session_factory,
+            run_id,
+            dispatched_at_utc=moment,
+            expected_report_at_utc=moment + timedelta(minutes=40),
+        )
+    for _ in range(3):
+        _dispatch(
+            session_factory,
+            run_id,
+            dispatched_at_utc=moment,
+            expected_report_at_utc=moment + timedelta(minutes=40),
+            mission_kind=MISSION_KIND_RECYCLE,
+        )
+
+    unread = overview.unread_reports(now_utc=NOW, day_start_utc=day_start(NOW))
+
+    assert unread.unread == 2, "回收混进「到点未读」了"
+    assert unread.dispatched_today == 5, "「当天已派出」该是合计（攻击 + 回收）"
+    assert unread.recycles_today == 3
+
+
+def test_a_recycle_still_in_the_air_is_not_counted_as_flying_either(
+    overview: OverviewRepository, session_factory: sessionmaker[Session], run_id: UUID
+) -> None:
+    """「还在飞（正常）」那一档同理——它的意思是「战报还没到点，等着就行」，
+    而回收根本没有要等的战报。三档口径必须一致，否则页面上三个数各说各的。
+    """
+    moment = NOW - timedelta(minutes=5)
+    _dispatch(
+        session_factory,
+        run_id,
+        dispatched_at_utc=moment,
+        expected_report_at_utc=NOW + timedelta(hours=1),
+    )
+    _dispatch(
+        session_factory,
+        run_id,
+        dispatched_at_utc=moment,
+        expected_report_at_utc=NOW + timedelta(hours=1),
+        mission_kind=MISSION_KIND_RECYCLE,
+    )
+    # 飞行时间没读出来那一档也一样。
+    _dispatch(session_factory, run_id, dispatched_at_utc=moment, mission_kind=MISSION_KIND_RECYCLE)
+
+    unread = overview.unread_reports(now_utc=NOW, day_start_utc=day_start(NOW))
+
+    assert unread.in_flight == 1
+    assert unread.unknown_eta == 0
+    assert unread.dispatched_today == 3
+    assert unread.recycles_today == 2

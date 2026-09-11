@@ -25,6 +25,7 @@ from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import BASIC_SLOTS
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
 from evo_helper.storage.models import (
@@ -161,6 +162,7 @@ def _dispatch(
     dispatched_at_utc: datetime,
     line_free_at_utc: datetime | None = None,
     expected_report_at_utc: datetime | None = None,
+    mission_kind: str = MISSION_KIND_ATTACK,
 ) -> UUID:
     global _CYCLE
     _CYCLE += timedelta(seconds=1)
@@ -193,6 +195,7 @@ def _dispatch(
                 accepted=True,
                 line_free_at_utc=line_free_at_utc,
                 expected_report_at_utc=expected_report_at_utc,
+                mission_kind=mission_kind,
             )
         )
         session.commit()
@@ -1463,3 +1466,69 @@ def test_a_day_before_the_first_beat_still_says_no_data(
 
     assert _period_column(html, "08-18", "挂机") == "—"
     assert _period_column(html, "08-19 今天", "挂机") == "≥ 1.0h"
+
+
+def test_recycles_do_not_inflate_the_unread_report_card(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️⚠️ **「到点未读」那个红数里不许混进回收。**
+
+    回收永远不会产生战报，混进来的话每一发到点之后都变成一发「未读」——
+    而这个数一红，读的人第一反应是「战报链路挂了」，然后去翻一条根本不存在的链路。
+
+    实测 2026-09-11 12:30 的生产库：23 发「到点未读」里 **16 发是回收**，
+    真值只有 7。这一条就是照那一屏写的。
+    """
+    landed = NOW - timedelta(hours=2)
+    for _ in range(2):
+        _dispatch(
+            factory,
+            run_id,
+            dispatched_at_utc=landed,
+            expected_report_at_utc=landed + timedelta(minutes=40),
+        )
+    for _ in range(3):
+        _dispatch(
+            factory,
+            run_id,
+            dispatched_at_utc=landed,
+            expected_report_at_utc=landed + timedelta(minutes=40),
+            mission_kind=MISSION_KIND_RECYCLE,
+        )
+
+    html = client.get("/overview").text
+    card = html[html.index("未读战报") : html.index("候选池")]
+
+    assert '2<span class="overview-unit">发到点未读' in card, "回收被算进「到点未读」了"
+    # 「当天已派出」仍是合计，而「其中回收」要写出来——否则三档凑不出那个 5。
+    assert "<b>5 发</b>" in card
+    assert "其中回收" in card and ">3 发</b>" in card
+
+
+def test_the_attack_report_card_does_not_divide_by_recycles(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️ 斜杠两边必须同口径：左边是攻击，右边是战报。
+
+    派遣总数摆在左边的话，比值就是假的——实测那一屏写着「38 发 / 16 份 · 42%」，
+    而 38 发里 18 发是回收，真值是 60%。
+    """
+    landed = NOW - timedelta(hours=2)
+    for _ in range(4):
+        _dispatch(factory, run_id, dispatched_at_utc=landed)
+    for _ in range(6):
+        _dispatch(factory, run_id, dispatched_at_utc=landed, mission_kind=MISSION_KIND_RECYCLE)
+    for _ in range(3):
+        _report(factory, reported_at_utc=NOW - timedelta(minutes=30))
+
+    html = client.get("/overview").text
+    card = html[html.index("攻击 / 战报") : html.index("撞保护期")]
+
+    # 4 发攻击、3 份战报 = 75%，不是 3 ÷ 10 = 30%。
+    assert '4<span class="overview-unit">发' in card
+    assert '/ 3<span class="overview-unit">份' in card
+    assert "75%" in card
+    assert "30%" not in card
+    # 派遣总数不丢，挪到下面那行。
+    assert "派遣共 <b>10</b> 发" in card
+    assert "回收" in card

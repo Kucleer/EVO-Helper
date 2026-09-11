@@ -290,8 +290,16 @@ class TodayCard:
     #: 「全 0」与「这条链路根本没读过资源」在库里分不开，那时候写 0 就是拿
     #: 「不知道」冒充 0（判据与措辞同 `logs.html` 摘要那一段，PR #217 定的）。
     resources_seen: bool
+    #: 攻击 + 回收。**不含侦察**（最后一次派遣 2026-08-23，已停用）。
     dispatches: int
+    attacks: int
+    recycles: int
     reports: int
+    #: 战报回收率 = `reports ÷ attacks`。
+    #:
+    #: ⚠️ **分母是攻击，不是派遣。** `#319` 改了周期表和星球效率表，**漏了这一张**
+    #: ——实测 2026-09-11 12:30 这张卡写着「38 发 / 16 份 · 42%」，
+    #: 而那 38 发里 18 发是回收、一份战报都不会有。真值是 12 ÷ 20 = 60%。
     recovery: float | None
     protection_hits: int
     utilisation: float | None
@@ -1022,8 +1030,10 @@ def _today_card(
         basics=haul.cells(BASIC_SLOTS),
         resources_seen=haul.seen,
         dispatches=counts.dispatches,
+        attacks=counts.attacks,
+        recycles=counts.recycles,
         reports=counts.reports,
-        recovery=recovery_rate(counts.reports, counts.dispatches),
+        recovery=recovery_rate(counts.reports, counts.attacks),
         protection_hits=counts.protection_hits,
         utilisation=capacity.utilisation,
         occupied_hours=capacity.occupied_hours,
@@ -1162,6 +1172,7 @@ def _empty_now_view(now: datetime) -> NowView:
             in_flight=0,
             unknown_eta=0,
             dispatched_today=0,
+            recycles_today=0,
             oldest_expected_at_utc=None,
         ),
         pool_total=0,
@@ -1181,6 +1192,8 @@ def _empty_now_view(now: datetime) -> NowView:
             basics=_Haul(totals={}).cells(BASIC_SLOTS),
             resources_seen=False,
             dispatches=0,
+            attacks=0,
+            recycles=0,
             reports=0,
             recovery=None,
             protection_hits=0,
