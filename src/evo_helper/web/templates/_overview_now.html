@@ -188,11 +188,21 @@
 
 <div class="overview-grid overview-grid-three">
   <div class="tile overview-card">
-    <div class="label">未读战报 <span class="muted">当天派出、还没回读的</span></div>
+    {#
+      ⚠️ 三档（到点未读 / 还在飞 / 时间没读出来）**只数攻击**，
+      而「当天已派出」是**合计**。回收永远不会有战报，混进三档里每一发到点
+      都会变成「未读」——实测 2026-09-11 12:30 这里显示 23 发，其中 16 发是回收。
+      所以要把「其中回收 N 发」写出来，否则读的人会拿三档去凑那个合计、凑不上。
+    #}
+    <div class="label">未读战报 <span class="muted">当天派出的攻击、还没回读的</span></div>
     <div class="value {% if now.unread.unread %}tone-danger{% else %}tone-ok{% endif %}">
       {{ now.unread.unread }}<span class="overview-unit">发到点未读</span>
     </div>
     <div class="overview-kv"><span>当天已派出</span><b>{{ now.unread.dispatched_today }} 发</b></div>
+    {% if now.unread.recycles_today %}
+      <div class="overview-kv"><span>其中回收</span><b class="tone-recycle"
+        title="回收不会产生战报，所以它不进上面那三档——这一行就是为了让合计对得上">{{ now.unread.recycles_today }} 发</b></div>
+    {% endif %}
     <div class="overview-kv"><span>还在飞（正常）</span><b>{{ now.unread.in_flight }} 发</b></div>
     <div class="overview-kv"><span>飞行时间没读出来</span><b class="{% if now.unread.unknown_eta %}tone-warn{% endif %}">{{ now.unread.unknown_eta }} 发</b></div>
     <div class="overview-kv"><span>最老一发到点于</span><b>
@@ -361,11 +371,19 @@
     </div>
   </div>
   <div class="tile overview-card">
-    <div class="label">派遣 / 战报</div>
-    <div class="value">{{ now.today.dispatches }}<span class="overview-unit">发</span>
+    {#
+      ⚠️ 主数字换成**攻击**，不是派遣总数：右边那个「/ N 份」是战报，
+      而回收不产生战报——两个数不同口径摆在一个斜杠两边，比值就是假的。
+      实测 2026-09-11 12:30 这里写着「38 发 / 16 份 · 42%」，
+      而 38 发里 18 发是回收，真值是 60%。派遣总数挪到下面一行，不丢。
+    #}
+    <div class="label">攻击 / 战报</div>
+    <div class="value">{{ now.today.attacks }}<span class="overview-unit">发</span>
       <span class="muted">/ {{ now.today.reports }}<span class="overview-unit">份</span></span></div>
-    <div class="overview-note">今日回收率
+    <div class="overview-note">今日战报回收率
       {% if now.today.recovery is none %}—{% else %}{{ '%.0f'|format(now.today.recovery * 100) }}%{% endif %}</div>
+    <div class="overview-note">派遣共 <b>{{ now.today.dispatches }}</b> 发{% if now.today.recycles %}，其中回收
+      <b class="tone-recycle">{{ now.today.recycles }}</b> 发（不产生战报）{% endif %}</div>
   </div>
   <div class="tile overview-card">
     <div class="label">撞保护期</div>

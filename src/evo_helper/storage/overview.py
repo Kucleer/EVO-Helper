@@ -85,13 +85,24 @@ class UnreadReports:
     """
 
     #: 当天派出、`expected_report_at_utc <= now` 且还没有关联战报的。**这就是它。**
+    #:
+    #: ⚠️⚠️ **只数攻击。** 回收**永远不会产生战报**，混进来就是纯假账：
+    #: 实测 2026-09-11 12:30 这张卡写着「23 发到点未读」，其中 **16 发是回收**
+    #: ——七成是假的，真值是 7。而这个数一红，读的人第一反应是「战报链路挂了」。
+    #: 同「假欠战报」那个 bug 的根子（`pending_reports_for_kind` 只认 ATTACK）。
     unread: int
-    #: 当天派出、还没到预计战报时刻的。正常，等着就行。
+    #: 当天派出、还没到预计战报时刻的。正常，等着就行。**同样只数攻击。**
     in_flight: int
-    #: 当天派出、飞行时间没读出来（`expected_report_at_utc IS NULL`）的。
+    #: 当天派出、飞行时间没读出来（`expected_report_at_utc IS NULL`）的。**只数攻击。**
     unknown_eta: int
-    #: 当天一共派出去几发（`accepted`）。上面三档的分母。
+    #: 当天一共派出去几发（`accepted`）= 攻击 + 回收。
+    #:
+    #: ⚠️ **这一个是合计，上面三档不是** —— 故意的：页面要能说出
+    #: 「派了 38 发，其中 18 发是回收（不产生战报），剩下 20 发攻击里 7 发还没读回」。
+    #: 把它也改成只数攻击的话，「今天到底派出去多少」就没地方看了。
     dispatched_today: int
+    #: 上面那 `dispatched_today` 里属于回收的。页面拿它解释三档为什么加不满。
+    recycles_today: int
     #: 未读那一档里最老的一发，预计战报时刻是什么时候。一发都没有时为 None。
     oldest_expected_at_utc: datetime | None
 
@@ -237,18 +248,31 @@ class OverviewRepository:
         ⚠️ **不许把历史积压混进来**（用户口径 2026-08-19）：实测总积压 713 发、
         最老派于 08-09 18:27。只给 713 会让人以为现在出了大问题，而那批绝大部分
         永远读不回来了。
+
+        ⚠️⚠️ **三档只数攻击，`dispatched_today` 数全部。** 回收永远不会有战报，
+        每一发到点之后都会掉进「未读」那一档——实测 2026-09-11 12:30：
+        23 发「到点未读」里 16 发是回收，真值只有 7。
+        这和「不许混进历史积压」是同一条理由：**假的红数比不显示更糟**。
         """
         expected = orm.AttackDispatchRow.expected_report_at_utc
         no_report = orm.BattleReportRow.id.is_(None)
-        unread_where = and_(no_report, expected <= now_utc)
+        # ⚠️ 三档只数攻击：回收永远不会有战报，混进来每一发都会变成「到点未读」。
+        is_attack = orm.AttackDispatchRow.mission_kind == MISSION_KIND_ATTACK
+        is_recycle = orm.AttackDispatchRow.mission_kind == MISSION_KIND_RECYCLE
+        unread_where = and_(is_attack, no_report, expected <= now_utc)
         day_end_utc = day_start_utc + timedelta(days=1)
         with self._session_factory() as session:
             row = session.execute(
                 select(
                     func.count().label("dispatched"),
+                    func.count().filter(is_recycle).label("recycles"),
                     func.count().filter(unread_where).label("unread"),
-                    func.count().filter(and_(no_report, expected > now_utc)).label("flying"),
-                    func.count().filter(and_(no_report, expected.is_(None))).label("unknown"),
+                    func.count()
+                    .filter(and_(is_attack, no_report, expected > now_utc))
+                    .label("flying"),
+                    func.count()
+                    .filter(and_(is_attack, no_report, expected.is_(None)))
+                    .label("unknown"),
                     func.min(expected).filter(unread_where).label("oldest"),
                 )
                 .select_from(orm.AttackDispatchRow)
@@ -267,6 +291,7 @@ class OverviewRepository:
             in_flight=int(row.flying or 0),
             unknown_eta=int(row.unknown or 0),
             dispatched_today=int(row.dispatched or 0),
+            recycles_today=int(row.recycles or 0),
             oldest_expected_at_utc=_as_utc(row.oldest),
         )
 
