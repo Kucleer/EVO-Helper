@@ -39,8 +39,14 @@
     <thead>
       <tr>
         <th scope="col">出发星球</th>
+        {# 派出 = 攻击 + 回收（不含侦察，最后一次派遣 2026-08-23）。 #}
         <th scope="col">派出</th>
-        <th scope="col">读回战报</th>
+        <th scope="col">攻击</th>
+        <th scope="col">攻击战报</th>
+        {# ⚠️ 分母是**攻击**不是派出：回收永远不产生战报，留在分母里会把这颗星球
+           的战报回收率压下去，而 `is_untrustworthy` 还拿它翻转排序。 #}
+        <th scope="col">战报回收率</th>
+        <th scope="col">回收</th>
         <th scope="col">回收率</th>
         <th scope="col" title="{{ origins.rare_labels|join(' + ') }}">稀有三样</th>
         <th scope="col">航线</th>
@@ -62,9 +68,20 @@
             <span class="tone-warn" title="当前配置里已经没有这颗星球了；它当天真派出过，所以照样列在这里">（已移除）</span>
           {% endif %}</th>
           <td>{{ row.dispatches }}</td>
+          <td>{{ row.attacks }}</td>
           <td>{{ row.reports }}</td>
           <td class="{% if row.recovery is none %}muted{% elif row.untrustworthy %}tone-danger{% elif row.recovery >= 0.75 %}tone-ok{% else %}tone-warn{% endif %}">
             {% if row.recovery is none %}—{% else %}{{ '%.0f'|format(row.recovery * 100) }}%{% endif %}
+          </td>
+          {# ⚠️ 「—」只给残骸回收上线之前的那些天（UTC 2026-09-10）。
+             上线之后的零必须写 0——写「—」会把「回收挂了」显示成「没数据」。 #}
+          <td class="{% if row.recycle_before_start %}muted{% elif row.recycles %}tone-recycle{% endif %}"
+              {% if row.recycle_before_start %}title="这一天还在残骸回收上线之前（UTC 2026-09-10）"{% endif %}>
+            {% if row.recycle_before_start %}—{% else %}{{ row.recycles }}{% endif %}
+          </td>
+          <td class="{% if row.recycle_before_start or row.recycle_rate is none %}muted{% elif row.recycle_rate %}tone-recycle{% endif %}"
+              {% if not row.recycle_before_start and row.recycle_rate is not none %}title="回收 ÷ 攻击"{% endif %}>
+            {% if row.recycle_before_start or row.recycle_rate is none %}—{% else %}{{ '%.0f'|format(row.recycle_rate * 100) }}%{% endif %}
           </td>
           <td title="{{ row.rare_hint }}">{{ row.rare_text }}</td>
           <td {% if not row.lines_exact %}class="tone-warn"
@@ -88,7 +105,9 @@
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="9" class="muted">这一天没有派遣记录</td></tr>
+        {# ⚠️ 写死的：出发星球 + 派出 + 攻击 + 攻击战报 + 战报回收率 + 回收 + 回收率
+             + 稀有三样 + 航线 + 在岗 + 每线 + 每线小时 = 12。加减列必须同步改。 #}
+        <tr><td colspan="12" class="muted">这一天没有派遣记录</td></tr>
       {% endfor %}
     </tbody>
   </table>

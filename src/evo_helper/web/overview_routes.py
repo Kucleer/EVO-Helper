@@ -60,6 +60,7 @@ from evo_helper.domain.overview import (
     BASIC_SLOTS,
     COUNT_STATS_START_UTC,
     RARE_SLOTS,
+    RECYCLE_STATS_START_UTC,
     RESOURCE_STATS_START_UTC,
     Granularity,
     LineCount,
@@ -74,6 +75,7 @@ from evo_helper.domain.overview import (
     period_lines,
     period_starts,
     recovery_rate,
+    recycle_rate,
     resource_window,
     trim_empty_tail,
     utilisation,
@@ -139,6 +141,8 @@ class LineCard:
     configured_lines: int
     holding: int
     unknown_duration: int
+    #: `holding` 里属于残骸回收的那些。**是子集，不是另一套计数。**
+    recycle_holding: int
     next_free_at_utc: datetime | None
     slots: tuple[str, ...]
     overflow: int
@@ -146,6 +150,11 @@ class LineCard:
     @property
     def full(self) -> bool:
         return self.holding >= self.configured_lines > 0
+
+    @property
+    def attack_holding(self) -> int:
+        """占着的里面不是回收的那些。合计卡按它加，别自己再减一遍。"""
+        return max(self.holding - self.recycle_holding, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +172,13 @@ class LineTotals:
     origins: int
     configured_lines: int
     holding: int
+    #: 占用合计里攻击 / 回收各几条（用户口径 2026-09-11：合计卡也要显示回收）。
+    #:
+    #: ⚠️ **和上面那几个数一样，从卡片加出来，不许另查一趟。** 这两个数就画在
+    #: 「10 / 10 条占用」正下方，另查一份的话它们会和下面那几张卡的格子对不上，
+    #: 而读这一页的人正是拿这两处判「此刻还能不能派」。
+    attack_holding: int
+    recycle_holding: int
     #: 各星球「最早空出」里最早的那一个；一个都算不出时 None，页面写「—」。
     next_free_at_utc: datetime | None
     #: **每一颗星球都满**才算满。
@@ -180,6 +196,8 @@ class LineTotals:
             origins=len(cards),
             configured_lines=sum(card.configured_lines for card in cards),
             holding=sum(card.holding for card in cards),
+            attack_holding=sum(card.attack_holding for card in cards),
+            recycle_holding=sum(card.recycle_holding for card in cards),
             next_free_at_utc=min(moments) if moments else None,
             all_full=bool(cards) and all(card.full for card in cards),
         )
@@ -293,9 +311,21 @@ class TodayCard:
 @dataclass(frozen=True, slots=True)
 class PeriodRow:
     label: str
+    #: 攻击 + 回收。**不含侦察**（最后一次派遣 2026-08-23，已停用）。
     dispatches: int
+    attacks: int
+    recycles: int
     reports: int
+    #: 战报回收率 = `reports ÷ attacks`。⚠️ **分母是攻击不是派遣** ——
+    #: 回收永远不产生战报，算进分母只会把这个率稀释成一个假的「战报丢了」。
     recovery: float | None
+    #: 回收率 = `recycles ÷ attacks`。
+    recycle_rate: float | None
+    #: 这一段在残骸回收上线**之前**——回收那两列要写「—」，不是 0。
+    #:
+    #: ⚠️ **上线之后的零必须写 0。** 写「—」会把「回收链路挂了」显示成
+    #: 「没数据」，正好把故障藏起来（同 `uptime_hours` 那一列的道理）。
+    recycle_before_start: bool
     rare: tuple[ResourceCell, ...]
     utilisation: float | None
     #: 分母按几条航线算。
@@ -308,15 +338,15 @@ class PeriodRow:
     uptime_hours: float | None
     uptime_partial: bool
     is_total: bool
-    #: 回收趟数（recycle_jobs 里 state=dispatched 的）。
-    recycle_dispatches: int = 0
-    #: 回收占线小时（来自 line_free_at_utc）。⚠️ 这是唯一能证明「回收真的在占资源」的量。
-    recycle_occupied_hours: float = 0.0
 
     @property
     def empty(self) -> bool:
         """整行没有任何事实。末尾连着的空行会被砍掉（`trim_empty_tail`）——
         数据只有几天时，「按月」那一档不该在页面上挂五行零。
+
+        ⚠️ 回收不用单独判：它已经算在 `dispatches` 里了（= 攻击 + 回收）。
+        这也顺手补上了一个旧洞——回收的趟数原先是另一列、不在这个判据里，
+        末尾某天「只有回收、没有攻击也没有战报」时整行会被砍掉。
         """
         return (
             self.dispatches == 0
@@ -707,11 +737,14 @@ def _line_card(usage: OriginLineUsage) -> LineCard:
         configured_lines=usage.configured_lines,
         holding=usage.holding,
         unknown_duration=usage.unknown_duration,
+        recycle_holding=usage.recycle_holding,
         next_free_at_utc=usage.next_free_at_utc,
         slots=line_slots(
             configured_lines=usage.configured_lines,
             holding=usage.holding,
             unknown_duration=usage.unknown_duration,
+            recycle_holding=usage.recycle_holding,
+            recycle_unknown=usage.recycle_unknown,
         ),
         overflow=overflow_lines(configured_lines=usage.configured_lines, holding=usage.holding),
     )
@@ -1081,13 +1114,18 @@ def build_period_rows(
             now_utc=now_utc,
             observed_since=observed_since,
         )
-        recycle_dispatches, recycle_hours = repository.recycle_period_stats(start=start, end=end)
         rows.append(
             PeriodRow(
                 label=period_label(start, granularity, now=now_utc),
                 dispatches=counts.dispatches,
+                attacks=counts.attacks,
+                recycles=counts.recycles,
                 reports=counts.reports,
-                recovery=recovery_rate(counts.reports, counts.dispatches),
+                recovery=recovery_rate(counts.reports, counts.attacks),
+                recycle_rate=recycle_rate(counts.recycles, counts.attacks),
+                # ⚠️ 判的是**窗口右界**，不是左界：跨起点那一格里回收已经在跑了，
+                # 按左界判会把它整格写成「—」，而那一格是有真数的。
+                recycle_before_start=end <= RECYCLE_STATS_START_UTC,
                 rare=rare,
                 utilisation=capacity.utilisation,
                 lines=capacity.lines.lines,
@@ -1095,8 +1133,6 @@ def build_period_rows(
                 uptime_hours=capacity.uptime_hours,
                 uptime_partial=capacity.uptime_partial,
                 is_total=granularity is Granularity.TOTAL,
-                recycle_dispatches=recycle_dispatches,
-                recycle_occupied_hours=recycle_hours,
             )
         )
     return trim_empty_tail(rows, lambda row: row.empty)

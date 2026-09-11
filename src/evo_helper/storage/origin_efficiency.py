@@ -36,6 +36,7 @@ from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.models import Coordinate
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.origin_efficiency import OriginDay
 from evo_helper.domain.overview import RARE_SLOTS, Occupancy, occupancy_end
 from evo_helper.storage import models as orm
@@ -70,7 +71,9 @@ class OriginEfficiencyRepository:
         return tuple(
             OriginDay(
                 origin=origin,
-                dispatches=dispatches,
+                dispatches=attacks + recycles,
+                attacks=attacks,
+                recycles=recycles,
                 reports=reports,
                 rare_amount=(haul := rare.get(origin, empty)).amount,
                 rare_approximate=haul.approximate,
@@ -78,7 +81,7 @@ class OriginEfficiencyRepository:
                 first_dispatch_at_utc=first,
                 last_dispatch_at_utc=last,
             )
-            for origin, (dispatches, reports, first, last) in counts.items()
+            for origin, (attacks, recycles, reports, first, last) in counts.items()
         )
 
     def origin_occupancies(
@@ -148,21 +151,27 @@ class OriginEfficiencyRepository:
     @staticmethod
     def _counts(
         session: Session, *, start: datetime, end: datetime
-    ) -> dict[Coordinate, tuple[int, int, datetime | None, datetime | None]]:
-        """每颗星球当天派了几发、其中几发已读回战报、首发与末发是什么时候。
+    ) -> dict[Coordinate, tuple[int, int, int, datetime | None, datetime | None]]:
+        """每颗星球当天派了几发（攻击 / 回收各几发）、其中几发已读回战报、首末发。
 
         ⚠️ **「已读回」数的是「这一发有没有战报」，不是「当天读回了几份战报」。**
-        后者会把昨天派出、今天读回的算进来，于是回收率变成一个自己跟自己比的数
-        （分子分母切的是两个不同的时刻）。
+        后者会把昨天派出、今天读回的算进来，于是战报回收率变成一个自己跟自己比
+        的数（分子分母切的是两个不同的时刻）。
+
+        ⚠️ **攻击与回收分开数。** 回收永远不会有战报，混在分母里会把这颗星球的
+        战报回收率压下去——而这一页正是用它判「哪颗星球不对劲」
+        （`is_untrustworthy` 还拿它翻转排序）。
 
         `battle_reports.dispatch_id` 上有唯一约束，所以这个 `LEFT JOIN` 不会扇出。
         """
+        kind = orm.AttackDispatchRow.mission_kind
         rows = session.execute(
             select(
                 orm.AttackIntentRow.origin_galaxy,
                 orm.AttackIntentRow.origin_system,
                 orm.AttackIntentRow.origin_position,
-                func.count().label("dispatches"),
+                func.count().filter(kind == MISSION_KIND_ATTACK).label("attacks"),
+                func.count().filter(kind == MISSION_KIND_RECYCLE).label("recycles"),
                 func.count().filter(orm.BattleReportRow.id.is_not(None)).label("reports"),
                 func.min(orm.AttackDispatchRow.dispatched_at_utc).label("first"),
                 func.max(orm.AttackDispatchRow.dispatched_at_utc).label("last"),
@@ -186,7 +195,8 @@ class OriginEfficiencyRepository:
         ).all()
         return {
             Coordinate(int(row.origin_galaxy), int(row.origin_system), int(row.origin_position)): (
-                int(row.dispatches or 0),
+                int(row.attacks or 0),
+                int(row.recycles or 0),
                 int(row.reports or 0),
                 _as_utc(row.first),
                 _as_utc(row.last),

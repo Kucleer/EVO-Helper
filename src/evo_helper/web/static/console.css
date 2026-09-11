@@ -30,6 +30,13 @@
   /* 海盗行的色。不复用 ok/warn/danger：那三个说的是「好 / 要留意 / 出事了」，
      而「这是个海盗」不是一种状态。 */
   --pirate: #c887e8;
+  /* 残骸回收。⚠️ **不是一种状态**，和 `--pirate` / `.tone-rare` 同理：
+     用 ok/warn 会把「这条航线在回收」读成「正常 / 要留意」。
+     靛蓝是剩下唯一没被占、且离 `--accent` 的青够远的色相——青=在飞/bot、
+     琥珀=时长未知/侦察、赤=攻击 chip、紫=海盗+稀有三样、绿=正常、红=出事。 */
+  --recycle: #7c9bec;
+  --recycle-dim: #1a2340;
+  --recycle-edge: #33477e;
 
   --radius: 6px;
   --gap: 16px;
@@ -1071,9 +1078,33 @@ tr:hover .log-line {
   font-size: 10px;
   font-style: normal;
 }
+/* 四档 = 任务类型 × 航线钟。⚠️ **两个维度各用一种视觉通道**：
+   类型靠底色 + 格子里的字（攻击 / 回收），「钟为 NULL」靠琥珀虚线边 + 问号。
+   挤成一档的话，「那条读不出飞行时间的是攻击还是回收」就看不见了——
+   而排障时想知道的正是这个。 */
 .overview-slots .slot-fly { background: var(--accent-dim); color: var(--accent); border: 1px solid #1c6c74; }
-.overview-slots .slot-unk { background: #3a3112; color: var(--warn); border: 1px solid #6d5a19; }
+.overview-slots .slot-flyunk { background: var(--accent-dim); color: var(--accent); border: 1px dashed var(--warn); }
+.overview-slots .slot-rec { background: var(--recycle-dim); color: var(--recycle); border: 1px solid var(--recycle-edge); }
+.overview-slots .slot-recunk { background: var(--recycle-dim); color: var(--recycle); border: 1px dashed var(--warn); }
 .overview-slots .slot-free { border: 1px dashed var(--border-strong); color: var(--text-faint); }
+/* 配得多的星球上「攻击?」三个字会挤出去。单卡现在最多 2 格，这条是给以后留的；
+   缩字之后完整说明仍在 `aria-label` 与 `title` 里，信息不丢。 */
+.overview-slots.dense i { font-size: 9px; }
+
+/* 合计卡的占比条。⚠️ 数字从卡片加出来（`LineTotals.of`），不另查一趟。 */
+.line-split { display: flex; gap: 4px; height: 8px; margin: 10px 0 2px; }
+.line-split span { display: block; height: 100%; border-radius: 4px; }
+.line-split .split-atk { background: var(--accent); }
+.line-split .split-rec { background: var(--recycle); }
+.line-split .split-free { background: var(--border-strong); }
+.line-breakdown { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; margin-top: 8px; color: var(--text-muted); }
+.line-breakdown i { font-style: normal; display: inline-flex; align-items: center; gap: 5px; }
+.line-breakdown b { font-variant-numeric: tabular-nums; }
+.line-breakdown .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.line-breakdown .swatch-atk { background: var(--accent); }
+.line-breakdown .swatch-rec { background: var(--recycle); }
+.line-breakdown .swatch-free { background: var(--border-strong); }
+.tone-recycle { color: var(--recycle); }
 
 .overview-res { display: flex; align-items: center; gap: 10px; }
 .overview-res img { flex: none; filter: drop-shadow(0 1px 3px rgba(0, 0, 0, .6)); }

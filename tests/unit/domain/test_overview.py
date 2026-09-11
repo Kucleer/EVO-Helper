@@ -17,8 +17,10 @@ from evo_helper.domain.overview import (
     RARE_SLOTS,
     RESOURCE_STATS_START_UTC,
     SLOT_FLYING,
+    SLOT_FLYING_UNKNOWN,
     SLOT_FREE,
-    SLOT_UNKNOWN,
+    SLOT_RECYCLE,
+    SLOT_RECYCLE_UNKNOWN,
     Granularity,
     LineSource,
     Occupancy,
@@ -173,21 +175,27 @@ def test_the_line_grid_has_exactly_as_many_cells_as_the_planet_configures() -> N
     原型第一版按「在飞 + 时长未知」画，于是一颗配了 4 条的星球画出了 7 格——
     那张图在说这颗星球有 7 条航线。
     """
-    cells = line_slots(configured_lines=4, holding=7, unknown_duration=3)
+    cells = line_slots(
+        configured_lines=4, holding=7, unknown_duration=3, recycle_holding=0, recycle_unknown=0
+    )
 
     assert len(cells) == 4
 
 
 def test_the_line_grid_shows_flying_then_unknown_then_free() -> None:
     """实测 `9:250:8`：配 4 条、占 4 条、其中 3 条是「时长未知」。"""
-    assert line_slots(configured_lines=4, holding=4, unknown_duration=3) == (
+    assert line_slots(
+        configured_lines=4, holding=4, unknown_duration=3, recycle_holding=0, recycle_unknown=0
+    ) == (
         SLOT_FLYING,
-        SLOT_UNKNOWN,
-        SLOT_UNKNOWN,
-        SLOT_UNKNOWN,
+        SLOT_FLYING_UNKNOWN,
+        SLOT_FLYING_UNKNOWN,
+        SLOT_FLYING_UNKNOWN,
     )
     # 实测 `4:277:15`：配 5 条、占 2 条、没有时长未知的。
-    assert line_slots(configured_lines=5, holding=2, unknown_duration=0) == (
+    assert line_slots(
+        configured_lines=5, holding=2, unknown_duration=0, recycle_holding=0, recycle_unknown=0
+    ) == (
         SLOT_FLYING,
         SLOT_FLYING,
         SLOT_FREE,
@@ -198,8 +206,30 @@ def test_the_line_grid_shows_flying_then_unknown_then_free() -> None:
 
 def test_each_planet_gets_its_own_configured_line_count() -> None:
     """每颗星球的航线数各不相同，不许写死（实测 5 条 / 4 条）。"""
-    assert len(line_slots(configured_lines=5, holding=0, unknown_duration=0)) == 5
-    assert len(line_slots(configured_lines=4, holding=0, unknown_duration=0)) == 4
+    assert (
+        len(
+            line_slots(
+                configured_lines=5,
+                holding=0,
+                unknown_duration=0,
+                recycle_holding=0,
+                recycle_unknown=0,
+            )
+        )
+        == 5
+    )
+    assert (
+        len(
+            line_slots(
+                configured_lines=4,
+                holding=0,
+                unknown_duration=0,
+                recycle_holding=0,
+                recycle_unknown=0,
+            )
+        )
+        == 4
+    )
 
 
 def test_holding_more_lines_than_configured_is_reported_instead_of_drawn() -> None:
