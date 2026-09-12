@@ -330,8 +330,10 @@
               这一页是第三处，改法照抄侦察那一档。
             #}
             {% if entry.mission_kind == 'RECYCLE' %}
-              <span class="chip kind-recycle"><span class="glyph" aria-hidden="true">♻</span>已派出</span>
-              <div class="muted" style="font-size:11px">回收发没有战报</div>
+              {% set recycle_state = 'RECYCLE_BACK' if entry.recycle_haul_back else 'RECYCLE_WAITING' %}
+              <span class="chip {{ recycle_tones.get(recycle_state, '') }}">
+                <span class="glyph" aria-hidden="true">{{ recycle_glyphs.get(recycle_state, '') }}</span>{{ recycle_labels.get(recycle_state, recycle_state) }}</span>
+              <div class="muted" style="font-size:11px">回收发没有战报，实收读的是回收报告邮件</div>
             {% elif entry.mission_kind == 'SCOUT' %}
               {% set scout_state = 'SCOUT_BACK' if entry.scout_report_back else 'SCOUT_WAITING' %}
               <span class="chip {{ scout_tones.get(scout_state, '') }}">

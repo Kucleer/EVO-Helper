@@ -395,6 +395,31 @@ SCOUT_RESULT_TONES: dict[str, str] = {SCOUT_RESULT_BACK: "ok", SCOUT_RESULT_WAIT
 SCOUT_RESULT_GLYPHS: dict[str, str] = {SCOUT_RESULT_BACK: "◉", SCOUT_RESULT_WAITING: "◌"}
 
 
+#: 回收发那一格的两档。**回收发永远不该显示「待战报」。**
+#:
+#: 用户口径（2026-09-12）：「回收可以使用待回收，读到邮件后，显示已回收」。
+#:
+#: ⚠️ **和侦察那一档形状一样，但「等的东西」不同**：侦察等的是侦察报告
+#: （`scout_reports` 表），回收等的是**回收报告邮件**里那三个资源数。
+#:
+#: ⚠️⚠️ **在邮件链路上线之前，这一格会恒为「待回收」。** 这**不是**
+#: 「待战报」那种假欠账：战报对回收发**永远不会来**，而回收报告邮件是真的
+#: 躺在信箱里、只是还没人去读（`docs/回收闭环/邮件读实收-评估-2026-09-12.md`）。
+#: 一个是等不到的东西，一个是还没去取的东西——页面上必须是两个词。
+RECYCLE_RESULT_BACK = "RECYCLE_BACK"
+RECYCLE_RESULT_WAITING = "RECYCLE_WAITING"
+
+RECYCLE_RESULT_LABELS: dict[str, str] = {
+    RECYCLE_RESULT_BACK: "已回收",
+    RECYCLE_RESULT_WAITING: "待回收",
+}
+RECYCLE_RESULT_TONES: dict[str, str] = {
+    RECYCLE_RESULT_BACK: "kind-recycle",
+    RECYCLE_RESULT_WAITING: "",
+}
+RECYCLE_RESULT_GLYPHS: dict[str, str] = {RECYCLE_RESULT_BACK: "♻", RECYCLE_RESULT_WAITING: "◌"}
+
+
 def missing_intel_labels() -> list[str]:
     """三张标签表里没有位置的取值。测试拿它当断言。
 
