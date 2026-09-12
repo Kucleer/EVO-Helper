@@ -25,12 +25,7 @@ from evo_helper.web.display import (
 )
 
 TEMPLATE = (
-    Path(__file__).resolve().parents[3]
-    / "src"
-    / "evo_helper"
-    / "web"
-    / "templates"
-    / "logs.html"
+    Path(__file__).resolve().parents[3] / "src" / "evo_helper" / "web" / "templates" / "logs.html"
 )
 
 
