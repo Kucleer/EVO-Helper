@@ -683,8 +683,11 @@ class BotLoop(PirateLoop):
 
         # 记派遣。⚠️ **必须显式传 RECYCLE** —— `_record_dispatch` 的默认值是 ATTACK，
         # 漏传的后果不是「标错一个字段」，是**回收喂自己**（见 `MISSION_KIND_RECYCLE`）。
-        self._record_dispatch(intent_id, flight, mission_kind=MISSION_KIND_RECYCLE)
-        self._finish_recycle_job(coordinate, "dispatched")
+        dispatch_id = self._record_dispatch(intent_id, flight, mission_kind=MISSION_KIND_RECYCLE)
+        # ⚠️ **`dispatch_id` 必须跟着一起落进作业行。** 这根外键是「这笔实收是哪一发
+        # 回收派的」唯一的依据；不传就只能拿坐标 + 时刻去凑，而同一坐标一天可能
+        # 回收好几趟（读回收邮件那条链路要的正是它）。
+        self._finish_recycle_job(coordinate, "dispatched", dispatch_id=dispatch_id)
         say(f"  已派出回收 → {coordinate}")
         self._leave_dispatch_list()
         return True
