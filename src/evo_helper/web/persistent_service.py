@@ -1554,6 +1554,7 @@ class MissionConsoleService:
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
         recycle_rate_tenths: object = None,
+        recycle_mail_opens: object = None,
     ) -> MilitaryAttackConfigView:
         """整份全局攻击配置原子替换。
 
@@ -1587,6 +1588,7 @@ class MissionConsoleService:
                 auto_toggle_log_seconds
             )
             recycle = self._scheduler.validate_recycle_rate_tenths(recycle_rate_tenths)
+            mail_opens = self._scheduler.validate_recycle_mail_opens(recycle_mail_opens)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
@@ -1603,6 +1605,7 @@ class MissionConsoleService:
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
             recycle_rate_tenths=recycle,
+            recycle_mail_opens=mail_opens,
         )
         self._invalidate_scheduler_view()
         return _config_view(row, tuple(json.loads(row.tiers_json)))
@@ -2599,6 +2602,7 @@ def _config_view(
         account_line_limit=row.account_line_limit,
         auto_toggle_log_seconds=row.auto_toggle_log_seconds,
         recycle_rate_tenths=row.recycle_rate_tenths,
+        recycle_mail_opens=row.recycle_mail_opens,
     )
 
 

@@ -349,6 +349,12 @@ class MilitaryAttackConfigOut(BaseModel):
     #: 前十发一次都不收（实测复现过），所以计数一律用整数。
     recycle_rate_tenths: int | None = Field(default=None, ge=0, le=10)
 
+    #: 每趟读几封回收报告邮件。**`None` / 0 = 不读（默认）。**
+    #:
+    #: ⚠️ 上界 12 与 `storage.repository.SqlAlchemyRepository.MAX_RECYCLE_MAIL_OPENS`
+    #: 是同一个数。两处必须一起改——页面放得进来、仓储却夹掉，用户会以为没保存上。
+    recycle_mail_opens: int | None = Field(default=None, ge=0, le=12)
+
 
 class CurrentMissionOut(BaseModel):
     task_id: int

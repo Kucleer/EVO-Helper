@@ -11,11 +11,14 @@ never binarized, and why coordinates get their own single-line ROI.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from io import BytesIO
 from typing import Any, Protocol
 
+from evo_helper.domain.quantities import Quantity, find_abbreviated_quantities
 from evo_helper.vision.fleet_counts import COUNT_RECIPES
 from evo_helper.vision.mail_unread import (
     WARMTH_BUCKET_WIDTH,
@@ -40,6 +43,19 @@ from evo_helper.vision.scan_reading import (
 )
 
 OCR_LANGUAGES = "chi_sim+eng"
+
+#: 回收报告资源格的读法。**三个配方都跑，读到的数字全当候选**（见
+#: `recycle_amount_candidates`）；哪个是真的由容量不变量挑，不在这里挑。
+#:
+#: ⚠️ **和 `tools.scan_coordinates.make_ocr` 的参数名对得上**：标定（2026-09-12，
+#: 8 封语料）是在那条路径上做的，`upscale` 在这里叫 `scale`，顺序同样是
+#: 先放大再二值化。名字不同、含义必须相同，否则标出来的阈值指的不是同一件事。
+#: 每一项是 `(放大倍数, 二值化阈值或 None)`。
+RECYCLE_CELL_RECIPES: tuple[tuple[int, int | None], ...] = (
+    (4, 120),
+    (4, None),
+    (3, None),
+)
 
 #: 判定像素算不算墨迹的亮度门槛。
 NUMBER_INK_THRESHOLD = 150
@@ -414,6 +430,46 @@ class ImageReportScreens:
     def security_message(self) -> str:
         """安全提示邮件的正文；与战斗报告的 VS / 舰队区域完全不同。"""
         return self._read(self._layout.security_message, OCR_PSM_COLUMN)
+
+    def recycle_amount_candidates(
+        self,
+    ) -> tuple[Sequence[Quantity], Sequence[Quantity], Sequence[Quantity]]:
+        """回收报告三个资源格的**全部候选读数**，一格一串。
+
+        ⚠️ **交出候选而不是答案。** 每格三个框 × 三种配方，读到的数字全收进来
+        去重；哪一个是真的由 `domain.recycle_mail.pick_amounts` 拿容量不变量去挑。
+        实测这样 8/8，而任何单一框都会在某些信上系统性地读错（整段在
+        `report_layout.ReportLayout.recycle_amount_cells`）。
+
+        ⚠️ **一格里读到几个数就都收下**，不许只取第一个：宽框常读成
+        `'"4 2.1M'` 这种「前缀垃圾 + 真值」，只取第一个会拿到垃圾。
+        """
+        out: list[list[Quantity]] = []
+        for cell in self._layout.recycle_amount_cells:
+            found: dict[Decimal, Quantity] = {}
+            for region in cell:
+                for scale, threshold in RECYCLE_CELL_RECIPES:
+                    try:
+                        text = self._read(
+                            region, OCR_PSM_LINE, scale=scale, threshold=threshold
+                        )
+                    except Exception:  # noqa: BLE001 - 一个配方读炸不该带倒整封
+                        continue
+                    for quantity in find_abbreviated_quantities(text):
+                        found.setdefault(quantity.value, quantity)
+            out.append([found[key] for key in sorted(found)])
+        first, second, third = out
+        return (first, second, third)
+
+    def recycle_ship_count(self) -> int | None:
+        """回收船数。读不出交回 `None` —— 它是容量不变量唯一的锚。
+
+        ⚠️ **不许兜底成 0 或者别的什么**：0 会让容量判据恒假、整条链路静默停摆，
+        而 `None` 在上层的意思明确是「这一封读不齐，下一趟再来」。
+        """
+        text = self._read(self._layout.recycle_ship_count, OCR_PSM_LINE, scale=3)
+        digits = re.sub(r"\D", "", text)
+        return int(digits) if digits else None
 
     def report_panel_image(self, quality: int = REPORT_PANEL_WEBP_QUALITY) -> ReportPanelImage:
         """把整块战报面板裁出来、编码成 WEBP。**这一块不喂 OCR，是给人看的。**
@@ -978,6 +1034,7 @@ class ImageReportScreens:
         whitelist: str | None = None,
         scale: int | None = None,
         resample: str = "lanczos",
+        threshold: int | None = None,
     ) -> str:
         crop = self._image.crop(region.as_box()).convert("L")
         scale = scale or self._layout.ocr_upscale
@@ -986,6 +1043,11 @@ class ImageReportScreens:
             "nearest": self._image_module.Resampling.NEAREST,
         }
         crop = crop.resize((crop.width * scale, crop.height * scale), filters[resample])
+        if threshold is not None:
+            # ⚠️ **顺序是「先放大再二值化」**，与 `tools.scan_coordinates.make_ocr`
+            # 一字不差 —— 标定是在那一条路径上做的（2026-09-12 的 8 封语料），
+            # 两边顺序一分家，标出来的阈值就不再指同一件事。
+            crop = crop.point(lambda value: 255 if value > threshold else 0)
         config = f"--psm {psm}"
         if whitelist:
             config += f" -c tessedit_char_whitelist={whitelist}"

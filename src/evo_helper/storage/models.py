@@ -1147,6 +1147,21 @@ class MilitaryAttackConfigRow(Base):
     #: 可空、不给 `server_default`：NULL = 关（同本表其余旋钮）。
     recycle_rate_tenths: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
+    #: 每趟最多读几封**回收报告邮件**。**NULL / 0 = 不读**（默认）。
+    #:
+    #: 用户口径（2026-09-12）：「我希望这是有个开关，可以让我选择读不读回收，
+    #: 我担心这花费我太多的时间」。
+    #:
+    #: ⚠️ **开关和预算是同一个旋钮，不拆两列。** 「读不读」和「每趟读几封」是同
+    #: 一个取舍的两端；拆开会多出「开着但预算 0」这种说不清的状态，而页面上那两个
+    #: 控件迟早会互相矛盾。要写给用户的那句话是：「调大 = 实收记得全，但每趟多花
+    #: 时间；0 = 完全不读，页面上的回收一直停在『待回收』」。
+    #:
+    #: ⚠️⚠️ **它自己一笔预算，不和战报抢。** 日常那趟的开封预算实测天天满载
+    #: （3/3 趟撞上限），回收报告挤进去就等于每挤掉一封战报、那一发派遣多等一趟
+    #: （整段在 `tools.pirate_loop.MAIL_UNREAD_MAX_OPENS` 与那份评估的 §3.4）。
+    recycle_mail_opens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
     #: 回收作业的时间上限（小时）。**空 = 24 小时。**
     #:
     #: 过期的代价只是时间：到了没按钮就不派——不占线、不占名额。

@@ -352,6 +352,21 @@ MAIL_FIRST_ROW_Y = 285
 MAIL_ROW_PITCH = 86
 MAIL_ROW_X = 900
 
+#: 「报告」底下那一排**二级**标签：战斗 / 侦察 / 舰队 / 系统（917 空间，y≈218）。
+#:
+#: ⚠️ **bot 从来没点过这一排。** 点完一级的「报告」默认停在「战斗」上，
+#: 于是「回收报告」和「舰队返回」这两种信 bot 一封都没见过——今天的账面是 0
+#: 不是因为没有，是因为翻不到（实拍确认，评估在
+#: `docs/回收闭环/邮件读实收-评估-2026-09-12.md` §1）。
+MAIL_BATTLE_SUB_TAB = (897, 218)
+MAIL_FLEET_SUB_TAB = (1033, 218)
+
+#: 切二级标签之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
+MAIL_SUB_TAB_WAIT_S = 1.8
+
+#: 切标签最多试几次。**试不成就整趟放弃，不许在认不出的列表上接着读。**
+MAIL_SUB_TAB_TRIES = 3
+
 #: 一屏能整行看到的邮件行数（第 7 行被切掉）。
 #:
 #: ⚠️ 这是**读得到主题**的行数，不再是「要打开几封」。两者原先是同一个数，
@@ -3003,6 +3018,54 @@ class PirateLoop:
         self._open_mail()
         self._scroll_mail_list_to_top()
 
+    #: 舰队标签里**只会**出现这两种主题；战斗标签里一个都不会出现。
+    #: 这一对就是「切成功了没有」的判据本身，见 `_select_mail_sub_tab`。
+    FLEET_TAB_KINDS = (ReportKind.RECYCLE, ReportKind.FLEET_RETURN)
+
+    def _select_mail_sub_tab(self, *, fleet: bool) -> bool:
+        """切「报告」底下的二级标签。切成了返回 True。
+
+        ## ⚠️⚠️ 判据是**列表内容**，不是标签上的字
+
+        标签行的小字被未读角标压住，`--psm 7` 实测读成 `'oe. se. eee ee'`
+        （整段在这个文件上方那条注释里）——拿它当判据等于换个地方失败。
+
+        而「切错了」是这条链路**最危险**的失败形态：切错之后列表里的主题**都认得出**，
+        日志上一切正常，只是读的是另一个标签的信。所以这里要的是一条能分开两边的
+        内容判据：**舰队标签里不会有「攻击报告」，战斗标签里不会有「舰队返回」或
+        「回收报告」**（实拍确认）。
+
+        ## ⚠️ 认不出就返回 False，不许「点了就当切成了」
+
+        点一下的代价是 1.8 秒，而在错标签上读一整趟的代价是一趟白跑加一串
+        看不出问题的日志。宁可整趟放弃。
+        """
+        target = MAIL_FLEET_SUB_TAB if fleet else MAIL_BATTLE_SUB_TAB
+        name = "舰队" if fleet else "战斗"
+        for attempt in range(MAIL_SUB_TAB_TRIES):
+            self._driver.click(*target, label=f"二级标签「{name}」")
+            self._driver.wait(MAIL_SUB_TAB_WAIT_S * (attempt + 1))
+            if not self._on_mail_list():
+                say(f"  点了二级标签「{name}」却不在邮件列表上了（第 {attempt + 1} 次）")
+                continue
+            kinds = [row.kind for row in self._mail_list_rows()]
+            here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
+            there = sum(1 for kind in kinds if kind is ReportKind.ATTACK)
+            good = (here > 0 and there == 0) if fleet else (there > 0 and here == 0)
+            if good:
+                say(
+                    f"  二级标签切到「{name}」：这一屏 {len(kinds)} 行里"
+                    f"舰队类 {here} 行、攻击报告 {there} 行，对得上"
+                )
+                return True
+            say(
+                f"  二级标签「{name}」切完之后内容对不上（舰队类 {here} 行、"
+                f"攻击报告 {there} 行、共 {len(kinds)} 行）；第 {attempt + 1} 次"
+            )
+        # 认不出时最贵的事是不知道当时画面长什么样。存一帧的成本是一次写盘。
+        self._dump_frame(f"mail-sub-tab-{name}-unconfirmed", PANEL_TITLE_ROI)
+        return False
+
     def _scroll_mail_list_to_top(self) -> None:
         """把邮件列表拖回真正的顶部：**拖到拖不动为止**，不是拖固定次数。
 
@@ -3165,6 +3228,7 @@ class PirateLoop:
         should_open: Callable[[MailRow], bool] | None = None,
         skip_known: bool = False,
         known_run: KnownRunGate | None = None,
+        fleet_sub_tab: bool = False,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
@@ -3252,6 +3316,14 @@ class PirateLoop:
            定位的东西，正是被这句措辞盖住的。
         """
         self._enter_mailbox()
+        # ⚠️ **切标签要排在拖回顶部之后**（`_enter_mailbox` 里拖）：换标签换的是
+        # 整个列表，上一个标签滚到哪与这一个无关。反过来先切再拖也对，但那样
+        # `_enter_mailbox` 里那句「第 0 行是什么时候的」说的是另一个标签的行。
+        if fleet_sub_tab and not self._select_mail_sub_tab(fleet=True):
+            return MailScan(
+                unread_budget=max_unread_opens,
+                cut_short="切不到「舰队」二级标签，这一趟不读回收报告",
+            )
         #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
         #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
         seen: set[str] = set()
@@ -3296,6 +3368,13 @@ class PirateLoop:
                     f"（第 {reentries}/{MAIL_MAX_REENTRIES} 次）"
                 )
                 self._enter_mailbox()
+                # ⚠️ **重进之后标签回到了「战斗」，必须再切一次。** 少了这一句，
+                # 重进之后剩下的那几屏读的是攻击报告那一列——而主题闸会把它们
+                # 全部拒掉，于是日志上看着是「翻完了没有回收报告」，
+                # 和「信箱里真的没有」一模一样。
+                if fleet_sub_tab and not self._select_mail_sub_tab(fleet=True):
+                    scan.cut_short = "重进信箱后切不回「舰队」二级标签"
+                    break
                 # 重进之后**不在这里再判一次**：判了就得决定「不成怎么办」，而那正是
                 # 下一轮循环开头那道守卫的活。交给它，重进预算才真的是预算——
                 # 在这里 break 的话，第 2 次重进永远走不到。
@@ -3862,6 +3941,90 @@ class PirateLoop:
         return read, written
 
     # -- 开工：先读战报，再更新计数 ------------------------------------------
+
+    def collect_recycle_hauls(self, *, max_opens: int) -> MailScan | None:
+        """去「舰队」标签读回收报告，把实收落表。关着（`max_opens <= 0`）时返回 None。
+
+        ## ⚠️ 它自己一趟、自己一笔预算
+
+        日常那趟的开封预算实测**天天满载**（3/3 趟撞上限），回收报告挤进去等于
+        每挤掉一封战报、那一发派遣就要多等一趟——真实代价是战报入库延迟，而那会
+        连锁影响选靶的读数新鲜度与配额对账（整段在那份评估的 §3.4）。
+        所以这一趟与战报那一趟**完全分开**，预算来自用户那个旋钮
+        （`recycle_mail_opens`），默认 0。
+
+        ## ⚠️⚠️ 走完一定切回「战斗」标签
+
+        少了这一步，下一趟战报那一趟会在舰队标签上开工——那时主题闸会把整列
+        「舰队返回」全部拒掉，日志上看着是「信箱里没有战报」，
+        和真的没有战报一模一样。这是这条链路最容易留下的暗坑。
+
+        ⚠️ 切不回去也**不抛**：这一趟的实收已经入库了，抛出去只会把它连带作废。
+        如实说一句，下一趟 `_enter_mailbox` 重进信箱时标签本来就会回到「战斗」。
+        """
+        if max_opens <= 0:
+            return None
+        repository, _run_id = self._ensure_run()
+
+        def should_open(row: MailRow) -> bool:
+            # ⚠️ 排在开封**之前**：一封 ≈ 8 秒，而「开出来才发现库里已有」要付全价。
+            # 未读那一档会越过这道闸（`_scan_mail_rows` 里那条「必开」），
+            # 所以每封信最多被白开一次——开过之后它就是已读，下一趟这里就拦住了。
+            if row.reported_at_utc is None:
+                return True
+            return not repository.has_recycle_report_at(row.reported_at_utc)
+
+        def visit(row: MailRow, page: Any) -> bool:
+            self._ingest_recycle_haul(row, page, repository)
+            return False
+
+        scan = self._scan_mail_rows(
+            wanted=(ReportKind.RECYCLE,),
+            label="回收报告",
+            visit=visit,
+            max_opens=max_opens,
+            # ⚠️ 未读那一档给**同一个**预算，不另给一份。回收报告基本全是未读
+            # （bot 从来没点过这个标签），两档各给一份就等于预算翻倍，
+            # 而用户那个旋钮说的是「这一趟最多花几封的时间」。
+            max_unread_opens=max_opens,
+            should_open=should_open,
+            fleet_sub_tab=True,
+        )
+        if not self._select_mail_sub_tab(fleet=False):
+            say("  读完回收报告没能切回「战斗」标签；下一趟重进信箱时会自己回去")
+        return scan
+
+    def _ingest_recycle_haul(self, row: MailRow, page: Any, repository: Any) -> None:
+        """把一封回收报告读成实收并落表。**读不出、认不上都只说一句，不抛。**
+
+        认领在仓储那一侧（`append_recycle_report`）：这一封手上**没有坐标**，
+        要靠抵达时刻去认那一发回收派遣，坐标从认下来的那一发抄过来。
+        """
+        from evo_helper.vision.recycle_mail_screen import (
+            RecycleMailUnreadable,
+            read_recycle_mail,
+        )
+
+        try:
+            reading = read_recycle_mail(page)
+        except RecycleMailUnreadable as error:
+            # 不存半份、不猜。下一趟这一封还在信箱里（已读，但 `should_open` 那道
+            # 闸只拦「库里已有」的，读不出的那些下一趟照旧会被再试一次）。
+            say(f"  第 {row.index} 行读不出回收报告：{error}")
+            return
+        claimed = repository.append_recycle_report(reading, report_id=uuid4())
+        metal, crystal, gas = (item.value for item in reading.amounts)
+        if claimed is None:
+            say(
+                f"  第 {row.index} 行读到实收（{reading.raw_time_text}："
+                f"{metal} / {crystal} / {gas}，回收船 {reading.ships}），"
+                "但认不出是哪一发回收派遣；这一封没入库"
+            )
+            return
+        say(
+            f"  第 {row.index} 行回收实收入库（{reading.raw_time_text}："
+            f"{metal} / {crystal} / {gas}，回收船 {reading.ships}）"
+        )
 
     def _ingest_report(self, row: MailRow, page: Any) -> ReportIngest:
         """把详情页上这一封读成一条战报并入库。**子类按自己的战报格式覆盖。**
@@ -4522,6 +4685,39 @@ class PirateLoop:
                 f"（库内 {status.dispatched_count} · 信箱 {status.observed_reports}），"
                 f"还有 {status.awaiting_reports} 发在等战报"
             )
+        self._collect_recycle_hauls_if_enabled(repository)
+
+    def _collect_recycle_hauls_if_enabled(self, repository: Any) -> None:
+        """开工对账之后读一趟回收报告。**旋钮是 0（默认）时一步都不走。**
+
+        ⚠️ **排在战报那一趟之后，而且是另起一趟信箱。** 战报那一趟的开封预算实测
+        天天满载，回收报告挤进去等于每挤掉一封战报、那一发派遣多等一趟
+        （整段在 `collect_recycle_hauls`）。多付的是一次进信箱（≈15 秒），
+        换来的是「战报什么时候入库」这件事完全不受这个新功能影响。
+
+        ⚠️ **一句异常都不许漏出去。** 这是一条旁路：读不到实收顶多是页面上那几发
+        停在「待回收」，而漏出去的异常会打断整轮——也就是拿攻击链路去赔一个
+        统计功能。判据同 `_store_report_screenshot` 头上那一段。
+        """
+        try:
+            budget = repository.recycle_mail_opens()
+        except Exception as error:  # noqa: BLE001 - 见 docstring：旁路不许拖累主路径
+            say(f"  读不到回收邮件旋钮（{error}）；这一趟不读回收报告")
+            return
+        if budget <= 0:
+            return
+        say(f"  开始读回收报告（这一趟最多 {budget} 封；旋钮是「每趟读几封」）")
+        try:
+            scan = self.collect_recycle_hauls(max_opens=budget)
+        except RoundExhausted:
+            # 这一条是**真的要往上抛**的：名额/时间用完了是整轮的事，
+            # 在这里吞掉会让调用方以为这一轮还能接着干。
+            raise
+        except Exception as error:  # noqa: BLE001 - 见 docstring
+            say(f"  读回收报告这一趟出错（{error}）；已入库的实收不受影响")
+            return
+        if scan is not None and scan.cut_short:
+            say(f"  回收报告这一趟没走完：{scan.cut_short}")
 
     def _scan_for_reconcile(self, day_start: datetime, *, now: datetime) -> DailyTally:
         """开工那一趟信箱。返回这一趟数出来的当日份数。
