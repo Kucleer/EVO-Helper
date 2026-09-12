@@ -753,7 +753,7 @@ def test_two_mails_that_share_a_second_on_one_screen_are_both_opened() -> None:
     取舍写在 `MailRow.identity` 里。
     """
     rows = [
-        _read(0, "08/08/2026 13:07:42", "bad ao 远征舰队返回"),
+        _read(0, "08/08/2026 13:07:42", "bad ao 远征报告 ‘eo m"),
         _read(1, "08/08/2026 13:07:42", "yw a 远征报告 ‘eo m"),
     ]
     loop, _events, opened = _loop([rows])
@@ -766,6 +766,37 @@ def test_two_mails_that_share_a_second_on_one_screen_are_both_opened() -> None:
     )
 
     assert [row.index for row in opened] == [0, 1], "同一屏上同一秒的两封被当成一封了"
+
+
+def test_a_fleet_return_is_skipped_at_the_list_instead_of_being_opened() -> None:
+    """⚠️ 2026-09-12：「舰队返回」进了 `classify_report_subject`，于是**列表页就跳过**。
+
+    这一条记的是上面那条用例**为什么换了主题**：实拍那一对里有一封是
+    `远征舰队返回`，而「远征舰队返回」含着「舰队返回」这四个字，
+    现在会被分流成 `FLEET_RETURN` ⇒ `may_be(ATTACK)` 为假 ⇒ 根本不开。
+
+    ⚠️ **这是要的行为，不是回归。** 舰队标签里「舰队返回」占三分之二，
+    而它的主题分不出攻击和回收（必须开了读正文），不在列表页跳过的话
+    未读那笔 12 封的预算会被它吃光，回收报告一封都轮不到
+    （`docs/回收闭环/邮件读实收-评估-2026-09-12.md`）。
+
+    ⚠️ 但同秒去重那条判据**不能跟着一起没**——所以上面那条用例换成了
+    两封都开得出来的主题，它守的东西一点没变。
+    """
+    rows = [
+        _read(0, "08/08/2026 13:07:42", "bad ao 远征舰队返回"),
+        _read(1, "08/08/2026 13:07:43", "yw a 远征报告 ‘eo m"),
+    ]
+    loop, _events, opened = _loop([rows])
+
+    loop._scan_mail_rows(
+        wanted=ReportKind.ATTACK,
+        label="攻击报告",
+        visit=lambda row, page: opened.append(row) or False,
+        max_pages=1,
+    )
+
+    assert [row.index for row in opened] == [1], "舰队返回没有在列表页被跳过，白开了一封"
 
 
 def test_a_screen_that_read_nothing_is_not_mistaken_for_the_bottom() -> None:

@@ -5,16 +5,18 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED, OUTCOME_RECYCLE
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import (
     BattleReport,
+    BattleResourceEntry,
     FleetSnapshotEntry,
     PlanetScoutAlert,
     ScoutReport,
     ScoutTriggerShip,
     UiObservation,
 )
+from evo_helper.domain.recycle_mail import RECYCLE_SLOTS, RecycleHaul
 from evo_helper.vision.live_reports import LiveBattleReport
 from evo_helper.vision.models import FleetLine
 from evo_helper.vision.pirate_reports import PirateReportReading
@@ -165,6 +167,46 @@ def to_protection_bounce_report(
         defender_target=target,
         raw_time_text=raw_time_text,
         outcome=OUTCOME_PROTECTED,
+    )
+
+
+def to_recycle_report(haul: RecycleHaul, *, report_id: UUID) -> BattleReport:
+    """回收报告邮件 → 一行合成战报，三样资源挂在上面。
+
+    ⚠️ **为什么复用 `battle_reports` 而不另起一张表**：全仓「这一趟收了多少」
+    只有一条路——`battle_report_resources` 的槽位行。挂上去之后，概览页的
+    「常规资源」合计、周期统计的资源列、星球效率的稀有三样，**四处一起就通了**，
+    一句查询都不用改。另起一张表等于把那套聚合再写一遍，而两份迟早分家
+    （同 `to_protection_bounce_report` 的理由）。
+
+    ⚠️ **`outcome=RECYCLE` 不是「第四种战果」**，它是个记号，让两处认得出这一行：
+    ①`period_counts` / `origin_efficiency` 把它排除在「攻击战报」之外
+    （回收不产生战报，算进去会把战报回收率撑高，见 `#321`）；
+    ②派遣日志那一格据此从「待回收」翻成「已回收」。
+
+    ⚠️ **战损、参战舰队、单位数一律留空** —— 回收没有战斗，那些数**不存在**，
+    不是没读到。填 0 会让这一趟变成「打了一仗零战损」，直接污染战斗统计。
+
+    ⚠️ **三样资源必须全有**（`RecycleHaul.amounts` 在解析层就保证了）：
+    少一格在库里长得和「那一格是 0」一模一样，而这里少一格就是少三分之一的收入。
+    """
+    entries = tuple(
+        BattleResourceEntry(
+            slot=slot,
+            amount=int(quantity.amount),
+            approximate=quantity.approximate,
+            uncertainty=quantity.uncertainty,
+        )
+        for slot, quantity in zip(RECYCLE_SLOTS, haul.amounts, strict=True)
+    )
+    return BattleReport(
+        report_id=report_id,
+        reported_at_utc=haul.reported_at_utc,
+        attacker_origin=haul.origin,
+        defender_target=haul.target,
+        raw_time_text=haul.raw_time_text,
+        outcome=OUTCOME_RECYCLE,
+        resources=entries,
     )
 
 

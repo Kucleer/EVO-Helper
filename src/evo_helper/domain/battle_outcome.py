@@ -65,6 +65,15 @@ OUTCOME_DRAW = "DRAW"
 #: 不会被当成一个 0 拉低平均。
 OUTCOME_PROTECTED = "PROTECTED"
 
+#: 回收这一趟捞回来了多少。**同样不是从画面横幅上读来的**，所以也不在
+#: `OUTCOME_LABELS` 里——它是回收报告邮件合成出来的一行，用途是
+#: ①把那一趟的三样资源挂进 `battle_report_resources`（于是「常规资源」合计
+#: 自动含进实收），②让派遣日志那一格从「待回收」翻成「已回收」。
+#:
+#: ⚠️ **它不算「攻击战报」**，判据同 `OUTCOME_PROTECTED`：回收不产生战报，
+#: 把它算进战报数会把战报回收率撑高（见 `#321`）。
+OUTCOME_RECYCLE = "RECYCLE"
+
 #: 词表顺序无关紧要，但要稳定：横幅的读数按它做吸附。
 #: **只放画面上真的会出现的那三个词**，理由见 `OUTCOME_PROTECTED`。
 OUTCOME_LABELS = (OUTCOME_VICTORY, OUTCOME_FAIL, OUTCOME_DRAW)
@@ -123,6 +132,7 @@ __all__ = [
     "OUTCOME_DRAW",
     "OUTCOME_FAIL",
     "OUTCOME_LABELS",
+    "OUTCOME_RECYCLE",
     "OUTCOME_PROTECTED",
     "OUTCOME_VICTORY",
     "outcome_from_survivors",
