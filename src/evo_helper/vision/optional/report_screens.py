@@ -450,9 +450,7 @@ class ImageReportScreens:
             for region in cell:
                 for scale, threshold in RECYCLE_CELL_RECIPES:
                     try:
-                        text = self._read(
-                            region, OCR_PSM_LINE, scale=scale, threshold=threshold
-                        )
+                        text = self._read(region, OCR_PSM_LINE, scale=scale, threshold=threshold)
                     except Exception:  # noqa: BLE001 - 一个配方读炸不该带倒整封
                         continue
                     for quantity in find_abbreviated_quantities(text):
