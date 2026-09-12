@@ -84,6 +84,9 @@ from .display import (
     MISSION_KIND_LABELS,
     MISSION_KIND_TONES,
     MISSION_LABELS,
+    RECYCLE_RESULT_GLYPHS,
+    RECYCLE_RESULT_LABELS,
+    RECYCLE_RESULT_TONES,
     SCOUT_RESULT_GLYPHS,
     SCOUT_RESULT_LABELS,
     SCOUT_RESULT_TONES,
@@ -409,7 +412,7 @@ def _ai_health(rows: Sequence[Any]) -> dict[str, object]:
     }
 
 
-#: 攻击日志一页显示多少条。日志是给人翻的，不是给人滚的。
+#: 派遣日志一页显示多少条。日志是给人翻的，不是给人滚的。
 ATTACK_LOG_LIMIT = 300
 
 
@@ -471,7 +474,7 @@ BlankableInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
 
 #: 允许空串的日期查询参数（`YYYY-MM-DD`）。空串→None，也就是「不按日期筛」。
 #:
-#: 和 `BlankableInt` 同一个坑：攻击日志页的日期框清空之后，浏览器照样提交
+#: 和 `BlankableInt` 同一个坑：派遣日志页的日期框清空之后，浏览器照样提交
 #: `date=`，声明成 `date | None` 会当场 422。日期框天生就有「清空」这个动作，
 #: 不像下拉框还能塞一个 `value=""` 的选项绕开，所以这一条是必须的。
 BlankableDate = Annotated[date | None, BeforeValidator(_blank_to_none)]
@@ -479,13 +482,13 @@ BlankableDate = Annotated[date | None, BeforeValidator(_blank_to_none)]
 #: 允许空串的文本查询参数。空串→None，也就是「这一格没填」。
 #:
 #: `str | None` 本身不会 422，但空串会一路走到解析函数那里变成一条错误提示，
-#: 而用户看到的只是「我没填这一格」。攻击日志的坐标框是两个 `<input>`，
+#: 而用户看到的只是「我没填这一格」。派遣日志的坐标框是两个 `<input>`，
 #: 提交表单必然带上 `target_start=&target_end=`。
 BlankableStr = Annotated[str | None, BeforeValidator(_blank_to_none)]
 
 
 def _target_span(start: str | None, end: str | None) -> CoordinateRange | None:
-    """把攻击日志上那两个坐标框读成一个闭区间。
+    """把派遣日志上那两个坐标框读成一个闭区间。
 
     只填一端时另一端跟着它走：填 `2:130` 就是「只看 2:130 这个星系」，而不是
     「从 2:130 到宇宙尽头」——一个人只填了起点，想的是那一个位置，不是半个宇宙。
@@ -1041,9 +1044,9 @@ def create_app(
         report_id: UUID,
         service: ApplicationService = Depends(get_service),
     ) -> Response:
-        """读这份战报时截下来的那一屏面板。攻击日志上那个链接就指这里。
+        """读这份战报时截下来的那一屏面板。派遣日志上那个链接就指这里。
 
-        **单独一条接口，而不是把字节并进攻击日志的列表响应。** 那一页一次取
+        **单独一条接口，而不是把字节并进派遣日志的列表响应。** 那一页一次取
         `ATTACK_LOG_LIMIT` 行，每张图约 40 KB；把 base64 塞进列表，一页就是几
         MB，页面在手机上直接卡死。列表只带一个布尔（有没有图），点了才取。
 
@@ -1074,7 +1077,10 @@ def create_app(
         outcome: BlankableStr = None,
         origin: BlankableStr = None,
     ) -> HTMLResponse:
-        """攻击日志：每一发打出去的舰队，游戏时间与现实时间并列。
+        """派遣日志：每一发打出去的舰队（攻击 / 侦察 / 回收），游戏时间与现实时间并列。
+
+        ⚠️ 2026-09-12 从「攻击日志」改名：回收发本来就在这一页上（查询没有
+        `mission_kind` 过滤），只是叫「攻击日志」时没人会来这儿找回收。
 
         筛选走查询参数，所以「只看海盗」「只看 8 月 9 日」「只看 2:130–2:140」
         都有自己可分享的链接。
@@ -1219,6 +1225,9 @@ def create_app(
                 "scout_labels": SCOUT_RESULT_LABELS,
                 "scout_tones": SCOUT_RESULT_TONES,
                 "scout_glyphs": SCOUT_RESULT_GLYPHS,
+                "recycle_labels": RECYCLE_RESULT_LABELS,
+                "recycle_tones": RECYCLE_RESULT_TONES,
+                "recycle_glyphs": RECYCLE_RESULT_GLYPHS,
                 "mission_kind_labels": MISSION_KIND_LABELS,
                 "mission_kind_tones": MISSION_KIND_TONES,
                 "mission_kind_glyphs": MISSION_KIND_GLYPHS,

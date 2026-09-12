@@ -209,7 +209,7 @@ class ResourceCell:
 
     ⚠️ **「约」和误差范围不在模板里现写。** 两句话都问
     `display.resource_amount_text` / `display.resource_precision_hint` 要——
-    攻击日志页那一列也是它们渲染的，同一个概念在两页上写成两种样子，
+    派遣日志页那一列也是它们渲染的，同一个概念在两页上写成两种样子，
     比两页都不标更让人犯迷糊（`logs.html` 那一段的理由）。
     """
 

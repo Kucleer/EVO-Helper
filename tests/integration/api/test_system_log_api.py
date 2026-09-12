@@ -236,12 +236,17 @@ def test_asking_for_an_image_that_is_not_there_is_a_404_not_a_500(client) -> Non
     assert client.get(f"/system-log/{plain}/payload").status_code == 200
 
 
-def test_the_attack_log_page_is_untouched(client) -> None:  # type: ignore[no-untyped-def]
-    """`/logs` 仍然是攻击日志。占用它会让「哪一页看得到 runner 报错」永远说不清。"""
+def test_the_dispatch_log_page_is_untouched(client) -> None:  # type: ignore[no-untyped-def]
+    """`/logs` 仍然是派遣日志。占用它会让「哪一页看得到 runner 报错」永远说不清。
+
+    ⚠️ 2026-09-12 从「攻击日志」改名为「派遣日志」——回收发本来就在这一页上，
+    只是旧名字让人不会来这儿找它。这一条钉的是**这一页没被系统日志占用**，
+    页面名只是判据；改名时跟着改名字，别把这条删了。
+    """
     response = client.get("/logs")
 
     assert response.status_code == 200
-    assert "攻击日志" in response.text
+    assert "派遣日志" in response.text
     assert "简报认不出，安全地不派" not in response.text
 
 

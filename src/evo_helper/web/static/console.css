@@ -192,6 +192,7 @@ body {
    预设那格是侦察/攻击），所以色相要岔开：那两个占了青与紫，这里走琥珀与赤。 */
 .chip.kind-scout { color: #d8a657; border-color: #5a4520; }
 .chip.kind-attack { color: #e07a5f; border-color: #5e3327; }
+.chip.kind-recycle { color: var(--recycle); border-color: var(--recycle-edge); }
 
 /* ---- stat tiles ----------------------------------------------------- */
 
