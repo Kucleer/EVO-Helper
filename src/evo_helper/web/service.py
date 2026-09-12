@@ -203,7 +203,7 @@ class StateEventView:
 
 @dataclass(frozen=True)
 class AttackLogView:
-    """攻击日志的一行：一次派遣，或一个还没派出去的意图。
+    """派遣日志的一行：一次派遣，或一个还没派出去的意图。
 
     只存 `dispatched_at_utc` 一个瞬时，不存两份时间。游戏内时间是 UTC+0
     （`vision.parsers.GAME_DISPLAY_ZONE`），现实时间是 UTC+8
@@ -242,7 +242,7 @@ class AttackLogView:
     #: - 「战果」永远显示「待战报」。侦察发**不产生战报**（它产出的是侦察报告，
     #:   走 `scout_reports` 那张表），而那一格问的是「有没有 `battle_reports`」，
     #:   于是那一夜 111 发侦察全部永远挂着「待战报」。同一条规则
-    #:   `storage.intel._battle_result` 早就写对了，只是攻击日志这条渲染路径
+    #:   `storage.intel._battle_result` 早就写对了，只是派遣日志这条渲染路径
     #:   从来没跟上——之前几次「修好了」修的都是情报中心那一侧。
     #: - 「预设」那格分不出侦察和攻击，两种发次长得一模一样。
     mission_kind: str | None = None
@@ -299,18 +299,18 @@ class AttackLogView:
     report_screenshot: bool = False
 
 
-#: 攻击日志「结果」那一档的三个取值。键同 `storage.intel.DISPATCH_*`，
+#: 派遣日志「结果」那一档的三个取值。键同 `storage.intel.DISPATCH_*`，
 #: 中文标签与 chip 样式复用 `display.DISPATCH_STATE_*`。
 #:
 #: **没有 `NEVER`。** 情报中心筛的是「目标星球」，一颗从没被派遣过的星球才叫
-#: 「从未派遣」；而攻击日志一行就是一次派遣意图，「从未」在这里不存在，摆出来
+#: 「从未派遣」；而派遣日志一行就是一次派遣意图，「从未」在这里不存在，摆出来
 #: 只会是一档永远筛出空页的选项——而空页读起来就是「这类记录没有」。
 ATTACK_LOG_RESULTS: tuple[str, ...] = ("SENT", "BLOCKED", "REJECTED")
 
 
 @dataclass(frozen=True)
 class AttackLogOptions:
-    """攻击日志上两档快速筛选的候选值，**从库里现有的记录取**。
+    """派遣日志上两档快速筛选的候选值，**从库里现有的记录取**。
 
     预设是用户自己在游戏里维护的，写死字面量就会漏掉他新建的那一个；战果同理，
     库里存的是战斗详情页上的画面原文（`BattleReportRow.outcome`），将来多一档
@@ -998,7 +998,7 @@ class FakeApplicationService:
         outcome: str | None = None,
         origin: Coordinate | None = None,
     ) -> list[AttackLogView]:
-        """Fake 服务不模拟派遣，所以攻击日志恒为空。
+        """Fake 服务不模拟派遣，所以派遣日志恒为空。
 
         返回空列表而不是抛未实现：页面在演示服务上也要打得开，
         并且要显示「还没有攻击记录」而不是 500。

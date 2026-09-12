@@ -290,7 +290,7 @@
           {# 「约」与误差范围都问 `display.resource_amount_text` /
              `resource_precision_hint` 要（经 `ResourceCell.text` / `.hint`），
              模板里不另写一遍：把近似值渲染得像精确读数是另一回事，而这条规则
-             在攻击日志页上已经有一份了。误差按有效位数算，所以进 `title`。 #}
+             在派遣日志页上已经有一份了。误差按有效位数算，所以进 `title`。 #}
           <div class="value tone-rare" title="{{ cell.hint }}">{{ cell.text }}</div>
           <div class="overview-note">昨天 {{ '{:,}'.format(now.today.yesterday.get(cell.slot, 0)) }}</div>
         </div>

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
-{% block title %}攻击日志 · EVO-Helper{% endblock %}
-{% block heading %}攻击日志{% endblock %}
+{% block title %}派遣日志 · EVO-Helper{% endblock %}
+{% block heading %}派遣日志{% endblock %}
 {% block topbar_extra %}
 <span class="chip"><span class="glyph" aria-hidden="true">🕗</span>游戏时间 UTC+0 · 现实时间 UTC+8</span>
 {% include "_auto_refresh.html" %}
@@ -320,7 +320,19 @@
               「待战报」，而其中不少早就把攻击带出去了——攻击都打完了，它的侦察
               还显示「待战报」，这一格自己打自己的脸。
             #}
-            {% if entry.mission_kind == 'SCOUT' %}
+            {#
+              ⚠️⚠️ **回收发同理，而且这是同一个坑的第三次。**
+              回收永远不会产生战报（残骸捞回来只有一封「回收报告」邮件，
+              不进 `battle_reports`），落到下面那条「没战报 → 待战报」上就是
+              永远等一个不会来的东西 —— 和 2026-08-13 那 111 发侦察一模一样。
+
+              前两次分别修在 `#320`（未读战报卡）与 `#321`（攻击战报那一列）。
+              这一页是第三处，改法照抄侦察那一档。
+            #}
+            {% if entry.mission_kind == 'RECYCLE' %}
+              <span class="chip kind-recycle"><span class="glyph" aria-hidden="true">♻</span>已派出</span>
+              <div class="muted" style="font-size:11px">回收发没有战报</div>
+            {% elif entry.mission_kind == 'SCOUT' %}
               {% set scout_state = 'SCOUT_BACK' if entry.scout_report_back else 'SCOUT_WAITING' %}
               <span class="chip {{ scout_tones.get(scout_state, '') }}">
                 <span class="glyph" aria-hidden="true">{{ scout_glyphs.get(scout_state, '') }}</span>{{ scout_labels.get(scout_state, scout_state) }}</span>
