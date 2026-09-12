@@ -486,7 +486,7 @@ class PersistentApplicationService:
         outcome: str | None = None,
         origin: Coordinate | None = None,
     ) -> list[AttackLogView]:
-        """攻击日志：每条意图一行，派出去的带上派遣事实。
+        """派遣日志：每条意图一行，派出去的带上派遣事实。
 
         用 `outerjoin` 而不是 `join`：**被闸门拦下、或者读简报没通过的意图
         没有对应的派遣行**，而这些恰恰是最需要在日志里看到的——
@@ -698,7 +698,7 @@ class PersistentApplicationService:
         return ReportScreenshotRepository(self._session_factory).load(report_id)
 
     def attack_log_options(self) -> AttackLogOptions:
-        """攻击日志上「预设」「出发星球」「战果」三档的候选值，从库里现有的记录取。
+        """派遣日志上「预设」「出发星球」「战果」三档的候选值，从库里现有的记录取。
 
         写死字面量会漏掉用户新建的预设——预设是他自己在游戏里维护的，助手这边
         只是读到什么记什么。战果同理：库里存的是战斗详情页上的画面原文。
@@ -2601,7 +2601,7 @@ def _pack(coordinate: Coordinate) -> int:
 
 
 def _dispatch_result_clause(result: str):  # type: ignore[no-untyped-def]
-    """把攻击日志「结果」那一格的判据翻成 SQL 过滤条件。
+    """把派遣日志「结果」那一格的判据翻成 SQL 过滤条件。
 
     页面上那一格是这么读的：没有派遣行 → 未派出；有且 accepted → 已派出；
     有但没 accepted → 被拒。这里必须逐条对上，否则筛出来的行和它自己显示的

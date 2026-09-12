@@ -139,7 +139,7 @@ def settled_score(score: float | None) -> float | None:
 
 
 def military_score_text(score: float | None) -> str:
-    """军力值在攻击日志上的写法：带千分位，没有读数就是「—」。
+    """军力值在派遣日志上的写法：带千分位，没有读数就是「—」。
 
     ⚠️ **`None` 必须显示成「—」，不能是 0。** 海盗位在 `bot_targets` 里没有行、
     还没上过榜的 bot 有行但没读数，两种都是 `None`；而被打空的 bot 军力真的是 0，
@@ -158,7 +158,7 @@ def military_score_text(score: float | None) -> str:
 
 
 def preset_signature_note(name: str, signature: str) -> str | None:
-    """攻击日志「预设」那一格的第二行：**只在签名不是从标题推出来的时候才有**。
+    """派遣日志「预设」那一格的第二行：**只在签名不是从标题推出来的时候才有**。
 
     用户口径 2026-08-19：「预设栏出现了重复的预设，保留一个就可以了」。那一格
     此前长这样——chip 一行写着 `攻击 BBB`，底下再来一行 `预设:BBB`。
@@ -355,21 +355,28 @@ BATTLE_RESULT_GLYPHS: dict[str, str] = {
 }
 
 
-#: 发次类型（侦察 / 攻击）在攻击日志上的 chip 样式。
+#: 发次类型（侦察 / 攻击 / 回收）在派遣日志上的 chip 样式。
 #:
-#: 用户口径（2026-08-14）：「预设中的侦查和攻击需要标记不同颜色」。两种发次在
-#: 那一页混排，而它们的**下一步完全不同**——侦察等的是侦察报告、攻击等的是战报，
-#: 分不出来就没法读那一列（见 `SCOUT_RESULT_*`）。
+#: 用户口径（2026-08-14）：「预设中的侦查和攻击需要标记不同颜色」。三种发次在
+#: 那一页混排，而它们的**下一步完全不同**——侦察等的是侦察报告、攻击等的是战报、
+#: **回收什么都不等**，分不出来就没法读那一列（见 `SCOUT_RESULT_*`）。
 #:
 #: 色永远配一个字形和一个词（同 `STATUS_TONES` 的规矩）。
-MISSION_KIND_LABELS: dict[str, str] = {"SCOUT": "侦察", "ATTACK": "攻击"}
-MISSION_KIND_TONES: dict[str, str] = {"SCOUT": "kind-scout", "ATTACK": "kind-attack"}
-MISSION_KIND_GLYPHS: dict[str, str] = {"SCOUT": "◎", "ATTACK": "⚔"}
+#:
+#: ⚠️ 回收用 `--recycle` 那个靛蓝，和概览页航线格子、周期统计的「回收」列同色
+#: （`#319`）：同一件事在三页上必须是同一个颜色，否则用户得各记一套。
+MISSION_KIND_LABELS: dict[str, str] = {"SCOUT": "侦察", "ATTACK": "攻击", "RECYCLE": "回收"}
+MISSION_KIND_TONES: dict[str, str] = {
+    "SCOUT": "kind-scout",
+    "ATTACK": "kind-attack",
+    "RECYCLE": "kind-recycle",
+}
+MISSION_KIND_GLYPHS: dict[str, str] = {"SCOUT": "◎", "ATTACK": "⚔", "RECYCLE": "♻"}
 
 
 #: 侦察发那一格的三档。**侦察发永远不该显示「待战报」。**
 #:
-#: 实机 2026-08-13 通宵：111 发侦察在攻击日志上全部挂着「待战报」，而侦察根本
+#: 实机 2026-08-13 通宵：111 发侦察在派遣日志上全部挂着「待战报」，而侦察根本
 #: 不产生战报——它产出的是侦察报告，走 `scout_reports` 那张表。用户连提两次
 #: 「战果列状态没更新」，成因就是这一格问错了问题（详见
 #: `web.service.AttackLogView.mission_kind`）。
@@ -386,6 +393,31 @@ SCOUT_RESULT_LABELS: dict[str, str] = {
 }
 SCOUT_RESULT_TONES: dict[str, str] = {SCOUT_RESULT_BACK: "ok", SCOUT_RESULT_WAITING: ""}
 SCOUT_RESULT_GLYPHS: dict[str, str] = {SCOUT_RESULT_BACK: "◉", SCOUT_RESULT_WAITING: "◌"}
+
+
+#: 回收发那一格的两档。**回收发永远不该显示「待战报」。**
+#:
+#: 用户口径（2026-09-12）：「回收可以使用待回收，读到邮件后，显示已回收」。
+#:
+#: ⚠️ **和侦察那一档形状一样，但「等的东西」不同**：侦察等的是侦察报告
+#: （`scout_reports` 表），回收等的是**回收报告邮件**里那三个资源数。
+#:
+#: ⚠️⚠️ **在邮件链路上线之前，这一格会恒为「待回收」。** 这**不是**
+#: 「待战报」那种假欠账：战报对回收发**永远不会来**，而回收报告邮件是真的
+#: 躺在信箱里、只是还没人去读（`docs/回收闭环/邮件读实收-评估-2026-09-12.md`）。
+#: 一个是等不到的东西，一个是还没去取的东西——页面上必须是两个词。
+RECYCLE_RESULT_BACK = "RECYCLE_BACK"
+RECYCLE_RESULT_WAITING = "RECYCLE_WAITING"
+
+RECYCLE_RESULT_LABELS: dict[str, str] = {
+    RECYCLE_RESULT_BACK: "已回收",
+    RECYCLE_RESULT_WAITING: "待回收",
+}
+RECYCLE_RESULT_TONES: dict[str, str] = {
+    RECYCLE_RESULT_BACK: "kind-recycle",
+    RECYCLE_RESULT_WAITING: "",
+}
+RECYCLE_RESULT_GLYPHS: dict[str, str] = {RECYCLE_RESULT_BACK: "♻", RECYCLE_RESULT_WAITING: "◌"}
 
 
 def missing_intel_labels() -> list[str]:

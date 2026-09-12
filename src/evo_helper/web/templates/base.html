@@ -48,7 +48,7 @@
       //: 自动刷新」。
       AUTO_REFRESH_MS: 15000,
 
-      //: 让当前这一页每 15 秒自己更新一次。**只有攻击日志与系统日志用它。**
+      //: 让当前这一页每 15 秒自己更新一次。**只有派遣日志与系统日志用它。**
       //:
       //: 收在这里而不是两页各抄一份：抄第二份的那天，两处就开始分家——而这段
       //: 里每一条都是「少了它就会烧掉带宽或者惹恼用户」的：
@@ -202,8 +202,8 @@
     <div class="group-label">辅助</div>
     {# 「运行详情」已关闭：它操作的是更早的 run_instances/scan_plans 那条路径，
        起停与记账都由任务中心（常驻调度器 + mission_runs）接手了。 #}
-    <a href="/logs" {% if active == 'logs' %}aria-current="page"{% endif %}>攻击日志</a>
-    {# 「系统日志」是脚本自己的诊断输出（`system_log` 表），和上面那条「攻击日志」
+    <a href="/logs" {% if active == 'logs' %}aria-current="page"{% endif %}>派遣日志</a>
+    {# 「系统日志」是脚本自己的诊断输出（`system_log` 表），和上面那条「派遣日志」
        不是一回事——那一页一行是一发打出去的舰队。跨机查看靠的就是这一页：
        实机在另一台机器上跑，它的 print 只落在那台机器的本地文件里。 #}
     <a href="/system-log" {% if active == 'system-log' %}aria-current="page"{% endif %}>系统日志</a>
