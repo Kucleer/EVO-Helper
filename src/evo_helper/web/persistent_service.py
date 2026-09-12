@@ -26,6 +26,7 @@ from evo_helper.application.backfill import (
 )
 from evo_helper.application.mission_freeze import FrozenOrigin, FrozenTask, MissionConfigFreeze
 from evo_helper.application.mission_scheduler import MissionScheduler, SchedulerSnapshot
+from evo_helper.domain.battle_outcome import OUTCOME_RECYCLE
 from evo_helper.domain.missions import (
     MissionParamError,
     bot_targets_in_range,
@@ -645,6 +646,12 @@ class PersistentApplicationService:
                     defender_losses=report.defender_losses if report else None,
                     mission_kind=dispatch.mission_kind if dispatch else None,
                     scout_report_back=bool(scouted),
+                    # ⚠️ 判据是「有没有那一行 `outcome=RECYCLE` 的合成战报」，
+                    # **不是** `report is not None`：回收发拿不到真战报，可它
+                    # 那一行合成战报和真战报住在同一张表里，只能靠 outcome 分。
+                    recycle_haul_back=bool(
+                        report is not None and report.outcome == OUTCOME_RECYCLE
+                    ),
                     report_id=report.id if report else None,
                     report_screenshot=bool(report is not None and report.id in with_screenshot),
                     resources=resources.get(report.id, ()) if report is not None else (),

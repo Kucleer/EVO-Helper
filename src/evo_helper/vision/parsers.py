@@ -145,6 +145,13 @@ class ReportKind(Enum):
     #: 别人对我们做了什么，这一封说的是**我们自己派出去的那一发的下场**。
     #: 处理见 `vision.protection_bounce`。
     PROTECTION_BOUNCE = "protection_bounce"
+    #: 回收舰队抵达残骸场的通知，正文里带着这一趟捞到的三样资源。
+    RECYCLE = "recycle"
+    #: 舰队回港通知。⚠️ **攻击和回收共用这一个主题**，分不出来——
+    #: 加这一档是为了在**列表页就跳过它**，不是为了读它。
+    #: 舰队标签里它占三分之二，不跳过的话未读预算会被它吃光
+    #: （`docs/回收闭环/邮件读实收-评估-2026-09-12.md`）。
+    FLEET_RETURN = "fleet_return"
     SYSTEM = "system"
     UNKNOWN = "unknown"
 
@@ -342,6 +349,14 @@ def classify_report_subject(subject: str) -> ReportKind:
         return ReportKind.PROTECTION_BOUNCE
     if "你的行星被侦察" in text:
         return ReportKind.PLANET_SCOUTED
+    # ⚠️ 这两条排在「海盗 / 攻击报告」之前无所谓（主题互不包含），
+    # 但**必须排在最后那条 `"战报" in text` 之前**：舰队标签里的
+    # 「矮星系统战报」会先命中 SYSTEM，而回收报告不含「战报」二字，
+    # 所以这里其实只要在 UNKNOWN 之前就行。放这儿是为了读起来挨着。
+    if "回收报告" in text:
+        return ReportKind.RECYCLE
+    if "舰队返回" in text:
+        return ReportKind.FLEET_RETURN
     if "海盗" in text:
         return ReportKind.PIRATE
     if "攻击报告" in text:

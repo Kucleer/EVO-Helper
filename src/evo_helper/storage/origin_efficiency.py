@@ -35,7 +35,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED
+from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED, OUTCOME_RECYCLE
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.origin_efficiency import OriginDay
 from evo_helper.domain.overview import RARE_SLOTS, Occupancy, occupancy_end
@@ -173,8 +173,9 @@ class OriginEfficiencyRepository:
                 orm.AttackIntentRow.origin_position,
                 func.count().filter(kind == MISSION_KIND_ATTACK).label("attacks"),
                 func.count().filter(kind == MISSION_KIND_RECYCLE).label("recycles"),
-                # ⚠️ 撞保护期那一行不算战报（用户口径 2026-09-11）：它是合成出来
-                # 给那一发结账用的，里面一格资源都没有。同 `period_counts`。
+                # ⚠️ 撞保护期与回收那两种合成行都不算战报。撞保护期是给那一发
+                # 结账用的（一格资源都没有）；回收捞回来的是资源不是战报。
+                # 同 `period_counts`。
                 func.count()
                 .filter(
                     orm.BattleReportRow.id.is_not(None),
@@ -182,7 +183,7 @@ class OriginEfficiencyRepository:
                     # 裸的 `!=` 会把没写结局的战报一起滤掉（NULL 不是 TRUE）。
                     or_(
                         orm.BattleReportRow.outcome.is_(None),
-                        orm.BattleReportRow.outcome != OUTCOME_PROTECTED,
+                        orm.BattleReportRow.outcome.not_in((OUTCOME_PROTECTED, OUTCOME_RECYCLE)),
                     ),
                 )
                 .label("reports"),
