@@ -4919,8 +4919,8 @@ class PirateLoop:
         estimate: FlightEstimate,
         *,
         mission_kind: str = MISSION_KIND_ATTACK,
-    ) -> None:
-        """记下这一发，并把简报上的飞行时长存成回程闹钟。
+    ) -> UUID:
+        """记下这一发，并把简报上的飞行时长存成回程闹钟。返回这一发的 `dispatch_id`。
 
         定不下来时写 NULL——`ReportWaitPlanner` 把「未知」当成「立即尝试收取」，
         而不是无限等一个不知道何时抵达的战报。
@@ -4932,6 +4932,10 @@ class PirateLoop:
         值一起落库**。三个来源的可信度差着数量级，而
         `docs/预计战报时间-估算方案.md` 第 2 条早就写死了「估算值绝不能长得像
         实测值」。
+
+        ⚠️ **返回值不许吞掉。** 回收链路靠它把 `recycle_jobs.dispatch_id` 这根外键
+        接上（「这笔实收是哪一发回收派的」）。返回 `None` 的那一版里，193 行作业
+        全是 NULL，只能拿坐标 + 时刻去凑 —— 而同一坐标一天可能回收好几趟。
         """
         repository, _run_id = self._ensure_run()
         dispatch_id = uuid4()
@@ -4952,6 +4956,7 @@ class PirateLoop:
             source=estimate.source,
             fleet_speed=estimate.fleet_speed,
         )
+        return dispatch_id
 
     # -- 会话 ---------------------------------------------------------------
 
