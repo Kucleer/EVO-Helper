@@ -101,3 +101,48 @@ def test_the_template_map_covers_both_states() -> None:
     assert re.search(r"recycle_tones\.get\(", block)
     assert re.search(r"recycle_glyphs\.get\(", block)
     assert "'RECYCLE_BACK'" in block and "'RECYCLE_WAITING'" in block
+
+
+def test_the_recycle_row_shows_the_basic_three_not_the_rare_three() -> None:
+    """⚠️ 用户口径 2026-09-14：「派遣日志中，回收报告的内容显示只需要金属晶体气体」。
+
+    ⚠️ **这不是偏好，是回收报告上只有这三格。** 残骸捞回来的就是金属/晶体/气体
+    （`domain.recycle_mail.RECYCLE_SLOTS`）。摆稀有三样的结果是一排确凿的 `0`，
+    而那三个 0 说的是「这封信上没有这一格」，不是「这一趟没捞着」——
+    正是这一页最在意的那种假话（同它自己那段「不摆一排 0」的理由）。
+    """
+    from pathlib import Path
+
+    from evo_helper.web import app as web_package
+
+    html = (Path(web_package.__file__).parent / "templates" / "logs.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "peek_slots = basic_slots if entry.mission_kind == 'RECYCLE' else rare_slots" in html, (
+        "回收那一行的摘要没有改摆基础三样；摆稀有三样会显示成一排假的 0"
+    )
+    assert "for slot in peek_slots" in html, "摘要那一圈还在直接用 rare_slots"
+
+
+def test_both_slot_tables_come_from_the_domain() -> None:
+    """⚠️ 槽位号只许有一份 —— 模板里不许出现 `(5, 8, 9)` 或 `(0, 1, 2)`。
+
+    `SLOT_LABELS` 的顺序与游戏「太空舱」页不一致，抄第二份出去，
+    对不上的症状是「数字全对、只是安在了别的资源名下」，页面上一点异样都没有。
+    """
+    import inspect
+    from pathlib import Path
+
+    from evo_helper.web import app as web_module
+    from evo_helper.web import app as web_package
+
+    html = (Path(web_package.__file__).parent / "templates" / "logs.html").read_text(
+        encoding="utf-8"
+    )
+    assert "(5, 8, 9)" not in html
+    assert "(0, 1, 2)" not in html
+
+    wiring = inspect.getsource(web_module)
+    assert '"rare_slots": RARE_SLOTS' in wiring
+    assert '"basic_slots": BASIC_SLOTS' in wiring

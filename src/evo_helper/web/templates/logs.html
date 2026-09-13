@@ -433,11 +433,18 @@
               几百的精确读数，但破千之后画面上一样是缩写显示的（`1.2K`）；摘要挪到
               前台不是把精度声明丢掉的理由（同 `military_score_estimated` 的先例）。
             #}
+            {#
+              ⚠️ **回收那一行摆的是基础三样，不是稀有三样**（用户口径 2026-09-14）。
+              回收报告上**只有**金属/晶体/气体这三格，摆稀有三样的结果是一排确凿的
+              `0` —— 而那三个 0 的意思是「这封信上没有这一格」，不是「这一趟没捞着」。
+              这一页最在意的正是这种假话（同上面那段「不摆一排 0」的理由，方向一致）。
+            #}
+            {% set peek_slots = basic_slots if entry.mission_kind == 'RECYCLE' else rare_slots %}
             {% set peek_text %}
               {%- if show_losses %}{{ losses_text }}{% endif -%}
               {%- if entry.resources -%}
                 {%- if show_losses %} · {% endif -%}
-                {%- for slot in rare_slots -%}
+                {%- for slot in peek_slots -%}
                   {%- if not loop.first %} · {% endif -%}
                   {%- set matches = entry.resources | selectattr('slot', 'equalto', slot) | list -%}
                   {%- if matches -%}

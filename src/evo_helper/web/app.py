@@ -36,7 +36,7 @@ from evo_helper.config import Settings
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.intel_query import InvalidQueryError, parse_coordinate_span
 from evo_helper.domain.models import Coordinate, CoordinateRange
-from evo_helper.domain.overview import RARE_SLOTS
+from evo_helper.domain.overview import BASIC_SLOTS, RARE_SLOTS
 from evo_helper.domain.reconcile_cooldown import RECONCILE_COOLDOWN
 from evo_helper.domain.records import TARGET_KIND_LABELS
 from evo_helper.domain.report_wait import (
@@ -1249,6 +1249,14 @@ def create_app(
                 # 就会分家」的亏（见它自己的注释），而这里抄错的症状是「数字全对、
                 # 只是安在了别的资源名下」，页面上一点异样都没有。
                 "rare_slots": RARE_SLOTS,
+                # 回收那一行的摘要摆**这三样**，不摆稀有三样（用户口径 2026-09-14：
+                # 「派遣日志中，回收报告的内容显示只需要金属晶体气体就可以了」）。
+                #
+                # ⚠️ 这不是偏好，是回收报告上**只有**这三格：残骸捞回来的就是
+                # 金属/晶体/气体（`domain.recycle_mail.RECYCLE_SLOTS`）。摆稀有三样
+                # 的结果是一排确凿的 `0`，而那三个 0 说的是「这封信上没有这一格」，
+                # 不是「这一趟没捞着」—— 正好是这一页最在意的那种假话。
+                "basic_slots": BASIC_SLOTS,
                 # 一张表单，也就只剩一个「清空」。**没有功能因此消失**：单独取消
                 # 某一档就是把那个下拉框拨回「全部」（或清掉日期 / 坐标框）再提交，
                 # 控件本身就是那个开关。原先三个「全部 X」按钮是三张表单各自的
