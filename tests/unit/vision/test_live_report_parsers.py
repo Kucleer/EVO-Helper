@@ -91,9 +91,17 @@ class TestReportSubject:
         assert not kind.is_dispatch_matchable
 
     def test_scout_and_system_reports_are_not_matchable(self) -> None:
+        """⚠️ 这条守的是「不可认领」，不是某一个具体档位。
+
+        「矮星系统战报」2026-09-13 之前落 `SYSTEM`（靠「含『战报』二字」的兜底），
+        之后有了自己的 `STARGATE`（用户要的「系统识别一下，日常读取可跳过」）。
+        **档位变了不算回归，可认领才算** —— 只有 `ATTACK` 能拿去关掉一发派遣。
+        """
         assert classify_report_subject("侦察报告") is ReportKind.SCOUT
-        assert classify_report_subject("矮星系统战报") is ReportKind.SYSTEM
-        assert not classify_report_subject("侦察报告").is_dispatch_matchable
+        assert classify_report_subject("矮星系统战报") is ReportKind.STARGATE
+        assert classify_report_subject("某种没见过的战报") is ReportKind.SYSTEM
+        for subject in ("侦察报告", "矮星系统战报", "某种没见过的战报"):
+            assert not classify_report_subject(subject).is_dispatch_matchable
 
     def test_unknown_subject_is_not_matchable(self) -> None:
         kind = classify_report_subject("联盟公告")

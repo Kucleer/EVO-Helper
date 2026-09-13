@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -358,6 +359,13 @@ MAIL_ROW_X = 900
 #: 于是「回收报告」和「舰队返回」这两种信 bot 一封都没见过——今天的账面是 0
 #: 不是因为没有，是因为翻不到（实拍确认，评估在
 #: `docs/回收闭环/邮件读实收-评估-2026-09-12.md` §1）。
+#: 矮星系统面板上那个「剩余 / 总数」。**只取前一个数。**
+STARGATE_QUOTA_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+#: 读那一格的配方，按顺序试到第一个解析得出的为止。
+#: 实测 12 种 ROI×配方组合全部读出 `5/5`，所以这三档只是余量，不是必须。
+STARGATE_QUOTA_RECIPES: tuple[tuple[int, int | None], ...] = ((4, 120), (4, None), (3, None))
+
 MAIL_BATTLE_SUB_TAB = (897, 218)
 MAIL_FLEET_SUB_TAB = (1033, 218)
 
@@ -4025,6 +4033,380 @@ class PirateLoop:
             f"  第 {row.index} 行回收实收入库（{reading.raw_time_text}："
             f"{metal} / {crystal} / {gas}，回收船 {reading.ships}）"
         )
+
+    #: 星门那座建筑所在的星球。用户口径（2026-09-13）：「固定使用 4 系的那个球（主球）」。
+    #:
+    #: ⚠️ **写死是有意的，不是偷懒。** 星门是一座**建筑**，只长在这一颗星球上；
+    #: 「当前停在哪颗星」不该决定打不打得成 —— 站错星球时正确的动作是先切过去，
+    #: 而不是在别的星球的地表上照这个坐标点下去（那儿是另一座建筑）。
+    STARGATE_ORIGIN = Coordinate(4, 277, 15)
+
+    #: 每天打几发。用户口径：「每日只需要攻击 3 次」。
+    #:
+    #: ⚠️ **它是我们这一侧的节制，不是游戏的上限。** 游戏自己给 5 次
+    #: （画面上的「今日剩余攻击次数 5/5」）。两个数都要看：游戏那个是**真相**
+    #: （手动打过、跨日重置都反映得出来），这个是用户要的量。取更紧的那个。
+    STARGATE_DAILY_ATTACKS = 3
+
+    #: 打星门用的预设。用户口径：「使用预设 BB 进行攻击」。
+    #:
+    #: ⚠️ 实机（2026-09-13）四个预设是 `AAA / BBB / CCC / 探险`，**没有叫 `BB` 的**；
+    #: 唯一以 BB 开头的是 `BBB`。「只按标题匹配、不读内容」那条口径在
+    #: `game.preset_picker` 上，这里只负责把名字交给它。
+    STARGATE_PRESET = "BBB"
+
+    #: 地表上最多试几个候选。
+    #:
+    #: ⚠️ **不是越多越好**：每试一个错的要付「点开 + 认屏 + 退回」约 8 秒，
+    #: 而实测真值在两帧里都排第 1、候选总共只有 2–3 个。给 3 是留余量，
+    #: 不是指望靠穷举蒙对 —— 真要穷举才中，说明识别器坏了，该去看现场图。
+    STARGATE_MAX_TRIES = 3
+
+    def attack_stargate(self, *, daily_cap: int | None = None) -> int:
+        """从星门打矮星系统。**最多派一发**，派出去返回 1，没派返回 0。
+
+        ## ⚠️⚠️ 一次只能在飞一发
+
+        用户口径（2026-09-13）：「星门一次只能发出一发」。所以这个方法**不循环**——
+        「今天打三次」是靠调度器隔开来调三次做到的，不是在这里连打三发。
+        写成循环的话第二发要么被游戏拒掉、要么做出点我们没预料的事，
+        而两种都会在日志上表现成「打了三发」。
+
+        ## ⚠️ 今天打过几次，问游戏，不自己记账
+
+        面板上写的是 `剩余/总数`（实拍 `5/5`），于是 **已用 = 总数 − 剩余**。
+        这个数跨重启、跨用户手动打、跨日重置都不会失真，而自己记的那份一定会在
+        某一次重启或某一次手点之后和真相分家 —— 那正是这个仓库里
+        「配额算错」那一类故障的老根。
+
+        ## ⚠️ 为什么这一条不写 `attack_dispatches`
+
+        那张表的每个消费者都默认「一行 = 占着一条航线 + 用掉一次当日攻击额度」。
+        星门**两样都不是**（用户口径 2026-09-13：「不占用航线」）。硬塞一行进去，
+        就得让航线账、日配额、选靶窗口、周期统计……每一处判据都学会这个新发次——
+        而那正是这个仓库里反复咬人的那一类改动（`#312` / `#320` / `#321` / `#323`
+        四次都是同一个形状：一种新发次撞上一个「照旧发次写的」判据）。
+
+        所以这一条**只落 `system_log`**，而当日次数靠游戏自己那个「今日剩余攻击次数」。
+        代价是派遣日志上看不到它 —— 那是个明确的取舍，不是遗漏。
+
+        ## ⚠️ 每一步都先认屏再点下一下
+
+        整条路是「地表 → 星门 → 横移 → 选中 → 攻击 → 三角 → 派遣页」。中间任何一屏
+        认不出来就**停在那里**，不继续盲点：这条路上每一次误点都落在真实操作上
+        （菜单上面那一格是情报页，地表上旁边那一格是别的建筑）。
+        """
+        cap = self.STARGATE_DAILY_ATTACKS if daily_cap is None else daily_cap
+        if cap <= 0:
+            return 0
+        self._open_for_stargate()
+        if self._stargate_already_flying():
+            say("  星门：已经有一发在飞（飞行中列表里有矮星系统）；这一趟不打")
+            return 0
+        if not self._open_stargate_target():
+            return 0
+        quota = self._stargate_quota()
+        if quota is None:
+            say("  星门：今日剩余次数读不出来；不猜，这一趟不打")
+            self._leave_stargate()
+            return 0
+        remaining, total = quota
+        used = max(0, total - remaining)
+        say(f"  星门：游戏说今天还剩 {remaining}/{total} 次（已用 {used}，我们的上限 {cap}）")
+        if remaining <= 0:
+            say("  星门：游戏说今天的次数已经用完了")
+            self._leave_stargate()
+            return 0
+        if used >= cap:
+            # ⚠️ 这一档和上面那档**必须分开说**：一个是游戏不让打了，
+            # 一个是我们自己收着不打。混成一句话，日后调高上限时没人知道该调哪儿。
+            say(f"  星门：今天已经打满我们自己的 {cap} 次；游戏那边还剩 {remaining} 次")
+            self._leave_stargate()
+            return 0
+        self._driver.click(*pirate_ui.STARGATE_DISPATCH_BUTTON, label="星门派遣")
+        self._driver.wait(DISPATCH_WAIT_S)
+        return self._launch_stargate()
+
+    def _stargate_already_flying(self) -> bool:
+        """飞行中列表里有没有一发正飞往矮星系统。读不出交回 `False`。
+
+        ## ⚠️ 为什么非要这道预检不可
+
+        用户口径（2026-09-13）：「星门一次只能发出一发」。而**每日次数那个读数
+        帮不上忙** —— 它数的是「今天派出过几发」，不是「现在有没有一发在飞」。
+        2026-09-13 实机：09:50 派出一发，10:17 那一趟读到「还剩 4/5」于是照打，
+        被游戏当场挡下（那一次也正好暴露了出发后没问弹窗这个 bug）。
+
+        ## ⚠️⚠️ 读不出时**往「在飞」那一侧倒**，也就是不打
+
+        第一版倒向「没在飞」，理由是「后面还有一道权威闸：真派的时候游戏自己会挡」。
+        **那个前提是错的** —— 2026-09-13 实机拍到飞行中列表里**同时有两发**
+        矮星系统（10:20 与 10:28 各一发），游戏根本没挡第二发。
+
+        所以「一次只能发出一发」这条口径只能由**我们自己**保证。读不出时宁可不打：
+        少打一发下一轮补得回来，多打一发收不回来。
+
+        ## ⚠️ 一行一读
+
+        取字函数恒用 `--psm 7`（单行）。整块读的话实测**恒为空字符串**，
+        而空字符串的意思正好是「没有矮星系统」—— 这道闸于是永远放行。
+        """
+        self._driver.click(*pirate_ui.NAV_FLEET, label="舰队")
+        self._driver.wait(DISPATCH_WAIT_S)
+        self._driver.click(*pirate_ui.DISPATCH_IN_FLIGHT_TAB, label="飞行中")
+        self._driver.wait(DISPATCH_WAIT_S)
+        rows = self._in_flight_destinations()
+        readable = [row for row in rows if row]
+        flying = any(pirate_ui.STARGATE_TARGET_NAME in row for row in readable)
+        if not readable:
+            # ⚠️ 一行都没读出来 ≠ 列表是空的。**当成「在飞」处理**，理由见 docstring。
+            say(f"  星门：飞行中列表一行都没读出来（读到 {rows}）；当成有在飞，这一趟不打")
+            self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
+            self._driver.wait(1.4)
+            self._navigator.invalidate()
+            return True
+        say(f"  星门：飞行中列表读到 {readable}；{'有' if flying else '没有'}矮星系统")
+        self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
+        self._driver.wait(1.4)
+        # 派遣面板开过之后导航栏里是什么已经不可知了（同 `_leave_dispatch_list`）。
+        self._navigator.invalidate()
+        return flying
+
+    def _in_flight_destinations(self) -> list[str]:
+        """飞行中列表这一屏每条记录的目的地。读不出的那一行交回空串。
+
+        ⚠️ **一行一读**：取字函数恒用 `--psm 7`，整块读恒为空（整段在
+        `pirate_ui.IN_FLIGHT_DEST_X` 那几个常量上）。
+        """
+        left, right = pirate_ui.IN_FLIGHT_DEST_X
+        out: list[str] = []
+        for index in range(pirate_ui.IN_FLIGHT_VISIBLE_ROWS):
+            middle = pirate_ui.IN_FLIGHT_FIRST_ROW_Y + pirate_ui.IN_FLIGHT_ROW_PITCH * index
+            text = self._read((left, middle - 18, right, middle + 18), upscale=3)
+            out.append(text.strip().replace(" ", ""))
+        return out
+
+    def _open_for_stargate(self) -> None:
+        """星门这一趟的开工三步。**和 `run()` 开头是同一组，不许少做。**
+
+        ⚠️ **这一条是实机打回来的**（2026-09-13）：第一版直接从 `_goto_planet_surface`
+        开始，而那时游戏停在登录页上 —— 于是这一趟在「切不回星球地表」上安全停住，
+        一发没派。少的正是 `_ensure_session`：它才是把游戏从登录页/读条页带进
+        游戏内的那一步。
+
+        ⚠️ 几何也要校（`ensure_game_window`）：窗口被改过尺寸时**所有坐标一起失效**，
+        而这件事悄无声息 —— 星门那几下会照 1920×917 的坐标落在别处，
+        而这条路上每一次误点都落在真实操作上。
+        """
+        from evo_helper.game.game_window import ensure_game_window
+
+        ensure_game_window()
+        self._ensure_session(force=True)
+        self._reset_to_known_screen()
+
+    def _open_stargate_target(self) -> bool:
+        """切到主球 → 地表 → 星门 → 横移 → 选中 → 攻击，走完停在矮星系统面板上。"""
+        if not self._ensure_stargate_planet():
+            return False
+        if not self._goto_planet_surface():
+            say("  星门：切不到星球地表")
+            return False
+        if not self._open_stargate_building():
+            return False
+        slow_drag_across(
+            self._driver,
+            pirate_ui.STARGATE_PAN_FROM_X,
+            pirate_ui.STARGATE_PAN_TO_X,
+            y=pirate_ui.STARGATE_PAN_Y,
+        )
+        self._driver.wait(1.6)
+        self._driver.click(*pirate_ui.STARGATE_TARGET, label="选中矮星系统")
+        self._driver.wait(1.8)
+        # 点「攻击」之前先读那条文字带。菜单上下两格挨着，上面那格开出来是情报页；
+        # 点错不会报错，只会开出一张看着正常、却什么都派不出去的页面。
+        label = self._read(pirate_ui.STARGATE_ATTACK_LABEL_ROI, upscale=4, threshold=120)
+        if "攻击" not in label:
+            self._dump_frame("stargate-menu-unrecognised", pirate_ui.STARGATE_ATTACK_LABEL_ROI)
+            say(f"  星门：选中之后没读到「攻击」那一格（读作 {label.strip()!r}）；不点")
+            self._leave_stargate()
+            return False
+        self._driver.click(*pirate_ui.STARGATE_ATTACK_BUTTON, label="星门攻击")
+        self._driver.wait(DISPATCH_WAIT_S)
+        if not self._settle(self._on_stargate_panel):
+            self._dump_frame("stargate-system-unrecognised", pirate_ui.STARGATE_PANEL_LABEL_ROI)
+            say("  星门：点了攻击却没读到矮星系统面板；停止")
+            return False
+        return True
+
+    def _ensure_stargate_planet(self) -> bool:
+        """把当前星球切到星门所在的那颗（`STARGATE_ORIGIN`）。切不成返回 False。
+
+        ⚠️ **这一步不能省，而且不能靠「回读起点」兜底。** 星门是一座**建筑**，
+        只长在主球上；站在别的星球时 `STARGATE_BUILDING` 那个坐标指向的是**另一座
+        建筑**，点下去会开出一个完全正常的、但不相干的面板。派遣页那道起点闸能挡住
+        「派错星球」，挡不住「在错的星球上点了别的东西」。
+
+        ⚠️ 调度器跑完一轮停在哪颗星球是不确定的（每轮按任务配的出发星切），
+        所以这一步**每趟都要问一次**，不能假定上一趟留在主球上。
+        """
+        target = self.STARGATE_ORIGIN
+        if not switch_needed(target, self._current_planet):
+            return True
+        say(f"星门：出发星球切到 {target}")
+        if not self._goto_planet_surface():
+            say("  星门：切星球之前回不到星球地表；这一趟不打")
+            return False
+        result = self.planet_switcher().switch_to(target)
+        if result is not SwitchResult.SWITCHED:
+            say(f"  星门：切不到 {target}（{result.value}）；这一趟不打")
+            if result is SwitchResult.NOT_FOUND:
+                say(f"  {target} 不在你的行星列表里；星门就长在这颗星球上，请核对")
+            return False
+        # 与 `ensure_origin_planet` 同一条规矩：**回读确认之后**才记下「已经在这儿了」。
+        self._current_planet = target
+        return True
+
+    def _open_stargate_building(self) -> bool:
+        """在地表上找到星门并点开。开出来了返回 True。
+
+        ## ⚠️ 坐标是**找**出来的，不是写死的
+
+        2026-09-13 实机打回来的：地表镜头会平移 —— 同一颗星球上星门先后出现在
+        `(1018, 455)` 与 `(864, 420)`，差了 150 多像素。写死的那一下点在空地上，
+        整趟停在「没读到『星门』标题」。而更坏的情形不是点空：**隔壁那一格是另一座
+        建筑**，点下去会开出一个完全正常、却不相干的面板。
+
+        ## ⚠️⚠️ 逐个试，让「面板标题」裁决
+
+        识别器交回来的是**候选**不是答案（理由整段在
+        `vision.optional.stargate_locator`：闭运算核没有一个值同时对两帧，
+        在两帧上调一个核就是过拟合）。所以这里照回收读数那条路子办 ——
+        出候选、让一个外部事实挑：点下去标题是不是「星门」。
+
+        实测两帧里真值都排第 1，候选总共 2–3 个，所以这个循环几乎总是一次就中。
+        """
+        from evo_helper.vision.optional.stargate_locator import stargate_candidates
+
+        candidates = stargate_candidates(self._driver.capture())
+        if not candidates:
+            self._dump_frame("stargate-not-on-surface", PANEL_TITLE_ROI)
+            say("  星门：地表上没找到星门（青蓝的环一个都没有）；停止")
+            return False
+        say(f"  星门：地表上找到 {len(candidates)} 个候选 {candidates[: self.STARGATE_MAX_TRIES]}")
+        for index, spot in enumerate(candidates[: self.STARGATE_MAX_TRIES]):
+            # ⚠️ **点底座，不点环。** 识别器交的是环心，而环是个发光特效、点不动；
+            # 建筑的可点区在它脚下那块平台上（整段在 ）。
+            target = (spot[0], spot[1] + pirate_ui.STARGATE_BASE_OFFSET_Y)
+            self._driver.click(*target, label="星门建筑")
+            self._driver.wait(DISPATCH_WAIT_S)
+            if self._settle(lambda: "星门" in self._panel_title()):
+                say(f"  星门：第 {index + 1} 个候选 {spot} → 点 {target} 开出来了")
+                return True
+            say(f"  星门：第 {index + 1} 个候选 {spot} → 点 {target} 开出来的不是星门；退回去再试")
+            # 点空时什么都没开，这几下落在恒星系/地表上无害（同 `_leave_stargate`）；
+            # 点开了别的建筑时，正是靠这几下把它关掉。
+            self._leave_stargate()
+        self._dump_frame("stargate-panel-unrecognised", PANEL_TITLE_ROI)
+        say(f"  星门：{len(candidates)} 个候选都不是星门；停止而不是继续盲点")
+        return False
+
+    def _on_stargate_panel(self) -> bool:
+        """在不在矮星系统面板上。
+
+        判据取**「今日剩余攻击次数」那一行标签**，不取页面标题：标题那一格写的是
+        「矮星系统」，而同样四个字在上一屏的菜单里也有；这行标签只在这一页上出现，
+        实测 3× 与 4×+二值化都读得出来。
+        """
+        text = self._read(pirate_ui.STARGATE_PANEL_LABEL_ROI)
+        return pirate_ui.STARGATE_PANEL_LABEL_KEYWORD in text.replace(" ", "")
+
+    def _stargate_quota(self) -> tuple[int, int] | None:
+        """游戏说的 `(今天还剩几次, 一天总共几次)`。读不出交回 `None`（**不猜**）。
+
+        ⚠️ **两个数都要**。只取「剩余」的话就算不出「今天已经打过几次」，
+        而那正是我们自己那条 3 次上限唯一的依据 —— 已用 = 总数 − 剩余。
+        自己另记一份的下场见 `attack_stargate` 的 docstring。
+
+        逐个配方试到第一个解析得出的为止，和别处窄 ROI 的路子一样。
+        """
+        for upscale, threshold in STARGATE_QUOTA_RECIPES:
+            text = self._read(pirate_ui.STARGATE_QUOTA_ROI, upscale=upscale, threshold=threshold)
+            match = STARGATE_QUOTA_RE.search(text)
+            if match is not None:
+                return int(match.group(1)), int(match.group(2))
+        return None
+
+    def _launch_stargate(self) -> int:
+        """派遣页 → 选预设 → 绿✓ → 简报 → 出发。派出去返回 1，没派成返回 0。
+
+        ⚠️ **刻意与 `attack()` 走同样的几下**（`PresetPicker` → `DISPATCH_CONFIRM`
+        → `_briefing_mission` → `BRIEFING_LAUNCH_BUTTON`）：2026-09-13 实机核对过，
+        星门的派遣页与常规攻击页**像素级吻合**，各写一份只会让两条路慢慢分家。
+        """
+        # ⚠️ **必须排在展开预设条之前。** `PRESET_TOGGLE` 就坐在起点那一行的右端，
+        # 条一展开就把起点整个盖住（同 `attack()` 里那一条）。
+        #
+        # ⚠️⚠️ 而这道闸在星门这条路上尤其要紧：星门是**一座建筑**，只长在主球上，
+        # 站错星球时地表上那个坐标是**另一座建筑**。回读起点是唯一一处能发现这件事
+        # 的地方 —— 前面每一屏都会"正常"地开出来。
+        if not self._require_origin_before_dispatch(
+            self.STARGATE_ORIGIN, purpose=pirate_ui.DispatchPurpose.ATTACK
+        ):
+            say("  星门：派遣页的起点核不过；这一发不打")
+            self._leave_dispatch_list()
+            return 0
+
+        picker = PresetPicker(
+            driver=_PresetPickerDriver(self._driver), read_names=self._preset_names, say=say
+        )
+        try:
+            picker.pick(self.STARGATE_PRESET)
+        except PresetNotFound as error:
+            say(f"  星门：{error}；关掉面板，不打这一发")
+            self._dump_frame("stargate-preset-not-found")
+            self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
+            self._driver.wait(DISPATCH_WAIT_S)
+            self._navigator.invalidate()
+            return 0
+        self._driver.click(*pirate_ui.DISPATCH_CONFIRM, label="确认终点")
+        self._driver.wait(BRIEFING_WAIT_S)
+        shown = self._briefing_mission()
+        if shown != "攻击":
+            unread = "（读不出）"
+            say(f"  星门：简报写的是 {shown or unread}，不是攻击；不点出发")
+            self._dump_frame("stargate-briefing-unrecognised", pirate_ui.BRIEFING_MISSION_ROI)
+            self._driver.click(*pirate_ui.BRIEFING_BACK_BUTTON, label="返回")
+            self._driver.wait(LAUNCH_WAIT_S)
+            return 0
+        self._driver.click(*pirate_ui.BRIEFING_LAUNCH_BUTTON, label="出发")
+        self._driver.wait(LAUNCH_WAIT_S)
+        # ⚠️⚠️ **点完「出发！」不等于派出去了。** 这一条是 2026-09-13 实机打回来的：
+        # 上一发还在飞的时候游戏会把这一发挡下来，而第一版这里直接就报了「已派出」——
+        # 于是日志上凭空多出一发，配额账跟着错。常规 `_launch()` 早就写着同一句
+        # （「点完出发不等于派出去了」），这条路当时漏抄了。
+        if not self._handle_dialog(self.STARGATE_ORIGIN, purpose=pirate_ui.DispatchPurpose.ATTACK):
+            say("  星门：点了出发，但游戏弹窗把这一发挡下来了；没派出去")
+            self._leave_dispatch_list()
+            return 0
+        record_system_log(
+            "INFO",
+            "tools.pirate_loop",
+            f"星门：向矮星系统派出一发（预设 {self.STARGATE_PRESET}，"
+            f"出发星球 {self.STARGATE_ORIGIN}）",
+            payload={"preset": self.STARGATE_PRESET, "origin": str(self.STARGATE_ORIGIN)},
+        )
+        say("  星门：已派出一发矮星系统攻击")
+        self._leave_dispatch_list()
+        return 1
+
+    def _leave_stargate(self) -> None:
+        """从星门那一串面板退回地表。**退不出去不抛**，下一步自己会认屏。"""
+        for _ in range(3):
+            if self._on_planet_surface():
+                return
+            self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭面板")
+            self._driver.wait(1.6)
+        self._navigator.invalidate()
 
     def _ingest_report(self, row: MailRow, page: Any) -> ReportIngest:
         """把详情页上这一封读成一条战报并入库。**子类按自己的战报格式覆盖。**

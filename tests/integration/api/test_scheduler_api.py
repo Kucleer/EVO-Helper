@@ -313,7 +313,13 @@ def test_every_task_is_listed_in_priority_order(console: Console) -> None:
     tasks = body["tasks"]
     assert isinstance(tasks, list)
 
-    assert sorted(item["kind"] for item in tasks) == ["BOT", "PIRATE", "RANKING", "SCAN"]
+    assert sorted(item["kind"] for item in tasks) == [
+        "BOT",
+        "PIRATE",
+        "RANKING",
+        "SCAN",
+        "STARGATE",
+    ]
     priorities = [item["priority"] for item in tasks]
     assert priorities == sorted(priorities)
 
@@ -446,7 +452,9 @@ def test_the_scan_priority_cannot_be_written(console: Console) -> None:
     tasks = console.get()["tasks"]
     assert isinstance(tasks, list)
     # 填空隙的两种都结构性地排在最后，它们之间再按 priority（SCAN 2 < RANKING 3）。
-    assert [item["kind"] for item in tasks[-2:]] == ["SCAN", "RANKING"]
+    # ⚠️ 意图不变：**填空隙那几种排在最后**（`domain.scheduler.GAP_FILLERS`）。
+    # 2026-09-13 起它们是三种：扫描 2 < 军力榜 3 < 星门 9。
+    assert [item["kind"] for item in tasks[-3:]] == ["SCAN", "RANKING", "STARGATE"]
 
 
 def test_the_scan_row_can_still_be_switched_off(console: Console) -> None:
