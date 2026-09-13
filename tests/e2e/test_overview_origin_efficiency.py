@@ -25,10 +25,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from evo_helper.application.mission_freeze import MissionFreezeLog
 from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
+from evo_helper.domain.battle_outcome import OUTCOME_RECYCLE
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.origin_efficiency import LOW_RECOVERY_THRESHOLD
 from evo_helper.domain.overview import BASIC_SLOTS, RARE_SLOTS
+from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage import origin_efficiency as storage_origin_efficiency
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
@@ -161,6 +163,7 @@ def _dispatch(
     origin: Coordinate,
     dispatched_at_utc: datetime,
     line_free_at_utc: datetime | None = None,
+    kind: str = MISSION_KIND_ATTACK,
 ) -> UUID:
     global _CYCLE
     _CYCLE += timedelta(seconds=1)
@@ -192,6 +195,7 @@ def _dispatch(
                 dispatched_at_utc=dispatched_at_utc,
                 accepted=True,
                 line_free_at_utc=line_free_at_utc,
+                mission_kind=kind,
             )
         )
         session.commit()
@@ -204,6 +208,7 @@ def _report(
     reported_at_utc: datetime,
     dispatch_id: UUID,
     resources: tuple[tuple[int, int], ...] = (),
+    outcome: str | None = None,
 ) -> None:
     report_id = uuid4()
     with factory() as session:
@@ -218,6 +223,7 @@ def _report(
                 defender_target_system=140,
                 defender_target_position=9,
                 dispatch_id=dispatch_id,
+                outcome=outcome,
             )
         )
         session.flush()
@@ -351,8 +357,14 @@ def test_the_basic_three_never_reach_the_numerator(
     factory: sessionmaker[Session],
     run_id: UUID,
 ) -> None:
-    """⚠️ 金属/晶体/气体由我方货舱容量决定、与目标无关，掺进来会让「预设大的
-    星球」无脑领先。这一发另收了三样基础各 720,000，页面上一格都不许多。
+    """⚠️⚠️ 基础三样由我方货舱容量决定、与目标无关，掺进分子会让「预设大的
+    星球」无脑领先。
+
+    ⚠️ **2026-09-13 之后它们出现在表里了**（各自一列），所以这一条不能再靠
+    「页面上一格都不许多」来判——那个判据现在会把「正确显示了收入」也判成错。
+    改判**分子**：「稀有三样」那一格、以及右边两个效率数，必须只由稀有那 1,000
+    算出来。这一发另收了三样基础各 720,000，合起来 2,161,000——
+    那个和**一次都不许出现**，出现就说明它们混进了分子。
     """
     _configure(repository)
     dispatch = _dispatch(factory, run_id, origin=EARLY, dispatched_at_utc=DAY + timedelta(hours=1))
@@ -364,10 +376,65 @@ def test_the_basic_three_never_reach_the_numerator(
     )
 
     html = _fragment(client)
+    cells = _cells(html, EARLY)
 
-    assert "1,000" in _cells(html, EARLY)
-    assert "720,000" not in html
+    assert "1,000" in cells
+    # ⚠️ 合计一次都不许出现：它是「基础三样混进了稀有那一格」唯一的可观察症状。
     assert "2,161,000" not in html
+    # 「每线」= 1,000 ÷ EARLY_LINES，分子里没有那三样。
+    # ⚠️ **右边那两个效率数必须仍然只由稀有那 1,000 算出来。**
+    # 「每线」= 1,000 ÷ 1 条（那一天线数没有真值，取下界，所以带「≤」）；
+    # 「每线小时」= 再 ÷ 20 小时在岗 = 50。基础三样但凡漏进分子，
+    # 这两个数会分别变成 2,161,000 和 108,050。
+    assert cells[-2].endswith("1,000")
+    assert cells[-1].endswith("50")
+    # 反过来：那三样确实**显示**出来了，各自一格。
+    assert cells.count("720,000") == len(BASIC_SLOTS)
+
+
+def test_the_basic_columns_separate_what_the_recycling_brought_back(
+    client: TestClient,
+    repository: SqlAlchemyRepository,
+    factory: sessionmaker[Session],
+    run_id: UUID,
+) -> None:
+    """⚠️ 那三格是**攻击 + 回收的合计**，`title` 里把两份分开写
+    （用户口径 2026-09-13，原话记在 `domain.overview.BASIC_SLOTS` 上）。
+
+    ⚠️⚠️ **分开写这件事不能省。** 攻击捞回的这三样由我方货舱容量决定、与目标
+    无关（实测 2026-08-20，同一预设 6 条战报的变异系数 0.0001）；回收捞回来的
+    才是真正随目标变的收成。只给一个合计，这一列就退化成「这颗星球的货舱有多大」，
+    而用户看这一列正是为了判断回收那条链路值不值。
+
+    ⚠️ 两份必须**加起来正好等于合计**：攻击那一份是减出来的，不另查一趟。
+    """
+    _configure(repository)
+    attack = _dispatch(factory, run_id, origin=EARLY, dispatched_at_utc=DAY + timedelta(hours=1))
+    _report(
+        factory,
+        reported_at_utc=DAY + timedelta(hours=2),
+        dispatch_id=attack,
+        resources=((BASIC_SLOTS[0], 400_000),),
+    )
+    recycle = _dispatch(
+        factory,
+        run_id,
+        origin=EARLY,
+        dispatched_at_utc=DAY + timedelta(hours=3),
+        kind=MISSION_KIND_RECYCLE,
+    )
+    _report(
+        factory,
+        reported_at_utc=DAY + timedelta(hours=4),
+        dispatch_id=recycle,
+        resources=((BASIC_SLOTS[0], 1_600_000),),
+        outcome=OUTCOME_RECYCLE,
+    )
+
+    html = _fragment(client)
+
+    assert "2,000,000" in _cells(html, EARLY)
+    assert 'title="攻击 400,000 · 回收 1,600,000' in html
 
 
 def test_the_rare_labels_come_from_the_slot_table(
@@ -395,12 +462,16 @@ def test_neither_the_query_nor_the_template_carries_a_second_copy_of_the_slots(
     template = _TEMPLATE.read_text(encoding="utf-8")
     for text in (sql, template):
         assert "(5, 8, 9)" not in text
+        assert "(0, 1, 2)" not in text
         for slot in RARE_SLOTS + BASIC_SLOTS:
             assert slot_label(slot) not in text
-    # 反过来：查询必须真的引用那一份常量，而模板里的名字必须是服务端翻译好送来的。
+    # 反过来：查询必须真的引用那两份常量，而模板里的名字必须是服务端翻译好送来的。
     assert "RARE_SLOTS" in sql
+    assert "BASIC_SLOTS" in sql
     assert "rare_labels" in template
     assert "basic_labels" in template
+    # ⚠️ 基础三样那几列的列名同样走服务端翻译（`cell.label`），不是模板里写死的。
+    assert "cell.label" in template
 
 
 # -- 回收率与「不可信」 ---------------------------------------------------------
@@ -438,6 +509,9 @@ def test_the_recovery_column_sits_next_to_the_efficiency_columns(
         "回收",
         "回收率",
         "稀有三样",
+        # ⚠️ 2026-09-13 加的基础三样，摆在稀有右边、「航线」左边
+        # （用户口径记在 `domain.overview.BASIC_SLOTS` 上）。
+        *[slot_label(slot) for slot in BASIC_SLOTS],
         "航线",
         "在岗",
         "每线",

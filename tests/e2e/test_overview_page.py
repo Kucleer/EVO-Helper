@@ -24,7 +24,7 @@ from evo_helper.application.mission_scheduler import MissionScheduler
 from evo_helper.application.mission_supervisor import MissionSupervisor
 from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.models import Coordinate
-from evo_helper.domain.overview import BASIC_SLOTS
+from evo_helper.domain.overview import BASIC_SLOTS, RARE_SLOTS
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.domain.scheduler import MissionKind
 from evo_helper.storage.database import Base, create_database_engine, create_session_factory
@@ -843,10 +843,15 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
     ⚠️ 列名 2026-09-11 改过一轮：「读回战报」→「攻击战报」、
     「回收率」→「战报回收率」（那个词被残骸回收抢了），并新增「攻击」
     「回收」「回收率」三列、删掉「残骸趟数」「残骸占线」。
+
+    ⚠️ 2026-09-13 又加了**基础三样**三列（用户口径记在
+    `domain.overview.BASIC_SLOTS` 上），摆在稀有三样右边、「挂机」左边。
     """
     html = client.get("/overview").text
     columns = _period_headers(html)
 
+    rare = [slot_label(slot) for slot in RARE_SLOTS]
+    basic = [slot_label(slot) for slot in BASIC_SLOTS]
     assert columns == [
         "周期",
         "派遣",
@@ -855,15 +860,17 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
         "战报回收率",
         "回收",
         "回收率",
-        "合金碎片",
-        "泰坦立方",
-        "收割者碎片",
+        *rare,
+        *basic,
         "挂机",
         "利用率",
     ]
     # 并排，不是分在两张表里。
-    assert columns.index("攻击战报") < columns.index("合金碎片")
-    assert columns.index("战报回收率") < columns.index("合金碎片")
+    assert columns.index("攻击战报") < columns.index(rare[0])
+    assert columns.index("战报回收率") < columns.index(rare[0])
+    # ⚠️ 基础三样**挨在稀有三样后面**：两组都是「这段时间收了什么」，拆开摆的话
+    # 中间隔着的那几列会让人以为它们是两类不同的东西。
+    assert columns.index(rare[-1]) + 1 == columns.index(basic[0])
     # ⚠️ 派遣 = 攻击 + 回收，三个数要挨着，读的人才看得出它们是一组。
     assert columns.index("派遣") + 1 == columns.index("攻击")
     assert columns.index("回收") + 1 == columns.index("回收率")

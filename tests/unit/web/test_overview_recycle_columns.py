@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from evo_helper.domain.overview import (
+    BASIC_SLOTS,
     RARE_SLOTS,
     RECYCLE_STATS_START_UTC,
     SLOT_FLYING,
@@ -147,37 +148,64 @@ def test_the_start_line_separates_no_feature_from_a_real_zero() -> None:
 # -- 写死的 colspan --------------------------------------------------------------
 
 
-def _column_count(name: str, *, rare_is_a_loop: bool) -> tuple[int, int]:
+#: 表头里那些**会在运行时展开**的 `<th>`：模板里写一个，渲染出 `len(slots)` 个。
+#:
+#: ⚠️⚠️ **新增一组按槽位展开的列，必须往这里加一行。** 不加的话下面那条用例
+#: 会拿一个偏小的列数去比 colspan，于是**真正写对了的 colspan 反而报红**——
+#: 一条守着列数的用例自己算错列数，比没有这条用例更难查。
+#: 2026-09-13 加基础三样那一列时就是这么发现的：原先的写法把「展开不展开」
+#: 做成了一个调用方传进来的布尔量，而那是模板自己的事实，两处必然分家。
+SLOT_LOOPS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("rare", RARE_SLOTS),
+    ("basics", BASIC_SLOTS),
+)
+
+
+def _column_count(name: str) -> tuple[int, int]:
     """(运行时真实列数, 模板里写死的 colspan)。
 
-    ⚠️ 两张表的「稀有」列不一样，**不许拿同一个公式套**：
-    周期统计那张是 `{% for cell in rows[0].rare %}`，一个 `<th>` 在运行时展开成
-    `len(RARE_SLOTS)` 列；星球效率那张只有**一列合计**，不展开。
+    ⚠️ **「这一列展不展开」由模板自己说了算，不由调用方传。** 两张表长得不一样：
+    周期统计那张的稀有列是 `{% for cell in ... .rare %}`，一个 `<th>` 展开成
+    `len(RARE_SLOTS)` 列；星球效率那张的稀有只有**一列合计**，不展开；
+    而 2026-09-13 之后两张表都有一个展开的 `basics` 循环。所以这里直接从
+    `<thead>` 的源码上认循环，认出一个就把那一个 `<th>` 记成 `len(slots)` 列。
     """
     html = (TEMPLATES / name).read_text(encoding="utf-8")
-    headers = len(re.findall(r'<th scope="col"', html))
-    columns = headers - 1 + len(RARE_SLOTS) if rare_is_a_loop else headers
+    # ⚠️ 只看 `<thead>`：表体里同名的循环是**格子**不是列，数进来会翻倍。
+    head = html.split("</thead>")[0]
+    columns = len(re.findall(r'<th scope="col"', head))
+    for attr, slots in SLOT_LOOPS:
+        if re.search(rf"{{%\s*for cell in \([^)]*\.{attr}\b", head):
+            columns += len(slots) - 1
     spans = {int(value) for value in re.findall(r'colspan="(\d+)"', html)}
     assert len(spans) == 1, f"{name} 里有不止一个 colspan：{spans}"
     return columns, spans.pop()
 
 
-@pytest.mark.parametrize(
-    ("template", "rare_is_a_loop"),
-    [("_overview_periods.html", True), ("_overview_origins.html", False)],
-)
-def test_the_hardcoded_colspan_matches_the_real_column_count(
-    template: str, rare_is_a_loop: bool
-) -> None:
+@pytest.mark.parametrize("template", ["_overview_periods.html", "_overview_origins.html"])
+def test_the_hardcoded_colspan_matches_the_real_column_count(template: str) -> None:
     """⚠️ 两张表的 `colspan` 都是**写死的**，加减列很容易漏改。
 
     漏改不会报错，只会让「这一档没有数据」那一行的底色少铺或多铺几列——
-    而那正是数据为空时唯一会显示的东西。这次改动一次加了 3 列、删了 2 列，
-    两张表都动了，正是最容易漏的时候。
+    而那正是数据为空时唯一会显示的东西。
     """
-    columns, colspan = _column_count(template, rare_is_a_loop=rare_is_a_loop)
+    columns, colspan = _column_count(template)
 
     assert colspan == columns, f"{template}: 实际 {columns} 列，colspan 写的是 {colspan}"
+
+
+@pytest.mark.parametrize("template", ["_overview_periods.html", "_overview_origins.html"])
+def test_both_tables_show_the_basic_three(template: str) -> None:
+    """⚠️ 用户口径 2026-09-13（原话在 `domain.overview.BASIC_SLOTS` 上）：
+    **两张表**都要有基础三样，攻击与回收都算进去。
+
+    只改一张是这次最容易犯的错——两张表的列几乎一一对应，改完一张很像已经做完了。
+    """
+    head = (TEMPLATES / template).read_text(encoding="utf-8").split("</thead>")[0]
+
+    assert re.search(r"{%\s*for cell in \([^)]*\.basics\b", head), (
+        f"{template} 的表头里没有基础三样那一组列"
+    )
 
 
 # -- 模板里那个分支写法 -----------------------------------------------------------

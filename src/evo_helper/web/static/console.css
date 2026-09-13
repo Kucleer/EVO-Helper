@@ -40,7 +40,11 @@
 
   --radius: 6px;
   --gap: 16px;
-  --nav-w: 208px;
+  /* 导航栏宽度。⚠️ **208px → 150px（用户口径 2026-09-13：「左侧的菜单也可以压缩
+     宽度」）。** 下限由两样东西定，再收就要动它们：最长的条目是四个汉字
+     （「数据概览」≈ 52px）、`.brand` 那行 `EVO HELPER` 带 0.14em 字距 ≈ 98px，
+     两边各留 14px 内边距。收窄腾出来的 58px 直接进了右边那两张宽表。 */
+  --nav-w: 150px;
   --topbar-h: 52px;
 
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
@@ -75,13 +79,13 @@ body {
   letter-spacing: 0.14em;
   font-size: 13px;
   color: var(--accent);
-  padding: 0 20px 18px;
+  padding: 0 14px 18px;
 }
 
 .sidenav a {
   color: var(--text-muted);
   text-decoration: none;
-  padding: 9px 20px;
+  padding: 9px 14px;
   border-left: 2px solid transparent;
   display: flex;
   gap: 10px;
@@ -101,7 +105,7 @@ body {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  padding: 16px 20px 6px;
+  padding: 16px 14px 6px;
 }
 
 .main { display: flex; flex-direction: column; min-width: 0; }
@@ -1135,26 +1139,69 @@ tr:hover .log-line {
 .overview-tab:hover { border-color: var(--accent); color: var(--text); }
 .overview-tab.on { color: #06202a; background: var(--accent); border-color: var(--accent); font-weight: 600; }
 
+/* 概览页那两张宽表（周期统计 / 按星球效率）。
+   2026-09-13 各加了基础三样三列，两张都是 15 列。实测 1500px 视口下还放得下
+   （表宽 1273 / 1288），但窗口再窄一点就会溢出。用户口径同日：「尽量左右滑动，
+   让列表更紧凑即可」——所以这里只做两件事：①行高与字号收紧；②首列冻结，
+   横向滚动时「是哪个周期/哪颗星球」不会跟着滚没。
+   横向滚动本身由 `.table-wrap` 的 `overflow: auto` 提供，不用再加。
+
+   ⚠️ 别把这一段推广到别的表：`.overview-grid-three` 那四张卡上写着
+   「用户 2026-08-26：我不要左右拖拽」，那是另一个地方、另一条口径。 */
 .overview-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .overview-table th, .overview-table td {
-  padding: 6px 9px;
+  padding: 5px 7px;
   text-align: right;
   border-bottom: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 .overview-table thead th {
   color: var(--text-muted);
   font-weight: 500;
   font-size: 11px;
   border-bottom: 1px solid var(--border-strong);
+  /* ⚠️ 压过冻结的首列（下面那条给了 2）。通用 `th` 规则只给到 1，照那个数，
+     纵向滚动时行首那一格会盖住表头 —— 两个都是 `position: sticky`，谁的
+     `z-index` 大谁在上面。 */
+  z-index: 3;
 }
-.overview-table th:first-child, .overview-table td:first-child { text-align: left; }
-.overview-table tbody th { font-weight: 500; }
+/* 首列冻结。⚠️ **背景必须是不透明的**：这一格浮在其余单元格上面，透明的话
+   横向滚动时右边的数字会从它底下透出来，读成一串叠字。
+
+   ⚠️ `z-index` 分三层，纵横同时滚时三者两两都会重叠，缺一层就有一处盖错：
+   普通格（无）< 冻结的首列 2 < 表头 3 < 左上角那一格 4。 */
+.overview-table th:first-child, .overview-table td:first-child {
+  text-align: left;
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--bg-panel);
+}
+.overview-table thead th:first-child { z-index: 4; }
+/* ⚠️ 行首那一格是 `<th scope="row">`，于是通用 `th` 规则（表头那条）顺带给了它
+   `position: sticky; top: 0` —— 那是给**表头**写的。上面那条冻结规则把它的
+   `z-index` 抬到 2 之后这件事才显形：纵向滚动时每一行的行名会依次钉在容器顶上、
+   叠成一摞。这一列只该**横向**冻结，所以在这里把纵向那一半解掉。 */
+.overview-table tbody th { font-weight: 500; top: auto; }
 .overview-table tbody tr:last-child td, .overview-table tbody tr:last-child th { border-bottom: none; }
 .overview-table .overview-total th, .overview-table .overview-total td {
   background: var(--bg-panel-raised);
   font-weight: 600;
 }
+/* ⚠️ 高亮行的首列要**重申**一次背景：上面那条冻结规则把 `--bg-panel` 钉死在
+   `td:first-child` 上，选择器还更具体，不写这一条的话合计行/第一名那一行的首列
+   会是唯一一格没跟着高亮的。 */
+.overview-table .overview-total th:first-child,
+.overview-table .overview-total td:first-child { background: var(--bg-panel-raised); }
+
+/* 基础三样那三列（`domain.overview.BASIC_SLOTS`，2026-09-13 加）。
+   ⚠️ **只做分组提示，不做强调**：它们不进任何效率指标（页脚那段说明写着为什么），
+   染得比「稀有三样」还显眼会把读者的眼睛引到一个不参与排名的数上。
+   一道左边框标出组的起点——`:first-of-type` 在这里不管用（同一行里 `col-basic`
+   前面还有别的 `td`），所以由模板在三格上都挂类，靠相邻兄弟选择器挑出第一格。 */
+.overview-table td:not(.col-basic) + td.col-basic,
+.overview-table th:not(.col-basic) + th.col-basic { border-left: 1px solid var(--border-strong); }
 
 /* 「此刻」区那四张卡（未读战报 / 候选池按星系 / 星系质量 / 各银河新鲜读数）。
    ⚠️ **下限从 250px 收到 210px**：四张要塞进一行，250 的话 1440 上就折了。

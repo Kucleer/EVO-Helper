@@ -32,13 +32,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Integer, cast, func, or_, select
+from sqlalchemy import Integer, case, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from evo_helper.domain.battle_outcome import OUTCOME_PROTECTED, OUTCOME_RECYCLE
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.origin_efficiency import OriginDay
-from evo_helper.domain.overview import RARE_SLOTS, Occupancy, occupancy_end
+from evo_helper.domain.overview import BASIC_SLOTS, RARE_SLOTS, Occupancy, occupancy_end
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
 from evo_helper.storage import models as orm
 
@@ -48,6 +48,25 @@ class _Rare:
     amount: int
     approximate: bool
     uncertainty: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Basic:
+    """一颗星球当天的基础三样，**每格一个**（合计 + 其中回收那一份）。
+
+    ⚠️ 和 `_Rare` 不一样，这里**不合并成一个数**：三格之间差着两个数量级
+    （最大的那格是千万级、最小的是十万级），加起来那个数没有意义
+    （同 `domain.overview.BASIC_SLOTS` 上「量纲都不一样」那一段）。
+    """
+
+    #: 槽位 → 合计（攻击 + 回收）。
+    amounts: dict[int, int]
+    #: 槽位 → 上面那个合计里回收捞回来的那一份。
+    recycled: dict[int, int]
+    #: 槽位 → 这一格有没有近似读数。
+    approximate: dict[int, bool]
+    #: 槽位 → 最大绝对误差（逐份相加）。
+    uncertainty: dict[int, int]
 
 
 class OriginEfficiencyRepository:
@@ -68,7 +87,9 @@ class OriginEfficiencyRepository:
         with self._session_factory() as session:
             counts = self._counts(session, start=start, end=end)
             rare = self._rare(session, start=start, end=end)
+            basic = self._basic(session, start=start, end=end)
         empty = _Rare(amount=0, approximate=False, uncertainty=0)
+        blank = _Basic(amounts={}, recycled={}, approximate={}, uncertainty={})
         return tuple(
             OriginDay(
                 origin=origin,
@@ -79,6 +100,10 @@ class OriginEfficiencyRepository:
                 rare_amount=(haul := rare.get(origin, empty)).amount,
                 rare_approximate=haul.approximate,
                 rare_uncertainty=haul.uncertainty,
+                basic_amounts=_slots((cargo := basic.get(origin, blank)).amounts),
+                basic_recycled=_slots(cargo.recycled),
+                basic_approximate=tuple(bool(cargo.approximate.get(slot)) for slot in BASIC_SLOTS),
+                basic_uncertainty=_slots(cargo.uncertainty),
                 first_dispatch_at_utc=first,
                 last_dispatch_at_utc=last,
             )
@@ -274,6 +299,108 @@ class OriginEfficiencyRepository:
             )
             for row in rows
         }
+
+    @staticmethod
+    def _basic(session: Session, *, start: datetime, end: datetime) -> dict[Coordinate, _Basic]:
+        """每颗星球当天派出去的那些发次，基础三样各收回来多少（攻击 + 回收）。
+
+        用户口径 2026-09-13，原话记在 `domain.overview.BASIC_SLOTS` 上
+        （⚠️ 不抄过来：那句话里带着三样的名字，而名字只许有一份）。
+
+        ⚠️⚠️ **这一趟和 `_rare` 是两件事，不许合并，也不许拿它去改效率指标。**
+        `_rare` 那一趟的注释里写着为什么基础三样绝不能进「每线小时」：攻击捞回的
+        这三样由**我方货舱容量**决定、与目标无关（实测 2026-08-20，同一预设 6 条
+        战报的变异系数 0.0001），掺进去会让预设大的星球无脑领先。这一趟只把收入
+        **摆出来看**，`domain.origin_efficiency` 里的 `per_line` / `per_line_hour`
+        一个字都没动。
+
+        ⚠️ **回收那一份要单独数出来。** 残骸回收捞回来的**只有**这三格
+        （`domain.recycle_mail.RECYCLE_SLOTS`），而它才是真正随目标变的收成——
+        和容量决定的那一份混成一个数，这一列就退化成「这颗星球的货舱有多大」。
+
+        ⚠️ **按槽位分开存，不求和。** 三格之间差着两个数量级，加起来那个数
+        没有意义（理由同 `domain.overview.BASIC_SLOTS`）。
+
+        归属同全表：按 `AttackDispatchRow.dispatched_at_utc` 切的**派出日**，
+        不是战报时刻——回收报告是隔一两个小时才读回来的，按战报时刻切会让
+        跨零点那几发记到第二天。
+        """
+        rows = session.execute(
+            select(
+                orm.AttackIntentRow.origin_galaxy,
+                orm.AttackIntentRow.origin_system,
+                orm.AttackIntentRow.origin_position,
+                orm.BattleReportResourceRow.slot,
+                func.sum(orm.BattleReportResourceRow.amount).label("amount"),
+                func.sum(
+                    case(
+                        (
+                            orm.BattleReportRow.outcome == OUTCOME_RECYCLE,
+                            orm.BattleReportResourceRow.amount,
+                        ),
+                        else_=0,
+                    )
+                ).label("recycled"),
+                func.max(cast(orm.BattleReportResourceRow.approximate, Integer)).label(
+                    "approximate"
+                ),
+                func.sum(orm.BattleReportResourceRow.uncertainty).label("uncertainty"),
+            )
+            .select_from(orm.BattleReportResourceRow)
+            .join(
+                orm.BattleReportRow,
+                orm.BattleReportRow.id == orm.BattleReportResourceRow.report_id,
+            )
+            .join(
+                orm.AttackDispatchRow,
+                orm.AttackDispatchRow.id == orm.BattleReportRow.dispatch_id,
+            )
+            .join(orm.AttackIntentRow, orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id)
+            .where(
+                orm.BattleReportResourceRow.slot.in_(BASIC_SLOTS),
+                orm.AttackDispatchRow.accepted.is_(True),
+                orm.AttackDispatchRow.dispatched_at_utc >= start,
+                orm.AttackDispatchRow.dispatched_at_utc < end,
+            )
+            .group_by(
+                orm.AttackIntentRow.origin_galaxy,
+                orm.AttackIntentRow.origin_system,
+                orm.AttackIntentRow.origin_position,
+                orm.BattleReportResourceRow.slot,
+            )
+        ).all()
+        amounts: dict[Coordinate, dict[int, int]] = defaultdict(dict)
+        recycled: dict[Coordinate, dict[int, int]] = defaultdict(dict)
+        approximate: dict[Coordinate, dict[int, bool]] = defaultdict(dict)
+        uncertainty: dict[Coordinate, dict[int, int]] = defaultdict(dict)
+        for row in rows:
+            origin = Coordinate(
+                int(row.origin_galaxy), int(row.origin_system), int(row.origin_position)
+            )
+            slot = int(row.slot)
+            amounts[origin][slot] = int(row.amount or 0)
+            recycled[origin][slot] = int(row.recycled or 0)
+            approximate[origin][slot] = bool(row.approximate)
+            uncertainty[origin][slot] = int(row.uncertainty or 0)
+        return {
+            origin: _Basic(
+                amounts=amounts[origin],
+                recycled=recycled[origin],
+                approximate=approximate[origin],
+                uncertainty=uncertainty[origin],
+            )
+            for origin in amounts
+        }
+
+
+def _slots(values: dict[int, int]) -> tuple[int, ...]:
+    """按 `BASIC_SLOTS` 的顺序摆成一条，缺的那格给 0。
+
+    ⚠️ **顺序由 `BASIC_SLOTS` 定，这里不许另写一份槽位号**：
+    `domain.battle_resources.SLOT_LABELS` 的顺序与游戏「太空舱」页并不一致，
+    抄第二份出去，对不上的症状是「数字全对、只是安在了别的资源名下」。
+    """
+    return tuple(values.get(slot, 0) for slot in BASIC_SLOTS)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

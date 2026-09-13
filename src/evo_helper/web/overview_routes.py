@@ -219,6 +219,27 @@ class ResourceCell:
     approximate: bool
     #: 最大绝对误差（逐份战报相加，见 `storage.overview.ResourceTotal`）。
     uncertainty: int = 0
+    #: `amount` 里**残骸回收**那一份（见 `storage.overview.ResourceTotal.recycled`）。
+    #: 稀有三样这一格恒为 0：回收报告只写 0/1/2 三格。
+    recycled: int = 0
+
+    @property
+    def attacked(self) -> int:
+        """`amount` 里攻击捞回来的那一份。
+
+        ⚠️ **减出来的，不是另查的。** 两份加起来必须正好等于摆在页面上的合计——
+        各查一趟的话，两趟之间入了一份战报，页面上就会出现「攻击 + 回收 ≠ 合计」。
+        """
+        return self.amount - self.recycled
+
+    @property
+    def source_hint(self) -> str:
+        """鼠标停上去那句：这个合计里攻击与回收各占多少。
+
+        ⚠️ **这一句只对基础三样有意义。** 稀有三样的 `recycled` 恒为 0，
+        那时这句话读起来就是「回收 0」——所以调用方（模板）只在基础三样那几列上挂它。
+        """
+        return f"攻击 {self.attacked:,} · 回收 {self.recycled:,}"
 
     @property
     def text(self) -> str:
@@ -335,6 +356,15 @@ class PeriodRow:
     #: 「没数据」，正好把故障藏起来（同 `uptime_hours` 那一列的道理）。
     recycle_before_start: bool
     rare: tuple[ResourceCell, ...]
+    #: 基础三样（`BASIC_SLOTS`），**攻击与回收合计**，各列的
+    #: `ResourceCell.recycled` 里带着回收那一份（用户口径 2026-09-13，
+    #: 原话记在 `domain.overview.BASIC_SLOTS` 上）。
+    #:
+    #: ⚠️ **它们不进任何效率指标。** 攻击捞回的这三样由我方货舱容量决定、
+    #: 与目标无关，掺进「每线小时」会让预设大的星球无脑领先
+    #: （判据与理由在 `storage.origin_efficiency._rare` 上）。这里只是把收入
+    #: 摆出来看，不参与排名。
+    basics: tuple[ResourceCell, ...]
     utilisation: float | None
     #: 分母按几条航线算。
     lines: int
@@ -360,6 +390,9 @@ class PeriodRow:
             self.dispatches == 0
             and self.reports == 0
             and all(cell.amount == 0 for cell in self.rare)
+            # ⚠️ 基础三样也要判：回收报告**只**写这三格，一段里「只有回收捞回来的
+            # 资源」时不带这一条就会被当成空行砍掉（同上面那个旧洞，方向一样）。
+            and all(cell.amount == 0 for cell in self.basics)
         )
 
 
@@ -1073,6 +1106,7 @@ class _Haul:
                 amount=total.amount if total else 0,
                 approximate=bool(total and total.approximate),
                 uncertainty=total.uncertainty if total else 0,
+                recycled=total.recycled if total else 0,
             )
             for slot, total in ((slot, self.totals.get(slot)) for slot in slots)
         )
@@ -1115,7 +1149,12 @@ def build_period_rows(
         if end <= start:
             continue
         counts = repository.period_counts(start=start, end=end)
-        rare = _haul(repository, start=start, end=end).cells(RARE_SLOTS)
+        # ⚠️ **一趟查询取两组格子**，不要为 basics 再 `_haul` 一次：那是同一段窗口
+        # 的同一趟聚合，查两遍除了多一趟往返，还会在两趟之间入了一份战报时
+        # 让「稀有三样」和「基础三样」出自两个不同的时刻。
+        haul = _haul(repository, start=start, end=end)
+        rare = haul.cells(RARE_SLOTS)
+        basics = haul.cells(BASIC_SLOTS)
         capacity = _capacity(
             repository,
             start=start,
@@ -1137,6 +1176,7 @@ def build_period_rows(
                 # 按左界判会把它整格写成「—」，而那一格是有真数的。
                 recycle_before_start=end <= RECYCLE_STATS_START_UTC,
                 rare=rare,
+                basics=basics,
                 utilisation=capacity.utilisation,
                 lines=capacity.lines.lines,
                 lines_exact=capacity.lines.exact,
