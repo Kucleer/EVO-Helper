@@ -4065,12 +4065,17 @@ class PirateLoop:
     def attack_stargate(self, *, daily_cap: int | None = None) -> int:
         """从星门打矮星系统。**最多派一发**，派出去返回 1，没派返回 0。
 
-        ## ⚠️⚠️ 一次只能在飞一发
+        ## ⚠️⚠️ 一趟打完当天的份额
 
-        用户口径（2026-09-13）：「星门一次只能发出一发」。所以这个方法**不循环**——
-        「今天打三次」是靠调度器隔开来调三次做到的，不是在这里连打三发。
-        写成循环的话第二发要么被游戏拒掉、要么做出点我们没预料的事，
-        而两种都会在日志上表现成「打了三发」。
+        用户口径（2026-09-13，**当天改过一次**）：先说的是「星门一次只能发出一发」，
+        而实拍推翻了那个前提 —— 飞行中列表里拍到**同时有两发**矮星系统，游戏不拦。
+        用户据此改口径：「直接在 4 系，一发把 3 轮都打掉」。
+
+        所以这里**就地循环**，一趟把当天的份额打完，不再指望调度器隔开来调三次。
+
+        ⚠️ **循环的条件是每一轮重读一次游戏那个数**，不是自己数到 3。
+        这样用户手动打过的那几发、上一趟打出去的那几发都自动算进来，
+        循环自己就停得住；而自己记的那份一定会在某次重启或某次手点之后和真相分家。
 
         ## ⚠️ 今天打过几次，问游戏，不自己记账
 
@@ -4100,91 +4105,43 @@ class PirateLoop:
         if cap <= 0:
             return 0
         self._open_for_stargate()
-        if self._stargate_already_flying():
-            say("  星门：已经有一发在飞（飞行中列表里有矮星系统）；这一趟不打")
-            return 0
-        if not self._open_stargate_target():
-            return 0
-        quota = self._stargate_quota()
-        if quota is None:
-            say("  星门：今日剩余次数读不出来；不猜，这一趟不打")
-            self._leave_stargate()
-            return 0
-        remaining, total = quota
-        used = max(0, total - remaining)
-        say(f"  星门：游戏说今天还剩 {remaining}/{total} 次（已用 {used}，我们的上限 {cap}）")
-        if remaining <= 0:
-            say("  星门：游戏说今天的次数已经用完了")
-            self._leave_stargate()
-            return 0
-        if used >= cap:
-            # ⚠️ 这一档和上面那档**必须分开说**：一个是游戏不让打了，
-            # 一个是我们自己收着不打。混成一句话，日后调高上限时没人知道该调哪儿。
-            say(f"  星门：今天已经打满我们自己的 {cap} 次；游戏那边还剩 {remaining} 次")
-            self._leave_stargate()
-            return 0
-        self._driver.click(*pirate_ui.STARGATE_DISPATCH_BUTTON, label="星门派遣")
-        self._driver.wait(DISPATCH_WAIT_S)
-        return self._launch_stargate()
-
-    def _stargate_already_flying(self) -> bool:
-        """飞行中列表里有没有一发正飞往矮星系统。读不出交回 `False`。
-
-        ## ⚠️ 为什么非要这道预检不可
-
-        用户口径（2026-09-13）：「星门一次只能发出一发」。而**每日次数那个读数
-        帮不上忙** —— 它数的是「今天派出过几发」，不是「现在有没有一发在飞」。
-        2026-09-13 实机：09:50 派出一发，10:17 那一趟读到「还剩 4/5」于是照打，
-        被游戏当场挡下（那一次也正好暴露了出发后没问弹窗这个 bug）。
-
-        ## ⚠️⚠️ 读不出时**往「在飞」那一侧倒**，也就是不打
-
-        第一版倒向「没在飞」，理由是「后面还有一道权威闸：真派的时候游戏自己会挡」。
-        **那个前提是错的** —— 2026-09-13 实机拍到飞行中列表里**同时有两发**
-        矮星系统（10:20 与 10:28 各一发），游戏根本没挡第二发。
-
-        所以「一次只能发出一发」这条口径只能由**我们自己**保证。读不出时宁可不打：
-        少打一发下一轮补得回来，多打一发收不回来。
-
-        ## ⚠️ 一行一读
-
-        取字函数恒用 `--psm 7`（单行）。整块读的话实测**恒为空字符串**，
-        而空字符串的意思正好是「没有矮星系统」—— 这道闸于是永远放行。
-        """
-        self._driver.click(*pirate_ui.NAV_FLEET, label="舰队")
-        self._driver.wait(DISPATCH_WAIT_S)
-        self._driver.click(*pirate_ui.DISPATCH_IN_FLIGHT_TAB, label="飞行中")
-        self._driver.wait(DISPATCH_WAIT_S)
-        rows = self._in_flight_destinations()
-        readable = [row for row in rows if row]
-        flying = any(pirate_ui.STARGATE_TARGET_NAME in row for row in readable)
-        if not readable:
-            # ⚠️ 一行都没读出来 ≠ 列表是空的。**当成「在飞」处理**，理由见 docstring。
-            say(f"  星门：飞行中列表一行都没读出来（读到 {rows}）；当成有在飞，这一趟不打")
-            self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
-            self._driver.wait(1.4)
-            self._navigator.invalidate()
-            return True
-        say(f"  星门：飞行中列表读到 {readable}；{'有' if flying else '没有'}矮星系统")
-        self._driver.click(*pirate_ui.DISPATCH_CLOSE, label="关闭派遣面板")
-        self._driver.wait(1.4)
-        # 派遣面板开过之后导航栏里是什么已经不可知了（同 `_leave_dispatch_list`）。
-        self._navigator.invalidate()
-        return flying
-
-    def _in_flight_destinations(self) -> list[str]:
-        """飞行中列表这一屏每条记录的目的地。读不出的那一行交回空串。
-
-        ⚠️ **一行一读**：取字函数恒用 `--psm 7`，整块读恒为空（整段在
-        `pirate_ui.IN_FLIGHT_DEST_X` 那几个常量上）。
-        """
-        left, right = pirate_ui.IN_FLIGHT_DEST_X
-        out: list[str] = []
-        for index in range(pirate_ui.IN_FLIGHT_VISIBLE_ROWS):
-            middle = pirate_ui.IN_FLIGHT_FIRST_ROW_Y + pirate_ui.IN_FLIGHT_ROW_PITCH * index
-            text = self._read((left, middle - 18, right, middle + 18), upscale=3)
-            out.append(text.strip().replace(" ", ""))
-        return out
+        sent = 0
+        # ⚠️ **循环次数硬性封顶。** 正常的出口是「重读配额发现已用够了」，
+        # 但万一那个数没跟着动（游戏改了扣减时机、或者读数漂了），没有这道上界
+        # 就会一直打下去 —— 而超打是收不回来的。
+        for _ in range(cap):
+            if not self._open_stargate_target():
+                break
+            quota = self._stargate_quota()
+            if quota is None:
+                say("  星门：今日剩余次数读不出来；不猜，不打了")
+                self._leave_stargate()
+                break
+            remaining, total = quota
+            used = max(0, total - remaining)
+            say(
+                f"  星门：游戏说今天还剩 {remaining}/{total} 次"
+                f"（已用 {used}，我们的上限 {cap}，这一趟已派 {sent} 发）"
+            )
+            if remaining <= 0:
+                say("  星门：游戏说今天的次数已经用完了")
+                self._leave_stargate()
+                break
+            if used >= cap:
+                # ⚠️ 这一档和上面那档**必须分开说**：一个是游戏不让打了，
+                # 一个是我们自己收着不打。混成一句话，日后调高上限时没人知道该调哪儿。
+                say(f"  星门：今天已经打满我们自己的 {cap} 次；游戏那边还剩 {remaining} 次")
+                self._leave_stargate()
+                break
+            self._driver.click(*pirate_ui.STARGATE_DISPATCH_BUTTON, label="星门派遣")
+            self._driver.wait(DISPATCH_WAIT_S)
+            got = self._launch_stargate()
+            if not got:
+                # 没派成（简报不对、预设找不着、或者游戏弹窗挡下）。**不重试**：
+                # 原因都写在日志里了，而在同一趟里硬顶回去只会把同一个错再演一遍。
+                break
+            sent += got
+        return sent
 
     def _open_for_stargate(self) -> None:
         """星门这一趟的开工三步。**和 `run()` 开头是同一组，不许少做。**

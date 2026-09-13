@@ -32,10 +32,12 @@ class _Loop:
         quota: tuple[int, int] | None,
         *,
         cap: int | None = None,
-        flying: bool = False,
+        decrements: bool = True,
     ) -> None:
         self.quota = quota
-        self.flying = flying
+        #: 真游戏**在派出那一刻就扣**这个数（2026-09-13 实测：10:20 派出后 4/5 → 3/5）。
+        #: 桩默认照做 —— 不照做的话这张表测的就不是循环条件，而是那道硬上界。
+        self.decrements = decrements
         self.opened = 0
         self.launched = 0
         self.left = 0
@@ -48,17 +50,25 @@ class _Loop:
     def _open_for_stargate(self) -> None:
         self.opened += 1
 
-    def _stargate_already_flying(self) -> bool:
-        return self.flying
-
     def _open_stargate_target(self) -> bool:
         return True
 
     def _stargate_quota(self) -> tuple[int, int] | None:
         return self.quota
 
+    #: ⚠️ 桩自己的熔断。没有它，「循环少了硬上界」这个 bug 的表现是**测试挂死**
+    #: 而不是变红 —— 挂死的用例在 CI 上只会超时，没人看得出是哪一条出的问题。
+    MAX_LAUNCHES = 10
+
     def _launch_stargate(self) -> int:
         self.launched += 1
+        if self.launched > self.MAX_LAUNCHES:
+            raise AssertionError(
+                f"派了 {self.launched} 发还没停 —— 循环没有硬上界，超打是收不回来的"
+            )
+        if self.decrements and self.quota is not None:
+            remaining, total = self.quota
+            self.quota = (max(0, remaining - 1), total)
         return 1
 
     def _leave_stargate(self) -> None:
@@ -85,63 +95,41 @@ def _run(loop: _Loop, monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> int:
     return PirateLoop.attack_stargate(loop, **kwargs)  # type: ignore[arg-type]
 
 
-class _FlyingProbe:
-    """只为 `_stargate_already_flying` 准备的桩：把列表内容喂进去，看它怎么判。"""
+class TestBurstingTheWholeDailyShare:
+    """⚠️ **口径当天改过一次，改的依据是实拍。**
 
-    def __init__(self, rows: list[str]) -> None:
-        self.rows = rows
-        self.said: list[str] = []
+    先说的是「星门一次只能发出一发」，而飞行中列表里拍到**同时有两发**矮星系统 ——
+    游戏不拦。用户据此改口径：「直接在 4 系，一发把 3 轮都打掉」。
+    """
 
-    def _in_flight_destinations(self) -> list[str]:
-        return self.rows
-
-    class _Nav:
-        def invalidate(self) -> None:
-            pass
-
-    class _Driver:
-        def click(self, x: int, y: int, *, label: str = "") -> None:
-            pass
-
-        def wait(self, _seconds: float) -> None:
-            pass
-
-    _navigator = _Nav()
-    _driver = _Driver()
-
-
-def _flying_with(rows: list[str]) -> bool:
-    import evo_helper.tools.pirate_loop as module
-
-    probe = _FlyingProbe(rows)
-    original = module.say
-    module.say = probe.said.append
-    try:
-        return PirateLoop._stargate_already_flying(probe)  # type: ignore[arg-type]
-    finally:
-        module.say = original
-
-
-class TestOneAtATime:
-    def test_a_call_dispatches_at_most_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """⚠️ **本文件的重点。** 用户口径：「星门一次只能发出一发」。
-
-        额度还剩 5 次、我们的上限是 3 —— 一个会循环的实现会在这里打三发，
-        而那三发里只有第一发能飞出去，另外两发的下场我们并不知道。
-        """
+    def test_one_trip_fires_the_whole_daily_share(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """额度满、上限 3 → 一趟打三发。"""
         loop = _Loop((5, 5))
 
-        assert _run(loop, monkeypatch) == 1
-        assert loop.launched == 1
+        assert _run(loop, monkeypatch, daily_cap=3) == 3
+        assert loop.launched == 3
+
+    def test_the_loop_is_hard_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """⚠️ **循环次数硬性封顶，不能只靠「重读配额」当出口。**
+
+        这里的桩让配额**永远不动**（模拟游戏改了扣减时机、或者读数漂了）。
+        没有那道上界就会一直打下去 —— 而超打是收不回来的。
+        """
+        loop = _Loop((5, 5), decrements=False)
+
+        assert _run(loop, monkeypatch, daily_cap=2) == 2
+        assert loop.launched == 2
 
 
 class TestAskingTheGameHowManyAreLeft:
     @pytest.mark.parametrize(
         ("quota", "cap", "launched"),
         [
-            ((5, 5), 3, 1),  # 一次没打过
-            ((3, 5), 3, 1),  # 已用 2，还能打第 3 发
+            ((5, 5), 3, 3),  # 一次没打过 → 一趟打满三发
+            ((4, 5), 3, 2),  # 已用 1 → 还能打两发
+            ((3, 5), 3, 1),  # 已用 2 → 只剩第 3 发
             ((2, 5), 3, 0),  # 已用 3 = 上限，收手（游戏那边还剩 2 次）
+            ((1, 5), 3, 0),  # 已用 4（用户自己手动打过）→ 照样收手
             ((0, 5), 3, 0),  # 游戏说没了
             ((5, 5), 0, 0),  # 上限 0 = 关掉
         ],
@@ -151,8 +139,9 @@ class TestAskingTheGameHowManyAreLeft:
     ) -> None:
         """⚠️ 已用 = 总数 − 剩余，**不自己记账**。
 
-        `(2, 5)` 那一行是关键：游戏还肯让我们打，是**我们自己**收手。
-        自己记一份计数的话，用户手动打过的那几发我们看不见，于是会超打。
+        `(2, 5)` 与 `(1, 5)` 那两行是关键：游戏还肯让我们打，是**我们自己**收手 ——
+        而 `(1, 5)` 那一行只可能来自用户手动打过。自己记一份计数的话那几发我们看不见，
+        于是会超打。
         """
         loop = _Loop(quota)
 
@@ -235,65 +224,6 @@ class TestTheOpeningSteps:
         assert "ensure_game_window" in source, "窗口尺寸被改过时所有坐标一起失效"
         assert "_ensure_session" in source, "少了它就会从登录页上开始点"
         assert "_reset_to_known_screen" in source
-
-
-class TestNotDispatchingWhileOneIsFlying:
-    """⚠️ 「星门一次只能发出一发」这条口径**有两道闸**，各自守着不同的失效形态。"""
-
-    def test_the_cheap_precheck_skips_the_whole_trip(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """飞行中列表里有矮星系统就不走那条路 —— 省掉整整一趟点击。
-
-        ⚠️ **每日次数那个读数答不了这个问题**：它数的是「今天派出过几发」，
-        不是「现在有没有一发在飞」。2026-09-13 实机：09:50 派出一发，10:17 那趟
-        读到「还剩 4/5」于是照打，被游戏当场挡下。
-        """
-        loop = _Loop((5, 5), flying=True)
-
-        assert _run(loop, monkeypatch) == 0
-        assert loop.launched == 0
-
-    def test_nothing_in_flight_means_go(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        loop = _Loop((5, 5), flying=False)
-
-        assert _run(loop, monkeypatch) == 1
-
-    def test_an_unreadable_list_counts_as_flying(self) -> None:
-        """⚠️⚠️ **这是这一轮实机最贵的一条。**
-
-        第一版倒向「没在飞」，理由是「后面还有一道权威闸：真派时游戏自己会挡」。
-        **那个前提是错的** —— 2026-09-13 实机拍到飞行中列表里同时有两发矮星系统
-        （10:20 与 10:28 各一发），游戏根本没挡第二发。
-
-        所以「一次只能发出一发」只能由我们自己保证：读不出时宁可不打。
-        少打一发下一轮补得回来，多打一发收不回来。
-        """
-        assert _flying_with(["", "", "", ""]) is True, (
-            "一行都读不出来时必须当成「有在飞」；当成「没在飞」会让这道闸永远放行。"
-        )
-
-    @pytest.mark.parametrize(
-        ("rows", "expected"),
-        [
-            (["矮星系统", "神秘星云", "神秘星云", "神秘星云"], True),
-            (["神秘星云", "神秘星云", "神秘星云", "矮星系统"], True),  # 在最后一行
-            (["神秘星云", "神秘星云", "", ""], False),
-            (["", "", "", ""], True),  # 一行都读不出 → 当成在飞
-        ],
-    )
-    def test_any_readable_row_decides(self, rows: list[str], expected: bool) -> None:
-        """只要读出了**一行**，就按读到的内容判；矮星系统出现在哪一行都算。"""
-        assert _flying_with(rows) is expected
-
-    def test_the_list_is_read_one_row_at_a_time(self) -> None:
-        """⚠️ 取字函数恒用 `--psm 7`（单行），整块读**实测恒为空字符串**。
-
-        而空字符串的意思正好是「列表里没有矮星系统」—— 这道闸于是永远放行。
-        2026-09-13 实机就是这么放过去一发的。
-        """
-        source = inspect.getsource(PirateLoop._in_flight_destinations)
-
-        assert "IN_FLIGHT_ROW_PITCH" in source, "必须一行一读，不能框住整张列表"
-        assert "IN_FLIGHT_VISIBLE_ROWS" in source
 
 
 class TestTheLaunchIsNotAssumedToHaveWorked:
