@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Integer, and_, cast, func, or_, select
+from sqlalchemy import Integer, and_, case, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -142,6 +142,15 @@ class ResourceTotal:
     #: 「误差不超过 ±N」的全部依据（`display.resource_precision_hint`）。
     #: 精确读到的行这一列是 0，所以全精确的合计照样是 0。
     uncertainty: int = 0
+    #: `amount` 里有多少是**残骸回收**捞回来的（`outcome = RECYCLE` 那些合成行）。
+    #:
+    #: ⚠️ **这是 `amount` 的一部分，不是另外加的一份。** 攻击那一份 = `amount - recycled`。
+    #: 分出来是因为两者的意思完全不同：攻击捞回的基础三样由**我方货舱容量**决定、
+    #: 与目标无关（实测同一预设 6 条战报的变异系数 0.0001），而回收捞回的才是
+    #: 真正随目标变的收成。合成一个数摆出来，用户没法判断回收这条链路值不值。
+    #:
+    #: 稀有三样这一列恒为 0——回收报告只写 0/1/2 三格（`domain.recycle_mail.RECYCLE_SLOTS`）。
+    recycled: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +470,11 @@ class OverviewRepository:
         08-18 23:10 看到的是 33 份 / 67,594，08-19 10:10 看到的是 61 份 / 166,194
         （**隔 11 小时涨了 2.5 倍**）。所以页面上这一列**必须**和「读回战报数」
         并排显示（需求文档 8.4），否则用户明天再看同一天的数会以为出了 bug。
+
+        ⚠️ **残骸回收捞回来的也在这里面。** 回收报告复用 `battle_reports`
+        （`application.report_ingest.to_recycle_report` 上写着为什么），所以这一趟
+        不用改就把它们算进来了。`ResourceTotal.recycled` 把其中回收那一份单拎出来
+        —— 页面要能分开显示，理由在那个字段上。
         """
         with self._session_factory() as session:
             rows = session.execute(
@@ -471,6 +485,18 @@ class OverviewRepository:
                         "approximate"
                     ),
                     func.sum(orm.BattleReportResourceRow.uncertainty).label("uncertainty"),
+                    # ⚠️ 同一趟查出来，不另起一趟按 outcome 再查一遍：周期统计
+                    # 一档最多 8 行，每行多一趟就是多 8 趟往返，而这两个数永远
+                    # 要并排显示（合计与它里面的回收那一份）。
+                    func.sum(
+                        case(
+                            (
+                                orm.BattleReportRow.outcome == OUTCOME_RECYCLE,
+                                orm.BattleReportResourceRow.amount,
+                            ),
+                            else_=0,
+                        )
+                    ).label("recycled"),
                 )
                 .join(
                     orm.BattleReportRow,
@@ -489,6 +515,7 @@ class OverviewRepository:
                 amount=int(row.amount or 0),
                 approximate=bool(row.approximate),
                 uncertainty=int(row.uncertainty or 0),
+                recycled=int(row.recycled or 0),
             )
             for row in rows
         )

@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+from evo_helper.domain.battle_outcome import OUTCOME_RECYCLE
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import day_start
 from evo_helper.domain.records import MISSION_KIND_ATTACK, MISSION_KIND_RECYCLE
@@ -532,6 +533,44 @@ def test_resource_totals_only_cover_reports_that_came_back(
 
     after = overview.resource_totals(start=window[0], end=window[1])
     assert [(item.slot, item.amount) for item in after] == [(5, 166_194), (8, 7_807)]
+
+
+def test_a_total_says_how_much_of_it_the_recycling_brought_back(
+    overview: OverviewRepository, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ **合计里回收那一份要单独数得出来**（用户口径 2026-09-13，原话记在
+    `domain.overview.BASIC_SLOTS` 上：两张表的基础三样要「包括攻击/回收」）。
+
+    两份加起来必须**正好**等于合计——页面上摆的是合计，`title` 里写的是拆分，
+    对不上就是页面自相矛盾。所以攻击那一份是**减出来**的，不另查一趟
+    （`web.overview_routes.ResourceCell.attacked`）。
+
+    ⚠️ 回收报告复用 `battle_reports`（`application.report_ingest.to_recycle_report`
+    上写着为什么），认得出它的**只有 `outcome = RECYCLE` 这个记号**。这一条钉的
+    就是那个记号真的被用上了：不判它的话，这一列会等于合计，而页面会说
+    「这些全是回收捞回来的」。
+    """
+    window = (datetime(2026, 9, 12, tzinfo=UTC), datetime(2026, 9, 13, tzinfo=UTC))
+    _report(
+        session_factory,
+        reported_at_utc=datetime(2026, 9, 12, 10, tzinfo=UTC),
+        resources=((0, 1_200_000), (5, 3_000)),
+    )
+    _report(
+        session_factory,
+        reported_at_utc=datetime(2026, 9, 12, 11, tzinfo=UTC),
+        resources=((0, 2_100_000),),
+        outcome=OUTCOME_RECYCLE,
+    )
+
+    totals = {item.slot: item for item in overview.resource_totals(start=window[0], end=window[1])}
+
+    assert (totals[0].amount, totals[0].recycled) == (3_300_000, 2_100_000)
+    # 两份加起来正好是合计。
+    assert totals[0].amount - totals[0].recycled == 1_200_000
+    # ⚠️ 稀有三样那几格恒为 0：回收报告只写 0/1/2 三格
+    # （`domain.recycle_mail.RECYCLE_SLOTS`），这里出现非零就是记号判错了。
+    assert (totals[5].amount, totals[5].recycled) == (3_000, 0)
 
 
 def test_the_error_range_of_a_total_is_the_sum_of_the_reports_that_made_it(

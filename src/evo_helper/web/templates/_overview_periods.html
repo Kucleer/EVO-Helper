@@ -32,6 +32,20 @@
         {% for cell in (rows[0].rare if rows else []) %}
           <th scope="col">{{ cell.label }}</th>
         {% endfor %}
+        {#
+          基础三样（`domain.overview.BASIC_SLOTS` 那三格）。用户口径 2026-09-13，
+          原话记在那个常量上。⚠️ 三样的**名字不许抄到这里**：列名走 `cell.label`，
+          是服务端 `slot_label` 翻译好送来的，同稀有那三列。
+
+          ⚠️ **格子里是攻击 + 回收的合计**，鼠标停上去才分开写。合计摆在明面上
+          是因为这一列问的是「这段时间一共收了多少」；而分开那一句不能省：
+          攻击捞回的这三样由**我方货舱容量**决定、与目标无关（实测同一预设
+          6 条战报的变异系数 0.0001），回收捞回的才是真正随目标变的收成。
+          只给一个合计，用户没法判断回收这条链路值不值。
+        #}
+        {% for cell in (rows[0].basics if rows else []) %}
+          <th scope="col" class="col-basic">{{ cell.label }}</th>
+        {% endfor %}
         {# 挂机紧挨着利用率：分母换成「周期总时长 × 线数」之后，「为什么低」
            这个问题的答案就在这一列里。 #}
         <th scope="col">挂机</th>
@@ -68,6 +82,12 @@
           {% for cell in row.rare %}
             <td>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
           {% endfor %}
+          {# ⚠️ `title` 里那两个数**加起来正好等于格子里的合计**（`attacked` 是减出来的，
+             不是另查的）——两趟查的话页面上会出现「攻击 + 回收 ≠ 合计」。 #}
+          {% for cell in row.basics %}
+            <td class="col-basic{% if cell.recycled %} tone-recycle{% endif %}"
+                title="{{ cell.source_hint }}">{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
+          {% endfor %}
           {# 挂机运行时长。⚠️ **无观测写「—」，不写 0**：心跳是 2026-08-20 才加的，
              之前的天补不回来，而写 0 等于说「那天没开机」——那是假话。 #}
           <td class="{% if row.uptime_hours is none %}muted{% endif %}"
@@ -93,8 +113,8 @@
           </td>
         </tr>
       {% else %}
-        {# ⚠️ 这个数是写死的，加减列必须同步改：周期 + 派遣 + 攻击 + 攻击战报 + 战报回收率 + 回收 + 回收率（7） + 稀有三样（len(RARE_SLOTS) = 3）+ 挂机 + 利用率（2）= 12。 #}
-        <tr><td colspan="12" class="muted">这一档没有数据</td></tr>
+        {# ⚠️ 这个数是写死的，加减列必须同步改：周期 + 派遣 + 攻击 + 攻击战报 + 战报回收率 + 回收 + 回收率（7） + 稀有三样（len(RARE_SLOTS) = 3）+ 基础三样（len(BASIC_SLOTS) = 3）+ 挂机 + 利用率（2）= 15。 #}
+        <tr><td colspan="15" class="muted">这一档没有数据</td></tr>
       {% endfor %}
     </tbody>
   </table>

@@ -153,6 +153,28 @@ class OriginDay:
     first_dispatch_at_utc: datetime | None
     #: 当天这颗星球的末发时刻；一发没派时为 None。
     last_dispatch_at_utc: datetime | None
+    #: 基础三样各收了多少，顺序同 `domain.overview.BASIC_SLOTS`（金属 / 晶体 / 气体）。
+    #: **攻击 + 回收的合计。** 用户口径 2026-09-13，原话记在
+    #: `domain.overview.BASIC_SLOTS` 上。
+    #:
+    #: ⚠️⚠️ **它们不进 `per_line` / `per_line_hour`，一个字都不许改那两个。**
+    #: 攻击捞回的这三样由我方货舱容量决定、与目标无关（实测 2026-08-20，同一预设
+    #: 6 条战报的变异系数 0.0001），掺进效率指标会让预设大的星球无脑领先——
+    #: 那正是 `storage.origin_efficiency._rare` 上那条「基础三样绝不许进来」
+    #: 挡着的事。这几格只是把收入摆出来看。
+    #:
+    #: ⚠️ **带默认值是因为「配了却一发没派」那些行由 `build_rows` 现造**
+    #: （库里查不出一个从未出现过的坐标），它们这几格本来就该是空的。
+    basic_amounts: tuple[int, ...] = ()
+    #: 上面那个合计里**回收**捞回来的那一份，同序。攻击那一份 = 合计 − 这个。
+    #:
+    #: ⚠️ **两者的意思完全不同**：攻击那一份是货舱容量的函数，回收那一份才是
+    #: 真正随目标变的收成。合成一个数摆出来，这一列就退化成「这颗星球的货舱有多大」。
+    basic_recycled: tuple[int, ...] = ()
+    #: 每一格有没有近似读数（画面上写成 `928K` 那种），同序。页面要标「约」。
+    basic_approximate: tuple[bool, ...] = ()
+    #: 每一格的最大绝对误差，逐份相加，同序。
+    basic_uncertainty: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

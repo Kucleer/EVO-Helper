@@ -49,6 +49,22 @@
         <th scope="col">回收</th>
         <th scope="col">回收率</th>
         <th scope="col" title="{{ origins.rare_labels|join(' + ') }}">稀有三样</th>
+        {#
+          基础三样（`domain.overview.BASIC_SLOTS` 那三格）。用户口径 2026-09-13，
+          原话记在那个常量上。⚠️ 三样的**名字不许抄到这里**：列名走 `cell.label`，
+          是服务端 `slot_label` 翻译好送来的，同稀有那三列。
+
+          ⚠️⚠️ **它们摆在「稀有三样」右边、「航线」左边，但不进右边那两个效率列。**
+          表还是按「每线小时」排序，而那个数只算稀有三样——理由在页脚最后一段：
+          攻击捞回的这三样由我方货舱容量决定、与目标无关，掺进去会让预设大的星球
+          无脑领先。摆出来是给人看收入的，不是给表排序用的。
+
+          ⚠️ **和「稀有三样」不一样，这里不合并成一格**：三格之间差着两个
+          数量级，加起来那个数没有意义（同 `domain.overview.BASIC_SLOTS`）。
+        #}
+        {% for cell in (origins.rows[0].basics if origins.rows else []) %}
+          <th scope="col" class="col-basic">{{ cell.label }}</th>
+        {% endfor %}
         <th scope="col">航线</th>
         <th scope="col" title="当天首发 → 现在。停用过的那几个小时也算在里面，见表下说明">在岗</th>
         <th scope="col">每线</th>
@@ -84,6 +100,13 @@
             {% if row.recycle_before_start or row.recycle_rate is none %}—{% else %}{{ '%.0f'|format(row.recycle_rate * 100) }}%{% endif %}
           </td>
           <td title="{{ row.rare_hint }}">{{ row.rare_text }}</td>
+          {# ⚠️ `title` 里那两个数**加起来正好等于格子里的合计**（`attacked` 是减出来的，
+             不是另查的）——两趟查的话页面上会出现「攻击 + 回收 ≠ 合计」。
+             回收那一份不为零时标蓝（`tone-recycle`），同回收那两列的配色。 #}
+          {% for cell in row.basics %}
+            <td class="col-basic{% if cell.recycled %} tone-recycle{% endif %}"
+                title="{{ cell.source_hint }} · {{ cell.hint }}">{{ cell.text }}</td>
+          {% endfor %}
           <td {% if not row.lines_exact %}class="tone-warn"
               title="那一天没有记下这颗星球配着几条（`mission_runs.configured_lines` 记的是账号总数，而它和此刻配置的总数对不上或者压根没记），用的是当天观测到的最大并发在飞数（{{ row.lines }} 条）当下界：分母偏小，所以真实效率不高于右边那两个数"{% endif %}>
             {% if row.lines %}{{ '≥ ' if not row.lines_exact }}{{ row.lines }} 条{% else %}<span class="muted">—</span>{% endif %}
@@ -106,8 +129,9 @@
         </tr>
       {% else %}
         {# ⚠️ 写死的：出发星球 + 派出 + 攻击 + 攻击战报 + 战报回收率 + 回收 + 回收率
-             + 稀有三样 + 航线 + 在岗 + 每线 + 每线小时 = 12。加减列必须同步改。 #}
-        <tr><td colspan="12" class="muted">这一天没有派遣记录</td></tr>
+             + 稀有三样 + 基础三样（len(BASIC_SLOTS) = 3）+ 航线 + 在岗 + 每线
+             + 每线小时 = 15。加减列必须同步改。 #}
+        <tr><td colspan="15" class="muted">这一天没有派遣记录</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -134,9 +158,12 @@
   盲点：账号总数没变、只是星球之间重新分配过，这里看不出来。
 </p>
 <p class="overview-note">
-  分子<b>只算稀有三样</b>（{{ origins.rare_labels|join(' / ') }}）。
-  {{ origins.basic_labels|join('/') }}<b>不进这个指标</b>：它们由我方货舱容量决定、与目标无关
-  （实测同一预设 6 条战报的变异系数 0.0001），掺进来会让「预设大的星球」无脑领先。
+  <b>「每线」「每线小时」的分子只算稀有三样</b>（{{ origins.rare_labels|join(' / ') }}）。
+  {{ origins.basic_labels|join('/') }}那三列<b>照常显示、但不进这两个指标</b>：
+  <b>攻击</b>捞回的这三样由我方货舱容量决定、与目标无关（实测同一预设 6 条战报的
+  变异系数 0.0001），掺进来会让「预设大的星球」无脑领先。
+  那三格是<b>攻击 + 回收的合计</b>，鼠标停上去分开写——
+  <b>回收</b>捞回来的才是真正随目标变的收成，而回收报告<b>只有</b>这三样。
 </p>
 {#
   ⚠️ **一个已知偏差，只记在这里，页面上不修正、也不解释。**

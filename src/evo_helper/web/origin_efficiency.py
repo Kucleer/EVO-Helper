@@ -41,6 +41,7 @@ from evo_helper.domain.battle_resources import slot_label
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.origin_efficiency import (
     LOW_RECOVERY_THRESHOLD,
+    OriginDay,
     OriginEfficiency,
     build_rows,
     day_label,
@@ -59,6 +60,37 @@ from evo_helper.web.display import resource_amount_text, resource_precision_hint
 from evo_helper.web.overview_routes import _FailureLog
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BasicCell:
+    """「按星球效率」表上一格基础资源。**模板里一个算术都不做。**
+
+    ⚠️ 这是 `overview_routes.ResourceCell` 的同形兄弟，故意**没有**做成同一个类：
+    那一个属于周期统计那张表、由 `_Haul.cells` 造，而这一张表的这几格是按星球
+    聚合出来的，两边的来源查询不同。真要合并得先把两条读侧对齐，那是另一件事。
+    """
+
+    label: str
+    #: 攻击 + 回收的合计。
+    amount: int
+    #: 上面那个合计里回收捞回来的那一份。
+    recycled: int
+    #: 这一格在页面上的写法（近似值带「约」），由 `display` 渲染。
+    text: str
+    #: 鼠标停上去那句：这个数准到什么程度。
+    hint: str
+
+    @property
+    def attacked(self) -> int:
+        """合计里攻击捞回来的那一份。**减出来的，不是另查的**——
+        两份加起来必须正好等于摆在页面上的合计。"""
+        return self.amount - self.recycled
+
+    @property
+    def source_hint(self) -> str:
+        """鼠标停上去那句：这个合计里攻击与回收各占多少。"""
+        return f"攻击 {self.attacked:,} · 回收 {self.recycled:,}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +121,13 @@ class OriginRow:
     rare_text: str
     rare_hint: str
     rare_amount: int
+    #: 金属 / 晶体 / 气体三格（顺序同 `domain.overview.BASIC_SLOTS`），
+    #: 每格是**攻击 + 回收的合计**，`recycled` 里带着回收那一份。
+    #:
+    #: ⚠️ **它们不进 `per_line` / `per_line_hour`。** 攻击捞回的这三样由我方货舱
+    #: 容量决定、与目标无关，掺进效率指标会让预设大的星球无脑领先
+    #: （判据在 `storage.origin_efficiency._rare` 上，页脚那段说明也写着）。
+    basics: tuple[BasicCell, ...]
     on_duty_hours: float
     per_line: float | None
     per_line_hour: float | None
@@ -254,6 +293,7 @@ def _row(item: OriginEfficiency) -> OriginRow:
         rare_text=resource_amount_text(entry),
         rare_hint=resource_precision_hint(entry),
         rare_amount=item.day.rare_amount,
+        basics=_basic_cells(item.day),
         on_duty_hours=item.on_duty_hours,
         per_line=item.per_line,
         per_line_hour=item.per_line_hour,
@@ -261,6 +301,52 @@ def _row(item: OriginEfficiency) -> OriginRow:
         first_dispatch_at_utc=item.day.first_dispatch_at_utc,
         last_dispatch_at_utc=item.day.last_dispatch_at_utc,
     )
+
+
+def _basic_cells(day: OriginDay) -> tuple[BasicCell, ...]:
+    """把这颗星球那三格摆成页面要的样子。
+
+    ⚠️ **名字由 `slot_label` 翻译，顺序由 `BASIC_SLOTS` 定**，两样都不在这里另写：
+    `domain.battle_resources.SLOT_LABELS` 的顺序与游戏「太空舱」页并不一致，
+    抄第二份出去，对不上的症状是「数字全对、只是安在了别的资源名下」，
+    页面上一点异样都没有。
+
+    ⚠️ **缺格补 0，不补「—」。** 这几格和回收那两列不一样：它们没有「功能上线
+    之前」这个分界——从 08-18 资源识别修好那天起，一格没有就是真的 0
+    （12 格是一起读的，读全了才入库，见 `storage.models.BattleReportResourceRow`）。
+    """
+    values = _padded(day.basic_amounts, fill=0)
+    recycled = _padded(day.basic_recycled, fill=0)
+    approximate = _padded(day.basic_approximate, fill=False)
+    uncertainty = _padded(day.basic_uncertainty, fill=0)
+    cells: list[BasicCell] = []
+    for index, slot in enumerate(BASIC_SLOTS):
+        entry = BattleResourceEntry(
+            slot=slot,
+            amount=values[index],
+            approximate=approximate[index],
+            uncertainty=uncertainty[index],
+        )
+        cells.append(
+            BasicCell(
+                label=slot_label(slot),
+                amount=entry.amount,
+                recycled=recycled[index],
+                text=resource_amount_text(entry),
+                hint=resource_precision_hint(entry),
+            )
+        )
+    return tuple(cells)
+
+
+def _padded[T](values: tuple[T, ...], *, fill: T) -> tuple[T, ...]:
+    """补到 `len(BASIC_SLOTS)` 这么长。
+
+    ⚠️ 「配了却一发没派」那些行由 `domain.origin_efficiency._empty_day` 现造，
+    这几个字段在那里是空元组（库里查不出一个从未出现过的坐标）。不补齐的话
+    页面上那一行会少三格，而表头还在——整行往左错位。
+    """
+    return tuple(values) + (fill,) * (len(BASIC_SLOTS) - len(values))
 
 
 def _day_choices(*, now_utc: datetime, selected: datetime) -> tuple[DayChoice, ...]:
@@ -294,6 +380,7 @@ def _empty_view(*, now_utc: datetime, day: str | None) -> OriginEfficiencyView:
 
 
 __all__ = [
+    "BasicCell",
     "DayChoice",
     "OriginEfficiencyView",
     "OriginRow",
