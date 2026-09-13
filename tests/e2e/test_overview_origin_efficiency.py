@@ -380,16 +380,20 @@ def test_the_basic_three_never_reach_the_numerator(
 
     assert "1,000" in cells
     # ⚠️ 合计一次都不许出现：它是「基础三样混进了稀有那一格」唯一的可观察症状。
+    # ⚠️ 缩写之后**两种形态都要防**：只判全位数的话，混进去会显示成 2.16M 而用例全绿。
     assert "2,161,000" not in html
-    # 「每线」= 1,000 ÷ EARLY_LINES，分子里没有那三样。
+    assert "2.16M" not in html
     # ⚠️ **右边那两个效率数必须仍然只由稀有那 1,000 算出来。**
     # 「每线」= 1,000 ÷ 1 条（那一天线数没有真值，取下界，所以带「≤」）；
     # 「每线小时」= 再 ÷ 20 小时在岗 = 50。基础三样但凡漏进分子，
     # 这两个数会分别变成 2,161,000 和 108,050。
+    # ⚠️ 这两列**不缩写**：`DISPLAY_UNITS` 只管资源格，效率数不在里面。
     assert cells[-2].endswith("1,000")
     assert cells[-1].endswith("50")
-    # 反过来：那三样确实**显示**出来了，各自一格。
-    assert cells.count("720,000") == len(BASIC_SLOTS)
+    # 反过来：那三样确实**显示**出来了，各自一格，按 M 缩写。
+    assert cells.count("0.72M") == len(BASIC_SLOTS)
+    # 缩写不等于丢数：全位数在 `title` 里。
+    assert 'title="720,000' in html
 
 
 def test_the_basic_columns_separate_what_the_recycling_brought_back(
@@ -433,8 +437,9 @@ def test_the_basic_columns_separate_what_the_recycling_brought_back(
 
     html = _fragment(client)
 
-    assert "2,000,000" in _cells(html, EARLY)
-    assert 'title="攻击 400,000 · 回收 1,600,000' in html
+    # 格子里是缩写的合计，`title` 里是全位数 + 两份的拆分。
+    assert "2.00M" in _cells(html, EARLY)
+    assert 'title="2,000,000 = 攻击 400,000 · 回收 1,600,000' in html
 
 
 def test_the_rare_labels_come_from_the_slot_table(

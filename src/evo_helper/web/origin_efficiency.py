@@ -48,11 +48,16 @@ from evo_helper.domain.origin_efficiency import (
     parse_day,
     selectable_days,
 )
-from evo_helper.domain.overview import BASIC_SLOTS, RARE_SLOTS
+from evo_helper.domain.overview import BASIC_SLOTS, DISPLAY_UNITS, RARE_SLOTS
 from evo_helper.domain.records import BattleResourceEntry
 from evo_helper.storage.origin_efficiency import OriginEfficiencyRepository
 from evo_helper.storage.overview import OverviewRepository
-from evo_helper.web.display import resource_amount_text, resource_precision_hint
+from evo_helper.web.display import (
+    resource_amount_short,
+    resource_amount_text,
+    resource_exact_text,
+    resource_precision_hint,
+)
 
 # ⚠️ 限流留痕那一套**直接 import 私名**，不抄一份等价的过来。这一页会轮询，
 # 库一断就是每 N 秒一条日志（PR #188 修过一次同形状的事故：两条日志占了
@@ -76,8 +81,13 @@ class BasicCell:
     amount: int
     #: 上面那个合计里回收捞回来的那一份。
     recycled: int
-    #: 这一格在页面上的写法（近似值带「约」），由 `display` 渲染。
+    #: 这一格在页面上的写法：按单位缩写（`12,345,678` → `12.35M`），由 `display` 渲染。
+    #:
+    #: ⚠️ 缩写把末几位抹掉了，所以 `exact` **必须**一起挂进 `title` ——
+    #: 否则页面上再也读不出这一格到底是多少，而库里明明还存着。
     text: str
+    #: 全位数写法，给 `title` 用。
+    exact: str
     #: 鼠标停上去那句：这个数准到什么程度。
     hint: str
 
@@ -332,7 +342,14 @@ def _basic_cells(day: OriginDay) -> tuple[BasicCell, ...]:
                 label=slot_label(slot),
                 amount=entry.amount,
                 recycled=recycled[index],
-                text=resource_amount_text(entry),
+                # ⚠️ 单位从 `DISPLAY_UNITS` 查。查不到就退回写全位数——
+                # 那张表哪天不再列这几格，这里自己就回到了老样子，不用跟着改。
+                text=(
+                    resource_amount_short(entry, unit=unit)
+                    if (unit := DISPLAY_UNITS.get(slot)) is not None
+                    else resource_amount_text(entry)
+                ),
+                exact=resource_exact_text(entry),
                 hint=resource_precision_hint(entry),
             )
         )

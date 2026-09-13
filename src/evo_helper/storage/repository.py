@@ -3359,7 +3359,7 @@ class SqlAlchemyRepository:
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
         recycle_rate_tenths: int | None = None,
-        recycle_mail_opens: int | None = None,
+        recycle_mail_opens: int | None = None,  # 0/1 开关，见 `recycle_mail_enabled`
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
@@ -4137,31 +4137,40 @@ class SqlAlchemyRepository:
             row.recycle_rate_tenths = clamped
             session.commit()
 
-    #: 每趟最多读几封回收报告的上界。**用户可以调大，但调不到没边**：
-    #: 一封 ≈ 8 秒，而舰队标签里三封信里只有一封是回收报告，
-    #: 预算 12 已经意味着一趟可能要翻三四屏。
-    MAX_RECYCLE_MAIL_OPENS = 12
+    def recycle_mail_enabled(self) -> bool:
+        """读不读回收报告。空/读不出 = 不读。
 
-    def recycle_mail_opens(self) -> int:
-        """每趟读几封回收报告。空/读不出 = 0（不读）。"""
+        ⚠️ **2026-09-13 从「每趟读几封」改成开关**（用户口径：「我只需要 on/off」）。
+        原先那个 0–12 的数在三个地方各写了一份上界（这里、`mission_scheduler`、
+        `web.schemas` 的 `le=12`），注释里还写着「三处必须一起改」—— 改成布尔之后
+        那三份一起没了。
+
+        ⚠️ **列没换，语义换了**：`military_attack_config.recycle_mail_opens` 仍是
+        那一列（不做迁移），现在只看**是不是零**：NULL / 0 = 关，非零 = 开。
+        老库里存着 1–12 的那些行照样读成「开」，不用补数据。
+
+        「每趟最多开几封」变成了一个标定常量
+        （`tools.pirate_loop.RECYCLE_MAIL_OPENS_PER_TRIP`）：那本来就不是用户
+        要调的东西，它要的是「读还是不读」。
+        """
         try:
             row = self.military_attack_config()
         except ValueError:
-            return 0
-        value = row.recycle_mail_opens
-        if value is None:
-            return 0
-        return max(0, min(self.MAX_RECYCLE_MAIL_OPENS, int(value)))
+            return False
+        return bool(row.recycle_mail_opens)
 
-    def set_recycle_mail_opens(self, opens: int) -> None:
-        """写回收邮件预算。落库前夹到 0–`MAX_RECYCLE_MAIL_OPENS`。"""
-        clamped = max(0, min(self.MAX_RECYCLE_MAIL_OPENS, int(opens)))
+    def set_recycle_mail_enabled(self, enabled: bool) -> None:
+        """写这个开关。落库写 1 / 0，**不写 NULL**。
+
+        ⚠️ 关掉时写 0 而不是 NULL：两者在读侧等价，但 NULL 在库里读起来是
+        「没配过」，而用户明确关掉是一个决定，不是没配。
+        """
         with self._session_factory() as session:
             row = session.get(orm.MilitaryAttackConfigRow, 1)
             if row is None:
                 row = orm.MilitaryAttackConfigRow(id=1)
                 session.add(row)
-            row.recycle_mail_opens = clamped
+            row.recycle_mail_opens = 1 if enabled else 0
             session.commit()
 
     def recycle_enabled_at_utc(self) -> datetime | None:

@@ -466,6 +466,48 @@ def resource_amount_text(entry: BattleResourceEntry) -> str:
     return f"约 {text}" if entry.approximate else text
 
 
+#: 每个单位除以多少、留几位小数。
+#:
+#: ⚠️ **K 留一位、M 留两位，这是照实际读数定的，不是随手选的**：
+#: 用 K 的那一格实测跨 19,537 – 975,700（19.5K – 975.7K），一位小数够分辨；
+#: 用 M 的那几格跨 443,100 – 887,040,700，一位小数会把 0.4M 和 0.9M 写成
+#: 只差一个数字的两个数，而它们差着一倍。
+_UNIT_SCALE: dict[str, tuple[int, int]] = {"K": (1_000, 1), "M": (1_000_000, 2)}
+
+
+def resource_amount_short(entry: BattleResourceEntry, *, unit: str) -> str:
+    """一格收获**按单位缩写**怎么写（`12,345,678` → `12.35M`）。
+
+    只给概览那两张宽表用，槽位与单位的对照在 `domain.overview.DISPLAY_UNITS`
+    （用户口径 2026-09-13：「合金碎片用单位K」「金属/晶体/气体单位用M」）。
+
+    ⚠️ **这不是 `resource_amount_text` 的替代品，两个都要留着。** 派遣日志页
+    一格只放一份战报的收获，位数本来就短，缩写只会把「这一发收了多少」变模糊；
+    宽表那边是七八位数乘十几列，不缩写就得横向滚。同一个概念在两处写成两种样子
+    是**有理由的**，所以理由写在这里、以及 `DISPLAY_UNITS` 上。
+
+    ⚠️ **「约」照旧带着。** 缩写让这个数看起来本来就不精确，但那是两回事：
+    「约」说的是**画面上当初就是缩写显示的、真值取不回来**，而这里的缩写是
+    我们自己为了排版做的、真值还在库里（鼠标停上去那句写着全位数）。
+    把「约」省掉等于拿我们的排版决定去掩盖一次真实的精度损失。
+
+    ⚠️ **0 写成 `0`，不写 `0.00M`。** 后者读起来像「有一点点但不到 0.01M」，
+    而这一格的 0 是确凿的零（12 格是一起读的，读全了才入库）。
+    """
+    divisor, digits = _UNIT_SCALE[unit]
+    text = "0" if entry.amount == 0 else f"{entry.amount / divisor:,.{digits}f}{unit}"
+    return f"约 {text}" if entry.approximate else text
+
+
+def resource_exact_text(entry: BattleResourceEntry) -> str:
+    """那个数的**全位数**写法，给缩写格子的 `title` 用。
+
+    ⚠️ 缩写把末几位抹掉了，真值必须在鼠标停上去时拿得到 —— 否则页面上就
+    **再也读不出**这一格到底是多少，而库里明明还存着。
+    """
+    return f"{entry.amount:,}"
+
+
 def resource_precision_hint(entry: BattleResourceEntry) -> str:
     """鼠标悬停时说清这一格准到什么程度。
 

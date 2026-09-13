@@ -1554,7 +1554,7 @@ class MissionConsoleService:
         account_line_limit: object = None,
         auto_toggle_log_seconds: object = None,
         recycle_rate_tenths: object = None,
-        recycle_mail_opens: object = None,
+        recycle_mail_enabled: object = None,
     ) -> MilitaryAttackConfigView:
         """整份全局攻击配置原子替换。
 
@@ -1588,7 +1588,7 @@ class MissionConsoleService:
                 auto_toggle_log_seconds
             )
             recycle = self._scheduler.validate_recycle_rate_tenths(recycle_rate_tenths)
-            mail_opens = self._scheduler.validate_recycle_mail_opens(recycle_mail_opens)
+            mail_on = self._scheduler.validate_recycle_mail_enabled(recycle_mail_enabled)
         except MissionParamError as exc:
             raise ServiceError(str(exc)) from exc
         row = self._repository.replace_military_attack_tiers(
@@ -1605,7 +1605,8 @@ class MissionConsoleService:
             account_line_limit=account_lines,
             auto_toggle_log_seconds=toggle_window,
             recycle_rate_tenths=recycle,
-            recycle_mail_opens=mail_opens,
+            # ⚠️ `None` 直接传下去 = 「这次不动这一列」；`False` 要落成 0。
+            recycle_mail_opens=None if mail_on is None else int(mail_on),
         )
         self._invalidate_scheduler_view()
         return _config_view(row, tuple(json.loads(row.tiers_json)))
@@ -2602,7 +2603,7 @@ def _config_view(
         account_line_limit=row.account_line_limit,
         auto_toggle_log_seconds=row.auto_toggle_log_seconds,
         recycle_rate_tenths=row.recycle_rate_tenths,
-        recycle_mail_opens=row.recycle_mail_opens,
+        recycle_mail_enabled=bool(row.recycle_mail_opens),
     )
 
 

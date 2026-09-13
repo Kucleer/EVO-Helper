@@ -105,7 +105,7 @@
              回收那一份不为零时标蓝（`tone-recycle`），同回收那两列的配色。 #}
           {% for cell in row.basics %}
             <td class="col-basic{% if cell.recycled %} tone-recycle{% endif %}"
-                title="{{ cell.source_hint }} · {{ cell.hint }}">{{ cell.text }}</td>
+                title="{{ cell.exact }} = {{ cell.source_hint }} · {{ cell.hint }}">{{ cell.text }}</td>
           {% endfor %}
           <td {% if not row.lines_exact %}class="tone-warn"
               title="那一天没有记下这颗星球配着几条（`mission_runs.configured_lines` 记的是账号总数，而它和此刻配置的总数对不上或者压根没记），用的是当天观测到的最大并发在飞数（{{ row.lines }} 条）当下界：分母偏小，所以真实效率不高于右边那两个数"{% endif %}>

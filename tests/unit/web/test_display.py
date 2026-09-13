@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from evo_helper.application.backfill import BackfillPhase
-from evo_helper.domain.records import TARGET_KIND_LABELS
+from evo_helper.domain.overview import BASIC_SLOTS, DISPLAY_UNITS
+from evo_helper.domain.records import TARGET_KIND_LABELS, BattleResourceEntry
 from evo_helper.domain.scheduler import MissionKind, TaskStatus
 from evo_helper.game.pirate_ui import PIRATE_TRIGGER_SHIPS
 from evo_helper.web.display import (
@@ -21,6 +22,8 @@ from evo_helper.web.display import (
     missing_backfill_phases,
     missing_intel_labels,
     missing_status_tones,
+    resource_amount_short,
+    resource_exact_text,
     settled_score,
 )
 
@@ -150,3 +153,58 @@ def test_an_interpolated_half_survives_the_settling() -> None:
 def test_an_unknown_score_stays_unknown() -> None:
     """**猜出来的数不许长得像量出来的**，`None` 更不许变成 `0`。"""
     assert settled_score(None) is None
+
+
+# -- 按单位缩写（用户口径 2026-09-13） --------------------------------------------
+
+
+def _entry(amount: int, *, approximate: bool = False) -> BattleResourceEntry:
+    return BattleResourceEntry(slot=0, amount=amount, approximate=approximate, uncertainty=0)
+
+
+class TestTheUnitSuffix:
+    def test_k_keeps_one_decimal_and_m_keeps_two(self) -> None:
+        """⚠️ 位数是照**实际读数的跨度**定的，不是随手选的。
+
+        用 K 的那一格实测跨 19,537 – 975,700；用 M 的跨 443,100 – 887,040,700，
+        一位小数会把 0.4M 和 0.9M 写成只差一个数字的两个数，而它们差着一倍。
+        """
+        assert resource_amount_short(_entry(27_500), unit="K") == "27.5K"
+        assert resource_amount_short(_entry(975_700), unit="K") == "975.7K"
+        assert resource_amount_short(_entry(887_040_700), unit="M") == "887.04M"
+        assert resource_amount_short(_entry(443_100), unit="M") == "0.44M"
+
+    def test_a_real_zero_is_written_as_zero(self) -> None:
+        """⚠️ **0 写成 `0`，不写 `0.00M`。**
+
+        后者读起来像「有一点点但不到 0.01M」，而这一格的 0 是确凿的零
+        （12 格是一起读的，读全了才入库）。
+        """
+        assert resource_amount_short(_entry(0), unit="M") == "0"
+        assert resource_amount_short(_entry(0), unit="K") == "0"
+
+    def test_the_approximate_marker_survives_the_abbreviation(self) -> None:
+        """⚠️⚠️ **「约」照旧带着。**
+
+        缩写让这个数看起来本来就不精确，但那是两回事：「约」说的是**画面上当初
+        就是缩写显示的、真值取不回来**；而这里的缩写是我们自己为了排版做的，
+        真值还在库里。把「约」省掉，等于拿我们的排版决定去掩盖一次真实的精度损失。
+        """
+        assert resource_amount_short(_entry(12_345_678, approximate=True), unit="M") == "约 12.35M"
+
+    def test_the_exact_text_keeps_every_digit(self) -> None:
+        """缩写抹掉的末几位**必须**能从 `title` 读回来，否则页面上再也读不出真值。"""
+        assert resource_exact_text(_entry(12_345_678)) == "12,345,678"
+
+
+class TestWhichSlotsAreAbbreviated:
+    def test_the_small_slots_are_deliberately_left_alone(self) -> None:
+        """⚠️ 读数只有三四位的那两格**不进** `DISPLAY_UNITS`。
+
+        把 794 写成 0.8K 既不省宽度、又丢了两位有效数字。
+        """
+        assert set(DISPLAY_UNITS) == {5, *BASIC_SLOTS}
+
+    def test_the_basic_three_all_use_the_same_unit(self) -> None:
+        """三格并排，单位不一致的话列与列之间没法一眼比大小。"""
+        assert {DISPLAY_UNITS[slot] for slot in BASIC_SLOTS} == {"M"}
