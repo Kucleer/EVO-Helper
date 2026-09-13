@@ -376,11 +376,39 @@ STARGATE_QUOTA_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 #: 实测 12 种 ROI×配方组合全部读出 `5/5`，所以这三档只是余量，不是必须。
 STARGATE_QUOTA_RECIPES: tuple[tuple[int, int | None], ...] = ((4, 120), (4, None), (3, None))
 
-MAIL_BATTLE_SUB_TAB = (897, 218)
+#: 「舰队」那个二级按钮的中心（client 空间，**不是**裁过 38px 的 viewport 空间）。
+#:
+#: ## ⚠️⚠️ 它是一个**筛选开关**，不是一排页签里的一个
+#:
+#: 2026-09-13 夜实机逐点验过这一排四个按钮（战斗 772 / 侦察 897 / 舰队 1033 /
+#: 系统 1150，y=218，坐标本身都对得上）。结果只有「舰队」这一个有反应：
+#:
+#:     起始 列表=舰队类 ×6
+#:     点 772（战斗） → 列表没变     点 772 再来一次 → 还是没变
+#:     点 1033（舰队）→ 列表变成攻击报告
+#:     再点 1033      → 又变回舰队类
+#:
+#: 也就是说：**点它 = 在「只看舰队类」和「回到默认（含攻击报告）」之间翻**，
+#: 而且这个状态**跨次记住**（下一趟进信箱时它还在上一趟留下的那一档上）。
+#:
+#: 所以两个方向都走这**同一个**坐标，靠内容判据决定还要不要再点一下。
+#:
+#: ⚠️ **原先还有一个 `MAIL_BATTLE_SUB_TAB = (897, 218)`，已经删掉。** 它有两处错：
+#: ①897 是「侦察」的 x，不是「战斗」的（那个 x 是从一级标签的「报告」抄来的，
+#: 两排的 x 中心确实一样，但第二排第二个是侦察）；②就算改对成 772，那个按钮
+#: 也不响应。它带来的后果是「读完回收报告切回战斗」实测 **3/3 全失败**。
+#:
+#: ⚠️ **量之前先确认坐标空间。** 这一夜我第一次量成了 `y+38`，得出「坐标落在空白里」
+#: 这个完全错误的结论 —— `driver.click()` 与 `driver.capture()` 都活在 client 空间，
+#: 只有 `report_layout` 的 ROI 活在裁掉 38 之后的 viewport 空间。
 MAIL_FLEET_SUB_TAB = (1033, 218)
 
-#: 切二级标签之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
-MAIL_SUB_TAB_WAIT_S = 1.8
+#: 点完之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
+#:
+#: ⚠️ **1.8 → 4.0（2026-09-13 夜）。** 1.8 秒实测读得到**没重绘完**的列表：
+#: 生产日志里那条「舰队类 3 行、攻击报告 2 行」的混合读数只可能出自重绘中间，
+#: 而探针用 4–5 秒时稳定。这一步一趟只走一两次，多等两秒买的是判据可信。
+MAIL_SUB_TAB_WAIT_S = 4.0
 
 #: 切标签最多试几次。**试不成就整趟放弃，不许在认不出的列表上接着读。**
 MAIL_SUB_TAB_TRIES = 3
@@ -3279,35 +3307,94 @@ class PirateLoop:
         内容判据：**舰队标签里不会有「攻击报告」，战斗标签里不会有「舰队返回」或
         「回收报告」**（实拍确认）。
 
+        ## ⚠️⚠️ 「舰队」是**开关**，不是一排页签里的一个，而且状态跨次记住
+
+        实测 2026-09-13 夜（干净状态下连做三轮，每轮只点一下「舰队」）：
+
+            第 1 轮 进来时 fleet_return ×6 → 点一下 → attack ×4
+            第 2 轮 进来时 attack ×4       → 点一下 → fleet_return ×6
+            第 3 轮 进来时 fleet_return ×6 → 点一下 → attack ×5
+
+        所以**已经在目标那一档上时再点一下会把它翻掉**，而信箱会把上一趟留下的
+        档位一直记着。这里因此必须**先看再点**：原先是无条件先点再看，于是
+        「上一趟停在舰队」这一种情形下第一下就翻走、判据对不上、重试再点又翻回来
+        —— 本该一下到位的一个按钮变成了赌奇偶。这正是那一夜「切不到舰队，
+        整趟不读」的成因。
+
+        ⚠️ **回去也点这同一个按钮**：同一夜验过，「战斗」那个按钮点了列表毫无反应
+        （连点两次都没变），整段在 `MAIL_FLEET_SUB_TAB` 上。
+
         ## ⚠️ 认不出就返回 False，不许「点了就当切成了」
 
-        点一下的代价是 1.8 秒，而在错标签上读一整趟的代价是一趟白跑加一串
-        看不出问题的日志。宁可整趟放弃。
+        在错标签上读一整趟的代价是一趟白跑加一串看不出问题的日志。宁可整趟放弃。
         """
-        target = MAIL_FLEET_SUB_TAB if fleet else MAIL_BATTLE_SUB_TAB
-        name = "舰队" if fleet else "战斗"
+        # ⚠️ 两个方向**同一个坐标**：它是开关不是页签（整段在 `MAIL_FLEET_SUB_TAB` 上）。
+        target = MAIL_FLEET_SUB_TAB
+        # ⚠️⚠️ **这个名字要绕开 `human_input.ACTING_WORDS`。** 它不是给人看的说明文字
+        # —— `_reject_acting_label` 拿它当安全闸：只读进程（回收那一趟正是
+        # `allow_actions=False`）点任何带「派遣/攻击/出发/删除/领取/取消/…」的标签
+        # 都会被拒。2026-09-13 夜这里连撞两次：先写「默认（含攻击报告）」中了「攻击」，
+        # 改成「取消舰队筛选」又中了「取消」。现在这个名字一个词都不沾。
+        name = "舰队" if fleet else "舰队筛选关"
         for attempt in range(MAIL_SUB_TAB_TRIES):
+            # ⚠️⚠️ **先看再点。** 这一排是 toggle，而且状态**跨次记住**：
+            # 已经停在目标标签上时再点一下，是把它**点掉**（实测 2026-09-13 夜，
+            # 干净状态下连做三轮，每轮点一下都在两个标签之间来回翻）。
+            # 原先是无条件先点再看，于是上一趟把信箱留在「舰队」上时，
+            # 这一趟第一下就切走了，然后判据对不上、重试再点又切回来 ——
+            # 一排本该一下到位的按钮变成了赌奇偶。
+            if attempt or self._on_mail_list():
+                settled = self._sub_tab_matches(fleet=fleet, name=name, quiet=not attempt)
+                if settled:
+                    return True
             self._driver.click(*target, label=f"二级标签「{name}」")
-            self._driver.wait(MAIL_SUB_TAB_WAIT_S * (attempt + 1))
+            self._driver.wait(MAIL_SUB_TAB_WAIT_S)
             if not self._on_mail_list():
                 say(f"  点了二级标签「{name}」却不在邮件列表上了（第 {attempt + 1} 次）")
                 continue
-            kinds = [row.kind for row in self._mail_list_rows(evidence_source="sub_tab")]
-            here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
-            there = sum(1 for kind in kinds if kind is ReportKind.ATTACK)
-            good = (here > 0 and there == 0) if fleet else (there > 0 and here == 0)
-            if good:
-                say(
-                    f"  二级标签切到「{name}」：这一屏 {len(kinds)} 行里"
-                    f"舰队类 {here} 行、攻击报告 {there} 行，对得上"
-                )
+            if self._sub_tab_matches(fleet=fleet, name=name, quiet=False):
                 return True
-            say(
-                f"  二级标签「{name}」切完之后内容对不上（舰队类 {here} 行、"
-                f"攻击报告 {there} 行、共 {len(kinds)} 行）；第 {attempt + 1} 次"
-            )
         # 认不出时最贵的事是不知道当时画面长什么样。存一帧的成本是一次写盘。
         self._dump_frame(f"mail-sub-tab-{name}-unconfirmed", PANEL_TITLE_ROI)
+        return False
+
+    def _sub_tab_matches(self, *, fleet: bool, name: str, quiet: bool) -> bool:
+        """当前这一屏的**内容**是不是目标标签的。判据与措辞只有这一份。
+
+        ⚠️ 判据是列表内容，不是标签上的字 —— 标签行的小字被未读角标压住，
+        实测 `--psm 7` 读成 `'oe. se. eee ee'`（2026-09-13 夜复验：换 `--psm 11`
+        逐词框能读出四个词的**碎片**并定位，但读不全，不足以当判据）。
+
+        `quiet` 给「点之前先看一眼」那一次用：那一次不匹配是**正常**的
+        （本来就不在目标标签上），照常打一行日志只会让日志里全是假警报。
+        """
+        kinds = [row.kind for row in self._mail_list_rows(evidence_source="sub_tab")]
+        here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
+        there = sum(1 for kind in kinds if kind is ReportKind.ATTACK)
+        # ⚠️⚠️ **两个方向的判据是不对称的，这是照实测定的，不是图省事。**
+        #
+        # 开着筛选时列表里只有「舰队返回 / 回收报告」这两种主题，而它们**读得准**
+        # ——2026-09-13 夜每一次开着筛选量到的都是 6/6 全中。所以「开着」要正面证据。
+        #
+        # 关掉之后列表里混着攻击报告，而**攻击报告的主题读不准**：同一夜实测
+        # 关掉筛选后那 6 行经常是「舰队类 0、攻击报告 0」——全是 unknown。
+        # 原先两边都要正面证据（`there > 0`），于是「关掉」这一侧**永远判不成立**，
+        # 重试三次全败、整趟放弃。所以这一侧只判「一封舰队类都没有」。
+        #
+        # ⚠️ 这不是把闸放松：`_on_mail_list()` 已经挡住「根本不在列表上」那一档，
+        # 而「筛选还开着却一封舰队类都读不出」在实测里一次都没出现过。
+        good = (here > 0 and there == 0) if fleet else here == 0
+        if good:
+            say(
+                f"  二级标签在「{name}」上：这一屏 {len(kinds)} 行里"
+                f"舰队类 {here} 行、攻击报告 {there} 行，对得上"
+            )
+            return True
+        if not quiet:
+            say(
+                f"  二级标签「{name}」内容对不上（舰队类 {here} 行、"
+                f"攻击报告 {there} 行、共 {len(kinds)} 行）"
+            )
         return False
 
     def _scroll_mail_list_to_top(self) -> None:

@@ -6,9 +6,12 @@
 ——读回收实收必须点「报告」底下那一排的「舰队」。所以清单里多了二级标签那两下，
 **而且只有那两下**：「侦察」「系统」以及一级的「个人/探索/收藏」仍旧不许碰。
 
-⚠️⚠️ 例外是**带着还原义务**的：读完必须切回「战斗」，否则下一趟战报那一趟会在
-舰队标签上开工，主题闸把整列「舰队返回」全拒掉，日志上看着和「信箱里没有战报」
+⚠️⚠️ 例外是**带着还原义务**的：读完必须把舰队筛选**关回去**，否则下一趟战报那一趟会
+在只剩舰队类的列表上开工，主题闸把它们全拒掉，日志上看着和「信箱里没有战报」
 一模一样。下面 `test_the_fleet_tab_is_always_switched_back` 守的就是这一条。
+
+⚠️ 2026-09-13 夜实机纠正：那一排里**只有「舰队」那个按钮有反应**，它是个
+筛选开关而不是页签，所以「关回去」点的是**同一个坐标**，不是去点「战斗」。
 
 游戏信箱里的分类标签、排序、搜索这些是用户自己配好的。助手在那上面点一下，
 下一轮翻到的就不是同一批邮件了，而这件事**不会报错**——只会表现成「战报读不到」，
@@ -21,6 +24,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 
 from evo_helper.tools import pirate_loop
 
@@ -38,7 +42,7 @@ ALLOWED_MAIL_CLICK_LABELS = frozenset(
         "关闭邮箱列表（左上角X）",
         # ⚠️ 2026-09-12 放开的那个例外，见模块头。**只有这两个**。
         "二级标签「舰队」",
-        "二级标签「战斗」",
+        "二级标签「舰队筛选关」",
     }
 )
 
@@ -127,7 +131,7 @@ def test_the_allow_list_has_no_filter_sounding_entries() -> None:
     # ⚠️ 2026-09-12 之前这里只有「报告标签」一个。放开成三个是**用户点名要的**
     # （「打开舰队的二级标签，你就可以看见回收报告」），不是顺手加的。
     # 再往里加任何一个之前，先回去读模块头那两段。
-    assert filterish == {"报告标签", "二级标签「舰队」", "二级标签「战斗」"}
+    assert filterish == {"报告标签", "二级标签「舰队」", "二级标签「舰队筛选关」"}
 
 
 def test_the_fleet_tab_is_always_switched_back() -> None:
@@ -197,3 +201,67 @@ def test_every_recycle_mail_leaves_evidence_behind() -> None:
 
     assert source.count("_dump_frame(") == 2, "读不出 / 认不上这两条出路要各留一张现场图"
     assert "_store_report_screenshot(" in source, "入库那一份没把邮件那一屏存下来"
+
+
+# -- 二级标签：它是开关，不是页签（2026-09-13 夜实机） -----------------------------
+
+
+def test_both_directions_click_the_same_button() -> None:
+    """⚠️⚠️ 「舰队」是一个**筛选开关**，两个方向点的是同一个坐标。
+
+    2026-09-13 夜实机逐点验过那一排四个按钮，只有「舰队」有反应；
+    原先还有一个 `MAIL_BATTLE_SUB_TAB`，它①用的是「侦察」的 x，②就算改对，
+    那个按钮也不响应——后果是「读完回收报告切回去」实测 3/3 全失败。
+
+    这一条钉的是「别再加回来一个方向专用的坐标」。
+    """
+    # ⚠️ 判**行首的赋值**，不判「这三个字出现过」：那个常量为什么被删掉，正写在
+    # `MAIL_FLEET_SUB_TAB` 的注释里，而注释里必然带着它的名字。按出现判的话，
+    # 这条用例会把那段说明本身判成违规 —— 红的地方指着注释，错在用例。
+    constants = inspect.getsource(pirate_loop).split("class PirateLoop", 1)[0]
+
+    assert not re.search(r"^MAIL_BATTLE_SUB_TAB\s*=", constants, re.M), (
+        "又出现了一个方向专用的二级标签坐标；那一排只有「舰队」那个按钮有反应"
+    )
+
+    # 反过来：切回去那一下必须真的走同一个坐标 —— `target` 只许被赋一次，
+    # 而且赋的就是那个开关。
+    # ⚠️ 同上：数「出现几次」会把注释里提到的那次也数进去（我刚踩过）。
+    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
+    targets = re.findall(r"^\s*target = (.+)$", source, re.M)
+    assert targets == ["MAIL_FLEET_SUB_TAB"], (
+        f"两个方向应当共用同一个 target，实际是 {targets}；分叉就说明又按方向挑坐标了"
+    )
+
+
+def test_it_looks_before_it_clicks() -> None:
+    """⚠️⚠️ **先看再点。** 它是开关，而且状态跨次记住。
+
+    已经在目标档位上时再点一下会把它**翻掉**。原先是无条件先点再看，于是
+    「上一趟停在舰队」这一种情形下第一下就翻走、判据对不上、重试再点又翻回来——
+    本该一下到位的一个按钮变成了赌奇偶，而那正是那一夜「切不到舰队，整趟不读」的成因。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
+    before_click = source.split("self._driver.click(", 1)[0]
+
+    assert "_sub_tab_matches(" in before_click, (
+        "点之前没有先看一眼；它是开关，已经到位时再点一下会翻掉"
+    )
+
+
+def test_the_click_label_dodges_the_read_only_gate() -> None:
+    """⚠️⚠️ 点击标签里**一个 `FORBIDDEN_LABELS` 都不许沾**。
+
+    那个字符串不是给人看的说明文字——`human_input._reject_acting_label` 拿它当安全闸，
+    而回收那一趟正是 `allow_actions=False` 跑的。2026-09-13 夜这里连撞两次：
+    「默认（含攻击报告）」中了「攻击」，「取消舰队筛选」又中了「取消」。
+    真合进去就是回收趟当场崩。
+    """
+    from evo_helper.game.human_input import FORBIDDEN_LABELS
+
+    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
+    names = re.findall(r'name = "([^"]*)" if fleet else "([^"]*)"', source)
+    assert names, "找不到那两个标签名；这条用例过期了"
+    for label in names[0]:
+        for word in FORBIDDEN_LABELS:
+            assert word not in label, f"标签「{label}」里有 {word!r}，只读进程点它会被拒"
