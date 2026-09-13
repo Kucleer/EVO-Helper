@@ -159,6 +159,35 @@ MAIL_TITLE_BAND_HEIGHT = 18
 #: 时刻带会被扫描边界切成一条「顶端 = 列表顶」的假带，反而顶到第 0 行上。
 MAIL_TIME_SCAN_MARGIN = 30
 
+#: 一行邮件的三段文字**各自的墨迹**相对**时刻带顶**的纵向范围。
+#:
+#: 实测 2026-09-12 离线量在七屏实拍（`var/logs/sample-mail*.png` 四屏、
+#: `var/mail-list.png` 一屏，共 42 行）上：主题 41/42 行落在 −30..−18
+#: （唯一的例外是被面板上沿切掉的那半行），发件人与时刻 42/42 行一致。
+#:
+#: ⚠️ **这三段加起来只有 39 像素（−30..+9），而名义行 ROI 高 85、行距 86。**
+#: 也就是说一行里**有 46 像素是空的**，而那 46 像素全在文字下方 —— 文字挤在
+#: 行的上三分之一。`mail_rows()` 读的名义 ROI 因此**没有向上的余量**：列表一离
+#: 网格（`_mail_time_bands` 里那几个 +10..+82 的实测偏移），主题就被 ROI 上沿
+#: 横着切掉。整段实测见 `mail_row_aligned`。
+MAIL_SUBJECT_INK_DY = (-30, -18)
+MAIL_SENDER_INK_DY = (-18, 3)
+MAIL_TIME_INK_DY = (0, 9)
+
+#: 自对齐重读一行时，ROI 上沿取「这一行自己的时刻带顶 − 这个数」。
+#:
+#: 安全窗口由上面那三段算出来，**不是调出来的**（ROI 高 85、行距 86）：
+#:
+#: - 自己的主题不许被上沿切掉：``dy ≥ 30``（留 2 像素余量 ⇒ 32）
+#: - 自己的时刻不许被下沿切掉：``dy + 9 ≤ 85`` ⇒ ``dy ≤ 76``
+#: - 下一行的主题不许挤进来：``dy + (86 − 30) ≥ 85`` ⇒ ``dy ≥ 29``
+#: - 上一行的时刻不许挤进来：``dy − (86 − 9) ≤ 0`` ⇒ ``dy ≤ 77``
+#:
+#: 取 48：落在 ``[32, 76]`` 里，两头各留 16 / 28 像素，而且正好是列表**停在顶部
+#: 不动时**实测的偏移（`var/mail-list.png` 六行量到 +48/+49）—— 也就是说自对齐
+#: 读出来的那一屏，和今天「碰巧对上了网格」的那一屏是同一个框。
+MAIL_ROW_ALIGNED_DY = 48
+
 #: 「获得资源」那 12 格**不走 tesseract**，走 `vision.resource_digits` 的字模匹配。
 #:
 #: ⚠️ **这一段原先是四套 tesseract 配方 + 两套谈拢，2026-08-18 整段换掉了。**
@@ -235,6 +264,13 @@ class ImageReportScreens:
         #: 而「单位」和「损失单位」会各问一次。
         self._details_anchor: int | None = None
         self._details_anchor_read = False
+        #: 时刻带定位结果的缓存。**一个实例只读一屏**，所以这个答案是常量。
+        #:
+        #: 缓存不是省时间的优化，是省**一整趟信箱**的：定位要在纯 Python 里逐行
+        #: 数墨迹（列表区 ~560 行 × 140 列），而现在问它的地方有四处（未读色、
+        #: 标定探针、离网格量、自对齐重读）。不缓存的话，加一处取证就等于给每一屏
+        #: 再加一遍全扫描，而一趟要翻八屏。
+        self._time_bands: dict[int, int] | None = None
 
     # -- ReportScreens ---------------------------------------------------
 
@@ -276,9 +312,17 @@ class ImageReportScreens:
         十几像素就整条落到行距的空白上——实测**对齐那一屏取到 0.233、离网格的
         两屏取到 0.000**，于是「未读最小占比」被拉到 0，两侧再也分不开。
 
-        ⚠️ **`mail_rows()` 的 OCR 之所以不受这件事影响，是因为它的 ROI 有 85px
-        高，装得下这点漂移。颜色判据没有这份余量**——18px 的带子容不下 82px 的
-        漂移。这就是同一屏上文字读得好、颜色读不出的全部原因。
+        ⚠️⚠️ **原先这里写着「`mail_rows()` 的 OCR 不受这件事影响，因为它的 ROI
+        有 85px 高、装得下这点漂移」——2026-09-12 的离线实测推翻了这句话。**
+        85px 的高度不是余量：一行的文字只占 `MAIL_SUBJECT_INK_DY` 到
+        `MAIL_TIME_INK_DY` 那 39 像素，全挤在行的上三分之一，剩下 46 像素的空白
+        在**文字下方**。于是**向上一个像素的余量都没有**：同一批七屏 42 行上，
+        偏移 ≥ 30 的 18 行认出 17 行，偏移 < 30 的 24 行只认出 5 行——而那 5 行
+        （偏移 +10 / +11）读到的还是**下一行**的主题，只因为同屏主题都一样才
+        没露馅。
+        文字这一侧受的影响不比颜色小，只是失效形态不同——颜色归零看得见，
+        主题读成噪声则一路装成「认不出的邮件」滑过主题闸。整段与那次的补法在
+        `mail_row_aligned`。
 
         ## 锚点取时刻格
 
@@ -308,6 +352,8 @@ class ImageReportScreens:
         ROI 下沿被切掉）。那是名义行 ROI 本身的老毛病（点击坐标也按名义行算），
         不是这里引入的；日常那趟每次进信箱都先拖回顶部正是为了压住它。
         """
+        if self._time_bands is not None:
+            return self._time_bands
         grey = self._image.convert("L")
         pixels = grey.load()
         layout = self._layout
@@ -337,6 +383,7 @@ class ImageReportScreens:
             inside = [top for top in tops if row.top <= top <= row.bottom]
             if len(inside) == 1:
                 located[index] = inside[0]
+        self._time_bands = located
         return located
 
     def _title_color(self, time_band_top: int | None) -> MailRowColor | None:
@@ -349,6 +396,71 @@ class ImageReportScreens:
             return None
         left, right = MAIL_TITLE_COLUMN
         return self._band_color(Region(left, top, right, bottom))
+
+    def mail_title_band_offsets(self) -> tuple[int | None, ...]:
+        """每一名义行的**离网格量**：这一行的时刻带顶 − 名义行顶。定位不到就 `None`。
+
+        下标就是 `mail_rows()` 的下标，和它读的是同一帧（同一个实例）。
+
+        这是「主题读不读得出」唯一的判别量：一行的文字只占时刻带顶的
+        −30..+9（`MAIL_SUBJECT_INK_DY` 那三段），名义 ROI 是 0..85，所以
+
+        - 偏移 < 30 ⇒ 主题被 ROI 上沿横着切掉 ⇒ 读成噪声 ⇒ 归 `UNKNOWN`；
+        - 偏移 ≲ 20 ⇒ 主题整条在 ROI 之外，ROI 里装的是**下一行**的主题
+          ⇒ 读得出、但读的是别人的（同屏主题都一样时这件事看不出来）。
+
+        ⚠️ **它只描述，不裁决。** 交出去是给取证与日志用的；拿它去决定
+        「这一行开不开」等于把一个观测量当成判据，而主题读不出时**正确的方向
+        是把主题读准，不是收紧闸门**（整段在 `tools.pirate_loop.MailRow.unread`
+        上方那条「读不出绝不能往不开那一侧倒」）。
+        """
+        bands = self._mail_time_bands()
+        layout = self._layout
+        return tuple(
+            None if (top := bands.get(index)) is None else top - layout.mail_row(index).top
+            for index in range(layout.mail_visible_rows)
+        )
+
+    def mail_row_aligned(self, index: int) -> str | None:
+        """把整行 ROI **按这一行自己的时刻带对齐**之后再读一遍。定位不到交回 `None`。
+
+        ⚠️ **现在只给取证用，不参与任何判断。** `mail_rows()` 一个字都没改。
+        它在这里的用途是回答实机上那个问不出来的问题：一行主题读不出的时候，
+        **同一帧、同一套配方**、只把 ROI 的上沿换成自对齐，到底读不读得出来。
+        没有这一问，日志里只剩一串噪声字符串，而噪声既可能是「框切错了」，
+        也可能是「那几个像素本来就糊」——两者的处置完全相反。
+
+        框宽（520）、放大（`ocr_upscale`）、不二值化、`--psm 6` 全部原样照抄
+        `mail_rows()`，**唯一的差别是 ROI 的纵向原点**。这是刻意的：一次只换
+        一个变量，交回来的读数才说得清是哪一个变量在起作用。
+
+        离线实测（2026-09-12，七屏 42 行，真值人眼核过，判据用
+        `classify_report_subject`）：
+
+        ==========================  ==========  ==========
+        ROI 纵向原点                主题认出    时刻读出
+        ==========================  ==========  ==========
+        名义行顶（今天生产用的）      22/42       35/42
+        自对齐，``dy = 48``          **32/42**   41/42
+        ==========================  ==========  ==========
+
+        ⚠️ **`dy` 不是调出来的**：39 / 45 / 48 / 54 / 60 五档跑下来是
+        33 / 32 / 32 / 31 / 31，差一行的抖动而已——它落在
+        `MAIL_ROW_ALIGNED_DY` 那个算出来的窗口里就行，不必标定。
+
+        剩下那 10 行**不是对齐能救的**（列表上下沿真的只露了半行、以及背景
+        透上来的幽灵字），配方那一侧还值不值得动，要等实机取证的裁片，
+        见 `tools.pirate_loop.PirateLoop._record_unreadable_subject_evidence`。
+
+        实拍不进 Git，所以这张表在仓库里复算不了——量它的那批图在主仓
+        `var/logs/sample-mail*.png` 与 `var/mail-list.png`。
+        """
+        bands = self._mail_time_bands()
+        top = bands.get(index)
+        if top is None:
+            return None
+        row = self._layout.mail_row(index)
+        return self._read(row.shifted(top - MAIL_ROW_ALIGNED_DY - row.top), OCR_PSM_COLUMN)
 
     def mail_row_crops(self, pad: int = MAIL_ROW_EVIDENCE_PAD) -> tuple[Any, ...]:
         """每一行的**原分辨率**裁片，只给标定探针与诊断证据用（不喂 OCR）。

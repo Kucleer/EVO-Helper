@@ -41,7 +41,8 @@ from evo_helper.vision.mail_unread import (
     MailUnreadCalibration,
     classify_unread,
 )
-from evo_helper.vision.report_layout import LAYOUT_VIEWPORT, LIVE_LAYOUT
+from evo_helper.vision.report_layout import LIVE_LAYOUT
+from support.mailbox import build_mail_list_frame
 
 #: 一组测试专用的标定。**故意不去动 `CALIBRATION`**：那个常量的值本身就是
 #: 「有没有标定过」这条事实，测试改掉它就等于把被测事实抹掉了。
@@ -205,62 +206,13 @@ def test_the_probe_leaves_a_gap_between_the_two_bands() -> None:
 # -- 合成图：像素那一侧量得出来吗 ---------------------------------------------
 
 Image = pytest.importorskip("PIL.Image", reason="requires the vision extra")
-ImageDraw = pytest.importorskip("PIL.ImageDraw", reason="requires the vision extra")
 pytest.importorskip("pytesseract", reason="requires the vision extra")
 
-#: 半透明面板的底色，偏蓝（R < B）。`ImageChops.subtract` 在 0 处截断，
-#: 所以它落在最低那一桶——这正是「白字和底色都不暖」成立的原因。
-PANEL_BACKGROUND = (40, 44, 52)
 
-#: 未读标题的黄橙色与已读标题的白色。**这两个值是照着实拍图肉眼描述画的，
-#: 不是量出来的**：它们只用来验通路，任何「实机上分得开吗」的结论都不能引它。
-UNREAD_TITLE = (236, 176, 48)
-READ_TITLE = (240, 240, 244)
-
-#: 信封上那个**红色角标**。合成图里必须有它：它每一行都在、也是暖色，而标题带的
-#: 左界（`MAIL_TITLE_COLUMN`）刻意躲开了它。少画一块，「x 不许往左」那条边界
-#: 就变成了没人守的注释。
-ENVELOPE_BADGE = (200, 60, 52)
-
-
-def _frame(unread_rows: set[int], *, drift: int = 0, time_column: bool = True) -> Any:
-    """一张标定视口大小的合成信箱列表页。
-
-    按实拍量到的几何画三样东西：右侧的**时刻格**（自对齐的锚点）、标题带，
-    以及信封上的红色角标。`drift` 把整个列表内容整体挪开名义行顶，模拟
-    滚轮滚过之后**离网格**的那几屏——判据必须对它免疫。
-    """
-    from evo_helper.vision.optional.report_screens import (
-        MAIL_TIME_COLUMN,
-        MAIL_TITLE_BAND_DY,
-        MAIL_TITLE_BAND_HEIGHT,
-        MAIL_TITLE_COLUMN,
-    )
-
-    image = Image.new("RGB", LAYOUT_VIEWPORT, PANEL_BACKGROUND)
-    draw = ImageDraw.Draw(image)
-    for index in range(LIVE_LAYOUT.mail_visible_rows):
-        region = LIVE_LAYOUT.mail_row(index)
-        # 时刻带的顶端落在这一名义行里，这就是归位判据认的东西。
-        time_top = region.top + 24 + drift
-        if time_column:
-            draw.rectangle(
-                (MAIL_TIME_COLUMN[0] + 4, time_top, MAIL_TIME_COLUMN[0] + 90, time_top + 12),
-                fill=READ_TITLE,
-            )
-        title_top = time_top + MAIL_TITLE_BAND_DY
-        colour = UNREAD_TITLE if index in unread_rows else READ_TITLE
-        draw.rectangle(
-            (
-                MAIL_TITLE_COLUMN[0],
-                title_top,
-                MAIL_TITLE_COLUMN[1] - 1,
-                title_top + MAIL_TITLE_BAND_HEIGHT - 1,
-            ),
-            fill=colour,
-        )
-        draw.rectangle((792, title_top, 812, title_top + 12), fill=ENVELOPE_BADGE)
-    return image
+#: 合成图的画法与那几个颜色常量住在 `support.mailbox`：颜色这一组用例量它的颜色，
+#: `test_mail_row_alignment.py` 量它的框。两边共用一张图，几何才不会各自漂。
+def _frame(unread_rows: set[int], **kwargs: Any) -> Any:
+    return build_mail_list_frame(unread_rows, **kwargs)
 
 
 def _screens(unread_rows: set[int], **kwargs: Any) -> Any:
