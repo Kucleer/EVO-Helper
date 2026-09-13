@@ -82,7 +82,7 @@ date: 2026-09-13
 
 - Configuration: 无新开关（取证默认开，名额是标定常量不是运维旋钮）
 - Database: **无迁移**；只多写 `system_log`
-- Verification: 裸 `pytest`（4529 passed / 270 skipped，新增 36 条）/ ruff / mypy 全绿。
+- Verification: 裸 `pytest`（4546 passed / 273 skipped，新增 40 条）/ ruff / mypy 全绿。
   4 条实拍用例在 worktree 里 skip —— 已把主仓实拍临时拷进来跑过全绿再清掉。
   **无新裸 SQL 形态**：`_from_database` 与既有的 `mail_unread_probe._from_database`
   是同一条 `SELECT id, payload_json FROM system_log WHERE message = :message`
