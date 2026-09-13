@@ -879,6 +879,22 @@ def test_the_period_table_shows_reports_and_recovery_beside_the_resources(
     assert columns.index("挂机") == columns.index("利用率") - 1
 
 
+def test_an_abbreviated_cell_still_carries_the_exact_number(
+    client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
+) -> None:
+    """⚠️⚠️ **缩写把末几位抹掉了，全位数必须在 `title` 里拿得到。**
+
+    不挂的话，页面上就**再也读不出**这一格到底是多少——而库里明明还存着。
+    这一条钉的正是「缩写是排版决定，不是精度损失」那句话的落点。
+    """
+    _report(factory, reported_at_utc=NOW - timedelta(minutes=30), resources=((5, 123_456),))
+
+    html = client.get("/overview").text
+
+    assert "123.5K" in html
+    assert 'title="123,456' in html
+
+
 def test_the_period_table_reports_the_measured_numbers(
     client: TestClient, factory: sessionmaker[Session], run_id: UUID, planets: None
 ) -> None:
@@ -896,7 +912,11 @@ def test_the_period_table_reports_the_measured_numbers(
     assert _period_column(html, "08-19 今天", "攻击") == "4"
     assert _period_column(html, "08-19 今天", "攻击战报") == "3"
     assert _period_column(html, "08-19 今天", "战报回收率") == "75%"
-    assert _period_column(html, "08-19 今天", "合金碎片") == "27,500"
+    # ⚠️ 这一格**按 K 缩写**（用户口径 2026-09-13，对照表在
+    # `domain.overview.DISPLAY_UNITS`）。全位数没丢——它在 `title` 里，下一条钉着。
+    assert _period_column(html, "08-19 今天", slot_label(5)) == "27.5K"
+    # ⚠️ 旁边那一格**没有**单位（读数只有三四位，缩写既不省宽度又丢有效数字）。
+    assert _period_column(html, "08-19 今天", slot_label(8)) == "3"
     # ⚠️ 这一页的夹具时钟是 2026-08-19（`NOW`），**早于**残骸回收上线
     # （UTC 2026-09-10），所以这里「—」才是对的。
     # 「上线之后的零必须写 0」那一侧由

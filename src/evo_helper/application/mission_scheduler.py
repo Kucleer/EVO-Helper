@@ -1184,24 +1184,23 @@ class MissionScheduler:
             raise MissionParamError("回收节奏必须在 0–10 之间（整数十分位）；0 = 关")
         return tenths
 
-    #: 每趟读几封回收报告的上界。与 `storage.repository` 那个同名常量、
-    #: 以及 `web.schemas` 里那个 `le=12` 是同一个数，三处必须一起改。
-    MAX_RECYCLE_MAIL_OPENS = 12
+    def validate_recycle_mail_enabled(self, value: object) -> bool | None:
+        """校验「读不读回收报告」这个开关。留空返回 `None`（= 不动这一列）。
 
-    def validate_recycle_mail_opens(self, value: object) -> int | None:
-        """校验「每趟读几封回收报告」。留空返回 `None`（不读）。
+        ⚠️ **2026-09-13 从 0–12 的数改成开关**（用户口径：「我只需要 on/off」）。
+        原先那个上界在三处各写一份（这里、`storage.repository`、`web.schemas`
+        的 `le=12`），注释里还写着「三处必须一起改」—— 那正是「同一个事实写在
+        多处」那一类事故的现成样本，改成布尔之后三份一起没了。
 
-        ⚠️ **0 是合法值而且是默认值**，它的意思是「完全不读」——不是「没配」。
-        这一条和别的上限旋钮不同：别的旋钮 0 基本都是配错了。
+        ⚠️ **`None` 与 `False` 不是一回事**：`None` 说的是「这次请求没带这一项」
+        （别的字段在改，这一项别动），`False` 说的是「用户把它关掉了」。
+        混成一个的话，任何一次改别的设置都会顺手把开关清掉。
         """
-        opens = _optional_int(value, label="每趟读几封回收报告")
-        if opens is None:
+        if value is None:
             return None
-        if opens < 0 or opens > self.MAX_RECYCLE_MAIL_OPENS:
-            raise MissionParamError(
-                f"每趟读几封回收报告必须在 0–{self.MAX_RECYCLE_MAIL_OPENS} 之间；0 = 不读"
-            )
-        return opens
+        if isinstance(value, bool):
+            return value
+        raise MissionParamError("读不读回收报告只能是 true / false")
 
     def account_line_limit(self) -> int | None:
         """全账号此刻认的航线上限，**没配就是 `None`**。页面显示那句提示时读它。

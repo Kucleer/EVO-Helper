@@ -144,15 +144,56 @@ def test_the_fleet_tab_is_always_switched_back() -> None:
 
 
 def test_the_recycle_trip_is_off_by_default() -> None:
-    """⚠️ 旋钮是 0（默认）时**一步都不许走**，连信箱都不许进。
+    """⚠️ 开关关着时**一步都不许走**，连信箱都不许进。
 
     用户口径（2026-09-12）：「我希望这是有个开关…我担心这花费我太多的时间」。
     默认开着等于替所有人决定每趟多花几分钟。
+
+    ⚠️ 2026-09-13 这个旋钮从「每趟读几封」改成了纯开关（用户口径：
+    「我只需要 on/off」），判据不变。
     """
     calls: list[int] = []
     loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
     loop._ensure_run = lambda: calls.append(1)  # type: ignore[attr-defined, assignment]
     loop._scan_mail_rows = lambda **_kwargs: calls.append(2)  # type: ignore[attr-defined, assignment]
 
-    assert loop.collect_recycle_hauls(max_opens=0) is None
-    assert calls == [], "旋钮是 0 时连库和信箱都不该碰"
+    assert loop.collect_recycle_hauls(enabled=False) is None
+    assert calls == [], "开关关着时连库和信箱都不该碰"
+
+
+def test_being_off_still_leaves_a_line_in_the_log() -> None:
+    """⚠️⚠️ **关着也要说一句。**
+
+    2026-09-13 实机代价：`recycle_mail_opens` 是 NULL，于是这条旁路静默 `return`，
+    结果生产库里 233 发回收派遣全停在「待回收」、而 `system_log` 里
+    **一个字都没有** —— 翻遍日志也查不出「为什么不读」，只能靠读源码。
+
+    一条旁路可以不做事，**但不许不留痕**（同 `every-feature-needs-diagnosable-logs`）。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._collect_recycle_hauls_if_enabled)
+    off_branch = source.split("if not enabled:", 1)
+    assert len(off_branch) == 2, "找不到「关着」那一支；这条用例过期了"
+    # ⚠️ 按**行首缩进**切那条 `return`，不要按裸的 "return" 切：
+    # 这一支的注释里就写着「静默 `return`」四个字，那么切会在注释处就断开，
+    # 于是这条用例永远红 —— 而红的地方指着源码，错在用例（同 #333 那次）。
+    body = off_branch[1].split("\n            return", 1)[0]
+    assert "say(" in body, (
+        "「关着」那一支直接 return 了，没留下任何日志 —— "
+        "2026-09-13 就是这样让 233 发回收无声停在「待回收」的"
+    )
+
+
+def test_every_recycle_mail_leaves_evidence_behind() -> None:
+    """⚠️ 用户口径 2026-09-13：「我需要开回收，并且记录对应邮件」。
+
+    三条出路各有各的留痕，**一条都不许空手走**：
+    读不出 → 现场图；认不上 → 现场图；入库 → 邮件那一屏进库，派遣日志上点得开。
+
+    读不出那一档最要紧：信已经开了、内容看过了，什么都不留的话，
+    下一趟它照样读不出，而没有原分辨率的现场，连「为什么」都无从查起
+    （同 `get-the-pixels-before-changing-a-judgement`）。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._ingest_recycle_haul)
+
+    assert source.count("_dump_frame(") == 2, "读不出 / 认不上这两条出路要各留一张现场图"
+    assert "_store_report_screenshot(" in source, "入库那一份没把邮件那一屏存下来"

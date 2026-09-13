@@ -59,6 +59,7 @@ from evo_helper.domain.models import Coordinate
 from evo_helper.domain.overview import (
     BASIC_SLOTS,
     COUNT_STATS_START_UTC,
+    DISPLAY_UNITS,
     RARE_SLOTS,
     RECYCLE_STATS_START_UTC,
     RESOURCE_STATS_START_UTC,
@@ -91,7 +92,12 @@ from evo_helper.storage.overview import (
     ResourceTotal,
     UnreadReports,
 )
-from evo_helper.web.display import resource_amount_text, resource_precision_hint
+from evo_helper.web.display import (
+    resource_amount_short,
+    resource_amount_text,
+    resource_exact_text,
+    resource_precision_hint,
+)
 from evo_helper.web.persistent_service import MissionConsoleService
 from evo_helper.web.resource_icons import PANEL_SIZE, ResourceIconCache
 
@@ -222,6 +228,12 @@ class ResourceCell:
     #: `amount` 里**残骸回收**那一份（见 `storage.overview.ResourceTotal.recycled`）。
     #: 稀有三样这一格恒为 0：回收报告只写 0/1/2 三格。
     recycled: int = 0
+    #: 这一格在**宽表**上按哪个单位缩写（`domain.overview.DISPLAY_UNITS`）。
+    #: None = 不缩写，照旧写全位数。
+    #:
+    #: ⚠️ 它只影响 `short`。`text` 一个字不改 —— 「此刻」那几张卡和派遣日志页
+    #: 还在用它，那几处不缩写（理由在 `DISPLAY_UNITS` 上）。
+    unit: str | None = None
 
     @property
     def attacked(self) -> int:
@@ -245,6 +257,22 @@ class ResourceCell:
     def text(self) -> str:
         """页面上的那个数。近似值带「约」。"""
         return resource_amount_text(self._entry)
+
+    @property
+    def short(self) -> str:
+        """宽表上的那个数：有单位就缩写（`12,345,678` → `12.35M`），没有就同 `text`。
+
+        ⚠️ 缩写把末几位抹掉了，所以摆这一格的地方**必须**把 `exact` 挂进 `title`——
+        不然页面上就再也读不出这一格到底是多少。
+        """
+        if self.unit is None:
+            return self.text
+        return resource_amount_short(self._entry, unit=self.unit)
+
+    @property
+    def exact(self) -> str:
+        """全位数写法，给 `short` 那一格的 `title` 用。"""
+        return resource_exact_text(self._entry)
 
     @property
     def hint(self) -> str:
@@ -1107,6 +1135,9 @@ class _Haul:
                 approximate=bool(total and total.approximate),
                 uncertainty=total.uncertainty if total else 0,
                 recycled=total.recycled if total else 0,
+                # ⚠️ 单位从 `DISPLAY_UNITS` 查，**不在这里另写一份槽位号**：
+                # 那张对照表是「哪几格缩写」唯一的一份事实。
+                unit=DISPLAY_UNITS.get(slot),
             )
             for slot, total in ((slot, self.totals.get(slot)) for slot in slots)
         )

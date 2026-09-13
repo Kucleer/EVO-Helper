@@ -79,14 +79,24 @@
               {% if not row.recycle_before_start and row.recycle_rate is not none %}title="回收 ÷ 攻击。分母是攻击不是派遣——派遣里含着回收，拿它当分母的话档位 r=1.0 也只能到 50%。⚠️ 超过 100% 不是超量回收：一发攻击和它喂出的回收隔着半小时到两小时，跨过 UTC 零点（本地 08:00）的那一发攻击记昨天、回收记今天。按周/按月/总计会收敛回档位值"{% endif %}>
             {% if row.recycle_before_start or row.recycle_rate is none %}—{% else %}{{ '%.0f'|format(row.recycle_rate * 100) }}%{% endif %}
           </td>
+          {#
+            稀有那三格。⚠️ **写法交给 `cell.short`，模板里不做算术**（同整页的规矩）：
+            哪几格缩写、缩到什么单位，唯一的一份事实在 `domain.overview.DISPLAY_UNITS`。
+            这三格里只有一格有单位，另外两格读数只有三四位、照旧写全。
+
+            ⚠️ **缩写的那一格必须把全位数挂进 `title`**：末几位被抹掉了，
+            不挂的话页面上再也读不出它到底是多少，而库里明明还存着。
+          #}
           {% for cell in row.rare %}
-            <td>{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
+            <td title="{{ cell.exact }}（{{ cell.hint }}）">{{ cell.short }}</td>
           {% endfor %}
-          {# ⚠️ `title` 里那两个数**加起来正好等于格子里的合计**（`attacked` 是减出来的，
-             不是另查的）——两趟查的话页面上会出现「攻击 + 回收 ≠ 合计」。 #}
+          {# ⚠️ `title` 里那两个数**加起来正好等于全位数那个合计**（`attacked` 是
+             减出来的，不是另查的）——两趟查的话页面上会出现「攻击 + 回收 ≠ 合计」。
+             ⚠️ 合计写**全位数**而不是缩写：格子里已经是缩写了，`title` 是这一格
+             唯一能读到真值的地方。 #}
           {% for cell in row.basics %}
             <td class="col-basic{% if cell.recycled %} tone-recycle{% endif %}"
-                title="{{ cell.source_hint }}">{{ '约 ' if cell.approximate }}{{ '{:,}'.format(cell.amount) }}</td>
+                title="{{ cell.exact }} = {{ cell.source_hint }}">{{ cell.short }}</td>
           {% endfor %}
           {# 挂机运行时长。⚠️ **无观测写「—」，不写 0**：心跳是 2026-08-20 才加的，
              之前的天补不回来，而写 0 等于说「那天没开机」——那是假话。 #}

@@ -253,18 +253,19 @@
   </p>
 
   <div class="filter-bar" style="margin-top:10px">
-    <label for="recycle-mail-opens">读回收报告（每趟最多几封，0 = 不读）</label>
-    <input id="recycle-mail-opens" type="number" min="0" max="12" step="1" value="0"
-           aria-label="每趟读几封回收报告" style="width:80px">
-    <span id="recycle-mail-opens-display" class="muted" style="margin-left:8px">0（不读）</span>
+    <label for="recycle-mail-enabled">
+      <input id="recycle-mail-enabled" type="checkbox"
+             aria-label="读不读回收报告"> 读回收报告
+    </label>
+    <span id="recycle-mail-enabled-display" class="muted" style="margin-left:8px">关</span>
   </div>
   <p class="muted">
     回收发<strong>不产生战报</strong>，实收（金属/晶体/气体）写在信箱「报告 → 舰队」里的
-    <strong>回收报告</strong>邮件上。这个数是 0 时完全不读，派遣日志上的回收会一直停在
-    <strong>待回收</strong>；调成非 0 之后读到的那几发会翻成<strong>已回收</strong>，
-    资源计进概览与周期统计。<br>
-    ⚠️ <strong>调大 = 实收记得全，但每趟多花时间</strong>：一封约 8 秒，而那个标签里
-    大约三封信只有一封是回收报告（其余是「舰队返回」，不开）。<br>
+    <strong>回收报告</strong>邮件上。关着时完全不读，派遣日志上的回收会一直停在
+    <strong>待回收</strong>；打开之后读到的那几发翻成<strong>已回收</strong>，
+    资源计进概览与周期统计，邮件那一屏也一并存下来，在派遣日志上点得开。<br>
+    ⚠️ <strong>每趟最多开几封是写死的</strong>（20 封/趟），不在这里调：
+    一封约 8 秒，而那个标签里大约三封信只有一封是回收报告（其余是「舰队返回」，不开）。<br>
     ⚠️ <strong>它自己一笔预算，不和战报抢</strong>——读战报那一趟的开封预算天天满载，
     挤进去会让战报入库延后。
   </p>
@@ -349,13 +350,12 @@
     { element: document.getElementById('auto-toggle-log'), key: 'auto_toggle_log_seconds', label: '调度器重复日志窗口' },
   ];
   // 回收节奏滑块：range 0–10，显示 0.0–1.0，落库整数十分位
-  const recycleMailOpens = document.getElementById('recycle-mail-opens');
-  const recycleMailOpensDisplay = document.getElementById('recycle-mail-opens-display');
+  const recycleMailEnabled = document.getElementById('recycle-mail-enabled');
+  const recycleMailEnabledDisplay = document.getElementById('recycle-mail-enabled-display');
   function updateRecycleMailDisplay() {
-    const opens = Number(recycleMailOpens.value);
-    recycleMailOpensDisplay.textContent = opens === 0 ? '0（不读）' : `${opens} 封/趟`;
+    recycleMailEnabledDisplay.textContent = recycleMailEnabled.checked ? '开' : '关';
   }
-  recycleMailOpens.addEventListener('input', updateRecycleMailDisplay);
+  recycleMailEnabled.addEventListener('change', updateRecycleMailDisplay);
   const recycleRate = document.getElementById('recycle-rate');
   const recycleRateDisplay = document.getElementById('recycle-rate-display');
   function updateRecycleDisplay() {
@@ -448,7 +448,7 @@
         // `||` 会把它显示成空框，也就是显示成「用默认值」。
         for (const knob of knobs) knob.element.value = config[knob.key] ?? '';
         recycleRate.value = config.recycle_rate_tenths ?? 0;
-        recycleMailOpens.value = config.recycle_mail_opens ?? 0;
+        recycleMailEnabled.checked = Boolean(config.recycle_mail_enabled);
         updateRecycleMailDisplay();
         updateRecycleDisplay();
         renderPlanets(list);
@@ -503,7 +503,7 @@
       score_max_age_hours: maxAge,
       window_floor: floor,
       recycle_rate_tenths: Number(recycleRate.value),
-      recycle_mail_opens: Number(recycleMailOpens.value),
+      recycle_mail_enabled: recycleMailEnabled.checked,
     };
     for (const knob of knobs) {
       const text = knob.element.value.trim();

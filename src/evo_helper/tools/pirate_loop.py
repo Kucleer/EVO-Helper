@@ -414,6 +414,22 @@ MAIL_SCAN_PAGES = 4
 #: 报告（海盗一系 4 发侦察、bot 一轮 6 发探路）。
 MAIL_MAX_OPENS = 8
 
+#: 回收报告那一趟**每趟最多开几封**。
+#:
+#: ⚠️ **它是标定常量，不是运维旋钮**（2026-09-13 用户口径：「我只需要 on/off」）。
+#: 原先这个数是页面上的 0–12 输入框，而用户要的从来只是「读还是不读」——
+#: 那个数同时还在三个文件里各写了一份上界，是典型的「同一个事实写在多处」。
+#:
+#: 取 20 的账：实测回收派遣约 **80 发/天**，空闲回读一天起 6 趟左右
+#: （2026-09-13 实测 6 趟），6 × 20 = 120 > 80，积压清得掉。
+#: 上界这一侧：一封 ≈ 8 秒，20 封 ≈ 2.7 分钟，而那是**最坏情况**——
+#: 主题闸会把「舰队返回」整列拒掉（那一档占舰队标签约三分之二），
+#: 真正开到的远少于 20。
+#:
+#: ⚠️ **不要拿它去顶时间预算。** 这一趟真正的界是空闲回读那一趟自己的截止
+#: （`MAIL_EXIT_MARGIN`）；这个数只挡「一组标偏的判据让它一直开下去」。
+RECYCLE_MAIL_OPENS_PER_TRIP = 20
+
 #: **未读**邮件另有的一笔开封预算，独立于 `MAIL_MAX_OPENS` 之外。
 #:
 #: 未读 ⇒ 我们还没开过它 ⇒ 库里不可能有它的战报。这类邮件**必开**：漏掉一封不是
@@ -4189,16 +4205,20 @@ class PirateLoop:
 
     # -- 开工：先读战报，再更新计数 ------------------------------------------
 
-    def collect_recycle_hauls(self, *, max_opens: int) -> MailScan | None:
-        """去「舰队」标签读回收报告，把实收落表。关着（`max_opens <= 0`）时返回 None。
+    def collect_recycle_hauls(self, *, enabled: bool) -> MailScan | None:
+        """去「舰队」标签读回收报告，把实收落表。关着时返回 None。
 
         ## ⚠️ 它自己一趟、自己一笔预算
 
         日常那趟的开封预算实测**天天满载**（3/3 趟撞上限），回收报告挤进去等于
         每挤掉一封战报、那一发派遣就要多等一趟——真实代价是战报入库延迟，而那会
         连锁影响选靶的读数新鲜度与配额对账（整段在那份评估的 §3.4）。
-        所以这一趟与战报那一趟**完全分开**，预算来自用户那个旋钮
-        （`recycle_mail_opens`），默认 0。
+        所以这一趟与战报那一趟**完全分开**，每趟的开封上限是
+        `RECYCLE_MAIL_OPENS_PER_TRIP`（标定常量，取值的账在它头上）。
+
+        ⚠️ **2026-09-13：用户那个旋钮从「每趟读几封」变成了纯开关**
+        （口径：「我只需要 on/off」）。所以这里收的是 `enabled: bool`，
+        「几封」不再由调用方决定 —— 那不是用户要调的东西。
 
         ## ⚠️⚠️ 走完一定切回「战斗」标签
 
@@ -4209,8 +4229,9 @@ class PirateLoop:
         ⚠️ 切不回去也**不抛**：这一趟的实收已经入库了，抛出去只会把它连带作废。
         如实说一句，下一趟 `_enter_mailbox` 重进信箱时标签本来就会回到「战斗」。
         """
-        if max_opens <= 0:
+        if not enabled:
             return None
+        max_opens = RECYCLE_MAIL_OPENS_PER_TRIP
         repository, _run_id = self._ensure_run()
 
         def should_open(row: MailRow) -> bool:
@@ -4230,9 +4251,15 @@ class PirateLoop:
             label="回收报告",
             visit=visit,
             max_opens=max_opens,
-            # ⚠️ 未读那一档给**同一个**预算，不另给一份。回收报告基本全是未读
-            # （bot 从来没点过这个标签），两档各给一份就等于预算翻倍，
-            # 而用户那个旋钮说的是「这一趟最多花几封的时间」。
+            # ⚠️ 未读那一档给**同一个**预算，不另给一份。两档各给一份就等于
+            # 预算翻倍，而这个数说的是「这一趟最多花几封的时间」。
+            #
+            # ⚠️⚠️ **别再把「回收报告基本全是未读」当成前提**（老注释这么写的）。
+            # 实测 2026-09-13 推翻了它：战报那一趟的「未读必开」会在**列表页主题
+            # OCR 读不出**时把回收报告一起开掉（生产库 1009 次未读强开，
+            # 主题多是空串或乱码），开完发现不是战报就丢掉 —— 于是信箱里的回收
+            # 报告大量已经是**已读**。这一趟照样够得到它们，靠的是
+            # `should_open` 只拦「库里已有」、不拦已读。
             max_unread_opens=max_opens,
             should_open=should_open,
             fleet_sub_tab=True,
@@ -4252,14 +4279,21 @@ class PirateLoop:
             read_recycle_mail,
         )
 
+        report_id = uuid4()
         try:
             reading = read_recycle_mail(page)
         except RecycleMailUnreadable as error:
             # 不存半份、不猜。下一趟这一封还在信箱里（已读，但 `should_open` 那道
             # 闸只拦「库里已有」的，读不出的那些下一趟照旧会被再试一次）。
+            #
+            # ⚠️ **但要留下这一屏**（用户口径 2026-09-13：「记录对应邮件」）。
+            # 读不出是这条链路唯一会**无声丢数据**的地方：信已经开了、内容看过了、
+            # 什么都没留下，而下一趟它仍然读不出——没有原分辨率的现场，
+            # 连「为什么读不出」都无从查起。
             say(f"  第 {row.index} 行读不出回收报告：{error}")
+            self._dump_frame("recycle-mail-unreadable")
             return
-        claimed = repository.append_recycle_report(reading, report_id=uuid4())
+        claimed = repository.append_recycle_report(reading, report_id=report_id)
         metal, crystal, gas = (item.value for item in reading.amounts)
         if claimed is None:
             say(
@@ -4267,11 +4301,25 @@ class PirateLoop:
                 f"{metal} / {crystal} / {gas}，回收船 {reading.ships}），"
                 "但认不出是哪一发回收派遣；这一封没入库"
             )
+            # ⚠️ 认不上的那些**也要留现场**。实测预计抵达时刻不是唯一键
+            # （相邻两发落在同一个窗口里的比例不低），而「认不上」是这条链路
+            # 最可能的常态失败 —— 不留图的话，事后没有任何东西能回答
+            # 「那一封到底是哪一发的」。
+            self._dump_frame("recycle-mail-unclaimed")
             return
         say(
             f"  第 {row.index} 行回收实收入库（{reading.raw_time_text}："
             f"{metal} / {crystal} / {gas}，回收船 {reading.ships}）"
         )
+        # ⚠️ **入库这一份要把邮件那一屏一起存进库**（用户口径 2026-09-13：
+        # 「记录对应邮件」），走战报截图同一张表、同一条旁路 ——
+        # 派遣日志上那一发于是和攻击战报一样点得开。
+        #
+        # ⚠️ 复用 `report_panel` 那块 ROI 是**核过几何的**，不是顺手：
+        # 它是 `Region(700, 105, 1220, 800)`，而这封信上要认的两样都在里面 ——
+        # 三个资源格 x∈[845,1140] y∈[306,342]、回收船数 (1140, 374, 1210, 402)。
+        # 哪天那块 ROI 收窄，这张图会悄悄裁掉内容而不报错，所以数字写在这里。
+        self._store_report_screenshot(report_id, page)
 
     #: 星门那座建筑所在的星球。用户口径（2026-09-13）：「固定使用 4 系的那个球（主球）」。
     #:
@@ -5388,15 +5436,20 @@ class PirateLoop:
             say("  回收报告这一轮归空闲回读那一趟读；开工趟不读（路由 idle）")
             return
         try:
-            budget = repository.recycle_mail_opens()
+            enabled = repository.recycle_mail_enabled()
         except Exception as error:  # noqa: BLE001 - 见 docstring：旁路不许拖累主路径
-            say(f"  读不到回收邮件旋钮（{error}）；这一趟不读回收报告")
+            say(f"  读不到回收邮件开关（{error}）；这一趟不读回收报告")
             return
-        if budget <= 0:
+        if not enabled:
+            # ⚠️ **关着也要说一句。** 2026-09-13 之前这里是静默 `return`，
+            # 结果是：用户看着派遣日志上几百发永远停在「待回收」，而日志里
+            # **一个字都没有** —— 翻遍 system_log 也找不到「我没读」这件事，
+            # 只能靠读源码才知道旋钮没开。一条旁路可以不做事，但不许不留痕。
+            say("  回收报告开关是关的；这一趟不读（页面：攻击配置 → 读回收报告）")
             return
-        say(f"  开始读回收报告（这一趟最多 {budget} 封；旋钮是「每趟读几封」）")
+        say(f"  开始读回收报告（这一趟最多 {RECYCLE_MAIL_OPENS_PER_TRIP} 封）")
         try:
-            scan = self.collect_recycle_hauls(max_opens=budget)
+            scan = self.collect_recycle_hauls(enabled=True)
         except RoundExhausted:
             # 这一条是**真的要往上抛**的：名额/时间用完了是整轮的事，
             # 在这里吞掉会让调用方以为这一轮还能接着干。
