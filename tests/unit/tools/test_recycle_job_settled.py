@@ -105,7 +105,7 @@ def test_every_recycle_outcome_settles_the_job_source_level() -> None:
         f"`_recycle_once` 有 {returns_false} 条失败出口，却只有 {settles} 处结作业；"
         "漏掉的那条会让作业永远 pending、每轮重试，攻击的名额被占死"
     )
-    assert 'self._finish_recycle_job(coordinate, "dispatched")' in source, (
+    assert 'self._finish_recycle_job(coordinate, "dispatched"' in source, (
         "派出成功之后没有结作业 —— 那一条会被下一轮当成待办再派一次"
     )
 
@@ -128,3 +128,94 @@ def test_recycle_dispatch_is_not_recorded_as_an_attack() -> None:
     assert "mission_kind=MISSION_KIND_RECYCLE" in source, (
         "回收派遣没显式传 mission_kind —— 默认值是 ATTACK，会让回收喂自己"
     )
+
+
+# -- 派出的那一发要挂回作业上 -----------------------------------------------
+
+
+class _DispatchRecordingRepo(_Repo):
+    """在 `_Repo` 的基础上，把 `_record_dispatch` 写下的那一发也记下来。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.saved_dispatch: object | None = None
+        self.settled_dispatch_ids: list[object] = []
+
+    def save_attack_intent(self, intent: object) -> None:  # noqa: ARG002
+        return None
+
+    def save_dispatch(self, dispatch: object) -> None:
+        self.saved_dispatch = dispatch
+
+    def record_flight_time(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def finish_recycle_job_for_target(
+        self, *, target, origin, state, executed_at_utc, dispatch_id=None
+    ):  # noqa: ANN001, ANN003, ARG002
+        self.settled_dispatch_ids.append(dispatch_id)
+        return super().finish_recycle_job_for_target(
+            target=target,
+            origin=origin,
+            state=state,
+            executed_at_utc=executed_at_utc,
+            dispatch_id=dispatch_id,
+        )
+
+
+def _recyclable_loop(repo: _DispatchRecordingRepo) -> BotLoop:
+    """一个能跑完 `_recycle_once` 顺利那一路的 loop：碰屏幕的全是假的。
+
+    ⚠️ **`_record_dispatch` 和 `_finish_recycle_job` 都是真的** —— 这条用例守的
+    正是这两者之间的接线，换成桩就等于没测。
+    """
+    from datetime import timedelta
+
+    from evo_helper.domain.flight_estimate import FlightEstimate, FlightSource
+    from evo_helper.game import pirate_ui
+    from evo_helper.tools.pirate_loop import TargetCheck
+
+    class _Driver:
+        def click(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def wait(self, _seconds: float) -> None:
+            return None
+
+    loop = _loop_with(repo)
+    loop._driver = _Driver()  # type: ignore[assignment]
+    loop._goto_checked = lambda _c: TargetCheck.CONFIRMED  # type: ignore[method-assign]
+    loop._find_recycle_button = lambda: 100  # type: ignore[method-assign]
+    loop._wait_for_recycle_dialog = lambda: pirate_ui.RECYCLE_DIALOG_TITLE  # type: ignore[method-assign]
+    loop._require_origin_before_dispatch = lambda _c, *, purpose: True  # type: ignore[method-assign]
+    loop._handle_dialog = lambda _c, *, purpose: True  # type: ignore[method-assign]
+    loop._briefing_mission = lambda: "回收"  # type: ignore[method-assign]
+    loop._read_flight_time = lambda _c: FlightEstimate(  # type: ignore[method-assign]
+        flight=timedelta(minutes=3),
+        source=FlightSource.BRIEFING_ARRIVAL,
+        reason="用例",
+    )
+    loop._launch = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+    loop._leave_dispatch_list = lambda: None  # type: ignore[method-assign]
+    return loop
+
+
+def test_the_dispatch_that_was_just_sent_is_hung_onto_the_job() -> None:
+    """⚠️ **派出成功那一路必须把这一发的 `dispatch_id` 写进作业。**
+
+    `recycle_jobs.dispatch_id` 这根外键从建表到 2026-09-12 一行都没写过（193 行
+    全是 NULL）：仓储和 `_finish_recycle_job` 早就收这个参数了，断的是调用方
+    —— `_record_dispatch` 返回 `None`，派遣 id 根本没出来。
+
+    没有它，读回收邮件那条链路只能拿「坐标 + 时刻」去凑实收是哪一发派的，
+    而同一坐标一天可能回收好几趟。
+    """
+    repo = _DispatchRecordingRepo()
+    loop = _recyclable_loop(repo)
+    target = Coordinate(5, 332, 5)
+
+    assert loop._recycle_once(target) is True
+
+    assert repo.calls == [(target, "dispatched")]
+    assert repo.saved_dispatch is not None
+    assert repo.settled_dispatch_ids == [repo.saved_dispatch.dispatch_id]
