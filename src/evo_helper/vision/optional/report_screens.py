@@ -29,6 +29,7 @@ from evo_helper.vision.parsers import REPORT_TIME_RE, normalise_report_time
 from evo_helper.vision.report_layout import (
     OCR_PSM_COLUMN,
     OCR_PSM_LINE,
+    RECYCLE_SHIP_OFFSETS,
     ColumnBand,
     Region,
     ReportLayout,
@@ -51,6 +52,11 @@ OCR_LANGUAGES = "chi_sim+eng"
 #: 8 封语料）是在那条路径上做的，`upscale` 在这里叫 `scale`，顺序同样是
 #: 先放大再二值化。名字不同、含义必须相同，否则标出来的阈值指的不是同一件事。
 #: 每一项是 `(放大倍数, 二值化阈值或 None)`。
+#: 读「回收船」那一格试哪几档放大。**沿用三格那一套的放大倍数**，不另发明一份：
+#: 同一屏、同样的小白字，两处各挑一套的话，下次有人调其中一套就会莫名其妙地
+#: 只修好一半。
+RECYCLE_SHIP_SCALES: tuple[int, ...] = (3, 4, 2)
+
 RECYCLE_CELL_RECIPES: tuple[tuple[int, int | None], ...] = (
     (4, 120),
     (4, None),
@@ -571,15 +577,36 @@ class ImageReportScreens:
         first, second, third = out
         return (first, second, third)
 
-    def recycle_ship_count(self) -> int | None:
-        """回收船数。读不出交回 `None` —— 它是容量不变量唯一的锚。
+    def recycle_ship_candidates(self) -> tuple[int, ...]:
+        """回收船数的**全部候选**，按可信度排。一个都读不出时返回空。
 
-        ⚠️ **不许兜底成 0 或者别的什么**：0 会让容量判据恒假、整条链路静默停摆，
-        而 `None` 在上层的意思明确是「这一封读不齐，下一趟再来」。
+        ⚠️ **交出候选而不是答案**，同三格读数那一步（`recycle_amount_candidates`）。
+        理由是实测的：详情页正文**行数会变**（坐标与名字长了就折行），整块跟着
+        上下浮动约 ±8px，而标定框只有 28px 高。2026-09-13 夜量了 33 张现场图 ——
+        数字实际落在 client y 408..419，标定框换算过去是 412..440，
+        **11px 高的数字被切掉 4px**，OCR 就废了。那一夜的失败几乎全是这一条。
+
+        ⚠️ **不许在这里挑。** 谁对由容量不变量裁（`domain.recycle_mail`），
+        和挑三格用的是同一条外部事实。这一层只负责把看到的都交出去 ——
+        「哪个框更好」在这个仓库里已经被证伪过两次。
+
+        ⚠️ **0 不进候选**：0 会让容量判据恒假，而那与「读不出」不是一回事。
         """
-        text = self._read(self._layout.recycle_ship_count, OCR_PSM_LINE, scale=3)
-        digits = re.sub(r"\D", "", text)
-        return int(digits) if digits else None
+        seen: dict[int, None] = {}
+        for offset in RECYCLE_SHIP_OFFSETS:
+            region = self._layout.recycle_ship_count.shifted(offset)
+            for scale in RECYCLE_SHIP_SCALES:
+                try:
+                    text = self._read(region, OCR_PSM_LINE, scale=scale)
+                except Exception:  # noqa: BLE001 - 一档读炸不该带倒整封
+                    continue
+                digits = re.sub(r"\D", "", text)
+                if not digits:
+                    continue
+                value = int(digits)
+                if value > 0:
+                    seen.setdefault(value, None)
+        return tuple(seen)
 
     def report_panel_image(self, quality: int = REPORT_PANEL_WEBP_QUALITY) -> ReportPanelImage:
         """把整块战报面板裁出来、编码成 WEBP。**这一块不喂 OCR，是给人看的。**
