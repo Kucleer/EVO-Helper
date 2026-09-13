@@ -1575,6 +1575,14 @@ def record_planet_list_overlay_retry(
 #: 它在账上和「战报还没回来」长得一模一样。
 _PROTECTION_BOUNCE_LOG_SOURCE = "tools.protection_bounce"
 
+#: 「列表页这一行的主题读不出」的取证记录在 `system_log` 里的 message。
+#:
+#: 单独一个 message 而不是混进 `MAIL_UNREAD_PROBE_MESSAGE`，理由和
+#: `_PROTECTION_BOUNCE_LOG_SOURCE` 一样：这件事「到底发生了几次」要能一句 SQL
+#: 数出来。而两条记录的**开关策略也不同** —— 未读色那条是标定语料，默认关、
+#: 靠环境变量开；这一条是**故障现场**，默认开、靠名额封顶。
+MAIL_SUBJECT_EVIDENCE_MESSAGE = "信箱列表页主题读不出"
+
 #: 信箱里**要打开、但不该喂给战报解析器**的那几种邮件。
 #:
 #: ⚠️ 它同时是两处判据的唯一来源：翻信箱时「这一行值不值得开」（`wanted`），
@@ -1624,6 +1632,25 @@ class PirateLoop:
     #: 的样子」，任意一屏都答得了，多录只是重复。6 屏够覆盖几趟不同的信箱状态
     #: （全已读的那一屏也是证据：它给出已读那一侧的分布）。
     MAX_MAIL_UNREAD_PROBES: int = 6
+
+    #: 「这一屏有主题读不出的行」这条取证，一个进程最多记这么多屏（见
+    #: `_record_unreadable_subject_evidence`）。**这一格管的是文字那一半。**
+    #:
+    #: 一屏一条、封顶 12：一趟信箱翻八屏，12 够覆盖一趟半。再多没有增量——
+    #: 要答的问题（「读不出的那些行离网格多少」）一屏就是一个样本，而同一趟里
+    #: 八屏的偏移往往一模一样（列表整体漂，不是逐行漂）。
+    MAX_MAIL_SUBJECT_EVIDENCE: int = 12
+
+    #: 上面那条取证里，**一条记录**最多带这么多行的裁片 + 自对齐重读。
+    #:
+    #: ⚠️ **图和重读一起封顶，文字不封顶**（同 `MAX_NAV_READBACK_FRAMES` 那条
+    #: 「文字每次都记，只有图封顶」）。两样都贵而且贵在不同地方：一行原分辨率裁片
+    #: base64 之后约 69 KB，而自对齐重读是**一次真的 OCR**（读一行约几百毫秒，
+    #: 直接加在开封循环上）。一屏六行全带上就是 400 KB + 两三秒。
+    #:
+    #: 取 2：一屏上的行离网格量几乎一致，两行足够回答「裁片上那几个字到底是什么」
+    #: 和「同一帧自对齐能不能读出来」；而剩下的行文字那一半照样全记。
+    MAIL_SUBJECT_EVIDENCE_CROPS: int = 2
 
     #: 导航栏回读对不上时，最多往 `system_log` 里塞这么多张**整帧**缩略图（见
     #: `_record_navigation_bar_mismatch`）。**文字每次都记，只有图封顶。**
@@ -2844,6 +2871,10 @@ class PirateLoop:
             for index, (text, flag) in enumerate(zip(texts, unread, strict=True))
         ]
         self._record_mail_unread_probe(screens, rows)
+        # ⚠️ **排在 `rows` 造好之后、交回调用方之前**：取证要的是「这一屏读成了
+        # 什么」，而那正是这几行 `MailRow`；放到调用方那边就得把 `screens`（同一帧）
+        # 一路传下去，而同一帧这件事是这个方法的全部约定。
+        self._record_unreadable_subject_evidence(screens, rows)
         return rows
 
     def _mail_row_unread(self, screens: Any, count: int) -> list[bool | None]:
@@ -2980,6 +3011,126 @@ class PirateLoop:
                 "mail_row_png_base64": crops,
             },
         )
+
+    def _record_unreadable_subject_evidence(self, screens: Any, rows: Sequence[MailRow]) -> None:
+        """这一屏有主题读不出的行时，把**为什么读不出**的现场写进 `system_log`。
+
+        ## 它要回答的那个问题
+
+        2026-09-12 那一夜 65 分钟里开封 58 封、白开 50 封，日志里只剩一串
+        `'TTT     seesere'` / `'一一 band a | rt rm kar Ae'`。噪声字符串本身
+        **答不了下一步该做什么**：它既可能是「ROI 把字切了」，也可能是
+        「那几个像素本来就糊」，而两者的处置正好相反（改框 vs 改配方）。
+
+        所以这条记录里三样缺一不可：
+
+        - **离网格量**（`title_band_offset` = 这一行的时刻带顶 − 名义行顶）。
+          这是唯一的判别量：一行的文字只占时刻带顶的 −30..+9，名义 ROI 是
+          0..85，所以偏移 < 30 就是**主题被 ROI 上沿横着切掉**。整段与离线
+          实测在 `vision.optional.report_screens.mail_title_band_offsets`。
+        - **同一帧自对齐重读一次的结果**（`aligned_subject`）。同一套配方、
+          只换 ROI 的纵向原点；读得出就说明这几个像素是好的、框错了。
+        - **原分辨率裁片**。前两样是机器读的，这一样是给人读的——「那四个字
+          到底是什么」只有人眼答得了，而这一夜真正缺的就是它。
+
+        ⚠️ **裁片必须原分辨率。** 480 宽的整帧缩略图上这行小字是一团糊斑，
+        整条教训在 `tools.scan_coordinates.crop_png_base64`。
+
+        ## 默认开
+
+        和 `_record_mail_unread_probe`（默认关、靠 `ENV_MAIL_UNREAD_PROBE`）
+        相反，而这个差别是**故意**的：那条采的是标定语料，常开会把日志表写成
+        语料库；这条记的是**正在发生的故障**，而默认关意味着「出事那一夜手上
+        什么都没有」——本仓已经为这件事付过两次账（2026-08-17 的
+        `unrecognised screen`、2026-08-13 的「那 59 封开的到底是什么」）。
+        代价由名额封顶（`MAX_MAIL_SUBJECT_EVIDENCE`）和
+        `MAIL_SUBJECT_EVIDENCE_CROPS` 兜住，跨轮那一半归 `_allow_evidence_frame`。
+
+        ⚠️ **它一个判断都不改。** 主题读不出仍旧是 `UNKNOWN`、仍旧照开——
+        「读不出绝不能往不开那一侧倒」（`MailRow.unread` 上方那条）在这次改动里
+        一个字都没动。这里只是把现场记下来。
+
+        ⚠️ **取证不许弄死链路**：拿不到能力（轻量测试桩）就不记，抛了就吞掉。
+        同 `_value_box_evidence`。
+        """
+        unreadable = [row for row in rows if row.kind is ReportKind.UNKNOWN]
+        if not unreadable:
+            return
+        if getattr(self, "_mail_subject_evidence", 0) >= self.MAX_MAIL_SUBJECT_EVIDENCE:
+            return
+        offsets_of = getattr(screens, "mail_title_band_offsets", None)
+        if not callable(offsets_of):
+            return
+        try:
+            offsets = tuple(offsets_of())
+        except Exception:  # noqa: BLE001 - 见 docstring：取证不许弄死链路
+            return
+        self._mail_subject_evidence = getattr(self, "_mail_subject_evidence", 0) + 1
+
+        def offset(index: int) -> int | None:
+            return offsets[index] if index < len(offsets) else None
+
+        body: dict[str, Any] = {
+            "rows_on_screen": len(rows),
+            "unreadable": len(unreadable),
+            "rows": [
+                {
+                    "index": row.index,
+                    "subject": row.subject,
+                    "raw_time_text": row.raw_time_text,
+                    "unread": row.unread,
+                    "title_band_offset": offset(row.index),
+                }
+                for row in unreadable
+            ],
+        }
+        # ⚠️ 名额花在**未读**那几行上：它们是「必开」的那一档，白开的成本由它们付。
+        # 未读读不出（`None`）排在已读之前，理由同 `MailRow.unread`——
+        # 读不出按「可能是未读」办，而不是按「已读」办。
+        ranked = sorted(unreadable, key=lambda row: (row.unread is False, row.unread is None))
+        picked = ranked[: self.MAIL_SUBJECT_EVIDENCE_CROPS]
+        if _allow_evidence_frame(body, "mail_subject_unreadable"):
+            body["evidence_rows"] = [self._subject_row_evidence(screens, row) for row in picked]
+        record_system_log(
+            "WARNING",
+            "tools.pirate_loop",
+            MAIL_SUBJECT_EVIDENCE_MESSAGE,
+            payload=body,
+        )
+
+    def _subject_row_evidence(self, screens: Any, row: MailRow) -> dict[str, Any]:
+        """一行的**贵**证据：原分辨率裁片 + 同一帧自对齐重读。两样都可能拿不到。
+
+        分成一个小方法，是为了让「这一样取不到」只丢掉这一样：裁片取不到
+        （Pillow 版本、ROI 出画）不该把自对齐重读也一起丢掉，反过来也一样。
+        整条记录的文字那一半在任何情况下都已经写进去了。
+        """
+        entry: dict[str, Any] = {"index": row.index}
+        crops_of = getattr(screens, "mail_row_crops", None)
+        if callable(crops_of):
+            try:
+                crops = crops_of()
+                if row.index < len(crops):
+                    entry["mail_row_png_base64"] = crop_png_base64(crops[row.index])
+            except Exception:  # noqa: BLE001 - 同上：取证不许弄死链路
+                entry["crop_failed"] = True
+        aligned_of = getattr(screens, "mail_row_aligned", None)
+        if callable(aligned_of):
+            try:
+                aligned = aligned_of(row.index)
+            except Exception:  # noqa: BLE001
+                entry["aligned_failed"] = True
+            else:
+                entry["aligned_text"] = aligned
+                if aligned is not None:
+                    # 自对齐重读之后**这一行会被判成什么**。判据原样走生产那一条
+                    # （`mail_row_from_text`），不在这里另写一份：另写一份就会和
+                    # 生产分岔，而这条记录存在的意义正是拿它去预判改框值不值得。
+                    reread = mail_row_from_text(row.index, aligned)
+                    entry["aligned_subject"] = reread.subject
+                    entry["aligned_kind"] = reread.kind.name
+                    entry["aligned_time_text"] = reread.raw_time_text
+        return entry
 
     def _enter_mailbox(self) -> None:
         """关浮层 → 切地表 → 开信箱 → 拖回顶部。两条链路进信箱的唯一姿势。
