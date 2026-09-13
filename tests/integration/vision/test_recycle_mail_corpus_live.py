@@ -111,15 +111,47 @@ def test_every_mail_in_the_corpus_reads_and_passes_the_capacity_gate() -> None:
 
 
 def test_the_ship_count_is_read_on_every_mail() -> None:
-    """船数是容量不变量**唯一的锚**，一封读不出就整封作废。
+    """船数是容量不变量**唯一的锚**，一个候选都出不来就整封作废。
 
     单独一条是因为它的失败形态最隐蔽：船数读空时上面那条会直接抛「读不出」，
     和「资源格读错」混在同一个断言里，事后分不出是哪一半坏了。
+
+    ⚠️ 2026-09-13 夜改成**出候选**（`recycle_ship_candidates`）：详情页正文行数
+    会变，整块上下浮动约 52px，而标定框只有 28px 高 —— 单读一次接不住。
+    这里只断言「至少出得来一个候选」；挑哪一个是容量不变量的事，上面那条管。
     """
     for name in _frames():
         screens = _screens(name)
-        ships = screens.recycle_ship_count()  # type: ignore[attr-defined]
-        assert ships is not None and ships > 0, f"{name} 的回收船数读不出"
+        ships = screens.recycle_ship_candidates()  # type: ignore[attr-defined]
+        assert ships, f"{name} 的回收船数一个候选都读不出"
+        assert all(n > 0 for n in ships), f"{name} 的船数候选里有 0：{ships}"
+
+
+def test_a_wrong_ship_candidate_cannot_smuggle_a_reading_through() -> None:
+    """⚠️⚠️ **多给几个船数候选，不许换来「读错但自洽」。**
+
+    这是出候选这件事唯一真正的风险：某一档偏移正好框住隔壁那一行的数字，
+    而那个数同样是整数、同样能进容量判据。挡住它的是「三格 + 船数」必须
+    **一起**自洽 —— 一个错船数几乎不可能让三格恰好凑出来。
+
+    这一条把那句话钉成断言：往候选里掺一个明显错的船数，读出来的结果不许变。
+    """
+    for name in _frames()[:3]:
+        screens = _screens(name)
+        honest = read_recycle_mail(screens)
+
+        tainted = _screens(name)
+        real = tuple(tainted.recycle_ship_candidates())  # type: ignore[attr-defined]
+        # 掺两个假的：一个比真值小一位，一个大一位。
+        tainted.recycle_ship_candidates = lambda: (  # type: ignore[attr-defined]
+            real[0] // 10 + 1,
+            real[0] * 10,
+            *real,
+        )
+
+        assert read_recycle_mail(tainted).ships == honest.ships, (
+            f"{name}：掺进假船数之后读出来的变了 —— 容量闸没挡住"
+        )
 
 
 def test_the_coordinates_are_deliberately_not_read() -> None:

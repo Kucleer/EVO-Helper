@@ -46,7 +46,7 @@ class RecycleMailScreens(Protocol):
         self,
     ) -> tuple[Sequence[Quantity], Sequence[Quantity], Sequence[Quantity]]: ...
 
-    def recycle_ship_count(self) -> int | None: ...
+    def recycle_ship_candidates(self) -> Sequence[int]: ...
 
 
 class RecycleMailUnreadable(ValueError):
@@ -95,31 +95,49 @@ def read_recycle_mail(
     time_text = _TIME_TEXT_RE.search(header)
     if time_text is None:
         raise RecycleMailUnreadable("邮件页眉没有可用的时间原文")
-    ships = screens.recycle_ship_count()
-    if not ships or ships <= 0:
+    ship_candidates = [n for n in screens.recycle_ship_candidates() if n > 0]
+    if not ship_candidates:
         raise RecycleMailUnreadable("回收船数读不出；没有船数就没有容量判据")
     candidates = screens.recycle_amount_candidates()
     # ⚠️ 挑选只看数值，但**返回的必须是原来那个 `Quantity`**：画面上写的是 `4.42M`
     # 这种缩写，`approximate` 与 `uncertainty` 带着「这是个约数」这件事一路进库，
     # 页面据此标「约」。在这里重造一个 `uncertainty=0` 的会把约数说成精确值。
     by_value = [{item.value: item for item in cell} for cell in candidates]
-    picked = pick_amounts(
-        (sorted(by_value[0]), sorted(by_value[1]), sorted(by_value[2])),
-        ships=ships,
-        capacity_per_ship=capacity_per_ship,
-    )
-    if picked is None:
-        counts = "/".join(str(len(cell)) for cell in candidates)
-        raise RecycleMailUnreadable(f"三格挑不出一组读数（候选数 {counts}，船 {ships}）")
-    amounts = (by_value[0][picked[0]], by_value[1][picked[1]], by_value[2][picked[2]])
-    total = sum((item.value for item in amounts), Decimal(0))
-    if not amounts_are_consistent(total, ships, capacity_per_ship=capacity_per_ship):
-        raise RecycleMailUnreadable(f"挑出来的一组过不了容量闸：合计 {total} vs 船 {ships}；不猜")
-    return RecycleMailReading(
-        raw_time_text=time_text.group(0),
-        reported_at_utc=reported_at,
-        amounts=amounts,
-        ships=ships,
+    # ⚠️⚠️ **船数也出候选，整组由同一条容量不变量裁。**
+    #
+    # 2026-09-13 夜实测：详情页正文行数会变（坐标与名字长了就折行），整块上下浮动
+    # 约 ±8px，于是船数那一格常常被切掉一截。原先船数只读一次、读不出就整封作废，
+    # 那一夜的失败几乎全是这一条。
+    #
+    # ⚠️ **判据一个字没放松**：每一组 `(船数, 三格)` 仍旧要过 `pick_amounts` +
+    # `amounts_are_consistent` 两道。多出来的只是「多试几个船数」，
+    # 而一个读错的船数几乎不可能让三格恰好凑出自洽的一组 —— 那正是这条不变量
+    # 当初被选中当裁判的理由。
+    #
+    # ⚠️ **第一个过闸的就收手**，不继续找「更好的」：候选按可信度排（标定框那一档
+    # 在最前），而「哪一组更自洽」是个没有外部事实支撑的问题 —— 问它就等于又回到
+    # 「哪个框更好」那个已经被证伪两次的形状。
+    counts = "/".join(str(len(cell)) for cell in candidates)
+    for ships in ship_candidates:
+        picked = pick_amounts(
+            (sorted(by_value[0]), sorted(by_value[1]), sorted(by_value[2])),
+            ships=ships,
+            capacity_per_ship=capacity_per_ship,
+        )
+        if picked is None:
+            continue
+        amounts = (by_value[0][picked[0]], by_value[1][picked[1]], by_value[2][picked[2]])
+        total = sum((item.value for item in amounts), Decimal(0))
+        if not amounts_are_consistent(total, ships, capacity_per_ship=capacity_per_ship):
+            continue
+        return RecycleMailReading(
+            raw_time_text=time_text.group(0),
+            reported_at_utc=reported_at,
+            amounts=amounts,
+            ships=ships,
+        )
+    raise RecycleMailUnreadable(
+        f"没有一组读数过得了容量闸（三格候选 {counts}，船数候选 {ship_candidates}）；不猜"
     )
 
 
