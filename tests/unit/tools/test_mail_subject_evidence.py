@@ -361,3 +361,21 @@ def test_an_unreadable_subject_is_still_opened(looper: Any) -> None:
     assert row.kind is ReportKind.UNKNOWN
     assert row.may_be(ReportKind.ATTACK) is True
     assert row.may_be([ReportKind.PIRATE, ReportKind.ATTACK]) is True
+
+
+def test_the_screen_says_what_it_was_being_read_for(looper: Any) -> None:
+    """⚠️⚠️ **切标签的嗅探和正经翻信箱必须分得开。**
+
+    #329 之后 `_select_mail_sub_tab` 为了认「切到哪个标签了」会反复读列表
+    （一次切换最多三屏），而它的判据就是 `row.kind`。主题读不出时舰队类和
+    攻击报告都数到 0 ⇒ 判「对不上」⇒ 三次之后**整趟放弃**。
+
+    两边的代价差一个量级（一次开封 ≈8 秒 vs 一整趟），账上混在一起就说不清
+    哪一边更该先修；而且嗅探那三屏会把名额啃光，正经那几屏一条都留不下。
+    """
+    obj, recorder = looper
+
+    obj._record_unreadable_subject_evidence(_Screens((24,) * 6), [_unreadable(0)])
+    obj._record_unreadable_subject_evidence(_Screens((25,) * 6), [_unreadable(0)], source="sub_tab")
+
+    assert [payload["source"] for payload in recorder.subject_payloads] == ["scan", "sub_tab"]

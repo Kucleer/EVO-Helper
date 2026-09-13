@@ -2867,7 +2867,7 @@ class PirateLoop:
             tesseract_cmd=str(_tesseract_path()),
         )
 
-    def _mail_list_rows(self) -> list[MailRow]:
+    def _mail_list_rows(self, *, evidence_source: str = "scan") -> list[MailRow]:
         """当前这一屏列表上的每一行：主题、时间、类型。**一封都不打开。**
 
         代价是一次截图加六次窄 ROI OCR，比开一封（≈8 秒）便宜整整一个量级——
@@ -2877,6 +2877,18 @@ class PirateLoop:
         各问一次会得出两份都对、却对不上的读数：「第 2 行是未读」被安到另一屏的
         第 2 行上，而那一屏的第 2 行是另一封邮件（`_report_screens` 头上「每次
         重新建」那条注释防的正是这件事，只是方向相反）。
+
+        `evidence_source` 只进取证记录，**不影响任何读数**。有两个调用场景，
+        而事后必须分得开：
+
+        - ``"scan"``：翻信箱那一趟正经读一屏，读不出就要花一次开封预算；
+        - ``"sub_tab"``：`_select_mail_sub_tab` 为了认「切到哪个标签了」而嗅探，
+          一次切换最多读三屏。
+
+        ⚠️ **两边都记，但记号不同。** 只记前者会漏掉一个更贵的失效：切标签的判据
+        就是 `row.kind`，主题读不出时它两边都数到 0 ⇒ 判「对不上」⇒ 三次之后
+        **整趟放弃**。那是比白开一封重得多的代价，而在日志上它长得像「标签点不动」。
+        只记后者则会让嗅探那三屏把名额啃光，正经那几屏一条都留不下。
         """
         screens = self._report_screens()
         texts = list(screens.mail_rows())
@@ -2889,7 +2901,7 @@ class PirateLoop:
         # ⚠️ **排在 `rows` 造好之后、交回调用方之前**：取证要的是「这一屏读成了
         # 什么」，而那正是这几行 `MailRow`；放到调用方那边就得把 `screens`（同一帧）
         # 一路传下去，而同一帧这件事是这个方法的全部约定。
-        self._record_unreadable_subject_evidence(screens, rows)
+        self._record_unreadable_subject_evidence(screens, rows, source=evidence_source)
         return rows
 
     def _mail_row_unread(self, screens: Any, count: int) -> list[bool | None]:
@@ -3027,7 +3039,9 @@ class PirateLoop:
             },
         )
 
-    def _record_unreadable_subject_evidence(self, screens: Any, rows: Sequence[MailRow]) -> None:
+    def _record_unreadable_subject_evidence(
+        self, screens: Any, rows: Sequence[MailRow], *, source: str = "scan"
+    ) -> None:
         """这一屏有主题读不出的行时，把**为什么读不出**的现场写进 `system_log`。
 
         ## 它要回答的那个问题
@@ -3086,6 +3100,10 @@ class PirateLoop:
             return offsets[index] if index < len(offsets) else None
 
         body: dict[str, Any] = {
+            # ⚠️ 这一屏是「正经翻信箱」还是「切标签时的嗅探」，取值与理由见
+            # `_mail_list_rows`。两者的代价完全不同（一次开封 vs 整趟放弃），
+            # 事后分不开就没法说清哪一边更该先修。
+            "source": source,
             "rows_on_screen": len(rows),
             "unreadable": len(unreadable),
             "rows": [
@@ -3199,7 +3217,7 @@ class PirateLoop:
             if not self._on_mail_list():
                 say(f"  点了二级标签「{name}」却不在邮件列表上了（第 {attempt + 1} 次）")
                 continue
-            kinds = [row.kind for row in self._mail_list_rows()]
+            kinds = [row.kind for row in self._mail_list_rows(evidence_source="sub_tab")]
             here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
             there = sum(1 for kind in kinds if kind is ReportKind.ATTACK)
             good = (here > 0 and there == 0) if fleet else (there > 0 and here == 0)

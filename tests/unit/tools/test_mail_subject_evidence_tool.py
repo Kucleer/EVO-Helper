@@ -32,9 +32,12 @@ ONE_PIXEL_PNG = base64.b64encode(
 
 
 def _record(
-    log_id: int, rows: list[dict[str, Any]], extras: list[dict[str, Any]]
+    log_id: int,
+    rows: list[dict[str, Any]],
+    extras: list[dict[str, Any]],
+    source: str = "scan",
 ) -> dict[str, Any]:
-    return {"id": log_id, "rows": rows, "evidence_rows": extras}
+    return {"id": log_id, "source": source, "rows": rows, "evidence_rows": extras}
 
 
 def test_the_crops_follow_the_row_index_not_the_position() -> None:
@@ -68,10 +71,17 @@ def test_a_record_without_rows_is_skipped_whole() -> None:
     assert rows_from_logs([{"id": 1}, {"rows": []}, {"id": "x", "rows": [{"index": 0}]}]) == []
 
 
-def _row(offset: int | None, *, aligned: str | None = None, crop: str = "") -> EvidenceRow:
+def _row(
+    offset: int | None,
+    *,
+    aligned: str | None = None,
+    crop: str = "",
+    source: str = "scan",
+) -> EvidenceRow:
     return EvidenceRow(
         log_id=1,
         index=0,
+        source=source,
         subject="一一 band",
         raw_time_text=None,
         unread=True,
@@ -133,3 +143,33 @@ def test_nothing_to_write_makes_no_directory(tmp_path: Path) -> None:
 
     assert write_corpus([_row(24), _row(25)], target) == []
     assert not target.exists()
+
+
+def test_the_two_kinds_of_screen_are_counted_apart() -> None:
+    """⚠️⚠️ **切标签嗅探那一档按「趟」算账，正经读那一档按「封」算账。**
+
+    #329 的二级标签判据就是 `row.kind`：主题读不出时舰队类和攻击报告都数到 0
+    ⇒ 判「对不上」⇒ 三次之后**整趟放弃**。所以 `sub_tab` 哪怕行数少得多，
+    也可能是更该先修的那一边。混在一个总数里，这件事就永远看不出来。
+    """
+    lines = "\n".join(offset_table([_row(24), _row(25), _row(24, source="sub_tab")]))
+
+    assert "按用途分" in lines
+    assert "scan" in lines and "sub_tab" in lines
+    assert "整趟放弃" in lines
+
+
+def test_one_kind_of_screen_needs_no_split() -> None:
+    """只有一种来源时不打这张表——没有对比的分档只是噪声。"""
+    assert "按用途分" not in "\n".join(offset_table([_row(24), _row(25)]))
+
+
+def test_a_record_without_a_source_reads_as_a_real_scan() -> None:
+    """老记录（这一版之前写的）没有 `source`，按最坏的那一档算：正经读。
+
+    ⚠️ 不许倒向 `sub_tab`：那一档在账上是「嗅探，无所谓」，
+    而把真花掉开封预算的行记成嗅探，会让代价整体看着变小。
+    """
+    rows = rows_from_logs([{"id": 3, "rows": [{"index": 0, "title_band_offset": 24}]}])
+
+    assert [row.source for row in rows] == ["scan"]

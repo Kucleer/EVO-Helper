@@ -70,6 +70,7 @@ class EvidenceRow:
 
     log_id: int
     index: int
+    source: str
     subject: str
     raw_time_text: str | None
     unread: bool | None
@@ -119,6 +120,7 @@ def rows_from_logs(records: Iterable[dict[str, Any]]) -> list[EvidenceRow]:
                 EvidenceRow(
                     log_id=log_id,
                     index=entry["index"],
+                    source=str(record.get("source") or "scan"),
                     subject=str(entry.get("subject") or ""),
                     raw_time_text=entry.get("raw_time_text"),
                     unread=entry.get("unread"),
@@ -170,7 +172,33 @@ def offset_table(rows: Sequence[EvidenceRow]) -> list[str]:
     located = [row.title_band_offset for row in rows if row.title_band_offset is not None]
     if located:
         lines.append(f"  偏移的实测范围：{min(located)} .. {max(located)}")
+    lines.extend(_source_split(rows))
     return lines
+
+
+def _source_split(rows: Sequence[EvidenceRow]) -> list[str]:
+    """按「这一屏是干什么读的」再分一次。**两边的代价完全不同。**
+
+    - ``scan``：翻信箱那一趟正经读一屏，读不出就花掉一次开封预算（≈8 秒）；
+    - ``sub_tab``：切二级标签时的嗅探，判据就是 `row.kind`，主题读不出时两边
+      都数到 0 ⇒ 判「对不上」⇒ 三次之后**整趟放弃**。
+
+    所以 `sub_tab` 那一档哪怕行数少得多，也可能是更该先修的那一边——
+    它按趟算账，而 `scan` 按封算账。
+    """
+    buckets: dict[str, int] = {}
+    for row in rows:
+        buckets[row.source] = buckets.get(row.source, 0) + 1
+    if len(buckets) <= 1:
+        return []
+    label = {
+        "scan": "翻信箱正经读（代价：一次开封 ≈8 秒）",
+        "sub_tab": "切标签嗅探（代价：整趟放弃）",
+    }
+    return ["  按用途分："] + [
+        f"    {name:10s} {count:4d} 行  {label.get(name, '')}"
+        for name, count in sorted(buckets.items(), key=lambda item: -item[1])
+    ]
 
 
 def aligned_table(rows: Sequence[EvidenceRow]) -> list[str]:
