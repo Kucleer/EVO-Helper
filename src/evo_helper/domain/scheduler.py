@@ -116,6 +116,11 @@ class MissionKind(Enum):
     #: 星门打矮星系统。**不派遣舰队、不占航线**（用户口径 2026-09-13），
     #: 所以它和扫描/军力榜一样是填空隙的那一类，见 。
     STARGATE = "STARGATE"
+    #: 信箱回读。**鼠标空着时翻一趟信箱就退**，不切出发星球、不派遣。
+    #:
+    #: 用户口径（2026-09-13）：读邮件挪到舰队派出之后、等航线回来的空档里做，
+    #: 不再挡在派遣前面。BOT 开工那一道对账原样保留当兜底。
+    MAIL = "MAIL"
 
 
 class DisabledRecovery(Enum):
@@ -244,7 +249,36 @@ def due_for_a_backoff_retry(
 #: 采集时发现那个判断在本模块里散着六处，语义完全一样。漏改任何一处的后果都是
 #: 静默的：漏在 `ready_to_run` 就永远不跑，漏在抢占判断就**攻击到点了也抢不过来**
 #: ——而那正是「间歇时间拿去扫描」这套设计唯一不能出错的地方。
-GAP_FILLERS = frozenset({MissionKind.SCAN, MissionKind.RANKING, MissionKind.STARGATE})
+#: 空档至少要有这么长，信箱回读才值得起一趟。
+#:
+#: ⚠️ **没有生产数据直接支撑**（方案 §4）：按 §2.2 量到的进箱 31 s + 至少四五封
+#: 定的。观察期用「起来不到 90 s 就被截止或抢占的占比」校它 —— 超过 20% 说明要调大。
+#:
+#: ⚠️ 它防的是一个**回归**：某条线 1 分钟后就空时 MAIL 照起，进箱 31 s 后被截止
+#: 或被抢占，而抢占要等 `min_dwell` 60 s —— 攻击因此白等最多 60 s，
+#: 而今天这种时刻鼠标是空的、攻击零等待。
+#: **可以被抢占**的那几种任务。
+#:
+#: ⚠️⚠️ 这不等于 `GAP_FILLERS`。军力榜也是填空隙的，但它**一趟 6 分钟不可续**
+#: （中途断掉那一趟白跑）；扫描的游标持久化、信箱回读有界且每封独立入库，
+#: 两者都是「随起随停没有代价」的那一类。
+#:
+#: ⚠️ 抽成集合是因为执行层原先把它写死成 `is not MissionKind.SCAN`（三处），
+#: 而领域层用的是 `fills_gaps()` —— **两边判据不一致**：只改 `GAP_FILLERS`
+#: 或只测 `decide()`，新加的填空隙任务一旦跑起来谁都停不了它。
+PREEMPTIBLE = frozenset({MissionKind.SCAN, MissionKind.MAIL})
+
+
+def preemptible(kind: MissionKind) -> bool:
+    """这种任务正在跑时，攻击（或到期的信箱回读）能不能把它停掉。"""
+    return kind in PREEMPTIBLE
+
+
+MAIL_MIN_WINDOW = timedelta(minutes=3)
+
+GAP_FILLERS = frozenset(
+    {MissionKind.SCAN, MissionKind.RANKING, MissionKind.STARGATE, MissionKind.MAIL}
+)
 
 
 def fills_gaps(kind: MissionKind) -> bool:
@@ -419,6 +453,9 @@ class TaskSnapshot:
     #: 今天只有 `RANKING` 会带上它（`SCAN` 压根不吃参数）。判据本身不认 kind，
     #: 将来第二种填空隙的任务要用它，不必改这一层。
     scan_cooldown: timedelta | None = None
+    #: 仅 MAIL：鼠标空着时，距**上次翻完信箱**至少隔多久再翻一趟。
+    #: `None` = 不设冷却（每次轮到就翻）。任务参数 `idle_cooldown_minutes`，默认 5。
+    mail_idle_cooldown: timedelta | None = None
 
 
 @dataclass(frozen=True)
@@ -505,6 +542,17 @@ class TaskFacts:
     #: runner，正是最该被节流的那种。事实来自 `mission_runs` 里该任务的最大
     #: `started_at_utc`，这一层不去查库。
     last_started_at_utc: datetime | None = None
+    #: 这个任务**上一轮结束**的时刻（`mission_runs.ended_at_utc` 的最大值）。
+    #:
+    #: ⚠️ **信箱回读的冷却按它算，不按开始算**（方案 §3.3）。按开始算时，
+    #: 一趟 ≥ 冷却时长的 MAIL **结束那一刻就又到期**，于是它永远排在最前，
+    #: 军力榜到期了也永远轮不上 —— 而回收预算开着时一趟约 6 分钟，
+    #: 这不是边角情形。
+    #:
+    #: ⚠️ 也不用共享的对账时刻：被截止的半截趟会刷新那个时刻，
+    #: 把 BOT 的兜底假跳过。两个时刻各答各的问题 ——
+    #: 这一个问「我上次什么时候**试完**」，对账那个问「上次什么时候**翻完**过」。
+    last_ended_at_utc: datetime | None = None
     #: 最近一次从**这个任务的出发星球**上真的把舰队派出去的时刻。和上一条比大小，
     #: 就知道上一轮是不是从头跑到尾一发都没派出去，见 `came_back_empty`。
     last_dispatch_at_utc: datetime | None = None
@@ -592,6 +640,12 @@ class SchedulerFacts:
     #: 而没有人去补货，一直空转到耐心耗尽为止。没建军力榜任务、或者把它停用了，
     #: 都会落到这一档。
     scan_is_available: bool = False
+    #: **所有出发星球**里最早会空出来的那条航线，什么时候空。算不出是 None。
+    #:
+    #: ⚠️ 信箱回读用它判「这个空档够不够翻一趟」。`None` 的含义是**算不出**
+    #: （全场只剩读不到飞行时长的派遣），不是「没有线会空」——
+    #: 那时该往放行那一侧倒，压着不读没有依据。
+    earliest_line_free_at_utc: datetime | None = None
     #: 按 `task_id` 挂的逐任务事实。查不到的任务看到的是 `NO_FACTS`。
     per_task: Mapping[int, TaskFacts] = field(default_factory=dict)
 
@@ -933,6 +987,91 @@ class ScanCooldownVerdict:
         return self.state is ScanCooldown.BLOCKING
 
 
+#: 空闲回读多久没翻完过，就把回收报告交回开工兜底趟。
+#:
+#: ⚠️ **没有它，满载时段回收报告会几小时没人读。** 攻击持续有活（线一空就有靶）时
+#: 空闲回读一直拿不到窗口，而路由已经切到它那一侧 —— 两边都不读。
+#: 加上之后最坏是「晚约一小时」，且兜底趟会接手。
+#:
+#: ⚠️ 先做常量。它是运维旋钮候选（想让回收报告更及时就调小），
+#: 但在有生产数据之前不值得先上页面。
+RECYCLE_IDLE_STALE = timedelta(minutes=60)
+
+#: 回收报告这一趟由谁读。
+RECYCLE_ROUTE_IDLE = "idle"
+RECYCLE_ROUTE_ROUND = "round"
+
+
+def recycle_route(
+    tasks: Sequence[TaskSnapshot],
+    *,
+    now_utc: datetime,
+    last_mail_completed_at: datetime | None,
+) -> str:
+    """回收报告归谁读：空闲回读（`idle`）还是攻击轮开工兜底（`round`）。
+
+    ## ⚠️ 只看三道前置 + 一道时效，**不复用完整的 `has_work`**
+
+    前置：任务在、启用、没被自动停用、在定时窗口内。
+    时效：空闲回读上一次**自己**翻完距今 ≤ `RECYCLE_IDLE_STALE`。
+
+    ⚠️ **不能把冷却和空档长度也算进来。** 那两条问的是「这一刻该不该起一趟」，
+    而路由问的是「读回收这件事**归谁**」。混进来的后果：信箱回读每次处于冷却里，
+    回收读信就被塞回派遣前面一次 —— 而把它挪出派遣前面正是这个方案的全部目的。
+
+    ## ⚠️ 首跑：还没翻完过 ⇒ 交给兜底趟
+
+    `last_mail_completed_at is None` 的意思是「空闲回读从没翻完过」（含刚启用）。
+    这时**不能**交给它 —— 否则从启用那一刻到它第一次翻完之间，两边都不读。
+    """
+    live = any(
+        task.kind is MissionKind.MAIL
+        and task.enabled
+        and task.disabled_reason is None
+        and within_schedule_window(task, now_utc)
+        for task in tasks
+    )
+    if not live:
+        return RECYCLE_ROUTE_ROUND
+    if last_mail_completed_at is None:
+        return RECYCLE_ROUTE_ROUND
+    if now_utc - last_mail_completed_at > RECYCLE_IDLE_STALE:
+        return RECYCLE_ROUTE_ROUND
+    return RECYCLE_ROUTE_IDLE
+
+
+def mail_has_work(task: TaskSnapshot, facts: SchedulerFacts) -> bool:
+    """信箱回读这会儿该不该起一趟。
+
+    两道闸，都不看「有没有战报到点没读」：
+
+    ## 1. 距**自己上次结束**够久了
+
+    ⚠️ **首跑放行。** 没有结束记录 = 这个任务从没跑过，而不是「刚跑完」。
+    写成「没有记录就不成立」的后果是：新任务永远产生不了第一条记录，
+    而回收路由这时可能已经切到空闲趟 —— **两边都不读回收报告**。
+    与 `scan_cooldown_verdict` 对 `last_started is None` 的处理同形。
+
+    ⚠️ **按结束算不按开始算**，理由整段在 `TaskFacts.last_ended_at_utc` 上。
+
+    ## 2. 空档够长
+
+    「此刻派不出去」不等于「接下来几分钟都派不出去」。某条线 1 分钟后就空时
+    起一趟，进箱 31 s 之后就会被截止或被抢占，而抢占要等 `min_dwell` 60 s ——
+    攻击白等最多 60 s，**而今天这种时刻鼠标是空的、攻击零等待**。这是回归。
+
+    ⚠️ 算不出最早放线时刻（全场只剩读不到飞行时长的派遣）就**放行**：
+    那时压着不读没有依据。截止判据在运行器里仍然兜着。
+    """
+    cooldown = task.mail_idle_cooldown
+    last_ended = facts.of(task).last_ended_at_utc
+    if cooldown is not None and last_ended is not None:
+        if facts.now_utc - last_ended < cooldown:
+            return False
+    free_at = facts.earliest_line_free_at_utc
+    return free_at is None or free_at - facts.now_utc >= MAIL_MIN_WINDOW
+
+
 def scan_cooldown_verdict(task: TaskSnapshot, facts: SchedulerFacts) -> ScanCooldownVerdict:
     """扫描间隔这一刻挡不挡得住这个任务。**判据只有这一份**，日志与页面都问它。
 
@@ -1167,6 +1306,8 @@ def has_work(
     # 正是「加了新 MissionKind 却漏改分支」唯一的把关（漏掉的后果是新链路
     # 静默套用 BOT 的判据）。写成显式的 `is ... or ... is ...`，收窄才成立。
     # 代价是加第三种填空隙任务时这里要跟着改一次，而 `assert_never` 会当场提醒。
+    if task.kind is MissionKind.MAIL:
+        return mail_has_work(task, facts)
     if (
         task.kind is MissionKind.SCAN
         or task.kind is MissionKind.RANKING

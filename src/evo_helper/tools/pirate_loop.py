@@ -88,7 +88,12 @@ from evo_helper.domain.report_wait import (
     parse_game_duration,
 )
 from evo_helper.domain.scan_bounds import PIRATE_POSITIONS
-from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY, quota_day_start_utc
+from evo_helper.domain.scheduler import (
+    EXIT_ENVIRONMENT_BUSY,
+    RECYCLE_ROUTE_IDLE,
+    RECYCLE_ROUTE_ROUND,
+    quota_day_start_utc,
+)
 from evo_helper.domain.target_order import DEFAULT_PROTECTION_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.game.nav_bar import (
@@ -137,7 +142,12 @@ from evo_helper.infrastructure.system_log import (
 )
 from evo_helper.storage.database import create_database_engine, create_session_factory
 from evo_helper.storage.report_screenshots import ReportScreenshotRepository
-from evo_helper.storage.repository import PirateProgress, SqlAlchemyRepository
+from evo_helper.storage.repository import (
+    RECONCILED_BY_MAIL,
+    RECONCILED_BY_ROUND,
+    PirateProgress,
+    SqlAlchemyRepository,
+)
 from evo_helper.tools.runner_logging import install_runner_system_log
 from evo_helper.tools.scan_coordinates import (
     LiveDriver,
@@ -457,6 +467,23 @@ MAIL_MAX_OPENS = 8
 #: **参数**，默认这个数；补录那条路自己传大值。**还欠一个配置页旋钮**：挪上去
 #: 要给攻击配置表加一列（`storage.models` 那张表 + 一次迁移），这一版刻意不碰
 #: 库结构，所以先记在这里，连同那句要写给用户的话：「调大 = 少丢战报、多花时间」。
+#: 开一封邮件大约要多久 —— **截止判据用它，不是用 0**。
+#:
+#: ⚠️ **标定常量，注明出处**：方案 §2.2 按近 3 天 163 趟有完整账的趟数、
+#: 用趟内总时长按开封数分桶算出来的边际值（0 封 30 s、1 封 58 s、2 封 91 s、
+#: 4 封 150 s、8 封 223 s ⇒ 每封约 30 s）。
+#:
+#: ⚠️ 它比代码里别处写的「≈8 秒」和评估文档的「≈20 秒」都大：那两个数只算了
+#: 点开与返回的等待，没算翻页、认屏、查重与多帧读数。拿小的那个当判据，
+#: 每一趟都会在截止点之后再开一两封。
+MAIL_OPEN_ESTIMATE = timedelta(seconds=30)
+
+#: 截止时刻要比「最早那条线空出来」提前多少。
+#:
+#: 关掉面板 + 下一轮开工切星球的余量。取 60 秒是按 §2.2 的进箱 31 s 估的：
+#: 收工不需要重新进箱，但要关面板、切回恒星系视图。
+MAIL_EXIT_MARGIN = timedelta(seconds=60)
+
 MAIL_UNREAD_MAX_OPENS = 12
 
 #: 常规闸**连着**开出多少封「库里已有」就不再开封（这一趟的保险值 N）。
@@ -1256,6 +1283,14 @@ class DailyTally:
     day_start: datetime
     observed: int = 0
     complete: bool = False
+    #: 这一趟**是不是按既有预算边界走完的**（翻到 `not_before` / 拖到底 / 翻满上限）。
+    #:
+    #: ⚠️⚠️ **它和 `complete` 是两件事，不许合并。** `complete` 说的是「当日份数
+    #: 数全了没」（有没有真看见昨天那一行）；这一格说的是「该翻的翻完了没」。
+    #: 被截止叫停的趟可能已经数够了份数（`complete=True`）却没翻完 —— 而
+    #: **只有翻完的趟才该推进 BOT 的兜底时刻**：写了对账时刻，紧接着那一轮 BOT
+    #: 就会把兜底跳过，战报被间接拖后，而短空档反复出现时会反复发生。
+    swept: bool = True
 
     def __call__(self, row: MailRow) -> None:
         if row.is_older_than(self.day_start):
@@ -1326,6 +1361,22 @@ class MailScan:
     blank_run_limit: int | None = None
     #: 这道闸有没有真的拦下开封。
     blank_run_stopped: bool = False
+    #: 这一趟是不是**半路出事**了（丢了邮件列表重进不回、切不回二级标签）。
+    #:
+    #: ⚠️⚠️ **和「翻满上限」严格分开。** 翻满 `max_pages` 是**按预算走完**，
+    #: 与「翻到昨天」「拖到底」同一档，照旧写对账时刻（方案 §3.3.1，也是今天
+    #: 开工趟的既有口径）；而这两种是这一趟**没走到该走的地方**。
+    #:
+    #: ⚠️ 单独一格而不是去认 `cut_short` 的中文：那是句人话、措辞随时会改，
+    #: 拿它当判据迟早静默失效 —— 而失效的样子是「翻满上限的趟不再写对账」，
+    #: 在日志上和「信箱一直翻不完」一模一样。
+    aborted: bool = False
+    #: 这一趟是不是**被截止叫停**的（空闲回读那条路，见 `MAIL_OPEN_ESTIMATE`）。
+    #:
+    #: ⚠️ **和 `cut_short` 分开一格，不共用那个字符串。** `cut_short` 是「没好好
+    #: 走完」的人话理由，措辞随时会改；而「写不写对账时刻」是个**判据**，
+    #: 拿中文去认迟早静默失效（同 `DisabledRecovery` 那条分开的理由）。
+    deadline_hit: bool = False
     #: 这一趟**没能好好走完**的理由；正常收工时是 None。
     #:
     #: ⚠️ 摘要必须把它说出来。实机 2026-08-13 20:35：一趟给了 30 屏预算的补录在
@@ -3406,6 +3457,7 @@ class PirateLoop:
         skip_known: bool = False,
         known_run: KnownRunGate | None = None,
         fleet_sub_tab: bool = False,
+        deadline: datetime | None = None,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
 
@@ -3538,6 +3590,7 @@ class PirateLoop:
                 if reentries >= MAIL_MAX_REENTRIES:
                     say(f"  已经不在邮件列表上了，重进 {reentries} 次都没用；这一趟到此为止")
                     scan.cut_short = f"丢了邮件列表，重进 {reentries} 次都没回去"
+                    scan.aborted = True
                     break
                 reentries += 1
                 say(
@@ -3551,6 +3604,7 @@ class PirateLoop:
                 # 和「信箱里真的没有」一模一样。
                 if fleet_sub_tab and not self._select_mail_sub_tab(fleet=True):
                     scan.cut_short = "重进信箱后切不回「舰队」二级标签"
+                    scan.aborted = True
                     break
                 # 重进之后**不在这里再判一次**：判了就得决定「不成怎么办」，而那正是
                 # 下一轮循环开头那道守卫的活。交给它，重进预算才真的是预算——
@@ -3662,6 +3716,22 @@ class PirateLoop:
                 if not forced and should_open is not None and not should_open(row):
                     say(f"  第 {row.index} 行时刻不在待补战报的预计窗口内；不打开")
                     continue
+                # ⚠️⚠️ **截止只作用在「还要不要再开一封」上，不动三笔预算、
+                # 不动 `observe` 那条数数的路。** 空闲回读要的是「体面收工」：
+                # 已经开封的各自入库不回滚，没开的留给下一趟。
+                #
+                # ⚠️ 判据用「现在 + 开一封要多久」而不是「现在」：卡着截止点开下去
+                # 必然超时，而超时的代价是让一条**已经空出来的航线**继续等
+                # （整段在 `MAIL_OPEN_ESTIMATE`）。
+                if deadline is not None and datetime.now(UTC) + MAIL_OPEN_ESTIMATE > deadline:
+                    scan.deadline_hit = True
+                    scan.cut_short = "到了截止时刻，这一趟没翻完就收工"
+                    say(
+                        f"  到截止时刻了（还要开一封需要约 {MAIL_OPEN_ESTIMATE.seconds} 秒）；"
+                        "这一趟收工，没开的留给下一趟"
+                    )
+                    done = True
+                    break
                 if forced:
                     unread_opened += 1
                     scan.unread_opened = unread_opened
@@ -4208,6 +4278,14 @@ class PirateLoop:
     #: ⚠️ **写死是有意的，不是偷懒。** 星门是一座**建筑**，只长在这一颗星球上；
     #: 「当前停在哪颗星」不该决定打不打得成 —— 站错星球时正确的动作是先切过去，
     #: 而不是在别的星球的地表上照这个坐标点下去（那儿是另一座建筑）。
+    #: 这一趟信箱是**谁起的**：`round`（攻击轮开工兜底）/ `mail`（空闲回读）。
+    #: 落进 `daily_reconciliations.completed_by` 与收工那条日志。
+    #:
+    #: ⚠️ **类属性而不是实例属性**：用例里大量用 `__new__` 造实例（绕过 `__init__`），
+    #: 实例属性它们一个都拿不到。而这个值的含义本来就是「除非空闲回读显式改，
+    #: 否则就是兜底趟」—— 一个类级默认正好表达它。
+    _reconcile_trigger: str = RECONCILED_BY_ROUND
+
     STARGATE_ORIGIN = Coordinate(4, 277, 15)
 
     #: 每天打几发。用户口径：「每日只需要攻击 3 次」。
@@ -4230,6 +4308,65 @@ class PirateLoop:
     #: 而实测真值在两帧里都排第 1、候选总共只有 2–3 个。给 3 是留余量，
     #: 不是指望靠穷举蒙对 —— 真要穷举才中，说明识别器坏了，该去看现场图。
     STARGATE_MAX_TRIES = 3
+
+    def run_mail_only(self) -> bool:
+        """**空闲回读**：只翻一趟信箱就退。返回这一趟翻完了没。
+
+        ## ⚠️ 它不切出发星球、不进目标循环
+
+        这一趟存在的全部理由是「鼠标空着的时候把信箱翻了」。切星球要开浮层、认坐标、
+        拖列表、回读（§2.2 量到的整趟 31 s 里它占大头），而信箱是**账号级的**，
+        跟站在哪颗星球上毫无关系 —— 开工那一趟把切星球排在读信箱后面，正是同一条理由。
+
+        ## ⚠️ 截止时刻在**进信箱之前**算一次
+
+        `deadline = 最早哪条线会空 − MAIL_EXIT_MARGIN`。算不出（全场只剩读不到飞行
+        时长的派遣）就不设截止 —— 那时压着不读没有依据，而调度器那一侧的抢占仍然兜底。
+
+        ## ⚠️⚠️ 被截止收工必须算**正常结束**
+
+        调度器把「`stopped_by` 不是 SELF 或退出码非 0」计入连续失败，连着三次自动停用。
+        截止收工是设计内的正常结束，所以这里**返回布尔、不抛、不用退出码表达**；
+        「翻完了没」走 `daily_reconciliations.completed_by` 那一列。
+        """
+        from evo_helper.game.game_window import ensure_game_window
+
+        ensure_game_window()
+        self._ensure_session(force=True)
+        self._reset_to_known_screen()
+        # ⚠️⚠️ **第四步不能省。** `run()` 的开工是四步，这里漏掉这一步的后果实机
+        # 打回来过（2026-09-13 15:14）：整趟从地表起跑，信箱翻得好好的、拖到底了，
+        # 收尾 `_close_mail` 要切回恒星系视图时没有前提，报「读完邮件切不回恒星系
+        # 视图」，接着关窗重开、入口序列又卡住 —— 一趟白跑。
+        #
+        # 同一个错今天犯过第二次了（星门那条路少了 `_ensure_session`）。
+        # 教训是：**新入口要抄全 `run()` 的开工序列，不是抄一部分。**
+        self._require_system_view("空闲回读开工时切不到恒星系视图")
+        # ⚠️ **在开工之前改**：`reconcile_today` 把它写进 `completed_by`，
+        # 而回收路由问的正是「空闲趟上一次自己翻完是什么时候」。
+        self._reconcile_trigger = RECONCILED_BY_MAIL
+        repository, _run_id = self._ensure_run()
+        now = datetime.now(UTC)
+        free_at = repository.next_line_free_at_any(now_utc=now)
+        deadline = None if free_at is None else free_at - MAIL_EXIT_MARGIN
+        record_system_log(
+            "INFO",
+            "tools.pirate_loop",
+            "空闲回读开工",
+            payload={
+                "earliest_line_free_at_utc": None if free_at is None else free_at.isoformat(),
+                "deadline_utc": None if deadline is None else deadline.isoformat(),
+                "open_estimate_seconds": int(MAIL_OPEN_ESTIMATE.total_seconds()),
+                "exit_margin_seconds": int(MAIL_EXIT_MARGIN.total_seconds()),
+            },
+        )
+        if deadline is None:
+            say("  空闲回读：算不出最早哪条线会空；这一趟不设截止")
+        else:
+            say(f"  空闲回读：截止时刻 {deadline:%H:%M:%S}（最早放线 {free_at:%H:%M:%S} 前 60 秒）")
+        swept = self.reconcile_today(deadline=deadline)
+        say(f"完成：空闲回读{'翻完了' if swept else '没翻完（下一趟或开工兜底接着翻）'}")
+        return swept
 
     def attack_stargate(self, *, daily_cap: int | None = None) -> int:
         """从星门打矮星系统。**最多派一发**，派出去返回 1，没派返回 0。
@@ -5046,8 +5183,14 @@ class PirateLoop:
             self.reconcile_today()
         return decision
 
-    def reconcile_today(self) -> None:
+    def reconcile_today(self, *, deadline: datetime | None = None) -> bool:
         """开工第一件事：**把今天的战报读进库**，读完再把「今天已经打了几发」更新掉。
+
+        返回**这一趟翻完了没**（判据见 `DailyTally.swept`）。空闲回读那条路据此
+        决定要不要推进对账时刻；开工兜底那条路不看返回值，行为与从前一致。
+
+        ``deadline`` 给了就每次开封前问一次，到点体面收工（`MAIL_OPEN_ESTIMATE`）。
+        开工兜底那一趟不传 —— 它本来就排在派遣前面，没有「别让攻击等」这个问题。
 
         用户口径（2026-08-11）：「任务启动先去读战报……读完后，需要更新海盗攻击 /
         bot 攻击的数量，因为我可能暂停任务重启启动。」
@@ -5148,7 +5291,7 @@ class PirateLoop:
         else:
             say("  库里没有到点还没战报的派遣；这一趟只补没入库的和数今天的份数")
         try:
-            tally = self._scan_for_reconcile(day_start, now=now)
+            tally = self._scan_for_reconcile(day_start, now=now, deadline=deadline)
         except RoundExhausted:
             raise
         except RuntimeError as error:
@@ -5157,7 +5300,7 @@ class PirateLoop:
                 # 退回按库计数，也就是今天没修正的那个状态——不比不做对账更糟。
                 # 不写记录，下一轮再试。
                 say(f"  开工翻不了信箱（{error}）；单子上没有欠账，这一轮先按库内计数走")
-                return
+                return False
             # 单子非空是**完全不同的一件事**：那几发的 6 小时钟正在走，
             # 而「下一轮再试」连撞两次同一堵墙就是永久丢数据（见 `MailboxUnreachable`）。
             # 升级一级：走 `SessionKeeper` 那条既有的关窗重开（配额 3 次 / 滚动
@@ -5167,15 +5310,29 @@ class PirateLoop:
                 f"（{_targets_note(outstanding)}）；关窗重开一次再翻（兜底策略）"
             )
             tally = self._retry_mailbox_after_restart(error, outstanding, day_start, now=now)
-        status = repository.record_daily_reconciliation(
-            self.TARGET_KIND,
-            day_utc=day_start,
-            observed_reports=tally.observed,
-            complete=tally.complete,
-            reconciled_at_utc=now,
-        )
+        # ⚠️⚠️ **只有翻完的趟才推进对账时刻。**
+        #
+        # `record_daily_reconciliation` 原先是无条件写的，而 BOT 开工那道兜底
+        # （`decide_reconcile`）只看这个时刻新不新。空闲回读进信箱刚拨到顶就撞
+        # 截止、一封没开也正常退出 —— 照旧写时刻的话，紧接着的 BOT 轮会把兜底
+        # 跳过，战报被间接拖后；短空档反复出现时会反复发生。
+        #
+        # ⚠️ 代价说清：截止收工的趟不推进时刻，BOT 兜底趟因此**比不加这道闸时多**。
+        # 这是对的方向 —— 兜底本来就该在「空闲趟没翻完」时顶上。
+        status = None
+        if tally.swept:
+            status = repository.record_daily_reconciliation(
+                self.TARGET_KIND,
+                day_utc=day_start,
+                observed_reports=tally.observed,
+                complete=tally.complete,
+                reconciled_at_utc=now,
+                completed_by=self._reconcile_trigger,
+            )
         note = "翻到底了" if tally.complete else "没翻到底，这是「至少」"
         say(f"  今天已有 {tally.observed} 份（{note}）")
+        if not tally.swept:
+            say("  这一趟没翻完，不推进对账时刻；下一趟或开工兜底会接着翻")
         # 收尾这几行才是**人真的会回头看的那份账**：上面那句 `[耗时]` 打在整趟
         # 最前面，到这里已经被几十行翻页与开封日志顶掉了。所以补认领的两个数在
         # 这里再报一次——用户口径（2026-09-07）「将实际耗时计入汇总即可」。
@@ -5194,9 +5351,27 @@ class PirateLoop:
                 f"还有 {status.awaiting_reports} 发在等战报"
             )
         self._collect_recycle_hauls_if_enabled(repository)
+        return tally.swept
+
+    #: 回收报告这一轮归谁读，由调度器每次起轮现算后用命令行送过来。
+    #:
+    #: ⚠️ **默认 `round` = 今天的行为。** 手工跑命令行时命令行上没有这个参数，
+    #: 那时按今天办（开工趟读）—— 而不是「谁都不读」。
+    _recycle_mail_route: str = RECYCLE_ROUTE_ROUND
 
     def _collect_recycle_hauls_if_enabled(self, repository: Any) -> None:
         """开工对账之后读一趟回收报告。**旋钮是 0（默认）时一步都不走。**
+
+        ## ⚠️ 路由：这一趟到底归不归我读
+
+        调度器算好之后用 `--recycle-mail-route` 送过来（判据在
+        `domain.scheduler.recycle_route`）。是 `idle` 就说明空闲回读任务活着、
+        而且最近确实翻完过 —— 那时**开工趟一步都不走**，把回收报告留给它，
+        这正是「把读信挪出派遣前面」这个方案的全部目的。
+
+        ⚠️⚠️ **「不读」的实现必须是不调这一步，而不是传预算 0。**
+        回收报告全是未读，一旦点进「舰队」子页签，「未读必开」那一档会越过预算
+        把它们开掉 —— 传 0 挡不住。
 
         ⚠️ **排在战报那一趟之后，而且是另起一趟信箱。** 战报那一趟的开封预算实测
         天天满载，回收报告挤进去等于每挤掉一封战报、那一发派遣多等一趟
@@ -5207,6 +5382,11 @@ class PirateLoop:
         停在「待回收」，而漏出去的异常会打断整轮——也就是拿攻击链路去赔一个
         统计功能。判据同 `_store_report_screenshot` 头上那一段。
         """
+        if self._recycle_mail_route == RECYCLE_ROUTE_IDLE and self._reconcile_trigger != (
+            RECONCILED_BY_MAIL
+        ):
+            say("  回收报告这一轮归空闲回读那一趟读；开工趟不读（路由 idle）")
+            return
         try:
             budget = repository.recycle_mail_opens()
         except Exception as error:  # noqa: BLE001 - 见 docstring：旁路不许拖累主路径
@@ -5227,7 +5407,9 @@ class PirateLoop:
         if scan is not None and scan.cut_short:
             say(f"  回收报告这一趟没走完：{scan.cut_short}")
 
-    def _scan_for_reconcile(self, day_start: datetime, *, now: datetime) -> DailyTally:
+    def _scan_for_reconcile(
+        self, day_start: datetime, *, now: datetime, deadline: datetime | None = None
+    ) -> DailyTally:
         """开工那一趟信箱。返回这一趟数出来的当日份数。
 
         单独成一个方法只为一件事：**重试要用一份干净的账**。`DailyTally` 是边翻
@@ -5263,7 +5445,18 @@ class PirateLoop:
             # （`exhaustive` 那一档连早停都不走）。在它上面开跳过，
             # 等于把「人手动来救」这条最后的路也堵掉。方案 §3.7 前提④。
             skip_known=True,
+            deadline=deadline,
         )
+        # ⚠️ **「翻完」= 按既有预算边界走完这一趟，不是「信箱已清空」。**
+        # 翻到昨天、拖到底、**翻满屏数上限**三种都算 —— 最后那种是今天开工趟的
+        # 既有口径（`complete` 那一列另外表达「份数全不全」）。
+        #
+        # 不算的只有两种：撞了截止（空闲回读主动收工）、半路出事（`aborted`）。
+        #
+        # ⚠️ 开封预算用完 / 连续白开闸触发 / 未读预算用完 **都不是结束事件** ——
+        # 扫描器里它们只是 `continue`，后面的行照旧读主题、照旧数当日份数、
+        # 未读那一档照旧越过预算开封。把它们当成「没翻完」会白白多跑兜底趟。
+        tally.swept = not scan.deadline_hit and not scan.aborted
         # ⚠️ **这道闸最可能的失效形态是「一直跳过 0 封」** —— 判据永远不成立，
         # 而那和「没装这道闸」在日志上一模一样。所以有跳过就报，没跳过也报一次
         # 「一封都没跳」，让「它到底在不在工作」这件事一眼可查。
@@ -5291,6 +5484,14 @@ class PirateLoop:
                 # 而「它是从哪一趟开始哑的」只有这个数答得上来。
                 "unread_silent_rounds": silent_rounds,
                 "outstanding_after": outstanding,
+                # ⚠️ 这两个键是排障的锚：「这一趟是谁起的」和「它为什么停」。
+                # 少了它们，被截止的趟和正常收工的趟在日志上一模一样，
+                # 而两者对「要不要写对账时刻」的答案相反。
+                "trigger": self._reconcile_trigger,
+                "stopped_by": (
+                    "deadline" if scan.deadline_hit else (scan.cut_short or "bottom_or_floor")
+                ),
+                "swept": tally.swept,
                 **mail_unread_payload(scan),
                 **mail_blank_payload(scan),
             },

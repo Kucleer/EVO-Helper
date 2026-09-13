@@ -25,6 +25,7 @@ MISSION_LABELS: dict[str, str] = {
     "SCAN": "扫描全星系 bot",
     "RANKING": "扫描军力榜",
     "STARGATE": "星门打矮星系统",
+    "MAIL": "信箱回读",
 }
 
 
@@ -42,6 +43,8 @@ PARAM_LABELS: dict[str, str] = {
     "last_system": "结束系号",
     "bot_limit": "扫描数量",
     "scan_cooldown_hours": "扫描间隔（小时）",
+    "daily_cap": "每日次数",
+    "idle_cooldown_minutes": "空闲间隔（分钟）",
 }
 
 

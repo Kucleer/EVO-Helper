@@ -385,8 +385,14 @@ def test_the_scan_row_is_not_draggable_and_says_why(client: TestClient) -> None:
     """
     body = _page_body(client.get("/missions").text)
 
-    # 与 `domain.scheduler.GAP_FILLERS` 同一批。
-    assert "const FILLS_GAPS = ['SCAN', 'RANKING'];" in body
+    # ⚠️ **只断言「扫描在清单里」，不抄死整行。**
+    # 抄死整行的话，每加一种填空隙任务这里都要红一次，而红的原因和这条用例
+    # 要守的行为（扫描那张卡不可拖）毫无关系 —— 2026-09-13 加星门与信箱回读时
+    # 就是这么红的。两份清单同步与否由
+    # `tests/unit/web/test_fills_gaps_sync.py` 专门守着。
+    listed = re.search(r"const FILLS_GAPS = \[([^\]]*)\];", body)
+    assert listed is not None, "missions.html 里找不到 FILLS_GAPS"
+    assert "'SCAN'" in listed.group(1)
     # 建卡时：填空隙的不可拖，别的都可拖。写成常量 'false' 就等于全都不能拖。
     assert "row.setAttribute('draggable', fillsGaps ? 'false' : 'true')" in body
     # 拖动过程中也不许把别人插到它后面。

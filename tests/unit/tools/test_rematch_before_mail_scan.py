@@ -131,7 +131,8 @@ def _loop(repository: _Repository, *, last_reconciled_at: datetime | None = None
     loop._ensure_run = lambda: (repository, None)
     loop._reconcile_decision = None
     loop._last_reconciled_at = lambda: last_reconciled_at
-    loop._scan_for_reconcile = lambda day_start, *, now: DailyTally(
+    # ⚠️ 桩要跟着接 `deadline`：空闲回读那条路每次开封前拿它问「还来得及吗」。
+    loop._scan_for_reconcile = lambda day_start, *, now, deadline=None: DailyTally(
         kind=ReportKind.PIRATE, day_start=day_start, observed=3, complete=True
     )
     return loop

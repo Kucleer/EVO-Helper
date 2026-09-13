@@ -82,6 +82,12 @@ class ProgressReading:
     #: 默认 0 的含义是「从来没写过」。给默认值只为了让既有测试不必逐个补参数；
     #: 生产路径（`SqlAlchemyMissionProgress.read`）永远显式传，有测试钉住。
     ranking_written_at: int = 0
+    #: 最近一次写下**对账时刻**的时刻（epoch 秒）。
+    #:
+    #: ⚠️ **和上面那个同理，是时刻不是行数。** `daily_reconciliations` 一天一条，
+    #: 同一天里反复对账只更新不新增 —— 拿 `COUNT(*)` 当信号的话，
+    #: 一天之内第二趟开始计数就再也不动。
+    reconciled_at: int = 0
 
     def for_kind(self, kind: MissionKind) -> tuple[int, ...]:
         """这条链路的进展由哪几个数字说了算。
@@ -107,6 +113,16 @@ class ProgressReading:
             return (self.coordinate_scans,)
         if kind is MissionKind.RANKING:
             return (self.ranking_written_at,)
+        if kind is MissionKind.MAIL:
+            # 信箱回读的产出：战报行数 + 对账时刻。
+            #
+            # ⚠️ **两个都要。** 只用对账时刻的话，被截止的趟一个信号都没有
+            # （它按设计不推进那个时刻）；只用战报行数的话，翻了一趟什么都没读到
+            # 的正常趟也会看着像卡住。
+            #
+            # ⚠️ 这一条不是防误杀 —— `STALL_TIMEOUT` 是 45 分钟而一趟 ≤ 6 分钟，
+            # 真正兜底的是那个时长。它在这里只为让进展信号**说真话**。
+            return (self.battle_reports, self.reconciled_at)
         if kind is MissionKind.STARGATE:
             # ⚠️ **故意交空元组：星门在库里不留任何产出。**
             #
@@ -150,11 +166,18 @@ class SqlAlchemyMissionProgress:
                 scout_reports=_count(session, orm.ScoutReportRow),
                 coordinate_scans=_count(session, orm.CoordinateScanRow),
                 ranking_written_at=_latest_epoch(session),
+                reconciled_at=_latest_reconciled_epoch(session),
             )
 
 
 def _count(session: Session, model: type[Base]) -> int:
     return session.scalar(select(func.count()).select_from(model)) or 0
+
+
+def _latest_reconciled_epoch(session: Session) -> int:
+    """最近一次写下对账时刻的时刻，取整秒。一行都没有就 0。"""
+    latest = session.scalar(select(func.max(orm.DailyReconciliationRow.reconciled_at_utc)))
+    return 0 if latest is None else int(latest.timestamp())
 
 
 def _latest_epoch(session: Session) -> int:

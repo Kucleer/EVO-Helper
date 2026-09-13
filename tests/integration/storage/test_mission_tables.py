@@ -153,7 +153,7 @@ def test_seeding_creates_one_row_per_chain_and_one_config(repository) -> None:  
     repository.ensure_mission_rows(now_utc=datetime.now(UTC))
 
     kinds = [row.kind for row in repository.mission_tasks()]
-    assert sorted(kinds) == ["BOT", "PIRATE", "RANKING", "SCAN", "STARGATE"]
+    assert sorted(kinds) == ["BOT", "MAIL", "PIRATE", "RANKING", "SCAN", "STARGATE"]
     assert repository.scheduler_config().pirate_daily_quota == 32
 
 
@@ -181,6 +181,8 @@ def test_only_the_read_only_chains_are_enabled_by_default(repository) -> None:  
         "SCAN": True,
         "RANKING": True,
         "STARGATE": False,
+        # 信箱回读会占着鼠标翻一趟信箱，同两条攻击链路默认关。
+        "MAIL": False,
     }
 
 
