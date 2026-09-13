@@ -152,6 +152,21 @@ class ReportKind(Enum):
     #: 舰队标签里它占三分之二，不跳过的话未读预算会被它吃光
     #: （`docs/回收闭环/邮件读实收-评估-2026-09-12.md`）。
     FLEET_RETURN = "fleet_return"
+    #: 星门打矮星系统之后的那封战报。
+    #:
+    #: ⚠️ **加这一档是为了在列表页就跳过它，不是为了读它**（用户口径 2026-09-13：
+    #: 「这就是星门的攻击战报，可以不用读取，你系统识别一下就可以，日常读取可跳过」）。
+    #:
+    #: 原先它是靠最后那条「含『战报』二字」的兜底落到 `SYSTEM` 的 —— 行为一样，
+    #: 但那是**碰巧对**：兜底一改，它就会跟着变，而没有任何东西守着这件事。
+    STARGATE = "stargate"
+    #: 建筑部署完成的通知。舰队标签里的第四种信。
+    #:
+    #: ⚠️ **不加这一档的代价是实的**：它在分类器里认不出来就落 `UNKNOWN`，
+    #: 而 `MailRow.may_be` 对 `UNKNOWN` **一律放行**（那条偏向是为战报那一趟定的）。
+    #: 于是读回收报告那一趟会把每一封「部署报告」当候选开掉 —— 未读必开越过主题闸，
+    #: 一封 ≈ 8 秒，而那一趟的预算只有个位数。
+    DEPLOY = "deploy"
     SYSTEM = "system"
     UNKNOWN = "unknown"
 
@@ -349,14 +364,21 @@ def classify_report_subject(subject: str) -> ReportKind:
         return ReportKind.PROTECTION_BOUNCE
     if "你的行星被侦察" in text:
         return ReportKind.PLANET_SCOUTED
-    # ⚠️ 这两条排在「海盗 / 攻击报告」之前无所谓（主题互不包含），
-    # 但**必须排在最后那条 `"战报" in text` 之前**：舰队标签里的
-    # 「矮星系统战报」会先命中 SYSTEM，而回收报告不含「战报」二字，
-    # 所以这里其实只要在 UNKNOWN 之前就行。放这儿是为了读起来挨着。
+    # ⚠️ 下面这四条是**舰队标签**里的四种信（实拍 2026-09-13：舰队返回 / 回收报告 /
+    # 矮星系统战报 / 部署报告）。它们**必须都在这里认出来**，理由不是「读它们」，
+    # 恰恰相反是「别读它们」：`MailRow.may_be` 对 `UNKNOWN` 一律放行，
+    # 漏掉任何一种，读回收报告那一趟就会把它整封开掉，白花 8 秒预算。
+    #
+    # ⚠️ 「矮星系统」与「部署报告」必须排在最后那条 `"战报" in text` 之前。
     if "回收报告" in text:
         return ReportKind.RECYCLE
     if "舰队返回" in text:
         return ReportKind.FLEET_RETURN
+    # ⚠️ **必须排在最后那条 `"战报" in text` 之前**，否则「矮星系统战报」会先落 SYSTEM。
+    if "矮星系统" in text:
+        return ReportKind.STARGATE
+    if "部署报告" in text:
+        return ReportKind.DEPLOY
     if "海盗" in text:
         return ReportKind.PIRATE
     if "攻击报告" in text:

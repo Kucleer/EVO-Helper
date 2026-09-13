@@ -24,6 +24,7 @@ MISSION_LABELS: dict[str, str] = {
     "BOT": "扫描+攻击 bot",
     "SCAN": "扫描全星系 bot",
     "RANKING": "扫描军力榜",
+    "STARGATE": "星门打矮星系统",
 }
 
 

@@ -47,6 +47,7 @@ def test_the_tasks_are_ordered_by_kind_not_by_priority() -> None:
         _task(MissionKind.SCAN, priority=9),
         _task(MissionKind.BOT, priority=0),
         _task(MissionKind.PIRATE, priority=5),
+        _task(MissionKind.STARGATE, priority=3),
     )
 
     assert [task.kind for task in freeze.tasks] == list(MissionKind)

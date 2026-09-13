@@ -112,6 +112,9 @@ module = [
   "cv2.*",
   "mss.*",
   "mss.tools.*",
+  # numpy 随 opencv-python 一起进来（`vision` 那组），CI 里同样没有。
+  # 2026-09-13 星门那个识别器是第一个在源码里直接 import 它的。
+  "numpy.*",
   "pytesseract.*",
   "ultralytics.*",
   "win32api.*",

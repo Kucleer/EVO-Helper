@@ -70,6 +70,7 @@ def test_startup_seeds_every_chain(tmp_path: Path) -> None:
         "PIRATE",
         "RANKING",
         "SCAN",
+        "STARGATE",
     ]
 
 

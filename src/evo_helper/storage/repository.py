@@ -130,6 +130,13 @@ _MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
     (MissionKind.PIRATE, "侦查+攻击海盗", False, 0, '{"radius": 10}'),
     (MissionKind.BOT, "扫描+攻击 bot", False, 1, "{}"),
     (MissionKind.SCAN, "扫描全星系 bot", True, 2, "{}"),
+    # 星门：**默认关着**，理由同两条攻击链路 —— 它会把一支舰队送出去，
+    # 而「装好就会派舰队」不是好默认（用户在任务页勾一下就开）。
+    #
+    # ⚠️ **优先级排在所有人后面**，这就是用户口径「发完攻击后系统空余时间进行填充」
+    # 的落点：调度器一次只跑一个任务，排最后意味着只有攻击那几条都没活干时它才轮得到。
+    # 它不占航线，所以航线满的时候它照样跑得起来（`domain.scheduler.GAP_FILLERS`）。
+    (MissionKind.STARGATE, "星门打矮星系统", False, 9, "{}"),
     (MissionKind.RANKING, "扫描军力榜", True, 3, "{}"),
 )
 

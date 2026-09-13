@@ -138,6 +138,32 @@ def scan_command() -> list[str]:
     return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.scan_coordinates"])
 
 
+def stargate_command(*, daily_cap: int, origin: Coordinate) -> list[str]:
+    """星门打矮星系统的命令行。
+
+    ⚠️ **`--stargate` 那个数是「当日上限」，不是「这一趟打几发」。** 星门一次只能在
+    飞一发（用户口径 2026-09-13），所以一趟最多派 1 发；「今天三次」靠调度器隔开来
+    调三次做到。整段在 `tools.pirate_loop.PirateLoop.attack_stargate`。
+
+    ⚠️ **不带 `--attack`。** 那个开关管的是常规那一轮派不派舰队，而这一档跑的是
+    另一条路；`tools.bot_loop` 里 `allow_actions` 已经显式写成
+    `args.attack or bool(args.stargate)` —— 「这个进程能不能把舰队送出去」
+    整个仓库只有那一处开关，不许在别处偷偷打开。
+    """
+    return _checked(
+        [
+            _PYTHON,
+            "-u",
+            "-m",
+            "evo_helper.tools.bot_loop",
+            "--stargate",
+            str(daily_cap),
+            "--origin",
+            str(origin),
+        ]
+    )
+
+
 def ranking_command(*, bot_limit: int | None = None, blind_rows: int | None = None) -> list[str]:
     """军力榜采集命令行。**没有 `--attack`。**
 

@@ -113,6 +113,9 @@ class MissionKind(Enum):
     BOT = "BOT"
     SCAN = "SCAN"
     RANKING = "RANKING"
+    #: 星门打矮星系统。**不派遣舰队、不占航线**（用户口径 2026-09-13），
+    #: 所以它和扫描/军力榜一样是填空隙的那一类，见 。
+    STARGATE = "STARGATE"
 
 
 class DisabledRecovery(Enum):
@@ -241,7 +244,7 @@ def due_for_a_backoff_retry(
 #: 采集时发现那个判断在本模块里散着六处，语义完全一样。漏改任何一处的后果都是
 #: 静默的：漏在 `ready_to_run` 就永远不跑，漏在抢占判断就**攻击到点了也抢不过来**
 #: ——而那正是「间歇时间拿去扫描」这套设计唯一不能出错的地方。
-GAP_FILLERS = frozenset({MissionKind.SCAN, MissionKind.RANKING})
+GAP_FILLERS = frozenset({MissionKind.SCAN, MissionKind.RANKING, MissionKind.STARGATE})
 
 
 def fills_gaps(kind: MissionKind) -> bool:
@@ -1164,8 +1167,17 @@ def has_work(
     # 正是「加了新 MissionKind 却漏改分支」唯一的把关（漏掉的后果是新链路
     # 静默套用 BOT 的判据）。写成显式的 `is ... or ... is ...`，收窄才成立。
     # 代价是加第三种填空隙任务时这里要跟着改一次，而 `assert_never` 会当场提醒。
-    if task.kind is MissionKind.SCAN or task.kind is MissionKind.RANKING:
-        # 扫描/军力榜都不派遣，因此不受航线约束，也没有完成态。它们正是用来填空隙的。
+    if (
+        task.kind is MissionKind.SCAN
+        or task.kind is MissionKind.RANKING
+        or task.kind is MissionKind.STARGATE
+    ):
+        # 扫描/军力榜/星门都不派遣**舰队航线**，因此不受航线约束，也没有完成态。
+        # 它们正是用来填空隙的。
+        #
+        # ⚠️ 星门确实会把一支舰队送出去，但它**不占航线**（用户口径 2026-09-13），
+        # 而这道闸问的正是「航线够不够」。按 BOT 那一档判的话，航线一满星门就再也
+        # 排不上 —— 而它本来就该在那种时候跑（「发完攻击后系统空余时间填充」）。
         return True
 
     can_dispatch = facts.of(task).free_lines > 0 and not waiting_for_a_line(task, facts)

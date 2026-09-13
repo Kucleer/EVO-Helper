@@ -107,6 +107,19 @@ class ProgressReading:
             return (self.coordinate_scans,)
         if kind is MissionKind.RANKING:
             return (self.ranking_written_at,)
+        if kind is MissionKind.STARGATE:
+            # ⚠️ **故意交空元组：星门在库里不留任何产出。**
+            #
+            # 它不写 `attack_dispatches`（用户口径 2026-09-13「不占用航线」，
+            # 整段理由在 `tools.pirate_loop.PirateLoop.attack_stargate`），
+            # 过程只落 `system_log`。所以这里没有「数字动没动」可看。
+            #
+            # ⚠️ 空元组的效果是：这一类退化成**纯挂钟判据** —— 指纹永远不变，
+            # 跑满 `STALL_TIMEOUT`(45 分钟) 就判卡死。**这恰恰是对的**：
+            # 实测一趟星门约 2 分钟（2026-09-13 六次实机），跑到 45 分钟只可能是
+            # 卡在某一屏上了。别为了「有个信号」去编一个 —— 编出来的信号会让
+            # 真卡死的那一轮看起来一直在动。
+            return ()
         # 穷举到这里说明 MissionKind 加了新成员却没人补分支——新链路静默套用
         # 别人的进展判据，等于给它配了一个永远不会响的看门狗。
         assert_never(kind)

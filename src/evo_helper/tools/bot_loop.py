@@ -92,6 +92,7 @@ from uuid import UUID
 from evo_helper.domain.bot_round import BOT_ATTACK_PRESET, BotPhase, DispatchFact, phase_of
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.records import MISSION_KIND_RECYCLE, TARGET_KIND_BOT
+from evo_helper.domain.scheduler import EXIT_ENVIRONMENT_BUSY
 from evo_helper.domain.target_order import DEFAULT_UNREADABLE_EXCLUSION
 from evo_helper.game import pirate_ui
 from evo_helper.infrastructure.system_log import record_knob_override, record_system_log
@@ -101,6 +102,7 @@ from evo_helper.tools.pirate_loop import (
     LoopOptions,
     PirateLoop,
     ReportIngest,
+    SessionUnavailable,
     TargetCheck,
     exit_code_for,
     parse_origin,
@@ -1074,11 +1076,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="本进程最多实际派出多少发；调度器按该出发点空闲航线数传入",
     )
+    parser.add_argument(
+        "--stargate",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "打星门：N 是**当日上限**（不是这一趟打几发 —— 星门一次只能在飞一发，"
+            "这一趟最多派 1 发）。0 = 不打。这一档只打星门，不跑常规那一轮"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.max_dispatches is not None and args.max_dispatches < 1:
         parser.error("--max-dispatches 必须至少为 1")
-    if not args.targets and not args.recycle:
-        parser.error("--targets 和 --recycle 至少要给一个")
+    if args.stargate < 0:
+        parser.error("--stargate 不能是负数")
+    if not args.targets and not args.recycle and not args.stargate:
+        parser.error("--targets / --recycle / --stargate 至少要给一个")
 
     import ctypes
 
@@ -1103,7 +1117,10 @@ def main(argv: list[str] | None = None) -> int:
     say(f"模式：{mode}；目标 {listed}" + (f"；回收 {recycle_listed}" if recycle_listed else ""))
 
     def go() -> int:
-        driver = LiveDriver(allow_actions=args.attack)
+        # ⚠️ 星门那一档也要动作能力：它要点「出发！」。
+        # `allow_actions` 是整个仓库里「这个进程能不能把舰队送出去」的唯一开关，
+        # 所以这里写成显式的或，而不是在别处偷偷打开。
+        driver = LiveDriver(allow_actions=args.attack or bool(args.stargate))
         ocr = make_ocr()
         # 守护提到这里建、并原样交给循环：**整轮只许有一份关窗重开配额**。
         # 在这里另建一个就等于把 `MAX_WINDOW_RESTARTS` 翻倍。
@@ -1111,6 +1128,24 @@ def main(argv: list[str] | None = None) -> int:
         # 「确保窗口在」也要落进重开的保护圈——2026-08-28 昨夜就是死在这一行的
         # 前身（裸 `driver.window()`）上，整段账在 `ensure_window_or_restart`。
         ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
+        if args.stargate:
+            # ⚠️ **星门这一档是独立的一趟，不跑常规那一轮。**
+            # 它不占航线、不写 `attack_dispatches`、当日次数读游戏自己的那个数
+            # （整段写在 `PirateLoop.attack_stargate` 上）。混进常规那一轮里跑，
+            # 就得让那一轮的航线账与配额判据也认识它 —— 而不认识正是这个仓库里
+            # 反复咬人的那一类 bug。
+            loop = BotLoop(driver, ocr, options, session_keeper=keeper)
+            try:
+                sent = loop.attack_stargate(daily_cap=args.stargate)
+            except SessionUnavailable as unavailable:
+                # ⚠️ **环境故障不许抛穿 `main()`。** 抛穿就是 Python 默认的退出码 1，
+                # 而调度器把 1 读成「这个任务坏了」并计进连续失败、走向自动停用。
+                # 会话回不来只是「这一趟没法开工」，下一趟画面正常了自己就好 ——
+                # 判据与常规那一轮共用（`exit_code_for` 的 `EXIT_ENVIRONMENT_BUSY`）。
+                say(f"星门这一趟开不了工：{unavailable}")
+                return EXIT_ENVIRONMENT_BUSY
+            say(f"完成：星门派出 {sent} 发")
+            return 0
         outcome = BotLoop(driver, ocr, options, session_keeper=keeper).run()
         say(
             f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"

@@ -76,6 +76,7 @@ from evo_helper.domain.missions import (
     pirate_systems,
     ranking_command,
     scan_command,
+    stargate_command,
 )
 from evo_helper.domain.models import Coordinate
 from evo_helper.domain.ranking import (
@@ -4423,6 +4424,12 @@ class MissionScheduler:
                 bot_limit=_ranking_bot_limit(params_json),
                 blind_rows=self._blind_rows(),
             )
+        if kind is MissionKind.STARGATE:
+            # ⚠️ **出发星球写死在 runner 那一侧**（`PirateLoop.STARGATE_ORIGIN`）：
+            # 星门是一座**建筑**，只长在主球上，不是「这个任务配在哪就从哪打」。
+            # 这里仍旧把 `origin` 传过去，是为了让命令行自解释、并让 runner 那道
+            # 「派遣页回读起点」的闸有个明确的期望值。
+            return stargate_command(daily_cap=_stargate_daily_cap(params_json), origin=origin)
         if kind is MissionKind.PIRATE:
             return pirate_command(
                 pirate_systems(origin, _pirate_radius(params_json)), origin=origin
@@ -4778,8 +4785,33 @@ def _int_param(data: dict[str, Any], name: str) -> int:
     return value
 
 
+#: 星门每天打几发的默认值。用户口径（2026-09-13）：「每日只需要攻击 3 次」。
+#: ⚠️ 游戏每天给 5 次，这个 3 是**用户要的节制**，不是游戏的上限。
+DEFAULT_STARGATE_DAILY_CAP = 3
+
+
 def _pirate_radius(raw: str) -> int:
     return _int_param(_params(raw), "radius")
+
+
+def _stargate_daily_cap(raw: str) -> int:
+    """星门一天最多打几发。**留空 = 用户口径的 3 次。**
+
+    用户口径（2026-09-13）：「每日只需要攻击 3 次」。做成任务参数而不是写死，
+    是因为它是个**运维旋钮**（记忆里那条「主动考虑可配置」）：游戏每天给 5 次，
+    用户哪天想多打两次不该来改代码。
+
+    ⚠️ **`0` 一律拒掉，不当成「关掉」。** 要关这条链路，任务行上有复选框；
+    用一个看起来像数量的 `0` 去表达「关掉」，日后没人分得清那是手滑还是本意
+    （同 `_ranking_bot_limit` 那一段）。
+    """
+    value = _params(raw).get("daily_cap")
+    if value is None:
+        return DEFAULT_STARGATE_DAILY_CAP
+    cap = _int_param(_params(raw), "daily_cap")
+    if cap < 1:
+        raise MissionParamError("星门的每日次数至少是 1；要关掉这条链路请用任务上的复选框")
+    return cap
 
 
 def _ranking_bot_limit(raw: str) -> int | None:

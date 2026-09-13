@@ -153,7 +153,7 @@ def test_seeding_creates_one_row_per_chain_and_one_config(repository) -> None:  
     repository.ensure_mission_rows(now_utc=datetime.now(UTC))
 
     kinds = [row.kind for row in repository.mission_tasks()]
-    assert sorted(kinds) == ["BOT", "PIRATE", "RANKING", "SCAN"]
+    assert sorted(kinds) == ["BOT", "PIRATE", "RANKING", "SCAN", "STARGATE"]
     assert repository.scheduler_config().pirate_daily_quota == 32
 
 
@@ -173,7 +173,15 @@ def test_only_the_read_only_chains_are_enabled_by_default(repository) -> None:  
     repository.ensure_mission_rows(now_utc=datetime.now(UTC))
 
     by_kind = {row.kind: row.enabled for row in repository.mission_tasks()}
-    assert by_kind == {"PIRATE": False, "BOT": False, "SCAN": True, "RANKING": True}
+    # ⚠️ 意图不变：**只有只读的那两条默认开着**。星门会把舰队送出去，
+    # 所以和两条攻击链路一样默认关（「装好就会派舰队不是好默认」）。
+    assert by_kind == {
+        "PIRATE": False,
+        "BOT": False,
+        "SCAN": True,
+        "RANKING": True,
+        "STARGATE": False,
+    }
 
 
 def test_seeding_twice_does_not_duplicate_or_overwrite(repository) -> None:  # type: ignore[no-untyped-def]
@@ -186,7 +194,7 @@ def test_seeding_twice_does_not_duplicate_or_overwrite(repository) -> None:  # t
     repository.ensure_mission_rows(now_utc=now)
 
     rows = repository.mission_tasks()
-    assert len(rows) == 4
+    assert len(rows) == len(MissionKind)
     assert next(row.priority for row in rows if row.kind == "PIRATE") == 7
 
 
