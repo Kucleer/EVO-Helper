@@ -469,6 +469,9 @@ class MilitaryAttackConfigView:
     #: 回收节奏（整数十分位 0–10）；`None` = 留空 = 关（0）。
     #: ⚠️ 页面上显示 0.0–1.0，落库存整数十分位，绝不用浮点。
     recycle_rate_tenths: int | None = None
+    #: 每趟读几封回收报告邮件；`None` / 0 = 不读（默认）。
+    #: ⚠️ 默认关是有意的：这是加功能不是修 bug，开着会让每趟信箱多花时间。
+    recycle_mail_opens: int | None = None
 
 
 @dataclass(frozen=True)

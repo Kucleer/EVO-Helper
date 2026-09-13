@@ -99,6 +99,35 @@ class Quantity:
         return int(self.value)
 
 
+#: 带后缀的数量在**含噪文本**里的样子。与 `_SUFFIXED_RE` 的区别只是「不要求整串」。
+_SUFFIXED_SCAN_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*([KMB])", re.IGNORECASE)
+
+
+def find_abbreviated_quantities(text: str) -> list[Quantity]:
+    """从一段**含噪** OCR 文本里挑出所有 `3.07M` / `280.25K` 形状的数量。
+
+    ⚠️ **和 `parse_quantity` 分开，是因为那一个用 `fullmatch`。** 回收报告的
+    资源格读出来常带前缀垃圾（实测 `'"4 2.1M'`、`'21M (人('`），整串匹配一个都
+    认不出，而那正是要读的数。
+
+    ⚠️ **只认带 K/M/B 后缀的**：裸数在这种噪声里几乎全是垃圾（图标碎片、背景
+    那层漂浮文字的残数），收进来只会给挑选器塞假候选。回收报告的三样在画面上
+    一律是缩写形式，所以这个限制不丢真值。
+
+    ⚠️ **一段文本里读到几个就返回几个，不许只取第一个**：`'"4 2.1M'` 里第一个
+    数字是垃圾。哪个是真的由调用方拿外部事实去判（回收那一侧是容量不变量，
+    整段在 `domain.recycle_mail.pick_amounts`）。
+    """
+    out: list[Quantity] = []
+    for match in _SUFFIXED_SCAN_RE.finditer(text or ""):
+        # ⚠️ 欧洲记法：`.` 是千分位、`,` 是小数点（`12.500` = 12500、`1,5M` = 1.5M）。
+        # 这里的数字是缩写形式，小数点后只有一两位，所以 `,` 一律当小数点。
+        parsed = parse_quantity(f"{match.group(1).replace(',', '.')}{match.group(2).upper()}")
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
 def parse_quantity(text: str) -> Quantity | None:
     """把画面上的一串数字读成 `Quantity`；读不出返回 None。
 
@@ -130,4 +159,4 @@ def parse_quantity(text: str) -> Quantity | None:
     )
 
 
-__all__ = ["SUFFIX_SCALES", "Quantity", "parse_quantity"]
+__all__ = ["SUFFIX_SCALES", "Quantity", "find_abbreviated_quantities", "parse_quantity"]

@@ -19,7 +19,7 @@ from evo_helper.domain.recycle_mail import (
     haul_is_consistent,
     looks_monotonic,
     parse_amounts,
-    vote,
+    pick_amounts,
 )
 
 NOW = datetime(2026, 9, 12, 5, 47, 4, tzinfo=UTC)
@@ -105,21 +105,68 @@ def test_a_haul_without_ships_is_rejected_rather_than_divided_by_zero() -> None:
     assert not haul_is_consistent(_haul(4_000_000, 2_000_000, 200_000, 0))
 
 
-# -- 投票 ------------------------------------------------------------------------
+# -- 挑读数（容量不变量当选择器） ----------------------------------------------
 
 
-def test_the_vote_takes_the_majority_because_the_noise_moves() -> None:
-    """⚠️ 背景那层漂浮文字每帧不一样，所以它的垃圾各不相同、真数字每帧都一样。
+def test_the_pick_rescues_the_mail_that_the_vote_got_wrong() -> None:
+    """⚠️ **这是实拍回归**：`recycle-12092026-032646.png`，晶体真值 `2.1M`。
 
-    实测同一封信 5 帧之间变了 255→1157 个像素；单帧 OCR 8 格错 2 格。
+    #325 的众数在这一封上以 11:4 选出了 `1M` —— 窄框把小数点切掉，
+    `2.1M` 读成 `21M` / `1M`，而**错的那个票反而多**。投票的前提是噪声随机，
+    可 ROI 切字是**系统性**的：同一个框每一帧都切掉同一位数字。
+
+    容量不变量不问「哪个读数多」，问「哪一组凑得出 273 艘船装得下的量」：
+    3.07M + 2.1M + 280.25K = 5.45M ≈ 273 × 20K = 5.46M（差 0.18%）。
     """
-    assert vote(["6.04M", "6.04M", "5.04M", "6.04M", "6.04M"]) == "6.04M"
+    picked = pick_amounts(
+        (
+            [Decimal("3070000")],
+            [Decimal("21000000"), Decimal("1000000"), Decimal("2100000")],
+            [Decimal("280250")],
+        ),
+        ships=273,
+    )
+    assert picked == (Decimal("3070000"), Decimal("2100000"), Decimal("280250"))
 
 
-def test_the_vote_gives_none_when_nothing_was_read() -> None:
-    """全读不出时 None ⇒ 整封作废。**不给兜底值**：0 和「没读出来」是两件事。"""
-    assert vote([]) is None
-    assert vote(["", "   "]) is None
+def test_the_pick_rescues_the_five_thousand_percent_mail_too() -> None:
+    """另一封实拍：`recycle-12092026-021709.png`，金属被读成 `413M`（真值 4.13M）。
+
+    368 艘 × 20K = 7.36M。`413M` 那一组差 5555%，`4.13M` 那一组差 0.02%。
+    """
+    picked = pick_amounts(
+        (
+            [Decimal("413000000"), Decimal("4130000"), Decimal("4300000")],
+            [Decimal("2800000"), Decimal("28000000")],
+            [Decimal("428200")],
+        ),
+        ships=368,
+    )
+    assert picked == (Decimal("4130000"), Decimal("2800000"), Decimal("428200"))
+
+
+def test_the_pick_needs_a_ship_count_to_stand_on() -> None:
+    """⚠️ 船数是这条不变量的锚。读不出船数就没有判据，**不许退回投票**。"""
+    assert pick_amounts(([Decimal(1)], [Decimal(2)], [Decimal(3)]), ships=0) is None
+
+
+def test_the_pick_gives_none_when_a_cell_has_no_candidate() -> None:
+    """任一格没候选就整封作废（同 `parse_amounts` 那条「全有或全无」）。"""
+    assert pick_amounts(([Decimal("3070000")], [], [Decimal("280250")]), ships=273) is None
+
+
+def test_the_pick_always_returns_something_so_the_caller_must_still_gate() -> None:
+    """⚠️ **本函数只挑最接近的一组，它不是闸门。**
+
+    这里三个候选没有一组凑得上 273 艘的量，可它照样返回最接近的那一组——
+    调用方必须再过一次 `haul_is_consistent`，否则会把一组垃圾当实收入库。
+    """
+    picked = pick_amounts(
+        ([Decimal("300")], [Decimal("200")], [Decimal("100")]),
+        ships=273,
+    )
+    assert picked == (Decimal("300"), Decimal("200"), Decimal("100"))
+    assert not haul_is_consistent(_haul(300, 200, 100, 273))
 
 
 # -- 三格全有或全无 ---------------------------------------------------------------

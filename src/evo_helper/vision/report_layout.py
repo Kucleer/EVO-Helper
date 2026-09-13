@@ -161,6 +161,16 @@ class ReportLayout:
     report_time: Region
     #: 安全提示邮件的正文。此类邮件没有 VS / 舰队区，关键信息只在这块正文。
     security_message: Region
+    #: 回收报告的三个资源格，**每格给一串框而不是一个**。
+    #:
+    #: ⚠️ **别在这里挑「最好的那个框」——那是个伪问题。** 实测 8 封语料：
+    #: 窄框会把 `2.1M` 的小数点切掉读成 `21M`（7/8），宽框会把图标吃进来读成
+    #: `262M`（6/8），更宽的 1/8。而它们**不在同一封信上同时死**，所以把三个框
+    #: 的读数一起当候选交给容量不变量去挑，8/8 全对（整段在
+    #: `domain.recycle_mail.pick_amounts`）。
+    recycle_amount_cells: tuple[tuple[Region, ...], ...]
+    #: 回收船数。容量不变量的锚，读不出就整封作废。
+    recycle_ship_count: Region
     detail_versus: Region
     replay_versus: Region
     #: Tight single-line ROIs for the coordinates, read separately at psm 7.
@@ -220,6 +230,15 @@ LIVE_LAYOUT = ReportLayout(
     report_header=Region(720, 125, 1200, 195),
     report_time=Region(1010, 126, 1205, 162),
     security_message=Region(720, 205, 1205, 420),
+    # ⚠️ 下面这些是在**含标题栏的 917 空间**里量的（2026-09-12 语料），
+    # 写进布局时统一减掉 `APP_TITLE_BAR_PX`（38），因为布局活在裁过的 879 空间里。
+    # 量的时候用的原始值记在 `docs/回收闭环/邮件读实收-评估-2026-09-12.md`。
+    recycle_amount_cells=(
+        (Region(854, 308, 925, 340), Region(845, 306, 915, 342), Region(849, 307, 920, 341)),
+        (Region(954, 308, 1025, 340), Region(938, 306, 1010, 342), Region(946, 307, 1018, 341)),
+        (Region(1042, 308, 1140, 340), Region(1030, 306, 1130, 342), Region(1036, 307, 1135, 341)),
+    ),
+    recycle_ship_count=Region(1140, 374, 1210, 402),
     detail_versus=Region(720, 370, 1200, 460),
     replay_versus=Region(720, 150, 1200, 240),
     detail_attacker_coordinate=Region(760, 428, 900, 452),
