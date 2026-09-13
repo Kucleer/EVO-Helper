@@ -138,6 +138,19 @@ def scan_command() -> list[str]:
     return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.scan_coordinates"])
 
 
+def mail_command() -> list[str]:
+    """空闲回读的命令行。**只翻一趟信箱就退。**
+
+    ⚠️ **不带 `--attack`、不带出发星球。** 信箱是账号级的，跟站在哪颗星球上
+    毫无关系；而切星球要开浮层、认坐标、拖列表、回读，是整趟里最贵的一段。
+
+    ⚠️ 冷却（`idle_cooldown_minutes`）**不上命令行**：它是调度器那一侧的判据
+    （`domain.scheduler.mail_has_work`），运行器起来的时候那个决定早就做完了。
+    送过去只会多一份能和调度器分家的副本。
+    """
+    return _checked([_PYTHON, "-u", "-m", "evo_helper.tools.bot_loop", "--mail-only"])
+
+
 def stargate_command(*, daily_cap: int, origin: Coordinate) -> list[str]:
     """星门打矮星系统的命令行。
 
@@ -207,7 +220,12 @@ def ranking_command(*, bot_limit: int | None = None, blind_rows: int | None = No
     return _checked(command)
 
 
-def pirate_command(systems: Sequence[tuple[int, int]], *, origin: Coordinate) -> list[str]:
+def pirate_command(
+    systems: Sequence[tuple[int, int]],
+    *,
+    origin: Coordinate,
+    recycle_mail_route: str | None = None,
+) -> list[str]:
     """海盗巡航命令行。
 
     `--scout --attack` 是这条命令会**真的动鼠标派舰队**的开关，不是可有可无的
@@ -224,7 +242,20 @@ def pirate_command(systems: Sequence[tuple[int, int]], *, origin: Coordinate) ->
     return _checked(
         [_PYTHON, "-u", "-m", "evo_helper.tools.pirate_loop", "--systems", *listed]
         + ["--origin", str(origin), "--scout", "--attack"]
+        # ⚠️ **海盗轮也要带。** 它走的是同一个 `run()` → `reconcile_today()`，
+        # 今天同样会在开工趟末尾读回收报告 —— 只给 bot 带的话路由形同虚设。
+        + _recycle_route_args(recycle_mail_route)
     )
+
+
+def _recycle_route_args(route: str | None) -> list[str]:
+    """`--recycle-mail-route` 的参数片段。`None` 时**什么都不加**。
+
+    ⚠️ `None` 的含义是「调度器没算」（手工跑命令行时就是这样），
+    运行器那边的默认是 `round` —— 也就是今天的行为。
+    在这里补一个「看起来一样」的默认值，日后改默认就改不动了。
+    """
+    return [] if route is None else ["--recycle-mail-route", route]
 
 
 def bot_command(
@@ -234,6 +265,7 @@ def bot_command(
     presets: Mapping[Coordinate, str] | None = None,
     max_dispatches: int | None = None,
     recycle: Sequence[Coordinate] | None = None,
+    recycle_mail_route: str | None = None,
 ) -> list[str]:
     """bot 攻击命令行。
 
@@ -280,7 +312,7 @@ def bot_command(
         command += ["--max-dispatches", str(max_dispatches)]
     # `--attack` 历来在末尾；保留这一约定，既让运行台账可直接肉眼识别，也不破坏
     # 依赖该稳定 argv 形状的现有调用方。
-    return _checked(command + ["--attack"])
+    return _checked(command + ["--attack"] + _recycle_route_args(recycle_mail_route))
 
 
 def _checked(command: list[str]) -> list[str]:

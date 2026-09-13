@@ -109,6 +109,13 @@ CONFIDENCE_ORIGIN_MISMATCH = 0.6
 #: 认不上时，日志里最多列几个候选。全列出来只会把一条日志撑成一屏。
 MAX_LOGGED_CANDIDATES = 8
 
+#: `daily_reconciliations.completed_by` 的两个取值。
+#:
+#: ⚠️ 做成常量而不是裸字符串：回收路由、写入点、用例三处都要用同一个词，
+#: 而拼错的样子是「路由永远以为空闲趟没翻过」—— 在日志上和「真的没翻过」一样。
+RECONCILED_BY_MAIL = "mail"
+RECONCILED_BY_ROUND = "round"
+
 #: 认领相关日志的 `source`。
 _MATCH_LOG_SOURCE = "storage.report_match"
 
@@ -129,6 +136,13 @@ STOPPED_BY_UNKNOWN = "UNKNOWN"
 _MISSION_SEEDS: tuple[tuple[MissionKind, str, bool, int, str], ...] = (
     (MissionKind.PIRATE, "侦查+攻击海盗", False, 0, '{"radius": 10}'),
     (MissionKind.BOT, "扫描+攻击 bot", False, 1, "{}"),
+    # 信箱回读：**默认关着**（同两条攻击链路 —— 它会占着鼠标，装好就自己跑不是
+    # 好默认），优先级 **1**，排在所有填空隙任务最前。
+    #
+    # ⚠️ 排在 SCAN（2）前面是有讲究的：SCAN 的 `has_work` 恒真、跑完不冷却、
+    # 没有完成态，一旦被启用就会一直占着填空隙的位置，排在它后面的永远轮不到。
+    # 而信箱回读一趟约 3.5 分钟、有界、有冷却 —— **有界的在前，无界的在后**。
+    (MissionKind.MAIL, "信箱回读", False, 1, "{}"),
     (MissionKind.SCAN, "扫描全星系 bot", True, 2, "{}"),
     # 星门：**默认关着**，理由同两条攻击链路 —— 它会把一支舰队送出去，
     # 而「装好就会派舰队」不是好默认（用户在任务页勾一下就开）。
@@ -1986,6 +2000,7 @@ class SqlAlchemyRepository:
         observed_reports: int,
         complete: bool,
         reconciled_at_utc: datetime,
+        completed_by: str | None = None,
     ) -> DailyAttackStatus:
         """记下「今天信箱里数到 N 份本链路的战报」。一天一条，**只增不减**。
 
@@ -2053,6 +2068,11 @@ class SqlAlchemyRepository:
             elif observed_reports == row.observed_reports:
                 row.complete = row.complete or complete
             row.reconciled_at_utc = moment
+            if completed_by is not None:
+                # ⚠️ **只在给了来源时才覆盖。** 传 None 的意思是「我不说」，
+                # 不是「把已有的抹掉」—— 老调用方（没跟上这个参数的）不该把
+                # 上一趟空闲回读留下的 `mail` 冲成 NULL，那会让回收路由误判。
+                row.completed_by = completed_by
             row.dispatched_count = _accepted_attacks_on(session, target_kind, day=day)
             row.attacks_used = max(row.attacks_used, row.dispatched_count, row.observed_reports)
             row.awaiting_reports = _awaiting_attack_reports(
@@ -2192,6 +2212,44 @@ class SqlAlchemyRepository:
                 )
             )
         return moment
+
+    def next_line_free_at_any(self, *, now_utc: datetime) -> datetime | None:
+        """**所有出发星球**里最早会空出来的那条航线，什么时候空。算不出返回 None。
+
+        判据与 `next_line_free_at` **逐字相同**，只是不按星球分组 —— 空闲回读要问的
+        是「接下来这几分钟，鼠标会不会被某个星球的派遣叫走」，而那与是哪颗星球无关。
+
+        ⚠️ **不另写一套占线逻辑。** 这里和按星球那一版共用同一组条件
+        （已接受、没被人工放手、航线钟还在未来）；两处各写一遍迟早分家，
+        而分家的样子是「页面说还有 3 分钟、调度器以为马上要空」。
+
+        ⚠️ 返回 None 的含义是**算不出**，不是「没有线会空」。调用方该往「放行」
+        那一侧倒：全场只剩读不到飞行时长的派遣时，压着不读信箱没有依据。
+        """
+        _require_utc(now_utc, "now_utc")
+        with self._session_factory() as session:
+            moment: datetime | None = session.scalar(
+                select(func.min(orm.AttackDispatchRow.line_free_at_utc)).where(
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.line_released_at_utc.is_(None),
+                    orm.AttackDispatchRow.line_free_at_utc > now_utc,
+                )
+            )
+        return moment
+
+    def last_mail_completed_at(self) -> datetime | None:
+        """**空闲回读那一趟**上一次翻完是什么时候。从来没有过返回 None。
+
+        ⚠️ **只认 `completed_by = 'mail'` 的行。** 共享的 `reconciled_at_utc`
+        分不出是谁翻的，而回收路由问的正是「空闲趟还活着吗」——
+        拿共享时刻去答，兜底趟一直在翻时它永远新鲜，路由就永远切不回兜底。
+        """
+        with self._session_factory() as session:
+            return session.scalar(
+                select(func.max(orm.DailyReconciliationRow.reconciled_at_utc)).where(
+                    orm.DailyReconciliationRow.completed_by == RECONCILED_BY_MAIL
+                )
+            )
 
     def release_held_lines(self, *, now_utc: datetime, hold: timedelta = UNKNOWN_LINE_HOLD) -> int:
         """把此刻还占着航线的派遣**全部**标成「人工已放手」，返回改了几行。
@@ -3670,6 +3728,33 @@ class SqlAlchemyRepository:
                 .group_by(orm.MissionRunRow.task_id)
             ).all()
         return {int(task_id): started_at for task_id, started_at in rows}
+
+    def last_mission_ends(self) -> dict[int, datetime]:
+        """每个任务上一次**结束**的时刻，按 `task_id` 挂。
+
+        ⚠️ **和 `last_mission_starts` 并存，不是替代它。** 两个数答的是不同的问题：
+
+        - 重启冷却问「刚起来就秒退的那种，节流住了没」⇒ 必须按**开始**算；
+        - 信箱回读的空闲冷却问「我上次什么时候**试完**」⇒ 必须按**结束**算。
+
+        按开始算的话，一趟 ≥ 冷却时长的信箱回读**结束那一刻就又到期**，
+        于是它永远排在最前，军力榜到期了也永远轮不上（方案 §3.3，
+        整段理由在 `domain.scheduler.TaskFacts.last_ended_at_utc` 上）。
+
+        ⚠️ 还没结束的那一轮（`ended_at_utc` 为 NULL）不参与 —— 它的含义是
+        「还在跑」，而「还在跑」那一档由 `decide()` 的 `running` 分支管，
+        不该混进冷却里。`task_id` 为 NULL 的历史行同样不参与，理由同上面那个方法。
+        """
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.MissionRunRow.task_id, func.max(orm.MissionRunRow.ended_at_utc))
+                .where(
+                    orm.MissionRunRow.task_id.is_not(None),
+                    orm.MissionRunRow.ended_at_utc.is_not(None),
+                )
+                .group_by(orm.MissionRunRow.task_id)
+            ).all()
+        return {int(task_id): ended_at for task_id, ended_at in rows}
 
     def record_mission_failure(
         self, task_id: int, *, exit_code: int | None, limit: int, now_utc: datetime

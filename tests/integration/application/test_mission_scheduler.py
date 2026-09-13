@@ -471,7 +471,12 @@ def test_the_pirate_command_carries_the_systems_the_radius_covers(  # type: igno
     assert "2:140" not in command
     # 这两个开关是「真的动鼠标派舰队」的意思，漏掉不报错、看着一切正常，
     # 代价是当天配额白白流失。
-    assert command[-2:] == ["--scout", "--attack"]
+    # ⚠️ 意图是「这两个开关必须原样出现在 argv 里」（漏掉 `--attack` 只会站过去看一眼、
+    # 不报错、一发不打），**不是「必须排在最末」**。2026-09-13 起后面还跟着
+    # `--recycle-mail-route`。所以按相邻子序列断言，不按位置。
+    assert ["--scout", "--attack"] == command[
+        command.index("--scout") : command.index("--scout") + 2
+    ]
 
 
 def test_the_bot_command_only_carries_targets_inside_the_range(  # type: ignore[no-untyped-def]

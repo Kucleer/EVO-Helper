@@ -393,7 +393,11 @@
   //
   // ⚠️ 军力榜（RANKING）也在这里面。从前这个判断写成「是不是 SCAN」，于是
   // 军力榜那张卡是可拖的，拖一下就吃一个 400。
-  const FILLS_GAPS = ['SCAN', 'RANKING'];
+  // ⚠️⚠️ **这份清单必须和 `domain.scheduler.GAP_FILLERS` 一字不差。**
+  // 它是 JS 里的一个字面量数组，领域层改了它不会跟着改 —— 2026-09-13 加星门时
+  // 就漏了一次（那张卡因此是可拖的，拖一下吃一个 400）。
+  // `tests/unit/web/test_fills_gaps_sync.py` 现在守着这件事。
+  const FILLS_GAPS = ['SCAN', 'RANKING', 'STARGATE', 'MAIL'];
 
   // 每条链路的参数框。**次序即卡上从左到右的次序**，与
   // `web.display.PARAM_LABELS` 是同一批键。
@@ -444,6 +448,14 @@
       { key: 'bot_limit', label: '扫描数量', width: 96, min: 1, placeholder: '留空 = 全扫' },
       { key: 'scan_cooldown_hours', label: '扫描间隔', width: 116, min: 0.1, step: '0.5', placeholder: '小时，留空 = 不限',
         title: '两轮扫描之间至少隔这么久，从上一轮「开始」的时刻算起（不是结束）。调大＝扫描少打断攻击、一夜派得出去的发数多，代价是读数变旧、军力被高估；调小＝读数新鲜、选靶准，代价是更常打断攻击。留空 = 不限。安全阀：窗口内候选低于「窗口门限」时，这个间隔会立刻让路——否则池子会被饿空，选靶只好回落到上一周期的陈旧读数。' },
+    ],
+    STARGATE: [
+      { key: 'daily_cap', label: '每日次数', width: 96, min: 1, placeholder: '留空 = 3',
+        title: '一天最多打几发星门。游戏自己每天给 5 次，这个数是你要的节制；已经打过几次读的是游戏那个「今日剩余攻击次数」，你手动打过的也算进来。' },
+    ],
+    MAIL: [
+      { key: 'idle_cooldown_minutes', label: '空闲间隔', width: 106, min: 0, placeholder: '分钟，留空 = 5',
+        title: '鼠标空着时，距上次翻完信箱至少隔这么久再翻一趟。调小 = 战报入库更快、空档用得更满；调大 = 省鼠标时间。填 0 = 每次轮到就翻。要关掉这条链路请用左边的复选框，不要用 0。' },
     ],
   };
 

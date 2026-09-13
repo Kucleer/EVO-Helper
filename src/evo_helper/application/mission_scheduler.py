@@ -72,6 +72,7 @@ from evo_helper.domain.missions import (
     NoFreeLineError,
     bot_command,
     bot_targets_in_range,
+    mail_command,
     pirate_command,
     pirate_systems,
     ranking_command,
@@ -96,6 +97,7 @@ from evo_helper.domain.report_wait import (
 from evo_helper.domain.rules import cycle_start_utc
 from evo_helper.domain.scheduler import (
     BACKOFF_SCHEME,
+    RECYCLE_ROUTE_ROUND,
     SCAN_YIELD_PATIENCE,
     Action,
     Decision,
@@ -114,10 +116,14 @@ from evo_helper.domain.scheduler import (
     free_lines_for,
     has_work,
     looks_like_an_environment_fault,
+    preemptible,
     quota_day_start_utc,
     scan_cooldown_verdict,
     tasks_failing_together,
     within_schedule_window,
+)
+from evo_helper.domain.scheduler import (
+    recycle_route as domain_recycle_route,
 )
 from evo_helper.domain.target_order import (
     DEFAULT_PROTECTION_EXCLUSION,
@@ -1805,7 +1811,7 @@ class MissionScheduler:
         if not self._backfill.pending:
             return
         running = self._supervisor.running
-        if running is not None and running.kind is not MissionKind.SCAN:
+        if running is not None and not preemptible(running.kind):
             return
         before = self._measure_backfill()
         with self._lock:
@@ -1813,7 +1819,7 @@ class MissionScheduler:
                 return
             running = self._supervisor.running
             if running is not None:
-                if running.kind is not MissionKind.SCAN:
+                if not preemptible(running.kind):
                     return
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             was = self._backfill.state()
@@ -2856,9 +2862,14 @@ class MissionScheduler:
                 return False
             running = self._supervisor.running
             if decision.action is Action.PREEMPT:
-                if running is None or running.kind is not MissionKind.SCAN:
+                if running is None or not preemptible(running.kind):
                     return False
-                # 只有扫描会被抢占（判据保证），它的游标持久化，随时可断。
+                # ⚠️ **判据是 `PREEMPTIBLE`，不是写死的某一种。** 这里原先写着
+                # `is not MissionKind.SCAN`，而领域层 `decide()` 用的是
+                # `fills_gaps()` —— 两边一不一致没人守着。新加一种填空隙任务时
+                # 只改领域层，它跑起来就**谁都停不了**（方案 §3.4 点名的那个坑）。
+                # 集合里那几种的共同点是「随起随停没有代价」：扫描游标持久化，
+                # 信箱回读有界且每封邮件独立入库。
                 self._finish(self._supervisor.stop(StopReason.PREEMPTED))
             elif running is not None:
                 return False
@@ -3213,6 +3224,9 @@ class MissionScheduler:
         """
         grace = timedelta(minutes=config.report_grace_minutes)
         starts = self._repository.last_mission_starts()
+        # 信箱回读的冷却按**结束**算（`TaskFacts.last_ended_at_utc`），
+        # 与重启冷却那个按开始算的并存 —— 两个数答的是不同的问题。
+        ends = self._repository.last_mission_ends()
         pirate_active = any(
             task.kind is MissionKind.PIRATE and _participating(task) for task in tasks
         )
@@ -3239,6 +3253,7 @@ class MissionScheduler:
         for task in tasks:
             base = TaskFacts(
                 last_started_at_utc=starts.get(task.task_id),
+                last_ended_at_utc=ends.get(task.task_id),
                 last_failure_at_utc=self._last_failure_at.get(task.task_id),
             )
             if not _participating(task) or fills_gaps(task.kind):
@@ -3375,6 +3390,14 @@ class MissionScheduler:
             ),
             pirate_quota=config.pirate_daily_quota,
             pirate_blocked_until_utc=self._pirate_block_until(tasks),
+            # 信箱回读用它判「这个空档够不够翻一趟」。**只有真有这样一个任务时才查**：
+            # 每 tick 一次的查询不该为一条没启用的链路白花（同上面 `account_free`
+            # 那一段的理由）。
+            earliest_line_free_at_utc=(
+                self._repository.next_line_free_at_any(now_utc=now)
+                if any(item.kind is MissionKind.MAIL and _participating(item) for item in tasks)
+                else None
+            ),
             per_task=per_task,
         )
 
@@ -3710,6 +3733,9 @@ class MissionScheduler:
             presets={item.coordinate: item.preset for item in group} if attack_targets else None,
             max_dispatches=total_budget if (recycle_targets or attack_targets) else None,
             recycle=recycle_targets,
+            # ⚠️ 军力批次那一路同样走 `run()` → `reconcile_today()`，
+            # 漏了它路由就只对普通 bot 轮生效 —— 而那正好是「有时读有时不读」。
+            recycle_mail_route=self._recycle_route(),
         )
 
     def _enabled_origins(self, row: orm.MissionTaskRow) -> set[Coordinate]:
@@ -4424,6 +4450,10 @@ class MissionScheduler:
                 bot_limit=_ranking_bot_limit(params_json),
                 blind_rows=self._blind_rows(),
             )
+        if kind is MissionKind.MAIL:
+            # ⚠️ 冷却不上命令行：它是调度器这一侧的判据（`mail_has_work`），
+            # 起进程的时候那个决定早就做完了。
+            return mail_command()
         if kind is MissionKind.STARGATE:
             # ⚠️ **出发星球写死在 runner 那一侧**（`PirateLoop.STARGATE_ORIGIN`）：
             # 星门是一座**建筑**，只长在主球上，不是「这个任务配在哪就从哪打」。
@@ -4432,7 +4462,9 @@ class MissionScheduler:
             return stargate_command(daily_cap=_stargate_daily_cap(params_json), origin=origin)
         if kind is MissionKind.PIRATE:
             return pirate_command(
-                pirate_systems(origin, _pirate_radius(params_json)), origin=origin
+                pirate_systems(origin, _pirate_radius(params_json)),
+                origin=origin,
+                recycle_mail_route=self._recycle_route(),
             )
         # ⚠️ **筛范围与排顺序是两件事，分两步写。**
         #
@@ -4444,7 +4476,33 @@ class MissionScheduler:
         # 原先没有这一步，目标顺序就是库里的返回顺序（大致按坐标升序）。实机
         # 2026-08-13 通宵：范围配的是 2:60–2:499、里面有 376 个已知 bot，
         # 而一夜只走到第 121 系——后面那些永远轮不到。
-        return self._bot_command(params_json, origin)
+        return self._bot_command(params_json, origin, route=self._recycle_route())
+
+    def _recycle_route(self) -> str:
+        """回收报告这一轮归谁读。**每次起轮现算**，不是写进任务参数的布尔值。
+
+        ⚠️ **判据在领域层那一份**（`domain.scheduler.recycle_route`），这里只负责
+        把两样事实喂给它：任务表快照、空闲回读上次自己翻完的时刻。
+        运行器不自己查任务表 —— 两处各算一遍迟早分家。
+
+        ⚠️ 读不到（库连不上之类）时回落 `round`，也就是**今天的行为**：
+        回收报告仍旧由开工趟读。错在这一侧只是「读得早一点」，
+        错在另一侧是「两边都不读」。
+        """
+        try:
+            # ⚠️ 走 `_snapshots` 而不是自己翻一遍行：那里统一解析了出发星球与航线上限
+            # 两个默认值，散着写会让页面显示的和实际用的分家。
+            tasks = self._snapshots(
+                self._repository.mission_tasks(), self._repository.scheduler_config()
+            )
+            route: str = domain_recycle_route(
+                tasks,
+                now_utc=datetime.now(UTC),
+                last_mail_completed_at=self._repository.last_mail_completed_at(),
+            )
+            return route
+        except Exception:  # noqa: BLE001 - 见 docstring：算不出就回到今天的行为
+            return RECYCLE_ROUTE_ROUND
 
     def _blind_rows(self) -> int | None:
         """军力榜盲滚**行数**。**填了数就锁死，留空则按实测自动标定。**
@@ -4558,7 +4616,12 @@ class MissionScheduler:
         )
 
     def _bot_command(
-        self, params_json: str, origin: Coordinate, *, max_dispatches: int | None = None
+        self,
+        params_json: str,
+        origin: Coordinate,
+        *,
+        max_dispatches: int | None = None,
+        route: str | None = None,
     ) -> list[str]:
         """组 bot runner 命令，并把当前可用航线变成真实的派遣预算。
 
@@ -4569,6 +4632,7 @@ class MissionScheduler:
             self._bot_selection(params_json, origin),
             origin=origin,
             max_dispatches=max_dispatches,
+            recycle_mail_route=route,
         )
 
 
@@ -4639,6 +4703,9 @@ def task_snapshot(row: orm.MissionTaskRow, *, origin: Coordinate, fleet_lines: i
         enabled_until_utc=row.enabled_until_utc,
         scan_cooldown=(
             _ranking_scan_cooldown(row.params_json) if kind is MissionKind.RANKING else None
+        ),
+        mail_idle_cooldown=(
+            _mail_idle_cooldown(row.params_json) if kind is MissionKind.MAIL else None
         ),
     )
 
@@ -4787,11 +4854,33 @@ def _int_param(data: dict[str, Any], name: str) -> int:
 
 #: 星门每天打几发的默认值。用户口径（2026-09-13）：「每日只需要攻击 3 次」。
 #: ⚠️ 游戏每天给 5 次，这个 3 是**用户要的节制**，不是游戏的上限。
+#: 信箱回读的空闲冷却默认值（方案 §3.7 建议 5 分钟 ≈ 一个 ≥5 分钟的空档正好装一趟）。
+DEFAULT_MAIL_IDLE_COOLDOWN = timedelta(minutes=5)
+
 DEFAULT_STARGATE_DAILY_CAP = 3
 
 
 def _pirate_radius(raw: str) -> int:
     return _int_param(_params(raw), "radius")
+
+
+def _mail_idle_cooldown(raw: str) -> timedelta:
+    """信箱回读的空闲冷却。**留空 = 默认 5 分钟。**
+
+    用户口径（方案 §3.7）：「鼠标空着时，距上次翻信箱至少隔多久再翻一趟」。
+    调小 = 战报入库更快、空档用得更满；调大 = 省鼠标时间。
+
+    ⚠️ **`0` 是合法的**，含义是「每次轮到就翻，不设冷却」。它和别的旋钮不同：
+    要关掉这条链路用任务上的复选框，而 `0` 在这里有明确且有用的意思。
+    ⚠️ 负数拒掉 —— 那只可能是手滑。
+    """
+    value = _params(raw).get("idle_cooldown_minutes")
+    if value is None:
+        return DEFAULT_MAIL_IDLE_COOLDOWN
+    minutes = _int_param(_params(raw), "idle_cooldown_minutes")
+    if minutes < 0:
+        raise MissionParamError("信箱回读的空闲间隔不能是负数；填 0 表示不设间隔")
+    return timedelta(minutes=minutes)
 
 
 def _stargate_daily_cap(raw: str) -> int:

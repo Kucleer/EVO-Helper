@@ -1077,6 +1077,23 @@ def main(argv: list[str] | None = None) -> int:
         help="本进程最多实际派出多少发；调度器按该出发点空闲航线数传入",
     )
     parser.add_argument(
+        "--recycle-mail-route",
+        choices=("idle", "round"),
+        default="round",
+        help=(
+            "回收报告这一轮归谁读：round = 开工趟读（默认，也是今天的行为）；"
+            "idle = 归空闲回读那一趟，开工趟一步都不走。**由调度器每次起轮现算后传入**"
+        ),
+    )
+    parser.add_argument(
+        "--mail-only",
+        action="store_true",
+        help=(
+            "只翻一趟信箱就退：不切出发星球、不进目标循环。"
+            "**空闲回读**那一档（调度器在鼠标空着时拉起），也可手工跑来排障"
+        ),
+    )
+    parser.add_argument(
         "--stargate",
         type=int,
         default=0,
@@ -1091,8 +1108,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-dispatches 必须至少为 1")
     if args.stargate < 0:
         parser.error("--stargate 不能是负数")
-    if not args.targets and not args.recycle and not args.stargate:
-        parser.error("--targets / --recycle / --stargate 至少要给一个")
+    if not args.targets and not args.recycle and not args.stargate and not args.mail_only:
+        parser.error("--targets / --recycle / --stargate / --mail-only 至少要给一个")
+    if args.mail_only and (args.targets or args.recycle or args.stargate):
+        # ⚠️ 这一档是**只翻信箱**，掺别的进来会让「这一趟到底干了什么」说不清，
+        # 而调度器那一侧正靠 `mission_runs` 的时长与退出码判断它。
+        parser.error("--mail-only 是独立的一档，不能和 --targets / --recycle / --stargate 同用")
 
     import ctypes
 
@@ -1120,6 +1141,9 @@ def main(argv: list[str] | None = None) -> int:
         # ⚠️ 星门那一档也要动作能力：它要点「出发！」。
         # `allow_actions` 是整个仓库里「这个进程能不能把舰队送出去」的唯一开关，
         # 所以这里写成显式的或，而不是在别处偷偷打开。
+        # ⚠️ `--mail-only` **不给动作能力**：它只翻信箱、不派舰队。
+        # `allow_actions` 是整个仓库里「这个进程能不能把舰队送出去」的唯一开关，
+        # 能不给就不给。
         driver = LiveDriver(allow_actions=args.attack or bool(args.stargate))
         ocr = make_ocr()
         # 守护提到这里建、并原样交给循环：**整轮只许有一份关窗重开配额**。
@@ -1128,6 +1152,19 @@ def main(argv: list[str] | None = None) -> int:
         # 「确保窗口在」也要落进重开的保护圈——2026-08-28 昨夜就是死在这一行的
         # 前身（裸 `driver.window()`）上，整段账在 `ensure_window_or_restart`。
         ensure_window_or_restart(driver, keeper, chain="tools.bot_loop")
+        if args.mail_only:
+            # ⚠️⚠️ **被截止收工要按正常结束收场（exit 0）。** 调度器把
+            # 「`stopped_by` 不是 SELF 或退出码非 0」计入连续失败，连着三次自动停用；
+            # 而截止收工是设计内的正常结束。「翻完了没」走
+            # `daily_reconciliations.completed_by` 那一列，不走退出码。
+            loop = BotLoop(driver, ocr, options, session_keeper=keeper)
+            loop._recycle_mail_route = args.recycle_mail_route  # noqa: SLF001
+            try:
+                loop.run_mail_only()
+            except SessionUnavailable as unavailable:
+                say(f"空闲回读开不了工：{unavailable}")
+                return EXIT_ENVIRONMENT_BUSY
+            return 0
         if args.stargate:
             # ⚠️ **星门这一档是独立的一趟，不跑常规那一轮。**
             # 它不占航线、不写 `attack_dispatches`、当日次数读游戏自己的那个数
@@ -1146,7 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_ENVIRONMENT_BUSY
             say(f"完成：星门派出 {sent} 发")
             return 0
-        outcome = BotLoop(driver, ocr, options, session_keeper=keeper).run()
+        loop = BotLoop(driver, ocr, options, session_keeper=keeper)
+        # ⚠️ 路由要在 `run()` 之前装上：`reconcile_today()` 是开工第一步。
+        loop._recycle_mail_route = args.recycle_mail_route  # noqa: SLF001
+        outcome = loop.run()
         say(
             f"完成：目标 {len(outcome.pirates)} 个，攻击 {len(outcome.attacked)} 发，"
             f"拦下 {len(outcome.refused)} 次"

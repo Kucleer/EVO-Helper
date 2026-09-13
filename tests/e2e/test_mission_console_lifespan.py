@@ -67,6 +67,7 @@ def test_startup_seeds_every_chain(tmp_path: Path) -> None:
 
     assert sorted(row.kind for row in repository.mission_tasks()) == [
         "BOT",
+        "MAIL",
         "PIRATE",
         "RANKING",
         "SCAN",

@@ -1344,6 +1344,17 @@ class DailyReconciliationRow(Base):
     #: **它不是过滤条件。** 下界照样参与配额取大——扔掉它就等于回到只按库算，
     #: 也就是回到会超额的那一侧。这一列只作诊断：日志要说清那个数是不是全天。
     complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: 这一条是**谁翻完的**：`'mail'`（空闲回读那一趟）/ `'round'`（攻击轮开工兜底）。
+    #: 旧行为 NULL。
+    #:
+    #: ⚠️ **为什么非要这一列不可。** 回收报告读哪一条路由，判据是「信箱回读任务
+    #: 上一次**自己**翻完是什么时候」。而 `reconciled_at_utc` 是两条路共享的 ——
+    #: 兜底趟一直在翻时那个时刻永远新鲜，路由会一直以为空闲趟活着，
+    #: 于是两边都不读回收报告。
+    #:
+    #: ⚠️ **不能拿 `complete` 顶替**：那一列说的是「当日份数数全了没」，
+    #: 与「是谁翻的」「该开的开完了没」都不是一件事。
+    completed_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
     #: 那天库内已被游戏接受的**攻击**派遣数（侦察发不数，口径同
     #: `repository.count_dispatches_since`）。当前事实，照实写。
     dispatched_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

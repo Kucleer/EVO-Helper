@@ -315,6 +315,7 @@ def test_every_task_is_listed_in_priority_order(console: Console) -> None:
 
     assert sorted(item["kind"] for item in tasks) == [
         "BOT",
+        "MAIL",
         "PIRATE",
         "RANKING",
         "SCAN",
