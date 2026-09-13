@@ -11,20 +11,19 @@
 
 ## ⚠️⚠️ 三条判据都是实拍打出来的，不是设计出来的
 
-1. **多帧投票**：详情页背后有一层漂浮文字（`-17003` / `COMMAND OFFICERS`），
-   它会压进资源格**而且在动**——实测同一封信 5 帧之间变了 255→1157 个像素。
-   单帧 OCR 在 8 格里错 2 格。
-2. **框宁可宽不可紧**：收紧的后果不是读不出，是**读出一个像样的错数**
-   （`529.7K` → `29.7K`）。前缀垃圾交给正则滤，缺首位数字没人救得回来。
-3. **容量不变量**：`回收船数 × 每艘容量 ≈ 三样合计`。实测好的六封偏差 ≤0.2%，
-   而两封读错的偏差 20% 与 5555%——**一刀切得干干净净**。
-
-⚠️ 用户给的「金属 > 晶体 > 气体」8 封全部成立，**但两封读错的也全部成立**，
-所以它只能当弱校验，不能当闸门。
+1. **不投票，改用容量不变量挑**（2026-09-12 晚在 8 封语料上推翻了原方案）：
+   `回收船数 × 每艘容量 ≈ 三样合计`。多框多配方出候选，让这条外部事实挑出
+   对得上的那一组 —— 实测 **8/8，最大偏差 0.19%**。整段在 `pick_amounts`。
+2. **⚠️ 「哪个框更好」是个伪问题**：窄框会把 `2.1M` 的小数点切掉读成 `21M`，
+   宽框会把图标吃进来读成 `262M`，而它们**不在同一封信上同时死**
+   （窄 7/8、宽 6/8、更宽 1/8）。所以把所有框的读数一起扔进候选，别挑框。
+3. **单调（金属 > 晶体 > 气体）只能剪枝，不能当闸门**：用户给的这条规律 8 封
+   全部成立，**但两封读错的也全部成立**。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -83,6 +82,26 @@ class RecycleHaul:
         return self.total / Decimal(self.ships)
 
 
+def amounts_are_consistent(
+    total: Decimal, ships: int, *, capacity_per_ship: float | Decimal | None = None
+) -> bool:
+    """容量不变量本身：`船数 × 每艘容量` 对不对得上三样合计。
+
+    ⚠️ **和 `haul_is_consistent` 分开，是因为视觉层手上没有坐标。**
+    回收报告正文里那两个坐标 OCR **读得出但会读错**（实测 `[1:55:6]` 读成
+    `[1:55:5]`、`4:452:13` 读成 `4:452:14`），所以整条链路**不拿它们当数据**——
+    坐标一律取自被认领的那一发派遣。视觉层因此造不出 `RecycleHaul`，
+    只能拿「合计 + 船数」过闸，过了才轮到认领去补坐标。
+    """
+    per_ship = Decimal(str(capacity_per_ship or NOMINAL_SHIP_CAPACITY))
+    if ships <= 0 or per_ship <= 0:
+        return False
+    expected = per_ship * Decimal(ships)
+    if expected <= 0:
+        return False
+    return abs(total - expected) / expected <= Decimal(str(CAPACITY_TOLERANCE))
+
+
 def haul_is_consistent(
     haul: RecycleHaul, *, capacity_per_ship: float | Decimal | None = None
 ) -> bool:
@@ -99,13 +118,7 @@ def haul_is_consistent(
 
     两封的「金属 > 晶体 > 气体」都成立，肉眼也都像真数——只有这一条拦得住。
     """
-    per_ship = Decimal(str(capacity_per_ship or NOMINAL_SHIP_CAPACITY))
-    if haul.ships <= 0 or per_ship <= 0:
-        return False
-    expected = per_ship * Decimal(haul.ships)
-    if expected <= 0:
-        return False
-    return abs(haul.total - expected) / expected <= Decimal(str(CAPACITY_TOLERANCE))
+    return amounts_are_consistent(haul.total, haul.ships, capacity_per_ship=capacity_per_ship)
 
 
 def looks_monotonic(haul: RecycleHaul) -> bool:
@@ -119,21 +132,71 @@ def looks_monotonic(haul: RecycleHaul) -> bool:
     return metal > crystal > gas > 0
 
 
-def vote(readings: list[str]) -> str | None:
-    """多帧多配方的众数。全都读不出时 None。
+def pick_amounts(
+    candidates: tuple[Sequence[Decimal], Sequence[Decimal], Sequence[Decimal]],
+    *,
+    ships: int,
+    capacity_per_ship: float | Decimal | None = None,
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    """从每格的若干候选里，挑出**合计对得上船数**的那一组。读不出时 None。
 
-    ⚠️ **投票的前提是噪声在动而数字不动**：背景那层漂浮文字每帧都不一样，
-    所以它在各帧里读出的垃圾各不相同，而真正的数字每帧都一样。
-    一帧一配方的话这个前提用不上，实测 8 格错 2 格。
+    ## ⚠️ 为什么是「挑」而不是「投票」
+
+    #325 里这一步是多帧多配方的众数（`vote`）。**实测推翻了它**：语料
+    `recycle-12092026-032646.png` 的晶体真值是 `2.1M`，而众数以 11:4 选出了 `1M`
+    —— 窄框把小数点切掉，`2.1M` 读成 `21M`、`1M`，**错的那个反而票多**。
+    投票的前提是「噪声随机、真值稳定」，可 ROI 切字是**系统性**的：同一个框在同
+    一封信上每一帧都切掉同一位数字，投票只会把这个错误投得更结实。
+
+    容量不变量没有这个毛病，因为它不问「哪个读数出现得多」，问的是
+    **「哪一组凑得出船能装的量」**——那是一条外部事实。
+
+    ## 实测（8 封语料，`docs/回收闭环/`）
+
+    | 做法 | 通过容量校验 |
+    |---|---|
+    | 窄框单读 | 7/8 |
+    | 宽框单读 | 6/8 |
+    | 更宽框单读 | 1/8 |
+    | **多框多配方 + 本函数挑** | **8/8**（最大偏差 0.19%） |
+
+    ⚠️ **「哪个框更好」是个伪问题**：三个框各有各的死法（窄框切小数点、宽框把
+    图标吃进来读成 `262M`），而它们**不在同一封信上同时死**。所以正确做法是
+    把所有框的读数都当候选扔进来，让不变量挑，而不是挑一个框。
+
+    ## ⚠️ 挑出来的也必须过闸
+
+    本函数返回的是「最接近的一组」，它**总能返回点什么**。调用方必须再用
+    `haul_is_consistent` 卡一次 —— 真值那一组实测偏差 ≤0.19%，而次优的那一组
+    差 6–100 倍（0.36% / 2.29%），两群离得很开。
+
+    ``capacity_per_ship`` 留空时用 `NOMINAL_SHIP_CAPACITY`，理由同
+    `haul_is_consistent`：**调用方应当传最近若干封算出来的中位数**，
+    否则货舱科技一升，这里就会开始挑错。
     """
-    counts: dict[str, int] = {}
-    for item in readings:
-        text = item.strip().upper()
-        if text:
-            counts[text] = counts.get(text, 0) + 1
-    if not counts:
+    if ships <= 0:
         return None
-    return max(counts.items(), key=lambda pair: (pair[1], pair[0]))[0]
+    per_ship = Decimal(str(capacity_per_ship or NOMINAL_SHIP_CAPACITY))
+    if per_ship <= 0:
+        return None
+    expected = per_ship * Decimal(ships)
+    if expected <= 0:
+        return None
+    best: tuple[Decimal, tuple[Decimal, Decimal, Decimal]] | None = None
+    for metal in candidates[0]:
+        for crystal in candidates[1]:
+            for gas in candidates[2]:
+                # ⚠️ 单调只当**剪枝**用，不当闸门（见 `looks_monotonic`）：
+                # 它 8 封全成立、连读错的那两封也成立，所以它筛不掉错的，
+                # 只能少试几组。真正定胜负的是下面那个偏差。
+                if not metal > crystal > gas > 0:
+                    continue
+                deviation = abs(metal + crystal + gas - expected) / expected
+                if best is None or deviation < best[0]:
+                    best = (deviation, (metal, crystal, gas))
+    if best is None:
+        return None
+    return best[1]
 
 
 def parse_amounts(texts: tuple[str, str, str]) -> tuple[Quantity, Quantity, Quantity] | None:
@@ -156,8 +219,9 @@ __all__ = [
     "NOMINAL_SHIP_CAPACITY",
     "RECYCLE_SLOTS",
     "RecycleHaul",
+    "amounts_are_consistent",
     "haul_is_consistent",
     "looks_monotonic",
     "parse_amounts",
-    "vote",
+    "pick_amounts",
 ]

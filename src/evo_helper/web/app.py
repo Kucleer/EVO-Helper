@@ -1385,6 +1385,7 @@ def _military_attack_config_out(view: MilitaryAttackConfigView) -> MilitaryAttac
         account_line_limit=view.account_line_limit,
         auto_toggle_log_seconds=view.auto_toggle_log_seconds,
         recycle_rate_tenths=view.recycle_rate_tenths,
+        recycle_mail_opens=view.recycle_mail_opens,
     )
 
 
@@ -1459,6 +1460,7 @@ def register_mission_routes(app: FastAPI) -> None:
                 account_line_limit=payload.account_line_limit,
                 auto_toggle_log_seconds=payload.auto_toggle_log_seconds,
                 recycle_rate_tenths=payload.recycle_rate_tenths,
+                recycle_mail_opens=payload.recycle_mail_opens,
             )
         )
 

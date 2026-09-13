@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from evo_helper.domain.ai_targeting import AiTargetDecision, InflightLine
+from evo_helper.domain.battle_outcome import OUTCOME_RECYCLE
 from evo_helper.domain.bot_round import DispatchFact
 from evo_helper.domain.coordinates import next_coordinate_after
 from evo_helper.domain.flight_estimate import (
@@ -31,6 +32,7 @@ from evo_helper.domain.ports import CoordinateClaim
 from evo_helper.domain.ranking import is_bot_coordinate
 from evo_helper.domain.records import (
     MISSION_KIND_ATTACK,
+    MISSION_KIND_RECYCLE,
     MISSION_KIND_SCOUT,
     TARGET_KIND_BOT,
     TARGET_KIND_PIRATE,
@@ -48,6 +50,7 @@ from evo_helper.domain.records import (
     StateEvent,
     TargetRevisit,
 )
+from evo_helper.domain.recycle_mail import RecycleHaul
 from evo_helper.domain.report_wait import (
     MAX_REPORT_AGE,
     UNKNOWN_LINE_HOLD,
@@ -859,6 +862,162 @@ class SqlAlchemyRepository:
                 announce_unclaimed=True,
             )
             session.commit()
+
+    def has_recycle_report_at(self, reported_at_utc: datetime) -> bool:
+        """这个**抵达时刻**的回收实收是不是已经在库里了。
+
+        ⚠️ **判据只有时刻，没有坐标** —— 这条链路压根不读坐标（整段在
+        `append_recycle_report`）。时刻是游戏自己盖在信上的章，不受本地时钟影响，
+        与 `has_report_at` 同源。
+
+        ⚠️ **必须带上 `outcome=RECYCLE`。** 合成的实收行和真战报住在同一张表里，
+        不按 outcome 分的话，同一秒抵达的一发攻击战报会把这一封判成「已有」，
+        于是那一趟的资源永远读不进来——而日志上看着是一句无害的「库里已有」。
+        """
+        _require_utc(reported_at_utc, "reported_at_utc")
+        with self._session_factory() as session:
+            found = session.scalars(
+                select(orm.BattleReportRow.id)
+                .where(
+                    orm.BattleReportRow.reported_at_utc == reported_at_utc,
+                    orm.BattleReportRow.outcome == OUTCOME_RECYCLE,
+                )
+                .limit(1)
+            ).first()
+        return found is not None
+
+    def append_recycle_report(self, reading: object, *, report_id: UUID) -> UUID | None:
+        """把一封回收报告的实收落表，并认领它对应的那一发回收派遣。
+
+        认上了返回那一发的 `dispatch_id`；认不上**一个字都不写**、返回 None。
+
+        ## ⚠️ 为什么认领反过来做：先找派遣，再拿派遣的坐标造报告
+
+        攻击战报是「报告自带出发点与目标，拿它们去找派遣」。回收报告**做不到**：
+        正文里那两个坐标 OCR 读得出、但会读错（实测 `[1:55:6]` 读成 `[1:55:5]`、
+        `4:452:13` 读成 `4:452:14`，8 封里两个都读全的只有 4 封，整段在
+        `vision.recycle_mail_screen`）。而「读出一个像样的错坐标」的后果是
+        **把这一趟的实收记到别人头上** —— 比读不出坏得多。
+
+        所以这一侧只拿**时刻**去找派遣（邮件盖的是抵达那一刻的章，派遣手上有
+        `expected_report_at_utc`），坐标一律从认下来的那一发抄过来。
+
+        ## ⚠️⚠️ 唯一才认，不唯一就整封不要
+
+        实测生产库 169 发回收派遣，**相邻预计抵达时刻有 9.5% 落在 60 秒以内**
+        （最小 0 秒）—— 时刻不是唯一键。所以窗口里活下来多于一发时**一发都不认**，
+        和 `_link_dispatch` 那条「仍然不猜」是同一条规矩。
+
+        代价是那一封这一趟不入库。**这是有意的**：认错的代价是一整趟的资源记错人，
+        而认不上的代价只是页面上多停一会儿「待回收」，下一趟这封信还在信箱里。
+        """
+        from evo_helper.application.report_ingest import to_recycle_report
+        from evo_helper.vision.recycle_mail_screen import RecycleMailReading
+
+        record = _require_type(reading, RecycleMailReading, "reading")
+        _require_utc(record.reported_at_utc, "reported_at_utc")
+        arrived = record.reported_at_utc
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(orm.AttackDispatchRow, orm.AttackIntentRow)
+                .join(
+                    orm.AttackIntentRow,
+                    orm.AttackIntentRow.id == orm.AttackDispatchRow.intent_id,
+                )
+                .where(
+                    orm.AttackDispatchRow.mission_kind == MISSION_KIND_RECYCLE,
+                    orm.AttackDispatchRow.accepted.is_(True),
+                    orm.AttackDispatchRow.expected_report_at_utc.is_not(None),
+                    orm.AttackDispatchRow.expected_report_at_utc
+                    >= arrived - MATCH_EXPECTED_WINDOW_AFTER,
+                    orm.AttackDispatchRow.expected_report_at_utc
+                    <= arrived + MATCH_EXPECTED_WINDOW_BEFORE,
+                )
+            ).all()
+            # 已经接过实收的那几发不再参与：同一发只有一趟实收，而重复认领会把
+            # 两封不同的信记到同一发上，页面上看不出来。
+            taken = set(
+                session.scalars(
+                    select(orm.BattleReportRow.dispatch_id).where(
+                        orm.BattleReportRow.outcome == OUTCOME_RECYCLE,
+                        orm.BattleReportRow.dispatch_id.is_not(None),
+                    )
+                ).all()
+            )
+            free = [(dispatch, intent) for dispatch, intent in rows if dispatch.id not in taken]
+            if len(free) != 1:
+                record_system_log(
+                    "WARNING",
+                    _MATCH_LOG_SOURCE,
+                    f"回收实收（{record.raw_time_text}）在抵达窗口里找到 {len(free)} 发候选"
+                    f"（窗口内共 {len(rows)} 发、已接过实收的排除掉 {len(rows) - len(free)} 发）；"
+                    "不猜是哪一发，这一封不入库，下一趟再来",
+                    payload={
+                        "mail_time": record.raw_time_text,
+                        "candidates": len(free),
+                        "in_window": len(rows),
+                    },
+                )
+                return None
+            dispatch, intent = free[0]
+            haul = RecycleHaul(
+                reported_at_utc=arrived,
+                origin=Coordinate(
+                    intent.origin_galaxy, intent.origin_system, intent.origin_position
+                ),
+                target=Coordinate(
+                    intent.target_galaxy, intent.target_system, intent.target_position
+                ),
+                amounts=record.amounts,
+                ships=record.ships,
+                raw_time_text=record.raw_time_text,
+            )
+            report = to_recycle_report(haul, report_id=report_id)
+            report_row = orm.BattleReportRow(
+                id=report.report_id,
+                reported_at_utc=report.reported_at_utc,
+                raw_time_text=report.raw_time_text,
+                attacker_origin_galaxy=haul.origin.galaxy,
+                attacker_origin_system=haul.origin.system,
+                attacker_origin_position=haul.origin.position,
+                defender_target_galaxy=haul.target.galaxy,
+                defender_target_system=haul.target.system,
+                defender_target_position=haul.target.position,
+                outcome=report.outcome,
+                # ⚠️ **认领是靠「抵达时刻唯一」定下来的，不是靠坐标**，所以置信度
+                # 记 `CONFIDENCE_EXPECTED_WINDOW` 那一档。记 1.0 会谎称出发点与
+                # 目标都核对过 —— 而这一条链路根本没读坐标。
+                match_confidence=CONFIDENCE_EXPECTED_WINDOW,
+                dispatch_id=dispatch.id,
+            )
+            session.add(report_row)
+            session.flush()
+            for entry in report.resources:
+                session.add(
+                    orm.BattleReportResourceRow(
+                        report_id=report.report_id,
+                        slot=entry.slot,
+                        amount=entry.amount,
+                        approximate=entry.approximate,
+                        uncertainty=entry.uncertainty,
+                    )
+                )
+            record_system_log(
+                "INFO",
+                _MATCH_LOG_SOURCE,
+                f"回收实收入库：{haul.target}（{record.raw_time_text}）"
+                f"金 {report.resources[0].amount} · 晶 {report.resources[1].amount}"
+                f" · 气 {report.resources[2].amount}，回收船 {record.ships}",
+                payload={
+                    "target": str(haul.target),
+                    "origin": str(haul.origin),
+                    "dispatch_id": str(dispatch.id),
+                    "ships": record.ships,
+                },
+            )
+            claimed: UUID = dispatch.id
+            session.commit()
+            return claimed
 
     def rematch_report_at(self, target: Coordinate, reported_at_utc: datetime) -> bool:
         """把库里那份**还没认领上派遣**的战报再认领一次。认上了返回 True。
@@ -3135,6 +3294,7 @@ class SqlAlchemyRepository:
         account_line_limit: int | None = None,
         auto_toggle_log_seconds: int | None = None,
         recycle_rate_tenths: int | None = None,
+        recycle_mail_opens: int | None = None,
     ) -> orm.MilitaryAttackConfigRow:
         """整份全局攻击配置原子替换。
 
@@ -3160,6 +3320,7 @@ class SqlAlchemyRepository:
             row.account_line_limit = account_line_limit
             row.auto_toggle_log_seconds = auto_toggle_log_seconds
             row.recycle_rate_tenths = recycle_rate_tenths
+            row.recycle_mail_opens = recycle_mail_opens
             session.commit()
             session.refresh(row)
             return row
@@ -3882,6 +4043,33 @@ class SqlAlchemyRepository:
             if clamped > 0 and (row.recycle_rate_tenths or 0) == 0:
                 row.recycle_enabled_at_utc = datetime.now(UTC)
             row.recycle_rate_tenths = clamped
+            session.commit()
+
+    #: 每趟最多读几封回收报告的上界。**用户可以调大，但调不到没边**：
+    #: 一封 ≈ 8 秒，而舰队标签里三封信里只有一封是回收报告，
+    #: 预算 12 已经意味着一趟可能要翻三四屏。
+    MAX_RECYCLE_MAIL_OPENS = 12
+
+    def recycle_mail_opens(self) -> int:
+        """每趟读几封回收报告。空/读不出 = 0（不读）。"""
+        try:
+            row = self.military_attack_config()
+        except ValueError:
+            return 0
+        value = row.recycle_mail_opens
+        if value is None:
+            return 0
+        return max(0, min(self.MAX_RECYCLE_MAIL_OPENS, int(value)))
+
+    def set_recycle_mail_opens(self, opens: int) -> None:
+        """写回收邮件预算。落库前夹到 0–`MAX_RECYCLE_MAIL_OPENS`。"""
+        clamped = max(0, min(self.MAX_RECYCLE_MAIL_OPENS, int(opens)))
+        with self._session_factory() as session:
+            row = session.get(orm.MilitaryAttackConfigRow, 1)
+            if row is None:
+                row = orm.MilitaryAttackConfigRow(id=1)
+                session.add(row)
+            row.recycle_mail_opens = clamped
             session.commit()
 
     def recycle_enabled_at_utc(self) -> datetime | None:

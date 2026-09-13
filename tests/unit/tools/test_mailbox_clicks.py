@@ -1,6 +1,14 @@
-"""翻信箱时**只许切到「报告」标签**，不许碰游戏里任何别的筛选控件。
+"""翻信箱时能碰哪些标签，**清单就在这里**。
 
 用户口径（2026-08-11）：「你只能切换到报告，其他的筛选不要动。」
+
+⚠️ **2026-09-12 用户放开了一个例外**：「打开舰队的二级标签，你就可以看见回收报告」
+——读回收实收必须点「报告」底下那一排的「舰队」。所以清单里多了二级标签那两下，
+**而且只有那两下**：「侦察」「系统」以及一级的「个人/探索/收藏」仍旧不许碰。
+
+⚠️⚠️ 例外是**带着还原义务**的：读完必须切回「战斗」，否则下一趟战报那一趟会在
+舰队标签上开工，主题闸把整列「舰队返回」全拒掉，日志上看着和「信箱里没有战报」
+一模一样。下面 `test_the_fleet_tab_is_always_switched_back` 守的就是这一条。
 
 游戏信箱里的分类标签、排序、搜索这些是用户自己配好的。助手在那上面点一下，
 下一轮翻到的就不是同一批邮件了，而这件事**不会报错**——只会表现成「战报读不到」，
@@ -28,6 +36,9 @@ ALLOWED_MAIL_CLICK_LABELS = frozenset(
         "返回",
         "关闭面板",
         "关闭邮箱列表（左上角X）",
+        # ⚠️ 2026-09-12 放开的那个例外，见模块头。**只有这两个**。
+        "二级标签「舰队」",
+        "二级标签「战斗」",
     }
 )
 
@@ -36,6 +47,10 @@ MAILBOX_METHODS = (
     "_open_mail",
     "_close_mail",
     "_scan_mail_rows",
+    # ⚠️ **切二级标签那一下写在这个方法里，不在上面三个里。** 少了这一行，
+    # 这条用例会继续全绿却什么都不守：新加的点击藏在一个没被审的方法里
+    # （`_scan_mail_rows` 只是调用它，源码里看不到那个 `label=`）。
+    "_select_mail_sub_tab",
 )
 
 
@@ -109,4 +124,35 @@ def test_the_allow_list_has_no_filter_sounding_entries() -> None:
         for label in ALLOWED_MAIL_CLICK_LABELS
         if any(word in label for word in ("标签", "筛选", "排序", "搜索"))
     }
-    assert filterish == {"报告标签"}
+    # ⚠️ 2026-09-12 之前这里只有「报告标签」一个。放开成三个是**用户点名要的**
+    # （「打开舰队的二级标签，你就可以看见回收报告」），不是顺手加的。
+    # 再往里加任何一个之前，先回去读模块头那两段。
+    assert filterish == {"报告标签", "二级标签「舰队」", "二级标签「战斗」"}
+
+
+def test_the_fleet_tab_is_always_switched_back() -> None:
+    """读完回收报告必须切回「战斗」标签。
+
+    ⚠️ **这是那个例外的还原义务。** 停在舰队标签上的后果不是报错，是下一趟
+    战报那一趟把整列「舰队返回」按主题拒掉——日志上和「信箱里没有战报」
+    一模一样，而那正是 2026-08-13 那夜「17 发攻击 0 份战报」的同一类症状。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop.collect_recycle_hauls)
+    assert "fleet=False" in source, (
+        "读完回收报告没有切回「战斗」标签；停在舰队标签上会让下一趟战报那一趟静默读空。"
+    )
+
+
+def test_the_recycle_trip_is_off_by_default() -> None:
+    """⚠️ 旋钮是 0（默认）时**一步都不许走**，连信箱都不许进。
+
+    用户口径（2026-09-12）：「我希望这是有个开关…我担心这花费我太多的时间」。
+    默认开着等于替所有人决定每趟多花几分钟。
+    """
+    calls: list[int] = []
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._ensure_run = lambda: calls.append(1)  # type: ignore[attr-defined, assignment]
+    loop._scan_mail_rows = lambda **_kwargs: calls.append(2)  # type: ignore[attr-defined, assignment]
+
+    assert loop.collect_recycle_hauls(max_opens=0) is None
+    assert calls == [], "旋钮是 0 时连库和信箱都不该碰"

@@ -1177,6 +1177,25 @@ class MissionScheduler:
             raise MissionParamError("回收节奏必须在 0–10 之间（整数十分位）；0 = 关")
         return tenths
 
+    #: 每趟读几封回收报告的上界。与 `storage.repository` 那个同名常量、
+    #: 以及 `web.schemas` 里那个 `le=12` 是同一个数，三处必须一起改。
+    MAX_RECYCLE_MAIL_OPENS = 12
+
+    def validate_recycle_mail_opens(self, value: object) -> int | None:
+        """校验「每趟读几封回收报告」。留空返回 `None`（不读）。
+
+        ⚠️ **0 是合法值而且是默认值**，它的意思是「完全不读」——不是「没配」。
+        这一条和别的上限旋钮不同：别的旋钮 0 基本都是配错了。
+        """
+        opens = _optional_int(value, label="每趟读几封回收报告")
+        if opens is None:
+            return None
+        if opens < 0 or opens > self.MAX_RECYCLE_MAIL_OPENS:
+            raise MissionParamError(
+                f"每趟读几封回收报告必须在 0–{self.MAX_RECYCLE_MAIL_OPENS} 之间；0 = 不读"
+            )
+        return opens
+
     def account_line_limit(self) -> int | None:
         """全账号此刻认的航线上限，**没配就是 `None`**。页面显示那句提示时读它。
 
