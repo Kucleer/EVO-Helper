@@ -442,6 +442,27 @@ def mail_list_is_empty(rows: Sequence[Any]) -> bool:
     return any(MAIL_EMPTY_LIST_MARK in (row.subject or "") for row in rows)
 
 
+def sub_tab_frame_is_mid_repaint(here: int, other: int) -> bool:
+    """这一屏是不是**两个列表混在一起的半成品**。
+
+    ⚠️⚠️ **同时读到舰队类和非舰队类 ⇒ 还在重绘，不是「切错了」。**
+
+    实拍 2026-09-15 06:52（`dump-mail-sub-tab-舰队-unconfirmed-065255.png` 那一趟）：
+    点完「舰队」之后连着两次读到「舰队类 5 行、非舰队类 1 行」—— **那就是舰队列表**，
+    只是混进一行还没重绘完的「攻击报告」。判据要求 `other == 0`，于是把一屏对的画面
+    判成不对，**又点了一次**，而再点就是把切好的档位点掉；最后停在战斗档位上收手。
+    整夜 45 趟回收里 **15 趟**（33%）就是这样白跑的。
+
+    ⚠️ 这不是把 `on` 放宽 —— 判「成功」照旧要求 `here > 0 and other == 0`
+    （那道闸挡着最危险的那一种，别动它，见 `_sub_tab_matches` 上那三次事故）。
+    收紧的是**「再点一次」这个动作的触发条件**：混合帧只许等，不许点。
+
+    ⚠️ 真正的「切错了」是 `here == 0`（问「关掉了？」的那 16 行全落在 0），
+    那一档照旧当失败处理，该点还是点。
+    """
+    return here > 0 and other > 0
+
+
 def mail_list_looks_unrendered(rows: Sequence[Any]) -> bool:
     """这一屏根本不是邮件列表（还在加载、或者停在别的页面上）。
 
@@ -495,6 +516,10 @@ MAIL_SUB_TAB_TRIES = 3
 #:
 #: ⚠️ 加大这个窗口**不会多点一次**（重点才是危险动作，见 `#348`），
 #: 最坏只是每趟多花约 16 秒。
+#: 一屏里**同时**读到舰队类和非舰队类时，多等几轮（每轮 `MAIL_SUB_TAB_SETTLE_WAIT_S`）。
+#: 这一档只等，**不点** —— 理由整段在 `sub_tab_frame_is_mid_repaint` 上。
+MAIL_SUB_TAB_REPAINT_READS = 8
+
 MAIL_SUB_TAB_SETTLE_READS = 8
 MAIL_SUB_TAB_SETTLE_WAIT_S = 2.0
 
@@ -3402,6 +3427,11 @@ class PirateLoop:
         ReportKind.DEPLOY,
     )
 
+    #: 上一次 `_sub_tab_matches` 读到的是不是**重绘中的混合帧**。
+    #: ⚠️ 默认 False：用例把 `_sub_tab_matches` 换掉时它不会被赋值，
+    #: 那种情况下要回到「老行为」，不能凭一个陈旧的 True 无限等下去。
+    _sub_tab_mid_repaint: bool = False
+
     def _select_mail_sub_tab(self, *, fleet: bool) -> bool:
         """切「报告」底下的二级标签。切成了返回 True。
 
@@ -3464,6 +3494,17 @@ class PirateLoop:
                 settled = self._sub_tab_matches(fleet=fleet, name=name, quiet=not attempt)
                 if settled:
                     return True
+                # ⚠️⚠️ **混合帧只许等，不许点。**
+                #
+                # 「舰队类 N 行、非舰队类 1 行」是**列表正在重绘**的正面证据，
+                # 不是「切错了」的证据。而这里再点一下就是把切好的档位点掉 ——
+                # 2026-09-15 06:52 实拍到的就是这条路：判失败→再点→停在战斗档位。
+                # 整段理由与那一夜的计数在 `sub_tab_frame_is_mid_repaint` 上。
+                if self._sub_tab_mid_repaint:
+                    say(f"  二级标签「{name}」这一屏两种都有，列表还在重绘；只等不点")
+                    if self._wait_out_sub_tab_repaint(fleet=fleet, name=name):
+                        return True
+                    continue
             self._driver.click(*target, label=f"二级标签「{name}」")
             self._driver.wait(MAIL_SUB_TAB_WAIT_S)
             if not self._on_mail_list():
@@ -3491,6 +3532,25 @@ class PirateLoop:
                 return True
         # 认不出时最贵的事是不知道当时画面长什么样。存一帧的成本是一次写盘。
         self._dump_frame(f"mail-sub-tab-{name}-unconfirmed", PANEL_TITLE_ROI)
+        return False
+
+    def _wait_out_sub_tab_repaint(self, *, fleet: bool, name: str) -> bool:
+        """混合帧就一直等到它画完。等到了返回 True。
+
+        ⚠️ **这里一次都不点。** 点击是这条路上唯一会把状态弄坏的动作
+        （档位会被点掉），而等待最多花掉
+        `MAIL_SUB_TAB_REPAINT_READS × MAIL_SUB_TAB_SETTLE_WAIT_S` 秒。
+        代价对比：多等十几秒 vs 整趟回收白跑（实测 33% 的趟数）。
+        """
+        for _ in range(MAIL_SUB_TAB_REPAINT_READS):
+            self._driver.wait(MAIL_SUB_TAB_SETTLE_WAIT_S)
+            if self._sub_tab_matches(fleet=fleet, name=name, quiet=True):
+                say(f"  二级标签在「{name}」上（等重绘画完认出来的）")
+                return True
+            # ⚠️ 已经画成「另一档」了（不再是混合帧）就别再等 —— 那是真的切错了，
+            # 回到外面那一层去点。
+            if not self._sub_tab_mid_repaint:
+                return False
         return False
 
     def _fleet_filter_looks_on(self) -> bool:
@@ -3523,6 +3583,7 @@ class PirateLoop:
         # ⚠️ 这一档要**大声**说出来：它和「筛选真的关掉了」在计数上一模一样，
         # 不说就又是一次「日志上看不出问题」。
         if mail_list_is_empty(rows):
+            self._sub_tab_mid_repaint = False
             if not quiet:
                 say(f"  二级标签「{name}」：这一屏是「没有符合当前筛选条件的邮件」，什么都确认不了")
             return False
@@ -3599,6 +3660,9 @@ class PirateLoop:
         # 问「关掉了？」的那 16 行（正常运行期）里舰队类读数全是 0。
         # ⚠️ 观察不是保证，何况那批样本本身有循环分类的嫌疑（见上）。
         # `other == 0` 只是让「判成开着」更难一点，留着不花钱。
+        # ⚠️ 顺手记下这一帧的形态给 `_select_mail_sub_tab` 用。**不能另开一次读屏** ——
+        # 多读一次会把「点完等刷新」那几帧吃掉（84 个用例栽在这上面过一次）。
+        self._sub_tab_mid_repaint = sub_tab_frame_is_mid_repaint(here, other)
         on = here > 0 and other == 0
         # ⚠️⚠️ **「切到战斗」那一侧的判据是「列表不是空的」，不是「看不见舰队类」。**
         #

@@ -897,3 +897,90 @@ def test_the_check_reads_again_while_the_list_refreshes() -> None:
         "列表刷新慢了几拍就判失败了 —— 那正是攻击战报整晚读不到的成因"
     )
     assert len(clicks) == 1, f"点了 {len(clicks)} 次；一次没读到就重点，很可能把刚切好的又点回去"
+
+
+# -- 2026-09-15 早「45 趟里 15 趟白跑」教出来的 -------------------------------
+
+
+def test_a_half_repainted_screen_is_a_reason_to_wait_not_to_click_again() -> None:
+    """⚠️⚠️ **一屏里两种都有 ⇒ 列表还在重绘,只等,不许再点。**
+
+    实拍 2026-09-15 06:52(`dump-mail-sub-tab-舰队-unconfirmed-065255.png` 那一趟):
+    点完「舰队」之后连着两次读到「舰队类 5 行、非舰队类 1 行」——**那就是舰队列表**,
+    只是混进一行还没重绘完的「攻击报告」。判据要求 `other == 0`,于是判成不对、
+    **又点了一次**,而再点就是把档位点掉,最后停在战斗档位上收手。
+    整夜 45 趟回收里 **15 趟(33%)** 就是这样白跑的。
+
+    ⚠️ 这一条钉的是**动作**,不是判据:`on = here > 0 and other == 0` 一个字没动。
+    """
+    kind = pirate_loop.ReportKind
+    mixed = [kind.RECYCLE] * 5 + [kind.ATTACK]
+    clean = [kind.RECYCLE] * 6
+    screens = [mixed, mixed, clean]
+    clicks: list[str] = []
+
+    class Driver:
+        def click(self, _x: int, _y: int, *, label: str = "") -> None:
+            clicks.append(label)
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    class Row:
+        def __init__(self, index: int, kind: object) -> None:
+            self.index, self.kind, self.subject = index, kind, "某封信"
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = Driver()  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_k: [  # type: ignore[assignment]
+        Row(i, k) for i, k in enumerate(screens.pop(0) if screens else clean)
+    ]
+
+    assert loop._select_mail_sub_tab(fleet=True) is True, (
+        "重绘中的那一帧被判成了「切错了」—— 那正是 15 趟回收白跑的成因"
+    )
+    assert clicks == [], f"在重绘中的画面上点了 {len(clicks)} 次;再点一下就是把切好的档位点掉"
+
+
+def test_a_screen_with_no_fleet_rows_at_all_still_gets_clicked() -> None:
+    """⚠️ 「只等不点」**只适用于混合帧**,别让它变成不点的万能借口。
+
+    `here == 0`(一行舰队类都没有)是真的没切过去 —— 问「关掉了?」的那 16 行
+    全落在这一档。这一档照旧该点。
+    """
+    kind = pirate_loop.ReportKind
+    screens = [[kind.ATTACK] * 6, [kind.RECYCLE] * 6]
+    clicks: list[str] = []
+
+    class Driver:
+        def click(self, _x: int, _y: int, *, label: str = "") -> None:
+            clicks.append(label)
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    class Row:
+        def __init__(self, index: int, kind: object) -> None:
+            self.index, self.kind, self.subject = index, kind, "某封信"
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = Driver()  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_k: [  # type: ignore[assignment]
+        Row(i, k) for i, k in enumerate(screens.pop(0) if screens else [kind.RECYCLE] * 6)
+    ]
+
+    assert loop._select_mail_sub_tab(fleet=True) is True
+    assert len(clicks) == 1, f"一行舰队类都没有还不点,点了 {len(clicks)} 次"
+
+
+def test_what_counts_as_a_half_repainted_screen() -> None:
+    """判据本身的真值表,三档都钉住。"""
+    assert pirate_loop.sub_tab_frame_is_mid_repaint(5, 1) is True, "两种都有 = 还在重绘"
+    assert pirate_loop.sub_tab_frame_is_mid_repaint(6, 0) is False, "干净的舰队屏不是重绘中"
+    assert pirate_loop.sub_tab_frame_is_mid_repaint(0, 6) is False, (
+        "一行舰队类都没有 = 真的切错了,这一档要照旧去点,不是等"
+    )
