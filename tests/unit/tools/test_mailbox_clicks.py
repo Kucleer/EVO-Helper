@@ -553,11 +553,16 @@ def _opens_with(unread: bool | None, *, skip_read_unknowns: bool) -> bool:
     """主题读不出、未读色是 `unread` 的那一行，会不会被打开。**真跑 `_scan_mail_rows`。**"""
     opened: list[int] = []
 
+    from datetime import UTC, datetime
+
     row = pirate_loop.MailRow(
         index=0,
-        subject="~~ — —w————",  # 真实现场里的一行，读不出
+        subject="~~ — —w————",  # 真实现场里的一行：主题读不出
         raw_time_text="14/09/2026 12:00:00",
-        reported_at_utc=None,
+        # ⚠️ 时刻必须读得出：这才是**真邮件行**的样子。
+        # 整屏没时刻会被 `mail_list_looks_unrendered` 判成「不是邮件列表」，
+        # 那条闸守的是另一件事（登录页上的幻影行）。
+        reported_at_utc=datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
         kind=pirate_loop.ReportKind.UNKNOWN,
         unread=unread,
     )
@@ -772,3 +777,68 @@ def test_the_scan_gives_up_on_an_empty_list_instead_of_opening_ghosts() -> None:
     assert opened == [], "在空列表上开了幻影邮件 —— 每封 ~24 秒，整轮会卡死"
     assert scan.aborted is True, "空列表那一趟没标 aborted，会被记成「翻完了」"
     assert scan.cut_short, "放弃了却没说理由"
+
+
+def test_a_screen_with_no_readable_times_is_not_a_mail_list() -> None:
+    """⚠️⚠️ **一行可解析的时刻都没有 ⇒ 这一屏不是邮件列表。**
+
+    2026-09-15 01:03 实机：`已重新登录` 之后 **7 秒**就开工读信，界面还没画出来，
+    于是在登录页上一行行开「幻影邮件」—— 每封 ~24 秒、全部以
+    「点开之后没读到「消息」标题」告终，**整轮卡死：12 分钟里攻击 0、回收 0、战报 0**。
+
+    读出来的「主题」暴露了那是什么页面：
+
+        第 4 行 '7   |   kucleer@126.com>   he Vo»'
+        第 5 行 '一 aa = 息EV-T GRION 1 / Kucleer \ ='
+
+    ⚠️⚠️ **判据必须是「时刻」而不是「主题」**：主题读不出是**常态**
+    （实测 87%），那些行照样是真邮件、照样要开。真邮件行长这样 ——
+    「时刻读得出、主题是乱码」：`13/09/2026 21:08:34 'bad 1 are ”公克RED'`。
+    """
+    unrendered = pirate_loop.mail_list_looks_unrendered
+
+    class Row:
+        def __init__(self, at: object) -> None:
+            self.reported_at_utc = at
+
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+    assert unrendered([Row(None), Row(None), Row(None)]) is True, "整屏没时刻，该判成不是列表"
+    assert unrendered([Row(None), Row(now), Row(None)]) is False, (
+        "只要有一行读得出时刻，它就是真列表 —— 其余行主题读不出是常态，不许因此放弃"
+    )
+    assert unrendered([]) is False, "空列表另有判据（`mail_list_is_empty`），不归这一条管"
+
+
+def test_the_scan_gives_up_when_the_screen_is_not_a_mail_list() -> None:
+    """⚠️ 不是列表就收手，别开幻影邮件；而且要标 `aborted`。"""
+    opened: list[int] = []
+
+    class Row:
+        index, kind = 0, pirate_loop.ReportKind.UNKNOWN
+        subject = "7   |   kucleer@126.com>   he Vo»"
+        raw_time_text = ""
+        reported_at_utc = None
+        unread = None
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._ensure_geometry = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._enter_mailbox = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
+    loop._fleet_filter_looks_on = lambda: False  # type: ignore[assignment]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._close_mail = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_kwargs: [Row()]  # type: ignore[assignment]
+    loop._open_mail_row = lambda r, _v: opened.append(r.index) or False  # type: ignore[attr-defined, assignment]
+
+    scan = loop._scan_mail_rows(
+        wanted=pirate_loop.ReportKind.ATTACK,
+        label="攻击战报",
+        visit=lambda _r, _p: False,
+    )
+
+    assert opened == [], "在不是邮件列表的画面上开了幻影邮件"
+    assert scan.aborted is True and scan.cut_short

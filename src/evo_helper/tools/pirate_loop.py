@@ -425,6 +425,30 @@ def mail_list_is_empty(rows: Sequence[Any]) -> bool:
     return any(MAIL_EMPTY_LIST_MARK in (row.subject or "") for row in rows)
 
 
+def mail_list_looks_unrendered(rows: Sequence[Any]) -> bool:
+    """这一屏根本不是邮件列表（还在加载、或者停在别的页面上）。
+
+    ⚠️⚠️ **判据是「一行可解析的时刻都没有」，不是「主题读不出」。**
+    这两件事必须分开，因为**主题读不出是常态**：实测列表行主题 OCR 有 87%
+    读不出，而那些行照样是真邮件、照样要开（整段在 `skip_read_unknowns` 上）。
+
+    真邮件行长这样 ——「时间读得出、主题是乱码」：
+
+        第 2 行开封（13/09/2026 21:08:34 'bad  1 are ”公克RED'）
+
+    而不是邮件列表的那一屏长这样 ——「时间也读不出」：
+
+        第 0 行开封（时间读不出 'RATA AMER IB.'）
+        第 4 行开封（时间读不出 '7   |   kucleer@126.com>   he Vo»'）   ← 这是登录页
+        第 5 行开封（时间读不出 '一 aa = 息EV-T GRION 1 / Kucleer'）   ← 这也是
+
+    ⚠️ 2026-09-15 凌晨的代价：重新登录之后 **7 秒**就开工读信，界面还没画出来，
+    于是一行行开「幻影邮件」—— 每封 ~24 秒、全部以「点开之后没读到「消息」标题」
+    告终，**整轮卡死：启动 12 分钟里攻击 0 发、回收 0 发、战报 0 份**。
+    """
+    return bool(rows) and all(getattr(row, "reported_at_utc", None) is None for row in rows)
+
+
 #: 点完之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
 #:
 #: ⚠️ **1.8 → 4.0（2026-09-13 夜）。** 1.8 秒实测读得到**没重绘完**的列表：
@@ -3843,12 +3867,24 @@ class PirateLoop:
         #
         # ⚠️ 走 `cut_short` + `aborted=True`：这一趟什么都没看过，
         # 不许被记成「翻完了」（理由整段在那两处提前返回上）。
-        if mail_list_is_empty(self._mail_list_rows(evidence_source="sub_tab")):
+        _first_screen = self._mail_list_rows(evidence_source="sub_tab")
+        if mail_list_is_empty(_first_screen):
             self._dump_frame("mail-list-empty", PANEL_TITLE_ROI)
             return MailScan(
                 unread_budget=max_unread_opens,
                 aborted=True,
                 cut_short="这一屏是「没有符合当前筛选条件的邮件」；不在空列表上开信",
+            )
+        # ⚠️⚠️ **一行可解析的时刻都没有 ⇒ 这一屏不是邮件列表。**
+        # 判据与理由整段在 `mail_list_looks_unrendered`（一句话：主题读不出是常态，
+        # 时刻全读不出不是）。2026-09-15 凌晨就是这一档：重新登录 7 秒后开工，
+        # 界面还没画出来，于是在登录页上一行行开幻影邮件、整轮卡死。
+        if mail_list_looks_unrendered(_first_screen):
+            self._dump_frame("mail-list-unrendered", PANEL_TITLE_ROI)
+            return MailScan(
+                unread_budget=max_unread_opens,
+                aborted=True,
+                cut_short="这一屏一行可解析的时刻都没有，不像邮件列表；不在上面开信",
             )
         #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
         #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
