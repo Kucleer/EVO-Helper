@@ -3377,7 +3377,8 @@ class PirateLoop:
         `quiet` 给「点之前先看一眼」那一次用：那一次不匹配是**正常**的
         （本来就不在目标标签上），照常打一行日志只会让日志里全是假警报。
         """
-        kinds = [row.kind for row in self._mail_list_rows(evidence_source="sub_tab")]
+        rows = self._mail_list_rows(evidence_source="sub_tab")
+        kinds = [row.kind for row in rows]
         here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
         # ⚠️⚠️⚠️ **这一对判据是不对称的，而那个不对称是照实测定的。**
         # 2026-09-13 夜和 09-14 上午我在同一个不对称上栽了两次，方向相反：
@@ -3463,6 +3464,21 @@ class PirateLoop:
                 f"  二级标签「{name}」内容对不上（舰队类 {here} 行、"
                 f"非舰队类 {other} 行、共 {len(kinds)} 行）"
             )
+            # ⚠️⚠️ **把那几行的主题原文一并打出来，不能只打计数。**
+            #
+            # 2026-09-14 晚实测：这一档连着 10 次都是「舰队类 N 行、非舰队类 1 行」，
+            # 于是切不到「舰队」、整趟放弃、回收读信每趟 0 份。而光看计数**分不出**
+            # 两种完全相反的解释：
+            #
+            #   A. 筛选确实开着，只是有一行读花成了攻击报告  ⇒ 判据太严；
+            #   B. 筛选根本没切过去，列表里真的混着攻击报告  ⇒ 判据是对的，该查点击。
+            #
+            # ⚠️ 判据失败时**存过现场图**（`mail-sub-tab-…-unconfirmed`），但那张图
+            # 落在跑生产的那台机器上，排障的人未必够得到（09-14 晚就是这样：
+            # 生产在 `CY-202305011401`，而排障在另一台）。**日志是唯一一定拿得到的**，
+            # 所以判据的输入必须进日志，不能只进图。
+            for row in rows:
+                say(f"    └ 第 {row.index} 行 kind={row.kind.name} 主题={row.subject!r}")
         return False
 
     def _scroll_mail_list_to_top(self) -> None:
