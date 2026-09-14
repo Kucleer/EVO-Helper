@@ -279,7 +279,7 @@ def test_the_filter_is_only_judged_in_the_direction_that_reads() -> None:
       筛选卡在舰队上没人发现，**攻击战报断流 9 小时、37 发无战报**。
     - 2026-09-14 午：把它改严成「必须正面看见非舰队类」——
       而非舰队类主题**本来就读不出**，于是永远确认不了、每轮在开工那步自杀，
-      **全线停摆 3.5 小时，一发都派不出去**。
+      **全线停摆 57 分钟，一发都派不出去**。
 
     实测事实只有一条：**舰队类主题读得准（6/6），非舰队类读不准。**
     所以「开着」要正面证据，「关掉了」= 认不出开着，不去正面确认。
@@ -314,7 +314,7 @@ def test_the_unfiltered_trips_guarantee_their_own_precondition() -> None:
       **每轮白花一次 OCR 而一点保护都没有**。
     - 处置只许走 `cut_short`，**不许抛** —— 同一天写过「关不掉就抛异常」，
       而「关不掉」在主题读不出时必然成立，于是每轮在开工那步自杀，
-      **攻击、扫描全停 3.5 小时，一发都没派出去**。
+      **攻击、扫描全停 57 分钟、216 轮全判失败**。
     """
     source = inspect.getsource(pirate_loop.PirateLoop._scan_mail_rows)
 
@@ -326,7 +326,7 @@ def test_the_unfiltered_trips_guarantee_their_own_precondition() -> None:
     )
     tail = source[source.index("_fleet_filter_looks_on") :][:700]
     assert "cut_short=" in tail, "关不掉筛选时没有走 cut_short"
-    assert "raise" not in tail, "关不掉筛选时又去抛异常了 —— 那正是停摆 3.5 小时的成因"
+    assert "raise" not in tail, "关不掉筛选时又去抛异常了 —— 那正是停摆 57 分钟的成因"
 
 
 def test_only_the_recycle_trip_may_be_strict_about_subjects() -> None:
@@ -376,7 +376,7 @@ def test_the_judgement_behaves_right_on_the_screens_that_actually_happened() -> 
     U = pirate_loop.ReportKind.UNKNOWN
 
     # 2026-09-14 生产现场：读不出主题的一整屏。
-    # ⚠️ 这一屏必须放行 —— 它正是让每一轮自杀、全线停摆 3.5 小时的那一屏。
+    # ⚠️ 这一屏必须放行 —— 它正是让每一轮自杀、全线停摆 57 分钟的那一屏。
     assert _judge([U] * 6, fleet=False) is True, "读不出主题的一屏必须当作「筛选没开着」放行"
     assert _judge([U] * 6, fleet=True) is False, "读不出主题时不许说「筛选开着」"
 
@@ -405,7 +405,7 @@ def test_the_judgement_behaves_right_on_the_screens_that_actually_happened() -> 
 
 
 def test_doubt_alone_never_kills_the_round() -> None:
-    """⚠️⚠️ **「查不出来」不许判死这一轮** —— 2026-09-14 停摆 3.5 小时的那一条。
+    """⚠️⚠️ **「查不出来」不许判死这一轮** —— 2026-09-14 停摆 57 分钟的那一条。
 
     这里直接跑那道前提检查：给它生产当时那一屏（全读不出），它必须**什么都不做**，
     既不点标签也不抛异常。
