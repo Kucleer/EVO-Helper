@@ -332,22 +332,52 @@ def test_the_unfiltered_trips_guarantee_their_own_precondition() -> None:
     assert "raise" not in tail, "关不掉筛选时又去抛异常了 —— 那正是停摆 57 分钟的成因"
 
 
-def test_only_the_recycle_trip_may_be_strict_about_subjects() -> None:
-    """⚠️ 用户口径 2026-09-14（连说三遍）：「舰队返回不要开信」。
+def test_only_the_recycle_trip_skips_read_unknowns() -> None:
+    """⚠️ 用户口径 2026-09-14：「舰队返回不要开信」+「读未读配色的，不是已读配色」。
 
-    回收那一趟因此连主题读不出的行也不开。**但战报那一趟绝不许开这个档** ——
-    那一侧「漏开一封 = 再也读不回来」，方向正好相反。
+    ⚠️⚠️ **第一版（`#339` 的 `strict_subject`）是「主题读不出就一律不开」，错的。**
+    实测列表行主题 OCR 有 87% 读不出（昨夜 601 封开封里 522 封是这一档），
+    回收报告正在其中 —— 上线后回收读信当场变成每趟 0 份，而库里还有 317 发在等实收。
+
+    现在改用未读色当闸：**只有正面认出「已读」才跳过**。
+
+    **但战报那一趟绝不许开这个档** —— 那一侧「漏开一封 = 再也读不回来」，方向相反。
     """
     recycle = inspect.getsource(pirate_loop.PirateLoop.collect_recycle_hauls)
-    assert "strict_subject=True" in recycle, "回收那一趟没开严格主题档；舰队返回还会被开"
+    assert "skip_read_unknowns=True" in recycle, "回收那一趟没开这道闸"
+    assert "strict_subject" not in recycle, (
+        "又出现了「主题读不出就一律不开」那一档 —— 它会把 87% 的回收报告一起挡死"
+    )
 
     for name in ("_scan_for_reconcile", "_scan_for_scout_reports"):
         method = getattr(pirate_loop.PirateLoop, name, None)
         if method is None:
             continue
-        assert "strict_subject" not in inspect.getsource(method), (
-            f"{name} 开了严格主题档 —— 那一侧漏开一封就是永久丢一份报告"
+        src = inspect.getsource(method)
+        assert "skip_read_unknowns" not in src and "strict_subject" not in src, (
+            f"{name} 开了这道闸 —— 那一侧漏开一封就是永久丢一份报告"
         )
+
+
+def test_unreadable_subjects_are_opened_unless_positively_read() -> None:
+    """⚠️⚠️ **判据方向：只有 `unread is False` 才跳过。**
+
+    `MailRow.unread` 的语义是 `None` = 「颜色读不出」，而它的注释写明
+    **「读不出绝不能往已读那一侧倒」**（判成已读的代价高得多）。
+
+    这条钉住三档的处置，因为搞反任何一档的症状都是「回收报告读不出来」，
+    而那在日志上和「信箱里没有回收报告」长得一样 —— 2026-09-14 已经吃过一次。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._scan_mail_rows)
+    gates = re.findall(r"^\s*if skip_read_unknowns and (.+):$", source, re.M)
+    assert len(gates) == 1, f"这道闸不止一处，或者找不到：{gates}"
+
+    assert gates[0] == "row.kind is ReportKind.UNKNOWN and row.unread is False", (
+        f"闸门判据被改了：{gates[0]}。"
+        "⚠️ 必须是 `row.unread is False`（正面认出已读才跳过）——"
+        "写成 `not row.unread` 会把 `None`（颜色读不出）一起跳掉，"
+        "那就退回成第一版那个把 87% 回收报告挡死的行为。"
+    )
 
 
 # -- 判据的**行为**，不是它的源码长什么样 ---------------------------------------
@@ -513,3 +543,65 @@ def test_giving_up_does_not_look_like_a_normal_empty_trip() -> None:
 
     assert (given_up.aborted, bool(given_up.cut_short)) == (True, True)
     assert (normal.aborted, bool(normal.cut_short)) == (False, False)
+
+
+def _opens_with(unread: bool | None, *, skip_read_unknowns: bool) -> bool:
+    """主题读不出、未读色是 `unread` 的那一行，会不会被打开。**真跑 `_scan_mail_rows`。**"""
+    opened: list[int] = []
+
+    row = pirate_loop.MailRow(
+        index=0,
+        subject="~~ — —w————",  # 真实现场里的一行，读不出
+        raw_time_text="14/09/2026 12:00:00",
+        reported_at_utc=None,
+        kind=pirate_loop.ReportKind.UNKNOWN,
+        unread=unread,
+    )
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    # ⚠️ `_scan_mail_rows` 起手会核视口（`_ensure_geometry`），那一步要真窗口。
+    # 这条用例验的是开封判据，不是几何，所以桩掉。
+    loop._ensure_geometry = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._enter_mailbox = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
+    loop._fleet_filter_looks_on = lambda: False  # type: ignore[assignment]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._close_mail = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_kwargs: [row]  # type: ignore[assignment]
+    loop._scroll_mail_list = lambda *_a, **_k: False  # type: ignore[attr-defined, assignment]
+
+    def _open(r, _visit):  # type: ignore[no-untyped-def]
+        opened.append(r.index)
+        return False
+
+    loop._open_mail_row = _open  # type: ignore[attr-defined, assignment]
+    loop._scan_mail_rows(
+        wanted=pirate_loop.ReportKind.RECYCLE,
+        label="回收报告",
+        visit=lambda _r, _p: False,
+        skip_read_unknowns=skip_read_unknowns,
+        max_pages=1,
+    )
+    return bool(opened)
+
+
+def test_only_positively_read_unknowns_are_skipped() -> None:
+    """⚠️⚠️ **三档处置,搞反任何一档都会让回收报告读不出来。**
+
+    而「读不出来」在日志上和「信箱里没有回收报告」长得一模一样 ——
+    2026-09-14 已经因此烧掉一整晚：`#339` 的第一版把**所有**主题读不出的行都跳过，
+    实测那是 **87%** 的开封（昨夜 601 封里 522 封），回收报告正在其中，
+    上线后回收读信当场变成每趟 0 份。
+    """
+    assert _opens_with(True, skip_read_unknowns=True) is True, "未读的必须开"
+    assert _opens_with(None, skip_read_unknowns=True) is True, (
+        "颜色读不出的必须开 —— `MailRow.unread` 的注释写明「读不出绝不能往已读那侧倒」"
+    )
+    assert _opens_with(False, skip_read_unknowns=True) is False, "确凿已读的才跳过"
+
+    # 闸没开的那一趟（战报侧）：三档都照开，一封都不许漏。
+    for state in (True, None, False):
+        assert _opens_with(state, skip_read_unknowns=False) is True, (
+            "战报那一侧漏开一封就是永久丢一份报告"
+        )
