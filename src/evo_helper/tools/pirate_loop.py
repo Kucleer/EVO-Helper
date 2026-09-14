@@ -3628,7 +3628,7 @@ class PirateLoop:
         skip_known: bool = False,
         known_run: KnownRunGate | None = None,
         fleet_sub_tab: bool = False,
-        strict_subject: bool = False,
+        skip_read_unknowns: bool = False,
         deadline: datetime | None = None,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
@@ -3898,22 +3898,39 @@ class PirateLoop:
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
                     continue
-                # ⚠️⚠️ **`strict_subject` 那一档连 `UNKNOWN` 也不开。**
+                # ⚠️⚠️ **主题读不出的行：只有「确凿已读」才跳过。**
                 #
-                # 用户口径 2026-09-14，连说三遍：「舰队返回不要开信」。
-                # 而 `may_be` 对主题读不出的行一律放行（那是给攻击战报定的：
-                # 漏开一封 = 少一份战报），于是舰队标签上主题糊掉的「舰队返回」
-                # 照样被开 —— 实测一夜 48 封。
+                # 用户口径 2026-09-14：①「舰队返回不要开信」（连说三遍）；
+                # ②「读邮件要去读未读配色的，而不是已读配色」。
                 #
-                # ⚠️ 代价是**主题糊掉的回收报告这一趟也开不到**。可以接受：
-                # `should_open` 只拦「库里已有」、不拦已读，所以它下一趟还会被再试一次，
-                # 而下一趟那一行的 OCR 未必再糊。用「这一趟少读一封」换「一封舰队返回
-                # 都不开」，正是用户要的那一侧。
+                # ⚠️⚠️⚠️ **这一档的第一版（`#339` 的 `strict_subject`）是错的，
+                # 而且错得很贵。** 那一版是「主题读不出就一律不开」，当晚实测：
+                #
+                #     列表行主题 OCR 有 **87%** 读不出（昨夜 601 封开封里 522 封是这一档）
+                #     —— 而回收报告正在其中。上线后回收读信当场变成 **每趟 0 份**，
+                #     而库里还有 317 发回收在等实收。
+                #
+                # 也就是说：它按字面实现了「不开」，却把要读的东西一起挡死了。
+                #
+                # **改用未读色当闸**，判据方向与 `MailRow.unread` 的语义一致：
+                #
+                #     unread is True  → 开（未读，按定义还没看过）
+                #     unread is None  → 开（颜色读不出；⚠️ 绝不往已读那侧倒，
+                #                          整段理由在 `MailRow.unread` 上）
+                #     unread is False → 跳过（**正面认出已读**，才是用户要跳的那一侧）
+                #
+                # 这样：已读的舰队返回不再被反复重开（那是用户真正在意的浪费）；
+                # 未读的舰队返回仍会被开**一次**，之后它变已读，再也不开 ——
+                # 而「一次」是拿不掉的：主题读不出时，开之前分不出它是哪一种。
+                #
+                # ⚠️ 误开一封舰队返回**不会污染数据**：`read_recycle_mail` 要求
+                # 「回收船数读得出 + 三格过容量不变量」，而舰队返回那封信上
+                # 根本没有「回收船」一行，一开就抛 `RecycleMailUnreadable`。
                 #
                 # ⚠️ **只给回收那一趟用。** 战报那一趟绝不许开这个档 ——
                 # 那一侧「漏开一封 = 再也读不回来」，方向正好相反。
-                if strict_subject and row.kind is ReportKind.UNKNOWN:
-                    say(f"  第 {row.index} 行主题读不出（{row.subject!r}）；严格模式下不打开")
+                if skip_read_unknowns and row.kind is ReportKind.UNKNOWN and row.unread is False:
+                    say(f"  第 {row.index} 行主题读不出（{row.subject!r}）且已读；不打开")
                     continue
                 # ⚠️ **排在主题闸之后、时刻窗口闸之前。** 主题闸在前是因为它不查库；
                 # 而这一道在时刻窗口闸之前，是因为「库里已经有了」比「时刻落不落在
@@ -4472,9 +4489,10 @@ class PirateLoop:
             max_unread_opens=max_opens,
             should_open=should_open,
             fleet_sub_tab=True,
-            # ⚠️ 用户口径 2026-09-14（连说三遍）：「舰队返回不要开信」。
-            # 主题读不出的行在这一趟一律不开，理由整段在 `_scan_mail_rows` 里。
-            strict_subject=True,
+            # ⚠️ 用户口径 2026-09-14：「舰队返回不要开信」+「读未读配色的，
+            # 不是已读配色」。主题读不出**且确凿已读**的行不开，理由整段在
+            # `_scan_mail_rows` 里（含第一版为什么错、错在哪）。
+            skip_read_unknowns=True,
         )
         if not self._select_mail_sub_tab(fleet=False):
             say("  读完回收报告没能切回「战斗」标签；下一趟重进信箱时会自己回去")
