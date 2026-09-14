@@ -10,8 +10,11 @@
 在只剩舰队类的列表上开工，主题闸把它们全拒掉，日志上看着和「信箱里没有战报」
 一模一样。下面 `test_the_fleet_tab_is_always_switched_back` 守的就是这一条。
 
-⚠️ 2026-09-13 夜实机纠正：那一排里**只有「舰队」那个按钮有反应**，它是个
-筛选开关而不是页签，所以「关回去」点的是**同一个坐标**，不是去点「战斗」。
+⚠️⚠️ 2026-09-15 实拍再次纠正：`#336` 说「那一排只有『舰队』有反应、它是开关」——
+**那个结论是错的**。取消舰队之后不是「显示全部」，是**什么都不显示**
+（第二排一个筛选都没选中时，列表正中写着「没有符合当前筛选条件的邮件。」，
+而角标写着战斗 11 封、舰队 99+ 封）。所以「切回去」= **点「战斗」**，
+整段经过在 `MAIL_BATTLE_SUB_TAB` 上。代价：攻击战报整晚读不到。
 
 游戏信箱里的分类标签、排序、搜索这些是用户自己配好的。助手在那上面点一下，
 下一轮翻到的就不是同一批邮件了，而这件事**不会报错**——只会表现成「战报读不到」，
@@ -42,7 +45,7 @@ ALLOWED_MAIL_CLICK_LABELS = frozenset(
         "关闭邮箱列表（左上角X）",
         # ⚠️ 2026-09-12 放开的那个例外，见模块头。**只有这两个**。
         "二级标签「舰队」",
-        "二级标签「舰队筛选关」",
+        "二级标签「战斗」",
     }
 )
 
@@ -131,7 +134,7 @@ def test_the_allow_list_has_no_filter_sounding_entries() -> None:
     # ⚠️ 2026-09-12 之前这里只有「报告标签」一个。放开成三个是**用户点名要的**
     # （「打开舰队的二级标签，你就可以看见回收报告」），不是顺手加的。
     # 再往里加任何一个之前，先回去读模块头那两段。
-    assert filterish == {"报告标签", "二级标签「舰队」", "二级标签「舰队筛选关」"}
+    assert filterish == {"报告标签", "二级标签「舰队」", "二级标签「战斗」"}
 
 
 def test_the_fleet_tab_is_always_switched_back() -> None:
@@ -206,31 +209,42 @@ def test_every_recycle_mail_leaves_evidence_behind() -> None:
 # -- 二级标签：它是开关，不是页签（2026-09-13 夜实机） -----------------------------
 
 
-def test_both_directions_click_the_same_button() -> None:
-    """⚠️⚠️ 「舰队」是一个**筛选开关**，两个方向点的是同一个坐标。
+def test_the_two_directions_click_different_buttons() -> None:
+    """⚠️⚠️⚠️ **要舰队就点舰队，要战报就点「战斗」——两个不同的按钮。**
 
-    2026-09-13 夜实机逐点验过那一排四个按钮，只有「舰队」有反应；
-    原先还有一个 `MAIL_BATTLE_SUB_TAB`，它①用的是「侦察」的 x，②就算改对，
-    那个按钮也不响应——后果是「读完回收报告切回去」实测 3/3 全失败。
+    `#336` 曾经把这一排判成「只有『舰队』有反应、它是个开关」，于是「切回去」
+    实现成**再点一次舰队把它取消**。2026-09-15 实拍推翻了那个模型
+    （`dump-mail-list-empty-014934.png`）：
 
-    这一条钉的是「别再加回来一个方向专用的坐标」。
+        战斗 [11]   侦察   舰队 [99+]   系统
+        列表正中：「没有符合当前筛选条件的邮件。」
+
+    **取消舰队之后不是「显示全部」，是什么都不显示。** 角标明明写着战斗 11 封、
+    舰队 99+ 封，而第二排一个筛选都没选中时列表是空的。
+
+    代价：**攻击战报整晚读不到**（09-14 06:37 → 09-15 02:00，一份都没有）。
+
+    ⚠️ 而 `#336` 之前的代码本来就是点「战斗」切回去的，只是坐标抄错
+    （897 是**侦察**的 x）。那个方向是对的，被我当成错的删掉了。
     """
-    # ⚠️ 判**行首的赋值**，不判「这三个字出现过」：那个常量为什么被删掉，正写在
-    # `MAIL_FLEET_SUB_TAB` 的注释里，而注释里必然带着它的名字。按出现判的话，
-    # 这条用例会把那段说明本身判成违规 —— 红的地方指着注释，错在用例。
     constants = inspect.getsource(pirate_loop).split("class PirateLoop", 1)[0]
 
-    assert not re.search(r"^MAIL_BATTLE_SUB_TAB\s*=", constants, re.M), (
-        "又出现了一个方向专用的二级标签坐标；那一排只有「舰队」那个按钮有反应"
-    )
+    for name in ("MAIL_FLEET_SUB_TAB", "MAIL_BATTLE_SUB_TAB"):
+        assert re.search(rf"^{name}\s*=\s*\(", constants, re.M), f"{name} 不见了"
 
-    # 反过来：切回去那一下必须真的走同一个坐标 —— `target` 只许被赋一次，
-    # 而且赋的就是那个开关。
-    # ⚠️ 同上：数「出现几次」会把注释里提到的那次也数进去（我刚踩过）。
+    assert pirate_loop.MAIL_FLEET_SUB_TAB != pirate_loop.MAIL_BATTLE_SUB_TAB, (
+        "两个方向又共用一个坐标了 —— 那是 `#336` 的错误模型，"
+        "取消舰队之后列表会变空，攻击战报就整晚读不到"
+    )
+    # ⚠️ 实拍量出来的 x：战斗跨 713~830、舰队跨 965~1082（`dump-mail-list-empty-014934.png`）。
+    assert 713 <= pirate_loop.MAIL_BATTLE_SUB_TAB[0] <= 830, "战斗的 x 落到别的按钮上了"
+    assert 965 <= pirate_loop.MAIL_FLEET_SUB_TAB[0] <= 1082, "舰队的 x 落到别的按钮上了"
+
+    # 两个方向必须**按 fleet 挑**坐标，不许写死一个。
     source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
     targets = re.findall(r"^\s*target = (.+)$", source, re.M)
-    assert targets == ["MAIL_FLEET_SUB_TAB"], (
-        f"两个方向应当共用同一个 target，实际是 {targets}；分叉就说明又按方向挑坐标了"
+    assert targets == ["MAIL_FLEET_SUB_TAB if fleet else MAIL_BATTLE_SUB_TAB"], (
+        f"切标签没有按方向挑坐标：{targets}"
     )
 
 
