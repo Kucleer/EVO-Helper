@@ -605,3 +605,45 @@ def test_only_positively_read_unknowns_are_skipped() -> None:
         assert _opens_with(state, skip_read_unknowns=False) is True, (
             "战报那一侧漏开一封就是永久丢一份报告"
         )
+
+
+def test_a_failed_subtab_check_logs_every_row_subject() -> None:
+    """⚠️⚠️ **判据对不上时，要把那几行的主题原文打进日志，不能只打计数。**
+
+    2026-09-14 晚：这一档连着 10 次都是「舰队类 N 行、非舰队类 1 行」，
+    于是切不到「舰队」、回收读信每趟 0 份。而光看计数**分不出**两种相反的解释 ——
+    「筛选开着但有一行读花」还是「筛选根本没切过去」。
+
+    ⚠️ 那一档**存过现场图**，但图落在跑生产的那台机器上，排障的人未必够得到
+    （当晚生产在 `CY-202305011401`，排障在另一台）。**日志是唯一一定拿得到的。**
+    """
+    lines: list[str] = []
+
+    class Row:
+        def __init__(self, index: int, kind: object, subject: str) -> None:
+            self.index, self.kind, self.subject = index, kind, subject
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._mail_list_rows = lambda **_kwargs: [  # type: ignore[assignment]
+        Row(0, pirate_loop.ReportKind.FLEET_RETURN, "eS  舰队返回"),
+        Row(1, pirate_loop.ReportKind.ATTACK, "AN SO 攻击报告 iva"),
+        Row(2, pirate_loop.ReportKind.UNKNOWN, "~~ — —w————"),
+    ]
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(pirate_loop, "say", lines.append):
+        assert loop._sub_tab_matches(fleet=True, name="舰队", quiet=False) is False
+
+    joined = "\n".join(lines)
+    for subject in ("eS  舰队返回", "AN SO 攻击报告 iva", "~~ — —w————"):
+        assert subject in joined, (
+            f"判据失败时没把主题原文 {subject!r} 打进日志 —— 光有计数分不出「读花了」和「没切过去」"
+        )
+    assert "ATTACK" in joined, "没打出每一行判成了什么 kind"
+
+    # ⚠️ `quiet=True` 那一次是「点之前先看一眼」，不匹配是**正常**的，不许刷屏。
+    lines.clear()
+    with unittest.mock.patch.object(pirate_loop, "say", lines.append):
+        loop._sub_tab_matches(fleet=True, name="舰队", quiet=True)
+    assert lines == [], "先看一眼那一次不该打日志（它不匹配是正常的）"
