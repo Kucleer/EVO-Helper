@@ -823,3 +823,43 @@ def test_a_dispatch_from_today_does_not_widen_the_floor(monkeypatch: pytest.Monk
     loop, _repository, _opened = _loop([], repository=_Repository(oldest_open=NOON))
 
     assert loop._report_floor(DAY_START, now=NOON) == DAY_START
+
+
+def test_a_trip_that_gave_up_on_the_tab_writes_no_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️⚠️ **切不了二级标签的那一趟，不许写对账时刻。**
+
+    2026-09-14 复核（Codex）第一轮查出的 P1：那两处提前返回只给了 `cut_short`，
+    而 `tally.swept` 只看 `deadline_hit` 与 `aborted` —— 于是**一趟什么都没扫的
+    行程被记成「翻完了」**，`record_daily_reconciliation` 照写，后面的轮次因冷却
+    而跳过。这和 09-13 夜那次事故是同一个病：失败的一趟被记成成功的一趟。
+
+    ⚠️ 复核第三轮又指出：我为这条写的用例只断到 `MailScan` 的字段与 `swept` 的
+    算式，**没有真跑调用链**。这一条补的就是那一步 —— 直接跑 `reconcile_today`，
+    断言仓储那一侧**一条对账记录都没有**。
+    """
+    loop, repository, _opened = _loop([[_row(0, ReportKind.ATTACK, NOON)]])
+    # 正面认出筛选开着，但怎么点都关不掉 —— 提前返回那条路。
+    loop._fleet_filter_looks_on = lambda: True  # type: ignore[assignment]
+    loop._select_mail_sub_tab = lambda **_kwargs: False  # type: ignore[assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+
+    _reconcile(loop, monkeypatch)
+
+    assert repository.records == [], (
+        "这一趟一封都没看过，却写了对账时刻 —— 后面的轮次会因冷却跳过，"
+        "而那正是 2026-09-13 夜那次事故的形状"
+    )
+
+
+def test_a_normal_trip_still_writes_its_reconciliation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """反过来也要成立：**正常那一趟必须照写**。
+
+    ⚠️ 少了这一条，上面那条用「永远不写」也能全绿 —— 那就把对账整个关掉了。
+    """
+    loop, repository, _opened = _loop([[_row(0, ReportKind.ATTACK, NOON)]])
+
+    _reconcile(loop, monkeypatch)
+
+    assert repository.records, "正常翻完的一趟没有写对账时刻"
