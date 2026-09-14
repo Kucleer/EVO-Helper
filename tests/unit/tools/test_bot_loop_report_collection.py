@@ -106,6 +106,11 @@ def _loop(pages: list[_Page], *, reachable: bool = True) -> tuple[Any, list[str]
     loop._on_mail_list = lambda: True
     loop._on_mail_detail = lambda: True
     loop._mail_list_rows = lambda: _attack_rows(len(pages) or 1)
+    # ⚠️ 二级标签那道前提检查在这里桩掉：它会去读一屏列表，而上面那个夹具是
+    # 「一屏一屏 pop」的 —— 让它真跑会**吃掉一屏**，把用例本意改掉。
+    # 那道检查自己有守卫用例（`test_the_report_trip_guarantees_its_own_precondition`），
+    # 真正的行为验收在实机。
+    loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
     remaining = list(pages)
     loop._report_screens = lambda: remaining.pop(0) if remaining else _Page(None)
     return loop, events

@@ -127,6 +127,11 @@ def _loop(
     loop._ingest_report = lambda row, page: (opened.append(row.index), ingest)[1]
     screens = list(pages)
     loop._mail_list_rows = lambda: screens.pop(0) if screens else []
+    # ⚠️ 二级标签那道前提检查在这里桩掉：它会去读一屏列表，而上面那个夹具是
+    # 「一屏一屏 pop」的 —— 让它真跑会**吃掉一屏**，把用例本意改掉。
+    # 那道检查自己有守卫用例（`test_the_report_trip_guarantees_its_own_precondition`），
+    # 真正的行为验收在实机。
+    loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
 
     inner = loop._scan_mail_rows
 

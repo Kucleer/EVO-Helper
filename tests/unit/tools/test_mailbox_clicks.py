@@ -265,3 +265,71 @@ def test_the_click_label_dodges_the_read_only_gate() -> None:
     for label in names[0]:
         for word in FORBIDDEN_LABELS:
             assert word not in label, f"标签「{label}」里有 {word!r}，只读进程点它会被拒"
+
+
+# -- 2026-09-14 那次「攻击战报断流 9 小时」教出来的三条 -------------------------
+
+
+def test_both_directions_need_positive_evidence() -> None:
+    """⚠️⚠️ **两个方向都要正面证据，一次都不许只靠「没看见对方」。**
+
+    2026-09-13 夜我把「关掉筛选」那一侧放松成了「没有舰队类就算切回去了」，
+    理由是攻击报告主题读不准、正面证据拿不到。代价 9 小时后显形：
+    信箱一直停在舰队筛选上，而**读战报那一趟就在只剩舰队类的列表上开工** ——
+    整屏按主题全拒、日志上一切正常，09-13 21h 起攻击战报断流、37 发无战报。
+
+    破绽当时就写在日志里：
+
+        二级标签在「舰队筛选关」上：这一屏 6 行里舰队类 0 行、攻击报告 0 行，对得上
+
+    「两个都是 0」既可能是没筛过的列表，也可能是半加载、甚至根本不在列表上。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._sub_tab_matches)
+    # ⚠️ 只看 `good = ` 那一行，**不要扫整段源码**：这次事故的成因就写在上面的
+    # 注释里，而注释里必然带着 `here == 0` 这几个字。按整段扫的话，这条用例会把
+    # 那段说明本身判成违规 —— 红的地方指着注释，错在用例。
+    # （同一个坑今天已经踩到第三次了：#333 的 colspan、#336 的 MAIL_BATTLE_SUB_TAB。）
+    verdicts = re.findall(r"^\s*good = (.+)$", source, re.M)
+    assert len(verdicts) == 1, f"判据不止一行，或者找不到：{verdicts}"
+    verdict = verdicts[0]
+
+    assert "other > 0" in verdict, (
+        f"「关掉筛选」那一侧又变回只靠「没看见舰队类」了（判据：{verdict}）—— "
+        "那正是 2026-09-14 那次攻击战报断流 9 小时的成因"
+    )
+    assert "here == 0" not in verdict, f"判据里出现了「没有舰队类就算数」这种反向断言：{verdict}"
+
+
+def test_the_report_trip_guarantees_its_own_precondition() -> None:
+    """⚠️⚠️ **读战报那一趟自己保证「舰队筛选是关的」，不指望回收那一趟收拾干净。**
+
+    那条「读完要切回去」的还原义务原先只写在回收那一侧，于是它一旦失手，
+    代价全落在战报这一侧 —— 而这一侧毫不知情，照常开工、什么都没找到，
+    日志上和「信箱里真的没有战报」一模一样。**9 小时没人发现。**
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._scan_for_reconcile)
+
+    assert "_select_mail_sub_tab(fleet=False)" in source, (
+        "读战报那一趟没有自己关掉舰队筛选；它不能指望别人收拾干净"
+    )
+    assert "raise RuntimeError" in source, (
+        "关不掉筛选时没有放弃这一趟 —— 在筛过的列表上翻等于静默读空，而那和真的没有战报分不出来"
+    )
+
+
+def test_only_the_recycle_trip_may_be_strict_about_subjects() -> None:
+    """⚠️ 用户口径 2026-09-14（连说三遍）：「舰队返回不要开信」。
+
+    回收那一趟因此连主题读不出的行也不开。**但战报那一趟绝不许开这个档** ——
+    那一侧「漏开一封 = 再也读不回来」，方向正好相反。
+    """
+    recycle = inspect.getsource(pirate_loop.PirateLoop.collect_recycle_hauls)
+    assert "strict_subject=True" in recycle, "回收那一趟没开严格主题档；舰队返回还会被开"
+
+    for name in ("_scan_for_reconcile", "_scan_for_scout_reports"):
+        method = getattr(pirate_loop.PirateLoop, name, None)
+        if method is None:
+            continue
+        assert "strict_subject" not in inspect.getsource(method), (
+            f"{name} 开了严格主题档 —— 那一侧漏开一封就是永久丢一份报告"
+        )

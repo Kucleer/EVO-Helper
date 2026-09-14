@@ -3370,30 +3370,40 @@ class PirateLoop:
         """
         kinds = [row.kind for row in self._mail_list_rows(evidence_source="sub_tab")]
         here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
-        there = sum(1 for kind in kinds if kind is ReportKind.ATTACK)
-        # ⚠️⚠️ **两个方向的判据是不对称的，这是照实测定的，不是图省事。**
+        # ⚠️⚠️ **两个方向都要正面证据。一次都不许只靠「没看见对方」。**
         #
-        # 开着筛选时列表里只有「舰队返回 / 回收报告」这两种主题，而它们**读得准**
-        # ——2026-09-13 夜每一次开着筛选量到的都是 6/6 全中。所以「开着」要正面证据。
+        # 2026-09-13 夜我把「关掉」那一侧放松成了 `here == 0`（没有舰队类就算切回去了），
+        # 理由是攻击报告主题读不准、正面证据拿不到。代价在 9 小时后显形：
+        # 信箱一直停在舰队筛选上，而**读战报那一趟就在只剩舰队类的列表上开工**，
+        # 整屏按主题全拒、日志上一切正常 —— 09-13 21h 起攻击战报断流，37 发无战报。
+        # 日志里那一行把破绽写得明明白白：
         #
-        # 关掉之后列表里混着攻击报告，而**攻击报告的主题读不准**：同一夜实测
-        # 关掉筛选后那 6 行经常是「舰队类 0、攻击报告 0」——全是 unknown。
-        # 原先两边都要正面证据（`there > 0`），于是「关掉」这一侧**永远判不成立**，
-        # 重试三次全败、整趟放弃。所以这一侧只判「一封舰队类都没有」。
+        #     点了二级标签「舰队筛选关」却不在邮件列表上了（第 1 次）
+        #     二级标签在「舰队筛选关」上：这一屏 6 行里舰队类 0 行、攻击报告 0 行，对得上
         #
-        # ⚠️ 这不是把闸放松：`_on_mail_list()` 已经挡住「根本不在列表上」那一档，
-        # 而「筛选还开着却一封舰队类都读不出」在实测里一次都没出现过。
-        good = (here > 0 and there == 0) if fleet else here == 0
+        # 「舰队类 0、攻击报告 0」既可能是没筛过的列表，也可能是半加载、
+        # 甚至根本不在列表上 —— 而那正是原 docstring 说的「切错了是最危险的失败形态」。
+        #
+        # 所以「关掉」这一侧改判**至少看见一封确凿的非舰队类**。范围比原先的
+        # `there > 0` 宽（不只攻击报告），但性质没变：仍然是正面证据。
+        other = sum(
+            1
+            for kind in kinds
+            if kind is not None
+            and kind is not ReportKind.UNKNOWN
+            and kind not in self.FLEET_TAB_KINDS
+        )
+        good = (here > 0 and other == 0) if fleet else other > 0
         if good:
             say(
                 f"  二级标签在「{name}」上：这一屏 {len(kinds)} 行里"
-                f"舰队类 {here} 行、攻击报告 {there} 行，对得上"
+                f"舰队类 {here} 行、非舰队类 {other} 行，对得上"
             )
             return True
         if not quiet:
             say(
                 f"  二级标签「{name}」内容对不上（舰队类 {here} 行、"
-                f"攻击报告 {there} 行、共 {len(kinds)} 行）"
+                f"非舰队类 {other} 行、共 {len(kinds)} 行）"
             )
         return False
 
@@ -3560,6 +3570,7 @@ class PirateLoop:
         skip_known: bool = False,
         known_run: KnownRunGate | None = None,
         fleet_sub_tab: bool = False,
+        strict_subject: bool = False,
         deadline: datetime | None = None,
     ) -> MailScan:
         """进一趟信箱，把**主题看着对得上**的报告逐封打开交给 `visit`。
@@ -3792,6 +3803,23 @@ class PirateLoop:
                 # 这也是「必开」有界的第二道保障：一整屏活动通知不会进来。
                 if not row.may_be(wanted):
                     say(f"  第 {row.index} 行不是{label}（主题读作 {row.subject!r}）；不打开")
+                    continue
+                # ⚠️⚠️ **`strict_subject` 那一档连 `UNKNOWN` 也不开。**
+                #
+                # 用户口径 2026-09-14，连说三遍：「舰队返回不要开信」。
+                # 而 `may_be` 对主题读不出的行一律放行（那是给攻击战报定的：
+                # 漏开一封 = 少一份战报），于是舰队标签上主题糊掉的「舰队返回」
+                # 照样被开 —— 实测一夜 48 封。
+                #
+                # ⚠️ 代价是**主题糊掉的回收报告这一趟也开不到**。可以接受：
+                # `should_open` 只拦「库里已有」、不拦已读，所以它下一趟还会被再试一次，
+                # 而下一趟那一行的 OCR 未必再糊。用「这一趟少读一封」换「一封舰队返回
+                # 都不开」，正是用户要的那一侧。
+                #
+                # ⚠️ **只给回收那一趟用。** 战报那一趟绝不许开这个档 ——
+                # 那一侧「漏开一封 = 再也读不回来」，方向正好相反。
+                if strict_subject and row.kind is ReportKind.UNKNOWN:
+                    say(f"  第 {row.index} 行主题读不出（{row.subject!r}）；严格模式下不打开")
                     continue
                 # ⚠️ **排在主题闸之后、时刻窗口闸之前。** 主题闸在前是因为它不查库；
                 # 而这一道在时刻窗口闸之前，是因为「库里已经有了」比「时刻落不落在
@@ -4350,6 +4378,9 @@ class PirateLoop:
             max_unread_opens=max_opens,
             should_open=should_open,
             fleet_sub_tab=True,
+            # ⚠️ 用户口径 2026-09-14（连说三遍）：「舰队返回不要开信」。
+            # 主题读不出的行在这一趟一律不开，理由整段在 `_scan_mail_rows` 里。
+            strict_subject=True,
         )
         if not self._select_mail_sub_tab(fleet=False):
             say("  读完回收报告没能切回「战斗」标签；下一趟重进信箱时会自己回去")
@@ -5557,6 +5588,26 @@ class PirateLoop:
         被数两遍。多数的方向虽然安全（只会让助手提前收手），但库里那个数会变成
         一个没人能解释的值，而它正是「今日 X/32」显示的东西。
         """
+        # ⚠️⚠️ **这一趟自己保证「舰队筛选是关的」，不指望别人收拾干净。**
+        #
+        # 2026-09-13 夜的事故：回收那一趟把信箱留在舰队筛选上，而这一趟照常开工、
+        # 整屏按主题全拒 —— 日志上和「信箱里没有战报」一模一样，**9 小时没人发现**，
+        # 37 发攻击没有战报。那条「读完要切回去」的还原义务写在回收那一侧，
+        # 于是它一旦失手，代价全落在这一侧，而这一侧毫不知情。
+        #
+        # ⚠️ 切不回去就**整趟不翻**，不是照翻。在筛过的列表上翻一趟的产出是
+        # 「什么都没找到」，而它和真的没有战报**分不出来** —— 那正是这次 9 小时
+        # 没被发现的原因。宁可大声放弃。
+        #
+        # ⚠️ 抛**普通 `RuntimeError`**，不是 `MailboxUnreachable`：调用方对前者已经
+        # 有现成的升级路径 —— 单子为空就记一句、不推进对账时刻；单子非空就关窗重开
+        # 再翻一次，而**关窗重开正好把信箱筛选一起重置了**。
+        # 用 `MailboxUnreachable` 会判死整轮并计入连续失败、三次之后自动停用任务 ——
+        # 对「切标签偶尔失手」这件事，那个惩罚太重。
+        if not self._select_mail_sub_tab(fleet=False):
+            say("  舰队筛选关不掉；这一趟不翻信箱（在筛过的列表上翻等于静默读空）")
+            self._dump_frame("reconcile-fleet-filter-stuck", PANEL_TITLE_ROI)
+            raise RuntimeError("舰队筛选关不掉，拒绝在筛过的列表上翻战报")
         tally = DailyTally(kind=self.RECONCILE_KIND, day_start=day_start)
         # ⚠️ **只有这一条日常链路接连续白开那道闸。** 补录那两个入口不接，理由和
         # 下面 `skip_known` 那段一字不差：那个入口存在的意义就是够到被各种闸筛掉
