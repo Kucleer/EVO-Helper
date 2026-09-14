@@ -3290,9 +3290,32 @@ class PirateLoop:
         self._open_mail()
         self._scroll_mail_list_to_top()
 
-    #: 舰队标签里**只会**出现这两种主题；战斗标签里一个都不会出现。
-    #: 这一对就是「切成功了没有」的判据本身，见 `_select_mail_sub_tab`。
-    FLEET_TAB_KINDS = (ReportKind.RECYCLE, ReportKind.FLEET_RETURN)
+    #: 舰队标签里会出现的**全部**主题；战斗标签里一个都不会出现。
+    #: 这一组就是「切成功了没有」的判据本身，见 `_select_mail_sub_tab`。
+    #:
+    #: ⚠️⚠️ **这里原先只列了两种，而同一个仓库的另一处写着四种** ——
+    #: `vision.parsers.classify_report_kind` 那段注释：「下面这四条是舰队标签里的
+    #: 四种信（实拍 2026-09-13：舰队返回 / 回收报告 / 矮星系统战报 / 部署报告）」。
+    #: 两处对同一件事的说法不一致，而判据用的是错的那一份。
+    #:
+    #: 代价 2026-09-14 晚实机打出来了：舰队标签第 0 行常驻一封**矮星系统战报**
+    #: （最新那封），于是「非舰队类 = 1」，`other == 0` 不成立，
+    #: **6 趟里 4 趟切不到「舰队」、整趟放弃、回收读信每趟 0 份**，
+    #: 而当时库里有 325 发回收在等实收。取证日志（`#344`）长这样：
+    #:
+    #:     └ 第 0 行 kind=STARGATE     主题='BS   矮星系统战报'   ← 就是它
+    #:     └ 第 1 行 kind=FLEET_RETURN 主题='se  舰队返回'
+    #:
+    #: ⚠️ 主题读得干干净净，**不是 OCR 读花** —— 是这张表少列了两种。
+    #:
+    #: ⚠️ **改这张表不是把判据放宽。** 判据仍旧是「读得出的行必须全都属于舰队标签」，
+    #: 只是「属于舰队标签」这件事现在照实测写全了。
+    FLEET_TAB_KINDS = (
+        ReportKind.RECYCLE,
+        ReportKind.FLEET_RETURN,
+        ReportKind.STARGATE,
+        ReportKind.DEPLOY,
+    )
 
     def _select_mail_sub_tab(self, *, fleet: bool) -> bool:
         """切「报告」底下的二级标签。切成了返回 True。

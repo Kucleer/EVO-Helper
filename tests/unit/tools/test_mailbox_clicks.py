@@ -647,3 +647,54 @@ def test_a_failed_subtab_check_logs_every_row_subject() -> None:
     with unittest.mock.patch.object(pirate_loop, "say", lines.append):
         loop._sub_tab_matches(fleet=True, name="舰队", quiet=True)
     assert lines == [], "先看一眼那一次不该打日志（它不匹配是正常的）"
+
+
+def test_the_fleet_tab_kinds_match_what_the_parser_documents() -> None:
+    """⚠️⚠️ **「舰队标签里有哪几种信」这件事，仓库里不许有两个版本。**
+
+    2026-09-14 晚实机：`FLEET_TAB_KINDS` 只列了两种（回收报告 / 舰队返回），
+    而 `vision.parsers` 那段注释写着四种（实拍 2026-09-13：还有**矮星系统战报**
+    与**部署报告**）。判据用的是错的那一份。
+
+    代价：舰队标签第 0 行常驻一封矮星系统战报（最新那封）⇒「非舰队类 = 1」⇒
+    `other == 0` 不成立 ⇒ **6 趟里 4 趟切不到「舰队」、回收读信每趟 0 份**，
+    而当时库里有 325 发回收在等实收。
+
+    ⚠️ 这一条把两处绑在一起：`parsers` 那段注释是实拍结论，它变了这里就要变。
+    """
+    assert set(pirate_loop.PirateLoop.FLEET_TAB_KINDS) == {
+        pirate_loop.ReportKind.RECYCLE,
+        pirate_loop.ReportKind.FLEET_RETURN,
+        pirate_loop.ReportKind.STARGATE,
+        pirate_loop.ReportKind.DEPLOY,
+    }, "舰队标签的主题清单和 parsers 那段实拍注释对不上了"
+
+    # 反向：这四种必须都被分类器认得出来，否则它们落 UNKNOWN，
+    # 而 `may_be` 对 UNKNOWN 一律放行 —— 那是 parsers 那段注释自己的理由。
+    from evo_helper.vision.parsers import classify_report_subject
+
+    for text_, expected in (
+        ("回收报告", pirate_loop.ReportKind.RECYCLE),
+        ("舰队返回", pirate_loop.ReportKind.FLEET_RETURN),
+        ("矮星系统战报", pirate_loop.ReportKind.STARGATE),
+        ("部署报告", pirate_loop.ReportKind.DEPLOY),
+    ):
+        assert classify_report_subject(text_) is expected, f"{text_} 认不出来了"
+
+
+def test_a_stargate_row_no_longer_blocks_the_fleet_tab_check() -> None:
+    """⚠️ 实机那一屏的原样回放：第 0 行矮星系统战报 + 5 行舰队返回。
+
+    改表之前这一屏判不成立（`other=1`），整趟放弃；改表之后它就是「筛选开着」。
+    """
+    F = pirate_loop.ReportKind.FLEET_RETURN
+    S = pirate_loop.ReportKind.STARGATE
+
+    assert _judge([S, F, F, F, F, F], fleet=True) is True, (
+        "第 0 行那封矮星系统战报又把「舰队」确认拦掉了 —— 6 趟里 4 趟就是这么废掉的"
+    )
+    assert _judge([S, F, F, F, F, F], fleet=False) is False
+
+    # ⚠️ 但确凿的攻击报告仍旧要拦住：那一屏是**没筛过**的列表。
+    A = pirate_loop.ReportKind.ATTACK
+    assert _judge([S, A, F, A, A, A], fleet=True) is False, "混着攻击报告的屏幕被判成「筛选开着」了"
