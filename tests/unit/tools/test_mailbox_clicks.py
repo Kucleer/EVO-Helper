@@ -856,3 +856,44 @@ def test_the_scan_gives_up_when_the_screen_is_not_a_mail_list() -> None:
 
     assert opened == [], "在不是邮件列表的画面上开了幻影邮件"
     assert scan.aborted is True and scan.cut_short
+
+
+def test_the_check_reads_again_while_the_list_refreshes() -> None:
+    """⚠️⚠️ **点完标签之后要多看几次，不能只看一次就判失败。**
+
+    2026-09-15 02:31 实拍（`dump-mail-sub-tab-战斗-unconfirmed-023122.png`）：
+    点「战斗」之后判据连着读到的还是**舰队类**，于是判定失败、又点了一次
+    （很可能把刚切好的点回去）；而失败时存下来的现场图上，列表第一行赫然是
+    **「攻击报告」**、角标 15 —— **那一下其实成功了，只是列表刷新比判据慢**。
+
+    ⚠️ `#336` 当年「战斗那个按钮不响应」的结论多半也是同一个时序假象，
+    而那个错误结论让「切回战报」整整走错了两天。
+
+    这一条钉住：**一次读不到，要再等再读，不许立刻重点**。
+    """
+    reads: list[int] = []
+    clicks: list[str] = []
+
+    class Driver:
+        def click(self, _x: int, _y: int, *, label: str = "") -> None:
+            clicks.append(label)
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = Driver()  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+
+    # 前 3 次读到的还是旧内容（没刷新），第 4 次才换过来。
+    def _matches(**_kwargs: object) -> bool:
+        reads.append(1)
+        return len(reads) >= 4
+
+    loop._sub_tab_matches = _matches  # type: ignore[assignment]
+
+    assert loop._select_mail_sub_tab(fleet=False) is True, (
+        "列表刷新慢了几拍就判失败了 —— 那正是攻击战报整晚读不到的成因"
+    )
+    assert len(clicks) == 1, f"点了 {len(clicks)} 次；一次没读到就重点，很可能把刚切好的又点回去"
