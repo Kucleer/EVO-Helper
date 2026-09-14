@@ -403,6 +403,28 @@ STARGATE_QUOTA_RECIPES: tuple[tuple[int, int | None], ...] = ((4, 120), (4, None
 #: 只有 `report_layout` 的 ROI 活在裁掉 38 之后的 viewport 空间。
 MAIL_FLEET_SUB_TAB = (1033, 218)
 
+#: 列表空了的时候，游戏在列表正中写的那句话（实拍 2026-09-15 01:04
+#: `dump-mail-detail-unrendered-010442.png`）。
+#:
+#: ⚠️⚠️ **这句话会被当成「第 0 行的主题」读进来**，于是整屏看着像「有几行、但都读不出」。
+#: 2026-09-15 凌晨的代价：读战报那一趟在空列表上一行行开「幻影邮件」，
+#: 每封 ~24 秒、全部以「点开之后没读到「消息」标题」告终，
+#: **整轮卡死 —— 启动 8 分钟里攻击 0 发、回收 0 发、战报 0 份**。
+#:
+#: ⚠️ 只取前六个字做判据：后面那半句 OCR 经常读花（实拍读成「没有符合当前**短选**条件的邮件。」）。
+MAIL_EMPTY_LIST_MARK = "没有符合当前"
+
+
+def mail_list_is_empty(rows: Sequence[Any]) -> bool:
+    """这一屏是不是「没有符合当前筛选条件的邮件」。**判据单独一个函数，好钉也好读。**
+
+    ⚠️ 空列表**不是**「筛选关掉了」的证据，也不是「信箱读完了」的证据 ——
+    它只说明当前筛选档位下没有邮件。把它当成前者，正是 2026-09-15 凌晨
+    整轮卡死的成因：`not on` 在 0 行舰队类、0 行非舰队类时成立。
+    """
+    return any(MAIL_EMPTY_LIST_MARK in (row.subject or "") for row in rows)
+
+
 #: 点完之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
 #:
 #: ⚠️ **1.8 → 4.0（2026-09-13 夜）。** 1.8 秒实测读得到**没重绘完**的列表：
@@ -3401,6 +3423,19 @@ class PirateLoop:
         （本来就不在目标标签上），照常打一行日志只会让日志里全是假警报。
         """
         rows = self._mail_list_rows(evidence_source="sub_tab")
+        # ⚠️⚠️ **空列表什么都确认不了。**
+        #
+        # 「没有符合当前筛选条件的邮件」那一屏读出来是 0 行舰队类、0 行非舰队类，
+        # 而 `good = not on` 在这种读数下**成立** —— 于是代码会报告「筛选关掉了」，
+        # 接着在空列表上一行行开幻影邮件。2026-09-15 凌晨实测：整轮卡死，
+        # 启动 8 分钟里攻击 0 发、回收 0 发、战报 0 份。
+        #
+        # ⚠️ 这一档要**大声**说出来：它和「筛选真的关掉了」在计数上一模一样，
+        # 不说就又是一次「日志上看不出问题」。
+        if mail_list_is_empty(rows):
+            if not quiet:
+                say(f"  二级标签「{name}」：这一屏是「没有符合当前筛选条件的邮件」，什么都确认不了")
+            return False
         kinds = [row.kind for row in rows]
         here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
         # ⚠️⚠️⚠️ **这一对判据是不对称的，而那个不对称是照实测定的。**
@@ -3800,6 +3835,21 @@ class PirateLoop:
                     aborted=True,
                     cut_short="舰队筛选开着又关不掉，这一趟不翻（在筛过的列表上翻等于静默读空）",
                 )
+        # ⚠️⚠️ **空列表就收手，别在上面开幻影邮件。**
+        #
+        # 2026-09-15 凌晨实测：信箱停在一个没有邮件的筛选档位上，那一屏写着
+        # 「没有符合当前筛选条件的邮件」，而扫描器照旧一行行开封 —— 每封 ~24 秒、
+        # 全部以「点开之后没读到「消息」标题」告终，**整轮卡死**。
+        #
+        # ⚠️ 走 `cut_short` + `aborted=True`：这一趟什么都没看过，
+        # 不许被记成「翻完了」（理由整段在那两处提前返回上）。
+        if mail_list_is_empty(self._mail_list_rows(evidence_source="sub_tab")):
+            self._dump_frame("mail-list-empty", PANEL_TITLE_ROI)
+            return MailScan(
+                unread_budget=max_unread_opens,
+                aborted=True,
+                cut_short="这一屏是「没有符合当前筛选条件的邮件」；不在空列表上开信",
+            )
         #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
         #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
         seen: set[str] = set()

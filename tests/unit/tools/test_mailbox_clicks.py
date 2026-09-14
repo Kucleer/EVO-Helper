@@ -387,11 +387,15 @@ def _judge(kinds: list[object], *, fleet: bool) -> bool:
     """拿一屏假的行类型去问判据。"""
 
     class Row:
-        def __init__(self, kind: object) -> None:
-            self.kind = kind
+        def __init__(self, index: int, kind: object) -> None:
+            # ⚠️ `subject` 不能省：`mail_list_is_empty` 要读它（空列表那道闸）。
+            # 真实的 `MailRow` 一定有这一格。
+            self.index, self.kind, self.subject = index, kind, "某封信"
 
     loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
-    loop._mail_list_rows = lambda **_kwargs: [Row(k) for k in kinds]  # type: ignore[assignment]
+    loop._mail_list_rows = lambda **_kwargs: [  # type: ignore[assignment]
+        Row(i, k) for i, k in enumerate(kinds)
+    ]
     return loop._sub_tab_matches(fleet=fleet, name="x", quiet=True)
 
 
@@ -466,7 +470,7 @@ def test_doubt_alone_never_kills_the_round() -> None:
             pass
 
     class Row:
-        kind = pirate_loop.ReportKind.UNKNOWN
+        index, kind, subject = 0, pirate_loop.ReportKind.UNKNOWN, "读不出的一行"
 
     loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
     loop._driver = Driver()  # type: ignore[attr-defined]
@@ -698,3 +702,73 @@ def test_a_stargate_row_no_longer_blocks_the_fleet_tab_check() -> None:
     # ⚠️ 但确凿的攻击报告仍旧要拦住：那一屏是**没筛过**的列表。
     A = pirate_loop.ReportKind.ATTACK
     assert _judge([S, A, F, A, A, A], fleet=True) is False, "混着攻击报告的屏幕被判成「筛选开着」了"
+
+
+def test_an_empty_filter_list_confirms_nothing() -> None:
+    """⚠️⚠️ **「没有符合当前筛选条件的邮件」那一屏，什么都确认不了。**
+
+    2026-09-15 01:04 实拍（`dump-mail-detail-unrendered-010442.png`）：信箱停在一个
+    没有邮件的筛选档位上，那句话被当成「第 0 行的主题」读进来，整屏读成
+    0 行舰队类、0 行非舰队类 —— 而 `good = not on` 在这种读数下**成立**。
+
+    于是代码报告「筛选关掉了」，接着在空列表上一行行开幻影邮件，每封 ~24 秒、
+    全部以「点开之后没读到「消息」标题」告终。**整轮卡死：启动 8 分钟里
+    攻击 0 发、回收 0 发、战报 0 份。**
+    """
+
+    class Row:
+        def __init__(self, subject: str) -> None:
+            self.index, self.kind, self.subject = 0, pirate_loop.ReportKind.UNKNOWN, subject
+
+    # 判据函数本身
+    assert pirate_loop.mail_list_is_empty([Row("没有符合当前筛选条件的邮件。")]) is True
+    # ⚠️ OCR 会把后半句读花（实拍读成「短选」），所以只认前六个字
+    assert pirate_loop.mail_list_is_empty([Row("没有符合当前短选条件的邮件。")]) is True
+    assert pirate_loop.mail_list_is_empty([Row("eS  舰队返回")]) is False
+    assert pirate_loop.mail_list_is_empty([]) is False
+
+    # 切标签那道判据：两个方向都不许在空列表上给出答案
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._mail_list_rows = lambda **_kwargs: [  # type: ignore[assignment]
+        Row("没有符合当前短选条件的邮件。")
+    ]
+    for fleet in (True, False):
+        assert loop._sub_tab_matches(fleet=fleet, name="x", quiet=True) is False, (
+            f"空列表被当成了「{'舰队开着' if fleet else '筛选关掉了'}」的证据"
+        )
+
+
+def test_the_scan_gives_up_on_an_empty_list_instead_of_opening_ghosts() -> None:
+    """⚠️ 看见空列表就收手，**不许在上面开幻影邮件**。
+
+    ⚠️ 而且要走 `aborted=True`：这一趟一封都没看过，不能被记成「翻完了」。
+    """
+    opened: list[int] = []
+
+    class Row:
+        index, kind = 0, pirate_loop.ReportKind.UNKNOWN
+        subject = "没有符合当前短选条件的邮件。"
+        raw_time_text = ""
+        reported_at_utc = None
+        unread = None
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._ensure_geometry = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._enter_mailbox = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
+    loop._fleet_filter_looks_on = lambda: False  # type: ignore[assignment]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._close_mail = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_kwargs: [Row()]  # type: ignore[assignment]
+    loop._open_mail_row = lambda r, _v: opened.append(r.index) or False  # type: ignore[attr-defined, assignment]
+
+    scan = loop._scan_mail_rows(
+        wanted=pirate_loop.ReportKind.ATTACK,
+        label="攻击战报",
+        visit=lambda _r, _p: False,
+    )
+
+    assert opened == [], "在空列表上开了幻影邮件 —— 每封 ~24 秒，整轮会卡死"
+    assert scan.aborted is True, "空列表那一趟没标 aborted，会被记成「翻完了」"
+    assert scan.cut_short, "放弃了却没说理由"
