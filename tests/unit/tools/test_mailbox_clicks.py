@@ -368,7 +368,14 @@ def test_the_judgement_behaves_right_on_the_screens_that_actually_happened() -> 
     源码守卫写对了判据行就会绿，而 2026-09-14 那次**判据行本身写得漂亮、
     在生产上却每轮自杀** —— 源码守卫一个字都拦不住（同 `tests-can-guard-a-bug`）。
 
-    下面每一屏都是**真实发生过的**，不是假想：
+    ⚠️ **口径说明**（2026-09-14 复核 Codex 指出，原措辞说得过满）：
+    这里输入的是**构造出来的行类型数组**，不是「截图 → OCR → 判据」的回放。
+    它验的是**判据函数本身**在各种计数组合下的取值；真实屏幕到类型数组那一段
+    （也就是 OCR 那一段）**不在这条用例的覆盖范围内**，那要靠实机。
+
+    ⚠️ **下面的组合不都是现场计数**（2026-09-14 复核第二轮指出）：
+    「全 unknown」「6/6 全中」对应真实观察到的计数；而 3/6 那一组是**构造出来的更严一档**
+    （现场观察到的最低是 4/6），用来确认阈值不会把低读数的开着屏漏掉。
     """
     F = pirate_loop.ReportKind.FLEET_RETURN
     R = pirate_loop.ReportKind.RECYCLE
@@ -389,11 +396,15 @@ def test_the_judgement_behaves_right_on_the_screens_that_actually_happened() -> 
     # 没筛过的列表：混着攻击报告。
     assert _judge([F, U, A, U, R, U], fleet=False) is True
 
-    # ⚠️ 筛选开着、但这一屏只读出 4/6（实测占 10%）——**必须照样认出来**。
-    # 复核时我差点把判据收紧成「整屏全中」，那会漏掉 5/6 与 4/6 两档，
-    # 也就是 54% 的卡住筛选（生产实测 28 次里只有 46% 是 6/6）。
+    # ⚠️ 筛选开着、但这一屏**只读出 3/6**（实测最低见过 4/6，这里取更严的一档）
+    # ——必须照样认出来。复核时我差点把判据收紧成「整屏全中」，
+    # 那会漏掉 5/6 与 4/6 两档，也就是 54% 的卡住筛选
+    # （生产实测 28 次里只有 46% 是 6/6）。
+    #
+    # ⚠️ 这一行原先注释成「4/6」，是数错了（2026-09-14 复核 Codex 指出）：
+    # [F, U, F, U, R, U] 里舰队类是 F、F、R **三个**。
     assert _judge([F, U, F, U, R, U], fleet=True) is True, (
-        "只读出 4/6 的开着屏被漏判了 —— 实测这一档占 10%，5/6 那档占 42%"
+        "只读出 3/6 的开着屏被漏判了 —— 实测 5/6 占 42%、4/6 占 10%"
     )
     assert _judge([F, U, F, U, R, U], fleet=False) is False
 
@@ -431,3 +442,69 @@ def test_doubt_alone_never_kills_the_round() -> None:
         "读不出主题的一屏被判成「筛选开着」—— 那会让前提检查去点标签、然后放弃整趟"
     )
     assert clicks == [], "只是探测一下，不该点任何标签"
+
+
+def _scan_that_gives_up(*, fleet_sub_tab: bool, filter_looks_on: bool):
+    """真跑一趟 `_scan_mail_rows`，让它在切标签那一步放弃，把返回对象交出来。
+
+    ⚠️ **必须真跑，不能扫源码。** 见下面那条用例的说明。
+    """
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._enter_mailbox = lambda: None  # type: ignore[attr-defined, assignment]
+    loop._select_mail_sub_tab = lambda **_kwargs: False  # type: ignore[assignment]
+    loop._fleet_filter_looks_on = lambda: filter_looks_on  # type: ignore[assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    return loop._scan_mail_rows(
+        wanted=pirate_loop.ReportKind.ATTACK,
+        label="攻击战报",
+        visit=lambda _row, _page: True,
+        fleet_sub_tab=fleet_sub_tab,
+    )
+
+
+def test_a_trip_that_scanned_nothing_is_never_recorded_as_swept() -> None:
+    """⚠️⚠️ **切不了二级标签的那一趟必须 `aborted=True`，否则对账时刻照写。**
+
+    2026-09-14 复核（Codex）第一轮指出的 P1：两处提前返回都只给了 `cut_short`，
+    而 `tally.swept = not deadline_hit and not aborted` **不看 `cut_short`** ——
+    于是一趟什么都没扫的行程被记成「翻完了」，`record_daily_reconciliation` 照写，
+    后面的轮次因冷却而跳过。这和 09-13 夜那次事故是**同一个病**：
+    失败的一趟被记成成功的一趟。
+
+    ⚠️⚠️⚠️ **这条用例的第一版是扫源码文本的，而它守不住任何东西**
+    （复核第二轮指出）：两处 `return` 里的**注释**也含 `aborted=True` 这串字，
+    所以把真参数删掉、只留注释，断言照样成立 —— 我当场试过，确实照样绿。
+
+    **源码文本匹配分不清代码和注释**（同 `guards-must-read-the-verdict-not-the-whole-source`，
+    两天内第四次栽在这一类上）。所以现在**真跑那两条路径、断言返回对象的值**。
+    """
+    # ① 回收方向：切不到「舰队」。这一处是 #336 就有的，同样漏过 aborted。
+    recycle = _scan_that_gives_up(fleet_sub_tab=True, filter_looks_on=False)
+    assert recycle.aborted is True, "切不到「舰队」标签却没标 aborted —— 对账时刻会被推进"
+    assert recycle.cut_short, "放弃了却没说理由"
+
+    # ② 战报方向：正面认出筛选开着，但关不掉。
+    report = _scan_that_gives_up(fleet_sub_tab=False, filter_looks_on=True)
+    assert report.aborted is True, "筛选关不掉却没标 aborted —— 对账时刻会被推进"
+    assert report.cut_short, "放弃了却没说理由"
+
+    # ③ ⚠️ 真正要守的是**下游那个结论**：`swept` 必须为 False。
+    #    上面两个断言只管字段，这一条管它被怎么用 —— 判据抄自 `_scan_for_reconcile`。
+    for scan in (recycle, report):
+        swept = not scan.deadline_hit and not scan.aborted
+        assert swept is False, (
+            "这一趟一封都没看过，却会被判成「翻完了」并写进 daily_reconciliations"
+        )
+
+
+def test_giving_up_does_not_look_like_a_normal_empty_trip() -> None:
+    """⚠️ 放弃的那一趟和「信箱里真的没有战报」**必须能分得出来**。
+
+    分不出来正是 09-13 夜烧掉 9 小时的原因。`cut_short` 那句人话是给人看的，
+    `aborted` 那一格是给代码看的 —— 两样都要有。
+    """
+    given_up = _scan_that_gives_up(fleet_sub_tab=False, filter_looks_on=True)
+    normal = pirate_loop.MailScan(unread_budget=0)
+
+    assert (given_up.aborted, bool(given_up.cut_short)) == (True, True)
+    assert (normal.aborted, bool(normal.cut_short)) == (False, False)
