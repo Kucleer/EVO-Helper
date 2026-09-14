@@ -403,6 +403,52 @@ STARGATE_QUOTA_RECIPES: tuple[tuple[int, int | None], ...] = ((4, 120), (4, None
 #: 只有 `report_layout` 的 ROI 活在裁掉 38 之后的 viewport 空间。
 MAIL_FLEET_SUB_TAB = (1033, 218)
 
+#: 列表空了的时候，游戏在列表正中写的那句话（实拍 2026-09-15 01:04
+#: `dump-mail-detail-unrendered-010442.png`）。
+#:
+#: ⚠️⚠️ **这句话会被当成「第 0 行的主题」读进来**，于是整屏看着像「有几行、但都读不出」。
+#: 2026-09-15 凌晨的代价：读战报那一趟在空列表上一行行开「幻影邮件」，
+#: 每封 ~24 秒、全部以「点开之后没读到「消息」标题」告终，
+#: **整轮卡死 —— 启动 8 分钟里攻击 0 发、回收 0 发、战报 0 份**。
+#:
+#: ⚠️ 只取前六个字做判据：后面那半句 OCR 经常读花（实拍读成「没有符合当前**短选**条件的邮件。」）。
+MAIL_EMPTY_LIST_MARK = "没有符合当前"
+
+
+def mail_list_is_empty(rows: Sequence[Any]) -> bool:
+    """这一屏是不是「没有符合当前筛选条件的邮件」。**判据单独一个函数，好钉也好读。**
+
+    ⚠️ 空列表**不是**「筛选关掉了」的证据，也不是「信箱读完了」的证据 ——
+    它只说明当前筛选档位下没有邮件。把它当成前者，正是 2026-09-15 凌晨
+    整轮卡死的成因：`not on` 在 0 行舰队类、0 行非舰队类时成立。
+    """
+    return any(MAIL_EMPTY_LIST_MARK in (row.subject or "") for row in rows)
+
+
+def mail_list_looks_unrendered(rows: Sequence[Any]) -> bool:
+    """这一屏根本不是邮件列表（还在加载、或者停在别的页面上）。
+
+    ⚠️⚠️ **判据是「一行可解析的时刻都没有」，不是「主题读不出」。**
+    这两件事必须分开，因为**主题读不出是常态**：实测列表行主题 OCR 有 87%
+    读不出，而那些行照样是真邮件、照样要开（整段在 `skip_read_unknowns` 上）。
+
+    真邮件行长这样 ——「时间读得出、主题是乱码」：
+
+        第 2 行开封（13/09/2026 21:08:34 'bad  1 are ”公克RED'）
+
+    而不是邮件列表的那一屏长这样 ——「时间也读不出」：
+
+        第 0 行开封（时间读不出 'RATA AMER IB.'）
+        第 4 行开封（时间读不出 '7   |   kucleer@126.com>   he Vo»'）   ← 这是登录页
+        第 5 行开封（时间读不出 '一 aa = 息EV-T GRION 1 / Kucleer'）   ← 这也是
+
+    ⚠️ 2026-09-15 凌晨的代价：重新登录之后 **7 秒**就开工读信，界面还没画出来，
+    于是一行行开「幻影邮件」—— 每封 ~24 秒、全部以「点开之后没读到「消息」标题」
+    告终，**整轮卡死：启动 12 分钟里攻击 0 发、回收 0 发、战报 0 份**。
+    """
+    return bool(rows) and all(getattr(row, "reported_at_utc", None) is None for row in rows)
+
+
 #: 点完之后等多久再认屏。列表是**换掉**不是滚动，比开一封快。
 #:
 #: ⚠️ **1.8 → 4.0（2026-09-13 夜）。** 1.8 秒实测读得到**没重绘完**的列表：
@@ -3401,6 +3447,19 @@ class PirateLoop:
         （本来就不在目标标签上），照常打一行日志只会让日志里全是假警报。
         """
         rows = self._mail_list_rows(evidence_source="sub_tab")
+        # ⚠️⚠️ **空列表什么都确认不了。**
+        #
+        # 「没有符合当前筛选条件的邮件」那一屏读出来是 0 行舰队类、0 行非舰队类，
+        # 而 `good = not on` 在这种读数下**成立** —— 于是代码会报告「筛选关掉了」，
+        # 接着在空列表上一行行开幻影邮件。2026-09-15 凌晨实测：整轮卡死，
+        # 启动 8 分钟里攻击 0 发、回收 0 发、战报 0 份。
+        #
+        # ⚠️ 这一档要**大声**说出来：它和「筛选真的关掉了」在计数上一模一样，
+        # 不说就又是一次「日志上看不出问题」。
+        if mail_list_is_empty(rows):
+            if not quiet:
+                say(f"  二级标签「{name}」：这一屏是「没有符合当前筛选条件的邮件」，什么都确认不了")
+            return False
         kinds = [row.kind for row in rows]
         here = sum(1 for kind in kinds if kind in self.FLEET_TAB_KINDS)
         # ⚠️⚠️⚠️ **这一对判据是不对称的，而那个不对称是照实测定的。**
@@ -3800,6 +3859,14 @@ class PirateLoop:
                     aborted=True,
                     cut_short="舰队筛选开着又关不掉，这一趟不翻（在筛过的列表上翻等于静默读空）",
                 )
+        # ⚠️⚠️ **空列表就收手，别在上面开幻影邮件。**
+        #
+        # 2026-09-15 凌晨实测：信箱停在一个没有邮件的筛选档位上，那一屏写着
+        # 「没有符合当前筛选条件的邮件」，而扫描器照旧一行行开封 —— 每封 ~24 秒、
+        # 全部以「点开之后没读到「消息」标题」告终，**整轮卡死**。
+        #
+        # ⚠️ 走 `cut_short` + `aborted=True`：这一趟什么都没看过，
+        # 不许被记成「翻完了」（理由整段在那两处提前返回上）。
         #: 见过的行身份 = 见过的邮件时间（`MailRow.identity`）。读不出时间的行不进来，
         #: 那一行一律算「没见过」——空时间当身份会让它们互相顶掉，静默少开一封。
         seen: set[str] = set()
@@ -3859,6 +3926,23 @@ class PirateLoop:
                 last_times = None
                 continue
             rows = self._mail_list_rows()
+            # ⚠️⚠️ **这两道闸用循环里已经读到的这一屏，绝不另外取一屏。**
+            #
+            # 2026-09-15 我第一版写在函数开头、额外调了一次 `_mail_list_rows()` ——
+            # 而单元夹具是「一屏一屏 pop」的，那一下**把一屏吃掉了**，当场挂 84 个用例。
+            # ⚠️ 同一个坑 `#339` 的提交信息里我自己写过，这是第二次踩。
+            if mail_list_is_empty(rows):
+                self._dump_frame("mail-list-empty", PANEL_TITLE_ROI)
+                scan.aborted = True
+                scan.cut_short = "这一屏是「没有符合当前筛选条件的邮件」；不在空列表上开信"
+                break
+            # ⚠️ 判据是「一行可解析的时刻都没有」，不是「主题读不出」——
+            # 主题读不出是常态（实测 87%），整段在 `mail_list_looks_unrendered`。
+            if mail_list_looks_unrendered(rows):
+                self._dump_frame("mail-list-unrendered", PANEL_TITLE_ROI)
+                scan.aborted = True
+                scan.cut_short = "这一屏一行可解析的时刻都没有，不像邮件列表；不在上面开信"
+                break
             times = [row.raw_time_text for row in rows]
             # ⚠️ **挑出「没见过的」要排在「记下见过的」之前。** 同一屏上行号不同就是
             # 两封不同的邮件，而同一秒真的会有两封（实拍上 `远征舰队返回` 与
