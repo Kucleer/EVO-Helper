@@ -270,51 +270,63 @@ def test_the_click_label_dodges_the_read_only_gate() -> None:
 # -- 2026-09-14 那次「攻击战报断流 9 小时」教出来的三条 -------------------------
 
 
-def test_both_directions_need_positive_evidence() -> None:
-    """⚠️⚠️ **两个方向都要正面证据，一次都不许只靠「没看见对方」。**
+def test_the_filter_is_only_judged_in_the_direction_that_reads() -> None:
+    """⚠️⚠️⚠️ **只在「筛选开着」这个方向上判，那是唯一拿得到正面证据的方向。**
 
-    2026-09-13 夜我把「关掉筛选」那一侧放松成了「没有舰队类就算切回去了」，
-    理由是攻击报告主题读不准、正面证据拿不到。代价 9 小时后显形：
-    信箱一直停在舰队筛选上，而**读战报那一趟就在只剩舰队类的列表上开工** ——
-    整屏按主题全拒、日志上一切正常，09-13 21h 起攻击战报断流、37 发无战报。
+    我在这个不对称上栽了两次，方向相反，两次都上了生产：
 
-    破绽当时就写在日志里：
+    - 2026-09-13 夜：把「关掉」那一侧放松成「没看见舰队类就算数」——
+      筛选卡在舰队上没人发现，**攻击战报断流 9 小时、37 发无战报**。
+    - 2026-09-14 午：把它改严成「必须正面看见非舰队类」——
+      而非舰队类主题**本来就读不出**，于是永远确认不了、每轮在开工那步自杀，
+      **全线停摆 3.5 小时，一发都派不出去**。
 
-        二级标签在「舰队筛选关」上：这一屏 6 行里舰队类 0 行、攻击报告 0 行，对得上
-
-    「两个都是 0」既可能是没筛过的列表，也可能是半加载、甚至根本不在列表上。
+    实测事实只有一条：**舰队类主题读得准（6/6），非舰队类读不准。**
+    所以「开着」要正面证据，「关掉了」= 认不出开着，不去正面确认。
     """
     source = inspect.getsource(pirate_loop.PirateLoop._sub_tab_matches)
-    # ⚠️ 只看 `good = ` 那一行，**不要扫整段源码**：这次事故的成因就写在上面的
-    # 注释里，而注释里必然带着 `here == 0` 这几个字。按整段扫的话，这条用例会把
-    # 那段说明本身判成违规 —— 红的地方指着注释，错在用例。
-    # （同一个坑今天已经踩到第三次了：#333 的 colspan、#336 的 MAIL_BATTLE_SUB_TAB。）
+    # ⚠️ 只看判据那两行，别扫整段 —— 上面那段注释里必然带着两次事故的反面写法。
+    on_lines = re.findall(r"^\s*on = (.+)$", source, re.M)
     verdicts = re.findall(r"^\s*good = (.+)$", source, re.M)
-    assert len(verdicts) == 1, f"判据不止一行，或者找不到：{verdicts}"
-    verdict = verdicts[0]
+    assert len(on_lines) == 1 and len(verdicts) == 1, f"判据不止一处：{on_lines} / {verdicts}"
 
-    assert "other > 0" in verdict, (
-        f"「关掉筛选」那一侧又变回只靠「没看见舰队类」了（判据：{verdict}）—— "
-        "那正是 2026-09-14 那次攻击战报断流 9 小时的成因"
+    assert on_lines[0] == "here > 0 and other == 0", (
+        f"「筛选开着」的正面判据被改了：{on_lines[0]}。"
+        "⚠️ 这个阈值是照 216 次生产实测定的：开着时舰队类 4~6 行（28 次，一次 0 都没有）、"
+        "关着时 0 行（188 次，100%）。收紧成「整屏全中」会漏掉 54% 的卡住筛选。"
     )
-    assert "here == 0" not in verdict, f"判据里出现了「没有舰队类就算数」这种反向断言：{verdict}"
+    assert verdicts[0] == "on if fleet else not on", (
+        f"两个方向不再共用同一个正面探测了：{verdicts[0]} —— "
+        "「关掉了」一旦去正面确认，就会因为非舰队类读不出而永远判不成立"
+    )
 
 
-def test_the_report_trip_guarantees_its_own_precondition() -> None:
-    """⚠️⚠️ **读战报那一趟自己保证「舰队筛选是关的」，不指望回收那一趟收拾干净。**
+def test_the_unfiltered_trips_guarantee_their_own_precondition() -> None:
+    """⚠️⚠️ **要没筛过列表的那几趟，自己保证筛选是关的。**
 
-    那条「读完要切回去」的还原义务原先只写在回收那一侧，于是它一旦失手，
-    代价全落在战报这一侧 —— 而这一侧毫不知情，照常开工、什么都没找到，
-    日志上和「信箱里真的没有战报」一模一样。**9 小时没人发现。**
+    「读完切回去」的还原义务原先只写在回收那一侧；它一失手，代价全落在读战报
+    那一侧，而那一侧毫不知情 —— 2026-09-13 夜就是这样烧了 9 小时、37 发无战报。
+
+    这一条同时钉住**位置**和**处置**，两样都是 2026-09-14 当天拿生产换来的：
+
+    - 位置必须在 `_enter_mailbox()` **之后** —— 第一版写在 `_scan_for_reconcile`
+      开头，那时信箱还没开，探测读的是恒星系视图、一行都读不到，
+      **每轮白花一次 OCR 而一点保护都没有**。
+    - 处置只许走 `cut_short`，**不许抛** —— 同一天写过「关不掉就抛异常」，
+      而「关不掉」在主题读不出时必然成立，于是每轮在开工那步自杀，
+      **攻击、扫描全停 3.5 小时，一发都没派出去**。
     """
-    source = inspect.getsource(pirate_loop.PirateLoop._scan_for_reconcile)
+    source = inspect.getsource(pirate_loop.PirateLoop._scan_mail_rows)
 
-    assert "_select_mail_sub_tab(fleet=False)" in source, (
-        "读战报那一趟没有自己关掉舰队筛选；它不能指望别人收拾干净"
+    assert "not fleet_sub_tab and self._fleet_filter_looks_on()" in source, (
+        "收手的条件不再以「正面认出筛选开着」打头 —— 只要主题读不出，它就会每趟都收手"
     )
-    assert "raise RuntimeError" in source, (
-        "关不掉筛选时没有放弃这一趟 —— 在筛过的列表上翻等于静默读空，而那和真的没有战报分不出来"
+    assert source.index("self._enter_mailbox()") < source.index("_fleet_filter_looks_on"), (
+        "那道探测排在开信箱之前 —— 它读不到列表，等于没装"
     )
+    tail = source[source.index("_fleet_filter_looks_on") :][:700]
+    assert "cut_short=" in tail, "关不掉筛选时没有走 cut_short"
+    assert "raise" not in tail, "关不掉筛选时又去抛异常了 —— 那正是停摆 3.5 小时的成因"
 
 
 def test_only_the_recycle_trip_may_be_strict_about_subjects() -> None:
@@ -333,3 +345,89 @@ def test_only_the_recycle_trip_may_be_strict_about_subjects() -> None:
         assert "strict_subject" not in inspect.getsource(method), (
             f"{name} 开了严格主题档 —— 那一侧漏开一封就是永久丢一份报告"
         )
+
+
+# -- 判据的**行为**，不是它的源码长什么样 ---------------------------------------
+
+
+def _judge(kinds: list[object], *, fleet: bool) -> bool:
+    """拿一屏假的行类型去问判据。"""
+
+    class Row:
+        def __init__(self, kind: object) -> None:
+            self.kind = kind
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._mail_list_rows = lambda **_kwargs: [Row(k) for k in kinds]  # type: ignore[assignment]
+    return loop._sub_tab_matches(fleet=fleet, name="x", quiet=True)
+
+
+def test_the_judgement_behaves_right_on_the_screens_that_actually_happened() -> None:
+    """⚠️⚠️ **这一条验的是行为，上面那两条只验源码文本。**
+
+    源码守卫写对了判据行就会绿，而 2026-09-14 那次**判据行本身写得漂亮、
+    在生产上却每轮自杀** —— 源码守卫一个字都拦不住（同 `tests-can-guard-a-bug`）。
+
+    下面每一屏都是**真实发生过的**，不是假想：
+    """
+    F = pirate_loop.ReportKind.FLEET_RETURN
+    R = pirate_loop.ReportKind.RECYCLE
+    A = pirate_loop.ReportKind.ATTACK
+    U = pirate_loop.ReportKind.UNKNOWN
+
+    # 2026-09-14 生产现场：读不出主题的一整屏。
+    # ⚠️ 这一屏必须放行 —— 它正是让每一轮自杀、全线停摆 3.5 小时的那一屏。
+    assert _judge([U] * 6, fleet=False) is True, "读不出主题的一屏必须当作「筛选没开着」放行"
+    assert _judge([U] * 6, fleet=True) is False, "读不出主题时不许说「筛选开着」"
+
+    # 2026-09-13 夜实测：筛选真开着时 6/6 全中。
+    assert _judge([F, F, R, F, R, F], fleet=True) is True, "筛选真开着必须认得出来"
+    assert _judge([F, F, R, F, R, F], fleet=False) is False, (
+        "筛选真开着时不许说「关掉了」—— 那正是 9 小时静默饿死的成因"
+    )
+
+    # 没筛过的列表：混着攻击报告。
+    assert _judge([F, U, A, U, R, U], fleet=False) is True
+
+    # ⚠️ 筛选开着、但这一屏只读出 4/6（实测占 10%）——**必须照样认出来**。
+    # 复核时我差点把判据收紧成「整屏全中」，那会漏掉 5/6 与 4/6 两档，
+    # 也就是 54% 的卡住筛选（生产实测 28 次里只有 46% 是 6/6）。
+    assert _judge([F, U, F, U, R, U], fleet=True) is True, (
+        "只读出 4/6 的开着屏被漏判了 —— 实测这一档占 10%，5/6 那档占 42%"
+    )
+    assert _judge([F, U, F, U, R, U], fleet=False) is False
+
+    # 混进一封确凿的非舰队类 ⇒ 不是筛过的列表。
+    assert _judge([F, U, A, U, R, U], fleet=True) is False
+
+    # 空屏（列表还没画出来）：两个方向都不许说「开着」。
+    assert _judge([], fleet=True) is False, "一行都没读到时不许说「筛选开着」"
+
+
+def test_doubt_alone_never_kills_the_round() -> None:
+    """⚠️⚠️ **「查不出来」不许判死这一轮** —— 2026-09-14 停摆 3.5 小时的那一条。
+
+    这里直接跑那道前提检查：给它生产当时那一屏（全读不出），它必须**什么都不做**，
+    既不点标签也不抛异常。
+    """
+    clicks: list[str] = []
+
+    class Driver:
+        def click(self, _x: int, _y: int, *, label: str = "") -> None:
+            clicks.append(label)
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    class Row:
+        kind = pirate_loop.ReportKind.UNKNOWN
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = Driver()  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._mail_list_rows = lambda **_kwargs: [Row() for _ in range(6)]  # type: ignore[assignment]
+
+    assert loop._fleet_filter_looks_on() is False, (
+        "读不出主题的一屏被判成「筛选开着」—— 那会让前提检查去点标签、然后放弃整趟"
+    )
+    assert clicks == [], "只是探测一下，不该点任何标签"
