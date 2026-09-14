@@ -270,34 +270,51 @@ def test_the_click_label_dodges_the_read_only_gate() -> None:
 # -- 2026-09-14 那次「攻击战报断流 9 小时」教出来的三条 -------------------------
 
 
-def test_both_directions_need_positive_evidence() -> None:
-    """⚠️⚠️ **两个方向都要正面证据，一次都不许只靠「没看见对方」。**
+def test_the_filter_is_only_judged_in_the_direction_that_reads() -> None:
+    """⚠️⚠️⚠️ **只在「筛选开着」这个方向上判，那是唯一拿得到正面证据的方向。**
 
-    2026-09-13 夜我把「关掉筛选」那一侧放松成了「没有舰队类就算切回去了」，
-    理由是攻击报告主题读不准、正面证据拿不到。代价 9 小时后显形：
-    信箱一直停在舰队筛选上，而**读战报那一趟就在只剩舰队类的列表上开工** ——
-    整屏按主题全拒、日志上一切正常，09-13 21h 起攻击战报断流、37 发无战报。
+    我在这个不对称上栽了两次，方向相反，两次都上了生产：
 
-    破绽当时就写在日志里：
+    - 2026-09-13 夜：把「关掉」那一侧放松成「没看见舰队类就算数」——
+      筛选卡在舰队上没人发现，**攻击战报断流 9 小时、37 发无战报**。
+    - 2026-09-14 午：把它改严成「必须正面看见非舰队类」——
+      而非舰队类主题**本来就读不出**，于是永远确认不了、每轮在开工那步自杀，
+      **全线停摆 3.5 小时，一发都派不出去**。
 
-        二级标签在「舰队筛选关」上：这一屏 6 行里舰队类 0 行、攻击报告 0 行，对得上
-
-    「两个都是 0」既可能是没筛过的列表，也可能是半加载、甚至根本不在列表上。
+    实测事实只有一条：**舰队类主题读得准（6/6），非舰队类读不准。**
+    所以「开着」要正面证据，「关掉了」= 认不出开着，不去正面确认。
     """
     source = inspect.getsource(pirate_loop.PirateLoop._sub_tab_matches)
-    # ⚠️ 只看 `good = ` 那一行，**不要扫整段源码**：这次事故的成因就写在上面的
-    # 注释里，而注释里必然带着 `here == 0` 这几个字。按整段扫的话，这条用例会把
-    # 那段说明本身判成违规 —— 红的地方指着注释，错在用例。
-    # （同一个坑今天已经踩到第三次了：#333 的 colspan、#336 的 MAIL_BATTLE_SUB_TAB。）
+    # ⚠️ 只看判据那两行，别扫整段 —— 上面那段注释里必然带着两次事故的反面写法。
+    on_lines = re.findall(r"^\s*on = (.+)$", source, re.M)
     verdicts = re.findall(r"^\s*good = (.+)$", source, re.M)
-    assert len(verdicts) == 1, f"判据不止一行，或者找不到：{verdicts}"
-    verdict = verdicts[0]
+    assert len(on_lines) == 1 and len(verdicts) == 1, f"判据不止一处：{on_lines} / {verdicts}"
 
-    assert "other > 0" in verdict, (
-        f"「关掉筛选」那一侧又变回只靠「没看见舰队类」了（判据：{verdict}）—— "
-        "那正是 2026-09-14 那次攻击战报断流 9 小时的成因"
+    assert on_lines[0] == "bool(kinds) and here == len(kinds)", (
+        f"「筛选开着」的正面判据被改了：{on_lines[0]} —— 必须是**整屏全中**。"
+        "「有舰队类且没有非舰队类」在没筛过的列表上也会成立（舰队类占信箱三分之二、"
+        "攻击报告主题读不出是常态），那会让它反手把筛选**打开**。"
     )
-    assert "here == 0" not in verdict, f"判据里出现了「没有舰队类就算数」这种反向断言：{verdict}"
+    assert verdicts[0] == "on if fleet else not on", (
+        f"两个方向不再共用同一个正面探测了：{verdicts[0]} —— "
+        "「关掉了」一旦去正面确认，就会因为非舰队类读不出而永远判不成立"
+    )
+
+
+def test_giving_up_requires_positive_evidence_not_mere_doubt() -> None:
+    """⚠️⚠️ **「查不出来」不许判死这一轮。**
+
+    2026-09-14 上午的事故：开工前的前提检查写成「关不掉就抛」，而「关不掉」
+    在读不出主题时**必然成立** —— 每一轮都在开工这步自杀，攻击、扫描、
+    全部任务一起停摆 3.5 小时。
+
+    放弃这一趟的条件必须是**正面认出筛选还开着、而且关不掉**。
+    """
+    source = inspect.getsource(pirate_loop.PirateLoop._scan_for_reconcile)
+
+    assert "_fleet_filter_looks_on() and not self._select_mail_sub_tab" in source, (
+        "放弃这一趟的条件不再以「正面认出筛选开着」打头 —— 只要主题读不出，它就会每一轮都放弃"
+    )
 
 
 def test_the_report_trip_guarantees_its_own_precondition() -> None:
@@ -312,6 +329,8 @@ def test_the_report_trip_guarantees_its_own_precondition() -> None:
     assert "_select_mail_sub_tab(fleet=False)" in source, (
         "读战报那一趟没有自己关掉舰队筛选；它不能指望别人收拾干净"
     )
+    # ⚠️ 但那一下必须**挂在正面探测后面**，见
+    # `test_giving_up_requires_positive_evidence_not_mere_doubt`。
     assert "raise RuntimeError" in source, (
         "关不掉筛选时没有放弃这一趟 —— 在筛过的列表上翻等于静默读空，而那和真的没有战报分不出来"
     )

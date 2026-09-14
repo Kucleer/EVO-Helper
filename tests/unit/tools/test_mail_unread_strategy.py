@@ -125,8 +125,13 @@ def _loop(pages: list[list[MailRow]], *, in_library: bool = False) -> tuple[Any,
     loop._mail_list_rows = lambda: screens.pop(0) if screens else []
     # ⚠️ 二级标签那道前提检查在这里桩掉：它会去读一屏列表，而上面那个夹具是
     # 「一屏一屏 pop」的 —— 让它真跑会**吃掉一屏**，把用例本意改掉。
-    # 那道检查自己有守卫用例（`test_the_report_trip_guarantees_its_own_precondition`），
+    # 那道检查自己有守卫用例（`test_giving_up_requires_positive_evidence_not_mere_doubt`），
     # 真正的行为验收在实机。
+    #
+    # ⚠️⚠️ 桩的是 `_fleet_filter_looks_on`（**唯一入口**），桩成「筛选没开着」——
+    # 那样前提检查一步都不走、一屏都不吃。只桩 `_select_mail_sub_tab` 不够：
+    # 探测那一下自己就会去读一屏（2026-09-14 实测 39 个用例挂在这上面）。
+    loop._fleet_filter_looks_on = lambda: False  # type: ignore[assignment]
     loop._select_mail_sub_tab = lambda **_kwargs: True  # type: ignore[assignment]
 
     def _open(row: MailRow, visit: Any) -> bool:
