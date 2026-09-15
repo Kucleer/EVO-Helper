@@ -3525,7 +3525,9 @@ class PirateLoop:
         对它们必须走回旧那条路，否则一改就是整批用例失去意义（不是变红，是变成
         「测了个不存在的东西」，更难发现）。
         """
-        capture = getattr(self._driver, "capture", None)
+        # ⚠️ 连驱动都可能没有（有些用例直接 `__new__` 一个 loop 来验扫描逻辑）。
+        # 这一层探测是**附加能力**，缺什么都只能回退，绝不能把调用方拖崩。
+        capture = getattr(getattr(self, "_driver", None), "capture", None)
         if not callable(capture):
             return None
         try:
@@ -3548,7 +3550,15 @@ class PirateLoop:
         on = self._read_mail_filters()
         if on is None:
             return self._select_mail_sub_tab_by_list(fleet=fleet)
-        for attempt in range(MAIL_SUB_TAB_TRIES):
+        # ⚠️⚠️ **多转一圈，让最后一次点完的读数也被判一次。**
+        #
+        # 原先成功判断只在循环开头，于是**最后一轮点成功了照样返回失败** ——
+        # 点对了、状态也对了，却去存现场图、报「切不到」，整趟作废。
+        # （2026-09-15 Codex 复核 P1-2 指出；当时新增的用例点一下就成，
+        # 覆盖不到「前几轮没生效、最后一轮才成」这一档。）
+        #
+        # 最后那一圈**只判不点**：预算是「点几次」，不是「看几次」。
+        for attempt in range(MAIL_SUB_TAB_TRIES + 1):
             # ⚠️ 侦察与系统是用户自己配的档位，**一下都不许点**（整段在
             # `MAIL_SUB_TAB_CLICKABLE` 上）。它们亮着就只能收手，不能顺手关掉。
             stuck = on - set(MAIL_SUB_TAB_CLICKABLE) - set(MAIL_SUB_TAB_IGNORED)
@@ -3564,6 +3574,8 @@ class PirateLoop:
             if mine == {want}:
                 say(f"  二级标签「{want}」亮着，其余该关的都关着，到位了")
                 return True
+            if attempt == MAIL_SUB_TAB_TRIES:
+                break  # 点击预算用完；上面那一眼已经判过，这里只负责收尾
             wrong = sorted(mine - {want})
             missing = [] if want in mine else [want]
             say(
@@ -3727,6 +3739,22 @@ class PirateLoop:
         if on is not None:
             return "舰队" in on
         return self._sub_tab_matches(fleet=True, name="舰队", quiet=True)
+
+    def _mail_filters_need_fixing(self, *, fleet: bool) -> bool:
+        """第二排现在是不是**不等于**这一趟要的样子。读不出时退回旧问法。
+
+        ⚠️⚠️ **不能只问「舰队亮不亮」。** 原先战报那一侧写的是
+        `if not fleet_sub_tab and self._fleet_filter_looks_on():` ——
+        于是 `{战斗,侦察}`、`{侦察}`、**空集合**这几档都不会去修，
+        而空集合那一屏是「没有符合当前筛选条件的邮件」，读战报照样读不到东西。
+        （2026-09-15 Codex 复核 P1-1 指出：颜色判据接入不完整，不是阈值问题。）
+        """
+        want = "舰队" if fleet else "战斗"
+        on = self._read_mail_filters()
+        if on is None:
+            # 读不出就维持旧问法：只有正面认出舰队开着才去动它。
+            return True if fleet else self._fleet_filter_looks_on()
+        return (on - set(MAIL_SUB_TAB_IGNORED)) != {want}
 
     def _sub_tab_matches(self, *, fleet: bool, name: str, quiet: bool) -> bool:
         """当前这一屏的**内容**是不是目标标签的。判据与措辞只有这一份。
@@ -4149,7 +4177,10 @@ class PirateLoop:
         # 攻击、扫描全停，**57 分钟里 216 轮全判失败**。所以：
         # 只有**正面认出筛选还开着、而且关不掉**才收手，走这里现成的 `cut_short`
         # （它会打一行「这一趟没走完：…」），**不抛**。
-        if not fleet_sub_tab and self._fleet_filter_looks_on():
+        # ⚠️ 判据是「现在**不等于**战报那一趟要的样子」，不是「舰队亮着」——
+        # 后者漏掉 `{战斗,侦察}` / `{侦察}` / 空集合三档（整段在
+        # `_mail_filters_need_fixing` 上）。
+        if not fleet_sub_tab and self._mail_filters_need_fixing(fleet=False):
             if not self._select_mail_sub_tab(fleet=False):
                 self._dump_frame("mail-fleet-filter-stuck", PANEL_TITLE_ROI)
                 # ⚠️ **待验证**（2026-09-14 复核指出，尚未处理）：这一条和上面那条
