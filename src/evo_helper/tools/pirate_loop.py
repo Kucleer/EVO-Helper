@@ -429,7 +429,87 @@ MAIL_BATTLE_SUB_TAB = (772, 218)
 #: **整轮卡死 —— 启动 8 分钟里攻击 0 发、回收 0 发、战报 0 份**。
 #:
 #: ⚠️ 只取前六个字做判据：后面那半句 OCR 经常读花（实拍读成「没有符合当前**短选**条件的邮件。」）。
+#: 「报告」底下第二排四个筛选的**采样框**（client 坐标，1920×917）。
+#: 取按钮左侧一小块纯底色，躲开图标与文字。
+#:
+#: ⚠️⚠️⚠️ **这一排是「多选」的，而选中态直接写在按钮底色上。**
+#: 2026-09-15 把全部 65 张失败现场图量了一遍（每张三块、共 195 个读数）：
+#:
+#:     未选中 R = 3 – 30        选中 R = 59 – 190        中间 30→59 是空档
+#:
+#: 四种状态与列表内容**全部对得上**：
+#:
+#:     一个都不选   ⇒ 「没有符合当前筛选条件的邮件。」
+#:     只选战斗     ⇒ 全是攻击报告
+#:     战斗+舰队    ⇒ 两类交错混排   ← 失败现场里最多的一档（23/65）
+#:     战斗+侦察    ⇒ 也能同时亮
+#:
+#: ⚠️ 这条把 09-13 以来所有「用列表内容反推筛选状态」的判据都废掉了：
+#: 列表内容**做不到**这件事（主题 87% 读不出，混排屏与半加载屏读数一模一样），
+#: 而按钮本身一直明明白白写着答案。整段经过在 `mail_filters_that_are_on` 上。
+MAIL_SUB_TAB_SAMPLES = {
+    "战斗": (728, 206, 750, 228),
+    "侦察": (855, 206, 877, 228),
+    "舰队": (980, 206, 1002, 228),
+    "系统": (1105, 206, 1127, 228),
+}
+
+#: 选中/未选中的分界。取在实测空档（30→59）正中偏上，两侧各有 15 以上余量。
+MAIL_SUB_TAB_LIT_R = 45
+
+#: 这条路径上**允许点**的两个筛选。侦察与系统是用户自己配的，一律不碰
+#: （用户口径 2026-08-11：「你只能切换到报告，其他的筛选不要动。」；
+#: 2026-09-12 放开的例外只到「舰队」为止）。
+MAIL_SUB_TAB_CLICKABLE = ("战斗", "舰队")
+
+#: 亮着也**不当回事**的那一档。
+#:
+#: ⚠️⚠️ **「系统」几乎一直是亮的**（实拍 42 张里绝大多数都亮），而我们**不许点它**。
+#: 把它算进「必须关掉」里，等于每一趟都收手 —— 那会把回收读信整条掐死，
+#: 比原来的 bug 还狠。差一点就这么写出去了。
+#:
+#: 忽略它是安全的：那一档里**根本没有信**（实拍那一帧只选中系统时，
+#: 列表正中就是「没有符合当前筛选条件的邮件。」，而同屏角标写着
+#: 个人 2 · 战斗 12 · 舰队 99+、**系统一个角标都没有**）。
+#: 所以它开着也不会把别的信混进列表来。
+#:
+#: ⚠️ 「侦察」不在这一档：它有信（角标 99+），混进来就会污染这一趟读的东西，
+#: 而我们同样不许点它 —— 所以它亮着只能收手，并把话说清楚让人去手动关。
+MAIL_SUB_TAB_IGNORED = ("系统",)
+
+#: 可点的那两个筛选的点击坐标，按名字取。
+MAIL_SUB_TAB_COORDS = {"战斗": MAIL_BATTLE_SUB_TAB, "舰队": MAIL_FLEET_SUB_TAB}
+
 MAIL_EMPTY_LIST_MARK = "没有符合当前"
+
+
+def mail_filters_that_are_on(image: Any) -> frozenset[str]:
+    """这一屏第二排**哪几个筛选亮着**。读按钮底色，不看列表内容。
+
+    ⚠️⚠️ **这是这条链路上唯一可靠的筛选状态来源。**
+    2026-09-13 起我连着三次拿「列表里有几行舰队类」去反推筛选状态，三次都栽：
+
+        09-13 夜  「没看见舰队类就算关掉」 → 筛选卡在舰队上没人发现，攻击战报断流 9 小时
+        09-14 午  「必须看见非舰队类」     → 非舰队类主题本来就读不出，每轮自杀、停摆 57 分钟
+        09-15 全天「两种都有 = 还在重绘」   → 那其实是**战斗+舰队都选中**的稳定画面，
+                                          于是「只等不点」干等到死，回收趟 41% 白跑
+
+    三次的共同根因是同一个：**列表内容反推不出筛选状态**。
+    主题 OCR 87% 读不出，而「混排」「半加载」「刚好连着几封同类」在读数上一模一样。
+
+    而按钮底色分得干干净净（65 张现场图、195 个读数）：未选中 3–30、选中 59–190。
+    """
+    box = image.convert("RGB") if hasattr(image, "convert") else image
+    on = []
+    for name, sample in MAIL_SUB_TAB_SAMPLES.items():
+        patch = box.crop(sample)
+        pixels = list(patch.getdata())
+        if not pixels:
+            continue
+        red = sum(pixel[0] for pixel in pixels) / len(pixels)
+        if red >= MAIL_SUB_TAB_LIT_R:
+            on.append(name)
+    return frozenset(on)
 
 
 def mail_list_is_empty(rows: Sequence[Any]) -> bool:
@@ -3438,7 +3518,72 @@ class PirateLoop:
     #: 那种情况下要回到「老行为」，不能凭一个陈旧的 True 无限等下去。
     _sub_tab_mid_repaint: bool = False
 
+    def _read_mail_filters(self) -> frozenset[str] | None:
+        """第二排哪几个筛选亮着。**读不到截图时返回 None**，由调用方回退到旧判据。
+
+        ⚠️ 单元测试的桩驱动大多只有 `click`/`wait`，没有 `capture` ——
+        对它们必须走回旧那条路，否则一改就是整批用例失去意义（不是变红，是变成
+        「测了个不存在的东西」，更难发现）。
+        """
+        capture = getattr(self._driver, "capture", None)
+        if not callable(capture):
+            return None
+        try:
+            return mail_filters_that_are_on(capture())
+        except Exception as error:  # noqa: BLE001
+            say(f"  读不出二级标签的选中态（{error}）；回到按列表内容判的老路")
+            return None
+
     def _select_mail_sub_tab(self, *, fleet: bool) -> bool:
+        """把第二排调成「只选目标那一个」。调成了返回 True。
+
+        ⚠️⚠️ **这一排是多选的**，所以不能「盲点一下目标」——
+        战斗开着的时候点舰队，得到的是**两个都开**（混排列表），
+        再点一下又把舰队关掉，于是在两种错的状态之间来回翻，永远到不了目标。
+        2026-09-15 实测这一档占了全部失败现场的 23/65，回收趟 41% 白跑。
+
+        正确的做法是**按差异开关**：该关的关掉，该开的打开，每一下都有明确目的。
+        """
+        want = "舰队" if fleet else "战斗"
+        on = self._read_mail_filters()
+        if on is None:
+            return self._select_mail_sub_tab_by_list(fleet=fleet)
+        for attempt in range(MAIL_SUB_TAB_TRIES):
+            # ⚠️ 侦察与系统是用户自己配的档位，**一下都不许点**（整段在
+            # `MAIL_SUB_TAB_CLICKABLE` 上）。它们亮着就只能收手，不能顺手关掉。
+            stuck = on - set(MAIL_SUB_TAB_CLICKABLE) - set(MAIL_SUB_TAB_IGNORED)
+            if stuck:
+                say(
+                    f"  二级标签上亮着「{'、'.join(sorted(stuck))}」，那几个不许碰"
+                    f"（要人工去关）；这一趟收手"
+                )
+                self._dump_frame(f"mail-sub-tab-{want}-foreign-filter", PANEL_TITLE_ROI)
+                return False
+            # ⚠️ 判「到位」只看**该管的那几个**：系统忽略（见 `MAIL_SUB_TAB_IGNORED`）。
+            mine = on - set(MAIL_SUB_TAB_IGNORED)
+            if mine == {want}:
+                say(f"  二级标签「{want}」亮着，其余该关的都关着，到位了")
+                return True
+            wrong = sorted(mine - {want})
+            missing = [] if want in mine else [want]
+            say(
+                f"  二级标签现在亮着 {sorted(on) or ['（一个都没有）']}，要的是只剩「{want}」；"
+                f"关掉 {wrong or ['—']}、打开 {missing or ['—']}"
+            )
+            # ⚠️ **先关后开。** 反过来会短暂出现「两个都开」，而那一屏正是
+            # 列表判据分不出的那一档；先关掉也让「一个都不选」的空列表只是一闪而过。
+            for name in wrong + missing:
+                self._driver.click(*MAIL_SUB_TAB_COORDS[name], label=f"二级标签「{name}」")
+                self._driver.wait(MAIL_SUB_TAB_WAIT_S)
+            fresh = self._read_mail_filters()
+            if fresh is None:
+                return self._select_mail_sub_tab_by_list(fleet=fleet)
+            on = fresh
+        say(f"  二级标签点了 {MAIL_SUB_TAB_TRIES} 轮仍然不是只剩「{want}」（现在 {sorted(on)}）")
+        self._dump_frame(f"mail-sub-tab-{want}-unconfirmed", PANEL_TITLE_ROI)
+        return False
+
+    def _select_mail_sub_tab_by_list(self, *, fleet: bool) -> bool:
         """切「报告」底下的二级标签。切成了返回 True。
 
         ## ⚠️⚠️ 判据是**列表内容**，不是标签上的字
@@ -3576,6 +3721,11 @@ class PirateLoop:
         非舰队类读不准。所有「筛选在哪一档」的判断都要从这一个方向问，
         整段理由在 `_sub_tab_matches`（那里记着我在这上面栽的两次，方向相反）。
         """
+        # ⚠️ 先问按钮。读得到就以它为准 —— 列表内容反推不出筛选状态
+        # （三次事故的共同根因，整段在 `mail_filters_that_are_on` 上）。
+        on = self._read_mail_filters()
+        if on is not None:
+            return "舰队" in on
         return self._sub_tab_matches(fleet=True, name="舰队", quiet=True)
 
     def _sub_tab_matches(self, *, fleet: bool, name: str, quiet: bool) -> bool:
