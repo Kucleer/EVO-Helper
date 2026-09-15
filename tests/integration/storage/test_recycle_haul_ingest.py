@@ -29,7 +29,10 @@ from evo_helper.domain.records import (
     FleetPresetRef,
 )
 from evo_helper.storage import models as orm
-from evo_helper.storage.repository import SqlAlchemyRepository
+from evo_helper.storage.repository import (
+    CONFIDENCE_NEAREST_ARRIVAL,
+    SqlAlchemyRepository,
+)
 from evo_helper.vision.recycle_mail_screen import RecycleMailReading
 
 ORIGIN = Coordinate(1, 55, 6)
@@ -173,15 +176,20 @@ class TestClaimingTheDispatch:
 
 
 class TestRefusingToGuess:
-    def test_two_recycles_arriving_together_are_both_left_alone(
+    def test_two_recycles_that_really_cannot_be_told_apart_are_both_left_alone(
         self,
         repository: SqlAlchemyRepository,
         session_factory: sessionmaker[Session],
         run_id: object,
     ) -> None:
-        """⚠️ 生产实测 9.5% 的相邻回收预计抵达落在 60 秒以内（最小 0 秒）。
+        """⚠️ 生产实测 9.5% 的相邻回收预计抵达落在 60 秒以内（**最小 0 秒**）。
 
+        两发都贴着邮件时刻时，时刻这一条线索就用尽了 ——
         认错的代价是一整趟资源记到别人头上；认不上只是这一封下一趟再读。
+
+        ⚠️ 这一条原先用的是「0 秒 + 30 秒」，那一档现在**会**认领
+        （见下面那条）：实测里真正那一发差 1–3 秒、次近的差 10–253 秒，
+        30 秒的间隔足够分开。所以这里改成真正分不出的那种：0 秒 + 4 秒。
         """
         _dispatch(repository, session_factory, run_id, target=TARGET, expected_at=ARRIVED)
         _dispatch(
@@ -189,7 +197,107 @@ class TestRefusingToGuess:
             session_factory,
             run_id,
             target=Coordinate(1, 27, 20),
-            expected_at=ARRIVED + timedelta(seconds=30),
+            expected_at=ARRIVED + timedelta(seconds=4),
+        )
+
+        claimed = repository.append_recycle_report(_reading(), report_id=uuid4())
+
+        assert claimed is None
+        assert _reports(session_factory) == []
+
+    def test_the_nearest_arrival_claims_it_when_it_is_clearly_the_nearest(
+        self,
+        repository: SqlAlchemyRepository,
+        session_factory: sessionmaker[Session],
+        run_id: object,
+    ) -> None:
+        """⚠️⚠️ **窗口里有两发时，时刻其实分得清清楚楚 —— 别整封丢掉。**
+
+        2026-09-15 实测，这是回收入库的**第一大堵点**：一夜「读到了实收却认不出
+        是哪一发」**60 次**，同期真正入库只有 **30** 份 —— 三格与船数全读出来了、
+        也过了容量闸，卡的只是归属。
+
+        25 封歧义样本的分布：**最近那一发差 1–3 秒，次近的差 10–253 秒**，
+        中间是一道空档。这里照着实测那一对摆：+2 秒 与 +58 秒。
+        """
+        mine = _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=TARGET,
+            expected_at=ARRIVED + timedelta(seconds=2),
+        )
+        _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=Coordinate(1, 27, 20),
+            expected_at=ARRIVED + timedelta(seconds=58),
+        )
+
+        claimed = repository.append_recycle_report(_reading(), report_id=uuid4())
+
+        assert claimed == mine.dispatch_id, "最近那一发明明就差 2 秒，却整封丢掉了"
+        (report,) = _reports(session_factory)
+        assert report.dispatch_id == mine.dispatch_id
+        # ⚠️ 置信度要如实记成「靠最近定的」那一档，不能冒充窗口唯一那档。
+        assert float(report.match_confidence) == CONFIDENCE_NEAREST_ARRIVAL
+
+    def test_a_nearest_that_is_not_clearly_nearest_still_claims_nothing(
+        self,
+        repository: SqlAlchemyRepository,
+        session_factory: sessionmaker[Session],
+        run_id: object,
+    ) -> None:
+        """⚠️ 「最近」不够，还要**明显最近**。
+
+        领先不足 `RECYCLE_NEAREST_MARGIN` 就说明这两发挨得太紧，时刻分不动它们。
+        实测 25 封歧义样本里两者最小间隔是 8 秒，门限 7 秒压在它下面。
+        """
+        _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=TARGET,
+            expected_at=ARRIVED + timedelta(seconds=2),
+        )
+        _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=Coordinate(1, 27, 20),
+            expected_at=ARRIVED + timedelta(seconds=8),
+        )
+
+        claimed = repository.append_recycle_report(_reading(), report_id=uuid4())
+
+        assert claimed is None
+        assert _reports(session_factory) == []
+
+    def test_a_near_miss_far_from_the_mail_is_never_claimed(
+        self,
+        repository: SqlAlchemyRepository,
+        session_factory: sessionmaker[Session],
+        run_id: object,
+    ) -> None:
+        """⚠️⚠️ 「最近的那一发」也得**真的近**，不能只是矮子里拔将军。
+
+        两发都离邮件时刻很远时，多半是**真正那一发根本不在窗口里**
+        （比如飞行时长读错、或者这封信的时刻读错）。这一档认下去就是记错人。
+        """
+        _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=TARGET,
+            expected_at=ARRIVED - timedelta(seconds=120),
+        )
+        _dispatch(
+            repository,
+            session_factory,
+            run_id,
+            target=Coordinate(1, 27, 20),
+            expected_at=ARRIVED - timedelta(seconds=240),
         )
 
         claimed = repository.append_recycle_report(_reading(), report_id=uuid4())
