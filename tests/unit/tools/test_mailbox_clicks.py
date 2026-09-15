@@ -350,14 +350,20 @@ def test_the_unfiltered_trips_guarantee_their_own_precondition() -> None:
       **攻击、扫描全停 57 分钟、216 轮全判失败**。
     """
     source = inspect.getsource(pirate_loop.PirateLoop._scan_mail_rows)
+    probe = "_mail_filters_need_fixing"
 
-    assert "not fleet_sub_tab and self._fleet_filter_looks_on()" in source, (
-        "收手的条件不再以「正面认出筛选开着」打头 —— 只要主题读不出，它就会每趟都收手"
+    #: ⚠️ 判据 2026-09-15 从「舰队亮着吗」换成「现在是不是不等于要的样子」——
+    #: 前者漏掉 `{战斗,侦察}` / `{侦察}` / 空集合三档（Codex 复核 P1-1）。
+    #: 位置与处置这两条**一个字没松**。
+    assert f"not fleet_sub_tab and self.{probe}(fleet=False)" in source, (
+        "收手的条件不再问「现在是不是不等于战报那一趟要的样子」"
     )
-    assert source.index("self._enter_mailbox()") < source.index("_fleet_filter_looks_on"), (
+    call = f"not fleet_sub_tab and self.{probe}(fleet=False)"
+    assert source.index("self._enter_mailbox()") < source.index(call), (
         "那道探测排在开信箱之前 —— 它读不到列表，等于没装"
     )
-    tail = source[source.index("_fleet_filter_looks_on") :][:700]
+    # ⚠️ 从**那一行调用**往后截，不从名字第一次出现处截 —— 注释里也会提到它。
+    tail = source[source.index(call) :][:700]
     assert "cut_short=" in tail, "关不掉筛选时没有走 cut_short"
     assert "raise" not in tail, "关不掉筛选时又去抛异常了 —— 那正是停摆 57 分钟的成因"
 
@@ -1179,3 +1185,51 @@ def test_without_a_screenshot_it_falls_back_to_the_old_list_judgement() -> None:
 
     assert loop._select_mail_sub_tab(fleet=True) is True
     assert calls == [True], "没有截图能力时没有回退到老判据"
+
+
+def test_the_probe_falls_back_to_positive_recognition_when_it_cannot_see() -> None:
+    """⚠️⚠️ **读不出按钮时，必须退回「只在正面认出筛选开着才动手」。**
+
+    新判据「现在 != 要的样子」在**读得到按钮**时才成立 —— 它靠的是正面读出整组状态。
+    读不出时若还用它，就退化成「认不出就当它不对」，那正是 2026-09-14 中午
+    每轮在开工那步自杀、**停摆 57 分钟**的形状。
+    """
+    asked: list[str] = []
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._read_mail_filters = lambda: None  # type: ignore[assignment]
+    loop._fleet_filter_looks_on = lambda: (  # type: ignore[assignment]
+        asked.append("正面问了一次") or False
+    )
+
+    assert loop._mail_filters_need_fixing(fleet=False) is False, (
+        "读不出按钮时没有退回正面判据 —— 那会让读战报那一趟每轮都去收手"
+    )
+    assert asked == ["正面问了一次"]
+
+
+def test_the_last_click_that_worked_is_not_reported_as_failure() -> None:
+    """⚠️⚠️ **最后一次点成功了，不许还返回失败。**
+
+    成功判断原先只在循环开头，于是最后一轮点对了、状态也对了，
+    循环一结束照样去存现场图、报「切不到」，整趟作废。
+    （2026-09-15 Codex 复核 P1-2；当时的用例点一下就成，覆盖不到这一档。）
+    """
+    driver = _FilterDriver({"战斗"})
+    # 前 N-1 轮点击不生效，最后一轮才生效。
+    budget = pirate_loop.MAIL_SUB_TAB_TRIES
+    real_click = driver.click
+    seen: list[int] = []
+
+    def flaky(x: int, y: int, *, label: str = "") -> None:
+        seen.append(1)
+        if len(seen) >= budget * 2 - 1:  # 最后一轮的两下（关战斗、开舰队）
+            real_click(x, y, label=label)
+        else:
+            driver.clicks.append(label)  # 点了，但没生效
+
+    driver.click = flaky  # type: ignore[assignment]
+
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is True, (
+        "最后一轮点成功了却报失败 —— 整趟白作废"
+    )
