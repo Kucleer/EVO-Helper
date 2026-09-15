@@ -241,11 +241,18 @@ def test_the_two_directions_click_different_buttons() -> None:
     assert 965 <= pirate_loop.MAIL_FLEET_SUB_TAB[0] <= 1082, "舰队的 x 落到别的按钮上了"
 
     # 两个方向必须**按 fleet 挑**坐标，不许写死一个。
-    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
+    # ⚠️ 这一段现在住在回退那条路上（新路按名字从 `MAIL_SUB_TAB_COORDS` 取）。
+    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab_by_list)
     targets = re.findall(r"^\s*target = (.+)$", source, re.M)
     assert targets == ["MAIL_FLEET_SUB_TAB if fleet else MAIL_BATTLE_SUB_TAB"], (
         f"切标签没有按方向挑坐标：{targets}"
     )
+    # ⚠️ 新路按名字取坐标，那张表里两个方向也必须是**不同的**按钮。
+    coords = pirate_loop.MAIL_SUB_TAB_COORDS
+    assert coords["战斗"] != coords["舰队"], f"两个方向指到同一个按钮上了：{coords}"
+    for name, (x, _y) in coords.items():
+        low, high = (713, 830) if name == "战斗" else (965, 1082)
+        assert low <= x <= high, f"「{name}」的 x={x} 不在实测量出的范围 {low}–{high} 内"
 
 
 def test_it_looks_before_it_clicks() -> None:
@@ -255,12 +262,17 @@ def test_it_looks_before_it_clicks() -> None:
     「上一趟停在舰队」这一种情形下第一下就翻走、判据对不上、重试再点又翻回来——
     本该一下到位的一个按钮变成了赌奇偶，而那正是那一夜「切不到舰队，整趟不读」的成因。
     """
-    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
-    before_click = source.split("self._driver.click(", 1)[0]
-
-    assert "_sub_tab_matches(" in before_click, (
-        "点之前没有先看一眼；它是开关，已经到位时再点一下会翻掉"
-    )
+    #: ⚠️ 判据换成「读按钮底色」之后，这一条要在**两条路上**分别守：
+    #: 新路走 `_read_mail_filters`，读不到截图时回退的老路走 `_sub_tab_matches`。
+    for method, looker in (
+        (pirate_loop.PirateLoop._select_mail_sub_tab, "_read_mail_filters("),
+        (pirate_loop.PirateLoop._select_mail_sub_tab_by_list, "_sub_tab_matches("),
+    ):
+        source = inspect.getsource(method)
+        before_click = source.split("self._driver.click(", 1)[0]
+        assert looker in before_click, (
+            f"{method.__name__} 在点之前没有先看一眼；它是开关，已经到位时再点一下会翻掉"
+        )
 
 
 def test_the_click_label_dodges_the_read_only_gate() -> None:
@@ -273,10 +285,14 @@ def test_the_click_label_dodges_the_read_only_gate() -> None:
     """
     from evo_helper.game.human_input import FORBIDDEN_LABELS
 
-    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab)
+    #: ⚠️ 现在标签名来自 `MAIL_SUB_TAB_COORDS` 的键（新路）与那两个字面量（老路），
+    #: 两边都要守 —— 漏掉哪一边，哪一边就会在实机上当场崩。
+    source = inspect.getsource(pirate_loop.PirateLoop._select_mail_sub_tab_by_list)
     names = re.findall(r'name = "([^"]*)" if fleet else "([^"]*)"', source)
     assert names, "找不到那两个标签名；这条用例过期了"
-    for label in names[0]:
+    labels = set(names[0]) | set(pirate_loop.MAIL_SUB_TAB_COORDS)
+    assert labels >= {"战斗", "舰队"}, f"可点的标签集合不对：{labels}"
+    for label in labels:
         for word in FORBIDDEN_LABELS:
             assert word not in label, f"标签「{label}」里有 {word!r}，只读进程点它会被拒"
 
@@ -1027,3 +1043,139 @@ def test_a_mixed_screen_that_never_settles_still_gets_clicked() -> None:
         "一直是混合帧就再也不点了 —— 那正是 ceb5de6 上生产后第一趟回收干等 106 秒的死法"
     )
     assert clicked, "从头到尾一次都没点；等待把唯一能救回来的动作顶掉了"
+
+
+# -- 2026-09-15 下午：那一排是**多选**的，选中态直接写在按钮底色上 ----------------
+
+
+def _screen(lit: set[str]) -> object:
+    """造一屏假的信箱：`lit` 里那几个筛选按钮画亮，其余画暗。"""
+    from PIL import Image
+
+    image = Image.new("RGB", (1920, 917), (10, 20, 40))
+    for name, box in pirate_loop.MAIL_SUB_TAB_SAMPLES.items():
+        # 实测：未选中 R 3–30、选中 R 59–190，中间 30→59 是空档。
+        fill = (120, 140, 180) if name in lit else (14, 40, 70)
+        image.paste(fill, box)
+    return image
+
+
+class _FilterDriver:
+    """点一下就把那个筛选**翻一下**——这正是实机的行为（多选、各自 toggle）。"""
+
+    def __init__(self, lit: set[str]) -> None:
+        self.lit = set(lit)
+        self.clicks: list[str] = []
+
+    def click(self, x: int, _y: int, *, label: str = "") -> None:
+        self.clicks.append(label)
+        for name, (cx, _cy) in pirate_loop.MAIL_SUB_TAB_COORDS.items():
+            if cx == x:
+                self.lit ^= {name}
+
+    def wait(self, _seconds: float) -> None:
+        pass
+
+    def capture(self) -> object:
+        return _screen(self.lit)
+
+
+def _loop_with(driver: object) -> object:
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = driver  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    return loop
+
+
+def test_the_filter_row_is_read_off_the_buttons_not_off_the_list() -> None:
+    """⚠️⚠️⚠️ **选中态直接写在按钮底色上。**
+
+    2026-09-15 把 65 张失败现场图量了一遍（每张三块、共 195 个读数）：
+    未选中 R = 3–30、选中 R = 59–190，中间 30→59 是空档。
+
+    在这之前我连着三次拿「列表里有几行舰队类」反推筛选状态，三次都栽
+    （断流 9 小时 / 停摆 57 分钟 / 回收趟 41% 白跑）——
+    共同根因就是**列表内容反推不出筛选状态**。
+    """
+    assert pirate_loop.mail_filters_that_are_on(_screen(set())) == frozenset()
+    assert pirate_loop.mail_filters_that_are_on(_screen({"舰队"})) == frozenset({"舰队"})
+    assert pirate_loop.mail_filters_that_are_on(_screen({"战斗", "舰队"})) == frozenset(
+        {"战斗", "舰队"}
+    ), "两个同时亮 = 混排列表，这一档正是骗了列表判据的那个"
+
+
+def test_it_turns_the_wrong_one_off_instead_of_blindly_clicking_the_target() -> None:
+    """⚠️⚠️ **多选面板上「盲点一下目标」永远到不了位。**
+
+    战斗开着的时候点舰队，得到的是**两个都开**（混排）；再点一下又把舰队关掉。
+    2026-09-15 实测：这一档占全部失败现场的 23/65，回收趟 41% 白跑。
+    """
+    driver = _FilterDriver({"战斗", "舰队"})
+
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is True
+    assert driver.clicks == ["二级标签「战斗」"], (
+        f"该关掉战斗，实际点了 {driver.clicks} —— 盲点目标只会在两种错的状态间来回翻"
+    )
+    assert driver.lit == {"舰队"}
+
+
+def test_it_closes_the_old_one_and_opens_the_new_one() -> None:
+    """只开着战斗时，要**两下**：关战斗、开舰队。"""
+    driver = _FilterDriver({"战斗"})
+
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is True
+    assert driver.clicks == ["二级标签「战斗」", "二级标签「舰队」"]
+    assert driver.lit == {"舰队"}
+
+
+def test_the_system_filter_being_on_does_not_stop_the_trip() -> None:
+    """⚠️⚠️⚠️ **「系统」几乎一直亮着，而我们不许点它。**
+
+    把它算进「必须关掉」，等于**每一趟都收手** —— 那会把回收读信整条掐死，
+    比原来的 bug 还狠。我差一点就这么写出去了。
+
+    忽略它是安全的：那一档里根本没有信（实拍只选中系统的那一帧，
+    列表正中就是「没有符合当前筛选条件的邮件。」，而同屏角标
+    个人 2 · 战斗 12 · 舰队 99+、**系统一个角标都没有**）。
+    """
+    driver = _FilterDriver({"系统", "舰队"})
+
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is True, (
+        "系统亮着就收手 —— 那等于把回收读信整条关掉"
+    )
+    assert driver.clicks == [], "系统亮着不该引出任何点击"
+
+
+def test_a_filter_we_are_not_allowed_to_touch_makes_it_give_up() -> None:
+    """⚠️ 「侦察」有信（角标 99+），混进来会污染这一趟读的东西，而我们**不许点它**。
+
+    所以它亮着只能收手，并把话说清楚让人去手动关 ——
+    不许顺手帮用户关掉（用户口径 2026-08-11：「其他的筛选不要动」）。
+    """
+    driver = _FilterDriver({"侦察", "战斗"})
+
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is False
+    assert driver.clicks == [], f"点了不许碰的筛选：{driver.clicks}"
+
+
+def test_without_a_screenshot_it_falls_back_to_the_old_list_judgement() -> None:
+    """⚠️ 桩驱动大多只有 `click`/`wait`。读不到截图必须回到老路 ——
+    否则一改就是整批用例**失去意义**（不是变红，是测了个不存在的东西）。
+    """
+    calls: list[bool] = []
+
+    class Bare:
+        def click(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    loop = _loop_with(Bare())
+    loop._select_mail_sub_tab_by_list = lambda *, fleet: (  # type: ignore[assignment]
+        calls.append(fleet) or True
+    )
+
+    assert loop._select_mail_sub_tab(fleet=True) is True
+    assert calls == [True], "没有截图能力时没有回退到老判据"
