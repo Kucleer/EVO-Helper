@@ -99,12 +99,33 @@ MATCH_TIME_TOLERANCE = timedelta(hours=12)
 MATCH_EXPECTED_WINDOW_BEFORE = timedelta(seconds=60)
 MATCH_EXPECTED_WINDOW_AFTER = timedelta(seconds=300)
 
+#: 窗口里剩下多于一发时，**最近那一发**要多近才敢认，以及它要比次近的领先多少。
+#:
+#: 实测 2026-09-15（生产库全量）：
+#:
+#:     25 封「窗口里 ≥2 发」的信： 最近 1–3 秒 · 次近 10–253 秒 · 两者最小间隔 8 秒
+#:     58 份**已认领**的实收（旧规则下窗口唯一，属 ground truth）：
+#:                                 0–22 秒，其中 ≤3 秒 47 份、≤5 秒 55 份
+#:
+#: 3 秒和 10 秒之间是一道**空档**，阈值落在空档里，不是拍出来的。
+#:
+#: ⚠️⚠️ **这一对判据只在「今天整封丢掉」的那一档上生效**（窗口里 ≥2 发）。
+#: 窗口里恰好一发时**一个字不动** —— 已认领那 58 份里有 3 份偏差是 7/13/22 秒，
+#: 一刀切成 5 秒会把它们弄丢。所以这是**纯增量**：只可能把「丢掉」变成「认领」，
+#: 不可能改变任何一次已有的认领。
+RECYCLE_NEAREST_TOLERANCE = timedelta(seconds=5)
+RECYCLE_NEAREST_MARGIN = timedelta(seconds=7)
+
 #: 认领的三档置信度：**如实反映这一份是凭几个字段认下来的**，不因为放宽了判据
 #: 就统一给高分。页面与排障都照着它读，`0.6` 那一档意味着「出发点读数与派遣对不上，
 #: 是靠目标 + 抵达时刻定的人」。
 CONFIDENCE_ORIGIN_TARGET_TIME = 1.0
 CONFIDENCE_EXPECTED_WINDOW = 0.9
 CONFIDENCE_ORIGIN_MISMATCH = 0.6
+
+#: 窗口里有好几发、靠「最近且明显最近」定下来的那一档。**比窗口唯一那档低**：
+#: 它多用了一条「次近的差得远」的假设，如实记下来，页面和排障才分得出。
+CONFIDENCE_NEAREST_ARRIVAL = 0.8
 
 #: 认不上时，日志里最多列几个候选。全列出来只会把一条日志撑成一屏。
 MAX_LOGGED_CANDIDATES = 8
@@ -923,14 +944,26 @@ class SqlAlchemyRepository:
         所以这一侧只拿**时刻**去找派遣（邮件盖的是抵达那一刻的章，派遣手上有
         `expected_report_at_utc`），坐标一律从认下来的那一发抄过来。
 
-        ## ⚠️⚠️ 唯一才认，不唯一就整封不要
+        ## ⚠️⚠️ 唯一就认；不唯一时只认「最近且明显最近」的那一发
 
         实测生产库 169 发回收派遣，**相邻预计抵达时刻有 9.5% 落在 60 秒以内**
-        （最小 0 秒）—— 时刻不是唯一键。所以窗口里活下来多于一发时**一发都不认**，
-        和 `_link_dispatch` 那条「仍然不猜」是同一条规矩。
+        （最小 0 秒）—— 时刻不是唯一键，所以不能无条件取最近的。
 
-        代价是那一封这一趟不入库。**这是有意的**：认错的代价是一整趟的资源记错人，
-        而认不上的代价只是页面上多停一会儿「待回收」，下一趟这封信还在信箱里。
+        ⚠️ 但原先「不唯一就整封丢掉」把好信也丢了，而且丢得很多：
+        2026-09-15 一夜「读到了实收却认不出是哪一发」**60 次**，同期真正入库
+        只有 **30** 份 —— 数据全读出来了（三格 + 船数过了容量闸），卡的只是归属。
+
+        实测 25 封歧义样本：**最近那一发差 1–3 秒，次近的差 10–253 秒**，
+        中间是一道空档。所以多于一发时再问一句：最近的够不够近
+        （`RECYCLE_NEAREST_TOLERANCE`）、它比次近的领先够不够多
+        （`RECYCLE_NEAREST_MARGIN`）。两条都满足才认，否则照旧整封不要。
+
+        ⚠️⚠️ **`len(free) == 1` 那条路一个字没动。** 已认领的 58 份里有 3 份
+        偏差是 7/13/22 秒，把容差一刀切成 5 秒会把它们弄丢。这一档是**纯增量**：
+        只可能把「丢掉」变成「认领」，不可能改变任何一次已有的认领。
+
+        认错的代价是一整趟的资源记错人，认不上的代价只是页面上多停一会儿
+        「待回收」、下一趟这封信还在信箱里 —— 所以余量留在「不认」那一侧。
         """
         from evo_helper.application.report_ingest import to_recycle_report
         from evo_helper.vision.recycle_mail_screen import RecycleMailReading
@@ -966,13 +999,72 @@ class SqlAlchemyRepository:
                 ).all()
             )
             free = [(dispatch, intent) for dispatch, intent in rows if dispatch.id not in taken]
+            # ⚠️⚠️ **窗口里剩好几发时，先看看「最近那一发」是不是明显就是它。**
+            #
+            # 原先这里直接整封丢掉，而实测那是**第一大堵点**：2026-09-15 一夜，
+            # 「读到了实收却认不出是哪一发」60 次，而真正入库只有 30 份 ——
+            # 数据全读出来了（三格 + 船数过了容量闸），卡的只是归属。
+            #
+            # 而时刻其实分得清清楚楚（25 封歧义样本，全量统计）：
+            #
+            #     最近那一发： 1–3 秒        次近那一发： 10–253 秒
+            #
+            # 3 秒和 10 秒之间是空档，两个阈值都落在空档里（见常量上的注释）。
+            #
+            # ⚠️ 这一档**只接管原先会被丢掉的那些**：`len(free) == 1` 的路径
+            # 一个字没动，所以它不可能改变任何一次已有的认领，只可能少丢几封。
+            nearest_confidence = CONFIDENCE_EXPECTED_WINDOW
+            if len(free) > 1:
+
+                def _gap(
+                    pair: tuple[orm.AttackDispatchRow, orm.AttackIntentRow],
+                ) -> timedelta:
+                    expected = pair[0].expected_report_at_utc
+                    assert expected is not None  # 查询里已经过滤掉 NULL
+                    return abs(expected - arrived)
+
+                by_gap = sorted(free, key=_gap)
+                best_gap = abs(by_gap[0][0].expected_report_at_utc - arrived)
+                runner_gap = abs(by_gap[1][0].expected_report_at_utc - arrived)
+                if (
+                    best_gap <= RECYCLE_NEAREST_TOLERANCE
+                    and runner_gap - best_gap >= RECYCLE_NEAREST_MARGIN
+                ):
+                    record_system_log(
+                        "INFO",
+                        _MATCH_LOG_SOURCE,
+                        f"回收实收（{record.raw_time_text}）窗口里有 {len(free)} 发，"
+                        f"按抵达时刻认最近的那一发（差 {best_gap.total_seconds():.0f} 秒；"
+                        f"次近的差 {runner_gap.total_seconds():.0f} 秒）",
+                        payload={
+                            "mail_time": record.raw_time_text,
+                            "candidates": len(free),
+                            "best_gap_s": best_gap.total_seconds(),
+                            "runner_gap_s": runner_gap.total_seconds(),
+                        },
+                    )
+                    free = [by_gap[0]]
+                    nearest_confidence = CONFIDENCE_NEAREST_ARRIVAL
             if len(free) != 1:
                 record_system_log(
                     "WARNING",
                     _MATCH_LOG_SOURCE,
                     f"回收实收（{record.raw_time_text}）在抵达窗口里找到 {len(free)} 发候选"
                     f"（窗口内共 {len(rows)} 发、已接过实收的排除掉 {len(rows) - len(free)} 发）；"
-                    "不猜是哪一发，这一封不入库，下一趟再来",
+                    "不猜是哪一发，这一封不入库，下一趟再来"
+                    + (
+                        ""
+                        if len(free) < 2
+                        else "；最近的差 {:.0f} 秒、次近的差 {:.0f} 秒，"
+                        "不够「最近且明显最近」".format(
+                            min(
+                                abs(d.expected_report_at_utc - arrived) for d, _ in free
+                            ).total_seconds(),
+                            sorted(abs(d.expected_report_at_utc - arrived) for d, _ in free)[
+                                1
+                            ].total_seconds(),
+                        )
+                    ),
                     payload={
                         "mail_time": record.raw_time_text,
                         "candidates": len(free),
@@ -1005,10 +1097,11 @@ class SqlAlchemyRepository:
                 defender_target_system=haul.target.system,
                 defender_target_position=haul.target.position,
                 outcome=report.outcome,
-                # ⚠️ **认领是靠「抵达时刻唯一」定下来的，不是靠坐标**，所以置信度
-                # 记 `CONFIDENCE_EXPECTED_WINDOW` 那一档。记 1.0 会谎称出发点与
-                # 目标都核对过 —— 而这一条链路根本没读坐标。
-                match_confidence=CONFIDENCE_EXPECTED_WINDOW,
+                # ⚠️ **认领是靠抵达时刻定下来的，不是靠坐标**，所以置信度记
+                # `CONFIDENCE_EXPECTED_WINDOW`（窗口唯一）或 `CONFIDENCE_NEAREST_ARRIVAL`
+                # （窗口里有好几发、靠「最近且明显最近」定的）那两档。
+                # 记 1.0 会谎称出发点与目标都核对过 —— 这条链路根本没读坐标。
+                match_confidence=nearest_confidence,
                 dispatch_id=dispatch.id,
             )
             session.add(report_row)
