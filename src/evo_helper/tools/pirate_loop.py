@@ -459,6 +459,12 @@ def sub_tab_frame_is_mid_repaint(here: int, other: int) -> bool:
 
     ⚠️ 真正的「切错了」是 `here == 0`（问「关掉了？」的那 16 行全落在 0），
     那一档照旧当失败处理，该点还是点。
+
+    ⚠️⚠️ **「两种都有」不等于「它是瞬态的」。** 2026-09-15 07:36 实测：
+    同一屏「舰队类 4 行、非舰队类 2 行」**稳定存在 100 秒**，那两行读出来是
+    清清楚楚的「攻击报告」，不是残影。所以这个判据只够用来**多等一会儿**，
+    **不够用来不点** —— 上游等不到就必须照常点下去，理由整段在
+    `_select_mail_sub_tab` 里那个 `continue` 的墓碑上。
     """
     return here > 0 and other > 0
 
@@ -3501,10 +3507,20 @@ class PirateLoop:
                 # 2026-09-15 06:52 实拍到的就是这条路：判失败→再点→停在战斗档位。
                 # 整段理由与那一夜的计数在 `sub_tab_frame_is_mid_repaint` 上。
                 if self._sub_tab_mid_repaint:
-                    say(f"  二级标签「{name}」这一屏两种都有，列表还在重绘；只等不点")
+                    say(f"  二级标签「{name}」这一屏两种都有；先等它画完，等不到再点")
                     if self._wait_out_sub_tab_repaint(fleet=fleet, name=name):
                         return True
-                    continue
+                    # ⚠️⚠️⚠️ **等不到就照常往下点。这里一度写的是 `continue`，那是个必败的坑。**
+                    #
+                    # `#350` 原样上生产（2026-09-15 07:24 `ceb5de6`）之后第一趟回收：
+                    # 三次 attempt 全读到混合帧、于是一次都没点，干等 106 秒放弃。
+                    # 而那两行**根本不是重绘残影** —— 100 秒里读数一字未变：
+                    #     第 2 行 '28 攻击报告 bad' · 第 4 行 '人人》 攻击报告 SX'
+                    # 那是一屏**稳定的真实画面**（筛选没选上，列表混着各类信）。
+                    #
+                    # 教训：混合帧**只说明两种都在**，不足以推出「它是瞬态的」。
+                    # 等一等是对的（真瞬态时能省掉一次危险的重点），
+                    # 但**等待不能取代点击** —— 点一下恰恰是这一档唯一能救回来的动作。
             self._driver.click(*target, label=f"二级标签「{name}」")
             self._driver.wait(MAIL_SUB_TAB_WAIT_S)
             if not self._on_mail_list():
