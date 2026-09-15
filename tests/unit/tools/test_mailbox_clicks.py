@@ -984,3 +984,46 @@ def test_what_counts_as_a_half_repainted_screen() -> None:
     assert pirate_loop.sub_tab_frame_is_mid_repaint(0, 6) is False, (
         "一行舰队类都没有 = 真的切错了,这一档要照旧去点,不是等"
     )
+
+
+def test_a_mixed_screen_that_never_settles_still_gets_clicked() -> None:
+    """⚠️⚠️⚠️ **等待不能取代点击。** `#350` 原样上生产时这里是个必败的坑。
+
+    2026-09-15 07:24 `ceb5de6` 上生产,第一趟回收:三次 attempt 全读到混合帧、
+    于是**一次都没点**,干等 106 秒放弃。而那两行根本不是重绘残影 ——
+    100 秒里读数一字未变(`'28 攻击报告 bad'` / `'人人》 攻击报告 SX'`),
+    那是一屏**稳定的真实画面**(筛选没选上,列表混着各类信)。
+
+    混合帧只说明「两种都在」,**推不出「它是瞬态的」**。
+    等一等是对的(真瞬态时能省掉一次危险的重点),但等不到就必须照常点 ——
+    点一下恰恰是这一档唯一能救回来的动作。
+    """
+    kind = pirate_loop.ReportKind
+    mixed = [kind.RECYCLE] * 4 + [kind.ATTACK] * 2
+    clean = [kind.RECYCLE] * 6
+    clicked: list[str] = []
+
+    class Driver:
+        def click(self, _x: int, _y: int, *, label: str = "") -> None:
+            clicked.append(label)
+
+        def wait(self, _seconds: float) -> None:
+            pass
+
+    class Row:
+        def __init__(self, index: int, kind: object) -> None:
+            self.index, self.kind, self.subject = index, kind, "某封信"
+
+    loop = pirate_loop.PirateLoop.__new__(pirate_loop.PirateLoop)
+    loop._driver = Driver()  # type: ignore[attr-defined]
+    loop._on_mail_list = lambda: True  # type: ignore[attr-defined, assignment]
+    loop._dump_frame = lambda *_a, **_k: None  # type: ignore[attr-defined, assignment]
+    # ⚠️ 点之前永远是那一屏混合的，点完才换过来 —— 「等」在这种屏上永远等不到。
+    loop._mail_list_rows = lambda **_k: [  # type: ignore[assignment]
+        Row(i, k) for i, k in enumerate(clean if clicked else mixed)
+    ]
+
+    assert loop._select_mail_sub_tab(fleet=True) is True, (
+        "一直是混合帧就再也不点了 —— 那正是 ceb5de6 上生产后第一趟回收干等 106 秒的死法"
+    )
+    assert clicked, "从头到尾一次都没点；等待把唯一能救回来的动作顶掉了"
