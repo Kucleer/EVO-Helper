@@ -3554,7 +3554,9 @@ class PirateLoop:
             if callable(ocr):
                 # 与 `_read` / `_frame_reader` 同一条取字路径：同一帧上先认标题再读色，
                 # 避免「读标题时一帧、读按钮时另一帧」这种混时刻。
-                title = crop_reader(frame, ocr)(PANEL_TITLE_ROI, upscale=3)
+                # ⚠️ `digits` 是 `make_ocr` 的**必填关键字**（scan_coordinates.ocr），
+                # 2026-09-16 漏传导致生产上每一次都走到 except、色判据从未生效。
+                title = crop_reader(frame, ocr)(PANEL_TITLE_ROI, digits=False, upscale=3)
                 if "邮箱" not in (title or ""):
                     say(f"  二级标签色判据跳过：面板标题读作 {title!r}，不是信箱")
                     return None
