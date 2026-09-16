@@ -1154,15 +1154,26 @@ def test_the_system_filter_being_on_does_not_stop_the_trip() -> None:
 
 
 def test_a_filter_we_are_not_allowed_to_touch_makes_it_give_up() -> None:
-    """⚠️ 「侦察」有信（角标 99+），混进来会污染这一趟读的东西，而我们**不许点它**。
+    """⚠️ 「侦察」亮着**只警告、不收手**（2026-09-16 改）。
 
-    所以它亮着只能收手，并把话说清楚让人去手动关 ——
-    不许顺手帮用户关掉（用户口径 2026-08-11：「其他的筛选不要动」）。
+    原理由是「侦察有信会污染」。但：
+      · 用户口径（2026-09-16）：最近没有侦察过，不会有侦察报告；
+        库里 `scout_reports` 最后一条停在 2026-08-22。
+      · 开封按主题挑「回收报告 / 攻击报告」，侦察信只会被跳过。
+      · 颜色判据在侦察上误报（眼睛图标 / 悬停）会把整条回收链路掐死 ——
+        2026-09-16 上午生产 2.8 小时全灭。
+
+    所以：**不点侦察**（用户口径 2026-08-11），但也不再因为它整趟放弃。
     """
     driver = _FilterDriver({"侦察", "战斗"})
 
-    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is False
-    assert driver.clicks == [], f"点了不许碰的筛选：{driver.clicks}"
+    assert _loop_with(driver)._select_mail_sub_tab(fleet=True) is True, (
+        "侦察亮着就收手 —— 那正是 2026-09-16 上午把回收读信整条掐死的原因"
+    )
+    assert driver.clicks == ["二级标签「战斗」", "二级标签「舰队」"], (
+        f"该关战斗、开舰队，且绝不点侦察；实际点了 {driver.clicks}"
+    )
+    assert driver.lit == {"侦察", "舰队"}, "侦察应保持亮着（不许点）"
 
 
 def test_without_a_screenshot_it_falls_back_to_the_old_list_judgement() -> None:
